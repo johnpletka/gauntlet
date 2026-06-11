@@ -5,7 +5,7 @@
   "reviewer": "codex (manual, human-run; prose output normalized to IDs F-001..F-010, OQ-1..OQ-3)",
   "triager": "claude (bootstrap builder, manual triage pre-P4)",
   "date": "2026-06-10",
-  "status": "awaiting human ratification at plan gate",
+  "status": "ratified by human 2026-06-10; 11 fix_now applied (plan.md in Plan.1 commit; OQ-3 to PRD-gauntlet.md by human authorization), declines F-008/OQ-2 sustained",
   "verdicts": [
     {
       "finding_id": "F-001",
