@@ -1,0 +1,52 @@
+# Gauntlet run configuration (FR-2.1, plan P3).
+#
+# Agent profiles bind adapter + model + flags; pipeline steps reference them by
+# name (`agent: builder`). Swapping builder/reviewer roles is a YAML edit here or
+# a per-step override — no code change (FR-2.2). The engine builds the actual
+# adapter via the entry-point registry (FR-2.4) and lints flags at load (§8).
+#
+# `gauntlet init` will scaffold this file in P6; it is hand-authored for the
+# bootstrap so the P3 engine has profiles to resolve.
+
+base_branch: main
+branch_prefix: "gauntlet/"
+# Single run-root for plan/transcripts/manifests (BOOTSTRAP-NOTES #2 / #13).
+run_root: runs
+test_command: "uv run pytest"
+
+# On resume of a step killed mid-edit with a dirty worktree (review F-003):
+#   park          -> stop for a human (default; nothing re-run over partial work)
+#   reset_to_base -> back up the partial work to a ref, reset to base, re-run
+interrupted_step: park
+
+agents:
+  builder:
+    adapter: claude-code
+    model: claude-opus-latest
+    permission_mode: acceptEdits
+    allowed_tools: [Bash, Read, Write, Edit, Grep, Glob]
+    # claude loads the repo's PreToolUse hook only under project setting sources
+    # (pins.yaml); the engine-managed judge cannot gate the builder without it.
+    base_flags: ["--setting-sources", "project"]
+  reviewer:
+    adapter: codex
+    model: gpt-5.5
+    sandbox: read-only        # pure review steps are read-only (FR-9.6)
+  triage:
+    adapter: api
+    model: claude-haiku-latest
+  judge_llm:
+    adapter: api
+    model: claude-haiku-latest
+
+# Per-agent commit identities (FR-9.7) so git log distinguishes who authored what.
+identities:
+  builder:
+    name: "Gauntlet Builder (claude)"
+    email: "builder@gauntlet.local"
+  reviewer:
+    name: "Gauntlet Reviewer (codex)"
+    email: "reviewer@gauntlet.local"
+  triage:
+    name: "Gauntlet Triage"
+    email: "triage@gauntlet.local"

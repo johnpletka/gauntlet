@@ -1,0 +1,138 @@
+"""Step execution contract: context, result, and the step-type registry.
+
+Step handlers receive a :class:`StepContext` (everything they may touch) and
+return a :class:`StepResult` (what the orchestrator records). Control flow —
+``on_fail`` routing, retries, parking, budget halts — is the orchestrator's
+job, not the handler's; a handler just reports ``done``/``failed``/``parked``.
+
+Step types register in :data:`BUILTIN_STEP_TYPES` and via the
+``gauntlet.step_types`` entry point (FR-5.5); each carries the capability
+metadata the load-time validator needs (FR-2.3).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from importlib.metadata import entry_points
+from pathlib import Path
+from typing import Any
+
+from gauntlet.adapters.base import AgentResult, Usage
+from gauntlet.engine.config import RunConfig
+from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.pipeline import Pipeline, Step
+from gauntlet.logging.redact import RedactingWriter
+
+STEP_TYPE_ENTRY_POINT_GROUP = "gauntlet.step_types"
+
+# StepResult.status values
+DONE = "done"
+FAILED = "failed"
+PARKED = "parked"
+HALTED = "halted"
+SKIPPED = "skipped"
+INTERRUPTED = "interrupted"  # killed mid-edit; record interrupted, park the run
+
+
+@dataclass
+class StepResult:
+    status: str
+    session_id: str | None = None
+    usage: Usage | None = None
+    commit_sha: str | None = None
+    commit_phase: str | None = None
+    notes: str = ""
+    # artifacts this step produced (artifact name -> path), merged into context
+    artifact_writes: dict[str, Path] = field(default_factory=dict)
+
+
+# An adapter factory lets unit tests inject fakes by agent-profile name without
+# touching the entry-point registry (the orchestrator stays offline-testable).
+AdapterFactory = Callable[[str], Any]
+
+
+@dataclass
+class StepContext:
+    repo_root: Path
+    run_dir: Path
+    artifact_root: Path  # slug dir: prd.md / plan.md / step outputs live here
+    config: RunConfig
+    pipeline: Pipeline
+    manifest: Manifest
+    record: StepRecord
+    writer: RedactingWriter
+    judge_env: dict[str, str] = field(default_factory=dict)
+    artifacts: dict[str, Path] = field(default_factory=dict)
+    iteration_item: Any | None = None
+    iteration_index: int | None = None
+    adapter_factory: AdapterFactory | None = None
+
+    def build_adapter(self, agent_name: str) -> Any:
+        """Resolve an agent profile to an adapter instance (override in tests)."""
+        if self.adapter_factory is not None:
+            return self.adapter_factory(agent_name)
+        return self.config.profile(agent_name).build_adapter()
+
+    def steps_dir(self) -> Path:
+        return self.run_dir / "steps"
+
+
+Handler = Callable[[Step, StepContext], StepResult]
+
+
+@dataclass(frozen=True)
+class StepSpec:
+    """Static metadata + handler for one step type."""
+
+    type: str
+    handler: Handler
+    # FR-2.3 load-time capability checks:
+    requires_repo_write: bool = False  # bound agent must be repo-write capable
+    uses_schema: bool = False  # warn if the bound adapter is best-effort JSON
+    needs_agent: bool = False  # must declare `agent:` (or message_agent)
+    # F-003: record the step's base SHA before running it.
+    touches_worktree: bool = False
+
+    def step_requires_repo_write(self, step: Step) -> bool:
+        # agent_task may opt out via `repo_write: false` (e.g. a doc reviewer).
+        if self.type == "agent_task":
+            return bool(step.get("repo_write", True))
+        return self.requires_repo_write
+
+    def step_touches_worktree(self, step: Step) -> bool:
+        if self.type == "agent_task":
+            return bool(step.get("repo_write", True))
+        return self.touches_worktree
+
+
+def builtin_specs() -> dict[str, StepSpec]:
+    # Imported lazily to avoid a cycle (steptypes imports this module).
+    from gauntlet.engine import steptypes
+
+    return steptypes.SPECS
+
+
+def step_specs() -> dict[str, StepSpec]:
+    """All step specs: built-ins plus ``gauntlet.step_types`` entry points."""
+    specs = dict(builtin_specs())
+    for ep in entry_points(group=STEP_TYPE_ENTRY_POINT_GROUP):
+        spec = ep.load()
+        spec_obj = spec() if callable(spec) and not isinstance(spec, StepSpec) else spec
+        if isinstance(spec_obj, StepSpec):
+            specs[spec_obj.type] = spec_obj
+    return specs
+
+
+def get_spec(step_type: str) -> StepSpec:
+    specs = step_specs()
+    try:
+        return specs[step_type]
+    except KeyError:
+        raise KeyError(
+            f"unknown step type {step_type!r}; registered: {sorted(specs)}"
+        ) from None
+
+
+def usage_from_result(result: AgentResult) -> Usage | None:
+    return result.usage

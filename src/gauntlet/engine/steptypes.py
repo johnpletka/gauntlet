@@ -1,0 +1,279 @@
+"""Built-in step types: agent_task, shell, human_gate, commit (FR-5, FR-9.2).
+
+The ``adversarial_cycle`` step type (the review→triage→fix→confirm primitive)
+is a P4 deliverable and registers there; P3 ships the four primitives the
+crash test and switchover need. Control flow (routing, retries, parking,
+budget halts) is the orchestrator's; handlers report status only.
+
+Trust model (plan §0 / review F-001): ``shell`` commands come **only** from
+human-committed pipeline/config YAML — :func:`render_shell_command` refuses any
+template token that is not a ``{{config.*}}`` reference, so agent-authored text
+can never be substituted into a command line.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+from gauntlet.engine.commit_format import header_prefix, validate_commit_message
+from gauntlet.engine.execution import (
+    DONE,
+    FAILED,
+    PARKED,
+    StepContext,
+    StepResult,
+    StepSpec,
+)
+from gauntlet.engine import gitops
+from gauntlet.engine.pipeline import Step
+
+_CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
+_ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
+
+
+# --- shell -------------------------------------------------------------------
+def render_shell_command(template: str, config) -> str:
+    """Substitute only ``{{config.<key>}}`` tokens; reject anything else.
+
+    Refusing non-config tokens is the engine-side enforcement of the trust
+    model: no agent-authored artifact may be interpolated into a shell command.
+    """
+    def _sub(m: re.Match[str]) -> str:
+        key = m.group(1)
+        value = getattr(config, key, None)
+        if value is None:
+            raise ValueError(
+                f"shell template references unknown config key {key!r}"
+            )
+        return str(value)
+
+    rendered = _CONFIG_TOKEN_RE.sub(_sub, template)
+    leftover = _ANY_TOKEN_RE.search(rendered)
+    if leftover:
+        raise ValueError(
+            f"shell command may only reference {{{{config.*}}}}; refusing "
+            f"to substitute {leftover.group(0)!r} (trust model / review F-001)"
+        )
+    return rendered
+
+
+def handle_shell(step: Step, ctx: StepContext) -> StepResult:
+    template = step.get("run")
+    if not template:
+        return StepResult(status=FAILED, notes="shell step has no `run:` command")
+    command = render_shell_command(template, ctx.config)
+    proc = subprocess.run(
+        command,
+        shell=True,
+        cwd=ctx.repo_root,
+        capture_output=True,
+        text=True,
+    )
+    _write_step_log(ctx, "output.txt", _proc_log(command, proc))
+    if proc.returncode != 0:
+        return StepResult(
+            status=FAILED,
+            notes=f"`{command}` exited {proc.returncode}",
+        )
+    return StepResult(status=DONE, notes=f"`{command}` exited 0")
+
+
+# --- human_gate --------------------------------------------------------------
+def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
+    show = step.get("show", []) or []
+    return StepResult(
+        status=PARKED,
+        notes=f"awaiting human decision; review: {', '.join(show) or '(nothing listed)'}",
+    )
+
+
+# --- agent_task --------------------------------------------------------------
+def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
+    agent_name = step.agent
+    if not agent_name:
+        return StepResult(status=FAILED, notes="agent_task step has no `agent:`")
+    adapter = ctx.build_adapter(agent_name)
+    prompt = _render_prompt(step, ctx)
+    schema = _load_schema(step, ctx)
+    timeout = step.timeout_s
+    if timeout is not None and hasattr(adapter, "timeout_s"):
+        adapter.timeout_s = timeout
+    result = adapter.run(
+        prompt,
+        session=ctx.record.session_id,
+        schema=schema,
+        cwd=ctx.repo_root,
+    )
+    _write_step_log(ctx, "prompt.md", prompt)
+    artifact_writes: dict[str, Path] = {}
+    output = step.get("output")
+    if output:
+        out_path = ctx.artifact_root / output
+        ctx.writer.write_text(out_path, result.text)
+        artifact_writes[output] = out_path
+    return StepResult(
+        status=DONE,
+        session_id=result.session_id,
+        usage=result.usage,
+        artifact_writes=artifact_writes,
+        notes=f"agent {agent_name!r} completed",
+    )
+
+
+def _render_prompt(step: Step, ctx: StepContext) -> str:
+    template_ref = step.get("prompt")
+    if template_ref:
+        template_path = ctx.repo_root / template_ref
+        base = template_path.read_text()
+    else:
+        base = step.get("prompt_text", "") or ""
+    parts = [base]
+    for name in step.get("inputs", []) or []:
+        path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+        content = Path(path).read_text() if Path(path).exists() else ""
+        parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
+    if ctx.iteration_item is not None:
+        parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{ctx.iteration_item}")
+    return "".join(parts)
+
+
+def _load_schema(step: Step, ctx: StepContext) -> dict | None:
+    ref = step.get("findings_schema") or step.get("schema")
+    if not ref:
+        return None
+    import json
+
+    return json.loads((ctx.repo_root / ref).read_text())
+
+
+# --- commit (FR-9.2/9.7) -----------------------------------------------------
+def handle_commit(step: Step, ctx: StepContext) -> StepResult:
+    repo = ctx.repo_root
+    exclude = [ctx.config.run_root]  # never commit / count the run bookkeeping
+    message = _commit_message(step, ctx)
+    err = validate_commit_message(message)
+    if err is not None:
+        # message_agent drafting includes a bounded redraft loop in _draft;
+        # a literal/exhausted message that still fails is a hard error.
+        return StepResult(status=FAILED, notes=f"commit message invalid: {err.reason}")
+    prefix = header_prefix(message)
+
+    # Mid-commit resume reconciliation (review F-003): if a prior attempt
+    # already created the commit (HEAD moved off the recorded base) but died
+    # before recording the SHA, adopt that commit rather than double-committing.
+    base = ctx.record.base_sha
+    if base and gitops.head_sha(repo) != base and gitops.is_clean(repo, exclude=exclude):
+        existing = gitops.head_sha(repo)
+        if header_prefix(gitops.commit_message(repo, existing)) == prefix:
+            return StepResult(
+                status=DONE,
+                commit_sha=existing,
+                commit_phase=prefix,
+                notes="reconciled pre-existing commit after mid-commit interruption",
+            )
+
+    if gitops.is_clean(repo, exclude=exclude):
+        return StepResult(
+            status=FAILED,
+            notes="commit step found a clean worktree with nothing to commit",
+        )
+
+    agent_name = step.agent or step.get("message_agent") or "builder"
+    identity = ctx.config.identity(agent_name)
+    sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
+    return StepResult(
+        status=DONE, commit_sha=sha, commit_phase=prefix, notes=f"committed {sha[:10]}"
+    )
+
+
+def _commit_message(step: Step, ctx: StepContext) -> str:
+    literal = step.get("message")
+    if literal:
+        return literal  # human-authored YAML; still format-validated above
+    return _draft_commit_message(step, ctx)
+
+
+def _draft_commit_message(step: Step, ctx: StepContext) -> str:
+    """Draft a commit message via the message_agent with bounded redraft.
+
+    The agent sees the diff + plan section (data); the engine validates the
+    format and asks for a redraft on violation (FR-9.2). Returns the last draft
+    (valid or not) — :func:`handle_commit` makes the accept/reject decision.
+    """
+    agent_name = step.get("message_agent")
+    if not agent_name:
+        raise ValueError("commit step needs either `message:` or `message_agent:`")
+    adapter = ctx.build_adapter(agent_name)
+    diff = gitops.diff_head(ctx.repo_root, exclude=[ctx.config.run_root])
+    base_prompt = (
+        (ctx.repo_root / step.get("prompt")).read_text()
+        if step.get("prompt")
+        else _DEFAULT_COMMIT_PROMPT
+    )
+    phase_hint = step.get("phase", "")
+    prompt = (
+        f"{base_prompt}\n\nRequired header phase prefix: {phase_hint or '(infer PN)'}\n"
+        f"\n--- diff (HEAD) ---\n{diff}\n"
+    )
+    max_redrafts = int(step.get("max_redrafts", 2))
+    message = ""
+    for attempt in range(1 + max_redrafts):
+        result = adapter.run(prompt, cwd=ctx.repo_root)
+        message = result.text.strip()
+        if validate_commit_message(message) is None:
+            return message
+        prompt = (
+            f"{base_prompt}\n\nYour previous draft was rejected: "
+            f"{validate_commit_message(message).reason}. "
+            "Return only the corrected commit message.\n"
+            f"\n--- diff (HEAD) ---\n{diff}\n"
+        )
+    return message
+
+
+_DEFAULT_COMMIT_PROMPT = (
+    "Draft a git commit message for the staged changes. Line 1: an imperative "
+    "header prefixed with the phase, e.g. 'P3: <summary>', at most 72 chars. "
+    "Then a blank line, then a body explaining what changed and why, the plan "
+    "assumption validated, and relevant FR references."
+)
+
+
+# --- helpers -----------------------------------------------------------------
+def _proc_log(command: str, proc: subprocess.CompletedProcess) -> str:
+    return (
+        f"$ {command}\n--- exit {proc.returncode} ---\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n"
+    )
+
+
+def _write_step_log(ctx: StepContext, name: str, text: str) -> None:
+    iteration = ctx.record.iteration
+    leaf = ctx.record.id if iteration is None else f"{ctx.record.id}.{iteration}"
+    ctx.writer.write_text(ctx.steps_dir() / leaf / name, text)
+
+
+SPECS: dict[str, StepSpec] = {
+    "agent_task": StepSpec(
+        type="agent_task",
+        handler=handle_agent_task,
+        needs_agent=True,
+        # repo_write / touches_worktree are decided per-step (default True)
+    ),
+    "shell": StepSpec(
+        type="shell",
+        handler=handle_shell,
+        touches_worktree=True,  # a test/build step can mutate the tree
+    ),
+    "human_gate": StepSpec(
+        type="human_gate",
+        handler=handle_human_gate,
+    ),
+    "commit": StepSpec(
+        type="commit",
+        handler=handle_commit,
+        touches_worktree=True,
+    ),
+}

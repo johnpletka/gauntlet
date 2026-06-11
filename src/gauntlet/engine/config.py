@@ -1,0 +1,136 @@
+"""Run configuration: agent profiles, identities, policy (`.gauntlet/config.yaml`).
+
+FR-2.1: every step's ``agent:`` references a named profile here, binding an
+adapter + model + flags. FR-2.2: swapping builder/reviewer is a YAML edit, no
+code change. The engine builds the actual adapter instance from a profile via
+the entry-point registry (FR-2.4); the banned-flag lint (PRD §8) runs as a side
+effect of constructing the CLI adapters and is invoked explicitly for ``api``.
+"""
+
+from __future__ import annotations
+
+import inspect
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+from gauntlet.adapters import get_adapter_class
+from gauntlet.config import lint_flags
+from gauntlet.engine.gitops import Identity
+
+DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
+
+
+class AgentProfile(BaseModel):
+    """One named agent profile (FR-2.1). Adapter-specific fields are passed
+    through to the adapter constructor; engine-level budget guards (FR-3.3) are
+    stripped out before construction."""
+
+    # extra fields are allowed so a plugin adapter can declare its own flags
+    # without a code change here (FR-2.4); they are filtered to the adapter's
+    # constructor signature at build time.
+    model_config = ConfigDict(extra="allow")
+
+    adapter: str
+    model: str | None = None
+
+    # --- engine-level guards (FR-3.3); not passed to the adapter ---
+    max_turns: int | None = None
+    budget_usd: float | None = None
+    step_timeout_s: float | None = None
+
+    def adapter_class(self) -> type:
+        return get_adapter_class(self.adapter)
+
+    def _adapter_kwargs(self) -> dict[str, Any]:
+        guard_fields = {"max_turns", "budget_usd", "step_timeout_s"}
+        data = self.model_dump(exclude_none=True)
+        data.pop("adapter", None)
+        for f in guard_fields:
+            data.pop(f, None)
+        return data
+
+    def build_adapter(self) -> Any:
+        """Construct the adapter, filtering kwargs to its constructor signature.
+
+        Unknown profile keys (e.g. an adapter-specific flag the engine has never
+        heard of) are dropped rather than crashing, keeping FR-2.4 plugins
+        first-class. Banned flags are still rejected: the CLI adapters lint in
+        ``__init__``; ``base_flags`` is linted here regardless of adapter.
+        """
+        cls = self.adapter_class()
+        kwargs = self._adapter_kwargs()
+        base_flags = kwargs.get("base_flags")
+        if isinstance(base_flags, list):
+            lint_flags(base_flags)
+        sig = inspect.signature(cls.__init__)
+        accepted = {
+            name
+            for name in sig.parameters
+            if name not in ("self",)
+        }
+        # If the constructor takes **kwargs we keep everything; otherwise filter.
+        takes_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if takes_var_kw:
+            return cls(**kwargs)
+        return cls(**{k: v for k, v in kwargs.items() if k in accepted})
+
+    def capabilities(self) -> Any:
+        """Declared adapter capabilities (FR-2.3 load-time validation)."""
+        return self.adapter_class().capabilities
+
+
+class RunConfig(BaseModel):
+    """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    base_branch: str = "main"
+    branch_prefix: str = "gauntlet/"
+    # Single run-root for every artifact of a run (BOOTSTRAP-NOTES #2): plan,
+    # transcripts, and manifests live under run_root/<slug>/. FR-4.1's
+    # ".gauntlet/runs" is this same setting; the bootstrap pins it to "runs".
+    run_root: str = "runs"
+    test_command: str = "uv run pytest"
+    agents: dict[str, AgentProfile] = Field(default_factory=dict)
+    identities: dict[str, Identity] = Field(default_factory=dict)
+
+    # Transaction-boundary policy on resume of a dirty interrupted step (F-003).
+    interrupted_step: str = "park"  # park | reset_to_base
+
+    # Reviewer-mutation policy is a P4 concern; the field is parsed here so a
+    # config authored ahead of P4 validates. Default per FR-9.6.
+    reviewer_mutation: str = "commit"
+
+    def profile(self, name: str) -> AgentProfile:
+        try:
+            return self.agents[name]
+        except KeyError:
+            raise KeyError(
+                f"no agent profile named {name!r}; known: {sorted(self.agents)}"
+            ) from None
+
+    def identity(self, agent_name: str) -> Identity:
+        """Commit identity for an agent (FR-9.7); falls back to a generic one."""
+        if agent_name in self.identities:
+            return self.identities[agent_name]
+        return Identity(
+            name=f"Gauntlet {agent_name}",
+            email=f"{agent_name}@gauntlet.local",
+        )
+
+    @classmethod
+    def load(cls, path: Path = DEFAULT_CONFIG_PATH) -> RunConfig:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"run config not found at {path}; `gauntlet init` scaffolds it (P6)"
+            )
+        data = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must be a YAML mapping, got {type(data).__name__}")
+        return cls.model_validate(data)

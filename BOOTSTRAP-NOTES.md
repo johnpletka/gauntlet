@@ -178,3 +178,69 @@ process, and what it suggests for Gauntlet's design.
    one — a capability can differ between first invocation and resume of the
    same CLI, so contract tests must exercise resume paths with the same flags
    they use on fresh invocations.
+
+## 2026-06-11 — P3 implementation (pipeline engine)
+
+13. **The engine's own run dir would perpetually dirty the worktree — fixed by
+    excluding the run root from every engine git operation.** The manifest /
+    transcripts live *inside* the repo under `run_root/<slug>/` (FR-4.1), so
+    every write makes `git status` non-empty. That destroys two P3 invariants
+    at once: the clean-worktree-at-handoff rule (CLAUDE.md §1) and the F-003
+    base-SHA transaction boundary (which decides "did this step leave partial
+    edits?" by diffing the worktree). Resolution, layered: (a) the live
+    run-instance dir gets a self-`.gitignore` (`*`); (b) **all** engine git
+    checks/mutations — `is_clean`, `is_dirty_vs`, the commit `git add`, the
+    reset backup snapshot — take an `exclude=[run_root]` pathspec so the run
+    bookkeeping is invisible to them. Consequence: phase commits carry the
+    *work*, never the engine's own manifest/pointer. *Design feedback:* this is
+    the concrete cost of "manifests are committable in-repo" (FR-4.1/4.5); the
+    P4 logger should decide deliberately what of a run becomes a tracked commit
+    vs. live bookkeeping, rather than letting `git add -A` sweep it in. Also
+    folds the two-slug confusion from #2 into a single `run_root` setting
+    (default `runs`; FR-4.1's `.gauntlet/runs` is this same knob).
+
+14. **`reset_to_base` needs `git clean`, not just `git reset --hard`.** When a
+    builder agent_task is killed mid-edit and policy is `reset_to_base`, the
+    partial work is often *untracked* files — and `reset --hard <base>` leaves
+    untracked files in place. So the rewind is: snapshot the dirty tree to a
+    backup ref (`refs/gauntlet/backup/<run>/…`, preserving the partial work for
+    a human), `reset --hard base`, then `git clean -fd` (no `-x`, and excluding
+    `run_root`, so neither the gitignored run dir nor the run pointer/authored
+    prd.md is wiped). The looped kill-9 crash test exercises both policies
+    (`park` records the step `interrupted` and parks; `reset_to_base` recovers
+    and completes with exactly one commit, no duplication).
+
+15. **Session-hook activation (deferred from #12) landed via engine-managed
+    judge lifecycle.** `gauntlet run` now starts the judge as a subprocess
+    (`python -m gauntlet judge serve`, robust to the console script not being on
+    PATH), injects per-run `GAUNTLET_JUDGE_{TOKEN,URL,MODE,RUN_ID}` into the
+    environment (and `GAUNTLET_STEP_ID` per step) so the PreToolUse hooks of the
+    agents the engine spawns gate against it, then tears the judge down on exit.
+    This is the designed home #12 pointed at: the bootstrap session itself is
+    still the human-backstop driver, but the *agents it orchestrates* are now
+    live-gated. The no-creds half of the P3 contract test asserts the
+    start→inject→stop lifecycle; the claude-driven half (skipped without the CLI)
+    asserts a real `agent_task → shell → commit` pipeline runs through the live
+    judge with audit entries.
+
+16. **Two live-gating facts the P3 contract test surfaced (verified on
+    claude 2.1.172 + judge fast path).** (a) The engine-managed judge only
+    gates a claude agent if that invocation loads the repo's PreToolUse hook —
+    which claude does **only** under `--setting-sources project`. So live
+    session gating (#15) requires the builder profile to carry
+    `base_flags: ["--setting-sources", "project"]`; without it the hook never
+    fires and the agent runs ungated. Added to `.gauntlet/config.yaml`'s builder
+    and pinned. (b) In-repo *writes* are deliberately not a policy fast-path
+    allow — `echo x > f` and the `Write` tool both escalate to the LLM
+    classifier rung, which fail-closes to **deny** when no `judge_llm` is
+    configured (verified: the agent's `echo gauntlet > hello.txt` was denied
+    `fail-closed`, audited). That is correct per FR-7.6 (writes aren't on the
+    deterministic allow list), but it means a live builder that edits files
+    needs a working `judge_llm`, or the human-interactive degraded mode. The P3
+    contract test therefore has the agent run a bare `echo` (a fast-path allow,
+    audited) and lets the `shell` step produce the committed change — proving
+    the agent_task→shell→commit machinery through a live judge without a
+    classifier dependency. *Design feedback:* `doctor` (P6) should probe that an
+    agent profile expected to write has either a reachable `judge_llm` or
+    interactive mode, and warn if a claude builder profile lacks project setting
+    sources — both are silent live-gating failures otherwise.

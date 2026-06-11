@@ -123,6 +123,19 @@ clis:
           binary against a live judge (exit 2, audit deny). Benign suite
           fast-path allow rate 100% (≥ 90% required). End-to-end claude block
           proven via a deny-policy sentinel.
+      - flag: "P3 engine-managed judge lifecycle + live agent_task gating"
+        verified: >-
+          `gauntlet run` starts the judge (python -m gauntlet judge serve),
+          injects per-run GAUNTLET_JUDGE_{TOKEN,URL,MODE,RUN_ID} + per-step
+          GAUNTLET_STEP_ID, and stops it on exit (no env leakage). A real
+          agent_task->shell->commit pipeline ran through the live judge: the
+          builder's `echo` tool call was gated by the PreToolUse hook and
+          audited as fast-path ALLOW with the run/step ids attributed. REQUIRES
+          the claude builder profile to pass `--setting-sources project`
+          (base_flags) — without it claude does not load the repo hook and the
+          agent runs UNGATED. In-repo writes (`Write` tool / `echo > f`) are not
+          a fast-path allow; they escalate to the judge_llm rung and fail-closed
+          to deny when no classifier is configured (BOOTSTRAP-NOTES #16).
     notes:
       - >-
         Judge binds 127.0.0.1 only and rejects callers without the per-run
