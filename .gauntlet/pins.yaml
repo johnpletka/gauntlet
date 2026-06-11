@@ -52,6 +52,11 @@ clis:
         Permission-bypass flags observed in --help (--dangerously-skip-permissions,
         --allow-dangerously-skip-permissions, --bare which skips hooks,
         --permission-mode bypassPermissions) are rejected by the config lint.
+      - >-
+        P3: no --max-turns flag on claude 2.1.172 (`claude --help` has no
+        turn/limit option), and `codex exec` has no turn cap either. The engine
+        therefore rejects `max_turns` at pipeline load (review F-006); the
+        working per-step halts are timeout_s and budget_usd (FR-3.3).
   codex:
     version: "codex-cli 0.139.0"
     verified_flags:

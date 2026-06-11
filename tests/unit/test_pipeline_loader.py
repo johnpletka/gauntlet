@@ -152,8 +152,57 @@ stages:
       - {id: tests, type: shell, run: "true", on_fail: {route_to: nowhere, max_retries: 1}}
 """
     pipeline, _ = load_pipeline(_write(tmp_path, text))
-    with pytest.raises(PipelineValidationError, match="unknown step"):
+    with pytest.raises(PipelineValidationError, match="not a step in the same stage"):
         validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_cross_stage_on_fail_route_rejected(tmp_path):
+    # route_to targets a step in a DIFFERENT stage -> rejected at load (F-005),
+    # since runtime routing is stage-local and would otherwise crash.
+    text = """
+name: d
+version: 1
+stages:
+  - id: a
+    steps:
+      - {id: build, type: shell, run: "true"}
+  - id: b
+    steps:
+      - {id: tests, type: shell, run: "true", on_fail: {route_to: build, max_retries: 1}}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="not a step in the same stage"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_max_turns_rejected_at_load(tmp_path):
+    # max_turns is unenforceable on the pinned CLIs -> rejected (F-006).
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: implement, type: agent_task, agent: builder, max_turns: 5}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="max_turns"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_max_turns_on_profile_rejected(tmp_path):
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: implement, type: agent_task, agent: builder}
+"""
+    cfg = {"agents": {"builder": {"adapter": "claude-code", "max_turns": 3}}}
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="max_turns"):
+        validate_pipeline(pipeline, RunConfig.model_validate(cfg))
 
 
 def test_unknown_step_type_rejected(tmp_path):

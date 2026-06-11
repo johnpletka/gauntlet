@@ -21,12 +21,24 @@ from pathlib import Path
 from gauntlet.judge.hook_client import (
     MODE_ENV_VAR,
     RUN_ID_ENV_VAR,
+    STEP_ID_ENV_VAR,
     URL_ENV_VAR,
 )
 from gauntlet.judge.service import TOKEN_ENV_VAR
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+# Every GAUNTLET_* var the run touches — snapshotted at start, restored at stop
+# so nothing (incl. the per-step GAUNTLET_STEP_ID set by the orchestrator) leaks
+# into the parent session (review F-009).
+_MANAGED_ENV_VARS = (
+    TOKEN_ENV_VAR,
+    URL_ENV_VAR,
+    MODE_ENV_VAR,
+    RUN_ID_ENV_VAR,
+    STEP_ID_ENV_VAR,
+)
 
 
 class ManagedJudge:
@@ -52,6 +64,7 @@ class ManagedJudge:
         self.startup_timeout_s = startup_timeout_s
         self.token = secrets.token_urlsafe(32)
         self._proc: subprocess.Popen | None = None
+        self._env_snapshot: dict[str, str | None] = {}
 
     @property
     def url(self) -> str:
@@ -87,6 +100,8 @@ class ManagedJudge:
             argv += ["--judge-model", self.judge_model]
         self._proc = subprocess.Popen(argv, env=child_env)
         self._await_healthy()
+        # Snapshot prior values of every managed var so stop() restores exactly.
+        self._env_snapshot = {v: os.environ.get(v) for v in _MANAGED_ENV_VARS}
         env = self.env()
         os.environ.update(env)  # the bootstrap session + child agents see it
         return env
@@ -112,8 +127,15 @@ class ManagedJudge:
     def stop(self) -> None:
         if self._proc is None:
             return
-        for var in (TOKEN_ENV_VAR, URL_ENV_VAR, MODE_ENV_VAR, RUN_ID_ENV_VAR):
-            os.environ.pop(var, None)
+        # Restore every managed GAUNTLET_* var to its pre-run value (incl. the
+        # per-step GAUNTLET_STEP_ID set by the orchestrator) — no env leak into
+        # the parent session on success or failure (review F-009).
+        for var, prior in (self._env_snapshot or {v: None for v in _MANAGED_ENV_VARS}).items():
+            if prior is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = prior
+        self._env_snapshot = {}
         self._proc.terminate()
         try:
             self._proc.wait(timeout=5.0)

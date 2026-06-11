@@ -64,6 +64,9 @@ class StepContext:
     writer: RedactingWriter
     judge_env: dict[str, str] = field(default_factory=dict)
     artifacts: dict[str, Path] = field(default_factory=dict)
+    # repo-relative paths of the engine's own bookkeeping (review F-001); commit
+    # and dirty checks exclude these but not real run artifacts.
+    excludes: list[str] = field(default_factory=list)
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
@@ -136,3 +139,24 @@ def get_spec(step_type: str) -> StepSpec:
 
 def usage_from_result(result: AgentResult) -> Usage | None:
     return result.usage
+
+
+def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path) -> list[str]:
+    """Repo-relative paths of the engine's own live bookkeeping (review F-001).
+
+    These — the run-instance dir (manifest/transcripts/steps/judge-audit) and the
+    active-run pointer — must be invisible to worktree-state checks and commits.
+    Everything *else* under the run root (prd.md, plan.md, declared step outputs)
+    is real work: tracked, detected by the transaction boundary, and committable.
+    Narrowing the exclusion to just this set is the F-001 fix — the prior code
+    excluded the whole run root, hiding real partial effects from the dirty-base
+    check.
+    """
+    excludes: list[str] = []
+    root = repo_root.resolve()
+    for p in (run_dir, artifact_root / "active-run.txt"):
+        try:
+            excludes.append(p.resolve().relative_to(root).as_posix())
+        except ValueError:
+            continue
+    return excludes

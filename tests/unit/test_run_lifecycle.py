@@ -59,6 +59,20 @@ def test_entry_contract_passes_for_real_prd(fixture_repo):
     mgr.check_entry_contract("demo")  # no raise
 
 
+def test_entry_contract_refuses_marker_only_removed(fixture_repo):
+    # F-007: deleting only the marker line leaves the scaffold body -> refuse.
+    from gauntlet.engine.run import PRD_STUB_MARKER
+
+    mgr = _prepare(fixture_repo)
+    mgr.new("demo")
+    prd = mgr.layout("demo").prd_path
+    stub = prd.read_text()
+    prd.write_text("\n".join(l for l in stub.splitlines() if PRD_STUB_MARKER not in l))
+    assert PRD_STUB_MARKER not in prd.read_text()
+    with pytest.raises(EntryContractError, match="only the marker removed"):
+        mgr.check_entry_contract("demo")
+
+
 LINEAR = """
 name: p
 version: 1
@@ -141,9 +155,29 @@ def test_rollback_to_phase_one_rewinds_branch_and_manifest(fixture_repo):
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: phase one"
     man = mgr.status("demo")
     assert [c.phase for c in man.commits] == ["P1"]
+    # F-002: ALL phase-2 step records (not just its commit) are rewound to
+    # pending, so a resume re-does the work git reset removed.
+    assert man.record("impl2").status == M.PENDING
+    assert man.record("c2").status == M.PENDING
+    assert man.record("impl1").status == M.DONE  # phase 1 kept
     # a backup ref preserved the pre-rollback tip
     refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
     assert p2_sha in refs or "refs/gauntlet/backup/" in refs
+
+
+def test_rollback_refuses_branch_ahead_of_manifest(fixture_repo):
+    # F-003: an extra unmanifested commit means branch != manifest tip -> refuse.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, LINEAR)
+    mgr.start("demo", path, use_judge=False,
+              adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
+    (fixture_repo / "extra.py").write_text("out of band\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=H", "-c", "user.email=h@h.local",
+        "commit", "-qm", "out-of-band commit")
+    with pytest.raises(RollbackGuardError, match="diverged"):
+        mgr.rollback("demo", phase=1)
 
 
 def test_rollback_refuses_dirty_worktree(fixture_repo):

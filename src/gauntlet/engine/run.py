@@ -15,6 +15,7 @@ from pathlib import Path
 
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
+from gauntlet.engine.execution import run_bookkeeping_excludes
 from gauntlet.engine.judgeproc import ManagedJudge
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
@@ -49,6 +50,14 @@ class RollbackGuardError(RuntimeError):
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _strip_marker(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if PRD_STUB_MARKER not in line)
+
+
+def _normalize(text: str) -> str:
+    return "\n".join(line.strip() for line in text.strip().splitlines() if line.strip())
 
 
 @dataclass
@@ -105,10 +114,19 @@ class RunManager:
                 f"{layout.prd_path} does not exist; `gauntlet new {slug}` scaffolds "
                 "a stub for a human to author (FR-10.1)"
             )
-        if PRD_STUB_MARKER in layout.prd_path.read_text():
+        content = layout.prd_path.read_text()
+        if PRD_STUB_MARKER in content:
             raise EntryContractError(
                 f"{layout.prd_path} is still the scaffolded stub; a human must "
                 "author the PRD before a run can start (FR-10.1)"
+            )
+        # Deleting only the marker line leaves the rest of the scaffold intact —
+        # still not a human-authored PRD. Compare the whole body, marker-stripped
+        # and whitespace-normalized, against the stub (review F-007).
+        if _normalize(content) == _normalize(_strip_marker(_PRD_STUB)):
+            raise EntryContractError(
+                f"{layout.prd_path} is the scaffolded stub with only the marker "
+                "removed; a human must author a real PRD before a run (FR-10.1)"
             )
 
     # ---- run (FR-8.1) -------------------------------------------------------
@@ -221,32 +239,31 @@ class RunManager:
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
 
-        # Guard 1: clean worktree (the work tree; run bookkeeping is excluded).
-        if not gitops.is_clean(self.repo_root, exclude=[self.config.run_root]):
+        # Guard 1: clean work tree — only the engine's own bookkeeping is
+        # excluded (review F-001), so an uncommitted real artifact still blocks.
+        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        if not gitops.is_clean(self.repo_root, exclude=excludes):
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
-        # Guard 2: branch agrees with the manifest (no out-of-band rewrite).
+        # Guard 2: branch tip MUST equal the manifest's last recorded commit.
+        # A branch ahead of the manifest (extra unmanifested commits) is a
+        # divergence — reset would silently discard those commits (review F-003).
         if not man.commits:
             raise RollbackGuardError("no recorded commits to roll back to")
         last_recorded = man.commits[-1].sha
         head = gitops.head_sha(self.repo_root)
-        if head != last_recorded and not gitops.is_ancestor(
-            self.repo_root, last_recorded, head
-        ):
+        if head != last_recorded:
             raise RollbackGuardError(
-                "refusing rollback: branch has diverged from the manifest's "
-                f"recorded SHAs (HEAD {head[:10]} vs recorded {last_recorded[:10]})"
+                "refusing rollback: branch has diverged from the manifest "
+                f"(HEAD {head[:10]} != last recorded {last_recorded[:10]}); the "
+                "branch and manifest must agree before a rewind (FR-9.9)"
             )
         # Resolve the target: the last commit whose phase prefix is P<phase>.
         target = self._phase_boundary_sha(man, phase)
         if target is None:
             raise RollbackGuardError(
                 f"no recorded phase-{phase} commit boundary to roll back to"
-            )
-        if not gitops.is_ancestor(self.repo_root, target, head) and target != head:
-            raise RollbackGuardError(
-                f"refusing rollback: target {target[:10]} is not an ancestor of HEAD"
             )
 
         # Backup ref + manifest snapshot before any rewind (F-010).
@@ -257,27 +274,42 @@ class RunManager:
         shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.snapshot-{ts}.json")
 
         gitops.reset_hard(self.repo_root, target)
-        # Rewind the manifest so branch and manifest never disagree about where
-        # the run stands: keep commits up to and including the target, drop the
-        # rest, and reset every step that produced a dropped commit back to
-        # pending (with its base SHA cleared) so a later resume re-does it.
+        self._rewind_manifest(man, run_dir, target)
+        man.write_atomic(run_dir / "manifest.json")
+        return target
+
+    def _rewind_manifest(self, man: Manifest, run_dir: Path, target: str) -> None:
+        """Rewind the manifest to match the reset branch (review F-002).
+
+        Drop commits after the target, and reset to `pending` EVERY step record
+        (any type, any iteration) that executes after the target phase boundary
+        in pipeline order — not just the steps that produced dropped commits.
+        Otherwise a later resume skips work `git reset --hard` removed and the
+        branch and manifest disagree (FR-9.9).
+        """
         keep: list = []
         for commit in man.commits:
             keep.append(commit)
             if commit.sha == target:
                 break
-        kept_step_ids = {c.step_id for c in keep}
-        dropped_step_ids = {c.step_id for c in man.commits} - kept_step_ids
         man.commits = keep
+        target_step = keep[-1].step_id
+
+        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+        order = [s.id for s in pipeline.all_steps()]
+        try:
+            cutoff = order.index(target_step)
+        except ValueError:  # pragma: no cover - defensive
+            cutoff = len(order) - 1
+        keep_ids = set(order[: cutoff + 1])
         for rec in man.steps:
-            if rec.id in dropped_step_ids:
+            if rec.id not in keep_ids:
                 rec.status = M.PENDING
                 rec.base_sha = None
+                rec.session_id = None
                 rec.ended = None
         man.status = M.RUN_PARKED
         man.current_step = None
-        man.write_atomic(run_dir / "manifest.json")
-        return target
 
     # ---- internals ----------------------------------------------------------
     def _phase_boundary_sha(self, man: Manifest, phase: int) -> str | None:

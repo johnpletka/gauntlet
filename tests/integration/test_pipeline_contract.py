@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
 from gauntlet.engine.run import RunManager
 from gauntlet.judge.service import TOKEN_ENV_VAR
 
@@ -83,8 +84,10 @@ def test_engine_manages_judge_lifecycle_around_a_run(tmp_path):
     mgr = RunManager(repo)
     status = mgr.start("demo", repo / "pipelines" / "mini.yaml", use_judge=True)
     assert status == M.RUN_DONE
-    # the judge env is torn down after the run (no leakage)
-    assert TOKEN_ENV_VAR not in os.environ
+    # the judge env is torn down after the run (no leakage) — every managed var,
+    # including the per-step GAUNTLET_STEP_ID set by the orchestrator (F-009)
+    for var in _MANAGED_ENV_VARS:
+        assert var not in os.environ, f"{var} leaked into the parent env"
     assert gitops.commit_subject(repo, "HEAD") == "P1: engine-managed judge run"
     assert (repo / "artifact.txt").read_text().strip() == "work"
 

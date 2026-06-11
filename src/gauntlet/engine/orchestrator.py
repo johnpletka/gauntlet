@@ -33,6 +33,7 @@ from gauntlet.engine.execution import (
     StepContext,
     StepResult,
     get_spec,
+    run_bookkeeping_excludes,
 )
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
@@ -73,6 +74,9 @@ class Orchestrator:
         self.clock = clock
         self.manifest_path = run_dir / "manifest.json"
         self.artifacts: dict[str, Path] = {}
+        # Narrow exclusion: only the engine's own bookkeeping is hidden from
+        # dirty checks / commits — real run artifacts stay visible (review F-001).
+        self.excludes = run_bookkeeping_excludes(repo_root, run_dir, artifact_root)
         self._ignore_run_dir()
         self._seed_artifacts()
 
@@ -174,6 +178,9 @@ class Orchestrator:
     def _run_step_foreach(self, step: Step) -> str:
         items = resolve_list(step.foreach, self._context())
         for idx, item in enumerate(items):
+            rec = self.manifest.record(step.id, str(idx))
+            if rec is not None and rec.status in (M.DONE, M.SKIPPED):
+                continue  # resume: don't re-run a completed iteration (F-004)
             result = self._execute(step, str(idx), item)
             if result.status != DONE:
                 return result.status
@@ -260,8 +267,10 @@ class Orchestrator:
         )
         if not is_agent_write:
             return None
-        exclude = [self.config.run_root]
-        if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=exclude):
+        # Detect partial work against the narrow bookkeeping exclusion, so a
+        # partial *artifact* under the run root (not just a repo-root file) is
+        # still seen as a mid-edit interruption (review F-001).
+        if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=self.excludes):
             return None  # clean re-entry: agent never progressed; safe to re-run
         if self.config.interrupted_step == "reset_to_base":
             ts = self.clock().replace(":", "-")
@@ -269,11 +278,13 @@ class Orchestrator:
             # Snapshot the partial work (tracked + untracked) before discarding.
             gitops.backup_dirty_worktree(
                 self.repo_root, backup, f"interrupted {rec.id} partial work",
-                exclude=exclude,
+                exclude=self.excludes,
             )
             gitops.reset_hard(self.repo_root, rec.base_sha)
-            # Spare the run root so the reset never wipes the run pointer,
-            # manifests, or the human-authored prd.md living under it.
+            # `clean` is broader than the dirty check on purpose: it spares the
+            # whole run root so the reset never wipes the run pointer, manifests,
+            # the authored prd.md, or prior declared artifacts — the re-run
+            # regenerates its own outputs over them.
             gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
             return None  # tree restored to base; re-run cleanly
         return StepResult(
@@ -352,6 +363,7 @@ class Orchestrator:
             writer=self.writer,
             judge_env=self.judge_env,
             artifacts=dict(self.artifacts),
+            excludes=self.excludes,
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
@@ -390,13 +402,16 @@ class Orchestrator:
         rec.ended = self.clock()
 
     def _find_parked_gate(self, step_id: str) -> StepRecord:
-        rec = self.manifest.record(step_id)
-        if rec is None or rec.status != M.PARKED:
-            raise ValueError(
-                f"step {step_id!r} is not parked at a gate "
-                f"(status: {rec.status if rec else 'absent'})"
-            )
-        return rec
+        # Scan across iterations so a gate parked inside a foreach (record
+        # `gate` with iteration `1`) is reachable by approve/reject (F-004).
+        for rec in self.manifest.steps:
+            if rec.id == step_id and rec.status == M.PARKED:
+                return rec
+        existing = self.manifest.record(step_id)
+        raise ValueError(
+            f"step {step_id!r} is not parked at a gate "
+            f"(status: {existing.status if existing else 'absent'})"
+        )
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)

@@ -44,14 +44,18 @@ def validate_pipeline(
 ) -> ValidationReport:
     report = ValidationReport()
     available: set[str] = set(seeds)
-    all_ids = {step.id for step in pipeline.all_steps()}
     for stage in pipeline.stages:
+        stage_ids = {step.id for step in stage.steps}
         for step in stage.steps:
             _validate_step(step, config, available, report)
-            if step.on_fail and step.on_fail.route_to not in all_ids:
+            # on_fail routing is stage-local: the runtime jumps within the
+            # current stage's step list, so a cross-stage target would validate
+            # then crash at runtime (review F-005). Reject it at load.
+            if step.on_fail and step.on_fail.route_to not in stage_ids:
                 report.errors.append(
-                    f"step {step.id!r} on_fail routes to unknown step "
-                    f"{step.on_fail.route_to!r}"
+                    f"step {step.id!r} on_fail routes to {step.on_fail.route_to!r}, "
+                    "which is not a step in the same stage (cross-stage routing "
+                    "is unsupported, FR-5.4 / review F-005)"
                 )
             output = step.get("output")
             if output:
@@ -70,6 +74,16 @@ def _validate_step(
     except KeyError as exc:
         report.errors.append(str(exc))
         return
+
+    # 1b. `max_turns` is unenforceable on the pinned CLIs (claude 2.1.172 has no
+    # --max-turns; codex exec has no turn cap) — reject it rather than silently
+    # ignore a claimed guard (review F-006). timeout_s + budget_usd are the
+    # working per-step halts (FR-3.3).
+    if step.max_turns is not None:
+        report.errors.append(
+            f"step {step.id!r} sets max_turns, but no installed adapter can honor "
+            "it; use timeout_s / budget_usd (FR-3.3 / review F-006)"
+        )
 
     # 2. dangling artifact dataflow (FR-5.3)
     for name in (step.get("inputs", []) or []):
@@ -94,6 +108,11 @@ def _validate_step(
             )
             continue
         profile = config.profile(ref)
+        if profile.max_turns is not None:
+            report.errors.append(
+                f"agent profile {ref!r} sets max_turns, unenforceable on the "
+                "pinned CLIs; use step_timeout_s / budget_usd (review F-006)"
+            )
         caps = profile.capabilities()
         if spec.step_requires_repo_write(step) and not caps.repo_write:
             report.errors.append(
