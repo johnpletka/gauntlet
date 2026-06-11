@@ -1,0 +1,81 @@
+# Doctor pin file (FR-1.5 groundwork, plan P1).
+# Records the installed CLI versions and the exact flags the P1 contract
+# suite verified against them (uv run pytest -m integration, 2026-06-10,
+# 9/9 passed). Written from what the installed CLIs actually do — where
+# observed behavior differs from the PRD/prompt, this file and a
+# BOOTSTRAP-NOTES.md entry win.
+verified_date: "2026-06-10"
+clis:
+  claude:
+    version: "2.1.172"
+    verified_flags:
+      - flag: "-p --output-format json (prompt via stdin)"
+        verified: >-
+          Single result object on stdout with result, session_id,
+          total_cost_usd, structured_output, and usage
+          {input_tokens, output_tokens, cache_read_input_tokens, ...}.
+      - flag: "--output-format stream-json"
+        verified: >-
+          JSONL events (system/init with session_id, assistant turns, final
+          result). Requires --verbose in -p mode.
+      - flag: "--resume <session-id>"
+        verified: >-
+          Continues the recorded session in -p mode; prior-turn content
+          (codeword) recalled.
+      - flag: "--model haiku"
+        verified: "Model alias resolves; used for all smoke traffic."
+      - flag: '--tools ""'
+        verified: "Empty string disables all built-in tools (tool-less smoke)."
+      - flag: "--json-schema <inline-json>"
+        verified: >-
+          Native structured output: conforming object surfaced in the result
+          event's structured_output field (PRD assumed best-effort JSON for
+          claude — positive divergence, see BOOTSTRAP-NOTES #9).
+      - flag: "--permission-mode acceptEdits + --allowedTools/--tools Write"
+        verified: >-
+          Write tool ran unprompted in a disposable fixture repo; file
+          created with expected content.
+    notes:
+      - >-
+        Cost IS reported (total_cost_usd) on this install, so the tokens-only
+        degraded path (PRD §12 Q3) is claude's fallback, not its default.
+      - >-
+        Permission-bypass flags observed in --help (--dangerously-skip-permissions,
+        --allow-dangerously-skip-permissions, --bare which skips hooks,
+        --permission-mode bypassPermissions) are rejected by the config lint.
+  codex:
+    version: "codex-cli 0.139.0"
+    verified_flags:
+      - flag: "exec --json (prompt via stdin with '-')"
+        verified: >-
+          JSONL events on stdout: thread.started{thread_id}, turn.started,
+          item.completed{item.type=agent_message, text}, turn.completed
+          {usage: input_tokens, cached_input_tokens, output_tokens,
+          reasoning_output_tokens}.
+      - flag: "exec --output-schema <file>"
+        verified: >-
+          Final agent message conformed to the schema; parsed and validated
+          first try (consistent with the plan-cycle-r1 capture).
+      - flag: "-o/--output-last-message <file>"
+        verified: "File written with the final agent message text."
+      - flag: "-s read-only / -s workspace-write"
+        verified: >-
+          read-only used for all review/smoke runs; workspace-write created a
+          file in a disposable fixture repo.
+      - flag: "exec resume <session-id>"
+        verified: >-
+          Prior-turn content (codeword) recalled. resume accepts --json,
+          --output-schema and -o, but NOT --sandbox/-s — the sandbox must be
+          pinned via -c sandbox_mode="..." on resume.
+    notes:
+      - >-
+        --full-auto does NOT exist on `codex exec` 0.139.0 (PRD §4.1/plan
+        mention it): exec is already non-interactive; the sandbox flag alone
+        governs write access. See BOOTSTRAP-NOTES #9.
+      - >-
+        Cost is never reported in the event stream — tokens-only degraded
+        path (PRD §12 Q3) is codex's normal mode.
+      - >-
+        Bypass flags observed in --help (--dangerously-bypass-approvals-and-sandbox,
+        --dangerously-bypass-hook-trust, -s danger-full-access) are rejected
+        by the config lint.

@@ -1,0 +1,45 @@
+[project]
+name = "gauntlet"
+version = "0.1.0"
+description = "Adversarial multi-agent development harness: PRD -> plan -> phased implementation, every artifact reviewed adversarially"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "litellm>=1.40",
+    "jsonschema>=4.21",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+gauntlet = "gauntlet.cli:app"
+
+# FR-2.4: adapters are plugins registered via entry points; the built-in three
+# register the same way a third-party adapter would.
+[project.entry-points."gauntlet.adapters"]
+claude-code = "gauntlet.adapters.claude_code:ClaudeCodeAdapter"
+codex = "gauntlet.adapters.codex:CodexAdapter"
+api = "gauntlet.adapters.api:ApiAdapter"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gauntlet"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires live CLI/API credentials; excluded by default",
+]
+# `uv run pytest` runs units only; `uv run pytest -m integration` overrides.
+addopts = "-m 'not integration'"

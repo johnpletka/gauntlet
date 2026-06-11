@@ -71,3 +71,21 @@ process, and what it suggests for Gauntlet's design.
    (21.5k in / 1.2k out tokens) and a session/thread id. The PRD's adapter
    assumptions (§4.1 CodexAdapter, FR-9.5 confirm mapping) look sound on
    codex-cli 0.139.0 — first real datapoint for the P1 pin file.
+
+## 2026-06-10 — P1 implementation
+
+9. **Installed-CLI flag drift cuts both ways, found on day one.** Three
+   divergences between the PRD/plan text and the installed CLIs, all caught by
+   contract tests before anything depended on them: (a) `codex exec` 0.139.0
+   has no `--full-auto` (PRD §4.1 lists it) — exec is already non-interactive
+   and `--sandbox` alone governs write access; (b) `codex exec resume` accepts
+   `--json`/`--output-schema`/`-o` but **not** `--sandbox`, so the sandbox must
+   be re-pinned via `-c sandbox_mode="…"` on resume or it silently reverts to
+   config default; (c) claude 2.1.172 gained native structured output
+   (`--json-schema`, result in a dedicated `structured_output` field) where the
+   PRD assumed best-effort JSON for claude — a positive divergence the
+   ClaudeCodeAdapter now uses as its primary path. *Design feedback:* validates
+   FR-1.5's pin-verified-behavior posture; the resume case (b) is the sneaky
+   one — a capability can differ between first invocation and resume of the
+   same CLI, so contract tests must exercise resume paths with the same flags
+   they use on fresh invocations.
