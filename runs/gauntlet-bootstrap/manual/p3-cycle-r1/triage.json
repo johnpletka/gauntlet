@@ -1,0 +1,72 @@
+{
+  "phase": "P3",
+  "round": 1,
+  "handoff_sha": "77570f9",
+  "reviewer": "codex exec -s read-only (codex-cli 0.139.0)",
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "severity": "blocking",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: artifact_root=slug_dir (under run_root) and every engine git op excludes the whole `runs` tree, so a declared agent output written under runs/<slug> is invisible to is_dirty_vs(base) — the default park policy could silently re-run over a real partial effect, violating the F-003 transaction-boundary deliverable. The exclusion must be narrowed to the live run-instance bookkeeping (run_dir + active pointer), letting prd.md/plan.md/declared outputs be tracked, detectable work.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: rollback resets only dropped commit-step records to pending; downstream non-commit step records (implement/tests of a rolled-back phase) stay `done`, so resume skips work that `git reset --hard` removed and reaches a clean-tree commit. FR-9.9 requires branch and manifest to agree.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: the divergence guard only rejects when the recorded tip is not an ancestor of HEAD, so a branch that is *ahead* of the manifest (extra unmanifested commits) passes and those commits are silently discarded by reset. The plan says rollback refuses if the branch has diverged from the manifest's recorded SHAs.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed for step-level foreach: _run_step_foreach re-executes every iteration without skipping terminal records, and a parked human_gate inside a foreach is unreachable by approve (current_step/_find_parked_gate ignore iteration). Stage-level foreach (what the standard pipeline uses) does skip done iterations and is unaffected, but FR-5.4/FR-8.2 require step-level foreach to resume safely too.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: validation accepts an on_fail.route_to anywhere in the pipeline, but the runtime index/_reset_for_retry are stage-local, so a cross-stage route validates then crashes instead of producing a checkpointed failed/parked run — a fail-open against CLAUDE.md §2. Simplest correct fix: validate route_to as stage-local.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-006",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed partial enforcement: budget_usd halt and per-invocation adapter timeout are wired/tested, but shell steps have no timeout, profile.step_timeout_s is stripped and never used as a fallback, and max_turns is never read. FR-3.3 asks for per-step max_turns/timeout/budget guards that halt at a checkpoint. Will wire shell timeout + profile-timeout fallback (HALTED on expiry) and pass max_turns to adapters that honor it / reject it at load where they don't.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-007",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "The plan scopes the entry contract to a template-marker check, but 'differs from the scaffolded stub' is better served by comparing the whole PRD body against the stub (marker-stripped) so deleting only the marker line still reads as the untouched stub and is refused. Cheap strengthening that honors FR-10.1's non-stub intent.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-008",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: _draft_commit_message sends only `git diff HEAD`, which omits untracked files that commit_all then stages — a new-file phase drafts from an empty diff; and the message-agent's usage/session is discarded, so manifest totals understate cost (§7/FR-3.2). Will include untracked-file status in the draft context and accumulate message-agent usage into the commit step record; plan-section inclusion is best-effort when provided.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-009",
+      "severity": "minor",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: the orchestrator sets GAUNTLET_STEP_ID in os.environ but ManagedJudge.stop() clears only TOKEN/URL/MODE/RUN_ID, leaking STEP_ID into the parent session after a run. Will clear all GAUNTLET_* judge vars (incl. STEP_ID) on stop and assert none remain after success and failure.",
+      "action": "fix_now"
+    }
+  ],
+  "summary": "All 9 findings are legitimate and accepted for fix_now; none are bikeshedding, premature optimization, or not_applicable. Two correctness defects are most material: F-001 (the run-root exclusion is broader than the live bookkeeping, so real partial artifact effects can be silently re-run over — undercutting the headline P3 crash/resume guarantee) and F-002/F-003 (rollback does not truly reconcile branch and manifest). The rest tighten genuinely partial P3 control surfaces: step-foreach resume, on_fail validation scope, timeout/max_turns enforcement, entry-contract non-stubness, commit-draft inputs/accounting, and judge-env teardown."
+}
