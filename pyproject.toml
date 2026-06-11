@@ -16,6 +16,10 @@ dependencies = [
 
 [project.scripts]
 gauntlet = "gauntlet.cli:app"
+# Lightweight per-tool-call hook entry point (stdlib-only logic); wired into
+# .claude/settings.json PreToolUse. Kept separate from the typer app so a
+# hook invocation does not pay for the full CLI import graph.
+gauntlet-judge-hook = "gauntlet.judge.hook_client:main"
 
 # FR-2.4: adapters are plugins registered via entry points; the built-in three
 # register the same way a third-party adapter would.

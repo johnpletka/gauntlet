@@ -35,6 +35,15 @@ clis:
         verified: >-
           Write tool ran unprompted in a disposable fixture repo; file
           created with expected content.
+      - flag: "PreToolUse hook via .claude/settings.json (--setting-sources project)"
+        verified: >-
+          P2: fires in `claude -p` for Bash tool calls. Payload carries
+          {session_id, cwd, hook_event_name, tool_name, tool_input{command},
+          tool_use_id, permission_mode}. Emitting hookSpecificOutput
+          permissionDecision=deny blocks the tool PRE-execution and surfaces
+          the reason to the agent (verified end-to-end: denied echo never
+          produced its output). permissionDecision=allow proceeds;
+          unreachable+interactive falls back to a normal prompt (no deadlock).
     notes:
       - >-
         Cost IS reported (total_cost_usd) on this install, so the tokens-only
@@ -86,3 +95,37 @@ clis:
         Bypass flags observed in --help (--dangerously-bypass-approvals-and-sandbox,
         --dangerously-bypass-hook-trust, -s danger-full-access) are rejected
         by the config lint.
+      - >-
+        P2 HOOK FINDING (deviation, ratified by John 2026-06-11): `codex exec`
+        does NOT fire PreToolUse hooks on 0.139.0 — verified against project
+        `.codex/hooks.json`, user `~/.codex/hooks.json`, `[features].hooks=true`
+        (globally stable+true), and even `--dangerously-bypass-hook-trust`. The
+        hook runtime (hooks/list, hook trust review) is app-server/TUI-only.
+        Codex's pre-execution control is therefore its SANDBOX, verified live:
+        `-s read-only` blocks all writes; `-s workspace-write` confines writes
+        to the workspace + system temp (TMPDIR/`/tmp` are writable by design),
+        and refuses writes to `$HOME`. The codex hook client is wired but inert
+        on this build; it activates automatically if a future codex fires exec
+        hooks. FR-7's "100% blocked pre-execution + audit" is met via claude;
+        codex is sandbox-sourced (coarser, no per-command judge audit). See
+        BOOTSTRAP-NOTES #10.
+  judge:
+    version: "gauntlet P2 (this repo)"
+    verified_flags:
+      - flag: "fast-path decision latency (FR-7.2 target p50 < 150 ms)"
+        verified: >-
+          Server-side policy fast-path p50 ≈ 2.4 ms (in-process timing in the
+          judge audit log), far under the 150 ms target. Measured over the
+          live red-team + benign hook runs in test_judge_live.py.
+      - flag: "FR-7 red-team acceptance (claude path)"
+        verified: >-
+          25/25 dangerous commands denied through the real gauntlet-judge-hook
+          binary against a live judge (exit 2, audit deny). Benign suite
+          fast-path allow rate 100% (≥ 90% required). End-to-end claude block
+          proven via a deny-policy sentinel.
+    notes:
+      - >-
+        Judge binds 127.0.0.1 only and rejects callers without the per-run
+        X-Gauntlet-Token (§8). LLM classifier rung + fail-closed verified by
+        unit tests; the live latency/acceptance numbers above are from the P2
+        contract run.

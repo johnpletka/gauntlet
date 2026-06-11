@@ -72,6 +72,62 @@ process, and what it suggests for Gauntlet's design.
    assumptions (§4.1 CodexAdapter, FR-9.5 confirm mapping) look sound on
    codex-cli 0.139.0 — first real datapoint for the P1 pin file.
 
+## 2026-06-11 — P2 hook discovery (the riskiest assumption, tested first)
+
+10. **`codex exec` does not fire PreToolUse hooks on 0.139.0 — the PRD's
+    codex-side hook control is non-functional headless.** Verified by direct
+    probe before writing any P2 code (plan risk #1: "hook semantics on
+    installed CLI versions"). Findings:
+    - **claude 2.1.172 — hook path fully works.** `claude -p` fires the
+      `PreToolUse` hook from `.claude/settings.json`; the payload is
+      `{session_id, cwd, hook_event_name, tool_name, tool_input{command,...},
+      tool_use_id, permission_mode, transcript_path}`. Emitting
+      `{"hookSpecificOutput":{"hookEventName":"PreToolUse",
+      "permissionDecision":"deny","permissionDecisionReason":"..."}}` blocks
+      the tool **pre-execution** and surfaces the reason to the agent
+      (verified: a denied bash `touch` never created its file; the agent
+      reported the deny reason). FR-7.3/7.4 hold on claude.
+    - **codex 0.139.0 — `exec` PreToolUse hook never fires.** Tried project
+      `.codex/hooks.json`, user `~/.codex/hooks.json`, `--enable codex_hooks`,
+      `[features].hooks=true` (already globally stable+true per
+      `codex features list`), and even `--dangerously-bypass-hook-trust`. The
+      hook command (a `tee` to a tmp file) never ran on a shell tool call.
+      The hook runtime (`hooks/list`, `hook/started`/`hook/completed`
+      notifications, trust review) lives in the **app-server/TUI** path; the
+      standalone `codex exec` we drive headlessly does not execute it.
+    - **codex sandbox backstop works and is the only headless codex control.**
+      `-s read-only` blocks ALL writes (`operation not permitted`, verified);
+      `-s workspace-write` confines writes to the workspace **and system temp**
+      (writing `/tmp/...` succeeded — `/tmp` is a default writable root, so it
+      is not an "outside" escape). The sandbox is a coarse filesystem/network
+      boundary, not the judge's semantic allow/deny, and produces no
+      judge-audit line or rationale.
+    *Why this matters:* FR-7.3 wires a codex `PreToolUse` (Bash) hook to the
+    judge, and FR-7's acceptance is "25 dangerous commands through EACH agent:
+    100% blocked pre-execution with audit entries." On this codex build that
+    is unachievable via a hook — only the sandbox blocks codex, and coarsely.
+    The PRD already leans on the sandbox as codex's backstop (§4.2, FR-7.3
+    "`--sandbox workspace-write` as the backstop for non-Bash tool gaps"), but
+    it assumed hooks "reliably cover Bash." They do not, headless. This is an
+    FR-acceptance interpretation the human must adjudicate (surfaced at the P2
+    entry, per FR-10.4 / the process contract's "stop and ask on FR
+    conflicts"), not a defect the builder silently re-architects around.
+    *Design feedback:* `doctor` must probe actual hook **firing** (not just
+    file presence) per CLI and record it in the pin file; the judge wiring
+    must be per-adapter, with codex's control declared as sandbox-primary on
+    builds where exec hooks don't fire. A future codex release that fires exec
+    hooks should be detected by the same probe, not assumed.
+    *Decision (ratified by John, 2026-06-11): sandbox-primary for codex.*
+    P2 builds the full judge+hook+audit path for claude (FR-7 met there);
+    codex's pre-execution control is its sandbox (read-only for review steps,
+    workspace-write for build steps). The codex hook client is still wired so
+    it activates automatically if a future codex build fires exec hooks, but is
+    pinned as inert on 0.139.0. FR-7's "100% blocked pre-execution with audit
+    entries" is scoped to claude; the red-team suite still runs through codex
+    to prove the sandbox blocks writes/network, recorded as sandbox-sourced
+    (not judge-audited) blocks. Recorded as a pinned deviation in the doctor
+    pin file.
+
 ## 2026-06-10 — P1 implementation
 
 9. **Installed-CLI flag drift cuts both ways, found on day one.** Three

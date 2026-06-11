@@ -9,3 +9,6 @@ dist/
 # IDE / editor
 .idea/
 .vscode/
+
+# P2 judge contract-test audit artifact
+.gauntlet/test-judge-audit.jsonl
