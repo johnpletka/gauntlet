@@ -4,7 +4,7 @@
   "reviewer": "codex exec -s read-only --json --output-schema (codex-cli 0.139.0); structured, no normalization",
   "triager": "claude (bootstrap builder, manual triage pre-P4)",
   "date": "2026-06-11",
-  "status": "AWAITING HUMAN RATIFICATION \u2014 no fixes applied yet",
+  "status": "ratified by human 2026-06-11 ('address all 8'); 8 fix_now applied in P2.1, OQ-1 rejected (no change)",
   "verdicts": [
     {
       "finding_id": "F-001",

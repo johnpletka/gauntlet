@@ -62,12 +62,29 @@ def _ask_judge(url: str, token: str, body: dict) -> dict:
         return json.loads(resp.read().decode())
 
 
-def decide_from_payload(payload: dict, env: dict | None = None) -> tuple[str, str, int]:
+def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int]:
     """Pure decision logic for one hook payload. Returns (decision, reason, exit)."""
     env = env if env is not None else os.environ
+    if not isinstance(payload, dict):
+        # Malformed shape (e.g. a JSON list): fail closed (review F-003).
+        return "deny", "hook payload was not a JSON object; failing closed", 2
+
     url = env.get(URL_ENV_VAR, DEFAULT_URL)
     token = env.get(TOKEN_ENV_VAR, "")
     mode = env.get(MODE_ENV_VAR, "unattended")
+
+    # Safe-by-default (review F-006): with no judge token configured we are not
+    # running under a gauntlet judge, so defer to the CLI's own permission
+    # handling (ask) rather than denying — a plain session in a repo whose
+    # settings wire this hook must not be bricked. A judge is only treated as
+    # "should be up" when a token is present.
+    if not token:
+        return (
+            "ask",
+            "no gauntlet judge configured (GAUNTLET_JUDGE_TOKEN unset); "
+            "deferring to normal permission handling",
+            0,
+        )
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
@@ -82,8 +99,19 @@ def decide_from_payload(payload: dict, env: dict | None = None) -> tuple[str, st
     }
     try:
         result = _ask_judge(url, token, body)
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        # Judge unreachable: distinguish from a judge deny (review F-004).
+    except urllib.error.HTTPError as exc:
+        # The judge answered with an HTTP error (401 foreign/bad token, 5xx
+        # decision fault): fail closed in BOTH modes — this is not a liveness
+        # failure, so it must not degrade to ask (review F-002).
+        return (
+            "deny",
+            f"judge returned HTTP {exc.code}; failing closed",
+            2,
+        )
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # Genuine liveness failure (connection refused / timeout): distinguish
+        # from a judge deny (review F-004). Interactive falls back to a prompt;
+        # unattended fails closed.
         if mode == "interactive":
             return (
                 "ask",
@@ -97,6 +125,12 @@ def decide_from_payload(payload: dict, env: dict | None = None) -> tuple[str, st
             f"judge unreachable and mode is unattended; failing closed ({exc})",
             2,
         )
+    except ValueError as exc:
+        # Response body was not valid JSON: malformed, fail closed.
+        return "deny", f"judge response was unparseable; failing closed ({exc})", 2
+
+    if not isinstance(result, dict):
+        return "deny", "judge response was not a JSON object; failing closed", 2
     decision = result.get("decision", "deny")
     reason = result.get("rationale") or f"judge decision: {decision}"
     if decision not in ("allow", "deny", "ask"):
@@ -106,14 +140,17 @@ def decide_from_payload(payload: dict, env: dict | None = None) -> tuple[str, st
 
 
 def main(argv: list[str] | None = None) -> int:
-    raw = sys.stdin.read()
     try:
-        payload = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        # Can't parse the hook payload: fail closed (PRD §8).
-        return _emit("deny", "hook payload was not valid JSON; failing closed")
-    decision, reason, _ = decide_from_payload(payload)
-    return _emit(decision, reason)
+        raw = sys.stdin.read()
+        try:
+            payload = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            # Can't parse the hook payload: fail closed (PRD §8).
+            return _emit("deny", "hook payload was not valid JSON; failing closed")
+        decision, reason, _ = decide_from_payload(payload)
+        return _emit(decision, reason)
+    except Exception as exc:  # any unexpected fault must fail closed (F-003)
+        return _emit("deny", f"hook client error; failing closed: {exc}")
 
 
 if __name__ == "__main__":  # pragma: no cover

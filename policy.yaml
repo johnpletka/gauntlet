@@ -68,8 +68,22 @@ deny:
     applies_to_tools: [Bash]
     command_patterns:
       - '\b(nc|ncat|netcat)\b\s'
-      - '\b(curl|wget)\b[^\n]*\s(https?://)(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org))'
+      # curl/wget to an http(s) host NOT in the allowlist. The boundary group
+      # ([/:?#\s]|$) after each allowlisted host means github.com.evil.example
+      # is not treated as github.com and is correctly denied (review F-004).
+      - '\b(curl|wget)\b[^\n]*\shttps?://(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org)([/:?#\s]|$))[^\s]'
+      # git/scp/ssh/rsync to a non-allowlisted remote (URL or user@host:path)
+      - '\bgit\b[^\n]*\s(https?|git|ssh)://(?!(github\.com|localhost|127\.0\.0\.1)([/:]|$))'
+      - '\b(scp|sftp|rsync)\b[^\n]*\s[\w.-]+@(?!localhost|127\.0\.0\.1)[\w.-]+:'
+      # download-and-run via interpreters fetching remote code
+      - '\b(python[0-9.]*|ruby|perl|node)\b[^\n]*\s-e[^\n]*https?://'
       - '/dev/tcp/'
+
+  - name: outbound-network-nonallowlisted-tool
+    description: "Non-Bash network fetch (e.g. WebFetch) to a non-allowlisted host."
+    applies_to_tools: [WebFetch]
+    command_patterns:
+      - 'https?://(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org)([/:?#\s]|$))[^\s]'
 
   - name: disable-safety
     description: "Disabling permission/sandbox/hook safety from within an agent command."

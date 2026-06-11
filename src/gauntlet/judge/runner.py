@@ -17,6 +17,13 @@ from gauntlet.judge.service import TOKEN_ENV_VAR, create_app, token_from_env
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 
+# The classifier rung must answer well within the CLI hook timeout
+# (gauntlet-judge-hook uses 8 s), so it is bounded below that (review F-007).
+# The named `judge_llm` agent profile (FR-2) is wired by the P3 config loader;
+# until then the dev command binds a bounded ad-hoc ApiAdapter here.
+JUDGE_LLM_TIMEOUT_S = 5.0
+JUDGE_LLM_MAX_TOKENS = 512
+
 
 def build_core(
     *,
@@ -29,7 +36,14 @@ def build_core(
     if judge_model:
         from gauntlet.adapters.api import ApiAdapter
 
-        classifier = LLMClassifier(ApiAdapter(model=judge_model))
+        classifier = LLMClassifier(
+            ApiAdapter(
+                model=judge_model,
+                timeout_s=JUDGE_LLM_TIMEOUT_S,
+                max_tokens=JUDGE_LLM_MAX_TOKENS,
+                temperature=0,
+            )
+        )
     return JudgeCore(engine, classifier=classifier, audit_path=audit_path)
 
 

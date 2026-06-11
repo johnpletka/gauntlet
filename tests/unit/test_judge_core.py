@@ -116,6 +116,22 @@ def test_audit_line_written_and_redacted(tmp_path):
     assert json.loads(lines[1])["decision"] == "deny"
 
 
+def test_classifier_adapter_bounded_under_hook_timeout():
+    # F-007: the LLM rung must answer within the CLI hook timeout (8 s)
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.judge.hook_client import HOOK_TIMEOUT_S
+    from gauntlet.judge.runner import JUDGE_LLM_TIMEOUT_S, build_core
+
+    assert JUDGE_LLM_TIMEOUT_S < HOOK_TIMEOUT_S
+    core = build_core(policy_path=POLICY, judge_model="test/model")
+    adapter = core.classifier._adapter
+    assert isinstance(adapter, ApiAdapter)
+    assert adapter.timeout_s == JUDGE_LLM_TIMEOUT_S
+    assert adapter.timeout_s < HOOK_TIMEOUT_S
+    assert adapter.temperature == 0
+    assert adapter.max_tokens is not None
+
+
 def test_audit_redacts_secret_in_command(tmp_path, monkeypatch):
     from gauntlet.logging.redact import RedactingWriter, Redactor
 

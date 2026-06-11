@@ -68,7 +68,7 @@ def test_unreachable_unattended_fails_closed(monkeypatch):
     patch_judge(monkeypatch, exc=urllib.error.URLError("conn refused"))
     decision, reason, code = hook_client.decide_from_payload(
         {"tool_name": "Bash", "tool_input": {"command": "git status"}},
-        env={"GAUNTLET_JUDGE_MODE": "unattended"},
+        env={"GAUNTLET_JUDGE_MODE": "unattended", "GAUNTLET_JUDGE_TOKEN": "tok"},
     )
     assert decision == "deny"
     assert code == 2
@@ -79,7 +79,7 @@ def test_unreachable_interactive_asks_with_warning(monkeypatch):
     patch_judge(monkeypatch, exc=urllib.error.URLError("conn refused"))
     decision, reason, code = hook_client.decide_from_payload(
         {"tool_name": "Bash", "tool_input": {"command": "git status"}},
-        env={"GAUNTLET_JUDGE_MODE": "interactive"},
+        env={"GAUNTLET_JUDGE_MODE": "interactive", "GAUNTLET_JUDGE_TOKEN": "tok"},
     )
     assert decision == "ask"
     assert code == 0
@@ -93,6 +93,57 @@ def test_invalid_decision_from_judge_fails_closed(monkeypatch, env):
     )
     assert decision == "deny"
     assert "failing closed" in reason
+
+
+def test_http_error_fails_closed_both_modes(monkeypatch, env):
+    # F-002: HTTPError (401 bad/foreign token, 5xx) must deny, not degrade to ask
+    import urllib.error
+
+    err = urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
+    for mode in ("unattended", "interactive"):
+        patch_judge(monkeypatch, exc=err)
+        e = dict(env, GAUNTLET_JUDGE_MODE=mode)
+        decision, reason, code = hook_client.decide_from_payload(
+            {"tool_name": "Bash", "tool_input": {"command": "git status"}}, env=e
+        )
+        assert decision == "deny", mode
+        assert code == 2
+        assert "401" in reason
+
+
+def test_list_payload_fails_closed(env):
+    # F-003: a JSON list payload must fail closed, not crash
+    decision, reason, code = hook_client.decide_from_payload(["not", "a", "dict"], env=env)
+    assert decision == "deny"
+    assert code == 2
+
+
+def test_non_dict_judge_response_fails_closed(monkeypatch, env):
+    # F-003: /decide returning a list/string must fail closed
+    patch_judge(monkeypatch, result=["unexpected"])
+    decision, reason, code = hook_client.decide_from_payload(
+        {"tool_name": "Bash", "tool_input": {"command": "x"}}, env=env
+    )
+    assert decision == "deny"
+
+
+def test_no_token_defers_to_ask(monkeypatch):
+    # F-006: with no judge token configured, defer to normal handling (ask),
+    # never deny — a plain session must not be bricked. Judge is not consulted.
+    called = {"v": False}
+
+    def fake(url, token, body):
+        called["v"] = True
+        return {"decision": "allow"}
+
+    monkeypatch.setattr(hook_client, "_ask_judge", fake)
+    decision, reason, code = hook_client.decide_from_payload(
+        {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
+        env={},  # no GAUNTLET_JUDGE_TOKEN
+    )
+    assert decision == "ask"
+    assert code == 0
+    assert called["v"] is False  # judge not even contacted
 
 
 def test_emit_deny_writes_json_and_stderr(capsys):

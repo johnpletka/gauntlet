@@ -17,6 +17,7 @@ Matchers operate on the hook payload ``{tool_name, tool_input}`` plus the run's
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -54,6 +55,13 @@ CREDENTIAL_PATH_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 # Extract candidate absolute or home-relative paths from a shell command.
 _PATH_TOKEN_RE = re.compile(r"(?<![\w/])(~|/)[^\s'\";|&]*")
+
+# Shell constructs that chain, substitute, or redirect — their presence means a
+# single allow rule matching one segment cannot vouch for the whole line
+# (review P2 F-001). Such lines are escalated to the LLM/fail-closed rung
+# instead of being allowed. Deny rules still run first (deny-first), so a
+# dangerous segment that matches a deny pattern is still blocked.
+_CHAINING_RE = re.compile(r"[;&|\n`]|\$\(|\bxargs\b|(?<![0-9])>|<\(")
 
 
 class PolicyRule(BaseModel):
@@ -103,13 +111,19 @@ class PolicyEngine:
     ) -> JudgeDecision | None:
         command = self._command_text(tool_name, tool_input)
         paths = self._candidate_paths(tool_name, tool_input, command)
+        chained = bool(_CHAINING_RE.search(command))
 
-        # Deny-first: a single matching deny rule is terminal (FR-7.2).
+        # Deny-first: a single matching deny rule is terminal (FR-7.2). Allow
+        # rules are skipped when the command chains/redirects (review F-001),
+        # so a benign prefix cannot bless a dangerous trailing segment; such
+        # lines fall through to ask/None -> LLM/fail-closed.
         for action, rules in (
             ("deny", self.policy.deny),
             ("allow", self.policy.allow),
             ("ask", self.policy.ask),
         ):
+            if action == "allow" and chained:
+                continue
             for rule in rules:
                 if self._matches(rule, tool_name, command, paths, repo_root):
                     return JudgeDecision(
@@ -178,12 +192,13 @@ class PolicyEngine:
 
     @staticmethod
     def _escapes(path: Path, repo_root: Path) -> bool:
-        resolved = PolicyEngine._resolve(path)
-        root = repo_root.expanduser()
-        try:
-            root = root.resolve()
-        except OSError:
-            root = root.absolute()
+        # Resolve relative paths against the request's repo_root (FR-7.1 run
+        # context), NOT the judge process cwd, and follow symlinks so a
+        # symlinked escape is caught (review F-005). Both sides go through
+        # realpath so a symlinked repo_root (e.g. macOS /tmp -> /private/tmp)
+        # compares consistently.
+        resolved = PolicyEngine._resolve(path, repo_root)
+        root = Path(os.path.realpath(str(repo_root.expanduser())))
         try:
             resolved.relative_to(root)
             return False
@@ -191,21 +206,14 @@ class PolicyEngine:
             return True
 
     @staticmethod
-    def _resolve(path: Path) -> Path:
+    def _resolve(path: Path, base: Path) -> Path:
         expanded = path.expanduser()
-        # Resolve without requiring existence; collapse .. lexically so a
-        # repo-relative ../../etc/passwd is correctly seen as an escape.
         if not expanded.is_absolute():
-            expanded = Path.cwd() / expanded
-        # os.path.normpath via Path: use as_posix normalization
-        parts: list[str] = []
-        for part in expanded.parts:
-            if part == "..":
-                if parts and parts[-1] not in ("/", ""):
-                    parts.pop()
-            elif part != ".":
-                parts.append(part)
-        return Path(*parts) if parts else Path("/")
+            expanded = base.expanduser() / expanded
+        # realpath follows symlinks for the existing prefix and lexically
+        # normalizes the rest (no existence requirement), so both `..` escapes
+        # and symlink escapes resolve to their real target.
+        return Path(os.path.realpath(str(expanded)))
 
     @staticmethod
     def _is_credential(path: Path) -> bool:
