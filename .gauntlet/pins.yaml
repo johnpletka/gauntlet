@@ -56,8 +56,11 @@ clis:
         verified: >-
           Final agent message conformed to the schema; parsed and validated
           first try (consistent with the plan-cycle-r1 capture).
-      - flag: "-o/--output-last-message <file>"
-        verified: "File written with the final agent message text."
+      - flag: "--output-last-message <file>"
+        verified: >-
+          Long form live-verified: file written with the final agent message
+          text (fresh exec and resume). The -o short alias is observed in
+          --help only, not exercised by the contract suite.
       - flag: "-s read-only / -s workspace-write"
         verified: >-
           read-only used for all review/smoke runs; workspace-write created a
@@ -65,11 +68,11 @@ clis:
       - flag: "exec resume <session-id>"
         verified: >-
           Live contract tests: plain resume recalled prior-turn content
-          (codeword), and resume + --output-schema + -o returned conforming
-          JSON (the combination P4's confirm pass relies on). resume accepts
-          --json/--output-schema/-o but NOT --sandbox/-s (help-surface
-          assertion test) — the sandbox must be pinned via
-          -c sandbox_mode="..." on resume.
+          (codeword), and resume + --output-schema + --output-last-message
+          returned conforming JSON (the combination P4's confirm pass relies
+          on). resume accepts --json/--output-schema/--output-last-message
+          but NOT --sandbox/-s (help-surface assertion test) — the sandbox
+          must be pinned via -c sandbox_mode="..." on resume.
     notes:
       - >-
         --full-auto does NOT exist on `codex exec` 0.139.0 (PRD §4.1/plan
