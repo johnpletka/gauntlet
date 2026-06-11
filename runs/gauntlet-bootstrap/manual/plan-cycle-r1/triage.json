@@ -1,0 +1,98 @@
+{
+  "artifact": "runs/gauntlet/plan.md",
+  "artifact_commit": "641090c",
+  "review_round": 1,
+  "reviewer": "codex (manual, human-run; prose output normalized to IDs F-001..F-010, OQ-1..OQ-3)",
+  "triager": "claude (bootstrap builder, manual triage pre-P4)",
+  "date": "2026-06-10",
+  "status": "awaiting human ratification at plan gate",
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "verdict": "legitimate",
+      "reasoning": "The plan never states the trust boundary for engine-executed subprocesses or for proposal patch application, and a model-drafted diff genuinely could address paths outside the repo or outside the versioned-asset allowlist. The remedy is scoped down, though: declare the trust model (engine subprocesses run only human-committed config: test_command, git ops), and add path-containment validation to proposal apply and artifact writes — not routing deterministic engine ops through the judge, whose job is gating agent improvisation.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-002",
+      "verdict": "legitimate",
+      "reasoning": "P1's golden-path smoke validates scriptability, which needs no tool use at all, so nothing is lost by pinning integration tests to tool-less prompts, read-only sandboxes, and disposable fixture repos for the few flags that must write. Without that constraint, a full-auto codex smoke test is briefly the least-guarded moment of the whole bootstrap. The alternative remedy (judge before P1) is rejected: PRD §9 ordering stands, constraints suffice.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-003",
+      "verdict": "legitimate",
+      "reasoning": "kill -9 mid-step leaves worktree side effects the manifest cannot see, and FR-8.2's 'restart the step cleanly' is only meaningful if the engine recorded a pre-step base SHA and can detect and park a dirty worktree on resume. This is core P3 design, not polish. Diff hashing adds little over base-SHA + porcelain status and is left to implementation discretion; the rest is adopted, including the die-after-edit-before-manifest-complete test case.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-004",
+      "verdict": "legitimate",
+      "reasoning": "Fail-closed plus an always-wired hook means a dead judge bricks the interactive session's tool use — a real deadlock, and the PRD's fail-closed posture (FR-7.2) is written for unattended runs, not for an interactive session with a human present. Adopt an explicit operational model: hook client distinguishes judge-deny from judge-unreachable; unattended runs deny on unreachable, the interactive bootstrap session falls back to normal permission prompts (permissionDecision: ask) with a loud warning; health-check endpoint and a documented human restart path.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-005",
+      "verdict": "legitimate",
+      "reasoning": "Judge audit logs (P2) and manual transcripts (P1 onward) target git, so FR-4.4's redact-before-write posture applies from the first byte written, not from P4. 'The builder will be careful' is not a control. A minimal redacting writer (known secret env-var values + common credential regexes) moves to P1 and is reused by the judge audit log and manual transcript capture; the full configurable redaction config stays in P4.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-006",
+      "verdict": "legitimate",
+      "reasoning": "Correct circularity catch: the P4 switchover requires a runnable bootstrap pipeline plus at least minimal prompt templates, and no phase deliverable produces them. Resolution: P4 gains 'minimal bootstrap pipeline + minimal prompt stubs (sufficient to drive P5-P7 implement/test/commit/review loops)' as an explicit deliverable; the full standard.yaml and polished prompt set remain P5 deliverables.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-007",
+      "verdict": "legitimate",
+      "reasoning": "FR-7.3 wires PreToolUse for all tools on Claude and leans on the codex sandbox for non-Bash gaps, but P2's acceptance only exercises Bash commands — so the phase's stated assumption (pre-execution blocking works as installed) would be validated for only part of the surface. Extend the red-team suite with Write/Edit path escapes, symlink escapes, credential-file reads, non-Bash network/file ops, and shell-quoting evasions, and verify the codex sandbox backstop explicitly.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-008",
+      "verdict": "premature_optimization",
+      "reasoning": "v1 ships zero third-party plugins; entry points exist so Gauntlet's own adapters register uniformly. Loading entry-point code carries exactly the trust of the Python environment that installed the package — by install time arbitrary code has already run — so an allowlist adds ceremony without adding a boundary. A 'doctor lists discovered non-builtin plugins' line is noted as a v1.1 candidate.",
+      "action": "defer"
+    },
+    {
+      "finding_id": "F-009",
+      "verdict": "legitimate",
+      "reasoning": "Aggregate agreement can hide the one failure the cycle cannot absorb: a blocking finding triaged into a reject category and silently dropped. Adopt severity-stratified sampling and confusion-matrix reporting, plus an escalation rule consistent with PRD §11 (blocking-severity or low-confidence verdicts escalate to a stronger model or human). The PRD's ≥85% overall gate stands; exit additionally requires zero unescalated blocking-severity misses, which is the practical form of '100% blocking recall' once the escalation valve exists.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-010",
+      "verdict": "legitimate",
+      "reasoning": "Rollback is the one engine operation that discards commits, and FR-9.9 says 'guided, with confirmation' without defining the guards. Refuse on dirty worktree, write a backup ref (refs/gauntlet/backup/<run>/<ts>) plus a manifest snapshot before rewind, and check branch divergence — three cheap additions that make the FR's promise real. Reflog technically preserves the commits anyway, which is why this is major-not-blocking, but explicit guards belong in P3.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "OQ-1",
+      "verdict": "legitimate",
+      "reasoning": "Fair clarification request. Authorship is procedurally, not technically, enforceable — and FR-10.1 itself frames it that way ('authoring is a human activity'). The enforceable contract is: prd.md exists AND differs from the scaffolded stub (template-marker check). One line added to P3's entry-contract deliverable; nothing more is honest to claim.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "OQ-2",
+      "verdict": "bikeshedding",
+      "reasoning": "FR-4.5 already ships the exclusion pattern as a supported option and FR-4.4's default-on redaction is the actual safety control; which default a team picks is a taste call the PRD has already made (committable, with an opt-out init presents). No plan change.",
+      "action": "reject"
+    },
+    {
+      "finding_id": "OQ-3",
+      "verdict": "legitimate",
+      "reasoning": "Real PRD self-contradiction: §12's resolved-question note says fix rounds are 'autosquashed by default' while FR-9.4 makes no-squash the default and §12's own struck-through item cites FR-9. The PRD is the human's artifact (FR-10.4), so the fix is proposed for human application rather than applied by the builder: replace the stale phrase with 'review-fix commits preserved as first-class history; squash-merge optional at PR time'.",
+      "action": "fix_now"
+    }
+  ],
+  "summary": {
+    "legitimate": 11,
+    "bikeshedding": 1,
+    "premature_optimization": 1,
+    "not_applicable": 0,
+    "fix_now": 11,
+    "defer": 1,
+    "reject": 1
+  }
+}
