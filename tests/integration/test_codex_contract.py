@@ -58,6 +58,53 @@ def test_resume_continuity(fixture_repo):
     assert "ZIRCON-42" in second.text
 
 
+# F-005 (P1 review round 1): pin-file claims need matching contract tests.
+def test_resume_with_output_schema(fixture_repo):
+    # P4's diff-scoped confirm pass leans on exactly this combination:
+    # exec resume + --output-schema + -o.
+    adapter = CodexAdapter(sandbox="read-only", timeout_s=TIMEOUT_S)
+    first = adapter.run(
+        "The codeword is OBSIDIAN-7. Reply with exactly: OK", cwd=fixture_repo
+    )
+    assert first.session_id
+    schema = {
+        "type": "object",
+        "properties": {"codeword": {"type": "string"}},
+        "required": ["codeword"],
+        "additionalProperties": False,
+    }
+    second = adapter.run(
+        "Report the codeword I gave you earlier via the schema.",
+        session=first.session_id,
+        schema=schema,
+        cwd=fixture_repo,
+    )
+    assert second.structured["codeword"] == "OBSIDIAN-7"
+    assert second.usage is not None
+
+
+def test_help_surface_matches_pin_file():
+    # Backs the pin-file divergence claims with assertions against the
+    # installed binary, not memory of its docs.
+    import subprocess
+
+    exec_help = subprocess.run(
+        ["codex", "exec", "--help"], capture_output=True, text=True, timeout=30
+    ).stdout
+    resume_help = subprocess.run(
+        ["codex", "exec", "resume", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    assert "--full-auto" not in exec_help  # PRD §4.1 mentions it; 0.139.0 lacks it
+    for flag in ("--json", "--output-schema", "--output-last-message"):
+        assert flag in exec_help, flag
+        assert flag in resume_help, flag
+    assert "--sandbox" in exec_help
+    assert "--sandbox" not in resume_help  # resume re-pins via -c sandbox_mode
+
+
 def test_workspace_write_in_disposable_fixture_repo(fixture_repo):
     # The write-mode sandbox flag is itself under test (plan F-002 carve-out).
     adapter = CodexAdapter(sandbox="workspace-write", timeout_s=TIMEOUT_S)

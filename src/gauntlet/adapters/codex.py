@@ -18,6 +18,7 @@ from typing import Any
 from gauntlet.adapters._structured import validate_schema
 from gauntlet.adapters.base import (
     AdapterCapabilities,
+    AgentFailedError,
     AgentResult,
     AgentTimeoutError,
     MalformedOutputError,
@@ -122,7 +123,14 @@ class CodexAdapter:
     def _parse(
         self, out: ProcessOutput, *, schema: dict | None, last_message: str | None
     ) -> AgentResult:
-        events = self._decode_events(out.stdout)
+        events = self._decode_events(out.stdout, strict=True, out=out)
+        # Fail closed on reported failure, even when output parses (F-001).
+        failure = self._failure_marker(out, events)
+        if failure:
+            raise AgentFailedError(
+                f"codex reported failure: {failure}; stderr: {out.stderr[:500]}",
+                partial=self._partial_result(out),
+            )
         text = last_message if last_message is not None else self._last_agent_message(events)
         if text is None:
             raise MalformedOutputError(
@@ -154,8 +162,9 @@ class CodexAdapter:
             exit_code=out.exit_code,
         )
 
-    @staticmethod
-    def _decode_events(stdout: str) -> list[dict[str, Any]]:
+    def _decode_events(
+        self, stdout: str, *, strict: bool, out: ProcessOutput | None = None
+    ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for line in stdout.splitlines():
             line = line.strip()
@@ -163,9 +172,31 @@ class CodexAdapter:
                 continue
             try:
                 events.append(json.loads(line))
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                # Fail closed (F-002): with --json, codex logs go to stderr,
+                # so a non-JSON stdout line means the event contract broke.
+                # Lenient mode is only for building checkpointable partials.
+                if strict:
+                    raise MalformedOutputError(
+                        f"non-JSON line in codex --json output: {line[:200]!r}",
+                        partial=self._partial_result(out)
+                        if out is not None
+                        else None,
+                    ) from exc
                 events.append({"type": "gauntlet.unparsed_line", "line": line})
         return events
+
+    @staticmethod
+    def _failure_marker(
+        out: ProcessOutput, events: list[dict[str, Any]]
+    ) -> str | None:
+        if out.exit_code != 0:
+            return f"exit code {out.exit_code}"
+        for event in events:
+            if event.get("type") in ("turn.failed", "error"):
+                detail = event.get("error") or event.get("message") or event
+                return f"{event['type']} event: {str(detail)[:300]}"
+        return None
 
     @staticmethod
     def _thread_id(events: list[dict[str, Any]]) -> str | None:
@@ -202,7 +233,7 @@ class CodexAdapter:
         )
 
     def _partial_result(self, out: ProcessOutput) -> AgentResult:
-        events = self._decode_events(out.stdout)
+        events = self._decode_events(out.stdout, strict=False)
         return AgentResult(
             text=self._last_agent_message(events) or "",
             session_id=self._thread_id(events),

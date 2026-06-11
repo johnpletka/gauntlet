@@ -21,6 +21,11 @@ from gauntlet.config import BannedFlagError, lint_flags
         ["codex", "exec", "--sandbox", "danger-full-access"],
         ["codex", "exec", "-s", "danger-full-access"],
         ["codex", "exec", "-s=danger-full-access"],
+        # F-003: the -c/--config override channel must not bypass the sandbox
+        ["codex", "exec", "-c", 'sandbox_mode="danger-full-access"'],
+        ["codex", "exec", "-c", "sandbox_mode=danger-full-access"],
+        ["codex", "exec", "-c=sandbox_mode=danger-full-access"],
+        ["codex", "exec", "--config", 'sandbox_mode="danger-full-access"'],
     ],
 )
 def test_banned_argv_rejected(argv):
@@ -42,6 +47,10 @@ def test_benign_argv_passes():
         ]
     )
     lint_flags(["codex", "exec", "--json", "--sandbox", "read-only", "-"])
+    # benign config overrides pass, including the adapter's own resume spelling
+    lint_flags(["codex", "exec", "-c", 'sandbox_mode="read-only"'])
+    lint_flags(["codex", "exec", "-c", 'model="o3"'])
+    lint_flags(["codex", "exec", "-c"])  # dangling -c is the CLI's problem
 
 
 def test_claude_adapter_rejects_banned_base_flags():

@@ -103,6 +103,35 @@ def test_writer_append_jsonl_redacts_values(tmp_path):
     assert json.loads(lines[1]) == {"cmd": "clean"}
 
 
+# F-004 (P1 review round 1): writers serialize before redacting, and
+# json.dumps escapes quotes/backslashes/newlines — the escaped form must
+# also be masked.
+def test_json_escaped_secret_variants_masked(tmp_path):
+    secrets = {
+        "QUOTE_TOKEN": 'abc"def"ghi12345',
+        "BACKSLASH_TOKEN": "abc\\def\\ghi12345",
+        "NEWLINE_TOKEN": "abc\ndef\nghi12345",
+    }
+    for name, value in secrets.items():
+        writer = RedactingWriter(Redactor(env={name: value}))
+        target = tmp_path / f"{name}.jsonl"
+        writer.append_jsonl(target, {"payload": value})
+        line = target.read_text()
+        assert "def" not in line, name  # no fragment of the secret survives
+        assert json.loads(line)["payload"] == f"[REDACTED:env:{name}]"
+
+
+def test_escaped_variant_hits_aggregate_per_env_name():
+    secret = 'top"secret"value99'
+    r = Redactor(env={"MY_KEY": secret})
+    # raw and JSON-escaped forms in the same text -> one aggregated hit entry
+    text, hits = r.redact(f"raw={secret} escaped={json.dumps(secret)}")
+    assert secret not in text
+    assert '\\"' not in text
+    assert len([h for h in hits if h.pattern == "env:MY_KEY"]) == 1
+    assert hits[0].count == 2
+
+
 def test_writer_no_hits_for_clean_text(tmp_path):
     writer = RedactingWriter(redactor())
     hits = writer.write_text(tmp_path / "clean.md", "nothing secret here")

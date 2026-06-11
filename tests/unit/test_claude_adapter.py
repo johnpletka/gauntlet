@@ -4,7 +4,11 @@ import json
 
 import pytest
 
-from gauntlet.adapters.base import AgentTimeoutError, MalformedOutputError
+from gauntlet.adapters.base import (
+    AgentFailedError,
+    AgentTimeoutError,
+    MalformedOutputError,
+)
 from gauntlet.adapters.claude_code import ClaudeCodeAdapter
 from gauntlet.adapters.process import ProcessOutput
 
@@ -123,6 +127,44 @@ def test_malformed_output_raises_with_partial(monkeypatch):
     assert partial is not None
     assert partial.exit_code == 1
     assert any("boom" in str(e) for e in partial.raw_events)
+
+
+# F-001 (P1 review round 1): parseable output must not mask a failed call.
+def test_is_error_result_raises(monkeypatch):
+    event = dict(RESULT_EVENT)
+    event["is_error"] = True
+    event["subtype"] = "error_during_execution"
+    patch_run(monkeypatch, fake_output(json.dumps(event)))
+    with pytest.raises(AgentFailedError, match="is_error") as excinfo:
+        ClaudeCodeAdapter().run("ping")
+    partial = excinfo.value.partial
+    assert partial.session_id == RESULT_EVENT["session_id"]
+    assert partial.text == "GAUNTLET_PONG"  # evidence preserved
+
+
+def test_error_subtype_raises(monkeypatch):
+    event = dict(RESULT_EVENT)
+    event["subtype"] = "error_max_turns"
+    patch_run(monkeypatch, fake_output(json.dumps(event)))
+    with pytest.raises(AgentFailedError, match="error_max_turns"):
+        ClaudeCodeAdapter().run("ping")
+
+
+def test_nonzero_exit_with_parseable_output_raises(monkeypatch):
+    patch_run(monkeypatch, fake_output(json.dumps(RESULT_EVENT), exit_code=1))
+    with pytest.raises(AgentFailedError, match="exit code 1") as excinfo:
+        ClaudeCodeAdapter().run("ping")
+    assert excinfo.value.partial.usage.input_tokens == 14
+
+
+# F-002: stream-json is a JSONL contract; a non-JSON stdout line fails closed.
+def test_stream_json_garbage_line_fails_closed(monkeypatch):
+    stdout = "\n".join(
+        [json.dumps({"type": "system", "session_id": "abc"}), "garbage here"]
+    )
+    patch_run(monkeypatch, fake_output(stdout))
+    with pytest.raises(MalformedOutputError, match="non-JSON line"):
+        ClaudeCodeAdapter(output_format="stream-json").run("ping")
 
 
 def test_missing_result_event_raises(monkeypatch):

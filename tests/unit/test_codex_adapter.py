@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from gauntlet.adapters.base import AgentTimeoutError, MalformedOutputError
+from gauntlet.adapters.base import (
+    AgentFailedError,
+    AgentTimeoutError,
+    MalformedOutputError,
+)
 from gauntlet.adapters.codex import CodexAdapter
 from gauntlet.adapters.process import ProcessOutput
 
@@ -121,14 +125,28 @@ def test_schema_violation_raises_with_partial(monkeypatch):
 
 
 def test_no_agent_message_raises(monkeypatch):
+    # exit 0 so the F-001 failure check doesn't fire first; a clean exit
+    # with no agent message is a malformed-output case
+    events = [{"type": "thread.started", "thread_id": THREAD_ID}]
+    patch_run(monkeypatch, fake_output(events, exit_code=0))
+    with pytest.raises(MalformedOutputError) as excinfo:
+        CodexAdapter().run("hi")
+    assert excinfo.value.partial.exit_code == 0
+
+
+def test_no_agent_message_with_nonzero_exit_raises_agent_failed(monkeypatch):
+    # F-001 ratified: nonzero exit takes precedence over the missing message
     events = [{"type": "thread.started", "thread_id": THREAD_ID}]
     patch_run(monkeypatch, fake_output(events, exit_code=1, stderr="auth error"))
-    with pytest.raises(MalformedOutputError) as excinfo:
+    with pytest.raises(AgentFailedError, match="exit code 1") as excinfo:
         CodexAdapter().run("hi")
     assert excinfo.value.partial.exit_code == 1
 
 
-def test_unparsed_lines_are_tolerated(monkeypatch):
+# Behavior ratified in P1 review round 1 (F-002): non-JSON stdout lines were
+# previously tolerated; with --json the event contract puts logs on stderr,
+# so they now fail closed.
+def test_unparsed_lines_fail_closed(monkeypatch):
     out = fake_output(make_events("ok"))
     noisy = ProcessOutput(
         argv=out.argv,
@@ -139,9 +157,37 @@ def test_unparsed_lines_are_tolerated(monkeypatch):
         timed_out=False,
     )
     patch_run(monkeypatch, noisy)
-    result = CodexAdapter().run("hi")
-    assert result.text == "ok"
-    assert result.raw_events[0]["type"] == "gauntlet.unparsed_line"
+    with pytest.raises(MalformedOutputError) as excinfo:
+        CodexAdapter().run("hi")
+    # the checkpointable partial preserves the offending line and the events
+    partial = excinfo.value.partial
+    assert partial is not None
+    assert any(
+        e.get("type") == "gauntlet.unparsed_line" and "WARN" in e.get("line", "")
+        for e in partial.raw_events
+    )
+    assert partial.session_id == THREAD_ID
+
+
+def test_turn_failed_event_raises(monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": THREAD_ID},
+        {"type": "turn.failed", "error": {"message": "rate limited"}},
+    ]
+    patch_run(monkeypatch, fake_output(events, exit_code=0))
+    with pytest.raises(AgentFailedError, match="turn.failed") as excinfo:
+        CodexAdapter().run("hi")
+    assert excinfo.value.partial.session_id == THREAD_ID
+
+
+def test_nonzero_exit_with_parseable_output_raises(monkeypatch):
+    # F-001: a parseable stream must not mask a failed invocation
+    patch_run(monkeypatch, fake_output(make_events("looks fine"), exit_code=2))
+    with pytest.raises(AgentFailedError, match="exit code 2") as excinfo:
+        CodexAdapter().run("hi")
+    partial = excinfo.value.partial
+    assert partial.text == "looks fine"  # evidence preserved for checkpointing
+    assert partial.usage.input_tokens == 21497
 
 
 def test_resume_argv(monkeypatch):

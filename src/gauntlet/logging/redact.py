@@ -52,6 +52,15 @@ CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def _secret_variants(value: str) -> set[str]:
+    """A secret's raw form plus its JSON-escaped serializations."""
+    return {
+        value,
+        json.dumps(value)[1:-1],  # ensure_ascii=True spelling
+        json.dumps(value, ensure_ascii=False)[1:-1],
+    }
+
+
 @dataclass(frozen=True)
 class RedactionHit:
     """One redaction occurrence: which pattern fired, how many times."""
@@ -74,13 +83,17 @@ class Redactor:
             import os
 
             env = os.environ
-        # Longest values first so overlapping secrets mask fully.
+        # Each secret is matched in its raw form AND its JSON-escaped forms:
+        # writers serialize before redacting, and json.dumps escapes quotes,
+        # backslashes and newlines, so the raw value alone would miss them
+        # (review P1 F-004). Longest variants first so overlaps mask fully.
         self._env_secrets: list[tuple[str, str]] = sorted(
             (
-                (name, value)
+                (name, variant)
                 for name, value in env.items()
                 if SECRET_ENV_NAME_RE.search(name)
                 and len(value) >= min_value_length
+                for variant in _secret_variants(value)
             ),
             key=lambda item: len(item[1]),
             reverse=True,
@@ -90,11 +103,16 @@ class Redactor:
     def redact(self, text: str) -> tuple[str, list[RedactionHit]]:
         """Return ``(redacted_text, hits)``; hits name the patterns that fired."""
         hits: list[RedactionHit] = []
-        for name, value in self._env_secrets:
-            count = text.count(value)
+        env_counts: dict[str, int] = {}
+        for name, variant in self._env_secrets:
+            count = text.count(variant)
             if count:
-                text = text.replace(value, f"[REDACTED:env:{name}]")
-                hits.append(RedactionHit(pattern=f"env:{name}", count=count))
+                text = text.replace(variant, f"[REDACTED:env:{name}]")
+                env_counts[name] = env_counts.get(name, 0) + count
+        hits.extend(
+            RedactionHit(pattern=f"env:{name}", count=count)
+            for name, count in env_counts.items()
+        )
         for pattern_name, pattern in self._patterns:
             text, count = pattern.subn(f"[REDACTED:{pattern_name}]", text)
             if count:

@@ -79,6 +79,12 @@ class AgentTimeoutError(AdapterError):
     """The CLI invocation exceeded its hard timeout and was killed (FR-3.3)."""
 
 
+class AgentFailedError(AdapterError):
+    """The CLI ran and produced parseable output, but reported failure
+    (nonzero exit, is_error, turn.failed). Fail closed: a failed call never
+    surfaces as a normal AgentResult (review P1 F-001)."""
+
+
 class MalformedOutputError(AdapterError):
     """Adapter output could not be parsed (or failed schema validation)."""
 

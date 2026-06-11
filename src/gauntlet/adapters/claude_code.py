@@ -17,6 +17,7 @@ from gauntlet.adapters._structured import extract_json, validate_schema
 from gauntlet.adapters.base import (
     AdapterCapabilities,
     AdapterError,
+    AgentFailedError,
     AgentResult,
     AgentTimeoutError,
     MalformedOutputError,
@@ -119,31 +120,50 @@ class ClaudeCodeAdapter:
     # -- output parsing --------------------------------------------------------
 
     def _parse(self, out: ProcessOutput, *, schema: dict | None) -> AgentResult:
-        events = self._decode_events(out)
+        events = self._decode_events(out, strict=True)
         result_event = next(
             (e for e in reversed(events) if e.get("type") == "result"), None
         )
+        partial = AgentResult(
+            text=(result_event or {}).get("result") or "",
+            session_id=(result_event or {}).get("session_id")
+            or next((e["session_id"] for e in events if e.get("session_id")), None),
+            usage=self._extract_usage(result_event or {}),
+            raw_events=events,
+            exit_code=out.exit_code,
+        )
+        # Fail closed on reported failure, even when output parses (F-001).
+        failure = self._failure_marker(out, result_event)
+        if failure:
+            raise AgentFailedError(
+                f"claude reported failure: {failure}; stderr: {out.stderr[:500]}",
+                partial=partial,
+            )
         if result_event is None:
             raise MalformedOutputError(
                 f"no result event in claude output (exit {out.exit_code}); "
                 f"stderr: {out.stderr[:500]}",
-                partial=self._partial_result(out, events=events),
+                partial=partial,
             )
         text = result_event.get("result") or ""
         structured = self._extract_structured(result_event, text, schema)
-        return AgentResult(
-            text=text,
-            structured=structured,
-            session_id=result_event.get("session_id")
-            or next(
-                (e["session_id"] for e in events if e.get("session_id")), None
-            ),
-            usage=self._extract_usage(result_event),
-            raw_events=events,
-            exit_code=out.exit_code,
-        )
+        return partial.model_copy(update={"text": text, "structured": structured})
 
-    def _decode_events(self, out: ProcessOutput) -> list[dict[str, Any]]:
+    @staticmethod
+    def _failure_marker(out: ProcessOutput, result_event: dict | None) -> str | None:
+        if out.exit_code != 0:
+            return f"exit code {out.exit_code}"
+        if result_event is not None:
+            if result_event.get("is_error"):
+                return f"is_error=true (subtype: {result_event.get('subtype')!r})"
+            subtype = result_event.get("subtype") or ""
+            if subtype.startswith("error"):
+                return f"subtype {subtype!r}"
+        return None
+
+    def _decode_events(
+        self, out: ProcessOutput, *, strict: bool
+    ) -> list[dict[str, Any]]:
         if self.output_format == "json":
             try:
                 obj = json.loads(out.stdout)
@@ -161,7 +181,15 @@ class ClaudeCodeAdapter:
                 continue
             try:
                 events.append(json.loads(line))
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                # Fail closed (F-002): with stream-json, logs go to stderr, so
+                # a non-JSON stdout line means the output contract broke.
+                # Lenient mode is only for building checkpointable partials.
+                if strict:
+                    raise MalformedOutputError(
+                        f"non-JSON line in claude stream-json output: {line[:200]!r}",
+                        partial=self._raw_partial(out),
+                    ) from exc
                 events.append({"type": "gauntlet.unparsed_line", "line": line})
         return events
 
@@ -208,7 +236,7 @@ class ClaudeCodeAdapter:
     ) -> AgentResult:
         if events is None:
             try:
-                events = self._decode_events(out)
+                events = self._decode_events(out, strict=False)
             except AdapterError:
                 events = [{"type": "gauntlet.raw_stdout", "stdout": out.stdout}]
         return AgentResult(

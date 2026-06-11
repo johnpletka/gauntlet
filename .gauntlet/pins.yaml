@@ -64,14 +64,18 @@ clis:
           file in a disposable fixture repo.
       - flag: "exec resume <session-id>"
         verified: >-
-          Prior-turn content (codeword) recalled. resume accepts --json,
-          --output-schema and -o, but NOT --sandbox/-s — the sandbox must be
-          pinned via -c sandbox_mode="..." on resume.
+          Live contract tests: plain resume recalled prior-turn content
+          (codeword), and resume + --output-schema + -o returned conforming
+          JSON (the combination P4's confirm pass relies on). resume accepts
+          --json/--output-schema/-o but NOT --sandbox/-s (help-surface
+          assertion test) — the sandbox must be pinned via
+          -c sandbox_mode="..." on resume.
     notes:
       - >-
         --full-auto does NOT exist on `codex exec` 0.139.0 (PRD §4.1/plan
         mention it): exec is already non-interactive; the sandbox flag alone
-        governs write access. See BOOTSTRAP-NOTES #9.
+        governs write access. Verified by a help-surface assertion test, not
+        a live run. See BOOTSTRAP-NOTES #9.
       - >-
         Cost is never reported in the event stream — tokens-only degraded
         path (PRD §12 Q3) is codex's normal mode.

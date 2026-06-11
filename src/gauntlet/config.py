@@ -39,6 +39,13 @@ BANNED_FLAG_VALUES: dict[str, frozenset[str]] = {
     "-s": frozenset({"danger-full-access"}),
 }
 
+# codex config overrides (`-c key=value`) that bypass the sandbox the same
+# way the banned flag values do (review P1 F-003: the adapter itself uses
+# `-c sandbox_mode=...` on resume, so this channel is a live control path).
+BANNED_CONFIG_VALUES: dict[str, frozenset[str]] = {
+    "sandbox_mode": frozenset({"danger-full-access"}),
+}
+
 
 def lint_flags(argv: Sequence[str]) -> None:
     """Reject permission-bypass / hook-disabling flags anywhere in ``argv``.
@@ -62,3 +69,20 @@ def lint_flags(argv: Sequence[str]) -> None:
                     f"banned value {effective!r} for {flag!r}: amounts to a "
                     "permission/sandbox bypass (PRD §8)"
                 )
+        if flag in ("-c", "--config"):
+            assignment = value if eq else (tokens[i + 1] if i + 1 < len(tokens) else "")
+            _check_config_assignment(assignment)
+
+
+def _check_config_assignment(assignment: str) -> None:
+    """Reject codex `-c key=value` overrides that bypass the sandbox."""
+    key, eq, value = assignment.partition("=")
+    if not eq:
+        return
+    key = key.strip()
+    value = value.strip().strip("\"'")  # TOML values arrive quoted or bare
+    if key in BANNED_CONFIG_VALUES and value in BANNED_CONFIG_VALUES[key]:
+        raise BannedFlagError(
+            f"banned config override {key}={value!r}: amounts to a sandbox "
+            "bypass (PRD §8)"
+        )
