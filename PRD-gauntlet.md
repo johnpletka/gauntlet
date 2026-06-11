@@ -446,7 +446,7 @@ Each phase ends with passing tests and a commit. Phases are ordered to kill the 
 
 ## 12. Open Questions
 
-~~1. Phase commits: dedicated branch vs. current branch~~ — **Resolved:** one PR per PRD on a dedicated `gauntlet/<slug>` branch; single clean commit per phase with header+body format; review fixes autosquashed by default. See FR-9.
+~~1. Phase commits: dedicated branch vs. current branch~~ — **Resolved:** one PR per PRD on a dedicated `gauntlet/<slug>` branch; single clean commit per phase with header+body format; review-fix commits preserved as first-class history (squash-merge optional at PR time). See FR-9.
 
 1. Consensus review (two reviewer models, union or intersection of findings) — v1.1 candidate; the pipeline schema already permits it.
 2. Per-org shared prompt/policy repo (`gauntlet init --from git@...`) for multi-repo teams — needed before broad rollout?
