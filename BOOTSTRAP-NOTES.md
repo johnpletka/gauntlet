@@ -145,6 +145,22 @@ process, and what it suggests for Gauntlet's design.
     command_execution event is emitted, and `doctor`/the pin file should note
     per-build whether codex surfaces denied commands as events.
 
+12. **P2 gate deviation (ratified by John, 2026-06-11): session-hook activation
+    deferred to P3.** The P2 exit criterion asks for THIS bootstrap session's
+    own PreToolUse hook to stay wired to the judge "protecting its own
+    construction." The committable wiring (`.claude/settings.json` ->
+    gauntlet-judge-hook, safe-by-default) IS shipped and FR-7 acceptance is met
+    by the live red-team tests. But live-gating THIS session would require a
+    session relaunch with GAUNTLET_JUDGE_* env (a running session's env is fixed
+    at launch) and would route every build command through the judge with the
+    human clearing ask-prompts. Decision: do NOT wire the running session now;
+    the P3 engine owns the judge lifecycle and sets per-run env, which is the
+    designed home for live session gating. The human is the interactive
+    backstop in the meantime (consistent with the F-004 operational model).
+    *Design feedback:* the bootstrap prompt's "wire this session from P2 onward"
+    instruction collides with "no engine until P3"; the self-gating dogfood is
+    cleaner once the engine can start the judge and inject env per run.
+
 ## 2026-06-10 — P1 implementation
 
 9. **Installed-CLI flag drift cuts both ways, found on day one.** Three
