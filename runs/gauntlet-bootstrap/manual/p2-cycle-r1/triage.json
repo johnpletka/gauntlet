@@ -1,0 +1,73 @@
+{
+  "artifact": "commit e6b8910 (P2: judge service, policy fast path, hook wiring, red-team suite)",
+  "review_round": 1,
+  "reviewer": "codex exec -s read-only --json --output-schema (codex-cli 0.139.0); structured, no normalization",
+  "triager": "claude (bootstrap builder, manual triage pre-P4)",
+  "date": "2026-06-11",
+  "status": "AWAITING HUMAN RATIFICATION \u2014 no fixes applied yet",
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "Real fail-open and the most serious finding. Allow rules use .search() with prefix anchoring, so `cat README.md; rm -rf src` or `echo ok; python -c '<exfil>'` matches an allow rule and terminates as allow \u2014 the dangerous trailing segment is never deny-checked or escalated, because allow is terminal. Deny-first only helps when a deny rule matches the whole line. Fix: allow rules must not terminate when the command contains shell chaining/metacharacters (; && || | ` $() newline); such lines escalate to the LLM/fail-closed rung instead of being allowed. Add red-team chaining cases."
+    },
+    {
+      "finding_id": "F-002",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "urllib HTTPError subclasses URLError, so a 401 (bad/foreign token) or 5xx is currently funneled to the interactive ask path \u2014 a misconfigured token would silently fall back to a normal prompt with no audit. The degraded-mode contract (review F-004) reserves ask for genuine liveness failures only. Fix: catch HTTPError separately; 401/403/5xx and malformed responses fail closed (deny, exit 2) in BOTH modes; only connection-refused/timeout is unreachable->ask."
+    },
+    {
+      "finding_id": "F-003",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "Fail-closed gap: main() only guards JSONDecodeError, so a JSON list payload (payload.get) or a /decide response that is a list/string (result.get) raises and exits 1, not the contract's fail-closed exit-2 deny. CLAUDE.md \u00a72 requires parse/shape errors to fail closed. Fix: validate payload and response are dicts; wrap decide_from_payload in a final guard in main() that emits deny/exit 2 on any error."
+    },
+    {
+      "finding_id": "F-004",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "The outbound-network allowlist regex anchors on a raw URL prefix, so `https://github.com.evil.example/...` starts with `github.com`, satisfies the negative lookahead, and escapes the deterministic deny (it then falls to LLM/fail-closed \u2014 not allowed outright, but the deterministic deny is bypassable, which is the claim). Fix: require a host boundary (github\\.com followed by / : or end) in the allowlist, and add git/scp/ssh URL network forms. Non-Bash network tools (WebFetch) get a deny/ask rule too. Tests for prefix-host and userinfo bypasses."
+    },
+    {
+      "finding_id": "F-005",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "Structural path checks resolve relative paths against Path.cwd() (the judge process cwd), not the repo_root supplied in run context (FR-7.1), and lexical normalization does not follow symlinks (the plan required symlink-escape coverage, review F-007). A relative file_path is judged against the wrong base. Fix: resolve relative paths against the request's repo_root; use realpath/resolve(strict=False) and add symlink-escape tests. (Deriving the git root from the hook is engine scope, P3; resolving against the provided repo_root is the P2 correctness fix.)"
+    },
+    {
+      "finding_id": "F-006",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "The P2 deliverable and exit criterion require Claude PreToolUse wiring in .claude/settings.json; the commit ships only settings.local.json and the live test uses a temp fixture. Fix: commit the repo .claude/settings.json wiring gauntlet-judge-hook + a static test asserting it points at the hook. To avoid bricking a plain session, the hook is made safe-by-default: when NO judge token is configured (not running under gauntlet) it ASKS rather than denies; it only hard-denies-on-unreachable when a token is present (active gauntlet run) in unattended mode. Live activation of THIS session (background judge + interactive mode) remains the human-confirmed gate step."
+    },
+    {
+      "finding_id": "F-007",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "The classifier ApiAdapter keeps the 120s default timeout while the hook times out at 8s, so the LLM rung is not bounded under the hook timeout (FR-7.2). Fix: build the classifier adapter with a timeout below the hook timeout (~5s), low max_tokens, temperature 0. The named judge_llm *profile* is FR-2 config that lands with P3's config.yaml loader; P2 binds a bounded ad-hoc adapter and this is recorded as a P3 follow-up, not silently dropped."
+    },
+    {
+      "finding_id": "F-008",
+      "verdict": "legitimate",
+      "action": "fix_now",
+      "reasoning": "Same weakness P1's review taught on the claude side: the codex sandbox test asserts only the file is absent, which also holds if the model never attempted the write. Since the sandbox is codex's primary control (ratified), the proof must pin an actual sandbox denial. Fix: assert from raw_events/text that codex issued the write command AND hit an operation-not-permitted error, while keeping the file-absent check and the outside-workspace/outside-temp target."
+    },
+    {
+      "finding_id": "OQ-1",
+      "verdict": "legitimate",
+      "action": "reject",
+      "reasoning": "Answered, no code change beyond F-007: default fail-closed WITHOUT a configured LLM is the correct P2 posture. The dev `gauntlet judge serve --judge-model` opt-in exists for live runs; the engine wires the judge_llm profile and a running classifier in P3 when config loading exists. Shipping a default-on classifier now would presume a model/credential the P2 scope doesn't own. Marked reject (no change) rather than fix_now."
+    }
+  ],
+  "summary": {
+    "legitimate": 9,
+    "bikeshedding": 0,
+    "premature_optimization": 0,
+    "not_applicable": 0,
+    "fix_now": 8,
+    "defer": 0,
+    "reject": 1
+  }
+}
