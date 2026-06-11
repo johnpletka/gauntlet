@@ -1,0 +1,49 @@
+{
+  "artifact": "commit 725f8ac (P1: Add agent adapters, timeout wrapper, redacting writer, pin file)",
+  "review_round": 1,
+  "reviewer": "codex exec -s read-only --json --output-schema (codex-cli 0.139.0); structured findings, no normalization needed",
+  "triager": "claude (bootstrap builder, manual triage pre-P4)",
+  "date": "2026-06-10",
+  "status": "AWAITING HUMAN RATIFICATION \u2014 no fixes applied yet",
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "verdict": "legitimate",
+      "reasoning": "ClaudeCodeAdapter._parse returns a normal AgentResult even when is_error/subtype signals failure or exit_code != 0, and CodexAdapter does the same on nonzero exit. CLAUDE.md \u00a72's fail-closed rule names unexpected exit codes explicitly; a downstream consumer reading .text would continue past a failed call. Fix: raise AdapterError carrying the fully-parsed partial result on nonzero exit, is_error (claude), or turn.failed (codex), with unit tests for parseable-failure outputs.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-002",
+      "verdict": "legitimate",
+      "reasoning": "Tolerating non-JSON stdout lines in JSONL modes is the 'silently continue' posture \u00a72 forbids \u2014 with --json both CLIs route logs to stderr, so a non-JSON stdout line means the output contract broke. Fix: MalformedOutputError with the raw lines preserved in the partial result; the codex unit test that asserted tolerance changes with this ratified behavior and is documented per-finding in the fix commit. Any benign warning line that surfaces later gets pinned explicitly, not absorbed silently.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-003",
+      "verdict": "legitimate",
+      "reasoning": "Self-inflicted hole: the adapter itself introduced the -c sandbox_mode spelling on resume, so the config-override channel is a live control path, and lint_flags never inspects -c/--config assignments \u2014 extra_flags could smuggle sandbox_mode=danger-full-access through. Fix: lint parses -c/--config key=value pairs (quoted or bare, = or space form) and rejects bypass sandbox values. The suggested duplicate-override policing beyond bypass values is P3 config-validation scope and is not adopted here.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-004",
+      "verdict": "legitimate",
+      "reasoning": "Correct false negative: json.dumps escapes quotes, backslashes and newlines, so an env secret containing any of them no longer matches its raw value at redaction time and lands on disk un-masked. Fix: the Redactor also matches the JSON-escaped variant of every env secret value; tests cover quote/backslash/newline-bearing secrets through append_jsonl.",
+      "action": "fix_now"
+    },
+    {
+      "finding_id": "F-005",
+      "verdict": "legitimate",
+      "reasoning": "Fair catch on pin-file honesty: resume-accepts-schema and --full-auto absence were verified by --help surface inspection, not by the contract suite, yet sit alongside contract-verified entries with no distinction. Fix: add a live resume-with-schema contract test (P4's diff-scoped confirm pass will lean on exactly that combination) plus a help-surface assertion for --full-auto absence, and reword the affected pin entries to cite how each was verified.",
+      "action": "fix_now"
+    }
+  ],
+  "summary": {
+    "legitimate": 5,
+    "bikeshedding": 0,
+    "premature_optimization": 0,
+    "not_applicable": 0,
+    "fix_now": 5,
+    "defer": 0,
+    "reject": 0
+  }
+}
