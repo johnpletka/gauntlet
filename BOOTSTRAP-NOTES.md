@@ -128,6 +128,23 @@ process, and what it suggests for Gauntlet's design.
     (not judge-audited) blocks. Recorded as a pinned deviation in the doctor
     pin file.
 
+11. **Codex emits no `command_execution` event for a sandbox-denied command.**
+    P2 review F-008 asked the codex sandbox test to prove both that the write
+    was *attempted* and that the sandbox *denied* it (not just that the file is
+    absent). Probing codex-cli 0.139.0: a read-only sandbox denial surfaces
+    ONLY as the exact OS errno inside an `agent_message`
+    (`zsh:1: operation not permitted: <path>`) — there is no
+    `command_execution` event in the `--json` stream for a command the sandbox
+    refuses. So the strongest available proof is the path-specific errno in
+    agent text (a model cannot produce the exact errno+path without the command
+    actually being dispatched and refused). The test requires that errno; it
+    cannot additionally require a raw command_execution event, because the CLI
+    does not emit one. Recorded as an accepted build-limitation at the P2 gate.
+    *Design feedback:* the P4 transcript logger should capture codex's
+    sandbox-refusal signal from agent_message text on builds where no
+    command_execution event is emitted, and `doctor`/the pin file should note
+    per-build whether codex surfaces denied commands as events.
+
 ## 2026-06-10 — P1 implementation
 
 9. **Installed-CLI flag drift cuts both ways, found on day one.** Three

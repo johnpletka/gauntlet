@@ -72,13 +72,16 @@ deny:
       # ([/:?#\s]|$) after each allowlisted host means github.com.evil.example
       # is not treated as github.com and is correctly denied (review F-004).
       - '\b(curl|wget)\b[^\n]*\shttps?://(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org)([/:?#\s]|$))[^\s]'
-      # git over a non-allowlisted scheme URL or an scp-style user@host:path remote
+      # git over a non-allowlisted scheme URL or an scp-style user@host:path
+      # remote. The boundary group after each allowlisted host keeps
+      # git@github.com.evil.example from masquerading as github.com.
       - '\bgit\b[^\n]*\s(https?|git|ssh)://(?!(github\.com|localhost|127\.0\.0\.1)([/:]|$))'
-      - '\bgit\b[^\n]*\s[\w.-]+@(?!github\.com|localhost|127\.0\.0\.1)[\w.-]+:'
+      - '\bgit\b[^\n]*\s[\w.-]+@(?!(github\.com|localhost|127\.0\.0\.1)([:/]|$))[\w.-]+:'
       # scp/sftp/rsync to a remote host (user@host:path)
-      - '\b(scp|sftp|rsync)\b[^\n]*\s[\w.-]+@(?!localhost|127\.0\.0\.1)[\w.-]+:'
-      # direct ssh to a non-loopback host (user@host or bare host)
-      - '\bssh\b[^\n]*\s[\w.-]+@(?!localhost|127\.0\.0\.1)[\w.-]+'
+      - '\b(scp|sftp|rsync)\b[^\n]*\s[\w.-]+@(?!(localhost|127\.0\.0\.1)([:/]|$))[\w.-]+:'
+      # direct ssh: user@host, or a bare dotted hostname (ssh evil.example)
+      - '\bssh\b[^\n]*\s[\w.-]+@(?!(localhost|127\.0\.0\.1)([:/]|$))[\w.-]+'
+      - '\bssh\b\s+(-\S+\s+|-\S+\s+\S+\s+)*(?!(localhost|127\.0\.0\.1)\b)[a-z0-9][\w-]*(\.[\w-]+)+'
       # download-and-run via interpreters fetching remote code (python -c,
       # ruby/perl/node -e, etc.)
       - '\b(python[0-9.]*|ruby|perl|node)\b[^\n]*\s-[ce]\b[^\n]*https?://'
