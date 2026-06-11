@@ -42,6 +42,10 @@ def build_core(
                 timeout_s=JUDGE_LLM_TIMEOUT_S,
                 max_tokens=JUDGE_LLM_MAX_TOKENS,
                 temperature=0,
+                # Single attempt: 1 try x 5 s stays under the 8 s hook timeout
+                # (review F-007 round 2). A schema-invalid answer fails closed
+                # to deny rather than burning the timeout on retries.
+                max_schema_retries=0,
             )
         )
     return JudgeCore(engine, classifier=classifier, audit_path=audit_path)

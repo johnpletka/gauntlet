@@ -34,19 +34,25 @@ def fixture_repo(tmp_path):
 
 
 def _sandbox_denied(result) -> bool:
-    """True if the output shows an actual sandbox denial of a write (F-008).
+    """True only if the output carries an OS-level sandbox-denial errno (F-008).
 
-    Proof of attempt-and-denial is an OS-level sandbox error — `operation not
-    permitted`, `read-only file system`, `permission denied` — which a model
-    cannot produce unless it actually issued the write and the sandbox refused
-    it (a mere refusal reads as "I won't do that", not a specific errno). We
-    scan both the agent text and any command_execution output.
+    Proof of attempt-and-denial is a specific OS sandbox error — `operation
+    not permitted`, `read-only file system`, `permission denied` — which a
+    model cannot produce unless the command was actually dispatched to the
+    shell and the sandbox refused it at the syscall (a mere refusal reads as
+    "I won't do that", not a path-specific errno).
+
+    Empirically (codex-cli 0.139.0, verified during P2 review round 2): a
+    read-only sandbox denial surfaces ONLY as the errno inside an
+    `agent_message` — codex emits no `command_execution` event for a command
+    the sandbox refuses — so we must accept the errno in agent text. We do
+    NOT accept a bare nonzero exit code as proof (it could be an unrelated
+    failure); the specific errno string is required (review F-008 round 2).
     """
     denial_markers = (
         "operation not permitted",
         "read-only file system",
         "permission denied",
-        "not permitted",
     )
 
     def has_marker(s: str) -> bool:
@@ -59,8 +65,6 @@ def _sandbox_denied(result) -> bool:
         item = event.get("item") if isinstance(event, dict) else None
         if isinstance(item, dict) and item.get("type") == "command_execution":
             if has_marker(item.get("aggregated_output", "")):
-                return True
-            if item.get("exit_code") not in (0, None):
                 return True
     return False
 

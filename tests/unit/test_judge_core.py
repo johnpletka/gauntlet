@@ -127,9 +127,13 @@ def test_classifier_adapter_bounded_under_hook_timeout():
     adapter = core.classifier._adapter
     assert isinstance(adapter, ApiAdapter)
     assert adapter.timeout_s == JUDGE_LLM_TIMEOUT_S
-    assert adapter.timeout_s < HOOK_TIMEOUT_S
     assert adapter.temperature == 0
     assert adapter.max_tokens is not None
+    # single attempt only, so worst case (1 x timeout) stays under the hook
+    # timeout — no retry can push total latency past it (F-007 round 2)
+    assert adapter.max_schema_retries == 0
+    worst_case = adapter.timeout_s * (1 + adapter.max_schema_retries)
+    assert worst_case < HOOK_TIMEOUT_S
 
 
 def test_audit_redacts_secret_in_command(tmp_path, monkeypatch):
