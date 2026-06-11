@@ -55,3 +55,19 @@ process, and what it suggests for Gauntlet's design.
    *Design feedback:* triage verdicts could use an optional `target_artifact`
    field so upstream-invalidation routing (FR-10.4) can be automated instead of
    inferred from reasoning text.
+
+7. **Naive credential regexes false-positive on ordinary prose.** A pre-commit
+   scan of the confirm-pass event log for `sk-…` matched "a**sk-with**-warning"
+   inside a verdict note. No real secret, but it cost a manual inspection.
+   *Design feedback:* the P1 redacting writer's patterns need word boundaries +
+   minimum length/entropy (e.g. `\bsk-[A-Za-z0-9]{20,}\b`), and the redactor
+   should log *what pattern* fired so false positives are diagnosable. Exact
+   env-var **value** matching (known secrets) stays the primary mechanism;
+   regexes are the fallback.
+
+8. **Schema-constrained confirm pass worked end-to-end.** `codex exec -s
+   read-only --output-schema … -o …` returned valid JSON on the first try (13/13
+   verdicts, parseable, no retry needed), with usage in the event stream
+   (21.5k in / 1.2k out tokens) and a session/thread id. The PRD's adapter
+   assumptions (§4.1 CodexAdapter, FR-9.5 confirm mapping) look sound on
+   codex-cli 0.139.0 — first real datapoint for the P1 pin file.
