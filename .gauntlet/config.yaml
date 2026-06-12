@@ -30,6 +30,10 @@ agents:
     # claude loads the repo's PreToolUse hook only under project setting sources
     # (pins.yaml); the engine-managed judge cannot gate the builder without it.
     base_flags: ["--setting-sources", "project"]
+    # A bootstrap implement step is a long-running build; the adapter's 600s
+    # default would halt it mid-phase (FR-3.3 applies, just with a realistic
+    # ceiling — notes #25).
+    step_timeout_s: 5400
   reviewer:
     adapter: codex
     model: gpt-5.5

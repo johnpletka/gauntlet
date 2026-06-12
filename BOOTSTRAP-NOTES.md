@@ -352,3 +352,19 @@ process, and what it suggests for Gauntlet's design.
     bootstrap lived on `gauntlet/bootstrap` (#2's two-slug pain, branch
     edition) — resolved by pre-creating the derived branch name at the tip
     before the first run; both names point into the same history.
+
+25. **Two operability gaps from the P5 restart, both fixed by config/hand.**
+    (a) The builder profile had no `step_timeout_s`, so the adapter's 600s
+    default would have halted the long p5-implement mid-edit; set to 5400s
+    (FR-3.3 still applies, with a realistic ceiling). (b) After killing the
+    seconds-old resume to apply that fix, the step record sat `running` with
+    a base SHA that predated the `P4.2` config commit — resume would have
+    false-parked on "head moved past base" even though the step never made
+    an edit. Resolved by hand-resetting the record to pending with the
+    reasoning written into its notes (worktree verified clean first).
+    *Design feedback:* the engine needs a guided `gauntlet reset-step
+    <slug> <step>` (clean-tree-checked, reason-recorded) so this manifest
+    surgery has a command path; and the resume disposition could distinguish
+    "head moved but tree clean and matches HEAD" (a human committed
+    something in between) from "tree dirty vs base" (real partial work) —
+    the former is re-runnable with a re-based boundary after confirmation.
