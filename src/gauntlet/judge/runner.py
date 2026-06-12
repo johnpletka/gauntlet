@@ -36,6 +36,7 @@ def build_core(
     policy_path: Path,
     audit_path: Path | None = None,
     judge_model: str | None = None,
+    repo_root: Path | None = None,
 ) -> JudgeCore:
     engine = PolicyEngine(Policy.load(policy_path))
     classifier = None
@@ -60,7 +61,9 @@ def build_core(
                 max_schema_retries=0,
             )
         )
-    return JudgeCore(engine, classifier=classifier, audit_path=audit_path)
+    return JudgeCore(
+        engine, classifier=classifier, audit_path=audit_path, repo_root=repo_root
+    )
 
 
 def generate_token() -> str:
@@ -75,6 +78,7 @@ def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     token: str | None = None,
+    repo_root: Path | None = None,
 ) -> None:  # pragma: no cover - exercised via the live contract suite
     import os
 
@@ -87,7 +91,8 @@ def serve(
     resolved_token = token or os.environ.get(TOKEN_ENV_VAR) or generate_token()
     os.environ[TOKEN_ENV_VAR] = resolved_token
     core = build_core(
-        policy_path=policy_path, audit_path=audit_path, judge_model=judge_model
+        policy_path=policy_path, audit_path=audit_path, judge_model=judge_model,
+        repo_root=repo_root,
     )
     app = create_app(core, token=resolved_token)
     print(f"gauntlet judge listening on http://{host}:{port}")

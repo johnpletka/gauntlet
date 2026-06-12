@@ -477,3 +477,27 @@ process, and what it suggests for Gauntlet's design.
     tool's actual point). *Design feedback:* `report --trend` (P7/FR-6.6)
     should track findings-per-round and the surfaced-vs-fixed ratio so a
     reviewer/triager that drifts into nitpicking is visible in the metrics.
+
+31. **#29's hook-env fix didn't take on claude — made the judge SERVICE
+    authoritative for the repo boundary instead.** P5 attempt 4 deny-looped
+    again on in-repo edits despite the P4.7 hook fix being live in the
+    editable source: `GAUNTLET_REPO_ROOT` never reached the
+    `gauntlet-judge-hook` subprocess claude spawns (claude evidently does not
+    propagate the engine-injected env to its PreToolUse hook process). The
+    env-injection approach was the wrong layer. Correct architecture: the
+    repo boundary is a property of the RUN, known by the engine that starts
+    the judge — so `JudgeCore` now holds an authoritative `repo_root`
+    (threaded `ManagedJudge -> gauntlet judge serve --repo-root -> build_core
+    -> JudgeCore`) and uses it for every path check; the request-body
+    repo_root (and thus the agent cwd) is a fallback only, for the dev
+    `judge serve` with no `--repo-root`. The hook-side `GAUNTLET_REPO_ROOT`
+    preference (#29) stays as belt-and-suspenders. Verified live end-to-end:
+    an in-repo Edit from a `/tmp/toy-project` cwd now ALLOWS, while a write
+    to `/etc/passwd` still DENIES via `write-outside-repo`. Also: the judge
+    audit line now logs `repo_root` — the boundary used for the check is
+    diagnosable from the audit alone; had it been there, #29/#31 would have
+    been a one-look diagnosis instead of two burned runs. *Design feedback:*
+    trust/identity context (repo root, run id) belongs in the engine->judge
+    channel, never re-derived from the sandboxed agent's ambient state; a
+    `doctor` smoke that fires one in-repo edit through the managed judge from
+    a foreign cwd would catch any regression here.

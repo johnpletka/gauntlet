@@ -133,6 +133,10 @@ def judge_serve(
     ),
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8787, help="Bind port."),
+    repo_root: Path = typer.Option(
+        None, help="Authoritative repo boundary for path checks (#31); "
+        "the engine passes this so checks never depend on the agent's cwd."
+    ),
 ) -> None:
     """Run the localhost judge service (dev command; engine-managed in P3)."""
     from gauntlet.judge.runner import serve
@@ -143,4 +147,5 @@ def judge_serve(
         judge_model=judge_model,
         host=host,
         port=port,
+        repo_root=repo_root,
     )

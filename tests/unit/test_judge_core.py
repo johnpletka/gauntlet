@@ -113,7 +113,36 @@ def test_audit_line_written_and_redacted(tmp_path):
     assert first["run_id"] == "run1"
     assert "latency_ms" in first
     assert first["matched_rule"]
+    assert first["repo_root"] == str(REPO_ROOT)  # #31: boundary is auditable
     assert json.loads(lines[1])["decision"] == "deny"
+
+
+def test_authoritative_repo_root_overrides_request(tmp_path):
+    # #31: when the engine pins the judge's repo_root, an agent's per-call
+    # cwd (request repo_root) cannot redefine "the repository tree". An
+    # in-repo write judged against a scratch cwd must still be allowed.
+    real_repo = REPO_ROOT
+    in_repo_edit = {"file_path": str(real_repo / "src/gauntlet/engine/run.py"),
+                    "content": "x"}
+    # Without the pin, the wrong (scratch) request root denies the in-repo edit
+    # via the path-escape rule — the exact P5 deny-loop (#29).
+    unpinned = JudgeCore(engine())
+    d1 = unpinned.decide("Edit", in_repo_edit, repo_root=Path("/tmp/toy-project"))
+    assert d1.decision == "deny" and d1.matched_rule == "write-outside-repo"
+    # With the engine-pinned root, path-escape no longer fires regardless of
+    # cwd: an in-repo write is not denied as outside-repo (it falls through to
+    # the LLM rung, which allows it live; here there is no classifier so it
+    # reaches fail-closed — the point is it is NOT the path-escape deny).
+    pinned = JudgeCore(engine(), repo_root=real_repo)
+    d2 = pinned.decide("Edit", in_repo_edit, repo_root=Path("/tmp/toy-project"))
+    assert d2.matched_rule != "write-outside-repo"
+
+
+def test_build_core_threads_repo_root():
+    from gauntlet.judge.runner import build_core
+
+    core = build_core(policy_path=POLICY, repo_root=REPO_ROOT)
+    assert core.repo_root == REPO_ROOT
 
 
 def test_classifier_adapter_bounded_under_hook_timeout():

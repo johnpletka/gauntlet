@@ -108,6 +108,12 @@ class ManagedJudge:
         ]
         if self.judge_model:
             argv += ["--judge-model", self.judge_model]
+        if self.repo_root is not None:
+            # Authoritative path boundary in the SERVICE itself (#31): the
+            # judge never depends on GAUNTLET_REPO_ROOT reaching the agent's
+            # hook subprocess (which it didn't, on claude — #29). The env var
+            # stays as belt-and-suspenders for the hook fallback.
+            argv += ["--repo-root", str(self.repo_root)]
         self._proc = subprocess.Popen(argv, env=child_env)
         self._await_healthy()
         # Snapshot prior values of every managed var so stop() restores exactly.
