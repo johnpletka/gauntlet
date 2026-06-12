@@ -29,6 +29,7 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine import gitops
 from gauntlet.engine.pipeline import Step
+from gauntlet.logging.transcript import StepLogger
 
 _CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
 _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
@@ -116,13 +117,15 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         timeout = ctx.config.profile(agent_name).step_timeout_s
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
+    logger = step_logger(ctx)
+    logger.log_prompt(prompt)  # before the call: the prompt survives a crash
     result = adapter.run(
         prompt,
         session=ctx.record.session_id,
         schema=schema,
         cwd=ctx.repo_root,
     )
-    _write_step_log(ctx, "prompt.md", prompt)
+    logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")
     if output:
@@ -342,10 +345,19 @@ def _proc_log(command: str, proc: subprocess.CompletedProcess) -> str:
     )
 
 
-def _write_step_log(ctx: StepContext, name: str, text: str) -> None:
+def step_log_dir(ctx: StepContext) -> Path:
     iteration = ctx.record.iteration
     leaf = ctx.record.id if iteration is None else f"{ctx.record.id}.{iteration}"
-    ctx.writer.write_text(ctx.steps_dir() / leaf / name, text)
+    return ctx.steps_dir() / leaf
+
+
+def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
+    """FR-4 logger for this step (or a sub-step, e.g. a cycle round's review)."""
+    return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
+
+
+def _write_step_log(ctx: StepContext, name: str, text: str) -> None:
+    ctx.writer.write_text(step_log_dir(ctx) / name, text)
 
 
 SPECS: dict[str, StepSpec] = {
@@ -370,3 +382,14 @@ SPECS: dict[str, StepSpec] = {
         touches_worktree=True,
     ),
 }
+
+
+def _register_cycle() -> None:
+    # Imported at the bottom: cycle.py uses this module's helpers lazily, but
+    # registering here keeps adversarial_cycle a built-in (PRD §4.1 v1 set).
+    from gauntlet.engine.cycle import SPEC as _CYCLE_SPEC
+
+    SPECS[_CYCLE_SPEC.type] = _CYCLE_SPEC
+
+
+_register_cycle()

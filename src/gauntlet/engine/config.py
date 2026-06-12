@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
 from gauntlet.engine.gitops import Identity
+from gauntlet.logging.redact import RedactionSettings
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
@@ -103,9 +104,12 @@ class RunConfig(BaseModel):
     # Transaction-boundary policy on resume of a dirty interrupted step (F-003).
     interrupted_step: str = "park"  # park | reset_to_base
 
-    # Reviewer-mutation policy is a P4 concern; the field is parsed here so a
-    # config authored ahead of P4 validates. Default per FR-9.6.
+    # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
+
+    # Configurable redaction list (FR-4.4), default-on; the transcript logger
+    # builds its Redactor from this.
+    redaction: RedactionSettings = Field(default_factory=RedactionSettings)
 
     def profile(self, name: str) -> AgentProfile:
         try:

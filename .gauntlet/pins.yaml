@@ -70,6 +70,17 @@ clis:
         verified: >-
           Final agent message conformed to the schema; parsed and validated
           first try (consistent with the plan-cycle-r1 capture).
+      - flag: "exec --output-schema (P4 live review path, strict-mode rules)"
+        verified: >-
+          P4: the schema is enforced server-side under OpenAI strict mode —
+          a schema whose `required` omits any declared property is rejected
+          with HTTP 400 before the model runs (exit 1). "Optional" fields
+          must be spelled required-but-nullable (type ["string","null"]);
+          `pattern` constraints were removed from the normative schemas to
+          stay inside the strict subset. With schemas/findings.json in that
+          form, the live adversarial_cycle contract test round-tripped:
+          review findings validated, fix-round commit, diff-scoped confirm
+          verdicts validated (tests/integration/test_cycle_contract.py).
       - flag: "--output-last-message <file>"
         verified: >-
           Long form live-verified: file written with the final agent message
@@ -114,6 +125,24 @@ clis:
         hooks. FR-7's "100% blocked pre-execution + audit" is met via claude;
         codex is sandbox-sourced (coarser, no per-command judge audit). See
         BOOTSTRAP-NOTES #10.
+  api_models:
+    version: "litellm (P4 verification, 2026-06-11)"
+    verified_flags:
+      - flag: "gpt-5-mini via LiteLLM (triage/judge_llm cheap tier)"
+        verified: >-
+          P4: live completion + cost reporting work with the present OpenAI
+          key (~$0.00015 per short call). Ran the full 36-finding triage
+          accuracy harness: 94.4% verdict agreement, blocking 9/9, zero
+          unescalated blocking→reject misses (report at
+          runs/gauntlet-bootstrap/manual/p4-triage-accuracy.md).
+      - flag: "gpt-5 via LiteLLM (escalation tier, review F-009)"
+        verified: "P4: live completion + cost reporting (~9x mini's price)."
+    notes:
+      - >-
+        `claude-haiku-latest` (the previous configured triage model) does NOT
+        resolve via LiteLLM, and no Anthropic key is present in this
+        environment — the profile could never have run here. Swapped to the
+        verified models above; BOOTSTRAP-NOTES #19.
   judge:
     version: "gauntlet P2 (this repo)"
     verified_flags:

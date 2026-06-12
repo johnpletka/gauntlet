@@ -39,6 +39,7 @@ from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.pipeline import Pipeline, Stage, Step
 from gauntlet.logging.redact import RedactingWriter
+from gauntlet.logging.transcript import write_run_index
 
 
 def _utcnow() -> str:
@@ -262,9 +263,13 @@ class Orchestrator:
         """
         if rec.base_sha is None or not spec.step_touches_worktree(step):
             return None
-        is_agent_write = step.type == "agent_task" and spec.step_requires_repo_write(
-            step
-        )
+        # agent_task killed mid-edit AND adversarial_cycle killed mid-round are
+        # both non-idempotent worktree writers: park (or reset) on a dirty base
+        # rather than re-running over partial fixer edits / unmanifested
+        # fix-round commits. shell and commit re-enter safely on their own.
+        is_agent_write = (
+            step.type == "agent_task" and spec.step_requires_repo_write(step)
+        ) or step.type == "adversarial_cycle"
         if not is_agent_write:
             return None
         # Detect partial work against the narrow bookkeeping exclusion, so a
@@ -343,6 +348,10 @@ class Orchestrator:
                     phase=result.commit_phase or "",
                     sha=result.commit_sha,
                 )
+            )
+        for phase, sha in result.commits:  # multi-commit steps (adversarial_cycle)
+            self.manifest.commits.append(
+                M.CommitRecord(step_id=rec.id, phase=phase, sha=sha)
             )
         if result.status == DONE:
             for name, path in result.artifact_writes.items():
@@ -431,3 +440,6 @@ class Orchestrator:
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)
+        # RUN.md (FR-4.3) is regenerated on every checkpoint so the index never
+        # lags the state machine; it is derived data, cheap to rewrite.
+        write_run_index(self.run_dir, self.manifest, self.writer)

@@ -1,16 +1,16 @@
-"""Minimal redacting writer (FR-4.4 down-payment; plan P1, review F-005).
+"""Redacting writer (FR-4.4; plan P1 review F-005, full list P4).
 
-From P1 onward, no log line the bootstrap writes lands on disk unredacted:
-manual transcripts, captured event streams, and (from P2) the judge audit log
-all pass through :class:`RedactingWriter`.
+No log line the bootstrap writes lands on disk unredacted: transcripts,
+captured event streams, and the judge audit log all pass through
+:class:`RedactingWriter`. From P4 the transcript logger is its home and the
+list is configurable (``redaction:`` in `.gauntlet/config.yaml`), default-on —
+these logs are intended for git.
 
 Design per BOOTSTRAP-NOTES #7:
 - Exact matching of known secret env-var *values* is the primary mechanism.
 - Credential-pattern regexes are the fallback, and they are boundary-aware
   with minimum lengths (a naive ``sk-`` once matched "ask-with-warning").
 - Every hit records *which pattern fired*, so false positives are diagnosable.
-
-The full configurable redaction list ships with the P4 logger.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 # Env vars whose names suggest credentials; their *values* get masked.
 SECRET_ENV_NAME_RE = re.compile(
@@ -52,6 +54,47 @@ CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+class ExtraPattern(BaseModel):
+    """One configured fallback regex (FR-4.4). Compiled at config load so a bad
+    pattern fails the run up front, not mid-write."""
+
+    name: str
+    regex: str
+
+    def compiled(self) -> re.Pattern[str]:
+        return re.compile(self.regex, re.DOTALL)
+
+
+class RedactionSettings(BaseModel):
+    """The configurable redaction list (FR-4.4), default-on.
+
+    ``extra_env_vars`` are env-var *names* whose values get masked even when the
+    name heuristic (KEY/TOKEN/SECRET/...) would miss them. ``extra_patterns``
+    extend the built-in credential regexes — they never replace them; the
+    defaults are the floor, configuration only adds.
+    """
+
+    extra_env_vars: list[str] = Field(default_factory=list)
+    extra_patterns: list[ExtraPattern] = Field(default_factory=list)
+    min_value_length: int = MIN_SECRET_VALUE_LENGTH
+
+
+def build_redactor(
+    settings: RedactionSettings | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Redactor:
+    """Construct a :class:`Redactor` from configured settings (FR-4.4)."""
+    settings = settings or RedactionSettings()
+    return Redactor(
+        env,
+        extra_patterns=tuple(
+            (p.name, p.compiled()) for p in settings.extra_patterns
+        ),
+        min_value_length=settings.min_value_length,
+        extra_env_names=frozenset(settings.extra_env_vars),
+    )
+
+
 def _secret_variants(value: str) -> set[str]:
     """A secret's raw form plus its JSON-escaped serializations."""
     return {
@@ -78,6 +121,7 @@ class Redactor:
         *,
         extra_patterns: tuple[tuple[str, re.Pattern[str]], ...] = (),
         min_value_length: int = MIN_SECRET_VALUE_LENGTH,
+        extra_env_names: frozenset[str] = frozenset(),
     ) -> None:
         if env is None:
             import os
@@ -91,7 +135,7 @@ class Redactor:
             (
                 (name, variant)
                 for name, value in env.items()
-                if SECRET_ENV_NAME_RE.search(name)
+                if (SECRET_ENV_NAME_RE.search(name) or name in extra_env_names)
                 and len(value) >= min_value_length
                 for variant in _secret_variants(value)
             ),

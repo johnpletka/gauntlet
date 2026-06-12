@@ -244,3 +244,75 @@ process, and what it suggests for Gauntlet's design.
     agent profile expected to write has either a reachable `judge_llm` or
     interactive mode, and warn if a claude builder profile lacks project setting
     sources — both are silent live-gating failures otherwise.
+
+## 2026-06-11 — P4 implementation (adversarial_cycle + logger + triage corpus)
+
+17. **The handoff said `gauntlet/bootstrap`; the repo's history lives on
+    `main`.** At P4 session start the branch `gauntlet/bootstrap` did not
+    exist — every P1–P3 commit had landed directly on `main` (4 ahead of
+    origin/main), contradicting both CLAUDE.md §3 ("never commit directly on
+    the base branch") and the continuation prompt's recorded state. Created
+    `gauntlet/bootstrap` at the inherited HEAD (`080ade7`) and continued
+    there; the pre-existing main commits are history, not rewritten (no
+    force-push rule). *Design feedback:* FR-9.1's "creates (or resumes on) a
+    dedicated branch" is the engine-owned guarantee that prevents exactly
+    this manual-process drift; a `doctor`/session-start check could assert
+    "not on the base branch" before any bootstrap work.
+
+18. **P4's own commits are manual `git` — the expected switchover gap.**
+    Switchover #1 covers branch/commit/manifest mechanics "where a command
+    exists"; there is no standalone `gauntlet commit`, and P4 builds the very
+    cycle that would drive itself. Recorded per the plan's "record any gap
+    that forced you to fall back to manual." Switchover #2 lands at the END
+    of P4: `pipelines/bootstrap.yaml` + `runs/gauntlet-bootstrap/prd.md` +
+    prompt stubs now express P5–P7, and from P5 onward manual process
+    execution is a bug. *Design feedback:* a thin `gauntlet commit
+    --phase PN` (format-validate + identity + manifest record, no pipeline
+    needed) would close the last manual surface for future bootstraps.
+
+19. **The configured cheap model was unrunnable on this machine — caught by
+    the P4 accuracy harness, fixed as config.** `.gauntlet/config.yaml` had
+    `triage: claude-haiku-latest`, but only an OpenAI key is present in the
+    environment and LiteLLM does not resolve that alias at all. Switched the
+    triage/judge_llm profiles to `gpt-5-mini` (the cheap model P1's contract
+    suite verified) and added an `escalation: gpt-5` profile for P4's
+    severity-aware escalation (review F-009); both probed live before use and
+    pinned. *Design feedback:* `doctor` (P6) must validate that every `api`
+    profile's model actually resolves against the present credentials —
+    a config that parses but cannot run is a silent run-time failure.
+
+20. **codex `--output-schema` enforces OpenAI strict-mode schema rules —
+    "optional" must be spelled required-but-nullable.** The first live review
+    call failed with HTTP 400: `'required' is required ... including every
+    key in properties`. The §7 excerpt marks `suggested_fix` optional; the
+    normative `schemas/findings.json` expresses that as required +
+    `["string","null"]` (the same spelling the hand-built P1–P3 review
+    schemas already used — this is why they worked). Also dropped `pattern`
+    constraints to stay inside the strict-mode subset. Verified end-to-end
+    after the fix (live probe + the P4 cycle contract test) and pinned.
+    *Design feedback:* schemas intended for native structured output must be
+    authored in the strict subset from the start; a future `doctor` check or
+    schema lint could enforce it.
+
+21. **Triage-accuracy result (P4 assumption test): PASS — but the corpus
+    verdict-skew is real and recorded.** `gpt-5-mini` over the 36-finding
+    hand-labeled corpus: 94.4% verdict agreement, blocking row 9/9, zero
+    blocking→reject misses (escalated or otherwise); report with per-severity
+    confusion matrices at `runs/gauntlet-bootstrap/manual/
+    p4-triage-accuracy.md`. Caveat recorded in the report: 34/36 labels are
+    `legitimate` because the bootstrap's reviewers were good — a
+    constant-`legitimate` predictor scores ~94%, so the aggregate gate is
+    weak on this data and the operative checks are the blocking-miss
+    criterion and the matrix (review F-009). *Design feedback:* FR-6.5's
+    human-corrected triage cases are the designed source of non-legitimate
+    examples; until those accumulate, treat aggregate agreement as a smoke
+    signal, not a quality proof.
+
+22. **Round artifacts are run bookkeeping, not commit payload (resolves the
+    #13 question for the cycle).** findings/triage/confirm JSON are written
+    under `run_dir/artifacts/` (excluded from engine git ops) with lossless
+    per-sub-step copies under `steps/<id>/rN-*/`. Writing them into the
+    tracked artifact root would have dirtied the tree between the fix commit
+    and the next round's handoff — the confirm pass writes AFTER the commit —
+    breaking FR-9.3 inside the cycle itself. Tracked commits carry the work;
+    the durable audit trail is the run dir, committed deliberately (FR-4.5).

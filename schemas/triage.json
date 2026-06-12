@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/triage.json",
+  "title": "Triage verdicts (PRD §7, FR-5.2)",
+  "description": "Point-by-point triager output: one verdict per finding. `finding_id`/`verdict`/`reasoning`/`action` are normative per PRD §7. `confidence` (severity-aware escalation, plan P4 / review F-009), `target_artifact` (upstream-invalidation routing, BOOTSTRAP-NOTES #6 / FR-10.4), and `escalated` (engine-recorded) are P4 schema additions; the PRD §7 excerpt itself is unchanged.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdicts"],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/verdict"}
+    },
+    "summary": {"type": "string"}
+  },
+  "definitions": {
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finding_id", "verdict", "reasoning", "action", "confidence", "target_artifact"],
+      "properties": {
+        "finding_id": {"type": "string"},
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "legitimate",
+            "bikeshedding",
+            "premature_optimization",
+            "not_applicable"
+          ]
+        },
+        "reasoning": {
+          "type": "string",
+          "description": "1-3 sentences."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["fix_now", "defer", "reject"]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["high", "medium", "low"],
+          "description": "Triager self-assessed confidence; `low` escalates to a stronger model or the human gate (review F-009)."
+        },
+        "target_artifact": {
+          "type": ["string", "null"],
+          "description": "null unless the fix lands in a different artifact than the one reviewed (e.g. a plan finding implicating the PRD); set, FR-10.4 upstream-invalidation routing becomes explicit instead of inferred from reasoning text. Required-but-nullable for native structured-output strict mode (see findings.json note)."
+        },
+        "escalated": {
+          "type": "boolean",
+          "description": "Engine-recorded: this verdict was re-issued by the escalation agent (or flagged for the human gate). Not produced by the cheap triager itself."
+        }
+      }
+    }
+  }
+}

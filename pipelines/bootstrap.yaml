@@ -1,0 +1,59 @@
+# Bootstrap pipeline — switchover #2 (plan P4, review F-006).
+#
+# Expresses the remaining bootstrap phases P5–P7 as a Gauntlet pipeline:
+# implement → tests → commit → adversarial_cycle → human gate, per phase.
+# From P5 onward these phases execute THROUGH `gauntlet run gauntlet-bootstrap
+# --pipeline pipelines/bootstrap.yaml`, human at the gates; manual process
+# execution past this point is a bug (plan §0 dogfooding switchover).
+#
+# This is deliberately the *minimal* expression of the loop. The polished
+# `standard.yaml` (prd-cycle → plan-author → foreach phases → retro) and the
+# full prompt set are P5 deliverables — this file is just enough machinery to
+# make the switchover real. Stages are written out explicitly rather than via
+# foreach: three phases, three stages — determinism over cleverness (§2).
+
+name: bootstrap
+version: 1
+
+stages:
+  - id: p5
+    steps:
+      - {id: p5-implement, type: agent_task, agent: builder,
+         prompt: prompts/bootstrap-implement-p5.md, inputs: [prd.md]}
+      - {id: p5-tests, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800, on_fail: {route_to: p5-implement, max_retries: 2}}
+      - {id: p5-commit, type: commit, message_agent: triage, phase: P5,
+         prompt: prompts/commit-message.md}
+      - {id: p5-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2}
+      - {id: p5-gate, type: human_gate,
+         show: [findings.json, triage.json, confirm.json]}
+
+  - id: p6
+    steps:
+      - {id: p6-implement, type: agent_task, agent: builder,
+         prompt: prompts/bootstrap-implement-p6.md, inputs: [prd.md]}
+      - {id: p6-tests, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800, on_fail: {route_to: p6-implement, max_retries: 2}}
+      - {id: p6-commit, type: commit, message_agent: triage, phase: P6,
+         prompt: prompts/commit-message.md}
+      - {id: p6-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2}
+      - {id: p6-gate, type: human_gate,
+         show: [findings.json, triage.json, confirm.json]}
+
+  - id: p7
+    steps:
+      - {id: p7-implement, type: agent_task, agent: builder,
+         prompt: prompts/bootstrap-implement-p7.md, inputs: [prd.md]}
+      - {id: p7-tests, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800, on_fail: {route_to: p7-implement, max_retries: 2}}
+      - {id: p7-commit, type: commit, message_agent: triage, phase: P7,
+         prompt: prompts/commit-message.md}
+      - {id: p7-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2}
+      - {id: p7-gate, type: human_gate,
+         show: [findings.json, triage.json, confirm.json]}

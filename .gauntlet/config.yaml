@@ -32,12 +32,19 @@ agents:
     adapter: codex
     model: gpt-5.5
     sandbox: read-only        # pure review steps are read-only (FR-9.6)
+  # Cheap-tier models verified live on this machine (P1/P4 contract runs; only
+  # an OpenAI key is present and `claude-haiku-latest` does not resolve via
+  # LiteLLM — see pins.yaml). FR-3.1 tiering: mini for classification, full
+  # model for severity-aware triage escalation (P4, review F-009).
   triage:
     adapter: api
-    model: claude-haiku-latest
+    model: gpt-5-mini
+  escalation:
+    adapter: api
+    model: gpt-5
   judge_llm:
     adapter: api
-    model: claude-haiku-latest
+    model: gpt-5-mini
 
 # Per-agent commit identities (FR-9.7) so git log distinguishes who authored what.
 identities:

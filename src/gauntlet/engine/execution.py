@@ -42,6 +42,9 @@ class StepResult:
     usage: Usage | None = None
     commit_sha: str | None = None
     commit_phase: str | None = None
+    # A multi-commit step (adversarial_cycle: fix rounds + reviewer-attributed
+    # mutation commits) reports every (phase-prefix, sha) it created, in order.
+    commits: list[tuple[str, str]] = field(default_factory=list)
     notes: str = ""
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)

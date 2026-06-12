@@ -21,7 +21,7 @@ from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.validate import validate_pipeline
-from gauntlet.logging.redact import RedactingWriter
+from gauntlet.logging.redact import RedactingWriter, build_redactor
 
 # Marker written into a scaffolded PRD; the entry contract refuses to run while
 # it is still present (FR-10.1 / review OQ-1: existence + non-stub-ness).
@@ -93,7 +93,9 @@ class RunManager:
     def __init__(self, repo_root: Path, config: RunConfig | None = None) -> None:
         self.repo_root = repo_root
         self.config = config or RunConfig.load(repo_root / ".gauntlet/config.yaml")
-        self.writer = RedactingWriter()
+        # The configured redaction list (FR-4.4) governs every byte the run
+        # writes; default-on even with an empty `redaction:` section.
+        self.writer = RedactingWriter(build_redactor(self.config.redaction))
 
     def layout(self, slug: str) -> RunLayout:
         return RunLayout(self.repo_root, self.config, slug)

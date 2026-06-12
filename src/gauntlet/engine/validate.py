@@ -60,6 +60,9 @@ def validate_pipeline(
             output = step.get("output")
             if output:
                 available.add(output)
+            if step.type == "adversarial_cycle":
+                # the cycle registers its round outputs as named artifacts
+                available.update({"findings.json", "triage.json", "confirm.json"})
     if report.errors:
         raise PipelineValidationError(report.errors)
     return report
@@ -98,6 +101,30 @@ def _validate_step(
             f"step {step.id!r} artifact {artifact!r} is not available at this "
             "point (dangling reference, FR-5.3)"
         )
+
+    # 2b. adversarial_cycle role bindings (FR-5.2): the three core roles are
+    # required, and capability checks are role-aware — the FIXER writes the
+    # repo (FR-2.3); the REVIEWER is intended read-only (FR-9.6), so a
+    # repo-write check on it would be exactly backwards.
+    if step.type == "adversarial_cycle":
+        for role in ("reviewer", "triager", "fixer"):
+            if not step.get(role):
+                report.errors.append(
+                    f"step {step.id!r} (adversarial_cycle) is missing required "
+                    f"role {role!r} (FR-5.2)"
+                )
+        fixer = step.get("fixer")
+        if fixer and fixer in config.agents:
+            if not config.profile(fixer).capabilities().repo_write:
+                report.errors.append(
+                    f"step {step.id!r} fixer {fixer!r} cannot write the repo "
+                    "(FR-2.3): fix rounds edit files"
+                )
+        if step.get("commit_each_fix_round") is False:
+            report.errors.append(
+                f"step {step.id!r} sets commit_each_fix_round=false, which "
+                "breaks the clean-handoff invariant (FR-9.3/9.4); unsupported"
+            )
 
     # 3. agent profile resolution + capabilities (FR-2.3) + banned flags (§8)
     agent_refs = _agent_refs(step, spec.needs_agent)
@@ -147,7 +174,8 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     refs: list[str] = []
     if step.agent:
         refs.append(step.agent)
-    for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer"):
+    for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer",
+                "escalation_agent"):
         ref = step.get(key)
         if ref:
             refs.append(ref)
