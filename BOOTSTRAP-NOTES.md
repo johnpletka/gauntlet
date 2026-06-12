@@ -368,3 +368,27 @@ process, and what it suggests for Gauntlet's design.
     "head moved but tree clean and matches HEAD" (a human committed
     something in between) from "tree dirty vs base" (real partial work) —
     the former is re-runnable with a re-based boundary after confirmation.
+
+26. **The judge's LLM rung was non-functional with gpt-5 models — every
+    escalated tool call failed closed, and the first live builder correctly
+    refused to work blind.** `build_core` passed `temperature=0` (a P2-era
+    determinism choice); gpt-5-family models reject any non-default
+    temperature, litellm raised UnsupportedParamsError, and the classifier
+    rung denied EVERYTHING the policy fast-path didn't allow — including
+    `Read` of the plan. The builder's response was the process working: it
+    made zero changes, wrote a precise operational-halt report naming the
+    exact litellm error, and asked for a human fix (the engine still
+    recorded the step `done` because the adapter exited 0 — see design
+    feedback below). Fixes, all live-verified: drop temperature (rubric
+    provides the determinism), add a `reasoning_effort` passthrough to
+    ApiAdapter with the judge pinned to `minimal` (2.3-3.1 s/verdict AND
+    more rubric-faithful than `low`, which allowed an out-of-repo write in
+    the probe; default effort blew the 5 s budget entirely), and timeout
+    5→6.5 s for cold-start headroom (first call measured 4.9 s). *Design
+    feedback:* (a) P2's live red-team suite ran the classifier rung against
+    a DIFFERENT provider family than the config later pinned — judge model
+    changes must re-run the classifier contract test; (b) `agent_task`
+    completion should not be inferred from exit-code alone — the builder's
+    own PHASE COMPLETE / halt-report convention exists precisely so the
+    engine can distinguish "done" from "stopped deliberately" (candidate
+    for the P5+ standard pipeline prompts + a completion-signal check).

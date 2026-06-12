@@ -127,7 +127,11 @@ def test_classifier_adapter_bounded_under_hook_timeout():
     adapter = core.classifier._adapter
     assert isinstance(adapter, ApiAdapter)
     assert adapter.timeout_s == JUDGE_LLM_TIMEOUT_S
-    assert adapter.temperature == 0
+    # gpt-5-family models reject any non-default temperature; passing temp=0
+    # made every classifier call fail closed (notes #26). Latency is bounded
+    # via minimal reasoning effort instead.
+    assert adapter.temperature is None
+    assert adapter.reasoning_effort == "minimal"
     assert adapter.max_tokens is not None
     # single attempt only, so worst case (1 x timeout) stays under the hook
     # timeout — no retry can push total latency past it (F-007 round 2)
