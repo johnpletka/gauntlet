@@ -277,6 +277,32 @@ def test_write_inside_repo_not_denied(engine):
     assert decision is None or decision.decision != "deny"
 
 
+def test_edit_content_mentioning_outside_path_not_denied(engine):
+    # BOOTSTRAP-NOTES #32: editing an IN-repo file whose content (old/new
+    # string) mentions an absolute path outside the repo must NOT be judged as
+    # a write to that path. The target is file_path; content is content.
+    inside = REPO_ROOT / "src" / "gauntlet" / "engine" / "orchestrator.py"
+    decision = engine.evaluate(
+        "Edit",
+        {
+            "file_path": str(inside),
+            "old_string": "backup = '/tmp/old'  # path token in content",
+            "new_string": "backup = '/etc/secrets/key'  # still just content",
+        },
+        repo_root=REPO_ROOT,
+    )
+    assert decision is None or decision.matched_rule != "write-outside-repo"
+
+
+def test_bash_path_token_still_harvested(engine):
+    # The harvest must still apply to real shell commands: a path TOKEN in a
+    # Bash command (here a credential read outside the repo) is still caught.
+    decision = engine.evaluate(
+        "Bash", {"command": "cat ~/.ssh/id_rsa"}, repo_root=REPO_ROOT
+    )
+    assert decision is not None and decision.decision == "deny"
+
+
 def test_relative_dotdot_escape_denied(engine, tmp_path):
     # repo_root = tmp_path/repo; a ../ write escapes it
     repo = tmp_path / "repo"

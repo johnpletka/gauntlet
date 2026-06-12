@@ -185,9 +185,17 @@ class PolicyEngine:
             value = tool_input.get(key)
             if isinstance(value, str) and value:
                 paths.append(Path(value))
-        # For Bash, harvest path-looking tokens (absolute or ~-relative).
-        for match in _PATH_TOKEN_RE.finditer(command):
-            paths.append(Path(match.group(0)))
+        # Harvest path-looking tokens ONLY from a real shell command (Bash),
+        # where a path token IS an operation target. For structured file tools
+        # (Edit/Write/...), the operation target is the explicit path key; the
+        # other string fields are CONTENT (old_string/new_string), and a file
+        # that legitimately contains a path string — pervasive in a
+        # path-handling codebase — must not be judged as operating on that path
+        # (BOOTSTRAP-NOTES #32: this false-positive denied in-repo edits to
+        # files whose content mentions an absolute path, stalling P5).
+        if isinstance(tool_input.get("command"), str):
+            for match in _PATH_TOKEN_RE.finditer(tool_input["command"]):
+                paths.append(Path(match.group(0)))
         return paths
 
     @staticmethod

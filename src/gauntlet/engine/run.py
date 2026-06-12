@@ -100,6 +100,21 @@ class RunManager:
     def layout(self, slug: str) -> RunLayout:
         return RunLayout(self.repo_root, self.config, slug)
 
+    @staticmethod
+    def _ensure_slug_gitignore(layout: "RunLayout") -> None:
+        """Ignore the active-run pointer at the slug level (BOOTSTRAP-NOTES #33).
+
+        Idempotent; engine-owned so the guarantee never depends on the repo's
+        own .gitignore. The pointer is the only live-bookkeeping file in the
+        slug dir (run-instance dirs self-ignore via their own .gitignore);
+        prd.md/plan.md and manual records stay tracked."""
+        layout.slug_dir.mkdir(parents=True, exist_ok=True)
+        gi = layout.slug_dir / ".gitignore"
+        existing = gi.read_text() if gi.exists() else ""
+        if "active-run.txt" not in existing.split():
+            gi.write_text((existing.rstrip("\n") + "\n" if existing else "")
+                          + "active-run.txt\n")
+
     # ---- new (FR-8.1 scaffold) ----------------------------------------------
     def new(self, slug: str) -> Path:
         layout = self.layout(slug)
@@ -153,6 +168,12 @@ class RunManager:
         run_id = f"run-{_utc_stamp()}"
         run_dir = layout.run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
+        # The active-run pointer is live bookkeeping, never commit payload
+        # (BOOTSTRAP-NOTES #33). An engine-written slug-level .gitignore keeps
+        # it ignored in EVERY repo — including throwaway fixture repos that
+        # lack the init-provided `runs/*/active-run.txt` rule — so it never
+        # dirties the worktree and `git add` never collides with it.
+        self._ensure_slug_gitignore(layout)
         # Snapshot the exact pipeline source into the run dir so resume reloads
         # precisely what started the run (FR-5.6 reproducibility).
         (run_dir / "pipeline.yaml").write_text(pipeline_path.read_text())
@@ -176,6 +197,7 @@ class RunManager:
     def resume(self, slug: str, *, use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None) -> str:
         layout = self.layout(slug)
+        self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
         pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")

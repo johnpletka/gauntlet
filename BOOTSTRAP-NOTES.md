@@ -501,3 +501,41 @@ process, and what it suggests for Gauntlet's design.
     channel, never re-derived from the sandboxed agent's ambient state; a
     `doctor` smoke that fires one in-repo edit through the managed judge from
     a foreign cwd would catch any regression here.
+
+32. **Judge denied in-repo edits whose CONTENT mentioned an outside path —
+    the real P5 blocker (builder correctly identified it, then halted).**
+    With the repo boundary finally correct (#31), P5's builder still hit
+    `write-outside-repo` fast-path denials editing in-repo engine files. Root
+    cause: `_candidate_paths` ran the path-token regex over `_command_text`,
+    which for non-Bash tools FLATTENS every string field — including an Edit's
+    `old_string`/`new_string`. So editing a file whose content contains an
+    absolute path (pervasive in a path-handling codebase: `/tmp/...`,
+    `~/.aws/...`, doc examples) made the judge extract that CONTENT path and
+    judge the edit as a write to it. The builder diagnosed it precisely
+    ("policy.py scope-tightening"), refused to work around the safety layer
+    (CLAUDE.md §3), and halted for a human — the right call. Fix: harvest path
+    tokens ONLY from a real shell `command` (Bash), where a token IS an
+    operation target; structured file tools use their explicit path key only.
+    Verified: an in-repo Edit with `/Users/.../.aws/credentials` in
+    old_string no longer fast-path-denies, while a Write to `/etc/evil.txt`
+    via file_path still denies. *Design feedback:* the disguised-halt gap
+    (#26b) bit a THIRD time here — the builder's halt was recorded `done`
+    (exit 0), so the engine marched on to a doomed commit step; a
+    completion-signal contract for `agent_task` is now clearly P5-critical,
+    not nice-to-have.
+
+33. **P4.5's active-run.txt gitignore collided with the engine's exclude
+    pathspec — `git add` errored, failing the commit step.** Once
+    active-run.txt was gitignored (P4.5) AND still named in the engine's
+    `:(exclude)active-run.txt` pathspec, `git add -A` refused ("paths are
+    ignored ... use -f") — git errors when a pathspec explicitly names an
+    ignored path, even an exclude. Fix: stop naming it in the pathspec (gitignore
+    already keeps it out of status/add) and have the ENGINE write a slug-level
+    `.gitignore` (`active-run.txt`) so the pointer is ignored in every repo —
+    including throwaway fixture repos that lack the repo-level rule — not just
+    where `init` shipped the rule. `run_bookkeeping_excludes` now lists only
+    the run-instance dir. Verified in a fresh fixture: `git add` exits 0,
+    active-run.txt stays unstaged, the slug `.gitignore` is the only added
+    bookkeeping. *Design feedback:* engine-owned ignores beat depending on the
+    repo's own `.gitignore`; the run-instance dir already self-ignores, and
+    the pointer now does too at the slug level — symmetric and portable.

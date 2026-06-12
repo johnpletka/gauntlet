@@ -147,19 +147,24 @@ def usage_from_result(result: AgentResult) -> Usage | None:
 def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path) -> list[str]:
     """Repo-relative paths of the engine's own live bookkeeping (review F-001).
 
-    These — the run-instance dir (manifest/transcripts/steps/judge-audit) and the
-    active-run pointer — must be invisible to worktree-state checks and commits.
-    Everything *else* under the run root (prd.md, plan.md, declared step outputs)
-    is real work: tracked, detected by the transaction boundary, and committable.
-    Narrowing the exclusion to just this set is the F-001 fix — the prior code
-    excluded the whole run root, hiding real partial effects from the dirty-base
-    check.
+    The run-instance dir (manifest/transcripts/steps/judge-audit) must be
+    invisible to worktree-state checks and commits. Everything *else* under the
+    run root (prd.md, plan.md, declared step outputs) is real work: tracked,
+    detected by the transaction boundary, and committable. Narrowing to just
+    this set is the F-001 fix — the prior code excluded the whole run root,
+    hiding real partial effects from the dirty-base check.
+
+    The active-run pointer is deliberately NOT listed here: it is ignored via a
+    ``.gitignore`` rule (``runs/*/active-run.txt``, shipped by ``init``), so git
+    already keeps it out of status and ``add``. Naming a gitignored path in an
+    ``:(exclude)`` pathspec makes ``git add`` ERROR ("paths are ignored ... use
+    -f"), which broke the commit step (BOOTSTRAP-NOTES #33). Letting gitignore
+    own it is both correct and avoids the pathspec collision.
     """
     excludes: list[str] = []
     root = repo_root.resolve()
-    for p in (run_dir, artifact_root / "active-run.txt"):
-        try:
-            excludes.append(p.resolve().relative_to(root).as_posix())
-        except ValueError:
-            continue
+    try:
+        excludes.append(run_dir.resolve().relative_to(root).as_posix())
+    except ValueError:
+        pass
     return excludes
