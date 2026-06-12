@@ -1,0 +1,84 @@
+{
+  "phase": "P4",
+  "round": 1,
+  "handoff_sha": "472a644",
+  "reviewer": "codex exec -s read-only --output-schema (codex-cli 0.139.0)",
+  "triager": "claude (bootstrap session), point-by-point",
+  "date": "2026-06-11",
+  "status": "awaiting human ratification",
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "severity": "blocking",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: _open_after_confirm() trusts the confirmer's verdict list — an omitted finding is silently treated as resolved, so a blocking finding can vanish by absence. FR-9.5 demands a per-finding verdict and fail-closed (§2) demands missing = unresolved. Fix: reconcile verdicts against the prior finding set; missing → unresolved (open), duplicates last-wins-with-note, unknown IDs recorded but never counted as closure.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-002",
+      "severity": "blocking",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: accepted == fix_now only, so a blocking finding triaged legitimate/defer (even post-escalation) exits via 'converged: accepted no findings' — exactly the silent carry-forward FR-10.5 forbids, and a non-null target_artifact never triggers the FR-10.4 upstream park. Fix: park at a human gate for any legitimate blocking finding not fixed this round and for any non-rejected verdict carrying a target_artifact.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-003",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: only blocking new_findings count, so a major regression the confirmer reports in the diff ships with a green cycle. Fix scoped deliberately: blocking and major new findings carry into the next round (blocking also as FR-10.5 blockers); minor/nit stay recorded in confirm.json without forcing another round — FR-10.5 defines satisfaction around blocking/unresolved, and a nit must not buy a full review round.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-004",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: the FR-9.6 guard runs only after a successful review return; a reviewer that mutates then emits invalid JSON gets retried on a dirty tree (FR-9.3 violation), and an exhausted-retry failure path never applies the mutation policy at all. Fix: check worktree state after every review attempt — success, malformed, or failure — and apply the policy before any retry or propagation.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-005",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed against FR-9.6's own words ('so triage can evaluate the reviewer's edits like any other proposed change'): the commit policy records the PN.rX commit but triage never sees the mutation. Fix: commit policy also appends a synthetic finding carrying the mutation status/diff (mirroring the revert path), and the confirm prompt lists the commits in the range with authors so reviewer vs fixer changes stay attributable inside the combined diff.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-006",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed asymmetry: detection uses the narrow ctx.excludes but revert-cleanup spares the whole run_root, so a reviewer file under runs/<slug>/ outside the live run dir survives the revert and is swept into the next fix commit by commit_all. Fix: clean with the same narrow excludes, then re-verify cleanliness and park if any non-bookkeeping dirt remains (fail closed).",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-007",
+      "severity": "major",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed: log_result() runs only on success, so malformed/failed attempts — which carry partial AgentResults with raw_events — leave no transcript, violating FR-4.2's 'every message from every agent' exactly where the evidence matters most. Fix: persist attempt-suffixed transcript/events for every exception carrying a partial, in _run_sub and agent_task.",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    },
+    {
+      "finding_id": "F-008",
+      "severity": "minor",
+      "verdict": "legitimate",
+      "reasoning": "Confirmed on both points: the root 'summary' property violates the pinned strict-mode rule the schema itself documents, and the few-shot examples omit the required target_artifact, inviting pointless schema retries at the cheap tier (FR-3.4). Fix: drop the unused root summary property and add target_artifact: null to all four examples (then re-run the accuracy harness, since the prompt is the measured artifact).",
+      "action": "fix_now",
+      "confidence": "high",
+      "target_artifact": null
+    }
+  ],
+  "summary": "8/8 legitimate, 8 fix_now, 0 declined. The reviewer found real fail-path holes in the cycle's closure logic (confirm cardinality, defer-on-blocking, new-finding handling), the mutation guard's error paths, transcript fidelity on failed attempts, and a strict-mode drift in the triage schema/prompt. All are fixable within P4 round 1; none invalidate the plan or PRD."
+}
