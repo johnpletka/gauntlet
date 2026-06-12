@@ -30,6 +30,7 @@ URL_ENV_VAR = "GAUNTLET_JUDGE_URL"
 MODE_ENV_VAR = "GAUNTLET_JUDGE_MODE"
 RUN_ID_ENV_VAR = "GAUNTLET_RUN_ID"
 STEP_ID_ENV_VAR = "GAUNTLET_STEP_ID"
+REPO_ROOT_ENV_VAR = "GAUNTLET_REPO_ROOT"
 DEFAULT_URL = "http://127.0.0.1:8787"
 HOOK_TIMEOUT_S = 8.0
 
@@ -88,7 +89,14 @@ def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
-    repo_root = payload.get("cwd") or env.get("GAUNTLET_REPO_ROOT") or os.getcwd()
+    # The repo boundary comes from the RUN (engine-injected, fixed for the
+    # run's lifetime), never from the agent's floating per-call cwd: an agent
+    # legitimately working in a scratch/toy directory would otherwise have its
+    # IN-repo edits judged "outside the repository tree" — a deny-loop, seen
+    # live in P5 (notes #29). The cwd is only the no-engine fallback.
+    repo_root = (
+        env.get(REPO_ROOT_ENV_VAR) or payload.get("cwd") or os.getcwd()
+    )
 
     body = {
         "tool_name": tool_name,

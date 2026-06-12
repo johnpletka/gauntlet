@@ -344,6 +344,7 @@ class RunManager:
             audit_path=run_dir / "judge-audit.jsonl",
             run_id=man.run_id,
             judge_model=judge_model,
+            repo_root=self.repo_root,  # the fixed path boundary (notes #29)
         )
         env = judge.start()
         try:

@@ -428,3 +428,26 @@ process, and what it suggests for Gauntlet's design.
     interaction is exactly the class of cross-FR contradiction the PRD
     adversarial-review prompt should hunt for (two normative sections, each
     individually fine, jointly unsatisfiable).
+
+29. **The judge took the repo boundary from the agent's floating cwd — a
+    deny-loop the moment the builder worked in a scratch directory.**
+    `hook_client` computed `repo_root = payload["cwd"] or GAUNTLET_REPO_ROOT
+    or getcwd()` — cwd FIRST. P5's builder legitimately moves into a
+    toy/scratch project (FR-10.1 toy PRD lives in a separate repo), and
+    every Edit/Read it then made against the *real* checkout resolved as
+    "outside the repository tree": fast-path deny on `write-outside-repo`,
+    and a wrong `repo_root` poisoning the LLM rung's context too. It
+    oscillated — work-from-repo allowed, work-from-toy denied — and on the
+    third P5 attempt tipped into a sustained deny-loop (44+ denials, no
+    progress), so I killed the run. Fix: the run's repo boundary is
+    engine-injected (`GAUNTLET_REPO_ROOT`, set by `ManagedJudge` from the
+    real repo root) and the hook prefers it over cwd; cwd is only the
+    no-engine fallback. The priority was simply backwards. Partial builder
+    work preserved at `refs/gauntlet/backup/p5-*-20260612`; the dead run's
+    steps reset for a clean re-run. *Design feedback:* this is the third
+    distinct "config/wiring parses fine but is wrong against the live
+    environment" failure of P5 (#24 opus alias, #26 judge temperature,
+    now #29 repo-root source) — `doctor` and a pre-run smoke (one gated
+    in-repo edit from a scratch cwd) would have caught all three before a
+    20-minute builder burn. The fail-closed posture made every one of them
+    safe-but-blocking rather than dangerous, exactly as designed.

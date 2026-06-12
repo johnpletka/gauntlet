@@ -20,6 +20,7 @@ from pathlib import Path
 
 from gauntlet.judge.hook_client import (
     MODE_ENV_VAR,
+    REPO_ROOT_ENV_VAR,
     RUN_ID_ENV_VAR,
     STEP_ID_ENV_VAR,
     URL_ENV_VAR,
@@ -38,6 +39,7 @@ _MANAGED_ENV_VARS = (
     MODE_ENV_VAR,
     RUN_ID_ENV_VAR,
     STEP_ID_ENV_VAR,
+    REPO_ROOT_ENV_VAR,
 )
 
 
@@ -53,6 +55,7 @@ class ManagedJudge:
         port: int = DEFAULT_PORT,
         mode: str = "unattended",
         startup_timeout_s: float = 15.0,
+        repo_root: Path | None = None,
     ) -> None:
         self.policy_path = policy_path
         self.audit_path = audit_path
@@ -62,6 +65,7 @@ class ManagedJudge:
         self.port = port
         self.mode = mode
         self.startup_timeout_s = startup_timeout_s
+        self.repo_root = repo_root
         self.token = secrets.token_urlsafe(32)
         self._proc: subprocess.Popen | None = None
         self._env_snapshot: dict[str, str | None] = {}
@@ -72,12 +76,18 @@ class ManagedJudge:
 
     def env(self) -> dict[str, str]:
         """The per-run judge env to inject for agent subprocesses (FR-7.3)."""
-        return {
+        env = {
             TOKEN_ENV_VAR: self.token,
             URL_ENV_VAR: self.url,
             MODE_ENV_VAR: self.mode,
             RUN_ID_ENV_VAR: self.run_id,
         }
+        if self.repo_root is not None:
+            # The run's fixed repo boundary for the hooks' path checks — the
+            # agent's floating cwd must never define "the repository tree"
+            # (P5 deny-loop, notes #29).
+            env[REPO_ROOT_ENV_VAR] = str(self.repo_root)
+        return env
 
     def start(self) -> dict[str, str]:
         child_env = {**os.environ, TOKEN_ENV_VAR: self.token}
