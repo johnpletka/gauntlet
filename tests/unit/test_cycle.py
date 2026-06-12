@@ -187,24 +187,31 @@ def test_no_findings_converges_without_commit(cycle_repo):
 
 
 def test_converges_in_two_rounds(cycle_repo):
+    # A BLOCKING finding loops to a second round (policy A); major would not.
     reviewer = SeqAdapter(
-        REVIEW(F("F-001")), CONFIRM(CV("F-001", "unresolved")),   # round 1
-        REVIEW(F("F-001")), CONFIRM(CV("F-001", "resolved")),     # round 2
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "resolved")),    # r2
     )
+    # blocking findings escalate (F-009), so an escalation agent is needed or
+    # triage parks before convergence is even reached.
     adapters = {
         "reviewer": reviewer,
         "triage": SeqAdapter(V("F-001"), V("F-001")),
+        "esc": SeqAdapter(V("F-001"), V("F-001")),
         "builder": SeqAdapter(
             writer("src.py", "attempt 1\n", {}),
             writer("src.py", "attempt 2\n", {}),
         ),
     }
-    status, man, _ = run_cycle(cycle_repo, adapters)
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
     assert status == M.RUN_DONE
     assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
     assert "converged in round 2" in man.record("cycle").notes
-    # round-2 review was told what stayed open (carried context)
+    # round-2 is the regression-scoped re-review, told what stayed open
     r2_review_prompt = reviewer.calls[2]["prompt"]
+    assert "re-reviewing a FIX ROUND" in r2_review_prompt or "re-review" in r2_review_prompt.lower()
     assert "still open from round 1" in r2_review_prompt
     assert "F-001" in r2_review_prompt
 
@@ -673,12 +680,13 @@ def test_upstream_target_artifact_parks_for_human(cycle_repo):
     assert "FR-10.4" in man.record("cycle").notes
 
 
-# --- P4.r1 F-003: non-blocking confirm regressions --------------------------------------
-def test_major_new_finding_forces_another_round(cycle_repo):
+# --- convergence policy A (BOOTSTRAP-NOTES #30) -----------------------------------------
+def test_blocking_new_finding_forces_another_round(cycle_repo):
+    # Only a BLOCKING new finding (a blocking regression) buys another round.
     reviewer = SeqAdapter(
         REVIEW(F("F-001")),
-        CONFIRM(CV("F-001"), new=[{"severity": "major",
-                                   "claim": "fix regressed the parser",
+        CONFIRM(CV("F-001"), new=[{"severity": "blocking",
+                                   "claim": "fix broke the build",
                                    "location": "src.py"}]),
         REVIEW(F("F-001")),                      # round 2 sees it carried
         CONFIRM(CV("F-001")),
@@ -693,7 +701,78 @@ def test_major_new_finding_forces_another_round(cycle_repo):
     status, man, _ = run_cycle(cycle_repo, adapters)
     assert status == M.RUN_DONE
     assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
-    assert "fix regressed the parser" in reviewer.calls[2]["prompt"]  # carried
+    assert "fix broke the build" in reviewer.calls[2]["prompt"]  # carried
+
+
+def test_major_new_finding_surfaced_not_looped(cycle_repo):
+    # Policy A: a MAJOR new finding from confirm does NOT force a round; it is
+    # recorded and surfaced for the gate. The cycle converges in round 1.
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(F("F-001")),
+            CONFIRM(CV("F-001"), new=[{"severity": "major",
+                                       "claim": "fix regressed the parser",
+                                       "location": "src.py"}]),
+        ),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1"]   # one round only
+    rec = man.record("cycle")
+    assert "surfaced for the gate" in rec.notes
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    surfaced = confirm["surfaced_for_gate"]
+    assert any(s["confirm_verdict"] == "new_finding" for s in surfaced)
+
+
+def test_major_finding_gets_one_attempt_then_surfaces(cycle_repo):
+    # The headline of policy A: an accepted MAJOR finding that stays unresolved
+    # after its fix is surfaced at the gate, NOT looped on (one attempt).
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")), CONFIRM(CV("F-001", "unresolved")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "attempted\n", {})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1"]   # exactly one attempt
+    assert len(reviewer.calls) == 2  # review + confirm, no round 2
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    assert any(s["id"] == "F-001" for s in confirm["surfaced_for_gate"])
+
+
+def test_strict_convergence_still_loops_on_major(cycle_repo):
+    # The opt-out: cycle_convergence=strict restores the P4 behavior where any
+    # accepted-unresolved finding loops to max_rounds.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")), CONFIRM(CV("F-001", "unresolved")),
+        REVIEW(F("F-001", "major")), CONFIRM(CV("F-001", "resolved")),
+    )
+    cfg = {**BASE_CONFIG, "cycle_convergence": "strict"}
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001"), V("F-001")),
+        "builder": SeqAdapter(
+            writer("src.py", "v1\n", {}), writer("src.py", "v2\n", {}),
+        ),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters, config=cfg)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]  # major looped
+
+
+def test_unknown_convergence_policy_fails_closed(cycle_repo):
+    adapters = {"reviewer": SeqAdapter(), "triage": SeqAdapter(), "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"convergence": "whatever"}
+    )
+    assert status == M.RUN_FAILED
+    assert "convergence policy" in man.record("cycle").notes
 
 
 def test_minor_new_finding_is_recorded_but_does_not_buy_a_round(cycle_repo):

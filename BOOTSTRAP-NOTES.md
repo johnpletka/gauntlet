@@ -451,3 +451,29 @@ process, and what it suggests for Gauntlet's design.
     in-repo edit from a scratch cwd) would have caught all three before a
     20-minute builder burn. The fail-closed posture made every one of them
     safe-but-blocking rather than dangerous, exactly as designed.
+
+30. **Cycle convergence policy made explicit (ratified by John, 2026-06-12):
+    severity-gated, regression-scoped — no bikeshedding/oscillation loop.**
+    The P4 cycle physically cannot loop forever (`max_rounds`, default 2, then
+    FR-10.5 escalation), but two things fed oscillation: each round re-ran a
+    FULL adversarial review (round 2 could invent fresh nitpicks), and a P4.r1
+    fix (F-003) made `major` confirm-regressions force another round. John
+    flagged this and chose option A. New behavior (config `cycle_convergence`,
+    default `"blocking"`; `"strict"` restores the P4 original):
+    - **blocking (P0):** the only severity that forces another round; loops to
+      `max_rounds`, then escalates to the human gate. Never silently shipped.
+    - **major (P1):** gets ONE fix attempt; if still open it is *surfaced* at
+      the human gate (recorded in `confirm.json` → `surfaced_for_gate`), not
+      looped on. Kills the "major continuously not addressed" oscillation.
+    - **minor/nit:** one shot in round 1, never loops.
+    - **rounds 2+ are regression-scoped** (`prompts/cycle-rereview.md`): the
+      re-reviewer confirms the carried (blocking) findings and may raise a new
+      finding only for a *blocking regression* — it does not hunt fresh issues.
+    Consistent with FR-10.5 ("satisfied" = no blocking/unresolved), so this is
+    an in-scope refinement recorded here, not a plan/PRD amendment. The
+    bootstrap's own P1–P4 cycles all converged in 1–2 rounds with mostly-
+    legitimate findings, so oscillation was never stress-tested in-house — the
+    policy is anticipatory, for the general-purpose use on other repos (the
+    tool's actual point). *Design feedback:* `report --trend` (P7/FR-6.6)
+    should track findings-per-round and the surfaced-vs-fixed ratio so a
+    reviewer/triager that drifts into nitpicking is visible in the metrics.

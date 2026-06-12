@@ -54,6 +54,7 @@ DEFAULT_CONFIRM_SCHEMA = "schemas/confirm.json"
 REJECT_VERDICTS = frozenset({"bikeshedding", "premature_optimization", "not_applicable"})
 OPEN_CONFIRM_VERDICTS = frozenset({"unresolved", "regression_introduced"})
 MUTATION_POLICIES = frozenset({"commit", "revert", "halt"})
+CONVERGENCE_POLICIES = frozenset({"blocking", "strict"})
 
 # §8: reviewer/confirmer output reaches the triager (and prompts generally)
 # wrapped between these markers, declared untrusted. Tests assert the wrap.
@@ -120,11 +121,19 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     triage_schema = _load_schema(ctx, step.get("triage_schema") or DEFAULT_TRIAGE_SCHEMA)
     confirm_schema = _load_schema(ctx, step.get("confirm_schema") or DEFAULT_CONFIRM_SCHEMA)
 
+    convergence = step.get("convergence") or ctx.config.cycle_convergence
+    if convergence not in CONVERGENCE_POLICIES:
+        return StepResult(
+            status=FAILED,
+            notes=f"unknown cycle convergence policy {convergence!r} "
+            f"(BOOTSTRAP-NOTES #30: {'|'.join(sorted(CONVERGENCE_POLICIES))})",
+        )
     usage = _UsageAccumulator()
     commits: list[tuple[str, str]] = []
     artifact_writes: dict[str, Path] = {}
-    carried: list[dict[str, Any]] = []  # unresolved findings carried into the next round
-    open_blockers: list[str] = []
+    carried: list[dict[str, Any]] = []  # open findings carried into the next round
+    surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
+    last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
 
     for rnd in range(1, max_rounds + 1):
         # FR-9.3: control passes to a reviewer only on a clean, committed tree.
@@ -265,36 +274,49 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         )
         cdata = confirm.structured or {}
         actions = {v["finding_id"]: v["action"] for v in verdicts}
-        open_items, open_blockers, reconciliation = _open_after_confirm(
-            by_id, actions, cdata
-        )
-        # The reconciliation result (missing / unknown / duplicate verdict IDs,
-        # F-001) is recorded next to the verdicts — data over inference.
+        open_items, reconciliation = _open_after_confirm(by_id, actions, cdata)
+        forcing = _forcing_open(open_items, convergence)
+        # Non-blocking open items don't loop (policy A); they accumulate and are
+        # surfaced at the human gate (BOOTSTRAP-NOTES #30). Dedup by id, latest
+        # round's verdict wins.
+        for it in open_items:
+            if it not in forcing:
+                surfaced[str(it.get("id", "?"))] = {**it, "round": rnd}
+        # The reconciliation + the gate-surfaced set are recorded next to the
+        # verdicts — data over inference.
         artifact_writes["confirm.json"] = _write_artifact(
-            ctx, "confirm.json", {**cdata, "engine_reconciliation": reconciliation}
+            ctx, "confirm.json",
+            {**cdata, "engine_reconciliation": reconciliation,
+             "surfaced_for_gate": list(surfaced.values())},
         )
-        if not open_items and not open_blockers:
+        last_forcing = forcing
+        if not forcing:
             return _finish(
                 StepResult(
                     status=DONE,
-                    notes=f"converged in round {rnd}: all confirm verdicts "
-                    f"resolved ({len(accepted)} fixed, "
-                    f"{len(verdicts) - len(accepted)} declined with reasons)",
+                    notes=f"converged in round {rnd} ({convergence} policy): no "
+                    f"open {'finding' if convergence == 'strict' else 'blocking'}"
+                    f"; {len(accepted)} fixed, "
+                    f"{len(surfaced)} non-blocking item(s) surfaced for the gate"
+                    + (f": {', '.join(surfaced)}" if surfaced else ""),
                 ),
                 usage, commits, artifact_writes,
             )
-        # next round reviews the post-fix state, scoped by what stayed open
+        # next round is regression-scoped and reviews only what still forces it
         handoff = fix_sha
-        carried = open_items
+        carried = forcing
 
     # max_rounds exhausted (FR-10.5): open blockers escalate, never carry forward.
-    if open_blockers:
+    if last_forcing:
         return _finish(
             StepResult(
                 status=PARKED,
                 notes="escalation (FR-10.5): max_rounds="
-                f"{max_rounds} exhausted with open blocking findings: "
-                f"{', '.join(open_blockers)}; a human must resolve",
+                f"{max_rounds} exhausted with open "
+                f"{'finding' if convergence == 'strict' else 'blocking'}(s): "
+                f"{_fmt_ids(last_forcing)}; a human must resolve"
+                + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
+                   if surfaced else ""),
             ),
             usage, commits, artifact_writes,
         )
@@ -422,8 +444,16 @@ def _review_prompt(
     step: Step, ctx: StepContext, handoff: str, rnd: int,
     carried: list[dict[str, Any]],
 ) -> str:
-    template = _template(ctx, step, "review_prompt", "prompts/cycle-review.md",
-                         _BUILTIN_REVIEW)
+    # Round 1 is a full adversarial review; rounds 2+ are REGRESSION-SCOPED so
+    # the loop converges instead of bikeshedding (BOOTSTRAP-NOTES #30): the
+    # re-reviewer confirms the carried findings and only raises something new
+    # if it is a blocking regression the fixes introduced.
+    if rnd > 1:
+        template = _template(ctx, step, "rereview_prompt",
+                             "prompts/cycle-rereview.md", _BUILTIN_REREVIEW)
+    else:
+        template = _template(ctx, step, "review_prompt", "prompts/cycle-review.md",
+                             _BUILTIN_REVIEW)
     parts = [template]
     mode = step.get("mode", "artifact")
     if mode == "code_review":
@@ -438,7 +468,8 @@ def _review_prompt(
         parts.append(f"\n--- artifact under review: {name} ---\n{Path(path).read_text()}")
     if carried:
         parts.append(
-            f"\n--- findings still open from round {rnd - 1} (focus here) ---\n"
+            f"\n--- findings still open from round {rnd - 1} (re-review ONLY "
+            f"these; raise new findings only for blocking regressions) ---\n"
             + wrap_as_data(json.dumps(carried, indent=2))
         )
     return "".join(parts)
@@ -656,8 +687,12 @@ def _open_after_confirm(
     by_id: dict[str, dict[str, Any]],
     actions: dict[str, str],
     cdata: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
-    """What stays open after a confirm pass, and which of it is blocking.
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """What stays open after a confirm pass — each item tagged with severity.
+
+    Reports the open set; the *policy* of which open items force another round
+    is the caller's (``cycle_convergence``, BOOTSTRAP-NOTES #30), so this
+    function stays purely descriptive.
 
     Fail-closed reconciliation (P4.r1 F-001): confirm verdicts are matched
     against the round's findings — a FIX_NOW finding with no verdict reads as
@@ -669,8 +704,9 @@ def _open_after_confirm(
 
     Open: ``unresolved``/``regression_introduced`` on an accepted finding,
     ``partially_resolved`` on a blocking one, a missing verdict for an
-    accepted finding, and new findings of blocking or major severity (P4.r1
-    F-003 — minor/nit new findings are recorded, but must not buy a round).
+    accepted finding, and new findings of blocking/major severity (minor/nit
+    new findings are noise, not recorded). Each open item carries ``severity``
+    and ``confirm_verdict`` so the caller can apply its convergence policy.
     """
     verdict_by_id: dict[str, dict[str, Any]] = {}
     unknown: list[str] = []
@@ -685,7 +721,6 @@ def _open_after_confirm(
             unknown.append(str(fid))
 
     open_items: list[dict[str, Any]] = []
-    blockers: list[str] = []
     missing: list[str] = []
     for fid, finding in by_id.items():
         severity = finding.get("severity", "")
@@ -705,19 +740,31 @@ def _open_after_confirm(
             or (verdict == "partially_resolved" and severity == "blocking")
         )
         if is_open:
-            open_items.append({**finding, "confirm_verdict": verdict,
+            open_items.append({**finding, "severity": severity,
+                               "confirm_verdict": verdict,
                                "confirm_notes": v.get("notes", "")})
-            if severity == "blocking" or verdict == "regression_introduced":
-                blockers.append(fid)
     for nf in cdata.get("new_findings") or []:
         severity = nf.get("severity")
         if severity in ("blocking", "major"):
-            open_items.append({**nf, "id": "NEW", "confirm_verdict": "new_finding"})
-            if severity == "blocking":
-                blockers.append(f"new: {nf.get('claim', '?')[:60]}")
+            open_items.append({**nf, "id": "NEW", "severity": severity,
+                               "confirm_verdict": "new_finding"})
     reconciliation = {"missing": missing, "unknown": unknown,
                       "duplicates": duplicates}
-    return open_items, blockers, reconciliation
+    return open_items, reconciliation
+
+
+def _forcing_open(open_items: list[dict[str, Any]], convergence: str) -> list[dict[str, Any]]:
+    """The open items that force another round under the convergence policy.
+
+    ``blocking`` (policy A, default): only blocking-severity open items loop.
+    ``strict``: every open item loops (the P4 original)."""
+    if convergence == "strict":
+        return list(open_items)
+    return [it for it in open_items if it.get("severity") == "blocking"]
+
+
+def _fmt_ids(items: list[dict[str, Any]]) -> str:
+    return ", ".join(str(it.get("id", "?")) for it in items)
 
 
 # --- fix-round commit message (FR-9.4) -------------------------------------------
@@ -821,6 +868,16 @@ _BUILTIN_REVIEW = (
     "id (F-001…), severity (blocking|major|minor|nit), category, location, "
     "claim, evidence, optional suggested_fix. Questions that are not claims "
     "go in open_questions."
+)
+_BUILTIN_REREVIEW = (
+    "You are re-reviewing a FIX ROUND, not doing a fresh review. The findings "
+    "still open from the prior round are listed below. Your job is narrow: "
+    "decide whether the fixes addressed THOSE findings. Return findings JSON, "
+    "but raise a NEW finding ONLY if the fixes introduced a `blocking` "
+    "regression — do NOT hunt for fresh minor/major issues; that review "
+    "happened in round 1 and re-litigating it is bikeshedding (BOOTSTRAP-NOTES "
+    "#30). Re-state a carried finding (same id) only if it is genuinely still "
+    "unaddressed. Questions go in open_questions."
 )
 _BUILTIN_TRIAGE = (
     "You are a triage classifier. Judge the single review finding below.\n"

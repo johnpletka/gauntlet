@@ -107,6 +107,15 @@ class RunConfig(BaseModel):
     # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
 
+    # Cycle convergence policy (FR-10.5; ratified 2026-06-12, BOOTSTRAP-NOTES
+    # #30). What forces another review round:
+    #   "blocking" (default) — only open BLOCKING findings loop (to max_rounds,
+    #     then escalate). Major gets one fix attempt then is surfaced at the
+    #     human gate; minor never loops. Rounds 2+ are regression-scoped.
+    #   "strict" — any accepted-but-unresolved finding loops (the P4 original);
+    #     higher fidelity, but oscillates on majors/minors.
+    cycle_convergence: str = "blocking"
+
     # Configurable redaction list (FR-4.4), default-on; the transcript logger
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
