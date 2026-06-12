@@ -316,3 +316,18 @@ process, and what it suggests for Gauntlet's design.
     and the next round's handoff — the confirm pass writes AFTER the commit —
     breaking FR-9.3 inside the cycle itself. Tracked commits carry the work;
     the durable audit trail is the run dir, committed deliberately (FR-4.5).
+
+23. **Manual review records bloat the FR-9.5 confirm range — engine design
+    already avoids it.** The P4 manual confirm's `<handoff>..<fix>` diff
+    initially weighed 520KB because the tracked `P4.r1` record commit (433KB
+    of captured review events) sat inside the range; the confirm prompt
+    excluded that bookkeeping explicitly and dropped to 59KB. Engine-driven
+    cycles are immune by construction: round records live under the
+    (excluded, self-ignored) run dir and never enter a range diff. Until the
+    manual process retires (P5, switchover #2), manual confirm prompts must
+    keep scoping their own records out. P4's review round itself worked
+    end-to-end: 8 schema-valid findings first try on the normative schema,
+    8/8 ratified-fixed-confirmed in one round, two real fail-path classes
+    (confirm-by-omission, defer-on-blocking) that the cycle now guards
+    against — the adversarial process catching holes in the adversarial
+    machinery is the dogfood working.
