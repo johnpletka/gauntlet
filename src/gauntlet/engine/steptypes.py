@@ -254,21 +254,47 @@ def _draft_commit_message(step: Step, ctx: StepContext):
     prompt = f"{header}\n{change}\n"
     max_redrafts = int(step.get("max_redrafts", 2))
     message = ""
-    usage = None
+    usage = _UsageAccumulator()  # sum across ALL draft attempts, incl. rejected
     session_id = None
     for _attempt in range(1 + max_redrafts):
         result = adapter.run(prompt, cwd=ctx.repo_root)
-        usage = result.usage  # accumulated per call by the orchestrator's totals
+        usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
         if validate_commit_message(message) is None:
-            return message, usage, session_id
+            return message, usage.result(), session_id
         prompt = (
             f"{header}\n\nYour previous draft was rejected: "
             f"{validate_commit_message(message).reason}. "
             f"Return only the corrected commit message.\n{change}\n"
         )
-    return message, usage, session_id
+    return message, usage.result(), session_id
+
+
+class _UsageAccumulator:
+    """Sum Usage across redraft attempts so rejected drafts still count (F-008)."""
+
+    def __init__(self) -> None:
+        self._in = 0
+        self._out = 0
+        self._cost: float | None = None
+        self._seen = False
+
+    def add(self, usage) -> None:
+        if usage is None:
+            return
+        self._seen = True
+        self._in += usage.input_tokens or 0
+        self._out += usage.output_tokens or 0
+        if usage.cost_usd is not None:
+            self._cost = (self._cost or 0.0) + usage.cost_usd
+
+    def result(self):
+        from gauntlet.adapters.base import Usage
+
+        if not self._seen:
+            return None
+        return Usage(input_tokens=self._in, output_tokens=self._out, cost_usd=self._cost)
 
 
 def _change_context(ctx: StepContext) -> str:
