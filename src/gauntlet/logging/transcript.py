@@ -65,15 +65,21 @@ class StepLogger:
         self.writer.write_text(self.step_dir / "prompt.md", prompt)
 
     def log_result(
-        self, result: AgentResult, *, structured_name: str = "structured.json"
+        self,
+        result: AgentResult,
+        *,
+        structured_name: str = "structured.json",
+        suffix: str = "",
     ) -> None:
         """Persist transcript.md + events.jsonl (+ structured output) for one
-        adapter invocation. Lossless: every raw event is written."""
+        adapter invocation. Lossless: every raw event is written. ``suffix``
+        names a failed attempt's record (e.g. ``-attempt1``) so retries never
+        overwrite evidence (FR-4.2 / P4.r1 F-007)."""
         self.writer.write_text(
-            self.step_dir / "transcript.md",
+            self.step_dir / f"transcript{suffix}.md",
             render_transcript(result.raw_events, final_text=result.text),
         )
-        events_path = self.step_dir / "events.jsonl"
+        events_path = self.step_dir / f"events{suffix}.jsonl"
         if not result.raw_events:
             # the lossless record exists even when an adapter reported no
             # events (e.g. test fakes) — absence would read as "not captured"

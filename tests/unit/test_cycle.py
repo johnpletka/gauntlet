@@ -275,13 +275,16 @@ def mutating_review(result):
 
 
 def test_mutation_policy_commit_records_reviewer_attributed_commit(cycle_repo):
+    triage = SeqAdapter(
+        V("F-001"), V("F-R1-MUTATION-1", "not_applicable", "reject"),
+    )
+    reviewer = SeqAdapter(mutating_review(REVIEW(F("F-001"))), CONFIRM(CV("F-001")))
     adapters = {
-        "reviewer": SeqAdapter(mutating_review(REVIEW(F("F-001"))),
-                               CONFIRM(CV("F-001"))),
-        "triage": SeqAdapter(V("F-001")),
+        "reviewer": reviewer,
+        "triage": triage,
         "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
     }
-    status, man, _ = run_cycle(cycle_repo, adapters)  # default policy: commit
+    status, man, run_dir = run_cycle(cycle_repo, adapters)  # default policy: commit
     assert status == M.RUN_DONE
     assert [c.phase for c in man.commits] == ["P5.r1", "P5.1"]
     mutation_sha = man.commits[0].sha
@@ -293,13 +296,22 @@ def test_mutation_policy_commit_records_reviewer_attributed_commit(cycle_repo):
     ).stdout.strip()
     assert author == "Gauntlet Reviewer (codex) <reviewer@gauntlet.local>"
     assert (cycle_repo / "sneaky.txt").exists()  # recorded, not lost
+    # P4.r1 F-005: triage SAW the mutation as a synthetic finding (with diff)…
+    assert len(triage.calls) == 2
+    assert "sneaky.txt" in triage.calls[1]["prompt"]
+    assert "mutation diff" in triage.calls[1]["prompt"]
+    # …and the confirm prompt attributes the commits in the range by author.
+    confirm_prompt = reviewer.calls[1]["prompt"]
+    assert "commits in range" in confirm_prompt
+    assert "Gauntlet Reviewer (codex)" in confirm_prompt
+    assert "Gauntlet Builder (claude)" in confirm_prompt
 
 
 def test_mutation_policy_revert_restores_handoff_and_adds_finding(cycle_repo):
     # triage must still see the synthetic finding even though review was empty
     adapters = {
         "reviewer": SeqAdapter(mutating_review(REVIEW())),
-        "triage": SeqAdapter(V("F-R1-MUTATION", "not_applicable", "reject")),
+        "triage": SeqAdapter(V("F-R1-MUTATION-1", "not_applicable", "reject")),
         "builder": SeqAdapter(),
     }
     status, man, run_dir = run_cycle(
@@ -310,8 +322,8 @@ def test_mutation_policy_revert_restores_handoff_and_adds_finding(cycle_repo):
     assert gitops.is_clean(cycle_repo, exclude=["runs"])
     findings = json.loads((run_dir / "artifacts" / "findings.json").read_text())
     ids = [f["id"] for f in findings["findings"]]
-    assert "F-R1-MUTATION" in ids
-    mut = findings["findings"][ids.index("F-R1-MUTATION")]
+    assert "F-R1-MUTATION-1" in ids
+    mut = findings["findings"][ids.index("F-R1-MUTATION-1")]
     assert mut["category"] == "principle-violation"
     # partial work preserved on a backup ref (never silently destroyed)
     refs = subprocess.run(
@@ -362,12 +374,15 @@ def test_fix_commit_body_lists_declined_findings_with_reasons(cycle_repo):
 
 
 def test_fix_commit_records_upstream_target_artifact(cycle_repo):
-    # BOOTSTRAP-NOTES #6: a finding whose fix lands upstream is routed explicitly.
+    # BOOTSTRAP-NOTES #6: a target_artifact verdict is routed explicitly. A
+    # non-rejected one parks the cycle (P4.r1 F-002); a REJECTED one is a
+    # recorded decline whose upstream pointer still lands in the commit body.
     adapters = {
-        "reviewer": SeqAdapter(REVIEW(F("F-001"), F("F-002")), CONFIRM(CV("F-001"), CV("F-002"))),
+        "reviewer": SeqAdapter(REVIEW(F("F-001"), F("F-002")),
+                               CONFIRM(CV("F-001"), CV("F-002"))),
         "triage": SeqAdapter(
             V("F-001"),
-            V("F-002", action="defer", target_artifact="prd.md"),
+            V("F-002", "not_applicable", "reject", target_artifact="prd.md"),
         ),
         "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
     }
@@ -570,6 +585,222 @@ def test_missing_roles_fail(cycle_repo):
         adapter_factory=lambda n: adapters[n],
     )
     assert orch.drive() == M.RUN_FAILED
+
+
+# --- P4.r1 F-001: confirm verdict reconciliation (fail closed) -----------------------
+def test_confirm_omitting_an_accepted_finding_does_not_converge(cycle_repo):
+    # The confirmer "loses" blocking F-001 both rounds: absence must read as
+    # unresolved, so the cycle exhausts max_rounds and escalates (FR-10.5).
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")), CONFIRM(),          # round 1: no verdicts
+        REVIEW(F("F-001", "blocking")), CONFIRM(),          # round 2: still none
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001"), V("F-001")),
+        "builder": SeqAdapter(
+            writer("src.py", "try 1\n", {}), writer("src.py", "try 2\n", {}),
+        ),
+        "esc": SeqAdapter(V("F-001"), V("F-001")),
+    }
+    status, man, run_dir = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_PARKED
+    assert "FR-10.5" in man.record("cycle").notes
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    assert confirm["engine_reconciliation"]["missing"] == ["F-001"]
+
+
+def test_confirm_unknown_and_duplicate_ids_recorded_not_counted(cycle_repo):
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),
+        CONFIRM(CV("F-001", "unresolved"),      # duplicate: last wins…
+                CV("F-001", "resolved"),         # …this one
+                CV("F-999", "resolved")),        # unknown id: noise, recorded
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, _, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE  # last-wins resolved verdict closes F-001
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    assert confirm["engine_reconciliation"]["unknown"] == ["F-999"]
+    assert confirm["engine_reconciliation"]["duplicates"] == ["F-001"]
+
+
+def test_declined_finding_needs_no_confirm_verdict(cycle_repo):
+    # Closure for a rejected finding came from triage; confirm omitting it is
+    # fine and must not hold the cycle open.
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"), F("F-002")),
+                               CONFIRM(CV("F-001"))),
+        "triage": SeqAdapter(V("F-001"), V("F-002", "bikeshedding", "reject")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, _, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+
+
+# --- P4.r1 F-002: closure guards --------------------------------------------------------
+def test_blocking_legitimate_defer_parks_instead_of_converging(cycle_repo):
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001", "blocking"))),
+        "triage": SeqAdapter(V("F-001", action="defer")),
+        "builder": SeqAdapter(),
+        "esc": SeqAdapter(V("F-001", action="defer")),  # strong model agrees: defer
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert "FR-10.5" in rec.notes and "F-001" in rec.notes
+
+
+def test_upstream_target_artifact_parks_for_human(cycle_repo):
+    # FR-10.4: a finding whose fix lands in a different (approved) artifact
+    # halts at a gate; the cycle never silently amends or silently converges.
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001", action="defer", target_artifact="prd.md")),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    assert "FR-10.4" in man.record("cycle").notes
+
+
+# --- P4.r1 F-003: non-blocking confirm regressions --------------------------------------
+def test_major_new_finding_forces_another_round(cycle_repo):
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),
+        CONFIRM(CV("F-001"), new=[{"severity": "major",
+                                   "claim": "fix regressed the parser",
+                                   "location": "src.py"}]),
+        REVIEW(F("F-001")),                      # round 2 sees it carried
+        CONFIRM(CV("F-001")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001"), V("F-001")),
+        "builder": SeqAdapter(
+            writer("src.py", "v1\n", {}), writer("src.py", "v2\n", {}),
+        ),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
+    assert "fix regressed the parser" in reviewer.calls[2]["prompt"]  # carried
+
+
+def test_minor_new_finding_is_recorded_but_does_not_buy_a_round(cycle_repo):
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(F("F-001")),
+            CONFIRM(CV("F-001"), new=[{"severity": "nit",
+                                       "claim": "typo in comment",
+                                       "location": "src.py"}]),
+        ),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    assert confirm["new_findings"][0]["claim"] == "typo in comment"  # recorded
+
+
+# --- P4.r1 F-004: mutation guard on failed review attempts ------------------------------
+def test_mutation_before_malformed_output_is_committed_before_retry(cycle_repo):
+    def mutate_then_fail(cwd):
+        (Path(cwd) / "sneaky.txt").write_text("mutated then crashed\n")
+        raise MalformedOutputError("schema validation failed: garbage")
+
+    reviewer = SeqAdapter(
+        lambda cwd: mutate_then_fail(cwd),   # attempt 1: mutate + malformed
+        REVIEW(F("F-001")),                  # attempt 2: clean review
+        CONFIRM(CV("F-001")),
+    )
+    triage = SeqAdapter(
+        V("F-001"), V("F-R1-MUTATION-1", "not_applicable", "reject"),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": triage,
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)  # policy: commit
+    assert status == M.RUN_DONE
+    # the mutation was committed BEFORE the retry, so attempt 2 started clean
+    assert [c.phase for c in man.commits] == ["P5.r1", "P5.1"]
+    # triage saw the synthetic mutation finding (appended after review's own)
+    assert "sneaky.txt" in triage.calls[1]["prompt"]
+
+
+def test_mutation_with_halt_policy_parks_even_on_malformed_attempt(cycle_repo):
+    def mutate_then_fail(cwd):
+        (Path(cwd) / "sneaky.txt").write_text("mutated then crashed\n")
+        raise MalformedOutputError("schema validation failed: garbage")
+
+    adapters = {
+        "reviewer": SeqAdapter(lambda cwd: mutate_then_fail(cwd)),
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"reviewer_mutation": "halt"}
+    )
+    assert status == M.RUN_PARKED
+    assert "sneaky.txt" in man.record("cycle").notes
+
+
+# --- P4.r1 F-006: revert cleanup uses the narrow excludes -------------------------------
+def test_revert_cleans_reviewer_file_under_run_root(cycle_repo):
+    # A reviewer file under runs/<slug>/ but OUTSIDE the live run dir is real
+    # dirt: detected, reverted, and cleaned — never swept into a later commit.
+    adapters = {
+        "reviewer": SeqAdapter(
+            writer("runs/demo/reviewer-droppings.txt", "oops\n", REVIEW())
+        ),
+        "triage": SeqAdapter(V("F-R1-MUTATION-1", "not_applicable", "reject")),
+        "builder": SeqAdapter(),
+    }
+    status, _, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"reviewer_mutation": "revert"}
+    )
+    assert status == M.RUN_DONE
+    assert not (cycle_repo / "runs" / "demo" / "reviewer-droppings.txt").exists()
+    assert gitops.is_clean(cycle_repo, exclude=["runs/demo/run-1"])
+
+
+# --- P4.r1 F-007: failed attempts leave transcripts --------------------------------------
+def test_malformed_attempt_partial_is_logged(cycle_repo):
+    from gauntlet.adapters.base import AgentResult as AR
+
+    partial = AR(text="half an answer",
+                 raw_events=[{"type": "x", "v": 1}], exit_code=0)
+    triage = SeqAdapter(
+        MalformedOutputError("schema validation failed: bad", partial=partial),
+        V("F-001", "bikeshedding", "reject"),
+    )
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": triage,
+        "builder": SeqAdapter(),
+    }
+    status, _, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    sub = run_dir / "steps" / "cycle" / "r1-triage" / "F-001"
+    assert (sub / "events-attempt1.jsonl").exists()      # lossless (FR-4.2)
+    assert (sub / "transcript-attempt1.md").exists()
+    assert "half an answer" in (sub / "transcript-attempt1.md").read_text()
+    assert (sub / "attempt1-error.txt").exists()
+    # the successful retry keeps the unsuffixed names
+    assert (sub / "events.jsonl").exists()
 
 
 # --- FR-4: sub-step transcripts --------------------------------------------------------

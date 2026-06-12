@@ -60,7 +60,7 @@ Finding (data):
 Verdict:
 ```json
 {"finding_id": "F-101", "verdict": "legitimate", "action": "fix_now",
- "confidence": "high",
+ "confidence": "high", "target_artifact": null,
  "reasoning": "Write-in-place genuinely loses state on a crash between truncate and flush; atomic write-temp-then-rename is the standard fix."}
 ```
 
@@ -74,7 +74,7 @@ Finding (data):
 Verdict:
 ```json
 {"finding_id": "F-102", "verdict": "bikeshedding", "action": "reject",
- "confidence": "high",
+ "confidence": "high", "target_artifact": null,
  "reasoning": "A naming preference with no behavioral or maintainability consequence; both spellings are unambiguous."}
 ```
 
@@ -88,7 +88,7 @@ Finding (data):
 Verdict:
 ```json
 {"finding_id": "F-103", "verdict": "premature_optimization", "action": "reject",
- "confidence": "high",
+ "confidence": "high", "target_artifact": null,
  "reasoning": "Runs have tens of steps by design and the flat JSON file is an explicit v1 decision; an indexed store adds machinery for a scale that does not exist."}
 ```
 
@@ -102,6 +102,6 @@ Finding (data):
 Verdict:
 ```json
 {"finding_id": "F-104", "verdict": "not_applicable", "action": "reject",
- "confidence": "medium",
+ "confidence": "medium", "target_artifact": null,
  "reasoning": "The call site is already wrapped by run_with_timeout, which kills the child on expiry; the claim misses the enclosing guard. Medium confidence because only the snippet, not the wrapper, is quoted."}
 ```

@@ -34,7 +34,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from gauntlet.adapters.base import MalformedOutputError
+from gauntlet.adapters.base import AdapterError, MalformedOutputError
 from gauntlet.engine import gitops
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
@@ -138,25 +138,25 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 usage, commits, artifact_writes,
             )
 
-        # ---- 1. review -------------------------------------------------------
+        # ---- 1. review, FR-9.6 guard applied after EVERY attempt (F-004) ------
+        # A reviewer can mutate the tree and THEN fail schema validation; the
+        # guard therefore runs between attempts (so a retry never re-enters on
+        # a dirty tree) and on the failure path (so the policy always applies).
         review_prompt = _review_prompt(step, ctx, handoff, rnd, carried)
-        review = _run_sub(
-            ctx, reviewer, review_prompt,
-            schema=findings_schema, usage=usage,
-            logger=step_logger(ctx, f"r{rnd}-review"),
-            structured_name="findings.json",
-        )
-
-        # ---- FR-9.6 mutation guard --------------------------------------------
-        parked, synthetic = _mutation_guard(
-            step, ctx, policy, phase, rnd, handoff, reviewer, commits
-        )
-        if parked is not None:
-            return _finish(parked, usage, commits, artifact_writes)
+        guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
+        try:
+            review = _run_sub(
+                ctx, reviewer, review_prompt,
+                schema=findings_schema, usage=usage,
+                logger=step_logger(ctx, f"r{rnd}-review"),
+                structured_name="findings.json",
+                after_attempt=guard.check,
+            )
+        except _ParkCycle as park:
+            return _finish(park.result, usage, commits, artifact_writes)
 
         findings = list((review.structured or {}).get("findings") or [])
-        if synthetic is not None:
-            findings.append(synthetic)
+        findings.extend(guard.synthetic_findings)
         open_questions = (review.structured or {}).get("open_questions") or []
         artifact_writes["findings.json"] = _write_artifact(
             ctx, "findings.json",
@@ -181,6 +181,39 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             )
 
         by_id = {f["id"]: f for f in findings}
+
+        # ---- closure guards (P4.r1 F-002): never converge past these ----------
+        # A legitimate blocking finding that is not being fixed this round is
+        # an open blocker (FR-10.5); a non-rejected finding whose fix lands in
+        # a different artifact is an upstream invalidation (FR-10.4). Both park
+        # for a human instead of exiting as convergence.
+        unfixed_blockers = [
+            v["finding_id"] for v in verdicts
+            if by_id.get(v["finding_id"], {}).get("severity") == "blocking"
+            and v.get("verdict") == "legitimate" and v["action"] != "fix_now"
+        ]
+        upstream = [
+            v["finding_id"] for v in verdicts
+            if v.get("target_artifact") and v["action"] != "reject"
+        ]
+        if unfixed_blockers or upstream:
+            reasons = []
+            if unfixed_blockers:
+                reasons.append(
+                    "legitimate blocking finding(s) not fixed this round "
+                    f"(FR-10.5): {', '.join(unfixed_blockers)}"
+                )
+            if upstream:
+                reasons.append(
+                    "finding(s) whose fix lands in an upstream artifact "
+                    f"(FR-10.4 upstream invalidation): {', '.join(upstream)}"
+                )
+            return _finish(
+                StepResult(status=PARKED,
+                           notes="escalation: " + "; ".join(reasons)),
+                usage, commits, artifact_writes,
+            )
+
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
         if not accepted:
             return _finish(
@@ -231,9 +264,15 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             structured_name="confirm.json",
         )
         cdata = confirm.structured or {}
-        artifact_writes["confirm.json"] = _write_artifact(ctx, "confirm.json", cdata)
-
-        open_items, open_blockers = _open_after_confirm(by_id, cdata)
+        actions = {v["finding_id"]: v["action"] for v in verdicts}
+        open_items, open_blockers, reconciliation = _open_after_confirm(
+            by_id, actions, cdata
+        )
+        # The reconciliation result (missing / unknown / duplicate verdict IDs,
+        # F-001) is recorded next to the verdicts — data over inference.
+        artifact_writes["confirm.json"] = _write_artifact(
+            ctx, "confirm.json", {**cdata, "engine_reconciliation": reconciliation}
+        )
         if not open_items and not open_blockers:
             return _finish(
                 StepResult(
@@ -270,6 +309,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
 
 
 # --- sub-agent execution --------------------------------------------------------
+class _ParkCycle(Exception):
+    """Internal control flow: a guard demands the cycle park for a human."""
+
+    def __init__(self, result: StepResult) -> None:
+        super().__init__(result.notes)
+        self.result = result
+
+
 def _run_sub(
     ctx: StepContext,
     agent_name: str,
@@ -280,12 +327,20 @@ def _run_sub(
     logger: Any,
     structured_name: str,
     max_retries: int = 1,
+    after_attempt: Any = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
     Adapters already validate/retry internally where they can (api); this
     outer retry re-invokes once with the validation error appended, then fails
     closed. Spend from failed attempts is real and is accounted (F-008).
+
+    FR-4.2 is lossless for FAILED attempts too (P4.r1 F-007): every exception
+    carrying a partial result gets its events/transcript persisted with an
+    attempt suffix before the retry or the raise. ``after_attempt`` (P4.r1
+    F-004) runs after every adapter invocation — success, malformed, or
+    failure — so the reviewer-mutation guard can never be skipped by an error
+    path or hand a dirty tree to a retry.
     """
     adapter = ctx.build_adapter(agent_name)
     timeout = None
@@ -296,22 +351,48 @@ def _run_sub(
     logger.log_prompt(prompt)
     attempt_prompt = prompt
     last_exc: MalformedOutputError | None = None
-    for _attempt in range(1 + max_retries):
+    for attempt in range(1, 2 + max_retries):
         try:
             result = adapter.run(attempt_prompt, schema=schema, cwd=ctx.repo_root)
         except MalformedOutputError as exc:
-            if exc.partial is not None and exc.partial.usage is not None:
-                usage.add(exc.partial.usage)
+            _log_partial(logger, exc, usage, attempt)
+            if after_attempt is not None:
+                after_attempt()
             last_exc = exc
             attempt_prompt = (
                 f"{prompt}\n\nYour previous response was rejected: {exc}. "
                 "Respond again with only the corrected JSON."
             )
             continue
+        except AdapterError as exc:
+            # failed/timed-out call: persist the evidence, run the guard,
+            # then let the orchestrator classify (HALTED for timeouts,
+            # FAILED otherwise) — fail closed, never fail silent.
+            _log_partial(logger, exc, usage, attempt)
+            if after_attempt is not None:
+                after_attempt()
+            raise
         logger.log_result(result, structured_name=structured_name)
         usage.add(result.usage)
+        if after_attempt is not None:
+            after_attempt()
         return result
     raise last_exc  # fail closed after bounded retries
+
+
+def _log_partial(logger: Any, exc: AdapterError, usage: Any, attempt: int) -> None:
+    """Persist a failed attempt's partial result (FR-4.2, P4.r1 F-007)."""
+    if exc.partial is None:
+        logger.log_text(f"attempt{attempt}-error.txt", str(exc))
+        return
+    if exc.partial.usage is not None:
+        usage.add(exc.partial.usage)
+    logger.log_result(
+        exc.partial,
+        structured_name=f"attempt{attempt}-partial.json",
+        suffix=f"-attempt{attempt}",
+    )
+    logger.log_text(f"attempt{attempt}-error.txt", str(exc))
 
 
 # --- round pieces ----------------------------------------------------------------
@@ -363,60 +444,117 @@ def _review_prompt(
     return "".join(parts)
 
 
-def _mutation_guard(
-    step: Step, ctx: StepContext, policy: str, phase: str, rnd: int,
-    handoff: str, reviewer: str, commits: list[tuple[str, str]],
-) -> tuple[StepResult | None, dict[str, Any] | None]:
-    """FR-9.6: detect and handle a worktree the reviewer dirtied."""
-    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-        return None, None
-    status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
-    n_paths = len(status.splitlines())
-    if policy == "halt":
-        return (
-            StepResult(
+class _MutationGuard:
+    """FR-9.6: detect and handle a worktree the reviewer dirtied.
+
+    Stateful so it can run after EVERY review attempt (P4.r1 F-004) —
+    multiple mutations within one round get distinct backup refs / commit
+    sequence numbers, and every mutation yields a synthetic finding so triage
+    evaluates the reviewer's edits like any other proposed change (P4.r1
+    F-005: the `commit` policy previously recorded the commit but showed
+    triage nothing).
+    """
+
+    def __init__(
+        self, step: Step, ctx: StepContext, policy: str, phase: str,
+        rnd: int, handoff: str, reviewer: str, commits: list[tuple[str, str]],
+    ) -> None:
+        self.ctx = ctx
+        self.policy = policy
+        self.phase = phase
+        self.rnd = rnd
+        self.handoff = handoff
+        self.reviewer = reviewer
+        self.commits = commits
+        self.seq = 0
+        self.synthetic_findings: list[dict[str, Any]] = []
+
+    def check(self) -> None:
+        ctx = self.ctx
+        if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            return
+        self.seq += 1
+        status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+        if self.policy == "halt":
+            raise _ParkCycle(StepResult(
                 status=PARKED,
-                notes=f"reviewer mutated the worktree during round-{rnd} review "
-                f"(policy halt, FR-9.6); paths:\n{status}",
-            ),
-            None,
+                notes=f"reviewer mutated the worktree during round-{self.rnd} "
+                f"review (policy halt, FR-9.6); paths:\n{status}",
+            ))
+        if self.policy == "revert":
+            self._revert(status)
+        else:  # commit
+            self._commit(status)
+
+    def _finding_id(self) -> str:
+        return f"F-R{self.rnd}-MUTATION-{self.seq}"
+
+    def _revert(self, status: str) -> None:
+        ctx = self.ctx
+        backup = (
+            f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
+            f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}"
         )
-    if policy == "revert":
-        ts = ctx.record.started or "now"
-        backup = f"refs/gauntlet/backup/{ctx.manifest.run_id}/{ctx.record.id}-r{rnd}-mutation"
         gitops.backup_dirty_worktree(
             ctx.repo_root, backup,
-            f"reviewer mutation during {ctx.record.id} round {rnd} ({ts})",
+            f"reviewer mutation during {ctx.record.id} round {self.rnd}",
             exclude=ctx.excludes,
         )
-        gitops.reset_hard(ctx.repo_root, handoff)
-        gitops.clean_untracked(ctx.repo_root, exclude=[ctx.config.run_root])
-        synthetic = {
-            "id": f"F-R{rnd}-MUTATION",
+        gitops.reset_hard(ctx.repo_root, self.handoff)
+        # Clean with the SAME narrow excludes as detection (P4.r1 F-006): a
+        # reviewer file under the run root but outside the live bookkeeping
+        # must be removed, or it rides into the next fix commit. The live run
+        # dir survives regardless (self-.gitignore; clean has no -x).
+        gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+        if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            residue = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+            raise _ParkCycle(StepResult(  # fail closed on residue
+                status=PARKED,
+                notes="reviewer-mutation revert left residue the engine could "
+                f"not clean (FR-9.6); parked for a human:\n{residue}",
+            ))
+        self.synthetic_findings.append({
+            "id": self._finding_id(),
             "severity": "major",
             "category": "principle-violation",
             "location": "worktree",
             "claim": "reviewer modified the worktree during a read-only review "
-            "step (reverted; snapshot kept at a backup ref)",
-            "evidence": f"git status after review (policy revert, FR-9.6):\n{status}",
+            f"step (reverted; snapshot kept at {backup})",
+            "evidence": "git status at detection (policy revert, FR-9.6):\n"
+            + status,
             "suggested_fix": None,
-        }
-        return None, synthetic
-    # policy == "commit": record the changes, clearly reviewer-attributed, so
-    # nothing is silently lost and triage can evaluate them like any change.
-    message = (
-        f"{phase}.r{rnd}: Reviewer-applied changes — {n_paths} path(s)\n\n"
-        "The reviewer modified the worktree during a review step intended to "
-        "be read-only. Policy `reviewer_mutation: commit` (FR-9.6) records the "
-        "mutation as reviewer-attributed history for triage to evaluate.\n\n"
-        f"git status at detection:\n{status}\n"
-    )
-    sha = gitops.commit_all(
-        ctx.repo_root, message,
-        identity=ctx.config.identity(reviewer), exclude=ctx.excludes,
-    )
-    commits.append((f"{phase}.r{rnd}", sha))
-    return None, None
+        })
+
+    def _commit(self, status: str) -> None:
+        ctx = self.ctx
+        n_paths = len(status.splitlines())
+        message = (
+            f"{self.phase}.r{self.rnd}: Reviewer-applied changes — "
+            f"{n_paths} path(s)\n\n"
+            "The reviewer modified the worktree during a review step intended "
+            "to be read-only. Policy `reviewer_mutation: commit` (FR-9.6) "
+            "records the mutation as reviewer-attributed history for triage "
+            "to evaluate.\n\n"
+            f"git status at detection:\n{status}\n"
+        )
+        sha = gitops.commit_all(
+            ctx.repo_root, message,
+            identity=ctx.config.identity(self.reviewer), exclude=ctx.excludes,
+        )
+        self.commits.append((f"{self.phase}.r{self.rnd}", sha))
+        # Triage must see the mutation, not just git history (F-005).
+        diff = gitops.range_diff(ctx.repo_root, f"{sha}^", sha)
+        self.synthetic_findings.append({
+            "id": self._finding_id(),
+            "severity": "major",
+            "category": "principle-violation",
+            "location": "worktree",
+            "claim": "reviewer modified the worktree during a read-only review "
+            f"step (recorded as reviewer-attributed commit {sha[:10]})",
+            "evidence": "git status at detection (policy commit, FR-9.6):\n"
+            f"{status}\n\nmutation diff (truncated):\n{diff[:4000]}",
+            "suggested_fix": None,
+        })
 
 
 def _triage(
@@ -501,8 +639,12 @@ def _confirm_prompt(
     template = _template(ctx, step, "confirm_prompt", "prompts/cycle-confirm.md",
                          _BUILTIN_CONFIRM)
     diff = gitops.range_diff(ctx.repo_root, handoff, fix_sha)
+    # Commit list with authors: reviewer-attributed PN.rX mutation commits in
+    # the range stay distinguishable from fixer commits (FR-9.6 / F-005).
+    commit_list = gitops.log_range(ctx.repo_root, handoff, fix_sha)
     return (
         template
+        + f"\n\n--- commits in range ({handoff[:10]}..{fix_sha[:10]}) ---\n{commit_list}"
         + f"\n\n--- commit-range diff ({handoff[:10]}..{fix_sha[:10]}) ---\n{diff}"
         + "\n\n--- your prior findings, with triage verdicts ---\n"
         + wrap_as_data(json.dumps(
@@ -511,32 +653,71 @@ def _confirm_prompt(
 
 
 def _open_after_confirm(
-    by_id: dict[str, dict[str, Any]], cdata: dict[str, Any]
-) -> tuple[list[dict[str, Any]], list[str]]:
+    by_id: dict[str, dict[str, Any]],
+    actions: dict[str, str],
+    cdata: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     """What stays open after a confirm pass, and which of it is blocking.
 
-    Open: any ``unresolved``/``regression_introduced`` verdict, a
-    ``partially_resolved`` verdict on a blocking finding, and any *new*
-    blocking finding the confirmer saw in the diff (FR-10.5)."""
+    Fail-closed reconciliation (P4.r1 F-001): confirm verdicts are matched
+    against the round's findings — a FIX_NOW finding with no verdict reads as
+    ``unresolved`` (the confirmer cannot close a finding by omission),
+    duplicates last-win, and verdicts for unknown IDs are recorded but never
+    count toward closure. Findings triage declined (``defer``/``reject``) are
+    closed by their recorded verdicts, not by confirm — except a
+    ``regression_introduced`` verdict, which is always open.
+
+    Open: ``unresolved``/``regression_introduced`` on an accepted finding,
+    ``partially_resolved`` on a blocking one, a missing verdict for an
+    accepted finding, and new findings of blocking or major severity (P4.r1
+    F-003 — minor/nit new findings are recorded, but must not buy a round).
+    """
+    verdict_by_id: dict[str, dict[str, Any]] = {}
+    unknown: list[str] = []
+    duplicates: list[str] = []
+    for v in cdata.get("verdicts") or []:
+        fid = v.get("finding_id")
+        if fid in by_id:
+            if fid in verdict_by_id:
+                duplicates.append(fid)
+            verdict_by_id[fid] = v  # duplicate: last wins, recorded
+        else:
+            unknown.append(str(fid))
+
     open_items: list[dict[str, Any]] = []
     blockers: list[str] = []
-    for v in cdata.get("verdicts") or []:
-        finding = by_id.get(v.get("finding_id"), {})
+    missing: list[str] = []
+    for fid, finding in by_id.items():
         severity = finding.get("severity", "")
+        accepted = actions.get(fid) == "fix_now"
+        v = verdict_by_id.get(fid)
+        if v is None:
+            if not accepted:
+                continue  # declined finding: closure came from triage, recorded
+            missing.append(fid)
+            v = {"finding_id": fid, "verdict": "unresolved",
+                 "notes": "no confirm verdict returned; treated as unresolved "
+                          "(fail closed, FR-9.5 / P4.r1 F-001)"}
         verdict = v.get("verdict")
-        is_open = verdict in OPEN_CONFIRM_VERDICTS or (
-            verdict == "partially_resolved" and severity == "blocking"
+        relevant = accepted or verdict == "regression_introduced"
+        is_open = relevant and (
+            verdict in OPEN_CONFIRM_VERDICTS
+            or (verdict == "partially_resolved" and severity == "blocking")
         )
         if is_open:
             open_items.append({**finding, "confirm_verdict": verdict,
                                "confirm_notes": v.get("notes", "")})
             if severity == "blocking" or verdict == "regression_introduced":
-                blockers.append(v.get("finding_id", "?"))
+                blockers.append(fid)
     for nf in cdata.get("new_findings") or []:
-        if nf.get("severity") == "blocking":
+        severity = nf.get("severity")
+        if severity in ("blocking", "major"):
             open_items.append({**nf, "id": "NEW", "confirm_verdict": "new_finding"})
-            blockers.append(f"new: {nf.get('claim', '?')[:60]}")
-    return open_items, blockers
+            if severity == "blocking":
+                blockers.append(f"new: {nf.get('claim', '?')[:60]}")
+    reconciliation = {"missing": missing, "unknown": unknown,
+                      "duplicates": duplicates}
+    return open_items, blockers, reconciliation
 
 
 # --- fix-round commit message (FR-9.4) -------------------------------------------

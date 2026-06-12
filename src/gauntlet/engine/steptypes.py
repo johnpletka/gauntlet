@@ -17,6 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from gauntlet.adapters.base import AdapterError
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -119,12 +120,21 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
     logger.log_prompt(prompt)  # before the call: the prompt survives a crash
-    result = adapter.run(
-        prompt,
-        session=ctx.record.session_id,
-        schema=schema,
-        cwd=ctx.repo_root,
-    )
+    try:
+        result = adapter.run(
+            prompt,
+            session=ctx.record.session_id,
+            schema=schema,
+            cwd=ctx.repo_root,
+        )
+    except AdapterError as exc:
+        # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
+        # partial evidence the adapter salvaged before the orchestrator
+        # classifies the error.
+        if exc.partial is not None:
+            logger.log_result(exc.partial, suffix="-failed")
+        logger.log_text("failure.txt", str(exc))
+        raise
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")

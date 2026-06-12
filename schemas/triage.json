@@ -10,8 +10,7 @@
     "verdicts": {
       "type": "array",
       "items": {"$ref": "#/definitions/verdict"}
-    },
-    "summary": {"type": "string"}
+    }
   },
   "definitions": {
     "verdict": {

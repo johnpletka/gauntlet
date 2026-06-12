@@ -164,6 +164,17 @@ def range_diff(repo: Path, base: str, head: str) -> str:
     return _run(repo, "diff", f"{base}..{head}")
 
 
+def log_range(repo: Path, base: str, head: str) -> str:
+    """One line per commit in ``base..head``: sha, author, subject.
+
+    The confirm pass embeds this so reviewer-attributed mutation commits
+    (`PN.rX`) stay distinguishable from fixer commits inside the combined
+    range diff (FR-9.6 / P4.r1 F-005)."""
+    return _run(
+        repo, "log", "--format=%h %an <%ae> — %s", f"{base}..{head}"
+    ).strip()
+
+
 def diff_head(repo: Path, *, exclude: list[str] | None = None) -> str:
     """Working-tree diff vs HEAD (the change a commit step is about to record)."""
     return _run(repo, "diff", "HEAD", *_exclude_pathspec(exclude))

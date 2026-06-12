@@ -3,7 +3,7 @@
 - model: `gpt-5-mini`
 - corpus: `prompts/triage-corpus.jsonl` (36 hand-labeled findings)
 - verdict agreement: **94.4%** (34/36; exit ≥ 85%)
-- action agreement (secondary): 88.9%
+- action agreement (secondary): 91.7%
 - blocking→reject misses without escalation: **0** (exit: zero)
 - blocking→reject misses caught by escalation: 0
 - exit criteria: **PASS**
@@ -32,8 +32,8 @@
 
 ## Disagreements
 
-- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted dynamic plugin/entry-point loading creates an unbounded code-execution surface; in a fail-closed safety harness this is a material security risk unless trust, allowlisting, version pinning, and audit controls are specified. The plan must define and enforce a plugin trust model and controls before exposing extension loading.
-- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence high) — Committing raw events.jsonl by default risks leaking large or sensitive content into git and bloating repositories; this is a real security and operability concern given the project's fail-closed safety posture. The plan should default to ignoring raw streams and require explicit opt-in to avoid accidental commits.
+- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading in a safety-critical orchestration plan is a genuine code-execution surface that can violate the fail-closed safety posture. The plan should define trust boundaries, allowlisting/version-pinning, and auditing/doctor warnings before enabling third-party extensions to avoid runtime compromise.
+- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence medium) — Treating events.jsonl as commit-friendly by default is a material spec/operability/privacy risk: raw event streams can be large or contain content teams should not put into git and would pollute history. The plan should be changed now to default to ignore or require explicit opt-in so the system remains fail-closed.
 
 ## Corpus caveat (recorded honestly)
 
