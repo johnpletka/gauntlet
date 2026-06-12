@@ -8,6 +8,11 @@ Accepted header forms (the phase prefix is structural, not free text):
 - ``P3: <imperative summary>``            phase commit (FR-9.2)
 - ``P3.1: Address review — <summary>``    fix round (FR-9.4)
 - ``P3.r1: Reviewer-applied changes — …`` reviewer-attributed (FR-9.6, P4)
+- ``PRD.1:`` / ``PLAN.r1:`` etc.          document-cycle stage labels: the
+  PRD/plan review loops in FR-5.1's ``standard.yaml`` are not numbered
+  phases, so their fix rounds carry the stage name instead (FR-10.4
+  resolution ratified 2026-06-12, BOOTSTRAP-NOTES #28). Rollback targets
+  stay numeric — ``PRD``/``PLAN`` commits are not ``--phase N`` boundaries.
 """
 
 from __future__ import annotations
@@ -17,8 +22,9 @@ from dataclasses import dataclass
 
 HEADER_MAX = 72
 
-# P<n>, P<n>.<round>, or P<n>.r<round>, then ": " then a non-empty summary.
-_HEADER_RE = re.compile(r"^P\d+(?:\.\d+|\.r\d+)?: \S.*$")
+# P<n> | PRD | PLAN, optionally .<round> or .r<round>, then ": " + summary.
+_PREFIX = r"(?:P\d+|PRD|PLAN)"
+_HEADER_RE = re.compile(rf"^{_PREFIX}(?:\.\d+|\.r\d+)?: \S.*$")
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ def validate_commit_message(message: str) -> FormatError | None:
     if not _HEADER_RE.match(header):
         return FormatError(
             "header must match 'PN: summary' / 'PN.x: ...' / 'PN.rx: ...' "
+            "(or the PRD/PLAN stage-label forms, BOOTSTRAP-NOTES #28) "
             f"(got {header!r})"
         )
     if len(lines) < 2 or lines[1].strip() != "":
@@ -63,5 +70,5 @@ def header_prefix(message: str) -> str | None:
     that already exists in ``git log`` against the phase the engine intended.
     """
     header = message.rstrip("\n").split("\n", 1)[0]
-    m = re.match(r"^(P\d+(?:\.\d+|\.r\d+)?):", header)
+    m = re.match(rf"^({_PREFIX}(?:\.\d+|\.r\d+)?):", header)
     return m.group(1) if m else None

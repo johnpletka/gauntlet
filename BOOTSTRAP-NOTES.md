@@ -392,3 +392,39 @@ process, and what it suggests for Gauntlet's design.
     own PHASE COMPLETE / halt-report convention exists precisely so the
     engine can distinguish "done" from "stopped deliberately" (candidate
     for the P5+ standard pipeline prompts + a completion-signal check).
+    The gap bit AGAIN the same day: the builder's FR-10.4 upstream-conflict
+    halt (#28) was also recorded `done`, and the run burned a tests+commit
+    step rediscovering that nothing had been built.
+
+27. **`gauntlet run` does not refuse while a run is already active — a
+    second invocation silently creates a competing run.** Asked "can I run
+    `gauntlet run` again?" mid-flight, the honest answer was no: `start()`
+    unconditionally creates a fresh `run-<timestamp>/`, repoints
+    `active-run.txt` at it, and would spawn a second builder against the
+    same worktree the live run's builder is editing — racing agents on one
+    tree, and the first run's bookkeeping orphaned with no pointer back.
+    Nothing was harmed (the question was asked, not executed), but the
+    foot-gun is one CLI invocation away. *Design feedback:* `start()` must
+    check the active pointer and refuse when that run's manifest says
+    `running` (or a live process holds it), with "resume or abort first"
+    guidance — and `doctor` should flag an active-run pointer whose run is
+    in a non-terminal state with no corresponding process.
+
+28. **FR-10.4 resolution (ratified by John, 2026-06-12): PRD/plan review
+    cycles carry stage labels — the commit format admits `PRD`/`PLAN`
+    prefixes.** P5's builder halted correctly on a real spec gap: FR-5.1's
+    `standard.yaml` starts with `prd-cycle`/`plan-cycle` (no phase number),
+    but FR-9.2/9.4 define commit headers as phase-numbered and the engine
+    enforced `P<digits>` only — so the normative pipeline failed at its
+    first step, and a PRD/plan fix round had no legal commit label. Options
+    surfaced per the contract; the human ratified extending the format:
+    `PRD:`/`PRD.1:`/`PRD.r1:` (and `PLAN…`) are now valid alongside
+    `P<n>…`, with `prd-cycle`/`plan-cycle` carrying `phase: PRD`/`PLAN`.
+    Rollback semantics are untouched — `--phase N` targets remain numeric;
+    PRD/PLAN commits are simply not rollback boundaries. Recorded here as
+    the FR-10.4 "accepted deviation note": the approved plan/PRD texts are
+    NOT amended (they stay as written; this note + the ratifying gate are
+    the audit trail). *Design feedback:* the PRD's FR-5.1↔FR-9.2
+    interaction is exactly the class of cross-FR contradiction the PRD
+    adversarial-review prompt should hunt for (two normative sections, each
+    individually fine, jointly unsatisfiable).

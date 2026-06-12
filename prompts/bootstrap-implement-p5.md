@@ -15,5 +15,12 @@ green (`uv run pytest`) before you finish. Do NOT commit — the pipeline's
 commit step handles that. Do NOT review your own work — the reviewer step
 handles that.
 
-If implementation reveals the plan or PRD is wrong, STOP and report the
-conflict per CLAUDE.md §4 (FR-10.4).
+Resolved upstream conflicts (do not re-raise these):
+- FR-5.1 ↔ FR-9.2 commit labels for the PRD/plan cycles — RESOLVED, ratified
+  2026-06-12 (BOOTSTRAP-NOTES #28): the commit format now admits `PRD`/`PLAN`
+  stage prefixes (`PRD.1: Address review — …`), and `standard.yaml`'s
+  `prd-cycle`/`plan-cycle` steps must carry `phase: PRD` / `phase: PLAN`.
+  Rollback `--phase N` targets remain numeric phases only.
+
+If implementation reveals the plan or PRD is wrong in some OTHER way, STOP
+and report the conflict per CLAUDE.md §4 (FR-10.4).
