@@ -22,7 +22,9 @@ interrupted_step: park
 agents:
   builder:
     adapter: claude-code
-    model: claude-opus-latest
+    # Short alias form — the only spelling claude 2.1.172 resolves (pinned;
+    # `claude-opus-latest` 404s, caught live at P5 start, notes #24).
+    model: opus
     permission_mode: acceptEdits
     allowed_tools: [Bash, Read, Write, Edit, Grep, Glob]
     # claude loads the repo's PreToolUse hook only under project setting sources

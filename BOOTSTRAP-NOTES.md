@@ -331,3 +331,24 @@ process, and what it suggests for Gauntlet's design.
     (confirm-by-omission, defer-on-blocking) that the cycle now guards
     against — the adversarial process catching holes in the adversarial
     machinery is the dogfood working.
+
+## 2026-06-12 — P5 start (first engine-driven run)
+
+24. **Second unrunnable placeholder model, caught at the first live use —
+    `doctor` must probe every profile's model, not just the api ones.** The
+    first `gauntlet run gauntlet-bootstrap` failed in `p5-implement`:
+    claude 2.1.172 rejects `--model claude-opus-latest` with an in-band 404
+    (is_error=true, exit 1). The short alias `opus` resolves (to
+    claude-opus-4-8) and is now configured + pinned. This is #19's lesson
+    again on the claude side, and the P4.r1 F-007 fix earned its keep on its
+    first day: the failed attempt left `failure.txt` /
+    `transcript-failed.md` / `events-failed.jsonl` under the step dir, so
+    diagnosis was a file-read, not a rerun. *Design feedback:* `doctor`
+    (P6) needs a cheap per-profile model-resolution probe for the CLI
+    adapters too (a tool-less one-token round-trip per configured model),
+    and engine model-rejection errors should surface the adapter's in-band
+    message in the step notes, not just the exit code. Also: the engine
+    derives `gauntlet/gauntlet-bootstrap` from the slug while the manual
+    bootstrap lived on `gauntlet/bootstrap` (#2's two-slug pain, branch
+    edition) — resolved by pre-creating the derived branch name at the tip
+    before the first run; both names point into the same history.

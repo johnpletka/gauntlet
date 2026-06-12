@@ -24,6 +24,13 @@ clis:
           (codeword) recalled.
       - flag: "--model haiku"
         verified: "Model alias resolves; used for all smoke traffic."
+      - flag: "--model opus"
+        verified: >-
+          P5 start: short alias resolves (modelUsage reports claude-opus-4-8).
+          The long form `claude-opus-latest` is REJECTED with an in-band 404
+          result (is_error=true, exit 1) — the builder profile must use the
+          short alias. Caught live by the first engine-driven builder step;
+          evidence preserved by the P4 failure-path transcripts (F-007).
       - flag: '--tools ""'
         verified: "Empty string disables all built-in tools (tool-less smoke)."
       - flag: "--json-schema <inline-json>"
