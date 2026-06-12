@@ -277,6 +277,7 @@ class _UsageAccumulator:
     def __init__(self) -> None:
         self._in = 0
         self._out = 0
+        self._cached = 0
         self._cost: float | None = None
         self._seen = False
 
@@ -286,6 +287,7 @@ class _UsageAccumulator:
         self._seen = True
         self._in += usage.input_tokens or 0
         self._out += usage.output_tokens or 0
+        self._cached += usage.cached_input_tokens or 0
         if usage.cost_usd is not None:
             self._cost = (self._cost or 0.0) + usage.cost_usd
 
@@ -294,7 +296,12 @@ class _UsageAccumulator:
 
         if not self._seen:
             return None
-        return Usage(input_tokens=self._in, output_tokens=self._out, cost_usd=self._cost)
+        return Usage(
+            input_tokens=self._in,
+            output_tokens=self._out,
+            cached_input_tokens=self._cached,
+            cost_usd=self._cost,
+        )
 
 
 def _change_context(ctx: StepContext) -> str:

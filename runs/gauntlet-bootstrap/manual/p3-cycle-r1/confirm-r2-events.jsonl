@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019eb98f-2e6d-7a92-9d73-aa033915afe7"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdicts\":[{\"finding_id\":\"F-008\",\"verdict\":\"partially_resolved\",\"note\":\"The redraft loop now accumulates input tokens, output tokens, and cost across rejected and accepted draft attempts before the orchestrator writes them to step/run totals. However the new accumulator drops cached_input_tokens, so that usage field is still omitted from manifest totals for all draft attempts.\"}],\"new_findings\":[],\"summary\":\"F-008 is only partially resolved because cached-token usage is not accumulated.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":73657,"cached_input_tokens":3456,"output_tokens":632,"reasoning_output_tokens":516}}

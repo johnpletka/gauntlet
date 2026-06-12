@@ -144,7 +144,9 @@ class RedraftUsageAdapter:
         text = "bad header" if self.n == 1 else "P1: ok\n\nbody."
         return AgentResult(
             text=text,
-            usage=Usage(input_tokens=50, output_tokens=5, cost_usd=0.001),
+            usage=Usage(
+                input_tokens=50, output_tokens=5, cached_input_tokens=20, cost_usd=0.001
+            ),
             session_id="s",
             exit_code=0,
         )
@@ -167,9 +169,10 @@ stages:
     orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
     assert orch.drive() == M.RUN_DONE
     assert drafter.n == 2  # one rejected + one accepted
-    # both attempts counted: 2 x 0.001 = 0.002
+    # both attempts counted across every usage field: 2 x each
     assert abs(orch.manifest.totals.cost_usd - 0.002) < 1e-9
     assert orch.manifest.record("commit").usage.input_tokens == 100
+    assert orch.manifest.record("commit").usage.cached_input_tokens == 40
 
 
 def test_commit_bad_literal_message_fails(fixture_repo):
