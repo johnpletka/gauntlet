@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/confirm.json",
+  "title": "Confirm-pass verdicts (FR-9.5)",
+  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdicts", "new_findings", "summary"],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "verdict", "notes"],
+        "properties": {
+          "finding_id": {"type": "string"},
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "resolved",
+              "partially_resolved",
+              "unresolved",
+              "regression_introduced"
+            ]
+          },
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "new_findings": {
+      "type": "array",
+      "description": "Defects visible in the round's diff itself (scope: the diff, nothing else).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "claim", "location"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["blocking", "major", "minor", "nit"]},
+          "claim": {"type": "string"},
+          "location": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "string"}
+  }
+}

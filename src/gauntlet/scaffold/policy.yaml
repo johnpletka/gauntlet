@@ -1,0 +1,174 @@
+# Gauntlet judge fast-path policy (FR-7.2, FR-7.6).
+#
+# Evaluated DENY-FIRST: a matching deny rule wins before any allow/ask rule.
+# allow/deny are terminal fast-path outcomes; ask escalates to the LLM
+# classifier, as does anything that matches no rule. Regexes are
+# case-insensitive. Within one rule, every specified matcher kind must match
+# (AND), so credential_outside_repo stays precise.
+#
+# Changes go through the retro proposal process (CLAUDE.md §8), not ad hoc.
+version: 1
+
+deny:
+  - name: force-push
+    description: "Force-push rewrites shared history and can destroy others' work."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bgit\s+push\b[^\n]*(--force(-with-lease)?\b|(^|\s)-f\b)'
+      - '\bgit\s+push\b[^\n]*\+[\w./-]+:'   # refspec force form (+src:dst)
+
+  - name: history-rewrite
+    description: "Rewriting committed history (rebase/reset --hard/filter) on a shared branch."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bgit\s+(rebase|filter-branch|filter-repo)\b'
+      - '\bgit\s+reset\s+(--hard|--keep)\b'
+      - '\bgit\s+commit\b[^\n]*--amend\b'
+      - '\bgit\s+update-ref\s+-d\b'
+      - '\bgit\s+branch\s+(-D|-M|--delete\s+--force)\b'
+
+  - name: rm-rf-dangerous
+    description: "Recursive force-delete of a root, home, or path outside the repo."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\b[^\n]*\s(/|~|\$HOME|\*)\s*$'
+      - '\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b[^\n]*\s(/|/\*|~|~/\*|\$HOME)(\s|$)'
+      - '\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b[^\n]*\s\.\./'
+
+  - name: curl-pipe-shell
+    description: "Piping a network download straight into a shell executes untrusted code."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\b(curl|wget|fetch)\b[^\n|]*\|\s*(sudo\s+)?(/usr/bin/|/bin/)?(ba|z|d|k)?sh\b'
+      - '\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?python[0-9.]*\b'
+
+  - name: package-publish
+    description: "Publishing a package pushes artifacts to a public/shared registry."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bnpm\s+publish\b'
+      - '\b(twine\s+upload|python\s+-m\s+twine\s+upload)\b'
+      - '\b(uv\s+publish|flit\s+publish|poetry\s+publish)\b'
+      - '\bcargo\s+publish\b'
+      - '\bgem\s+push\b'
+      - '\bdocker\s+push\b'
+
+  - name: credential-read-outside-repo
+    description: "Reading credential files outside the repository (keys, tokens, cloud creds)."
+    credential_outside_repo: true
+
+  - name: credential-read-command-outside-repo
+    description: "Shelling out to read credential files outside the repository."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\b(cat|less|more|head|tail|bat|cp|scp|rsync|strings|xxd|od|base64)\b[^\n]*(\.ssh/id_|\.aws/credentials|\.netrc|\.pypirc|id_rsa|id_ed25519|\.pem\b)'
+
+  - name: outbound-network-nonallowlisted
+    description: "Outbound network to a non-allowlisted host (exfiltration / untrusted fetch)."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\b(nc|ncat|netcat)\b\s'
+      # curl/wget to an http(s) host NOT in the allowlist. The boundary group
+      # ([/:?#\s]|$) after each allowlisted host means github.com.evil.example
+      # is not treated as github.com and is correctly denied (review F-004).
+      - '\b(curl|wget)\b[^\n]*\shttps?://(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org)([/:?#\s]|$))[^\s]'
+      # git over a non-allowlisted scheme URL or an scp-style user@host:path
+      # remote. The boundary group after each allowlisted host keeps
+      # git@github.com.evil.example from masquerading as github.com.
+      - '\bgit\b[^\n]*\s(https?|git|ssh)://(?!(github\.com|localhost|127\.0\.0\.1)([/:]|$))'
+      - '\bgit\b[^\n]*\s[\w.-]+@(?!(github\.com|localhost|127\.0\.0\.1)([:/]|$))[\w.-]+:'
+      # scp/sftp/rsync to a remote host (user@host:path)
+      - '\b(scp|sftp|rsync)\b[^\n]*\s[\w.-]+@(?!(localhost|127\.0\.0\.1)([:/]|$))[\w.-]+:'
+      # direct ssh: user@host, or a bare dotted hostname (ssh evil.example)
+      - '\bssh\b[^\n]*\s[\w.-]+@(?!(localhost|127\.0\.0\.1)([:/]|$))[\w.-]+'
+      - '\bssh\b\s+(-\S+\s+|-\S+\s+\S+\s+)*(?!(localhost|127\.0\.0\.1)\b)[a-z0-9][\w-]*(\.[\w-]+)+'
+      # download-and-run via interpreters fetching remote code (python -c,
+      # ruby/perl/node -e, etc.)
+      - '\b(python[0-9.]*|ruby|perl|node)\b[^\n]*\s-[ce]\b[^\n]*https?://'
+      - '/dev/tcp/'
+
+  - name: outbound-network-nonallowlisted-tool
+    description: "Non-Bash network fetch (e.g. WebFetch) to a non-allowlisted host."
+    applies_to_tools: [WebFetch]
+    command_patterns:
+      - 'https?://(?!(localhost|127\.0\.0\.1|github\.com|raw\.githubusercontent\.com|pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org)([/:?#\s]|$))[^\s]'
+
+  - name: disable-safety
+    description: "Disabling permission/sandbox/hook safety from within an agent command."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '--dangerously-skip-permissions\b'
+      - '--dangerously-bypass-approvals-and-sandbox\b'
+      - '--dangerously-bypass-hook-trust\b'
+      - 'sandbox_mode\s*=\s*["'']?danger-full-access'
+      - '\bchmod\s+(-R\s+)?[0-7]*777\b'
+
+  - name: write-outside-repo
+    description: "Writing or editing a file outside the repository tree."
+    applies_to_tools: [Write, Edit, NotebookEdit, MultiEdit]
+    path_escape: true
+
+allow:
+  - name: git-readonly
+    description: "Read-only git inspection."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*git\s+(status|diff|log|show|branch|remote(\s+-v)?|rev-parse|describe|blame|shortlog|config\s+--get|ls-files|stash\s+list)\b'
+
+  - name: git-normal-flow
+    description: "Ordinary non-destructive git workflow commands."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*git\s+(add|commit(?![^\n]*--amend)|checkout(?![^\n]*-f\b)|switch|fetch|pull(?![^\n]*--force)|merge(?![^\n]*--abort)|restore|tag(?!\s+-d))\b'
+
+  - name: read-inspect
+    description: "Listing/reading/searching files within the workspace."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*(ls|pwd|cat|head|tail|wc|file|stat|tree|du|df)\b'
+      # find is benign only when it neither deletes nor execs a subcommand;
+      # destructive find falls through to the bulk-deletion ask rule.
+      - '^\s*find\b(?![^\n]*(-delete|-exec|-execdir|-ok))'
+      - '^\s*(rg|grep|ag|ack|fd)\b'
+      - '^\s*(echo|printf)\b'
+      - '^\s*(which|type|command\s+-v|whoami|hostname|date|env|uname)\b'
+
+  - name: test-and-build-runners
+    description: "Running the project's test/lint/build tooling."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*(uv\s+run\s+)?(pytest|python\s+-m\s+pytest)\b'
+      - '^\s*(ruff|black|flake8|mypy|pyright|isort)\b'
+      - '^\s*(npm|pnpm|yarn)\s+(test|run\s+(test|lint|build|typecheck))\b'
+      - '^\s*(make|just)\s'
+      - '^\s*(cargo|go)\s+(test|build|vet|fmt|check)\b'
+
+ask:
+  - name: package-install
+    description: "Installing packages can run arbitrary install scripts."
+    applies_to_tools: [Bash]
+    risk_category: package-install
+    command_patterns:
+      - '\b(pip[0-9.]*|pipx|uv|poetry|conda)\b[^\n]*\binstall\b'
+      - '\b(npm|pnpm|yarn)\b[^\n]*\b(install|add|ci)\b'
+      - '\b(brew|apt|apt-get|yum|dnf|gem|cargo|go)\b[^\n]*\b(install|add|get)\b'
+
+  - name: database-migration
+    description: "Schema migrations mutate persistent state."
+    applies_to_tools: [Bash]
+    risk_category: migration
+    command_patterns:
+      - '\b(alembic|migrate|flyway|liquibase)\b'
+      - '\b(python\s+manage\.py|django-admin)\s+migrate\b'
+      - '\b(rails|rake)\s+db:migrate\b'
+      - '\b(npx\s+)?(prisma|knex|sequelize)\b[^\n]*\bmigrat'
+
+  - name: bulk-deletion
+    description: "Deleting many files at once warrants a closer look."
+    applies_to_tools: [Bash]
+    risk_category: bulk-deletion
+    command_patterns:
+      - '\bfind\b[^\n]*-delete\b'
+      - '\bxargs\b[^\n]*\brm\b'
+      - '\bgit\s+clean\s+(-[a-z]*f[a-z]*|--force)\b'
+      - '\brm\s+(-[a-z]*r[a-z]*)\b[^\n]*\*'

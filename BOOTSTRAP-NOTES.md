@@ -619,3 +619,57 @@ process, and what it suggests for Gauntlet's design.
     judge already knows the boundary, notes #31/#32) would convert these from
     LLM-rung gambles into deterministic sub-150ms allows — a strong FR-6.3
     retro-proposal candidate from this very run.
+
+## 2026-06-12 — P6 (`init` / `doctor` / rollout packaging)
+
+40. **`init` ships the default assets as bundled package data, not by copying
+    the repo's own root files.** An installed `gauntlet` (via `uv tool install`
+    from a git URL, FR-1.1) has no repo checkout to copy from, so the scaffold
+    set lives under `src/gauntlet/scaffold/` and is bundled into the wheel
+    (verified: 20 files present in the built wheel). The shipped `policy.yaml`,
+    `pipelines/standard.yaml`, `prompts/*`, `schemas/*`, and
+    `.claude/settings.json` are byte-identical copies of the repo's canonical
+    assets; a unit drift-guard (`test_shipped_scaffold_matches_repo_canonical_assets`)
+    fails if they diverge. The scaffold `config.yaml` is *intentionally
+    different* — a clean default per PRD FR-2.1, not the bootstrap's
+    pin-specific config (short `opus` alias, `base_flags`, `step_timeout_s`) —
+    so it is excluded from the drift guard.
+
+41. **The repo-level codex hooks config is written but inert on the pinned
+    build, and its exact schema is unverified.** FR-1.2 requires `init` to write
+    "the repo-level Codex hooks config." Per #10 (ratified sandbox-primary),
+    `codex exec` 0.139.0 never fires PreToolUse hooks, so the file
+    (`.codex/hooks.json`) cannot be exercised to verify codex's expected schema.
+    `init` writes a forward-looking config that mirrors the shared
+    stdin-JSON / exit-2 / `permissionDecision` contract and documents its inert
+    status in-file; `doctor`'s `codex-hook` check reads the firing status from
+    the pin notes and reports "present (inert; sandbox-primary)" as **healthy,
+    not a failure** — failing on a hook the build cannot fire would be exactly
+    backwards. If a future codex build fires exec hooks, the same probe detects
+    it and the schema gets verified then (consistent with the project's
+    pin-verified-not-assumed ethos). Recorded as a known unverified-but-required
+    artifact, not a silent guess.
+
+42. **`doctor` is split into pure checks + injected probes so the "simulated
+    broken environment" tests run offline.** Each check returns a
+    `CheckResult(status, detail, remedy)`; CLI version lookup and the env
+    (for API-key presence) arrive through an injectable `DoctorProbes`. Real
+    invocation builds probes that shell out to `claude --version` /
+    `codex --version` and read `os.environ`; the unit suite injects fakes for
+    missing-CLI / stale-version / missing-key / secret-in-config cases. FR-1.5
+    version skew is a WARN (does not block); genuine blockers (absent CLI,
+    unwired hook, no API key for any configured api profile, credential literal
+    in repo config, unloadable policy/config) are FAILs that exit non-zero.
+    Observed live on this repo: `doctor` correctly WARNs that the installed
+    claude (2.1.177) has drifted from the pin-verified 2.1.172 — the pin file is
+    now one patch release behind the machine; left as-is (the contract suite
+    re-verifies and updates the pin, per #24's lesson, not a P6 edit).
+
+43. **Second-environment install test uses a throwaway `uv venv`, not
+    `uv tool install`.** The plan's ground rule asks before system/global
+    tooling. `uv tool install` writes to the user's global tool dir (machine
+    state); a disposable `uv venv` + `uv pip install <wheel>` is fully contained
+    in a tmp dir and proves the same thing (console scripts on PATH, scaffold
+    bundled, `init`/`doctor` run). The README documents the real
+    `uv tool install git+<url>` path for teammates; the test uses the contained
+    equivalent by default (container/global tooling deferred to human sign-off).

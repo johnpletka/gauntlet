@@ -1,0 +1,61 @@
+# Gauntlet run configuration (FR-2.1). Scaffolded by `gauntlet init`.
+#
+# Agent profiles bind adapter + model + flags; pipeline steps reference them by
+# name (`agent: builder`). Swapping builder/reviewer roles is a YAML edit here
+# or a per-step override — no code change (FR-2.2). The engine builds the actual
+# adapter via the entry-point registry (FR-2.4) and lints flags at load (§8).
+#
+# Per-user secrets (API keys) live in the environment / keychain, NEVER in this
+# file (FR-1.4) — `gauntlet doctor` fails if a credential literal appears here.
+# This file references models, not credentials.
+
+base_branch: main
+branch_prefix: "gauntlet/"
+# Single run-root for plan/transcripts/manifests under run_root/<slug>/.
+run_root: runs
+test_command: "uv run pytest"
+
+# On resume of a step killed mid-edit with a dirty worktree (FR-8.2):
+#   park          -> stop for a human (default; nothing re-run over partial work)
+#   reset_to_base -> back up the partial work to a ref, reset to base, re-run
+interrupted_step: park
+
+# Reviewer-mutation policy (FR-9.6): commit | revert | halt.
+reviewer_mutation: commit
+
+agents:
+  builder:
+    adapter: claude-code
+    model: claude-opus-latest          # passed via --model
+    permission_mode: acceptEdits
+    allowed_tools: [Bash, Read, Write, Edit, Grep, Glob]
+    # claude loads the repo's PreToolUse hook only under project setting
+    # sources; the engine-managed judge cannot gate the builder without it.
+    base_flags: ["--setting-sources", "project"]
+  reviewer:
+    adapter: codex
+    model: gpt-5.5
+    sandbox: read-only        # pure review steps are read-only (FR-9.6)
+  # Cheap-tier models for classification (FR-3.1): a small model for triage and
+  # the judge LLM rung, a stronger model for severity-aware triage escalation.
+  triage:
+    adapter: api
+    model: claude-haiku-latest
+  escalation:
+    adapter: api
+    model: claude-opus-latest
+  judge_llm:
+    adapter: api
+    model: gpt-5-mini
+
+# Per-agent commit identities (FR-9.7) so git log distinguishes who authored what.
+identities:
+  builder:
+    name: "Gauntlet Builder (claude)"
+    email: "builder@gauntlet.local"
+  reviewer:
+    name: "Gauntlet Reviewer (codex)"
+    email: "reviewer@gauntlet.local"
+  triage:
+    name: "Gauntlet Triage"
+    email: "triage@gauntlet.local"

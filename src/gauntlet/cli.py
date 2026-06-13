@@ -1,7 +1,8 @@
 """Gauntlet CLI entry point.
 
 P3 adds the run lifecycle (`new`, `run`, `status`, `approve`, `reject`,
-`resume`, `abort`, `rollback`); `init`/`doctor` land in P6 per the plan.
+`resume`, `abort`, `rollback`); P6 adds `init` (idempotent scaffolding) and
+`doctor` (environment validation).
 """
 
 from __future__ import annotations
@@ -31,6 +32,47 @@ def main() -> None:
 def version() -> None:
     """Print the installed gauntlet version."""
     typer.echo(f"gauntlet {__version__}")
+
+
+@app.command()
+def init(
+    from_repo: bool = typer.Option(
+        False, "--from-repo",
+        help="The repo already carries committed Gauntlet assets; only ensure "
+        "machine-local hook wiring + .gitignore guidance (team-adopter path).",
+    ),
+) -> None:
+    """Scaffold config/pipeline/prompts/policy + hook wiring (FR-1.2, idempotent)."""
+    from gauntlet.engine.init import MISSING, init_repo
+
+    result = init_repo(Path.cwd(), from_repo=from_repo)
+    for a in result.actions:
+        suffix = f" — {a.detail}" if a.detail else ""
+        typer.echo(f"  {a.action:8} {a.path}{suffix}")
+    if result.missing:
+        typer.echo(
+            "\nmissing committed assets (expected with --from-repo on a "
+            "configured repo): " + ", ".join(a.path for a in result.missing)
+        )
+    typer.echo("\nnext: `gauntlet doctor`, then `gauntlet new <slug>` / `gauntlet run <slug>`")
+
+
+@app.command()
+def doctor() -> None:
+    """Validate the environment: CLIs, auth, hooks, judge, keys (FR-1.3, FR-1.5)."""
+    from gauntlet.engine.doctor import FAIL, OK, WARN, has_failure, run_doctor
+
+    glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
+    results = run_doctor(Path.cwd())
+    for r in results:
+        line = f"  {glyph.get(r.status, '?')} {r.name}: {r.detail}"
+        typer.echo(line)
+        if r.remedy and r.status in (WARN, FAIL):
+            typer.echo(f"      → {r.remedy}")
+    if has_failure(results):
+        typer.echo("\ndoctor found blocking problems (see ✗ above)", err=True)
+        raise typer.Exit(1)
+    typer.echo("\nenvironment OK")
 
 
 def _manager() -> "object":
