@@ -276,6 +276,68 @@ class RunManager:
             data.run_id = Manifest.load(run_dir / "manifest.json").run_id
         return write_feedback(run_dir, data, self.writer)
 
+    def regenerate_proposals(
+        self, slug: str, *, run_dir: Path | None = None, adapter_factory=None
+    ) -> list:
+        """Re-run proposal synthesis for a run, picking up feedback (FR-6.1→6.3).
+
+        FR-6.1 requires feedback captured "at run end or later" to be able to
+        drive proposal generation. The retrospective step reads feedback once
+        during the run, so feedback entered afterwards (via ``gauntlet
+        feedback``) would otherwise never reach synthesis (review F-001). This
+        re-synthesises from the run's saved self-critiques + the now-present
+        feedback, APPENDING any new pending proposals under ``retro/proposals/``
+        (prior proposals are never clobbered — data over inference).
+
+        Returns the proposals generated this pass (possibly empty). Returns
+        ``[]`` when the run's pipeline has no retrospective step or no proposer.
+        """
+        from gauntlet.engine import retro
+        from gauntlet.engine.execution import StepContext
+        from gauntlet.engine.feedback import read_feedback
+        from gauntlet.engine.manifest import StepRecord
+        from gauntlet.engine.steptypes import _UsageAccumulator
+
+        layout = self.layout(slug)
+        run_dir = run_dir or layout.active_run_dir()
+        man = Manifest.load(run_dir / "manifest.json")
+        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+
+        step = next(
+            (s for s in pipeline.all_steps() if s.type == "retrospective"), None
+        )
+        if step is None or not step.get("proposer"):
+            return []
+        proposer = step.get("proposer")
+
+        critiques: dict[str, str] = {}
+        for agent in step.get("agents") or []:
+            crit = run_dir / "retro" / f"retro-{agent}.md"
+            if crit.exists():
+                critiques[agent] = crit.read_text()
+        feedback = read_feedback(run_dir)
+
+        rec = man.record("retrospective") or StepRecord(
+            id="retrospective", type="retrospective"
+        )
+        ctx = StepContext(
+            repo_root=self.repo_root,
+            run_dir=run_dir,
+            artifact_root=layout.slug_dir,
+            config=self.config,
+            pipeline=pipeline,
+            manifest=man,
+            record=rec,
+            writer=self.writer,
+            excludes=run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir),
+            adapter_factory=adapter_factory,
+        )
+        usage = _UsageAccumulator()
+        summary = retro.build_run_summary(ctx)
+        return retro._generate_proposals(
+            ctx, step, summary, critiques, feedback, proposer, usage
+        )
+
     # ---- proposals (FR-6.3/6.4) ---------------------------------------------
     def _all_slugs(self) -> list[str]:
         root = self.repo_root / self.config.run_root

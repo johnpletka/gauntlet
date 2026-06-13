@@ -134,6 +134,27 @@ def test_materialize_flags_valid_and_invalid(asset_repo: Path):
     assert len(list(proposals_dir.glob("*.md"))) == 2
 
 
+def test_materialize_rejects_multi_file_diff(asset_repo: Path):
+    # F-005: even when every touched path is allowlisted, a diff editing more
+    # than one file violates the single-file proposal contract — one approval
+    # must never apply multiple asset changes under a single rationale.
+    one = _capture_diff(asset_repo, "prompts/triage.md",
+                        "rubric line one EDIT\nrubric line two\n")
+    two = _capture_diff(asset_repo, "policy.yaml", "deny: [rm]\n")
+    multi = one + two  # both hunks target allowlisted files
+    proposals_dir = asset_repo / "runs" / "demo" / "run-1" / "retro" / "proposals"
+    [proposal] = P.materialize_proposals(
+        asset_repo, proposals_dir,
+        [{"slug": "multi", "target_path": "prompts/triage.md",
+          "rationale": "touches two files", "diff": multi}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+    assert not proposal.valid and proposal.status == P.INVALID
+    assert "exactly one file" in proposal.invalid_reason
+    # both touched paths are recorded for the human (data over inference)
+    assert set(proposal.targets) == {"prompts/triage.md", "policy.yaml"}
+
+
 # --- governed apply (FR-6.4/6.5) ---------------------------------------------
 def test_apply_proposal_patches_changelog_and_commits(asset_repo: Path):
     diff = _capture_diff(asset_repo, "prompts/triage.md",

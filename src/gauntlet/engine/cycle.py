@@ -929,32 +929,49 @@ class _CycleMetrics:
         self.rounds = 0
         self.findings_total = 0
         self.accepted_total = 0  # findings triaged action == fix_now
+        # accepted (fix_now) findings the confirm pass marked `resolved` — the
+        # FR-6.6 "% accepted fixes that survive the confirm pass" numerator. The
+        # confirm pass returns a verdict on EVERY prior finding, including
+        # declined ones (expected `unresolved`); those must NOT count against
+        # fix-survival, so we join confirm verdicts to the round's accepted set.
+        self.accepted_resolved_total = 0
         self.verdict_counts: dict[str, int] = {}
         self.confirm_counts: dict[str, int] = {}
+        self._round_accepted_ids: set[str] = set()
 
     def record_round(self, findings: list[dict[str, Any]]) -> None:
         self.rounds += 1
         self.findings_total += len(findings)
 
     def record_verdicts(self, verdicts: list[dict[str, Any]]) -> None:
+        self._round_accepted_ids = set()
         for v in verdicts:
             verdict = v.get("verdict")
             if verdict:
                 self.verdict_counts[verdict] = self.verdict_counts.get(verdict, 0) + 1
             if v.get("action") == "fix_now":
                 self.accepted_total += 1
+                fid = v.get("finding_id")
+                if fid:
+                    self._round_accepted_ids.add(fid)
 
     def record_confirm(self, cdata: dict[str, Any]) -> None:
+        # The confirm pass that follows immediately confirms THIS round's fixes,
+        # so its verdicts are scoped to the round's findings — join against the
+        # round's accepted ids (set in record_verdicts just before).
         for v in cdata.get("verdicts") or []:
             verdict = v.get("verdict")
             if verdict:
                 self.confirm_counts[verdict] = self.confirm_counts.get(verdict, 0) + 1
+            if verdict == "resolved" and v.get("finding_id") in self._round_accepted_ids:
+                self.accepted_resolved_total += 1
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "rounds": self.rounds,
             "findings_total": self.findings_total,
             "accepted_total": self.accepted_total,
+            "accepted_resolved_total": self.accepted_resolved_total,
             "verdict_counts": dict(self.verdict_counts),
             "confirm_counts": dict(self.confirm_counts),
         }

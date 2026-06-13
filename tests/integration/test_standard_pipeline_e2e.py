@@ -22,7 +22,9 @@ from pathlib import Path
 
 import pytest
 
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import gitops, manifest as M, proposals as P
+from gauntlet.engine.feedback import FeedbackData, TriageCorrection
+from gauntlet.engine.pipeline import content_hash, load_pipeline
 from gauntlet.engine.report import build_report
 from gauntlet.engine.run import RunManager
 
@@ -154,3 +156,57 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     assert tri is not None, "no triage cost row; classification spend not attributed"
     assert tri.pct_cost is not None, "triage percentage is null; cannot verify FR-3"
     assert tri.pct_cost < 5.0
+
+    # --- FR-6 acceptance: feedback (captured after the run) drives a real,
+    # human-reviewed proposal (P7 plan §"Real-data", review F-001/F-006) -------
+    run_dir = mgr.layout("toy").active_run_dir()
+    # the retro stage ran and self-critiqued each role at run end (FR-6.2)
+    assert (run_dir / "retro" / "retro-builder.md").exists()
+    assert (run_dir / "retro" / "retro-reviewer.md").exists()
+
+    # Seed a deliberate triage error in feedback, captured AFTER the run: name a
+    # real finding from the run's triage and mark its verdict wrong (FR-6.1).
+    triage = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    a_verdict = (triage.get("verdicts") or [{}])[0]
+    seeded_fid = a_verdict.get("finding_id", "F-001")
+    mgr.save_feedback("toy", FeedbackData(
+        outcome_rating="mixed",
+        reviewer_misses="the reviewer under-weighted an input-validation gap",
+        triage_corrections=[TriageCorrection(
+            finding_id=seeded_fid, correct_verdict="legitimate",
+            note="this was a real defect the triager wrongly dismissed")],
+        notes="Sharpen the triage rubric so input-validation gaps are not "
+              "dismissed as bikeshedding.",
+    ), run_dir=run_dir)
+
+    # Late feedback drives proposal generation (FR-6.1 → FR-6.3): re-synthesise.
+    generated = mgr.regenerate_proposals("toy")
+    assert generated, "no proposals generated from seeded feedback (FR-6 acceptance)"
+    pending = [p for p in P.list_proposals(run_dir / "retro" / "proposals")
+               if p.status == P.PENDING and p.valid]
+    assert pending, "no valid, applyable prompt-diff proposal (FR-6 acceptance)"
+
+    # Human approves one; the approved diff is applied + committed and the
+    # CHANGELOG accumulates (FR-6.4/6.5). Capture the target's hash to prove the
+    # next run's manifest would see the new version (FR-6 acceptance).
+    target = pending[0].targets[0]
+    before = content_hash((repo / target).read_text())
+    approved = pending[0].name
+    results = mgr.review_proposals(
+        "toy", decide=lambda p: ("approve", "") if p.name == approved else ("reject", "x"),
+    )
+    applied = [r for r in results if r["action"] == "applied"]
+    assert applied, f"approval did not apply any proposal: {results}"
+    after = content_hash((repo / target).read_text())
+    assert before != after, "approved proposal did not change the target asset"
+    assert "## " in (repo / "prompts" / "CHANGELOG.md").read_text()
+    # FR-6 acceptance: a fresh run's manifest would record the new asset version.
+    # _prompt_hashes derives content_hash from disk, so for any asset the manifest
+    # tracks (prompt templates, policy.yaml), the recorded hash now equals the
+    # post-apply content — provably the new version, not the old one. (Some
+    # targets, e.g. the triage few-shot corpus, are not referenced by a step and
+    # so are not manifest-hashed; the content change above is the guarantee there.)
+    pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+    hashes = RunManager(repo)._prompt_hashes(pipeline)
+    if target in hashes:
+        assert hashes[target] == after

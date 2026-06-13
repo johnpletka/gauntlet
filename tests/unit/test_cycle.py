@@ -176,6 +176,8 @@ def test_converges_in_one_round(cycle_repo):
     assert rec.metrics["rounds"] == 1
     assert rec.metrics["findings_total"] == 1
     assert rec.metrics["accepted_total"] == 1
+    # the one accepted fix was confirmed resolved → counts toward fix-survival (F-004)
+    assert rec.metrics["accepted_resolved_total"] == 1
     assert rec.metrics["verdict_counts"]["legitimate"] == 1
     assert rec.metrics["confirm_counts"]["resolved"] == 1
 

@@ -42,28 +42,32 @@ class TrendMetrics:
 def build_run_trend(manifest: Any, *, judge_audit_path: Path | None = None) -> TrendMetrics:
     rounds = 0
     findings_total = 0
+    accepted_total = 0
+    accepted_resolved_total = 0
     verdict_counts: dict[str, int] = {}
-    confirm_counts: dict[str, int] = {}
     for rec in manifest.steps:
         m = rec.metrics or {}
         if not m:
             continue
         rounds += int(m.get("rounds", 0) or 0)
         findings_total += int(m.get("findings_total", 0) or 0)
+        accepted_total += int(m.get("accepted_total", 0) or 0)
+        accepted_resolved_total += int(m.get("accepted_resolved_total", 0) or 0)
         for k, v in (m.get("verdict_counts") or {}).items():
             verdict_counts[k] = verdict_counts.get(k, 0) + int(v)
-        for k, v in (m.get("confirm_counts") or {}).items():
-            confirm_counts[k] = confirm_counts.get(k, 0) + int(v)
 
     total_verdicts = sum(verdict_counts.values())
     pct_legitimate = (
         100.0 * verdict_counts.get("legitimate", 0) / total_verdicts
         if total_verdicts else None
     )
-    total_confirm = sum(confirm_counts.values())
+    # FR-6.6: "% accepted fixes that survive the confirm pass" — resolved
+    # ACCEPTED fixes over accepted fixes, NOT over all confirm verdicts. Declined
+    # findings carry an expected `unresolved` confirm verdict and must not depress
+    # the metric (F-004).
     fix_survival = (
-        100.0 * confirm_counts.get("resolved", 0) / total_confirm
-        if total_confirm else None
+        100.0 * accepted_resolved_total / accepted_total
+        if accepted_total else None
     )
     findings_per_round = findings_total / rounds if rounds else None
 

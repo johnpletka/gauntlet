@@ -12,13 +12,17 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import json
+
 from gauntlet.engine import manifest as M
 from gauntlet.engine.config import RunConfig
+from gauntlet.engine.execution import StepContext
 from gauntlet.engine.feedback import FeedbackData, TriageCorrection
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
 from gauntlet.engine import proposals as P
+from gauntlet.engine import retro as R
 from gauntlet.logging.redact import RedactingWriter
 
 from conftest import FakeAdapter
@@ -66,13 +70,14 @@ def _capture_diff(repo: Path, rel: str, new_content: str) -> str:
     return diff
 
 
-def _run_retro(repo: Path, adapters: dict, *, feedback=None):
+def _run_retro(repo: Path, adapters: dict, *, feedback=None, step_extra=None):
     step = {
         "id": "retrospective", "type": "retrospective",
         "agents": ["builder", "reviewer"], "proposer": "triage",
         "retro_prompt": "prompts/retro.md",
         "synthesis_prompt": "prompts/proposal-synthesis.md",
     }
+    step.update(step_extra or {})
     pipeline = Pipeline.model_validate(
         {"name": "demo", "version": 1, "stages": [{"id": "retro", "steps": [step]}]}
     )
@@ -158,19 +163,131 @@ def test_feedback_reaches_synthesis_prompt(tmp_path: Path):
     assert "converged in 1" in synth_prompt
 
 
-def test_retro_survives_proposer_failure(tmp_path: Path):
-    # a synthesis hiccup must not strand an otherwise-complete run (best-effort).
-    repo = _retro_repo(tmp_path)
-
+def _boom_adapters():
     class Boom(FakeAdapter):
         def run(self, *a, **k):
             raise RuntimeError("synthesis exploded")
 
-    adapters = {
+    return {
         "builder": FakeAdapter(text="b"),
         "reviewer": FakeAdapter(text="r"),
         "triage": Boom(),
     }
-    status, man, run_dir = _run_retro(repo, adapters)
+
+
+def test_retro_fails_closed_on_proposer_failure(tmp_path: Path):
+    # F-002: proposal synthesis is the FR-6 deliverable — a synthesiser fault
+    # must FAIL the step, not report the retro loop complete by default.
+    repo = _retro_repo(tmp_path)
+    status, man, run_dir = _run_retro(repo, _boom_adapters())
+    assert status == M.RUN_FAILED
+    rec = man.record("retrospective")
+    assert rec.status == M.FAILED
+    assert "proposal synthesis FAILED" in rec.notes
+    # the failure evidence was persisted (data over inference)
+    assert (run_dir / "retro" / "proposal-synthesis-error.txt").exists()
+
+
+def test_retro_optional_synthesis_survives_failure(tmp_path: Path):
+    # The best-effort path still exists, but only when explicitly opted into.
+    repo = _retro_repo(tmp_path)
+    status, man, run_dir = _run_retro(
+        repo, _boom_adapters(), step_extra={"proposals_optional": True}
+    )
     assert status == M.RUN_DONE
-    assert "proposal synthesis skipped" in man.record("retrospective").notes
+    rec = man.record("retrospective")
+    assert rec.status == M.DONE
+    assert "proposal synthesis FAILED" in rec.notes
+    assert "proposals_optional" in rec.notes
+
+
+# --- F-003: role-specific, all-rounds summaries ------------------------------
+def _write_round(step_dir: Path, rnd: int, findings, verdicts, confirm):
+    rdir = step_dir / f"r{rnd}-review"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "findings.json").write_text(json.dumps({"findings": findings}))
+    tdir = step_dir / f"r{rnd}-triage"
+    for fid, v in verdicts.items():
+        sub = tdir / fid
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "verdict.json").write_text(json.dumps(v))  # no finding_id, as in prod
+    cdir = step_dir / f"r{rnd}-confirm"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / "confirm.json").write_text(json.dumps({"verdicts": confirm}))
+
+
+def _ctx_with_cycle(tmp_path: Path) -> StepContext:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_dir = repo / "runs" / "demo" / "run-1"
+    step_dir = run_dir / "steps" / "impl-cycle.0"
+    # round 1: F-001 accepted+resolved, F-002 declined (reject)+unresolved
+    _write_round(
+        step_dir, 1,
+        findings=[
+            {"id": "F-001", "severity": "blocking", "category": "correctness",
+             "claim": "loader off-by-one drops the last record"},
+            {"id": "F-002", "severity": "nit", "category": "style",
+             "claim": "rename foo to bar"},
+        ],
+        verdicts={
+            "F-001": {"verdict": "legitimate", "action": "fix_now", "confidence": "high"},
+            "F-002": {"verdict": "bikeshedding", "action": "reject", "confidence": "high"},
+        },
+        confirm=[{"finding_id": "F-001", "verdict": "resolved"},
+                 {"finding_id": "F-002", "verdict": "unresolved"}],
+    )
+    # round 2: F-003 accepted+resolved
+    _write_round(
+        step_dir, 2,
+        findings=[{"id": "F-003", "severity": "major", "category": "correctness",
+                   "claim": "missing null guard on parse"}],
+        verdicts={"F-003": {"verdict": "legitimate", "action": "fix_now", "confidence": "high"}},
+        confirm=[{"finding_id": "F-003", "verdict": "resolved"}],
+    )
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1, "stages": [{"id": "s", "steps": [
+            {"id": "impl-cycle", "type": "adversarial_cycle", "mode": "code_review",
+             "reviewer": "reviewer", "triager": "triage", "fixer": "builder"},
+            {"id": "retrospective", "type": "retrospective",
+             "agents": ["builder", "reviewer"], "proposer": "triage"},
+        ]}],
+    })
+    man = Manifest(run_id="run-1", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    man.steps.append(StepRecord(id="impl-cycle", type="adversarial_cycle",
+                                iteration="0", notes="converged in round 2"))
+    rec = StepRecord(id="retrospective", type="retrospective")
+    return StepContext(
+        repo_root=repo, run_dir=run_dir, artifact_root=repo,
+        config=RunConfig.model_validate(BASE_CONFIG), pipeline=pipeline,
+        manifest=man, record=rec, writer=RedactingWriter(),
+    )
+
+
+def test_agent_summaries_are_role_specific_across_all_rounds(tmp_path: Path):
+    ctx = _ctx_with_cycle(tmp_path)
+    reviewer = R.build_agent_summary(ctx, "reviewer")
+    builder = R.build_agent_summary(ctx, "builder")
+
+    # the two agents get DIFFERENT slices, not one shared blob (F-003 defect #1)
+    assert reviewer != builder
+    assert "findings you raised" in reviewer.lower()
+    assert "fixes you applied" in builder.lower()
+
+    # the reviewer sees every finding it raised, across BOTH rounds, with the
+    # triage verdict and confirm outcome joined by id (F-003 defect #2)
+    for fid in ("F-001", "F-002", "F-003"):
+        assert fid in reviewer
+    assert "triage: bikeshedding/reject" in reviewer
+    assert "confirm: resolved" in reviewer
+
+    # the fixer only sees the fixes it actually applied — the declined F-002 is
+    # not a fix it made, so it must not appear in the fixer's slice
+    assert "F-001" in builder and "F-003" in builder
+    assert "F-002" not in builder
+
+    # the comprehensive synthesis summary covers all rounds + the cycle outcome
+    full = R.build_run_summary(ctx)
+    assert "round 1" in full and "round 2" in full
+    assert "converged in round 2" in full

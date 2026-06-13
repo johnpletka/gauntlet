@@ -243,6 +243,16 @@ def _validate_diff(
             "diff escapes the versioned-asset allowlist (prompts/, pipelines/, "
             f"schemas/, policy.yaml): {', '.join(offending)}"
         )
+    # Single-file contract (F-005): the proposal schema/prompt say each proposal
+    # edits exactly ONE file, and apply stages all touched paths under one
+    # approval — so a diff touching several allowlisted files would apply
+    # multiple asset changes under a single rationale/review decision. Reject
+    # anything whose de-duplicated target set is not exactly one path.
+    if len(targets) != 1:
+        return False, (
+            "a proposal must edit exactly one file (proposal contract), but the "
+            f"diff touches {len(targets)}: {', '.join(targets)}"
+        )
     if declared and not path_allowed(declared):
         return False, f"declared target_path {declared!r} is outside the allowlist"
     if declared and declared not in targets:

@@ -32,6 +32,7 @@ def _manifest() -> Manifest:
         id="impl-cycle", type="adversarial_cycle",
         metrics={
             "rounds": 2, "findings_total": 4, "accepted_total": 3,
+            "accepted_resolved_total": 2,
             "verdict_counts": {"legitimate": 3, "bikeshedding": 1},
             "confirm_counts": {"resolved": 2, "unresolved": 1},
         },
@@ -51,12 +52,34 @@ def test_trend_math_from_fixture_manifest():
     assert t.findings_per_round == pytest.approx(2.0)
     # 3 of 4 verdicts legitimate
     assert t.pct_legitimate == pytest.approx(75.0)
-    # 2 resolved of 3 confirm verdicts survive
+    # 2 of 3 ACCEPTED fixes survived the confirm pass (declined findings'
+    # expected `unresolved` verdicts are excluded from the denominator — F-004)
     assert t.fix_survival == pytest.approx(2 / 3 * 100)
     assert t.test_failure_loops == 2
     # one numbered phase (P1); P1.1 collapses to P1
     assert t.phases == 1
     assert t.cost_per_phase == pytest.approx(2.0)
+
+
+def test_fix_survival_ignores_declined_findings(tmp_path: Path):
+    # F-004: a round can accept 1 finding (resolved) and decline 3 others, whose
+    # confirm verdicts are the expected `unresolved`. Survival must be 100% (the
+    # one accepted fix held), NOT 1/4 — declined verdicts are not failed fixes.
+    man = Manifest(
+        run_id="r", slug="d", branch="b", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+    )
+    man.steps.append(StepRecord(
+        id="c", type="adversarial_cycle",
+        metrics={
+            "rounds": 1, "findings_total": 4, "accepted_total": 1,
+            "accepted_resolved_total": 1,
+            "verdict_counts": {"legitimate": 1, "bikeshedding": 3},
+            "confirm_counts": {"resolved": 1, "unresolved": 3},
+        },
+    ))
+    t = build_run_trend(man)
+    assert t.fix_survival == pytest.approx(100.0)
 
 
 def test_trend_handles_run_without_metrics():

@@ -199,8 +199,21 @@ def feedback(slug: str) -> None:
         outcome_rating=rating, reviewer_misses=misses,
         triage_corrections=corrections, notes=notes,
     )
-    path = _manager().save_feedback(slug, data)
+    mgr = _manager()
+    path = mgr.save_feedback(slug, data)
     typer.echo(f"feedback saved to {path}")
+    # FR-6.1: feedback captured at run end or LATER must be able to drive
+    # proposal generation. The retro step already ran, so re-synthesise now with
+    # the feedback present (review F-001), appending any new pending proposals.
+    if typer.confirm(
+        "Regenerate improvement proposals from this feedback now?", default=True
+    ):
+        generated = mgr.regenerate_proposals(slug)
+        valid = sum(1 for p in generated if getattr(p, "valid", False))
+        typer.echo(
+            f"generated {len(generated)} proposal(s), {valid} applyable; "
+            f"review with `gauntlet proposals review --slug {slug}`"
+        )
 
 
 proposals_app = typer.Typer(no_args_is_help=True, help="Improvement proposals (FR-6.4).")

@@ -16,9 +16,12 @@ import pytest
 
 from gauntlet.engine import proposals as P
 from gauntlet.engine.config import RunConfig
+from gauntlet.engine.feedback import FeedbackData, TriageCorrection
 from gauntlet.engine.pipeline import Pipeline
 from gauntlet.engine.run import RunManager
 from gauntlet.logging.redact import RedactingWriter
+
+from conftest import FakeAdapter
 
 CFG = """\
 base_branch: main
@@ -137,6 +140,67 @@ def test_manifest_records_policy_hash(tmp_path: Path):
     # an approved policy proposal provably changes the next run's manifest.
     assert "policy.yaml" in hashes
     assert hashes["policy.yaml"].startswith("sha256:")
+
+
+def test_feedback_after_run_regenerates_proposals(tmp_path: Path):
+    # F-001: feedback captured AFTER the run must be able to drive proposal
+    # generation (FR-6.1). A completed run with no feedback yet → enter feedback
+    # → regenerate → a pending proposal appears reflecting that feedback.
+    repo = _repo(tmp_path)
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".gitignore").write_text("*\n")  # engine self-ignore
+    man = {
+        "run_id": "run-1", "slug": "demo", "branch": "gauntlet/demo",
+        "base_branch": "main",
+        "pipeline": {"name": "standard", "version": 1, "hash": "h"},
+        "status": "RUN_DONE",
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (run_dir / "pipeline.yaml").write_text(
+        "name: standard\nversion: 1\nstages:\n"
+        "  - id: retro\n    steps:\n"
+        "      - {id: retrospective, type: retrospective, "
+        "agents: [builder, reviewer], proposer: triage}\n"
+    )
+    # self-critiques the original retro left behind
+    (run_dir / "retro").mkdir()
+    (run_dir / "retro" / "retro-builder.md").write_text("builder critique")
+    (run_dir / "retro" / "retro-reviewer.md").write_text("reviewer critique")
+
+    proposals_dir = run_dir / "retro" / "proposals"
+    assert not P.list_proposals(proposals_dir)  # nothing yet
+
+    mgr = RunManager(repo)
+    # capture a triage correction in feedback (the FR-6.5 corpus seed case)
+    mgr.save_feedback(
+        "demo",
+        FeedbackData(
+            outcome_rating="mixed", reviewer_misses="missed the off-by-one",
+            triage_corrections=[TriageCorrection(
+                finding_id="F-002", correct_verdict="legitimate", note="was real")],
+            notes="SENTINEL-LATE-FEEDBACK",
+        ),
+        run_dir=run_dir,
+    )
+
+    # the synthesiser proposes sharpening the rubric from that feedback
+    diff = _capture_diff(repo, "prompts/triage.md", "rubric one SHARPENED\nrubric two\n")
+    fake = FakeAdapter(text="{}", structured={"proposals": [
+        {"slug": "sharpen-rubric", "target_path": "prompts/triage.md",
+         "rationale": "human marked F-002 a false bikeshedding", "diff": diff}]})
+    generated = mgr.regenerate_proposals(
+        "demo", run_dir=run_dir, adapter_factory=lambda n: fake
+    )
+
+    # a pending, applyable proposal now exists, driven by the late feedback
+    assert len(generated) == 1 and generated[0].valid
+    pending = [p for p in P.list_proposals(proposals_dir)
+               if p.status == P.PENDING and p.valid]
+    assert len(pending) == 1 and pending[0].slug == "sharpen-rubric"
+    # the feedback actually reached the synthesis prompt
+    synth_prompt = (run_dir / "steps" / "retrospective" / "synthesis" / "prompt.md").read_text()
+    assert "SENTINEL-LATE-FEEDBACK" in synth_prompt
 
 
 def test_trend_reads_cross_run_metrics(tmp_path: Path):
