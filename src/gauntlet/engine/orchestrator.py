@@ -339,6 +339,14 @@ class Orchestrator:
         if result.usage is not None:
             rec.usage.add(result.usage)
             self.manifest.totals.add(result.usage)
+        # Per-agent-profile accumulation (FR-3.2): a step reports which profile
+        # each slice of usage belongs to so `gauntlet report` can answer the
+        # FR-3 cost-attribution acceptance. Kept separate from `totals`, never
+        # double-counted (totals already took the step's grand usage above).
+        for agent_name, agent_usage in (result.usage_by_agent or {}).items():
+            self.manifest.agent_usage.setdefault(
+                agent_name, M.UsageTotals()
+            ).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
         if result.commit_sha:
@@ -383,11 +391,23 @@ class Orchestrator:
             "config": self.config,
             "artifacts": {name: True for name in self._existing_artifacts()},
             "vars": self.extra_context,
+            # `foreach: plan.phases` (FR-5.1): the structured phase list the
+            # plan-author emits in plan.md. Resolved lazily from the artifact so
+            # the phases stage fans out over exactly what the (approved) plan
+            # declares — and stays empty/missing until plan.md exists, so the
+            # foreach only resolves after the plan gate (FR-10.2).
+            "plan": self._plan_context(),
         }
         ctx.update(self.extra_context)
         if item is not None:
             ctx["item"] = item
         return ctx
+
+    def _plan_context(self) -> dict[str, Any]:
+        from gauntlet.engine.planphases import load_plan_phases
+
+        phases = load_plan_phases(self.artifact_root / "plan.md")
+        return {"phases": phases} if phases is not None else {}
 
     def _seed_artifacts(self) -> None:
         for name in ("prd.md", "plan.md"):

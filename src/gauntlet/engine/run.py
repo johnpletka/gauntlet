@@ -102,18 +102,23 @@ class RunManager:
 
     @staticmethod
     def _ensure_slug_gitignore(layout: "RunLayout") -> None:
-        """Ignore the active-run pointer at the slug level (BOOTSTRAP-NOTES #33).
+        """Ignore the slug-level live bookkeeping (BOOTSTRAP-NOTES #33).
 
         Idempotent; engine-owned so the guarantee never depends on the repo's
-        own .gitignore. The pointer is the only live-bookkeeping file in the
-        slug dir (run-instance dirs self-ignore via their own .gitignore);
-        prd.md/plan.md and manual records stay tracked."""
+        own .gitignore. Two bookkeeping entries: the active-run pointer, and the
+        slug ``.gitignore`` itself — it is engine-regenerated each run, never a
+        commit payload, and leaving it untracked would dirty the worktree at the
+        very first review handoff of a `standard` run (prd-cycle is step 1, with
+        no commit step before it to sweep it in — unlike the bootstrap pipeline,
+        whose first step is a phase commit). Self-ignoring mirrors the run-dir's
+        own ``*`` self-ignore. prd.md/plan.md and manual records stay tracked."""
         layout.slug_dir.mkdir(parents=True, exist_ok=True)
         gi = layout.slug_dir / ".gitignore"
-        existing = gi.read_text() if gi.exists() else ""
-        if "active-run.txt" not in existing.split():
-            gi.write_text((existing.rstrip("\n") + "\n" if existing else "")
-                          + "active-run.txt\n")
+        existing = gi.read_text().split() if gi.exists() else []
+        wanted = [".gitignore", "active-run.txt"]
+        if any(w not in existing for w in wanted):
+            lines = list(dict.fromkeys(existing + wanted))  # dedup, stable order
+            gi.write_text("\n".join(lines) + "\n")
 
     # ---- new (FR-8.1 scaffold) ----------------------------------------------
     def new(self, slug: str) -> Path:
@@ -230,7 +235,9 @@ class RunManager:
                 layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
         orch = self._orchestrator(layout, run_dir, pipeline, man,
                                   judge_env={}, adapter_factory=adapter_factory)
-        return orch.approve_gate(gate, notes)
+        status = orch.approve_gate(gate, notes)
+        self._maybe_draft_pr(layout, run_dir, man, status)
+        return status
 
     def reject(self, slug: str, notes: str, gate: str | None = None) -> str:
         layout = self.layout(slug)
@@ -351,11 +358,31 @@ class RunManager:
             orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                       adapter_factory=adapter_factory,
                                       extra_context=extra_context, clock=clock)
-            return orch.drive()
-        return self._with_judge(man, run_dir, lambda env: self._orchestrator(
-            layout, run_dir, pipeline, man, judge_env=env,
-            adapter_factory=adapter_factory, extra_context=extra_context,
-            clock=clock).drive())
+            status = orch.drive()
+        else:
+            status = self._with_judge(man, run_dir, lambda env: self._orchestrator(
+                layout, run_dir, pipeline, man, judge_env=env,
+                adapter_factory=adapter_factory, extra_context=extra_context,
+                clock=clock).drive())
+        self._maybe_draft_pr(layout, run_dir, man, status)
+        return status
+
+    def _maybe_draft_pr(self, layout, run_dir, man, status: str) -> None:
+        """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.
+
+        Owned by the RunManager (not the orchestrator) because PR.md is a
+        slug-dir deliverable a human edits and commits — opening and pushing
+        stay human actions (PRD §2.2). Best-effort: a completed run is never
+        reported failed because the human-facing draft could not be rendered.
+        """
+        if status != M.RUN_DONE:
+            return
+        from gauntlet.engine.pr import write_pr_draft
+
+        try:
+            write_pr_draft(layout.slug_dir, run_dir, man, self.writer)
+        except Exception:  # pragma: no cover - defensive; the run still completed
+            pass
 
     def _with_judge(self, man, run_dir, fn):
         judge_model = None
@@ -378,7 +405,9 @@ class RunManager:
                        adapter_factory):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        return orch.approve_gate(gate, notes)
+        status = orch.approve_gate(gate, notes)
+        self._maybe_draft_pr(layout, run_dir, man, status)
+        return status
 
     def _orchestrator(self, layout, run_dir, pipeline, man, *, judge_env,
                       adapter_factory=None, extra_context=None, clock=None) -> Orchestrator:
@@ -398,14 +427,24 @@ class RunManager:
             kwargs["clock"] = clock
         return Orchestrator(**kwargs)
 
+    # Every prompt-template reference a step can carry, so the manifest records
+    # the exact version of the whole prompt set a run used (FR-5.6 / the P5
+    # "versioned prompt set" deliverable) — not just the `prompt:` author/commit
+    # templates, but the adversarial_cycle's review/triage/fix/confirm overrides.
+    _PROMPT_REF_KEYS = (
+        "prompt", "review_prompt", "rereview_prompt", "triage_prompt",
+        "fix_prompt", "confirm_prompt",
+    )
+
     def _prompt_hashes(self, pipeline) -> dict[str, str]:
         from gauntlet.engine.pipeline import content_hash
 
         hashes: dict[str, str] = {}
         for step in pipeline.all_steps():
-            ref = step.get("prompt")
-            if ref:
-                path = self.repo_root / ref
-                if path.exists():
-                    hashes[ref] = content_hash(path.read_text())
+            for key in self._PROMPT_REF_KEYS:
+                ref = step.get(key)
+                if ref and ref not in hashes:
+                    path = self.repo_root / ref
+                    if path.exists():
+                        hashes[ref] = content_hash(path.read_text())
         return hashes

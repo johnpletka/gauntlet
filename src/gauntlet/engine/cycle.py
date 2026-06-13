@@ -135,6 +135,29 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
 
+    # Artifact-mode baseline commit (FR-5.1 ↔ FR-9.3). In `standard.yaml` the
+    # plan-author writes plan.md, then plan-cycle reviews it with no commit step
+    # in between (FR-5.1's exact sequence). A freshly authored/edited artifact is
+    # therefore uncommitted at the handoff — which would (a) trip the round-1
+    # clean-handoff guard and (b) make the post-review mutation check read the
+    # whole artifact as a "reviewer mutation". The cycle commits it as the clean,
+    # reviewable baseline so mutation detection (FR-9.6) and the diff-scoped
+    # confirm (FR-9.5) have a committed handoff. Engine-composed message, no
+    # agent call (determinism over cleverness, §2). prd.md is already committed
+    # by its human author, so the tree is clean there and this is a no-op — and
+    # code_review mode always hands off on the prior phase-commit, so it is too.
+    #
+    # Guarded to fire ONLY when the single dirty path is the artifact itself: a
+    # genuinely dirty handoff (anything else uncommitted) must still fail the
+    # round-1 clean-handoff guard (FR-9.3), never be silently swept into a
+    # baseline commit.
+    if step.get("mode", "artifact") == "artifact" and _only_artifact_dirty(ctx, step):
+        baseline = _baseline_commit(ctx, step, phase, fixer)
+        if isinstance(baseline, StepResult):
+            return _finish(baseline, usage, commits, artifact_writes)
+        commits.append((phase, baseline))
+        handoff = baseline
+
     for rnd in range(1, max_rounds + 1):
         # FR-9.3: control passes to a reviewer only on a clean, committed tree.
         if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
@@ -377,7 +400,7 @@ def _run_sub(
         try:
             result = adapter.run(attempt_prompt, schema=schema, cwd=ctx.repo_root)
         except MalformedOutputError as exc:
-            _log_partial(logger, exc, usage, attempt)
+            _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
                 after_attempt()
             last_exc = exc
@@ -390,25 +413,27 @@ def _run_sub(
             # failed/timed-out call: persist the evidence, run the guard,
             # then let the orchestrator classify (HALTED for timeouts,
             # FAILED otherwise) — fail closed, never fail silent.
-            _log_partial(logger, exc, usage, attempt)
+            _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
                 after_attempt()
             raise
         logger.log_result(result, structured_name=structured_name)
-        usage.add(result.usage)
+        usage.add(result.usage, agent=agent_name)  # per-profile split (FR-3.2)
         if after_attempt is not None:
             after_attempt()
         return result
     raise last_exc  # fail closed after bounded retries
 
 
-def _log_partial(logger: Any, exc: AdapterError, usage: Any, attempt: int) -> None:
+def _log_partial(
+    logger: Any, exc: AdapterError, usage: Any, attempt: int, agent_name: str
+) -> None:
     """Persist a failed attempt's partial result (FR-4.2, P4.r1 F-007)."""
     if exc.partial is None:
         logger.log_text(f"attempt{attempt}-error.txt", str(exc))
         return
     if exc.partial.usage is not None:
-        usage.add(exc.partial.usage)
+        usage.add(exc.partial.usage, agent=agent_name)
     logger.log_result(
         exc.partial,
         structured_name=f"attempt{attempt}-partial.json",
@@ -767,6 +792,58 @@ def _fmt_ids(items: list[dict[str, Any]]) -> str:
     return ", ".join(str(it.get("id", "?")) for it in items)
 
 
+# --- artifact-mode baseline commit (FR-5.1 ↔ FR-9.3) -----------------------------
+def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
+    """True iff the single uncommitted path is the artifact under review.
+
+    The freshly authored/edited artifact is the *only* expected dirt before an
+    artifact-mode review; anything else uncommitted is a genuinely dirty handoff
+    that must fail (FR-9.3), so the baseline commit fires only in the clean case.
+    """
+    name = step.get("artifact")
+    if not name:
+        return False
+    try:
+        rel = (ctx.artifact_root / name).resolve().relative_to(
+            ctx.repo_root.resolve()
+        ).as_posix()
+    except ValueError:
+        return False
+    status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
+    return paths == [rel]
+
+
+def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):
+    """Commit the freshly authored artifact as the clean review baseline.
+
+    Returns the commit SHA, or a terminal StepResult on a format/commit error
+    (fail closed). The message is engine-composed and format-validated like a
+    fix-round commit — the artifact is data, the commit that frames it is not.
+    """
+    artifact = step.get("artifact") or "the artifact"
+    message = (
+        f"{phase}: Author {artifact} for adversarial review\n\n"
+        f"The {phase} artifact ({artifact}) was authored by the builder and is "
+        "committed here as the clean, reviewable baseline. The clean-handoff "
+        "invariant (FR-9.3) requires a committed worktree when control passes to "
+        "the reviewer, so a reviewer worktree mutation is detectable (FR-9.6) and "
+        "the diff-scoped confirm pass (FR-9.5) has a committed handoff to diff "
+        "against. Engine-composed; no agent call (FR-5.1 plan/PRD cycle wiring).\n"
+    )
+    err = validate_commit_message(message)
+    if err is not None:  # engine-composed; a violation here is a bug
+        return StepResult(
+            status=FAILED,
+            notes=f"artifact-mode baseline commit message invalid: {err.reason}",
+        )
+    sha = gitops.commit_all(
+        ctx.repo_root, message,
+        identity=ctx.config.identity(fixer), exclude=ctx.excludes,
+    )
+    return sha
+
+
 # --- fix-round commit message (FR-9.4) -------------------------------------------
 def _fix_commit_message(
     phase: str, rnd: int, findings: list[dict[str, Any]],
@@ -811,6 +888,7 @@ def _finish(
     artifact_writes: dict[str, Path],
 ) -> StepResult:
     result.usage = usage.result()
+    result.usage_by_agent = usage.by_agent()  # per-profile split (FR-3.2)
     result.commits = list(commits)
     if result.status == DONE:
         result.artifact_writes = dict(artifact_writes)

@@ -48,6 +48,10 @@ class StepResult:
     notes: str = ""
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
+    # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent
+    # steps report one entry; an adversarial_cycle splits across its roles.
+    # The orchestrator merges this into the manifest's per-profile totals.
+    usage_by_agent: dict[str, Usage] = field(default_factory=dict)
 
 
 # An adapter factory lets unit tests inject fakes by agent-profile name without
@@ -160,11 +164,21 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     ``:(exclude)`` pathspec makes ``git add`` ERROR ("paths are ignored ... use
     -f"), which broke the commit step (BOOTSTRAP-NOTES #33). Letting gitignore
     own it is both correct and avoids the pathspec collision.
+
+    ``PR.md`` (FR-9.8) IS listed: it is engine-drafted at final-gate pass but
+    must never be auto-committed or pushed — opening the PR stays a human action
+    (PRD §2.2). Excluding it keeps the engine's own commits and clean/rollback
+    checks from sweeping it in, while leaving it plainly visible for the human to
+    ``git add`` and commit deliberately (it is not gitignored, so no #33 clash).
     """
     excludes: list[str] = []
     root = repo_root.resolve()
     try:
         excludes.append(run_dir.resolve().relative_to(root).as_posix())
+    except ValueError:
+        pass
+    try:
+        excludes.append((artifact_root / "PR.md").resolve().relative_to(root).as_posix())
     except ValueError:
         pass
     return excludes

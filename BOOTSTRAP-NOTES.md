@@ -539,3 +539,83 @@ process, and what it suggests for Gauntlet's design.
     bookkeeping. *Design feedback:* engine-owned ignores beat depending on the
     repo's own `.gitignore`; the run-instance dir already self-ignores, and
     the pointer now does too at the slug level — symmetric and portable.
+
+34. **P5: `standard.yaml`'s artifact-mode plan cycle has no committed baseline
+    — FR-5.1's exact step sequence collides with FR-9.3.** FR-5.1 wires the
+    plan stage as `plan-author → plan-cycle` with no commit step between them,
+    so the freshly authored `plan.md` is *uncommitted* when control passes to
+    the reviewer. The P4 `adversarial_cycle` (exercised only on already-
+    committed artifacts — every artifact-mode test seeds + commits prd.md
+    first) requires a clean baseline: its round-1 clean-handoff guard would
+    fail, and worse, its post-review mutation check would read the whole
+    uncommitted plan.md as a "reviewer mutation". Resolved *without* deviating
+    from FR-5.1's sequence: the cycle, in artifact mode, commits the artifact
+    as an engine-composed `PLAN:`/`PRD:` baseline (no agent call) **only when
+    the single dirty path is the artifact itself** — a genuinely dirty handoff
+    (anything else uncommitted) still fails FR-9.3. prd.md is already committed
+    by its human author, so prd-cycle is a clean no-op; code_review cycles hand
+    off on the prior phase-commit, so they are too. *Design feedback:* the
+    artifact-mode/code-mode split in the cycle had an unstated precondition
+    (committed artifact) that only surfaced when the first *uncommitted*
+    artifact (an authored plan) actually ran through it — exactly the kind of
+    gap a dogfood end-to-end is meant to find.
+
+35. **P5: `standard`'s first step is a *review*, so the slug `.gitignore` had
+    to self-ignore.** The bootstrap pipeline's first step is a phase commit,
+    which sweeps the engine-written slug `.gitignore` into git before any
+    review. `standard.yaml` opens with `prd-cycle` — a review — so that
+    untracked `.gitignore` would dirty the worktree at the very first handoff
+    and fail FR-9.3. Fix: the slug `.gitignore` now lists itself (mirroring the
+    run-instance dir's `*` self-ignore, notes #33), so the slug-level
+    bookkeeping is invisible to the worktree-state machine in every pipeline
+    shape, commit-first or review-first.
+
+36. **P5: `PR.md` is engine-drafted but must stay out of the engine's own git
+    operations (FR-9.8 ↔ §2.2).** Drafting `runs/<slug>/PR.md` at the final
+    gate left the worktree dirty, which broke the clean-tree invariant for
+    post-run operations (rollback refused on the untracked PR.md). PR.md is
+    added to `run_bookkeeping_excludes`: the engine never auto-commits or
+    pushes it (opening the PR is a human action, §2.2), and clean/rollback
+    checks ignore it — but it stays plainly visible for the human to
+    `git add` deliberately (not gitignored, so no #33 pathspec clash). PR
+    drafting lives in `RunManager` (which owns the slug layout), not the
+    orchestrator, so a bare `adversarial_cycle` driven straight to DONE in a
+    unit test does not spuriously emit a PR.
+
+37. **P5: per-agent-profile cost attribution is needed for the FR-3 acceptance,
+    not just per-step.** `gauntlet report` must answer "is triage/judge/retro
+    < 5% of run cost?" — but a single `adversarial_cycle` step bills the
+    reviewer, triager, fixer, and escalation profiles, so the manifest's
+    per-step totals cannot attribute classification spend. Added
+    `manifest.agent_usage` (per-profile `UsageTotals`), populated from a new
+    `StepResult.usage_by_agent`: `agent_task`/`commit` report their one
+    profile; the cycle threads the agent name through `_run_sub` so the grand
+    total and the per-profile split fall out of one accumulator. Kept separate
+    from `totals`, never double-counted.
+
+38. **P5: the disguised-halt gap (#26b/#32) is closed for `agent_task` —
+    opt-in.** Per #32, an agent that exits 0 may still have *halted* (an
+    FR-10.4 upstream conflict), and exit-code-alone marched the engine on to a
+    doomed commit. `agent_task` now honours an opt-in completion-signal
+    contract: `halt_on:` (a marker that, if present in the final output, parks
+    the run for a human instead of recording `done`) and `require_signal:` (a
+    marker that, if absent, fails closed). Opt-in so document-authoring tasks
+    keep plain exit-code semantics; `standard.yaml`'s `plan-author` and
+    `implement` steps set `halt_on: "UPSTREAM CONFLICT"` (the CLAUDE.md §4
+    builder-conflict signal). Deferred: a positive `PHASE COMPLETE` structured
+    handshake and applying the contract to the live bootstrap implement steps
+    — recorded here rather than scope-crept into P5.
+
+39. **P5 operability: the session's own judge fail-closed-denied a benign
+    prompt-file `Write` mid-implementation (transient LLM-rung error).** While
+    writing `prompts/review-code.md`, the wired PreToolUse judge returned
+    "judge LLM error, failing closed" and blocked the write; an immediate retry
+    of the identical write succeeded. The fast path has no allow rule for
+    ordinary in-repo file writes, so they escalate to the LLM classifier rung,
+    which intermittently errors (timeout/rate) and — correctly — fails closed.
+    For a frontier-model interactive build session this is a real tax: dozens
+    of benign in-repo writes each gamble on the classifier. *Design feedback:*
+    a fast-path allow rule for in-repo writes under the run/repo root (the
+    judge already knows the boundary, notes #31/#32) would convert these from
+    LLM-rung gambles into deterministic sub-150ms allows — a strong FR-6.3
+    retro-proposal candidate from this very run.

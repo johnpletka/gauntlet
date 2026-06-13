@@ -1,0 +1,71 @@
+# The default Gauntlet pipeline — the 3-gate workflow (FR-5.1).
+#
+# PRD gate → plan gate → per-phase gates, each artifact run through the
+# adversarial_cycle primitive (review → triage → fix → confirm). This is the
+# polished, general-purpose pipeline (`gauntlet run <slug>` uses it by default);
+# `pipelines/bootstrap.yaml` is the minimal switchover-#2 expression of the same
+# loop for Gauntlet's own P5–P7.
+#
+# ENTRY CONTRACT (FR-10.1): Gauntlet does not author PRDs. The human writes
+# runs/<slug>/prd.md and `gauntlet run` begins at adversarial review; the run
+# refuses to start while prd.md is absent or still the scaffolded stub.
+#
+# Commit labels (BOOTSTRAP-NOTES #28, ratified 2026-06-12): the PRD and plan
+# review loops are not numbered phases, so their cycles carry `phase: PRD` /
+# `phase: PLAN` and their fix rounds commit as `PRD.1:` / `PLAN.1:`. Numbered
+# phases (P1, P2, …) come from the plan's `gauntlet-phases` block and are the
+# only `rollback --phase N` boundaries.
+
+name: standard
+version: 1
+
+stages:
+  # --- PRD gate -------------------------------------------------------------
+  - id: prd
+    steps:
+      # The human-authored prd.md is already committed (it is the run's seed);
+      # the cycle reviews it as a document and applies accepted fixes.
+      - {id: prd-cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         phase: PRD, reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-document.md}
+      - {id: prd-approve, type: human_gate,
+         show: [prd.md, findings.json, triage.json, confirm.json]}
+
+  # --- plan gate ------------------------------------------------------------
+  - id: plan
+    steps:
+      - {id: plan-author, type: agent_task, agent: builder,
+         prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md,
+         halt_on: "UPSTREAM CONFLICT"}
+      # plan.md is freshly authored and uncommitted; the artifact-mode cycle
+      # commits it as the clean review baseline (PLAN: …) before reviewing.
+      - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
+         phase: PLAN, reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-document.md}
+      - {id: plan-approve, type: human_gate,
+         show: [plan.md, findings.json, triage.json, confirm.json]}
+
+  # --- phase loop (one iteration per plan.phases entry) ---------------------
+  - id: phases
+    foreach: plan.phases              # plan-author emits the structured phase list
+    steps:
+      - {id: implement, type: agent_task, agent: builder,
+         prompt: prompts/implement-phase.md, inputs: [prd.md, plan.md],
+         halt_on: "UPSTREAM CONFLICT"}
+      - {id: tests, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800, on_fail: {route_to: implement, max_retries: 2}}
+      # clean worktree + commit BEFORE the reviewer handoff (FR-9.3); the phase
+      # prefix (P1, P2, …) comes from the foreach item's id.
+      - {id: phase-commit, type: commit, message_agent: triage,
+         prompt: prompts/commit-message.md}
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-code.md}
+
+  # --- retrospective (placeholder; FR-6.2 retro logic activates in P7) -------
+  - id: retro
+    steps:
+      - {id: retrospective, type: retrospective, agents: [builder, reviewer]}

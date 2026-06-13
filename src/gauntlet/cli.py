@@ -111,6 +111,15 @@ def abort(slug: str) -> None:
 
 
 @app.command()
+def report(slug: str) -> None:
+    """Print the per-step / per-agent-profile cost breakdown for a run (FR-3.2)."""
+    from gauntlet.engine.report import render_report
+
+    man = _manager().status(slug)
+    typer.echo(render_report(man), nl=False)
+
+
+@app.command()
 def rollback(
     slug: str,
     phase: int = typer.Option(..., "--phase", help="Roll the branch back to phase N."),

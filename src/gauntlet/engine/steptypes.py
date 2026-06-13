@@ -13,6 +13,7 @@ can never be substituted into a command line.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -102,6 +103,24 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
+# --- retrospective (placeholder; FR-6 logic activates in P7) ------------------
+def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
+    """Inert placeholder so `standard.yaml` can carry the retro stage from P5.
+
+    The plan ratifies that ``standard.yaml`` ships the retro stage from P5 with
+    the step "active only when registered; P7 activates it" (plan refinement
+    table). Registering an inert spec now is what makes the stage loadable and
+    valid; the real FR-6.2 behaviour — per-agent run summaries and self-critique
+    — is explicitly deferred to P7. It is a no-op that records its deferral, so
+    a full `standard` run reaches DONE instead of failing on an unknown type.
+    """
+    return StepResult(
+        status=DONE,
+        notes="retrospective placeholder: FR-6.2 retro logic is a P7 deliverable "
+        "(plan refinement table); inert until P7 registers the real handler",
+    )
+
+
 # --- agent_task --------------------------------------------------------------
 def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     agent_name = step.agent
@@ -136,6 +155,23 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         logger.log_text("failure.txt", str(exc))
         raise
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
+    usage_by_agent = {agent_name: result.usage} if result.usage else {}
+
+    # Completion-signal contract (BOOTSTRAP-NOTES #32): a headless agent that
+    # exits 0 may still have *halted* — surfaced an FR-10.4 upstream conflict
+    # instead of doing the work. Exit code alone read that as `done` and the
+    # engine marched on to a doomed commit. Opt-in per step so document-authoring
+    # tasks (plan-author) are unaffected: when `halt_on:` is set and its marker
+    # appears in the final output, park for a human (fail closed, never DONE);
+    # when `require_signal:` is set and absent, fail closed.
+    signal = _completion_signal(step, result.text)
+    if signal is not None:
+        status, note = signal
+        return StepResult(
+            status=status, session_id=result.session_id, usage=result.usage,
+            usage_by_agent=usage_by_agent, notes=note,
+        )
+
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")
     if output:
@@ -146,9 +182,32 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         status=DONE,
         session_id=result.session_id,
         usage=result.usage,
+        usage_by_agent=usage_by_agent,
         artifact_writes=artifact_writes,
         notes=f"agent {agent_name!r} completed",
     )
+
+
+def _completion_signal(step: Step, text: str):
+    """Read an agent_task's final output for a halt/completion contract (#32).
+
+    Returns ``None`` to proceed normally, or ``(status, note)`` to short-circuit.
+    Both checks are opt-in (absent keys → no contract), so existing steps and
+    the document-authoring tasks keep their plain exit-code semantics.
+    """
+    halt_on = step.get("halt_on")
+    if halt_on and halt_on in (text or ""):
+        return PARKED, (
+            f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
+            "parked for a human instead of marking the step done (#32)"
+        )
+    require = step.get("require_signal")
+    if require and require not in (text or ""):
+        return FAILED, (
+            f"agent did not emit the required completion signal {require!r}; "
+            "failing closed rather than advancing on a silent non-completion (#32)"
+        )
+    return None
 
 
 def _render_prompt(step: Step, ctx: StepContext) -> str:
@@ -164,7 +223,9 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
         content = Path(path).read_text() if Path(path).exists() else ""
         parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
     if ctx.iteration_item is not None:
-        parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{ctx.iteration_item}")
+        item = ctx.iteration_item
+        rendered = item if isinstance(item, str) else json.dumps(item, indent=2)
+        parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{rendered}")
     return "".join(parts)
 
 
@@ -172,8 +233,6 @@ def _load_schema(step: Step, ctx: StepContext) -> dict | None:
     ref = step.get("findings_schema") or step.get("schema")
     if not ref:
         return None
-    import json
-
     return json.loads((ctx.repo_root / ref).read_text())
 
 
@@ -183,7 +242,8 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # Narrow exclusion (review F-001): commit real artifacts (plan.md, outputs);
     # keep only the engine's own bookkeeping out of the commit and the checks.
     exclude = ctx.excludes
-    message, draft_usage, draft_session = _commit_message(step, ctx)
+    message, draft_usage, draft_session, drafter = _commit_message(step, ctx)
+    usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
     if err is not None:
         # message_agent drafting includes a bounded redraft loop in _draft;
@@ -191,6 +251,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         return StepResult(
             status=FAILED,
             usage=draft_usage,
+            usage_by_agent=usage_by_agent,
             session_id=draft_session,
             notes=f"commit message invalid: {err.reason}",
         )
@@ -208,6 +269,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
                 commit_sha=existing,
                 commit_phase=prefix,
                 usage=draft_usage,
+                usage_by_agent=usage_by_agent,
                 session_id=draft_session,
                 notes="reconciled pre-existing commit after mid-commit interruption",
             )
@@ -216,6 +278,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         return StepResult(
             status=FAILED,
             usage=draft_usage,
+            usage_by_agent=usage_by_agent,
             session_id=draft_session,
             notes="commit step found a clean worktree with nothing to commit",
         )
@@ -225,16 +288,17 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
     return StepResult(
         status=DONE, commit_sha=sha, commit_phase=prefix,
-        usage=draft_usage, session_id=draft_session, notes=f"committed {sha[:10]}",
+        usage=draft_usage, usage_by_agent=usage_by_agent,
+        session_id=draft_session, notes=f"committed {sha[:10]}",
     )
 
 
 def _commit_message(step: Step, ctx: StepContext):
-    """Return ``(message, usage, session_id)``; usage/session are None for a
-    literal message (no model call)."""
+    """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
+    are None for a literal message (no model call)."""
     literal = step.get("message")
     if literal:
-        return literal, None, None  # human-authored YAML; still format-validated
+        return literal, None, None, None  # human-authored YAML; still validated
     return _draft_commit_message(step, ctx)
 
 
@@ -245,8 +309,8 @@ def _draft_commit_message(step: Step, ctx: StepContext):
     files `git add -A` will sweep in (review F-008: a new-file phase otherwise
     drafts from an empty diff) — plus an optional plan section. The engine
     validates the format and asks for a redraft on violation (FR-9.2). Returns
-    ``(message, usage, session_id)`` so the commit step records the drafter's
-    cost (FR-3.2/§7).
+    ``(message, usage, session_id, drafter)`` so the commit step records the
+    drafter's cost (FR-3.2/§7).
     """
     agent_name = step.get("message_agent")
     if not agent_name:
@@ -258,7 +322,11 @@ def _draft_commit_message(step: Step, ctx: StepContext):
         if step.get("prompt")
         else _DEFAULT_COMMIT_PROMPT
     )
-    phase_hint = step.get("phase", "")
+    # Phase prefix: an explicit `phase:` wins; otherwise, inside the
+    # `foreach: plan.phases` fan-out, the iteration's phase id (P1, P2…) is the
+    # required prefix, so each phase commit is labelled from the plan, not
+    # left for the drafter to guess (FR-5.1 / FR-9.2).
+    phase_hint = step.get("phase") or _iteration_phase(ctx)
     plan_section = _plan_section(step, ctx)
     header = (
         f"{base_prompt}\n\nRequired header phase prefix: {phase_hint or '(infer PN)'}\n"
@@ -275,17 +343,30 @@ def _draft_commit_message(step: Step, ctx: StepContext):
         session_id = result.session_id
         message = result.text.strip()
         if validate_commit_message(message) is None:
-            return message, usage.result(), session_id
+            return message, usage.result(), session_id, agent_name
         prompt = (
             f"{header}\n\nYour previous draft was rejected: "
             f"{validate_commit_message(message).reason}. "
             f"Return only the corrected commit message.\n{change}\n"
         )
-    return message, usage.result(), session_id
+    return message, usage.result(), session_id, agent_name
+
+
+def _iteration_phase(ctx: StepContext) -> str:
+    """The phase id (P1, P2…) of the current foreach item, if it carries one."""
+    item = ctx.iteration_item
+    if isinstance(item, dict):
+        return str(item.get("id", "") or "")
+    return ""
 
 
 class _UsageAccumulator:
-    """Sum Usage across redraft attempts so rejected drafts still count (F-008)."""
+    """Sum Usage across calls so rejected drafts / sub-agent calls still count.
+
+    Optionally tracks a per-agent breakdown (FR-3.2): pass ``agent=`` to
+    :meth:`add` and the cycle's grand total and its per-profile split fall out
+    of one accumulator (F-008 for redraft sums; per-agent for `gauntlet report`).
+    """
 
     def __init__(self) -> None:
         self._in = 0
@@ -293,8 +374,9 @@ class _UsageAccumulator:
         self._cached = 0
         self._cost: float | None = None
         self._seen = False
+        self._by_agent: dict[str, _UsageAccumulator] = {}
 
-    def add(self, usage) -> None:
+    def add(self, usage, *, agent: str | None = None) -> None:
         if usage is None:
             return
         self._seen = True
@@ -303,6 +385,8 @@ class _UsageAccumulator:
         self._cached += usage.cached_input_tokens or 0
         if usage.cost_usd is not None:
             self._cost = (self._cost or 0.0) + usage.cost_usd
+        if agent is not None:
+            self._by_agent.setdefault(agent, _UsageAccumulator()).add(usage)
 
     def result(self):
         from gauntlet.adapters.base import Usage
@@ -315,6 +399,15 @@ class _UsageAccumulator:
             cached_input_tokens=self._cached,
             cost_usd=self._cost,
         )
+
+    def by_agent(self) -> dict:
+        """Per-agent-profile Usage (FR-3.2); empty when no agent was tagged."""
+        out = {}
+        for name, acc in self._by_agent.items():
+            r = acc.result()
+            if r is not None:
+                out[name] = r
+        return out
 
 
 def _change_context(ctx: StepContext) -> str:
@@ -390,6 +483,11 @@ SPECS: dict[str, StepSpec] = {
         type="commit",
         handler=handle_commit,
         touches_worktree=True,
+    ),
+    "retrospective": StepSpec(
+        type="retrospective",
+        handler=handle_retrospective,
+        # placeholder until P7; no agent, no worktree write, no schema
     ),
 }
 

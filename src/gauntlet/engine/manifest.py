@@ -95,6 +95,11 @@ class Manifest(BaseModel):
     steps: list[StepRecord] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
     totals: UsageTotals = Field(default_factory=UsageTotals)
+    # Per-agent-profile usage (FR-3.2): `gauntlet report` needs the spend split
+    # by profile, not just by step — a single adversarial_cycle step bills the
+    # reviewer, triager, fixer, and escalation profiles, so step-level totals
+    # alone cannot answer "is triage < 5% of run cost?" (FR-3 acceptance).
+    agent_usage: dict[str, UsageTotals] = Field(default_factory=dict)
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:
