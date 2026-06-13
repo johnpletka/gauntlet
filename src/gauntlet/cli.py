@@ -153,12 +153,91 @@ def abort(slug: str) -> None:
 
 
 @app.command()
-def report(slug: str) -> None:
-    """Print the per-step / per-agent-profile cost breakdown for a run (FR-3.2)."""
-    from gauntlet.engine.report import render_report
+def report(
+    slug: str,
+    trend: bool = typer.Option(
+        False, "--trend", help="Also show cross-run improvement metrics (FR-6.6)."
+    ),
+) -> None:
+    """Print the per-step / per-agent-profile cost breakdown for a run (FR-3.2).
 
-    man = _manager().status(slug)
+    With ``--trend``, also print the cross-run improvement metrics (findings per
+    round, %legitimate, fix-survival, test loops, judge ask-rate, cost/phase).
+    """
+    from gauntlet.engine.report import render_report
+    from gauntlet.engine.trend import render_trend
+
+    mgr = _manager()
+    man = mgr.status(slug)
     typer.echo(render_report(man), nl=False)
+    if trend:
+        typer.echo("")
+        typer.echo(render_trend(mgr.trend(slug)), nl=False)
+
+
+@app.command()
+def feedback(slug: str) -> None:
+    """Capture human feedback for a run into retro/feedback.md (FR-6.1)."""
+    from gauntlet.engine.feedback import FeedbackData, TriageCorrection, VERDICTS
+
+    rating = typer.prompt("Outcome rating (e.g. good/mixed/poor)", default="")
+    misses = typer.prompt("What did the reviewers miss?", default="")
+    corrections: list[TriageCorrection] = []
+    typer.echo("Triage corrections (false legitimate / false bikeshedding). "
+               "Leave the finding id blank to finish.")
+    while True:
+        fid = typer.prompt("  finding id", default="")
+        if not fid.strip():
+            break
+        verdict = typer.prompt(f"  correct verdict {VERDICTS}", default="legitimate")
+        note = typer.prompt("  note", default="")
+        corrections.append(
+            TriageCorrection(finding_id=fid.strip(), correct_verdict=verdict.strip(), note=note)
+        )
+    notes = typer.prompt("Freeform notes", default="")
+    data = FeedbackData(
+        outcome_rating=rating, reviewer_misses=misses,
+        triage_corrections=corrections, notes=notes,
+    )
+    path = _manager().save_feedback(slug, data)
+    typer.echo(f"feedback saved to {path}")
+
+
+proposals_app = typer.Typer(no_args_is_help=True, help="Improvement proposals (FR-6.4).")
+app.add_typer(proposals_app, name="proposals")
+
+
+@proposals_app.command("review")
+def proposals_review(
+    slug: str = typer.Option(None, "--slug", help="Limit to one run slug (default: all)."),
+) -> None:
+    """Present pending proposals; approve/reject + apply approved diffs (FR-6.4)."""
+    mgr = _manager()
+    pending = [
+        (rd, p) for rd, p in mgr.list_proposals(slug)
+        if getattr(p, "status", "") == "pending" and getattr(p, "valid", False)
+    ]
+    if not pending:
+        typer.echo("no pending, applyable proposals")
+        return
+
+    def decide(proposal):
+        typer.echo("")
+        typer.echo(f"Proposal {proposal.name} (from {proposal.source_run})")
+        typer.echo(f"  targets: {', '.join(proposal.targets) or '(none)'}")
+        typer.echo(f"  rationale: {proposal.rationale.strip()[:500]}")
+        typer.echo("  diff:")
+        for line in proposal.diff.splitlines():
+            typer.echo(f"    {line}")
+        if typer.confirm("Approve and apply this proposal?", default=False):
+            return "approve", ""
+        notes = typer.prompt("Rejection notes", default="")
+        return "reject", notes
+
+    results = mgr.review_proposals(slug, decide=decide)
+    for r in results:
+        extra = r.get("sha", r.get("reason", ""))
+        typer.echo(f"  {r['proposal']}: {r['action']}" + (f" ({extra[:60]})" if extra else ""))
 
 
 @app.command()

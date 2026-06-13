@@ -52,6 +52,10 @@ class StepResult:
     # steps report one entry; an adversarial_cycle splits across its roles.
     # The orchestrator merges this into the manifest's per-profile totals.
     usage_by_agent: dict[str, Usage] = field(default_factory=dict)
+    # Structured outcome counts persisted onto the StepRecord for `--trend`
+    # (FR-6.6): rounds, finding/verdict/confirm tallies an adversarial_cycle
+    # emits so trend metrics come from the manifest (P7 test strategy).
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 # An adapter factory lets unit tests inject fakes by agent-profile name without

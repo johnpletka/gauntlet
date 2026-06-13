@@ -146,6 +146,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     usage = _UsageAccumulator()
     commits: list[tuple[str, str]] = []
     artifact_writes: dict[str, Path] = {}
+    metrics = _CycleMetrics()  # trend outcome counts (FR-6.6 / P7)
     carried: list[dict[str, Any]] = []  # open findings carried into the next round
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
@@ -169,7 +170,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     if step.get("mode", "artifact") == "artifact" and _only_artifact_dirty(ctx, step):
         baseline = _baseline_commit(ctx, step, phase, fixer)
         if isinstance(baseline, StepResult):
-            return _finish(baseline, usage, commits, artifact_writes)
+            return _finish(baseline, usage, commits, artifact_writes, metrics)
         commits.append((phase, baseline))
         handoff = baseline
 
@@ -182,7 +183,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     notes=f"worktree dirty at round-{rnd} review handoff; the "
                     "clean-handoff invariant (FR-9.3) failed upstream",
                 ),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
 
         # ---- 1. review, FR-9.6 guard applied after EVERY attempt (F-004) ------
@@ -200,10 +201,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 after_attempt=guard.check,
             )
         except _ParkCycle as park:
-            return _finish(park.result, usage, commits, artifact_writes)
+            return _finish(park.result, usage, commits, artifact_writes, metrics)
 
         findings = list((review.structured or {}).get("findings") or [])
         findings.extend(guard.synthetic_findings)
+        metrics.record_round(findings)
         open_questions = (review.structured or {}).get("open_questions") or []
         artifact_writes["findings.json"] = _write_artifact(
             ctx, "findings.json",
@@ -213,18 +215,19 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if not findings:
             return _finish(
                 StepResult(status=DONE, notes=f"converged: round-{rnd} review returned no findings"),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
 
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
         verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
+        metrics.record_verdicts(verdicts)
         artifact_writes["triage.json"] = _write_artifact(
             ctx, "triage.json", {"verdicts": verdicts}, validate=triage_schema
         )
         if park_reason is not None:
             return _finish(
                 StepResult(status=PARKED, notes=park_reason),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
 
         by_id = {f["id"]: f for f in findings}
@@ -258,7 +261,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             return _finish(
                 StepResult(status=PARKED,
                            notes="escalation: " + "; ".join(reasons)),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
 
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
@@ -269,7 +272,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     notes=f"converged: round-{rnd} accepted no findings "
                     "(declines recorded with reasons in triage.json)",
                 ),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
 
         # ---- 3. fix + fix-round commit (FR-9.4) -------------------------------
@@ -285,14 +288,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     notes=f"fixer made no changes in round {rnd} despite "
                     f"{len(accepted)} accepted finding(s); failing closed",
                 ),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
         message = _fix_commit_message(phase, rnd, findings, verdicts)
         err = validate_commit_message(message)
         if err is not None:  # engine-composed; a violation here is a bug
             return _finish(
                 StepResult(status=FAILED, notes=f"fix-round commit message invalid: {err.reason}"),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
         fix_sha = gitops.commit_all(
             ctx.repo_root, message,
@@ -311,6 +314,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             structured_name="confirm.json",
         )
         cdata = confirm.structured or {}
+        metrics.record_confirm(cdata)
         actions = {v["finding_id"]: v["action"] for v in verdicts}
         open_items, reconciliation = _open_after_confirm(by_id, actions, cdata)
         forcing = _forcing_open(open_items, convergence)
@@ -338,7 +342,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     f"{len(surfaced)} non-blocking item(s) surfaced for the gate"
                     + (f": {', '.join(surfaced)}" if surfaced else ""),
                 ),
-                usage, commits, artifact_writes,
+                usage, commits, artifact_writes, metrics,
             )
         # next round is regression-scoped and reviews only what still forces it
         handoff = fix_sha
@@ -356,7 +360,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
                    if surfaced else ""),
             ),
-            usage, commits, artifact_writes,
+            usage, commits, artifact_writes, metrics,
         )
     return _finish(
         StepResult(
@@ -364,7 +368,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             notes=f"max_rounds={max_rounds} reached with non-blocking items "
             "still open; recorded in confirm.json and carried as history",
         ),
-        usage, commits, artifact_writes,
+        usage, commits, artifact_writes, metrics,
     )
 
 
@@ -900,14 +904,60 @@ def _condense(text: str, limit: int = 200) -> str:
 # --- helpers ---------------------------------------------------------------------
 def _finish(
     result: StepResult, usage: Any, commits: list[tuple[str, str]],
-    artifact_writes: dict[str, Path],
+    artifact_writes: dict[str, Path], metrics: "_CycleMetrics | None" = None,
 ) -> StepResult:
     result.usage = usage.result()
     result.usage_by_agent = usage.by_agent()  # per-profile split (FR-3.2)
     result.commits = list(commits)
+    if metrics is not None:
+        result.metrics = metrics.as_dict()  # trend outcome counts (FR-6.6)
     if result.status == DONE:
         result.artifact_writes = dict(artifact_writes)
     return result
+
+
+class _CycleMetrics:
+    """Per-cycle outcome counts persisted to the manifest for ``--trend`` (FR-6.6).
+
+    Accumulated across rounds and read by :mod:`gauntlet.engine.trend`, so the
+    trend math is manifest-derived (the plan's P7 test strategy), never a walk
+    of the per-round log dirs. Counts are intentionally additive across rounds:
+    ``findings_per_round`` and ``%legitimate`` divide by ``rounds`` downstream.
+    """
+
+    def __init__(self) -> None:
+        self.rounds = 0
+        self.findings_total = 0
+        self.accepted_total = 0  # findings triaged action == fix_now
+        self.verdict_counts: dict[str, int] = {}
+        self.confirm_counts: dict[str, int] = {}
+
+    def record_round(self, findings: list[dict[str, Any]]) -> None:
+        self.rounds += 1
+        self.findings_total += len(findings)
+
+    def record_verdicts(self, verdicts: list[dict[str, Any]]) -> None:
+        for v in verdicts:
+            verdict = v.get("verdict")
+            if verdict:
+                self.verdict_counts[verdict] = self.verdict_counts.get(verdict, 0) + 1
+            if v.get("action") == "fix_now":
+                self.accepted_total += 1
+
+    def record_confirm(self, cdata: dict[str, Any]) -> None:
+        for v in cdata.get("verdicts") or []:
+            verdict = v.get("verdict")
+            if verdict:
+                self.confirm_counts[verdict] = self.confirm_counts.get(verdict, 0) + 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "rounds": self.rounds,
+            "findings_total": self.findings_total,
+            "accepted_total": self.accepted_total,
+            "verdict_counts": dict(self.verdict_counts),
+            "confirm_counts": dict(self.confirm_counts),
+        }
 
 
 def _write_artifact(

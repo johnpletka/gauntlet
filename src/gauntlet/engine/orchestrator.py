@@ -356,6 +356,8 @@ class Orchestrator:
             ).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
+        if result.metrics:
+            rec.metrics = dict(result.metrics)  # trend outcome counts (FR-6.6)
         if result.commit_sha:
             self.manifest.commits.append(
                 M.CommitRecord(

@@ -172,6 +172,12 @@ def test_converges_in_one_round(cycle_repo):
     assert gitops.is_clean(cycle_repo, exclude=["runs"])
     # usage from every sub-call accumulated (4 calls x 10/5)
     assert rec.usage.input_tokens == 40 and rec.usage.output_tokens == 20
+    # cycle outcome counts persisted to the manifest for --trend (FR-6.6, P7)
+    assert rec.metrics["rounds"] == 1
+    assert rec.metrics["findings_total"] == 1
+    assert rec.metrics["accepted_total"] == 1
+    assert rec.metrics["verdict_counts"]["legitimate"] == 1
+    assert rec.metrics["confirm_counts"]["resolved"] == 1
 
 
 def test_no_findings_converges_without_commit(cycle_repo):

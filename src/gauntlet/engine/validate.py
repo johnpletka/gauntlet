@@ -126,6 +126,16 @@ def _validate_step(
                 "breaks the clean-handoff invariant (FR-9.3/9.4); unsupported"
             )
 
+    # 2c. retrospective role bindings (FR-6.2): at least one self-critiquing
+    # agent is required; the proposer is optional (no proposer → self-critique
+    # only, generation skipped and recorded).
+    if step.type == "retrospective":
+        if not (step.get("agents") or []):
+            report.errors.append(
+                f"step {step.id!r} (retrospective) needs a non-empty `agents:` "
+                "list to self-critique (FR-6.2)"
+            )
+
     # 3. agent profile resolution + capabilities (FR-2.3) + banned flags (§8)
     agent_refs = _agent_refs(step, spec.needs_agent)
     for ref in agent_refs:
@@ -175,10 +185,14 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     if step.agent:
         refs.append(step.agent)
     for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer",
-                "escalation_agent"):
+                "escalation_agent", "proposer"):
         ref = step.get(key)
         if ref:
             refs.append(ref)
+    # The retrospective step fans out over a list of self-critiquing agents
+    # (FR-6.2); each must resolve to a profile like any other agent reference.
+    for ref in step.get("agents", []) or []:
+        refs.append(ref)
     return refs
 
 

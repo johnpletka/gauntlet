@@ -103,24 +103,6 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
-# --- retrospective (placeholder; FR-6 logic activates in P7) ------------------
-def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
-    """Inert placeholder so `standard.yaml` can carry the retro stage from P5.
-
-    The plan ratifies that ``standard.yaml`` ships the retro stage from P5 with
-    the step "active only when registered; P7 activates it" (plan refinement
-    table). Registering an inert spec now is what makes the stage loadable and
-    valid; the real FR-6.2 behaviour — per-agent run summaries and self-critique
-    — is explicitly deferred to P7. It is a no-op that records its deferral, so
-    a full `standard` run reaches DONE instead of failing on an unknown type.
-    """
-    return StepResult(
-        status=DONE,
-        notes="retrospective placeholder: FR-6.2 retro logic is a P7 deliverable "
-        "(plan refinement table); inert until P7 registers the real handler",
-    )
-
-
 # --- agent_task --------------------------------------------------------------
 def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     agent_name = step.agent
@@ -484,20 +466,18 @@ SPECS: dict[str, StepSpec] = {
         handler=handle_commit,
         touches_worktree=True,
     ),
-    "retrospective": StepSpec(
-        type="retrospective",
-        handler=handle_retrospective,
-        # placeholder until P7; no agent, no worktree write, no schema
-    ),
 }
 
 
-def _register_cycle() -> None:
-    # Imported at the bottom: cycle.py uses this module's helpers lazily, but
-    # registering here keeps adversarial_cycle a built-in (PRD §4.1 v1 set).
+def _register_builtins() -> None:
+    # Imported at the bottom: cycle.py / retro.py use this module's helpers
+    # lazily, but registering here keeps adversarial_cycle and retrospective
+    # built-ins (PRD §4.1 v1 step set).
     from gauntlet.engine.cycle import SPEC as _CYCLE_SPEC
+    from gauntlet.engine.retro import SPEC as _RETRO_SPEC
 
-    SPECS[_CYCLE_SPEC.type] = _CYCLE_SPEC
+    for spec in (_CYCLE_SPEC, _RETRO_SPEC):
+        SPECS[spec.type] = spec
 
 
-_register_cycle()
+_register_builtins()

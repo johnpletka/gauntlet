@@ -265,6 +265,95 @@ class RunManager:
         layout = self.layout(slug)
         return Manifest.load(layout.active_run_dir() / "manifest.json")
 
+    # ---- feedback (FR-6.1) --------------------------------------------------
+    def save_feedback(self, slug: str, data, *, run_dir: Path | None = None) -> Path:
+        """Capture human feedback into the run's ``retro/feedback.md`` (+ json)."""
+        from gauntlet.engine.feedback import write_feedback
+
+        layout = self.layout(slug)
+        run_dir = run_dir or layout.active_run_dir()
+        if not data.run_id and (run_dir / "manifest.json").exists():
+            data.run_id = Manifest.load(run_dir / "manifest.json").run_id
+        return write_feedback(run_dir, data, self.writer)
+
+    # ---- proposals (FR-6.3/6.4) ---------------------------------------------
+    def _all_slugs(self) -> list[str]:
+        root = self.repo_root / self.config.run_root
+        if not root.exists():
+            return []
+        return sorted(p.name for p in root.iterdir() if p.is_dir())
+
+    def _iter_run_dirs(self, slug: str | None = None):
+        slugs = [slug] if slug else self._all_slugs()
+        for s in slugs:
+            sdir = self.layout(s).slug_dir
+            if not sdir.exists():
+                continue
+            for run_dir in sorted(sdir.glob("run-*")):
+                if (run_dir / "manifest.json").exists():
+                    yield run_dir
+
+    def list_proposals(self, slug: str | None = None) -> list[tuple[Path, object]]:
+        """Every proposal across runs (optionally one slug), as (run_dir, Proposal)."""
+        from gauntlet.engine.proposals import list_proposals
+
+        out: list[tuple[Path, object]] = []
+        for run_dir in self._iter_run_dirs(slug):
+            for p in list_proposals(run_dir / "retro" / "proposals"):
+                out.append((run_dir, p))
+        return out
+
+    def review_proposals(self, slug: str | None = None, *, decide, timestamp=None) -> list[dict]:
+        """Present pending proposals to ``decide`` and apply/reject each (FR-6.4).
+
+        ``decide(proposal) -> (action, notes)`` where action is ``approve`` or
+        ``reject``; the CLI wires it to interactive prompts, tests pass a
+        callback. Approved diffs are applied on a clean tree and committed — no
+        proposal self-applies (this is an engine action gated on human approval).
+        Per-proposal failures are recorded, never aborting the whole review.
+        """
+        from gauntlet.engine import proposals as P
+        from gauntlet.engine.execution import run_bookkeeping_excludes
+
+        timestamp = timestamp or _utc_stamp()
+        changelog = self.repo_root / "prompts" / "CHANGELOG.md"
+        identity = self.config.identity("retro")
+        results: list[dict] = []
+        for run_dir, proposal in self.list_proposals(slug):
+            if proposal.status != P.PENDING or not proposal.valid:
+                continue
+            action, notes = decide(proposal)
+            if action != "approve":
+                P.reject_proposal(proposal, notes or "")
+                results.append({"proposal": proposal.name, "action": "rejected"})
+                continue
+            excludes = run_bookkeeping_excludes(self.repo_root, run_dir, run_dir.parent)
+            if not gitops.is_clean(self.repo_root, exclude=excludes):
+                raise P.ProposalError(
+                    "refusing to apply a proposal: worktree is dirty; commit or "
+                    "discard changes first (governed apply needs a clean tree)"
+                )
+            try:
+                sha = P.apply_proposal(
+                    self.repo_root, proposal, identity=identity,
+                    changelog_path=changelog, timestamp=timestamp,
+                )
+                results.append({"proposal": proposal.name, "action": "applied", "sha": sha})
+            except P.ProposalError as exc:
+                results.append({"proposal": proposal.name, "action": "error", "reason": str(exc)})
+        return results
+
+    # ---- trend metrics (FR-6.6) ---------------------------------------------
+    def trend(self, slug: str | None = None) -> list:
+        from gauntlet.engine.trend import build_run_trend
+
+        rows = []
+        for run_dir in self._iter_run_dirs(slug):
+            man = Manifest.load(run_dir / "manifest.json")
+            rows.append(build_run_trend(man, judge_audit_path=run_dir / "judge-audit.jsonl"))
+        rows.sort(key=lambda r: r.run_id)
+        return rows
+
     # ---- rollback (FR-9.9 / review F-010) -----------------------------------
     def rollback(self, slug: str, phase: int) -> str:
         layout = self.layout(slug)
@@ -495,6 +584,10 @@ class RunManager:
     _PROMPT_REF_KEYS = (
         "prompt", "review_prompt", "rereview_prompt", "triage_prompt",
         "fix_prompt", "confirm_prompt",
+        # retrospective + proposal-synthesis templates (FR-6.2/6.3): versioned
+        # like every other prompt, so a retro proposal that edits them shows up
+        # in the next run's manifest hashes (FR-6 acceptance).
+        "retro_prompt", "synthesis_prompt",
     )
 
     def _prompt_hashes(self, pipeline) -> dict[str, str]:
@@ -508,6 +601,13 @@ class RunManager:
                 path = self.repo_root / ref
                 if path.exists():
                     hashes[ref] = content_hash(path.read_text())
+
+        # Judge policy is a versioned, retro-tunable asset (FR-6.3): record its
+        # content hash so an approved policy proposal provably changes the next
+        # run's manifest, exactly as an approved prompt proposal does (FR-6
+        # acceptance — "the next run uses the new version, visible in the
+        # manifest's prompt/policy hashes").
+        record("policy.yaml")
 
         for step in pipeline.all_steps():
             for key in self._PROMPT_REF_KEYS:

@@ -137,16 +137,23 @@ def _factory(adapters):
 def test_standard_runs_end_to_end_with_fakes(tmp_path):
     repo = _scaffold(tmp_path)
     adapters = {
-        # prd-cycle, plan-cycle, impl-cycle each converge on an empty review
-        "reviewer": Script(review_empty(), review_empty(), review_empty()),
+        # prd-cycle, plan-cycle, impl-cycle each converge on an empty review;
+        # +1 reviewer self-critique in the now-active retro stage (FR-6.2, P7).
+        "reviewer": Script(
+            review_empty(), review_empty(), review_empty(),
+            AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
+        ),
         "builder": Script(
             text_result(PLAN_MD),                              # plan-author
             text_result("implemented P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
             AgentResult(text="P1: build the widget\n\nImplements widget() for P1.\n"
                              "Validates the toy spec end-to-end.\n",
                         usage=_u(), exit_code=0),                # phase-commit draft
+            # retro proposal synthesis (FR-6.3): no change warranted this run.
+            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
         ),
         "escalation": Script(),
     }
@@ -219,15 +226,21 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
     repo = _scaffold(tmp_path, pipeline_text=yaml.safe_dump(spec, sort_keys=False))
 
     adapters = {
-        # one extra review call for the added step (4 cycles converge empty)
-        "reviewer": Script(*[review_empty() for _ in range(4)]),
+        # one extra review call for the added step (4 cycles converge empty) +1
+        # reviewer self-critique in the now-active retro stage (FR-6.2, P7).
+        "reviewer": Script(
+            *[review_empty() for _ in range(4)],
+            AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
+        ),
         "builder": Script(
             text_result(PLAN_MD),
             text_result("did P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
             AgentResult(text="P1: build widget\n\nImplements widget() for P1.\nbody.\n",
                         usage=_u(), exit_code=0),
+            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
         ),
         "escalation": Script(),
     }

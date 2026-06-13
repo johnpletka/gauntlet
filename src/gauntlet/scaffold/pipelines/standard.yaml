@@ -65,7 +65,15 @@ stages:
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-code.md}
 
-  # --- retrospective (placeholder; FR-6.2 retro logic activates in P7) -------
+  # --- retrospective + governed self-improvement (FR-6.2/6.3; active in P7) --
+  # Each agent self-critiques the run; the cheap `proposer` synthesises feedback
+  # + retros into path-contained diffs under retro/proposals/. Nothing applies
+  # automatically — `gauntlet proposals review` is the human ratification gate
+  # (FR-6.4). `gauntlet feedback <run>` captures human feedback at run end or
+  # later; `gauntlet report --trend` reads the cross-run metrics (FR-6.6).
   - id: retro
     steps:
-      - {id: retrospective, type: retrospective, agents: [builder, reviewer]}
+      - {id: retrospective, type: retrospective,
+         agents: [builder, reviewer], proposer: triage,
+         retro_prompt: prompts/retro.md,
+         synthesis_prompt: prompts/proposal-synthesis.md}

@@ -151,6 +151,26 @@ def commit_all(
     return head_sha(repo)
 
 
+def commit_paths(
+    repo: Path, message: str, paths: list[str], *, identity: Identity
+) -> str:
+    """Stage exactly ``paths`` and commit with an explicit identity. Returns SHA.
+
+    Unlike :func:`commit_all`, this never runs ``git add -A`` — the governed
+    proposal apply (FR-6.4) commits precisely the allowlisted asset(s) it patched
+    plus the CHANGELOG, so run bookkeeping can never be swept into the commit.
+    The message is passed on stdin (``-F -``); no agent-authored text hits argv.
+    """
+    _run(repo, "add", "--", *paths)
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit", "-F", "-",
+    ]
+    _run(repo, *args, stdin=message)
+    return head_sha(repo)
+
+
 def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
@@ -200,6 +220,29 @@ def create_ref(repo: Path, ref: str, sha: str) -> None:
 
 def reset_hard(repo: Path, sha: str) -> None:
     _run(repo, "reset", "--hard", sha)
+
+
+def apply_patch_check(repo: Path, patch: str) -> bool:
+    """True iff ``patch`` applies cleanly to the worktree (no side effects).
+
+    ``git apply --check`` validates the unified diff against the current tree
+    without touching a single byte — used to tell a human, before they approve a
+    retro proposal (FR-6.4), whether the diff still applies."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "apply", "--check", "-"],
+        input=patch, capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def apply_patch(repo: Path, patch: str) -> None:
+    """Apply a unified diff to the worktree (governed proposal apply, FR-6.4).
+
+    The patch text is passed on stdin — never on argv — and is the only
+    model-derived bytes that reach git here; path-containment is validated by
+    the caller (review F-001) before this runs, and ``--check`` gates it first.
+    """
+    _run(repo, "apply", "-", stdin=patch)
 
 
 def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:

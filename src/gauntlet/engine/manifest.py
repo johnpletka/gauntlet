@@ -73,6 +73,11 @@ class StepRecord(BaseModel):
     notes: str | None = None
     # foreach binding key, when this record is one iteration of a fan-out step
     iteration: str | None = None
+    # Step-emitted structured outcome counts for `gauntlet report --trend`
+    # (FR-6.6): an adversarial_cycle records rounds, finding/verdict/confirm
+    # tallies here so trend math reads the manifest, never the log dirs (the
+    # plan's P7 test strategy is "trend-metric math from fixture manifests").
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CommitRecord(BaseModel):
