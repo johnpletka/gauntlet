@@ -26,7 +26,9 @@ reviewer_mutation: commit
 agents:
   builder:
     adapter: claude-code
-    model: claude-opus-latest          # passed via --model
+    # Short alias form — the only spelling claude 2.1.172 resolves; the long
+    # `claude-opus-latest` is rejected with an in-band 404 (.gauntlet/pins.yaml).
+    model: opus                        # passed via --model
     permission_mode: acceptEdits
     allowed_tools: [Bash, Read, Write, Edit, Grep, Glob]
     # claude loads the repo's PreToolUse hook only under project setting
@@ -38,12 +40,14 @@ agents:
     sandbox: read-only        # pure review steps are read-only (FR-9.6)
   # Cheap-tier models for classification (FR-3.1): a small model for triage and
   # the judge LLM rung, a stronger model for severity-aware triage escalation.
+  # Pinned to ApiAdapter models verified live via LiteLLM (.gauntlet/pins.yaml):
+  # `claude-haiku-latest` did not resolve, so the cheap tier is OpenAI here.
   triage:
     adapter: api
-    model: claude-haiku-latest
+    model: gpt-5-mini
   escalation:
     adapter: api
-    model: claude-opus-latest
+    model: gpt-5
   judge_llm:
     adapter: api
     model: gpt-5-mini

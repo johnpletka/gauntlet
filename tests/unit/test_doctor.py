@@ -7,7 +7,10 @@ probes are injected so these run offline.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import yaml
 
 from gauntlet.engine.doctor import (
     FAIL,
@@ -42,8 +45,22 @@ def _healthy_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _probes(versions: dict[str, str | None], env: dict[str, str]) -> DoctorProbes:
-    return DoctorProbes(cli_version=lambda name: versions.get(name), env=env)
+def _probes(
+    versions: dict[str, str | None],
+    env: dict[str, str],
+    *,
+    authed: dict[str, bool | None] | None = None,
+    which: object | None = None,
+) -> DoctorProbes:
+    # Default: every present CLI is authenticated and the hook binary is on PATH,
+    # so a "healthy" environment passes without a real subprocess/PATH probe.
+    auth_map = authed if authed is not None else {c: True for c in versions}
+    return DoctorProbes(
+        cli_version=lambda name: versions.get(name),
+        env=env,
+        cli_authenticated=lambda name: auth_map.get(name),
+        which=which if which is not None else (lambda name: f"/usr/bin/{name}"),
+    )
 
 
 _GOOD_VERSIONS = {"claude": "2.1.172", "codex": "codex-cli 0.139.0"}
@@ -64,6 +81,9 @@ def test_healthy_environment_passes(tmp_path):
     assert names["claude-hook"].status == OK
     assert names["judge"].status == OK
     assert names["api-keys"].status == OK
+    # CLIs probe as authenticated (FR-1.3)
+    assert names["claude-auth"].status == OK
+    assert names["codex-auth"].status == OK
     # codex hook present-but-inert is healthy, not a failure
     assert names["codex-hook"].status == OK
     assert "inert" in names["codex-hook"].detail
@@ -117,13 +137,116 @@ def test_no_api_key_fails(tmp_path):
     assert has_failure(results)
 
 
-def test_partial_api_key_warns(tmp_path):
+def _set_model(repo: Path, profile: str, model: str) -> None:
+    p = repo / ".gauntlet/config.yaml"
+    data = yaml.safe_load(p.read_text())
+    data["agents"][profile]["model"] = model
+    p.write_text(yaml.safe_dump(data))
+
+
+def test_referenced_profile_missing_key_fails(tmp_path):
+    # A profile the default pipeline references (escalation_agent) needs a key
+    # the env lacks: doctor must FAIL, not WARN — the pipeline cannot run (F-006).
     repo = _healthy_repo(tmp_path)
-    # OpenAI present (judge_llm) but Anthropic absent (triage/escalation)
+    _set_model(repo, "escalation", "anthropic/claude-x")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x"}))
+    keys = _by_name(results)["api-keys"]
+    assert keys.status == FAIL
+    assert "ANTHROPIC_API_KEY" in keys.detail
+    assert "escalation" in keys.detail
+    assert has_failure(results)
+
+
+def test_unused_profile_missing_key_warns(tmp_path):
+    # An api profile no pipeline step references is not run-blocking: a missing
+    # key for it is a WARN, while the referenced profiles stay satisfied (F-006).
+    repo = _healthy_repo(tmp_path)
+    p = repo / ".gauntlet/config.yaml"
+    data = yaml.safe_load(p.read_text())
+    data["agents"]["spare"] = {"adapter": "api", "model": "anthropic/claude-x"}
+    p.write_text(yaml.safe_dump(data))
     results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x"}))
     keys = _by_name(results)["api-keys"]
     assert keys.status == WARN
-    assert "ANTHROPIC_API_KEY" in keys.detail
+    assert "spare" in keys.detail
+    assert not has_failure(results)
+
+
+# ---- CLI authentication (FR-1.3, review F-004) ------------------------------
+
+def test_logged_out_cli_fails(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(
+        repo,
+        probes=_probes(_GOOD_VERSIONS, _GOOD_ENV, authed={"claude": False, "codex": True}),
+    )
+    auth = _by_name(results)["claude-auth"]
+    assert auth.status == FAIL
+    assert auth.remedy and "log in" in auth.remedy.lower()
+    assert has_failure(results)
+
+
+def test_unverifiable_auth_warns(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(
+        repo,
+        probes=_probes(_GOOD_VERSIONS, _GOOD_ENV, authed={"claude": None, "codex": True}),
+    )
+    assert _by_name(results)["claude-auth"].status == WARN
+    assert not has_failure(results)
+
+
+def test_absent_cli_has_no_auth_row(tmp_path):
+    # The version check owns the "not found" FAIL; auth does not double-report.
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(
+        repo, probes=_probes({"claude": None, "codex": _GOOD_VERSIONS["codex"]}, _GOOD_ENV)
+    )
+    assert "claude-auth" not in _by_name(results)
+    assert "codex-auth" in _by_name(results)
+
+
+# ---- structural hook validation (FR-7.3, review F-005) ----------------------
+
+def test_malformed_claude_settings_fails(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / ".claude/settings.json").write_text("{not valid json")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert _by_name(results)["claude-hook"].status == FAIL
+    assert has_failure(results)
+
+
+def test_narrow_matcher_claude_hook_fails(tmp_path):
+    # The judge must see every tool call; a Bash-only matcher leaves tools ungated.
+    repo = _healthy_repo(tmp_path)
+    (repo / ".claude/settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [
+            {"matcher": "Bash",
+             "hooks": [{"type": "command", "command": "gauntlet-judge-hook", "timeout": 15}]},
+        ]}
+    }))
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    hook = _by_name(results)["claude-hook"]
+    assert hook.status == FAIL
+    assert "*" in (hook.detail + (hook.remedy or ""))
+
+
+def test_hook_binary_not_on_path_fails(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(
+        repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV, which=lambda name: None)
+    )
+    hook = _by_name(results)["claude-hook"]
+    assert hook.status == FAIL
+    assert "PATH" in hook.detail
+
+
+def test_codex_hook_present_but_unwired_warns(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / ".codex/hooks.json").write_text('{"hooks": {}}')
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    codex = _by_name(results)["codex-hook"]
+    assert codex.status == WARN
     assert not has_failure(results)
 
 

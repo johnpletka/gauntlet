@@ -14,6 +14,7 @@ probes only run when the real default probes are used.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -64,6 +65,11 @@ class CheckResult:
     remedy: str | None = None
 
 
+def _no_auth_probe(_name: str) -> bool | None:
+    """Default auth probe: 'could not determine' (used by offline unit tests)."""
+    return None
+
+
 @dataclass(frozen=True)
 class DoctorProbes:
     """Injectable environment access so checks are testable offline."""
@@ -71,6 +77,12 @@ class DoctorProbes:
     # name -> version string (e.g. "2.1.172"), or None if the CLI is absent.
     cli_version: Callable[[str], str | None]
     env: Mapping[str, str]
+    # name -> True (authenticated) / False (logged out or broken) / None
+    # (could not determine). FR-1.3: a logged-out CLI must FAIL doctor.
+    cli_authenticated: Callable[[str], bool | None] = _no_auth_probe
+    # PATH lookup for the hook console script (injected so tests are
+    # deterministic regardless of the runner's PATH).
+    which: Callable[[str], str | None] = shutil.which
 
 
 def _real_cli_version(name: str) -> str | None:
@@ -90,8 +102,51 @@ def _real_cli_version(name: str) -> str | None:
     return text or None
 
 
+def _real_cli_authenticated(name: str) -> bool | None:
+    """Best-effort, non-interactive auth probe (FR-1.3).
+
+    Runs the cheapest pin-verified, tool-less invocation each CLI supports and
+    reads the exit code. A logged-out / unauthorized CLI exits non-zero (claude
+    surfaces an in-band ``is_error`` result with exit 1; ``codex exec`` exits
+    non-zero), which we treat as NOT authenticated so doctor fails closed
+    *before* the first real agent step rather than after it. ``None`` means the
+    probe could not run at all (binary absent, or it timed out / errored
+    ambiguously); the caller then WARNs rather than asserting a state it could
+    not observe.
+
+    The invocations use exactly the flags ``.gauntlet/pins.yaml`` verified
+    (claude: ``-p`` / ``--output-format json`` / ``--model haiku`` / ``--tools ""``;
+    codex: ``exec --json -s read-only``). They make a minimal live model call;
+    the P6 second-environment integration run confirms them end-to-end.
+    """
+    if shutil.which(name) is None:
+        return None
+    try:
+        if name == "claude":
+            proc = subprocess.run(
+                ["claude", "-p", "--output-format", "json",
+                 "--model", "haiku", "--tools", ""],
+                input="ping", capture_output=True, text=True, timeout=90,
+            )
+        elif name == "codex":
+            proc = subprocess.run(
+                ["codex", "exec", "--json", "-s", "read-only", "-"],
+                input="ping", capture_output=True, text=True, timeout=90,
+            )
+        else:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.returncode == 0
+
+
 def real_probes() -> DoctorProbes:
-    return DoctorProbes(cli_version=_real_cli_version, env=os.environ)
+    return DoctorProbes(
+        cli_version=_real_cli_version,
+        env=os.environ,
+        cli_authenticated=_real_cli_authenticated,
+        which=shutil.which,
+    )
 
 
 def _extract_version(text: str | None) -> str | None:
@@ -137,7 +192,60 @@ def _check_cli(cli: str, probes: DoctorProbes, pins: PinFile | None) -> CheckRes
     return CheckResult(cli, OK, detail + (f" (matches pin {pinned})" if pinned else ""))
 
 
-def _check_claude_hook(repo_root: Path) -> CheckResult:
+def _check_cli_auth(cli: str, probes: DoctorProbes) -> CheckResult | None:
+    """FR-1.3: a logged-out CLI must FAIL, not pass and break at the first step.
+
+    Returns ``None`` (no row) when the CLI is absent — its FAIL is already owned
+    by :func:`_check_cli`, so we do not double-report.
+    """
+    if probes.cli_version(cli) is None:
+        return None
+    name = f"{cli}-auth"
+    authed = probes.cli_authenticated(cli)
+    if authed is True:
+        return CheckResult(name, OK, "authenticated")
+    if authed is False:
+        return CheckResult(
+            name, FAIL, "not authenticated (or the CLI errored)",
+            remedy=(
+                f"log in to the {cli!r} CLI; a logged-out CLI passes a version "
+                "check but fails at the first agent step (FR-1.3)"
+            ),
+        )
+    return CheckResult(
+        name, WARN, "could not verify authentication (no probe result)",
+        remedy=f"confirm `{cli}` is logged in before starting a run",
+    )
+
+
+def _parse_json(path: Path) -> tuple[object | None, str | None]:
+    """(value, error). error is a human string when the file is unreadable JSON."""
+    try:
+        return json.loads(path.read_text() or "null"), None
+    except json.JSONDecodeError as exc:
+        return None, str(exc)
+
+
+def _gauntlet_pretooluse_entries(settings: dict) -> list[dict]:
+    """PreToolUse entries that route to the gauntlet judge hook."""
+    entries = []
+    for entry in settings.get("hooks", {}).get("PreToolUse", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks", []) or []:
+            if isinstance(hook, dict) and hook.get("command") == HOOK_COMMAND:
+                entries.append((entry, hook))
+                break
+    return entries
+
+
+def _check_claude_hook(repo_root: Path, probes: DoctorProbes) -> CheckResult:
+    """FR-1.3/FR-7.3: structurally verify the PreToolUse judge wiring (review F-005).
+
+    Parse the file (a malformed settings.json is a FAIL, not a pass), verify a
+    PreToolUse entry routes every tool (matcher ``*``) to the hook command as a
+    ``command`` hook, and confirm the hook console script is actually on PATH.
+    """
     path = repo_root / ".claude" / "settings.json"
     rel = ".claude/settings.json"
     if not path.exists():
@@ -145,15 +253,54 @@ def _check_claude_hook(repo_root: Path) -> CheckResult:
             "claude-hook", FAIL, f"{rel} missing",
             remedy="run `gauntlet init` to wire the PreToolUse judge hook",
         )
-    if HOOK_COMMAND not in path.read_text():
+    settings, err = _parse_json(path)
+    if err is not None or not isinstance(settings, dict):
         return CheckResult(
-            "claude-hook", FAIL, f"{rel} does not wire {HOOK_COMMAND}",
+            "claude-hook", FAIL,
+            f"{rel} is not a JSON object" + (f": {err}" if err else ""),
+            remedy="fix the JSON; an unparseable settings file leaves the agent ungated",
+        )
+    matched = _gauntlet_pretooluse_entries(settings)
+    if not matched:
+        return CheckResult(
+            "claude-hook", FAIL, f"{rel} has no PreToolUse entry wiring {HOOK_COMMAND}",
             remedy="run `gauntlet init` to add the PreToolUse judge hook",
         )
-    return CheckResult("claude-hook", OK, f"PreToolUse → {HOOK_COMMAND}")
+    # The judge must see every tool call; a narrower matcher silently leaves
+    # tools ungated (FR-7.3 "100% blocked pre-execution").
+    if not any(entry.get("matcher") == "*" for entry, _ in matched):
+        scopes = ", ".join(sorted({str(e.get("matcher")) for e, _ in matched}))
+        return CheckResult(
+            "claude-hook", FAIL,
+            f"{HOOK_COMMAND} wired only for matcher(s) {scopes}, not all tools (*)",
+            remedy="set the PreToolUse matcher to `*` so every tool call is judged (FR-7.3)",
+        )
+    # The wired command must resolve to an executable, or the hook never runs.
+    if probes.which(HOOK_COMMAND) is None:
+        return CheckResult(
+            "claude-hook", FAIL, f"{HOOK_COMMAND} wired but not found on PATH",
+            remedy="reinstall gauntlet (`uv tool install` / `pipx install`) so the "
+            "hook console script is on PATH (FR-1.1)",
+        )
+    _, hook = matched[0]
+    if hook.get("type") != "command" or not hook.get("timeout"):
+        return CheckResult(
+            "claude-hook", WARN,
+            f"PreToolUse → {HOOK_COMMAND} present but missing type=command/timeout",
+            remedy="run `gauntlet init` to rewrite the canonical hook entry",
+        )
+    return CheckResult("claude-hook", OK, f"PreToolUse(*) → {HOOK_COMMAND}")
 
 
 def _check_codex_hook(repo_root: Path, pins: PinFile | None) -> CheckResult:
+    """Validate the codex hook config structurally (review F-005).
+
+    Codex exec does not fire PreToolUse hooks on the pinned build (BOOTSTRAP-
+    NOTES #10): its pre-execution control is the sandbox, so a missing or
+    inert-but-wired config is not run-blocking — hence WARN, never FAIL. But we
+    still parse it and verify it actually wires the hook command, rather than
+    reporting OK for any file that merely exists.
+    """
     path = repo_root / ".codex" / "hooks.json"
     rel = ".codex/hooks.json"
     if not path.exists():
@@ -161,15 +308,24 @@ def _check_codex_hook(repo_root: Path, pins: PinFile | None) -> CheckResult:
             "codex-hook", WARN, f"{rel} missing",
             remedy="run `gauntlet init` to write the (forward-looking) codex hooks config",
         )
-    # Sandbox-primary on the pinned build: codex exec does not fire exec hooks,
-    # so a present-but-inert config is healthy, not a failure (BOOTSTRAP-NOTES
-    # #10). Doctor reports the firing status from the pin rather than asserting
-    # a hook that cannot fire.
-    note = "present"
+    settings, err = _parse_json(path)
+    if err is not None or not isinstance(settings, dict):
+        return CheckResult(
+            "codex-hook", WARN, f"{rel} is not a JSON object" + (f": {err}" if err else ""),
+            remedy="run `gauntlet init` to rewrite the codex hooks config",
+        )
+    if not _gauntlet_pretooluse_entries(settings):
+        return CheckResult(
+            "codex-hook", WARN, f"{rel} does not wire {HOOK_COMMAND}",
+            remedy="run `gauntlet init` to rewrite the codex hooks config",
+        )
+    # Sandbox-primary on the pinned build: a present-but-inert config is healthy
+    # (BOOTSTRAP-NOTES #10). Report the firing status from the pin.
+    note = f"PreToolUse → {HOOK_COMMAND}"
     if pins and "codex" in pins.clis:
         joined = " ".join(pins.clis["codex"].notes).lower()
         if "never fire" in joined or "does not fire" in joined:
-            note = "present (inert on pinned codex; sandbox-primary control — FR-7.3)"
+            note += " (inert on pinned codex; sandbox-primary control — FR-7.3)"
     return CheckResult("codex-hook", OK, note)
 
 
@@ -192,14 +348,6 @@ def _check_judge(repo_root: Path) -> CheckResult:
     return CheckResult("judge", OK, "policy.yaml loads; judge startable")
 
 
-def _api_models(config) -> list[str]:
-    return [
-        p.model
-        for p in config.agents.values()
-        if p.adapter == "api" and p.model
-    ]
-
-
 def _required_key(model: str) -> str | None:
     low = model.lower()
     for prefix, var in _KEY_BY_PREFIX.items():
@@ -208,40 +356,90 @@ def _required_key(model: str) -> str | None:
     return None
 
 
-def _check_api_keys(config, probes: DoctorProbes) -> CheckResult:
-    models = _api_models(config)
-    if not models:
+# Step keys that reference a named agent profile (FR-2.1). `agents` (list) is the
+# retrospective step's form.
+_AGENT_REF_KEYS = ("agent", "reviewer", "triager", "fixer", "escalation_agent",
+                   "message_agent")
+
+
+def _referenced_agents(repo_root: Path) -> set[str] | None:
+    """Agent profile names the default pipeline references, or None if it cannot
+    be loaded (the caller then treats every configured api profile as required —
+    fail closed)."""
+    pipeline_path = repo_root / "pipelines" / "standard.yaml"
+    if not pipeline_path.exists():
+        return None
+    try:
+        from gauntlet.engine.pipeline import load_pipeline
+
+        pipeline, _ = load_pipeline(pipeline_path)
+    except Exception:
+        return None
+    names: set[str] = set()
+    for step in pipeline.all_steps():
+        for key in _AGENT_REF_KEYS:
+            val = step.get(key)
+            if isinstance(val, str):
+                names.add(val)
+        agents = step.get("agents")
+        if isinstance(agents, list):
+            names.update(a for a in agents if isinstance(a, str))
+    return names
+
+
+def _check_api_keys(
+    config, probes: DoctorProbes, referenced: set[str] | None
+) -> CheckResult:
+    """FR-1.3/FR-1.4: every api profile the run needs must have its key in the
+    environment. A referenced profile missing its credential is a FAIL — not a
+    WARN that lets doctor exit zero for an unusable pipeline (review F-006)."""
+    api_profiles = {
+        name: p.model
+        for name, p in config.agents.items()
+        if p.adapter == "api" and p.model
+    }
+    if not api_profiles:
         return CheckResult("api-keys", WARN, "no `api` adapter profiles configured")
-    required: dict[str, set[str]] = {}     # env var -> models needing it
+
+    # referenced=None means we could not resolve the pipeline; require every
+    # configured profile (fail closed).
+    def required_profile(name: str) -> bool:
+        return referenced is None or name in referenced
+
+    required: dict[str, set[str]] = {}        # env var -> referenced profiles
+    optional_missing: dict[str, set[str]] = {}  # env var -> unused profiles
     unknown: list[str] = []
-    for model in models:
+    for name, model in api_profiles.items():
         var = _required_key(model)
         if var is None:
-            unknown.append(model)
-        else:
-            required.setdefault(var, set()).add(model)
-    have = {v for v in required if probes.env.get(v)}
-    missing = sorted(set(required) - have)
-    if required and not have:
+            unknown.append(f"{name}={model}")
+            continue
+        if required_profile(name):
+            required.setdefault(var, set()).add(name)
+        elif not probes.env.get(var):
+            optional_missing.setdefault(var, set()).add(name)
+
+    have = sorted(v for v in required if probes.env.get(v))
+    missing = sorted(set(required) - set(have))
+    if missing:
+        needed = ", ".join(sorted(n for v in missing for n in required[v]))
         return CheckResult(
             "api-keys", FAIL,
-            f"no API key present for any configured api model (need one of: "
-            f"{', '.join(sorted(required))})",
-            remedy="export the key in your shell / keychain, never in repo config (FR-1.4)",
+            f"missing {', '.join(missing)} required by profile(s): {needed}",
+            remedy="export the key(s) in your shell / keychain, never in repo config (FR-1.4)",
         )
-    detail = f"present: {', '.join(sorted(have))}" if have else "none required"
-    if missing:
-        return CheckResult(
-            "api-keys", WARN,
-            f"{detail}; missing {', '.join(missing)} "
-            f"(needed by {', '.join(sorted(m for v in missing for m in required[v]))})",
-            remedy="export the missing key(s) before using those profiles (FR-1.4)",
+    detail = f"present: {', '.join(have)}" if have else "none required"
+    warn_bits: list[str] = []
+    if optional_missing:
+        om = ", ".join(
+            f"{v} ({', '.join(sorted(optional_missing[v]))})"
+            for v in sorted(optional_missing)
         )
+        warn_bits.append(f"unused profile(s) missing {om}")
     if unknown:
-        return CheckResult(
-            "api-keys", WARN,
-            f"{detail}; could not infer the key var for model(s): {', '.join(unknown)}",
-        )
+        warn_bits.append(f"could not infer the key var for: {', '.join(unknown)}")
+    if warn_bits:
+        return CheckResult("api-keys", WARN, f"{detail}; " + "; ".join(warn_bits))
     return CheckResult("api-keys", OK, detail)
 
 
@@ -292,7 +490,10 @@ def run_doctor(
     results = [_check_version()]
     for cli in AGENT_CLIS:
         results.append(_check_cli(cli, probes, pins))
-    results.append(_check_claude_hook(repo_root))
+        auth = _check_cli_auth(cli, probes)
+        if auth is not None:
+            results.append(auth)
+    results.append(_check_claude_hook(repo_root, probes))
     results.append(_check_codex_hook(repo_root, pins))
     results.append(_check_judge(repo_root))
     results.append(_check_repo_secrets(repo_root))
@@ -308,7 +509,13 @@ def run_doctor(
             remedy="run `gauntlet init` to scaffold a config",
         ))
     else:
-        results.append(_check_api_keys(config, probes))
+        referenced = _referenced_agents(repo_root)
+        # The engine-managed judge always consumes the `judge_llm` profile when
+        # configured, even though no pipeline step names it (FR-7.1) — count it
+        # as referenced so its key is required, not treated as unused.
+        if referenced is not None and "judge_llm" in config.agents:
+            referenced = referenced | {"judge_llm"}
+        results.append(_check_api_keys(config, probes, referenced))
     results.append(_check_pin_file(repo_root, pins))
     return results
 

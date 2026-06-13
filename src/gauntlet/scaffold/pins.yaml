@@ -1,0 +1,185 @@
+# Doctor pin file (FR-1.5 groundwork, plan P1).
+# Records the installed CLI versions and the exact flags the P1 contract
+# suite verified against them (uv run pytest -m integration, 2026-06-10,
+# 9/9 passed). Written from what the installed CLIs actually do — where
+# observed behavior differs from the PRD/prompt, this file and a
+# BOOTSTRAP-NOTES.md entry win.
+verified_date: "2026-06-10"
+clis:
+  claude:
+    version: "2.1.172"
+    verified_flags:
+      - flag: "-p --output-format json (prompt via stdin)"
+        verified: >-
+          Single result object on stdout with result, session_id,
+          total_cost_usd, structured_output, and usage
+          {input_tokens, output_tokens, cache_read_input_tokens, ...}.
+      - flag: "--output-format stream-json"
+        verified: >-
+          JSONL events (system/init with session_id, assistant turns, final
+          result). Requires --verbose in -p mode.
+      - flag: "--resume <session-id>"
+        verified: >-
+          Continues the recorded session in -p mode; prior-turn content
+          (codeword) recalled.
+      - flag: "--model haiku"
+        verified: "Model alias resolves; used for all smoke traffic."
+      - flag: "--model opus"
+        verified: >-
+          P5 start: short alias resolves (modelUsage reports claude-opus-4-8).
+          The long form `claude-opus-latest` is REJECTED with an in-band 404
+          result (is_error=true, exit 1) — the builder profile must use the
+          short alias. Caught live by the first engine-driven builder step;
+          evidence preserved by the P4 failure-path transcripts (F-007).
+      - flag: '--tools ""'
+        verified: "Empty string disables all built-in tools (tool-less smoke)."
+      - flag: "--json-schema <inline-json>"
+        verified: >-
+          Native structured output: conforming object surfaced in the result
+          event's structured_output field (PRD assumed best-effort JSON for
+          claude — positive divergence, see BOOTSTRAP-NOTES #9).
+      - flag: "--permission-mode acceptEdits + --allowedTools/--tools Write"
+        verified: >-
+          Write tool ran unprompted in a disposable fixture repo; file
+          created with expected content.
+      - flag: "PreToolUse hook via .claude/settings.json (--setting-sources project)"
+        verified: >-
+          P2: fires in `claude -p` for Bash tool calls. Payload carries
+          {session_id, cwd, hook_event_name, tool_name, tool_input{command},
+          tool_use_id, permission_mode}. Emitting hookSpecificOutput
+          permissionDecision=deny blocks the tool PRE-execution and surfaces
+          the reason to the agent (verified end-to-end: denied echo never
+          produced its output). permissionDecision=allow proceeds;
+          unreachable+interactive falls back to a normal prompt (no deadlock).
+    notes:
+      - >-
+        Cost IS reported (total_cost_usd) on this install, so the tokens-only
+        degraded path (PRD §12 Q3) is claude's fallback, not its default.
+      - >-
+        Permission-bypass flags observed in --help (--dangerously-skip-permissions,
+        --allow-dangerously-skip-permissions, --bare which skips hooks,
+        --permission-mode bypassPermissions) are rejected by the config lint.
+      - >-
+        P3: no --max-turns flag on claude 2.1.172 (`claude --help` has no
+        turn/limit option), and `codex exec` has no turn cap either. The engine
+        therefore rejects `max_turns` at pipeline load (review F-006); the
+        working per-step halts are timeout_s and budget_usd (FR-3.3).
+  codex:
+    version: "codex-cli 0.139.0"
+    verified_flags:
+      - flag: "exec --json (prompt via stdin with '-')"
+        verified: >-
+          JSONL events on stdout: thread.started{thread_id}, turn.started,
+          item.completed{item.type=agent_message, text}, turn.completed
+          {usage: input_tokens, cached_input_tokens, output_tokens,
+          reasoning_output_tokens}.
+      - flag: "exec --output-schema <file>"
+        verified: >-
+          Final agent message conformed to the schema; parsed and validated
+          first try (consistent with the plan-cycle-r1 capture).
+      - flag: "exec --output-schema (P4 live review path, strict-mode rules)"
+        verified: >-
+          P4: the schema is enforced server-side under OpenAI strict mode —
+          a schema whose `required` omits any declared property is rejected
+          with HTTP 400 before the model runs (exit 1). "Optional" fields
+          must be spelled required-but-nullable (type ["string","null"]);
+          `pattern` constraints were removed from the normative schemas to
+          stay inside the strict subset. With schemas/findings.json in that
+          form, the live adversarial_cycle contract test round-tripped:
+          review findings validated, fix-round commit, diff-scoped confirm
+          verdicts validated (tests/integration/test_cycle_contract.py).
+      - flag: "--output-last-message <file>"
+        verified: >-
+          Long form live-verified: file written with the final agent message
+          text (fresh exec and resume). The -o short alias is observed in
+          --help only, not exercised by the contract suite.
+      - flag: "-s read-only / -s workspace-write"
+        verified: >-
+          read-only used for all review/smoke runs; workspace-write created a
+          file in a disposable fixture repo.
+      - flag: "exec resume <session-id>"
+        verified: >-
+          Live contract tests: plain resume recalled prior-turn content
+          (codeword), and resume + --output-schema + --output-last-message
+          returned conforming JSON (the combination P4's confirm pass relies
+          on). resume accepts --json/--output-schema/--output-last-message
+          but NOT --sandbox/-s (help-surface assertion test) — the sandbox
+          must be pinned via -c sandbox_mode="..." on resume.
+    notes:
+      - >-
+        --full-auto does NOT exist on `codex exec` 0.139.0 (PRD §4.1/plan
+        mention it): exec is already non-interactive; the sandbox flag alone
+        governs write access. Verified by a help-surface assertion test, not
+        a live run. See BOOTSTRAP-NOTES #9.
+      - >-
+        Cost is never reported in the event stream — tokens-only degraded
+        path (PRD §12 Q3) is codex's normal mode.
+      - >-
+        Bypass flags observed in --help (--dangerously-bypass-approvals-and-sandbox,
+        --dangerously-bypass-hook-trust, -s danger-full-access) are rejected
+        by the config lint.
+      - >-
+        P2 HOOK FINDING (deviation, ratified by John 2026-06-11): `codex exec`
+        does NOT fire PreToolUse hooks on 0.139.0 — verified against project
+        `.codex/hooks.json`, user `~/.codex/hooks.json`, `[features].hooks=true`
+        (globally stable+true), and even `--dangerously-bypass-hook-trust`. The
+        hook runtime (hooks/list, hook trust review) is app-server/TUI-only.
+        Codex's pre-execution control is therefore its SANDBOX, verified live:
+        `-s read-only` blocks all writes; `-s workspace-write` confines writes
+        to the workspace + system temp (TMPDIR/`/tmp` are writable by design),
+        and refuses writes to `$HOME`. The codex hook client is wired but inert
+        on this build; it activates automatically if a future codex fires exec
+        hooks. FR-7's "100% blocked pre-execution + audit" is met via claude;
+        codex is sandbox-sourced (coarser, no per-command judge audit). See
+        BOOTSTRAP-NOTES #10.
+  api_models:
+    version: "litellm (P4 verification, 2026-06-11)"
+    verified_flags:
+      - flag: "gpt-5-mini via LiteLLM (triage/judge_llm cheap tier)"
+        verified: >-
+          P4: live completion + cost reporting work with the present OpenAI
+          key (~$0.00015 per short call). Ran the full 36-finding triage
+          accuracy harness: 94.4% verdict agreement, blocking 9/9, zero
+          unescalated blocking→reject misses (report at
+          runs/gauntlet-bootstrap/manual/p4-triage-accuracy.md).
+      - flag: "gpt-5 via LiteLLM (escalation tier, review F-009)"
+        verified: "P4: live completion + cost reporting (~9x mini's price)."
+    notes:
+      - >-
+        `claude-haiku-latest` (the previous configured triage model) does NOT
+        resolve via LiteLLM, and no Anthropic key is present in this
+        environment — the profile could never have run here. Swapped to the
+        verified models above; BOOTSTRAP-NOTES #19.
+  judge:
+    version: "gauntlet P2 (this repo)"
+    verified_flags:
+      - flag: "fast-path decision latency (FR-7.2 target p50 < 150 ms)"
+        verified: >-
+          Server-side policy fast-path p50 ≈ 2.4 ms (in-process timing in the
+          judge audit log), far under the 150 ms target. Measured over the
+          live red-team + benign hook runs in test_judge_live.py.
+      - flag: "FR-7 red-team acceptance (claude path)"
+        verified: >-
+          25/25 dangerous commands denied through the real gauntlet-judge-hook
+          binary against a live judge (exit 2, audit deny). Benign suite
+          fast-path allow rate 100% (≥ 90% required). End-to-end claude block
+          proven via a deny-policy sentinel.
+      - flag: "P3 engine-managed judge lifecycle + live agent_task gating"
+        verified: >-
+          `gauntlet run` starts the judge (python -m gauntlet judge serve),
+          injects per-run GAUNTLET_JUDGE_{TOKEN,URL,MODE,RUN_ID} + per-step
+          GAUNTLET_STEP_ID, and stops it on exit (no env leakage). A real
+          agent_task->shell->commit pipeline ran through the live judge: the
+          builder's `echo` tool call was gated by the PreToolUse hook and
+          audited as fast-path ALLOW with the run/step ids attributed. REQUIRES
+          the claude builder profile to pass `--setting-sources project`
+          (base_flags) — without it claude does not load the repo hook and the
+          agent runs UNGATED. In-repo writes (`Write` tool / `echo > f`) are not
+          a fast-path allow; they escalate to the judge_llm rung and fail-closed
+          to deny when no classifier is configured (BOOTSTRAP-NOTES #16).
+    notes:
+      - >-
+        Judge binds 127.0.0.1 only and rejects callers without the per-run
+        X-Gauntlet-Token (§8). LLM classifier rung + fail-closed verified by
+        unit tests; the live latency/acceptance numbers above are from the P2
+        contract run.

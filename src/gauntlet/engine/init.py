@@ -4,6 +4,8 @@ Scaffolds the committable Gauntlet assets into a repo so a teammate who clones
 it gets the identical workflow:
 
 * ``.gauntlet/config.yaml`` — agent profiles + identities (FR-2.1).
+* ``.gauntlet/pins.yaml`` — verified CLI versions ``gauntlet doctor`` checks
+  installed versions against for drift (FR-1.5).
 * ``pipelines/standard.yaml`` — the default 3-gate pipeline (FR-5.1).
 * ``prompts/`` + ``schemas/`` — the versioned prompt templates and structured
   output schemas the pipeline references.
@@ -31,6 +33,10 @@ from pathlib import Path
 
 SCAFFOLD_DIR = Path(__file__).resolve().parent.parent / "scaffold"
 
+
+class InitError(RuntimeError):
+    """`gauntlet init` cannot proceed without risking existing state (fail closed)."""
+
 # The hook command both CLIs invoke (the console script from FR-1.1).
 HOOK_COMMAND = "gauntlet-judge-hook"
 
@@ -39,7 +45,13 @@ GITIGNORE_MARKER = "# --- Gauntlet (added by `gauntlet init`"
 
 # scaffold-relative source -> repo-relative target for the committable assets.
 # Directories are expanded file-by-file so a re-run can skip/keep per file.
-_ASSET_FILES = {"config.yaml": ".gauntlet/config.yaml", "policy.yaml": "policy.yaml"}
+_ASSET_FILES = {
+    "config.yaml": ".gauntlet/config.yaml",
+    # The pin file doctor checks installed CLI versions against (FR-1.5); a
+    # fresh repo cannot validate drift without it (review F-003).
+    "pins.yaml": ".gauntlet/pins.yaml",
+    "policy.yaml": "policy.yaml",
+}
 _ASSET_DIRS = {
     "pipelines": "pipelines",
     "prompts": "prompts",
@@ -142,12 +154,24 @@ def _wire_claude_hook(repo_root: Path, result: InitResult) -> None:
         result.add(rel, CREATED, "PreToolUse → gauntlet-judge-hook")
         return
 
+    # Fail closed on malformed external state (CLAUDE.md §2): a parse error or a
+    # non-object document must NOT be silently replaced — that would destroy a
+    # user's existing settings during an "idempotent" re-run (review F-007).
+    raw = path.read_text()
     try:
-        settings = json.loads(path.read_text() or "{}")
-    except json.JSONDecodeError:
-        settings = {}
+        settings = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise InitError(
+            f"{rel} is not valid JSON ({exc}); refusing to overwrite it. Fix the "
+            "file (or move it aside) and re-run `gauntlet init` to merge the "
+            "PreToolUse judge hook."
+        ) from exc
     if not isinstance(settings, dict):
-        settings = {}
+        raise InitError(
+            f"{rel} is not a JSON object (found {type(settings).__name__}); "
+            "refusing to overwrite it. Fix the file (or move it aside) and re-run "
+            "`gauntlet init`."
+        )
 
     if _pretooluse_has_hook(settings):
         result.add(rel, PRESENT, "PreToolUse already wired to the judge")

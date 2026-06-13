@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.init import (
     CREATED,
@@ -19,15 +21,18 @@ from gauntlet.engine.init import (
     SCAFFOLD_DIR,
     SKIPPED,
     WIRED,
+    InitError,
     init_repo,
 )
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.validate import validate_pipeline
+from gauntlet.pins import load_pins
 
 REPO = Path(__file__).resolve().parents[2]
 
 EXPECTED_ASSETS = {
     ".gauntlet/config.yaml",
+    ".gauntlet/pins.yaml",
     "policy.yaml",
     "pipelines/standard.yaml",
     "schemas/findings.json",
@@ -68,6 +73,37 @@ def test_scaffolded_config_and_pipeline_validate(tmp_path):
     assert phash.startswith("sha256:")
     # the cycle's default prompt set + referenced schema all landed
     assert (tmp_path / "schemas/findings.json").exists()
+
+
+def test_init_scaffolds_pin_file(tmp_path):
+    # doctor needs a pin file to validate CLI version drift (FR-1.5, review F-003).
+    init_repo(tmp_path)
+    pins_path = tmp_path / ".gauntlet/pins.yaml"
+    assert pins_path.exists()
+    pins = load_pins(pins_path)
+    assert "claude" in pins.clis and "codex" in pins.clis
+
+
+def test_init_refuses_to_clobber_malformed_claude_settings(tmp_path):
+    # Fail closed on malformed external state; never silently destroy the user's
+    # existing settings.json during an "idempotent" re-run (review F-007).
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    original = "{ this is not valid JSON, do not eat it"
+    (claude / "settings.json").write_text(original)
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+    assert (claude / "settings.json").read_text() == original
+
+
+def test_init_refuses_non_object_claude_settings(tmp_path):
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    original = '["a list, not a settings object"]'
+    (claude / "settings.json").write_text(original)
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+    assert (claude / "settings.json").read_text() == original
 
 
 def test_claude_hook_wired_with_judge_command(tmp_path):
@@ -169,6 +205,7 @@ def test_shipped_scaffold_matches_repo_canonical_assets():
     """
     checks = {
         SCAFFOLD_DIR / "policy.yaml": REPO / "policy.yaml",
+        SCAFFOLD_DIR / "pins.yaml": REPO / ".gauntlet/pins.yaml",
         SCAFFOLD_DIR / "pipelines/standard.yaml": REPO / "pipelines/standard.yaml",
         SCAFFOLD_DIR / "claude-settings.json": REPO / ".claude/settings.json",
     }
