@@ -73,6 +73,16 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
         seen.add(pid)
         if not item.get("title"):
             raise PlanPhasesError(f"phase {pid} is missing a 'title'")
+        # The plan-author contract (prompts/plan-author.md) requires every phase
+        # to carry a goal, and implement-phase.md identifies the current phase by
+        # id/title/goal — a phase with no goal would fan out into implementation
+        # with nothing to anchor it. Fail closed rather than fan out over a guess.
+        goal = item.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise PlanPhasesError(
+                f"phase {pid} is missing a non-empty 'goal' (each phase must "
+                "carry id/title/goal; implement-phase.md keys off the goal)"
+            )
         phases.append(item)
     return phases
 

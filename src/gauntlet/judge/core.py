@@ -106,6 +106,10 @@ class JudgeCore:
                 "risk_category": decision.risk_category,
                 "matched_rule": decision.matched_rule,
                 "rationale": decision.rationale,
+                # Judge LLM-rung spend, when this decision consulted the
+                # classifier — the cross-process channel that carries judge cost
+                # back to the manifest for `gauntlet report` (review F-003).
+                "usage": decision.usage,
                 # The boundary used for path checks — logged so a wrong root is
                 # diagnosable from the audit alone, not inferred (#31).
                 "repo_root": str(repo_root) if repo_root is not None else None,

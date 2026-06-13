@@ -131,15 +131,26 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     assert any(p.split(".")[0].lstrip("P").isdigit() for p in phases)
     # the toy was actually implemented and its tests pass
     assert (repo / "slugify.py").exists()
-    assert gitops.is_clean(repo, exclude=["runs", "runs/toy/PR.md"]) or True
+    # FR-9 clean history: the final tree is committed — only the run's own
+    # bookkeeping under runs/ is excluded. Asserted directly, not vacuously
+    # (review F-006): a dirty worktree at run end is a hard failure.
+    assert gitops.is_clean(repo, exclude=["runs"]), gitops.status_porcelain(
+        repo, exclude=["runs"]
+    )
 
     # FR-9.8: PR.md drafted, not opened/pushed.
     pr = repo / "runs" / "toy" / "PR.md"
     assert pr.exists() and "Not opened, not pushed" in pr.read_text()
 
-    # FR-3 acceptance: classification (triage) is a small share of total cost.
+    # FR-3 acceptance: classification (triage) is a small, measured share of
+    # total cost. The triage row and its percentage MUST be present — a missing
+    # row or null percentage fails the acceptance rather than passing vacuously
+    # (review F-006).
     report = build_report(man)
-    if report.total_cost:
-        tri = next((a for a in report.agents if a.agent == "triage"), None)
-        if tri and tri.pct_cost is not None:
-            assert tri.pct_cost < 5.0
+    assert report.total_cost, (
+        "run reported no priced total cost; FR-3 cost acceptance is unmeasurable"
+    )
+    tri = next((a for a in report.agents if a.agent == "triage"), None)
+    assert tri is not None, "no triage cost row; classification spend not attributed"
+    assert tri.pct_cost is not None, "triage percentage is null; cannot verify FR-3"
+    assert tri.pct_cost < 5.0

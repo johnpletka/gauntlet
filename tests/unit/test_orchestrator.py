@@ -166,6 +166,44 @@ stages:
     assert orch.manifest.record("pricey").status == M.HALTED
 
 
+def test_budget_guard_preserves_side_effect_metadata(fixture_repo):
+    # F-001: a DONE result that already produced a commit + per-agent usage must
+    # keep those fields when the guard converts it to HALTED — otherwise
+    # _finalize records the step halted with no commit/usage, breaking FR-3.3
+    # checkpointing and FR-9 branch/manifest consistency.
+    from gauntlet.engine.execution import DONE, HALTED, StepResult
+
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: pricey, type: agent_task, agent: builder, budget_usd: 0.1, prompt_text: go}
+"""
+    orch = _build(fixture_repo, text)
+    step = next(s for s in orch.pipeline.all_steps() if s.id == "pricey")
+    rec = M.StepRecord(id="pricey", type="agent_task", agent="builder")
+    result = StepResult(
+        status=DONE,
+        usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.5),
+        commit_sha="a" * 40,
+        commit_phase="P1",
+        commits=[("P1.1", "b" * 40)],
+        usage_by_agent={"builder": Usage(cost_usd=0.5)},
+        artifact_writes={"findings.json": Path("/tmp/findings.json")},
+        notes="converged in round 1",
+    )
+    guarded = orch._apply_budget_guard(step, rec, result)
+    assert guarded.status == HALTED
+    assert guarded.commit_sha == "a" * 40
+    assert guarded.commits == [("P1.1", "b" * 40)]
+    assert "builder" in guarded.usage_by_agent
+    assert guarded.artifact_writes  # side-effect metadata not discarded
+    assert "converged in round 1" in guarded.notes  # original notes kept
+    assert "budget halt" in guarded.notes
+
+
 def test_human_gate_parks_then_approve_continues(fixture_repo):
     text = """
 name: demo

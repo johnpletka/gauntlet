@@ -8,6 +8,7 @@ review F-010).
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -372,8 +373,13 @@ class RunManager:
 
         Owned by the RunManager (not the orchestrator) because PR.md is a
         slug-dir deliverable a human edits and commits — opening and pushing
-        stay human actions (PRD §2.2). Best-effort: a completed run is never
-        reported failed because the human-facing draft could not be rendered.
+        stay human actions (PRD §2.2).
+
+        PR.md is a REQUIRED final-gate artifact (FR-9.8), so a failure to render
+        it is not swallowed (review F-005): the error is recorded as a manifest
+        warning, persisted, and re-raised. Fail closed and data over inference —
+        a completed run never silently returns RUN_DONE with the deliverable
+        missing and no trace of why.
         """
         if status != M.RUN_DONE:
             return
@@ -381,8 +387,12 @@ class RunManager:
 
         try:
             write_pr_draft(layout.slug_dir, run_dir, man, self.writer)
-        except Exception:  # pragma: no cover - defensive; the run still completed
-            pass
+        except Exception as exc:
+            man.warnings.append(
+                f"FR-9.8 PR.md draft failed at final-gate pass: {exc!r}"
+            )
+            man.write_atomic(run_dir / "manifest.json")
+            raise
 
     def _with_judge(self, man, run_dir, fn):
         judge_model = None
@@ -400,6 +410,57 @@ class RunManager:
             return fn(env)
         finally:
             judge.stop()
+            # The judge stopped, so its audit log is fully flushed — fold any
+            # LLM-classifier spend it recorded into the manifest (review F-003).
+            self._merge_judge_usage(man, run_dir)
+
+    def _merge_judge_usage(self, man: Manifest, run_dir: Path) -> None:
+        """Fold judge LLM-classifier spend into the manifest (review F-003).
+
+        The judge runs as a separate process and records each LLM-rung
+        decision's usage in ``judge-audit.jsonl``. Without this merge that spend
+        never reaches ``manifest.totals``/``agent_usage``, so it is excluded from
+        both total run cost and the per-profile table — and the FR-3 acceptance
+        check ("judge/triage/retro each < 5% of total") cannot be measured.
+
+        Idempotent: the ``judge_llm`` total is recomputed from the FULL audit on
+        every call and only the delta is applied to ``totals``. A run that parks
+        and resumes (or steps through several gates) appends to the same audit
+        and re-runs this merge, so judge spend is never double counted.
+        """
+        from gauntlet.adapters.base import Usage
+
+        audit_path = run_dir / "judge-audit.jsonl"
+        if not audit_path.exists():
+            return
+        agg = M.UsageTotals()
+        saw_usage = False
+        for line in audit_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:  # a torn final line is not fatal here
+                continue
+            recorded = entry.get("usage")
+            if not recorded:
+                continue
+            saw_usage = True
+            agg.add(Usage(**recorded))
+        if not saw_usage:
+            return
+        prior = man.agent_usage.get("judge_llm") or M.UsageTotals()
+        delta = Usage(
+            input_tokens=agg.input_tokens - prior.input_tokens,
+            output_tokens=agg.output_tokens - prior.output_tokens,
+            cached_input_tokens=agg.cached_input_tokens - prior.cached_input_tokens,
+            cost_usd=(None if agg.cost_usd is None
+                      else agg.cost_usd - (prior.cost_usd or 0.0)),
+        )
+        man.totals.add(delta)
+        man.agent_usage["judge_llm"] = agg
+        man.write_atomic(run_dir / "manifest.json")
 
     def _approve_drive(self, layout, run_dir, pipeline, man, gate, notes, env,
                        adapter_factory):
@@ -437,14 +498,26 @@ class RunManager:
     )
 
     def _prompt_hashes(self, pipeline) -> dict[str, str]:
+        from gauntlet.engine.cycle import CYCLE_PROMPT_DEFAULTS
         from gauntlet.engine.pipeline import content_hash
 
         hashes: dict[str, str] = {}
+
+        def record(ref: str | None) -> None:
+            if ref and ref not in hashes:
+                path = self.repo_root / ref
+                if path.exists():
+                    hashes[ref] = content_hash(path.read_text())
+
         for step in pipeline.all_steps():
             for key in self._PROMPT_REF_KEYS:
-                ref = step.get(key)
-                if ref and ref not in hashes:
-                    path = self.repo_root / ref
-                    if path.exists():
-                        hashes[ref] = content_hash(path.read_text())
+                record(step.get(key))
+            # An adversarial_cycle loads default templates for every role the
+            # pipeline leaves unspecified (rereview/triage/fix/confirm), and those
+            # files steer behavior — so hash the EFFECTIVE path for each role,
+            # override or default, not just the refs spelled out in the YAML
+            # (review F-002; FR-5.6 reproducibility).
+            if step.type == "adversarial_cycle":
+                for key, default_ref in CYCLE_PROMPT_DEFAULTS.items():
+                    record(step.get(key) or default_ref)
         return hashes

@@ -51,6 +51,21 @@ DEFAULT_FINDINGS_SCHEMA = "schemas/findings.json"
 DEFAULT_TRIAGE_SCHEMA = "schemas/triage.json"
 DEFAULT_CONFIRM_SCHEMA = "schemas/confirm.json"
 
+# Every prompt template the cycle can load, mapped to the repo-relative path it
+# falls back to when the pipeline names no override. Exposed so the manifest's
+# `prompt_hashes` records the FULL prompt set a run actually used (FR-5.6 / the
+# P5 versioned-prompt-set deliverable) — the cycle reads these default files at
+# runtime, so omitting them from the manifest understated reproducibility when a
+# pipeline (like standard.yaml) only set `review_prompt` (review F-002). Keep in
+# lockstep with the `_template(...)` default refs below.
+CYCLE_PROMPT_DEFAULTS = {
+    "review_prompt": "prompts/cycle-review.md",
+    "rereview_prompt": "prompts/cycle-rereview.md",
+    "triage_prompt": "prompts/triage.md",
+    "fix_prompt": "prompts/cycle-fix.md",
+    "confirm_prompt": "prompts/cycle-confirm.md",
+}
+
 REJECT_VERDICTS = frozenset({"bikeshedding", "premature_optimization", "not_applicable"})
 OPEN_CONFIRM_VERDICTS = frozenset({"unresolved", "regression_introduced"})
 MUTATION_POLICIES = frozenset({"commit", "revert", "halt"})

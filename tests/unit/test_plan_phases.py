@@ -83,7 +83,11 @@ def test_bad_phase_id_rejected():
 
 
 def test_duplicate_phase_id_rejected():
-    text = "```gauntlet-phases\n- id: P1\n  title: a\n- id: P1\n  title: b\n```\n"
+    text = (
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: a\n  goal: do a\n"
+        "- id: P1\n  title: b\n  goal: do b\n```\n"
+    )
     with pytest.raises(PlanPhasesError, match="duplicate"):
         extract_phases(text)
 
@@ -91,6 +95,19 @@ def test_duplicate_phase_id_rejected():
 def test_missing_title_rejected():
     text = "```gauntlet-phases\n- id: P1\n  goal: no title here\n```\n"
     with pytest.raises(PlanPhasesError, match="missing a 'title'"):
+        extract_phases(text)
+
+
+def test_missing_goal_rejected():
+    # F-004: a phase with id+title but no goal must fail closed, not fan out.
+    text = "```gauntlet-phases\n- id: P1\n  title: x\n```\n"
+    with pytest.raises(PlanPhasesError, match="goal"):
+        extract_phases(text)
+
+
+def test_empty_goal_rejected():
+    text = "```gauntlet-phases\n- id: P1\n  title: x\n  goal: '   '\n```\n"
+    with pytest.raises(PlanPhasesError, match="goal"):
         extract_phases(text)
 
 

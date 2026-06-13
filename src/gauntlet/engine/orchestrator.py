@@ -313,15 +313,22 @@ class Orchestrator:
             return result
         projected = (rec.usage.cost_usd or 0.0) + result.usage.cost_usd
         if projected > budget:
-            return StepResult(
-                status=HALTED,
-                usage=result.usage,
-                session_id=result.session_id,
-                notes=(
-                    f"budget halt (FR-3.3): step cost ${projected:.4f} exceeds "
-                    f"budget ${budget:.4f}; halting at checkpoint"
-                ),
+            # The handler may have ALREADY produced side effects before the
+            # projection tripped — a commit / adversarial_cycle can have created
+            # a commit and per-agent usage at this checkpoint. Discarding those
+            # (the prior fresh-StepResult conversion) would record the step as
+            # halted with no commit, artifact, or per-agent usage, breaking
+            # FR-3.3 checkpointing and FR-9 branch/manifest consistency (F-001).
+            # Preserve every field; only the status and notes change.
+            halt_note = (
+                f"budget halt (FR-3.3): step cost ${projected:.4f} exceeds "
+                f"budget ${budget:.4f}; halting at checkpoint"
             )
+            result.status = HALTED
+            result.notes = (
+                f"{result.notes}\n{halt_note}" if result.notes else halt_note
+            )
+            return result
         return result
 
     def _finalize(self, rec: StepRecord, result: StepResult) -> None:

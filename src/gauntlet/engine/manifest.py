@@ -92,6 +92,11 @@ class Manifest(BaseModel):
     prompt_hashes: dict[str, str] = Field(default_factory=dict)
     status: str = RUN_RUNNING
     current_step: str | None = None
+    # Non-fatal anomalies surfaced rather than swallowed (data over inference) —
+    # e.g. a required final-gate artifact (FR-9.8 PR.md) that could not be
+    # rendered. Recorded so a completed run never silently hides a missing
+    # deliverable (review F-005).
+    warnings: list[str] = Field(default_factory=list)
     steps: list[StepRecord] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
     totals: UsageTotals = Field(default_factory=UsageTotals)

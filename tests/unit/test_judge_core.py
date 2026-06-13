@@ -21,16 +21,19 @@ def engine():
 class FakeAdapter:
     """Stands in for an ApiAdapter; returns or raises a scripted result."""
 
-    def __init__(self, structured=None, exc=None):
+    def __init__(self, structured=None, exc=None, usage=None):
         self._structured = structured
         self._exc = exc
+        self._usage = usage
         self.calls = []
 
     def run(self, prompt, *, schema=None, **kw):
         self.calls.append(prompt)
         if self._exc is not None:
             raise self._exc
-        return AgentResult(text="", structured=self._structured, exit_code=0)
+        return AgentResult(
+            text="", structured=self._structured, usage=self._usage, exit_code=0
+        )
 
 
 def test_policy_deny_is_terminal_no_llm():
@@ -69,6 +72,40 @@ def test_unmatched_routes_to_llm():
     d = core.decide("Bash", {"command": "telnet bbs.example.org"}, repo_root=REPO_ROOT)
     assert d.source == "llm"
     assert d.decision == "deny"
+
+
+def test_llm_decision_carries_usage_into_audit(tmp_path):
+    # F-003: the classifier's token/cost usage must travel on the decision and
+    # into the audit, or judge spend is invisible to `gauntlet report` and the
+    # FR-3 "judge < 5% of run cost" acceptance cannot be measured.
+    from gauntlet.adapters.base import Usage
+
+    adapter = FakeAdapter(
+        structured={"decision": "allow", "risk_category": "x", "rationale": "ok"},
+        usage=Usage(input_tokens=12, output_tokens=3, cost_usd=0.002),
+    )
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), classifier=LLMClassifier(adapter), audit_path=audit)
+    d = core.decide(
+        "Bash", {"command": "pip install requests"}, repo_root=REPO_ROOT
+    )
+    assert d.source == "llm"
+    assert d.usage == {
+        "input_tokens": 12, "output_tokens": 3,
+        "cached_input_tokens": None, "cost_usd": 0.002,
+    }
+    line = json.loads(audit.read_text().splitlines()[0])
+    assert line["usage"]["cost_usd"] == 0.002
+
+
+def test_fast_path_decision_has_no_usage(tmp_path):
+    # A policy fast-path decision never consults the LLM, so it carries no usage.
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), audit_path=audit)
+    d = core.decide("Bash", {"command": "git status"}, repo_root=REPO_ROOT)
+    assert d.source == "fast-path"
+    assert d.usage is None
+    assert json.loads(audit.read_text().splitlines()[0])["usage"] is None
 
 
 def test_no_classifier_fails_closed_on_unmatched():

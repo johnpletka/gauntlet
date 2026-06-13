@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -19,3 +19,7 @@ class JudgeDecision(BaseModel):
     risk_category: str | None = None
     # name of the policy rule that matched, when source == fast-path
     matched_rule: str | None = None
+    # Token/cost usage of the LLM-classifier call that produced this decision
+    # (FR-3 / review F-003): only set on the `llm` rung. Carried here so the
+    # judge audit records judge spend and `gauntlet report` can attribute it.
+    usage: dict[str, Any] | None = None
