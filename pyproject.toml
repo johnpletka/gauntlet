@@ -1,9 +1,21 @@
 [project]
 name = "gauntlet-spec"
-version = "0.1.0"
+version = "0.1.1"
 description = "Adversarial multi-agent development harness: PRD -> plan -> phased implementation, every artifact reviewed adversarially"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "John Pletka", email = "john.pletka@gmail.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "typer>=0.12",
     "pydantic>=2.7",
@@ -13,6 +25,11 @@ dependencies = [
     "jsonschema>=4.21",
     "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/johnpletka/gauntlet"
+Repository = "https://github.com/johnpletka/gauntlet"
+Issues = "https://github.com/johnpletka/gauntlet/issues"
 
 [project.scripts]
 gauntlet = "gauntlet.cli:app"

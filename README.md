@@ -103,7 +103,7 @@ codex login
 
 ```sh
 uv tool install gauntlet-spec       # from PyPI; or the git URL below for HEAD
-# uv tool install git+https://github.com/johnpletka/gauntlet-dev-harness.git
+# uv tool install git+https://github.com/johnpletka/gauntlet.git
 gauntlet version
 ```
 
@@ -148,7 +148,7 @@ codex --version
 
 ```powershell
 uv tool install gauntlet-spec
-# or, for HEAD: uv tool install "git+https://github.com/johnpletka/gauntlet-dev-harness.git"
+# or, for HEAD: uv tool install "git+https://github.com/johnpletka/gauntlet.git"
 gauntlet version
 ```
 
