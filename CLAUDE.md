@@ -73,10 +73,12 @@ branch is fine.
 
 Branch names carry a type prefix so history is machine-classifiable:
 `<type>/<slug>`, where `<type>` is one of `fix`, `feat`, `sec`, `perf`,
-`docs`, `chore`, `test` (e.g. `fix/no-direct-main`, `feat/judge-policy`).
-Automated `gauntlet run` pipelines keep their spec'd `gauntlet/<slug>`
-branches (FR-9.1); the type-prefix convention governs manual development on
-this repo.
+`docs`, `chore`, `test` (e.g. `fix/no-direct-main`, `feat/judge-policy`). The
+categories are self-explanatory; when more than one applies, pick the most
+consequential — a security bug fix is `sec`, not `fix`; a slow-path
+correctness fix is `fix`, not `perf`. Automated `gauntlet run` pipelines keep
+their spec'd `gauntlet/<slug>` branches (FR-9.1); the type-prefix convention
+governs manual development on this repo.
 
 Every branch lands through a pull request: open a PR against the base branch,
 let review/CI run, and merge through the PR. `main` only ever advances by
