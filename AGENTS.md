@@ -224,7 +224,7 @@ BOOTSTRAP-NOTES.md  # process pain points recorded during bootstrap
 PRD-gauntlet.md     # the spec
 ```
 
-**Key dependencies:** Python 3.12+, `uv`, `typer`, `pydantic`, `fastapi`,
+**Key dependencies:** Python 3.10+, `uv`, `typer`, `pydantic`, `fastapi`,
 `uvicorn`, `litellm`. No heavier orchestration frameworks. The orchestrator
 is thin by design.
 

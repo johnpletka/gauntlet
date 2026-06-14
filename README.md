@@ -63,7 +63,7 @@ You need:
 
 | Requirement | Why | Notes |
 |---|---|---|
-| **Python ≥ 3.12** | runtime | Managed for you by `uv`. |
+| **Python ≥ 3.10** | runtime | Managed for you by `uv`. |
 | **[`uv`](https://docs.astral.sh/uv/)** | install + run | The only build/run tool you install by hand. |
 | **`claude` CLI** ([Claude Code](https://docs.claude.com/en/docs/claude-code)) | the **builder** agent | Must be installed and authenticated. |
 | **`codex` CLI** ([Codex CLI](https://github.com/openai/codex)) | the **reviewer** agent | Must be installed and authenticated. |
@@ -102,9 +102,18 @@ codex login
 **3. Install Gauntlet** as a global tool:
 
 ```sh
-uv tool install git+https://github.com/johnpletka/gauntlet-dev-harness.git
+uv tool install gauntlet-spec       # from PyPI; or the git URL below for HEAD
+# uv tool install git+https://github.com/johnpletka/gauntlet.git
 gauntlet version
 ```
+
+> **The PyPI package is `gauntlet-spec`, not `gauntlet`.** The bare name
+> `gauntlet` on PyPI is an unrelated (and broken) project. The installed command
+> is still `gauntlet` — only the install name differs.
+
+> **Python 3.10+ is required.** If your default interpreter is older, `uv` will
+> refuse with `does not satisfy Python>=3.10`. Add `--python 3.10` (or newer) to
+> the command and `uv` will fetch a suitable interpreter automatically.
 
 This puts two console scripts on your PATH: `gauntlet` (the CLI) and
 `gauntlet-judge-hook` (the per-tool-call safety hook, wired automatically by
@@ -138,9 +147,15 @@ codex --version
 **3. Install Gauntlet:**
 
 ```powershell
-uv tool install "git+https://github.com/johnpletka/gauntlet-dev-harness.git"
+uv tool install gauntlet-spec
+# or, for HEAD: uv tool install "git+https://github.com/johnpletka/gauntlet.git"
 gauntlet version
 ```
+
+> **The PyPI package is `gauntlet-spec`, not `gauntlet`** — the bare name is an
+> unrelated, broken project. The command is still `gauntlet`. If `uv` reports
+> `does not satisfy Python>=3.10`, append `--python 3.10` (or newer) and it will
+> fetch a compatible interpreter.
 
 ---
 
@@ -301,6 +316,11 @@ contract suite, which requires authenticated CLIs and API keys.
 
 ## Troubleshooting
 
+- **`gauntlet` errors with `ModuleNotFoundError: No module named 'gauntlet'`**
+  (or `gauntlet.main`) — you installed the unrelated PyPI package via
+  `uv tool install gauntlet`. Run `uv tool uninstall gauntlet`, then reinstall
+  the correct package: `uv tool install gauntlet-spec` (add `--python 3.10` if
+  your default interpreter is older).
 - **`gauntlet-judge-hook: command not found`** during a run — the hook console
   script isn't on the PATH the agent CLI sees. Re-run `gauntlet init` (or
   `gauntlet init --from-repo`) and confirm `uv tool`'s bin directory is on your
