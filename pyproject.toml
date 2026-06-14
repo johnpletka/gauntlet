@@ -1,6 +1,6 @@
 [project]
 name = "gauntlet-spec"
-version = "0.1.1"
+version = "0.1.2"
 description = "Adversarial multi-agent development harness: PRD -> plan -> phased implementation, every artifact reviewed adversarially"
 readme = "README.md"
 requires-python = ">=3.10"
