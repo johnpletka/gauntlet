@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from gauntlet.logging.redact import RedactingWriter
 
@@ -36,6 +36,18 @@ class TriageCorrection(BaseModel):
     finding_id: str
     correct_verdict: str  # what triage SHOULD have said (one of VERDICTS)
     note: str = ""
+
+    @field_validator("correct_verdict")
+    @classmethod
+    def _verdict_in_enum(cls, v: str) -> str:
+        # Enforced at the model so EVERY path (CLI, tests, future callers) writes
+        # only valid verdicts into feedback.json — a bad enum would otherwise flow
+        # silently into proposal synthesis and triage-corpus seeding (review).
+        if v not in VERDICTS:
+            raise ValueError(
+                f"correct_verdict {v!r} is not one of {VERDICTS}"
+            )
+        return v
 
 
 class FeedbackData(BaseModel):

@@ -219,6 +219,31 @@ def test_apply_refuses_invalid_proposal(asset_repo: Path):
                          timestamp="2026-06-13")
 
 
+def test_apply_revalidates_diff_not_markdown_fields(asset_repo: Path):
+    # review: a proposal file edited between generation and approval could keep
+    # `valid: true` and a single `targets:` field while swapping the diff block
+    # for a multi-file diff — slipping several allowlisted asset changes through
+    # one approval. Apply must re-derive targets from the diff and re-run the
+    # full generation-time contract, not trust the mutable markdown fields.
+    one = _capture_diff(asset_repo, "prompts/triage.md",
+                        "rubric one EDIT\nrubric line two\n")
+    two = _capture_diff(asset_repo, "policy.yaml", "deny: [rm]\n")
+    tampered = P.Proposal(
+        number=1, slug="tampered", status=P.PENDING, source_run="run-1",
+        targets=["prompts/triage.md"],   # markdown claims one file...
+        rationale="r", diff=one + two,    # ...but the diff touches two
+        valid=True,                       # ...and claims it is valid
+        path=asset_repo / "p.md",
+    )
+    with pytest.raises(P.ProposalError, match="revalidation"):
+        P.apply_proposal(asset_repo, tampered, identity=IDENTITY,
+                         changelog_path=asset_repo / "prompts/CHANGELOG.md",
+                         timestamp="2026-06-14")
+    # nothing was applied: the asset is untouched and no commit was made
+    assert "EDIT" not in (asset_repo / "prompts/triage.md").read_text()
+    assert _git(asset_repo, "status", "--porcelain").strip() == ""
+
+
 def test_corpus_feeding_appends_human_corrected_case(asset_repo: Path):
     # FR-6.5: a human-corrected triage case is fed to the few-shot corpus via the
     # SAME governed-apply mechanism (the corpus is an allowlisted prompts/ asset).

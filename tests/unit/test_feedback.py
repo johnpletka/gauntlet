@@ -4,13 +4,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from gauntlet.engine.feedback import (
+    VERDICTS,
     FeedbackData,
     TriageCorrection,
     read_feedback,
     write_feedback,
 )
 from gauntlet.logging.redact import RedactingWriter
+
+
+def test_triage_correction_rejects_unknown_verdict():
+    # review: a bad enum must not reach feedback.json -> proposal synthesis /
+    # corpus seeding. The model rejects anything outside VERDICTS.
+    with pytest.raises(ValidationError):
+        TriageCorrection(finding_id="F-1", correct_verdict="legit")
+
+
+@pytest.mark.parametrize("verdict", VERDICTS)
+def test_triage_correction_accepts_every_valid_verdict(verdict):
+    assert TriageCorrection(finding_id="F-1", correct_verdict=verdict).correct_verdict == verdict
 
 
 def _data() -> FeedbackData:

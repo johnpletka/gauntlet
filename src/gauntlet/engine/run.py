@@ -49,6 +49,16 @@ class RollbackGuardError(RuntimeError):
     """A rollback guard (review F-010) refused the operation."""
 
 
+class ActiveRunError(RuntimeError):
+    """`start()` refused because a non-terminal run is already active."""
+
+
+# A run in one of these states is finished and may be superseded by a fresh
+# `start()`. Any other state (running / parked) is still live — starting over it
+# would orphan it and risk competing agents against one worktree.
+_TERMINAL_RUN_STATES = frozenset({M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED})
+
+
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
 
@@ -152,6 +162,33 @@ class RunManager:
                 "removed; a human must author a real PRD before a run (FR-10.1)"
             )
 
+    def _refuse_if_active_run(self, layout: "RunLayout") -> None:
+        """Fail closed if a non-terminal run already owns this slug (review).
+
+        `start()` mints a fresh run dir and overwrites ``active-run.txt``. If the
+        existing active run is still running or parked, doing so silently
+        orphans it — abandoning its manifest and potentially launching competing
+        agents against one worktree, which breaks the clean-handoff invariant.
+        Require the active run to be terminal (done/aborted/failed) or an
+        explicit ``gauntlet resume`` / ``gauntlet abort`` first.
+
+        A dangling or corrupt pointer (no manifest, unreadable JSON) is not a
+        live run, so we let `start()` replace it rather than wedging the slug.
+        """
+        if not layout.active_pointer.exists():
+            return
+        try:
+            man = Manifest.load(layout.active_run_dir() / "manifest.json")
+        except (OSError, ValueError):
+            return
+        if man.status not in _TERMINAL_RUN_STATES:
+            raise ActiveRunError(
+                f"run {man.run_id!r} for slug {layout.slug!r} is still "
+                f"{man.status!r}; refusing to start a second run that would "
+                "orphan it. Use `gauntlet resume` to continue it, or "
+                "`gauntlet abort` to end it first."
+            )
+
     # ---- run (FR-8.1) -------------------------------------------------------
     def start(
         self,
@@ -165,6 +202,7 @@ class RunManager:
     ) -> str:
         self.check_entry_contract(slug)
         layout = self.layout(slug)
+        self._refuse_if_active_run(layout)
         pipeline, phash = load_pipeline(pipeline_path)
         validate_pipeline(pipeline, self.config)
 

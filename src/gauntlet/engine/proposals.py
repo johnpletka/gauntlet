@@ -308,24 +308,28 @@ def apply_proposal(
             f"proposal {proposal.name} is invalid ({proposal.invalid_reason}); "
             "refusing to apply"
         )
-    contained, offending = path_containment(proposal.diff)
-    if not contained:
+    # Re-run the FULL generation-time contract against the diff itself, not the
+    # mutable markdown `valid:`/`targets:` fields (review): a proposal file
+    # edited between generation and approval could otherwise smuggle a different
+    # or multi-file allowlisted diff through under one human approval. Recompute
+    # the targets from the diff and re-validate (containment + single-file +
+    # applies-cleanly), so apply enforces exactly what generation did.
+    targets = diff_target_paths(proposal.diff)
+    ok, reason = _validate_diff(repo_root, proposal.diff, "", targets)
+    if not ok:
         raise ProposalError(
-            f"proposal {proposal.name} diff escapes the allowlist at apply time: "
-            f"{', '.join(offending)} (review F-001)"
+            f"proposal {proposal.name} failed apply-time revalidation: {reason} "
+            "(the proposal file may have been edited since generation)"
         )
     patch = _ensure_trailing_nl(proposal.diff)
-    if not gitops.apply_patch_check(repo_root, patch):
-        raise ProposalError(
-            f"proposal {proposal.name} diff no longer applies cleanly; the "
-            "asset changed since the proposal was generated"
-        )
     gitops.apply_patch(repo_root, patch)
     append_changelog(changelog_path, proposal, timestamp)
     message = _commit_message(proposal, timestamp)
     # Stage exactly the patched asset(s) + the CHANGELOG — never `add -A`, so a
-    # gitignored-or-not run dir can never ride into the commit.
-    paths = list(dict.fromkeys(proposal.targets + [_changelog_rel(repo_root, changelog_path)]))
+    # gitignored-or-not run dir can never ride into the commit. Use the targets
+    # recomputed from the diff (not the markdown field) so staging matches what
+    # was actually validated and patched.
+    paths = list(dict.fromkeys(targets + [_changelog_rel(repo_root, changelog_path)]))
     sha = gitops.commit_paths(repo_root, message, paths, identity=identity)
     proposal.status = APPLIED
     if proposal.path is not None:

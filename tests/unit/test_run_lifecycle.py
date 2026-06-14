@@ -74,6 +74,40 @@ def test_entry_contract_refuses_marker_only_removed(fixture_repo):
         mgr.check_entry_contract("demo")
 
 
+GATED_REFUSE = """
+name: p
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: gate, type: human_gate, show: [prd.md]}
+"""
+
+
+def test_start_refuses_second_run_while_active(fixture_repo):
+    # review finding: a second `start()` over a still-live run would overwrite
+    # active-run.txt and orphan the first, risking competing agents on one
+    # worktree. Refuse unless the active run is terminal (resume/abort instead).
+    from gauntlet.engine.run import ActiveRunError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, GATED_REFUSE)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    with pytest.raises(ActiveRunError, match="parked"):
+        mgr.start("demo", path, use_judge=False)
+
+
+def test_start_allowed_after_terminal_run(fixture_repo):
+    # once the active run is terminal (here: aborted), a fresh start is fine.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, GATED_REFUSE)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    mgr.abort("demo")  # terminal
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED  # no raise
+
+
 LINEAR = """
 name: p
 version: 1

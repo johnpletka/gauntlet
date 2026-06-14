@@ -43,7 +43,7 @@ def init(
     ),
 ) -> None:
     """Scaffold config/pipeline/prompts/policy + hook wiring (FR-1.2, idempotent)."""
-    from gauntlet.engine.init import MISSING, init_repo
+    from gauntlet.engine.init import init_repo
 
     result = init_repo(Path.cwd(), from_repo=from_repo)
     for a in result.actions:
@@ -189,10 +189,14 @@ def feedback(slug: str) -> None:
         fid = typer.prompt("  finding id", default="")
         if not fid.strip():
             break
-        verdict = typer.prompt(f"  correct verdict {VERDICTS}", default="legitimate")
+        while True:
+            verdict = typer.prompt(f"  correct verdict {VERDICTS}", default="legitimate").strip()
+            if verdict in VERDICTS:
+                break
+            typer.echo(f"    '{verdict}' is not a valid verdict; choose one of {VERDICTS}")
         note = typer.prompt("  note", default="")
         corrections.append(
-            TriageCorrection(finding_id=fid.strip(), correct_verdict=verdict.strip(), note=note)
+            TriageCorrection(finding_id=fid.strip(), correct_verdict=verdict, note=note)
         )
     notes = typer.prompt("Freeform notes", default="")
     data = FeedbackData(

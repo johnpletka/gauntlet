@@ -193,7 +193,10 @@ class PolicyEngine:
         # path-handling codebase — must not be judged as operating on that path
         # (BOOTSTRAP-NOTES #32: this false-positive denied in-repo edits to
         # files whose content mentions an absolute path, stalling P5).
-        if isinstance(tool_input.get("command"), str):
+        # Gate on the tool NAME, not merely the presence of a `command` key, so a
+        # non-Bash tool that happens to carry a `command` string can't have its
+        # content tokens harvested as operation targets (review).
+        if tool_name == "Bash" and isinstance(tool_input.get("command"), str):
             for match in _PATH_TOKEN_RE.finditer(tool_input["command"]):
                 paths.append(Path(match.group(0)))
         return paths

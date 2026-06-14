@@ -130,6 +130,17 @@ def test_ask_categories(engine, cmd, category):
     assert decision.risk_category == category
 
 
+@pytest.mark.parametrize("cmd", ["env", "printenv", "printenv OPENAI_API_KEY"])
+def test_env_dump_not_terminally_allowed(engine, cmd):
+    # review: bare `env`/`printenv` dumps every var (API keys, judge token) into
+    # agent context. It must NOT fast-path allow — it escalates to the LLM
+    # classifier (None) instead, fail closed.
+    decision = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert decision is None or decision.decision != "allow", (
+        f"{cmd} wrongly fast-path allowed (leaks secrets)"
+    )
+
+
 def test_unmatched_returns_none(engine):
     # an exotic command no rule covers -> escalate to LLM (None)
     decision = engine.evaluate(

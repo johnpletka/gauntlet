@@ -131,7 +131,12 @@ allow:
       - '^\s*find\b(?![^\n]*(-delete|-exec|-execdir|-ok))'
       - '^\s*(rg|grep|ag|ack|fd)\b'
       - '^\s*(echo|printf)\b'
-      - '^\s*(which|type|command\s+-v|whoami|hostname|date|env|uname)\b'
+      # `env`/`printenv` deliberately NOT allowed: bare `env` dumps every
+      # environment variable — including OPENAI_API_KEY / ANTHROPIC_API_KEY /
+      # GAUNTLET_JUDGE_TOKEN — into agent context with no classification. Omit
+      # it here so it falls through to the LLM classifier (fail closed); the
+      # classifier can still allow a legitimate `env FOO=bar <cmd>` form.
+      - '^\s*(which|type|command\s+-v|whoami|hostname|date|uname)\b'
 
   - name: test-and-build-runners
     description: "Running the project's test/lint/build tooling."
