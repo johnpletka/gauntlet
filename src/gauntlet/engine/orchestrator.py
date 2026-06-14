@@ -33,11 +33,13 @@ from gauntlet.engine.execution import (
     StepContext,
     StepResult,
     get_spec,
+    run_bookkeeping_excludes,
 )
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.pipeline import Pipeline, Stage, Step
 from gauntlet.logging.redact import RedactingWriter
+from gauntlet.logging.transcript import write_run_index
 
 
 def _utcnow() -> str:
@@ -73,6 +75,9 @@ class Orchestrator:
         self.clock = clock
         self.manifest_path = run_dir / "manifest.json"
         self.artifacts: dict[str, Path] = {}
+        # Narrow exclusion: only the engine's own bookkeeping is hidden from
+        # dirty checks / commits — real run artifacts stay visible (review F-001).
+        self.excludes = run_bookkeeping_excludes(repo_root, run_dir, artifact_root)
         self._ignore_run_dir()
         self._seed_artifacts()
 
@@ -174,6 +179,9 @@ class Orchestrator:
     def _run_step_foreach(self, step: Step) -> str:
         items = resolve_list(step.foreach, self._context())
         for idx, item in enumerate(items):
+            rec = self.manifest.record(step.id, str(idx))
+            if rec is not None and rec.status in (M.DONE, M.SKIPPED):
+                continue  # resume: don't re-run a completed iteration (F-004)
             result = self._execute(step, str(idx), item)
             if result.status != DONE:
                 return result.status
@@ -255,13 +263,19 @@ class Orchestrator:
         """
         if rec.base_sha is None or not spec.step_touches_worktree(step):
             return None
-        is_agent_write = step.type == "agent_task" and spec.step_requires_repo_write(
-            step
-        )
+        # agent_task killed mid-edit AND adversarial_cycle killed mid-round are
+        # both non-idempotent worktree writers: park (or reset) on a dirty base
+        # rather than re-running over partial fixer edits / unmanifested
+        # fix-round commits. shell and commit re-enter safely on their own.
+        is_agent_write = (
+            step.type == "agent_task" and spec.step_requires_repo_write(step)
+        ) or step.type == "adversarial_cycle"
         if not is_agent_write:
             return None
-        exclude = [self.config.run_root]
-        if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=exclude):
+        # Detect partial work against the narrow bookkeeping exclusion, so a
+        # partial *artifact* under the run root (not just a repo-root file) is
+        # still seen as a mid-edit interruption (review F-001).
+        if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=self.excludes):
             return None  # clean re-entry: agent never progressed; safe to re-run
         if self.config.interrupted_step == "reset_to_base":
             ts = self.clock().replace(":", "-")
@@ -269,11 +283,13 @@ class Orchestrator:
             # Snapshot the partial work (tracked + untracked) before discarding.
             gitops.backup_dirty_worktree(
                 self.repo_root, backup, f"interrupted {rec.id} partial work",
-                exclude=exclude,
+                exclude=self.excludes,
             )
             gitops.reset_hard(self.repo_root, rec.base_sha)
-            # Spare the run root so the reset never wipes the run pointer,
-            # manifests, or the human-authored prd.md living under it.
+            # `clean` is broader than the dirty check on purpose: it spares the
+            # whole run root so the reset never wipes the run pointer, manifests,
+            # the authored prd.md, or prior declared artifacts — the re-run
+            # regenerates its own outputs over them.
             gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
             return None  # tree restored to base; re-run cleanly
         return StepResult(
@@ -297,15 +313,22 @@ class Orchestrator:
             return result
         projected = (rec.usage.cost_usd or 0.0) + result.usage.cost_usd
         if projected > budget:
-            return StepResult(
-                status=HALTED,
-                usage=result.usage,
-                session_id=result.session_id,
-                notes=(
-                    f"budget halt (FR-3.3): step cost ${projected:.4f} exceeds "
-                    f"budget ${budget:.4f}; halting at checkpoint"
-                ),
+            # The handler may have ALREADY produced side effects before the
+            # projection tripped — a commit / adversarial_cycle can have created
+            # a commit and per-agent usage at this checkpoint. Discarding those
+            # (the prior fresh-StepResult conversion) would record the step as
+            # halted with no commit, artifact, or per-agent usage, breaking
+            # FR-3.3 checkpointing and FR-9 branch/manifest consistency (F-001).
+            # Preserve every field; only the status and notes change.
+            halt_note = (
+                f"budget halt (FR-3.3): step cost ${projected:.4f} exceeds "
+                f"budget ${budget:.4f}; halting at checkpoint"
             )
+            result.status = HALTED
+            result.notes = (
+                f"{result.notes}\n{halt_note}" if result.notes else halt_note
+            )
+            return result
         return result
 
     def _finalize(self, rec: StepRecord, result: StepResult) -> None:
@@ -323,8 +346,18 @@ class Orchestrator:
         if result.usage is not None:
             rec.usage.add(result.usage)
             self.manifest.totals.add(result.usage)
+        # Per-agent-profile accumulation (FR-3.2): a step reports which profile
+        # each slice of usage belongs to so `gauntlet report` can answer the
+        # FR-3 cost-attribution acceptance. Kept separate from `totals`, never
+        # double-counted (totals already took the step's grand usage above).
+        for agent_name, agent_usage in (result.usage_by_agent or {}).items():
+            self.manifest.agent_usage.setdefault(
+                agent_name, M.UsageTotals()
+            ).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
+        if result.metrics:
+            rec.metrics = dict(result.metrics)  # trend outcome counts (FR-6.6)
         if result.commit_sha:
             self.manifest.commits.append(
                 M.CommitRecord(
@@ -332,6 +365,10 @@ class Orchestrator:
                     phase=result.commit_phase or "",
                     sha=result.commit_sha,
                 )
+            )
+        for phase, sha in result.commits:  # multi-commit steps (adversarial_cycle)
+            self.manifest.commits.append(
+                M.CommitRecord(step_id=rec.id, phase=phase, sha=sha)
             )
         if result.status == DONE:
             for name, path in result.artifact_writes.items():
@@ -352,6 +389,7 @@ class Orchestrator:
             writer=self.writer,
             judge_env=self.judge_env,
             artifacts=dict(self.artifacts),
+            excludes=self.excludes,
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
@@ -362,11 +400,23 @@ class Orchestrator:
             "config": self.config,
             "artifacts": {name: True for name in self._existing_artifacts()},
             "vars": self.extra_context,
+            # `foreach: plan.phases` (FR-5.1): the structured phase list the
+            # plan-author emits in plan.md. Resolved lazily from the artifact so
+            # the phases stage fans out over exactly what the (approved) plan
+            # declares — and stays empty/missing until plan.md exists, so the
+            # foreach only resolves after the plan gate (FR-10.2).
+            "plan": self._plan_context(),
         }
         ctx.update(self.extra_context)
         if item is not None:
             ctx["item"] = item
         return ctx
+
+    def _plan_context(self) -> dict[str, Any]:
+        from gauntlet.engine.planphases import load_plan_phases
+
+        phases = load_plan_phases(self.artifact_root / "plan.md")
+        return {"phases": phases} if phases is not None else {}
 
     def _seed_artifacts(self) -> None:
         for name in ("prd.md", "plan.md"):
@@ -390,13 +440,16 @@ class Orchestrator:
         rec.ended = self.clock()
 
     def _find_parked_gate(self, step_id: str) -> StepRecord:
-        rec = self.manifest.record(step_id)
-        if rec is None or rec.status != M.PARKED:
-            raise ValueError(
-                f"step {step_id!r} is not parked at a gate "
-                f"(status: {rec.status if rec else 'absent'})"
-            )
-        return rec
+        # Scan across iterations so a gate parked inside a foreach (record
+        # `gate` with iteration `1`) is reachable by approve/reject (F-004).
+        for rec in self.manifest.steps:
+            if rec.id == step_id and rec.status == M.PARKED:
+                return rec
+        existing = self.manifest.record(step_id)
+        raise ValueError(
+            f"step {step_id!r} is not parked at a gate "
+            f"(status: {existing.status if existing else 'absent'})"
+        )
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
@@ -416,3 +469,6 @@ class Orchestrator:
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)
+        # RUN.md (FR-4.3) is regenerated on every checkpoint so the index never
+        # lags the state machine; it is derived data, cheap to rewrite.
+        write_run_index(self.run_dir, self.manifest, self.writer)

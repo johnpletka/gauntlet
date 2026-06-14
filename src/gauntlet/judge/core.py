@@ -23,11 +23,18 @@ class JudgeCore:
         classifier: LLMClassifier | None = None,
         audit_path: Path | None = None,
         writer: RedactingWriter | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.policy_engine = policy_engine
         self.classifier = classifier
         self.audit_path = audit_path
         self.writer = writer or RedactingWriter()
+        # The authoritative repo boundary (BOOTSTRAP-NOTES #29/#31): when the
+        # engine starts the judge it knows the real repo root and pins it here,
+        # so path checks NEVER depend on the agent's per-call cwd reaching the
+        # hook. The request-supplied repo_root is a fallback only (the dev
+        # `gauntlet judge serve` with no --repo-root).
+        self.repo_root = repo_root
 
     def decide(
         self,
@@ -39,10 +46,12 @@ class JudgeCore:
         step_id: str | None = None,
     ) -> JudgeDecision:
         start = time.monotonic()
-        decision = self._ladder(tool_name, tool_input, repo_root)
+        effective_root = self.repo_root or repo_root
+        decision = self._ladder(tool_name, tool_input, effective_root)
         latency_ms = round((time.monotonic() - start) * 1000, 2)
         self._audit(
-            tool_name, tool_input, decision, latency_ms, run_id, step_id
+            tool_name, tool_input, decision, latency_ms, run_id, step_id,
+            repo_root=effective_root,
         )
         return decision
 
@@ -77,6 +86,7 @@ class JudgeCore:
         latency_ms: float,
         run_id: str | None,
         step_id: str | None,
+        repo_root: Path | None = None,
     ) -> None:
         if self.audit_path is None:
             return
@@ -96,6 +106,13 @@ class JudgeCore:
                 "risk_category": decision.risk_category,
                 "matched_rule": decision.matched_rule,
                 "rationale": decision.rationale,
+                # Judge LLM-rung spend, when this decision consulted the
+                # classifier — the cross-process channel that carries judge cost
+                # back to the manifest for `gauntlet report` (review F-003).
+                "usage": decision.usage,
+                # The boundary used for path checks — logged so a wrong root is
+                # diagnosable from the audit alone, not inferred (#31).
+                "repo_root": str(repo_root) if repo_root is not None else None,
                 "latency_ms": latency_ms,
             },
         )

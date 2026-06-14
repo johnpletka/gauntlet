@@ -21,16 +21,19 @@ def engine():
 class FakeAdapter:
     """Stands in for an ApiAdapter; returns or raises a scripted result."""
 
-    def __init__(self, structured=None, exc=None):
+    def __init__(self, structured=None, exc=None, usage=None):
         self._structured = structured
         self._exc = exc
+        self._usage = usage
         self.calls = []
 
     def run(self, prompt, *, schema=None, **kw):
         self.calls.append(prompt)
         if self._exc is not None:
             raise self._exc
-        return AgentResult(text="", structured=self._structured, exit_code=0)
+        return AgentResult(
+            text="", structured=self._structured, usage=self._usage, exit_code=0
+        )
 
 
 def test_policy_deny_is_terminal_no_llm():
@@ -69,6 +72,40 @@ def test_unmatched_routes_to_llm():
     d = core.decide("Bash", {"command": "telnet bbs.example.org"}, repo_root=REPO_ROOT)
     assert d.source == "llm"
     assert d.decision == "deny"
+
+
+def test_llm_decision_carries_usage_into_audit(tmp_path):
+    # F-003: the classifier's token/cost usage must travel on the decision and
+    # into the audit, or judge spend is invisible to `gauntlet report` and the
+    # FR-3 "judge < 5% of run cost" acceptance cannot be measured.
+    from gauntlet.adapters.base import Usage
+
+    adapter = FakeAdapter(
+        structured={"decision": "allow", "risk_category": "x", "rationale": "ok"},
+        usage=Usage(input_tokens=12, output_tokens=3, cost_usd=0.002),
+    )
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), classifier=LLMClassifier(adapter), audit_path=audit)
+    d = core.decide(
+        "Bash", {"command": "pip install requests"}, repo_root=REPO_ROOT
+    )
+    assert d.source == "llm"
+    assert d.usage == {
+        "input_tokens": 12, "output_tokens": 3,
+        "cached_input_tokens": None, "cost_usd": 0.002,
+    }
+    line = json.loads(audit.read_text().splitlines()[0])
+    assert line["usage"]["cost_usd"] == 0.002
+
+
+def test_fast_path_decision_has_no_usage(tmp_path):
+    # A policy fast-path decision never consults the LLM, so it carries no usage.
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), audit_path=audit)
+    d = core.decide("Bash", {"command": "git status"}, repo_root=REPO_ROOT)
+    assert d.source == "fast-path"
+    assert d.usage is None
+    assert json.loads(audit.read_text().splitlines()[0])["usage"] is None
 
 
 def test_no_classifier_fails_closed_on_unmatched():
@@ -113,7 +150,36 @@ def test_audit_line_written_and_redacted(tmp_path):
     assert first["run_id"] == "run1"
     assert "latency_ms" in first
     assert first["matched_rule"]
+    assert first["repo_root"] == str(REPO_ROOT)  # #31: boundary is auditable
     assert json.loads(lines[1])["decision"] == "deny"
+
+
+def test_authoritative_repo_root_overrides_request(tmp_path):
+    # #31: when the engine pins the judge's repo_root, an agent's per-call
+    # cwd (request repo_root) cannot redefine "the repository tree". An
+    # in-repo write judged against a scratch cwd must still be allowed.
+    real_repo = REPO_ROOT
+    in_repo_edit = {"file_path": str(real_repo / "src/gauntlet/engine/run.py"),
+                    "content": "x"}
+    # Without the pin, the wrong (scratch) request root denies the in-repo edit
+    # via the path-escape rule — the exact P5 deny-loop (#29).
+    unpinned = JudgeCore(engine())
+    d1 = unpinned.decide("Edit", in_repo_edit, repo_root=Path("/tmp/toy-project"))
+    assert d1.decision == "deny" and d1.matched_rule == "write-outside-repo"
+    # With the engine-pinned root, path-escape no longer fires regardless of
+    # cwd: an in-repo write is not denied as outside-repo (it falls through to
+    # the LLM rung, which allows it live; here there is no classifier so it
+    # reaches fail-closed — the point is it is NOT the path-escape deny).
+    pinned = JudgeCore(engine(), repo_root=real_repo)
+    d2 = pinned.decide("Edit", in_repo_edit, repo_root=Path("/tmp/toy-project"))
+    assert d2.matched_rule != "write-outside-repo"
+
+
+def test_build_core_threads_repo_root():
+    from gauntlet.judge.runner import build_core
+
+    core = build_core(policy_path=POLICY, repo_root=REPO_ROOT)
+    assert core.repo_root == REPO_ROOT
 
 
 def test_classifier_adapter_bounded_under_hook_timeout():
@@ -127,7 +193,11 @@ def test_classifier_adapter_bounded_under_hook_timeout():
     adapter = core.classifier._adapter
     assert isinstance(adapter, ApiAdapter)
     assert adapter.timeout_s == JUDGE_LLM_TIMEOUT_S
-    assert adapter.temperature == 0
+    # gpt-5-family models reject any non-default temperature; passing temp=0
+    # made every classifier call fail closed (notes #26). Latency is bounded
+    # via minimal reasoning effort instead.
+    assert adapter.temperature is None
+    assert adapter.reasoning_effort == "minimal"
     assert adapter.max_tokens is not None
     # single attempt only, so worst case (1 x timeout) stays under the hook
     # timeout — no retry can push total latency past it (F-007 round 2)

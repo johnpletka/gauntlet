@@ -1,0 +1,14 @@
+# --- Gauntlet (added by `gauntlet init`, FR-4.5) ---
+# Run manifests and transcripts are committable by design (FR-4): they are the
+# audit trail a reviewer reconstructs a run from. Only live bookkeeping and the
+# P2 judge contract-test artifact are ignored.
+#
+# Engine live-run pointers are bookkeeping, never commit payload.
+runs/*/active-run.txt
+.gauntlet/test-judge-audit.jsonl
+#
+# OPTIONAL: raw event streams are lossless but heavy. Teams that find them too
+# heavy for git can uncomment the next line — `transcript.md` remains the
+# committable, human-readable record (FR-4.2/4.5).
+# **/events.jsonl
+# --- end Gauntlet ---

@@ -43,12 +43,16 @@ class ApiAdapter:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.model = model
         self.max_schema_retries = max_schema_retries
         self.timeout_s = timeout_s
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Reasoning-model latency knob (gpt-5 family): "minimal" turns a
+        # multi-second deliberation into a fast classification (notes #26).
+        self.reasoning_effort = reasoning_effort
 
     def run(
         self,
@@ -120,6 +124,8 @@ class ApiAdapter:
             kwargs["temperature"] = self.temperature
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         return litellm.completion(**kwargs)
 
     @staticmethod

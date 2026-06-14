@@ -6,9 +6,13 @@ __pycache__/
 *.egg-info/
 dist/
 
-# IDE / editor
+# IDE / editor / OS
 .idea/
 .vscode/
+.DS_Store
 
 # P2 judge contract-test audit artifact
 .gauntlet/test-judge-audit.jsonl
+
+# Engine live-run pointers are bookkeeping, never commit payload (notes #13/#22)
+runs/*/active-run.txt

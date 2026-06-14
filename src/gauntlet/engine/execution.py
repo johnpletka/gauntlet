@@ -42,9 +42,20 @@ class StepResult:
     usage: Usage | None = None
     commit_sha: str | None = None
     commit_phase: str | None = None
+    # A multi-commit step (adversarial_cycle: fix rounds + reviewer-attributed
+    # mutation commits) reports every (phase-prefix, sha) it created, in order.
+    commits: list[tuple[str, str]] = field(default_factory=list)
     notes: str = ""
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
+    # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent
+    # steps report one entry; an adversarial_cycle splits across its roles.
+    # The orchestrator merges this into the manifest's per-profile totals.
+    usage_by_agent: dict[str, Usage] = field(default_factory=dict)
+    # Structured outcome counts persisted onto the StepRecord for `--trend`
+    # (FR-6.6): rounds, finding/verdict/confirm tallies an adversarial_cycle
+    # emits so trend metrics come from the manifest (P7 test strategy).
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 # An adapter factory lets unit tests inject fakes by agent-profile name without
@@ -64,6 +75,9 @@ class StepContext:
     writer: RedactingWriter
     judge_env: dict[str, str] = field(default_factory=dict)
     artifacts: dict[str, Path] = field(default_factory=dict)
+    # repo-relative paths of the engine's own bookkeeping (review F-001); commit
+    # and dirty checks exclude these but not real run artifacts.
+    excludes: list[str] = field(default_factory=list)
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
@@ -136,3 +150,39 @@ def get_spec(step_type: str) -> StepSpec:
 
 def usage_from_result(result: AgentResult) -> Usage | None:
     return result.usage
+
+
+def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path) -> list[str]:
+    """Repo-relative paths of the engine's own live bookkeeping (review F-001).
+
+    The run-instance dir (manifest/transcripts/steps/judge-audit) must be
+    invisible to worktree-state checks and commits. Everything *else* under the
+    run root (prd.md, plan.md, declared step outputs) is real work: tracked,
+    detected by the transaction boundary, and committable. Narrowing to just
+    this set is the F-001 fix — the prior code excluded the whole run root,
+    hiding real partial effects from the dirty-base check.
+
+    The active-run pointer is deliberately NOT listed here: it is ignored via a
+    ``.gitignore`` rule (``runs/*/active-run.txt``, shipped by ``init``), so git
+    already keeps it out of status and ``add``. Naming a gitignored path in an
+    ``:(exclude)`` pathspec makes ``git add`` ERROR ("paths are ignored ... use
+    -f"), which broke the commit step (BOOTSTRAP-NOTES #33). Letting gitignore
+    own it is both correct and avoids the pathspec collision.
+
+    ``PR.md`` (FR-9.8) IS listed: it is engine-drafted at final-gate pass but
+    must never be auto-committed or pushed — opening the PR stays a human action
+    (PRD §2.2). Excluding it keeps the engine's own commits and clean/rollback
+    checks from sweeping it in, while leaving it plainly visible for the human to
+    ``git add`` and commit deliberately (it is not gitignored, so no #33 clash).
+    """
+    excludes: list[str] = []
+    root = repo_root.resolve()
+    try:
+        excludes.append(run_dir.resolve().relative_to(root).as_posix())
+    except ValueError:
+        pass
+    try:
+        excludes.append((artifact_root / "PR.md").resolve().relative_to(root).as_posix())
+    except ValueError:
+        pass
+    return excludes

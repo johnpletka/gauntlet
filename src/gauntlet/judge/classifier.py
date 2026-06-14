@@ -74,9 +74,15 @@ class LLMClassifier:
                 source="fail-closed",
                 rationale="judge LLM returned unparseable/invalid decision; failing closed",
             )
+        # Carry the call's usage so judge LLM spend reaches the audit and, from
+        # there, the manifest — otherwise it is invisible to `gauntlet report`
+        # and the FR-3 "judge < 5% of run cost" acceptance cannot be measured
+        # (review F-003).
+        usage = result.usage.model_dump() if result.usage is not None else None
         return JudgeDecision(
             decision=data["decision"],
             source="llm",
             rationale=data.get("rationale", ""),
             risk_category=data.get("risk_category"),
+            usage=usage,
         )

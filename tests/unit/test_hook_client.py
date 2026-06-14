@@ -176,3 +176,30 @@ class _FakeStdin:
 
     def read(self):
         return self._text
+
+
+def test_repo_root_prefers_engine_env_over_agent_cwd(monkeypatch):
+    # P5 deny-loop regression (notes #29): an agent working from a scratch/toy
+    # directory must not have its in-repo edits judged against that cwd. The
+    # engine-injected GAUNTLET_REPO_ROOT defines the boundary for the run.
+    fake = patch_judge(monkeypatch, result={"decision": "allow", "rationale": "ok"})
+    env = {
+        "GAUNTLET_JUDGE_TOKEN": "tok",
+        "GAUNTLET_REPO_ROOT": "/real/repo",
+    }
+    hook_client.decide_from_payload(
+        {"tool_name": "Edit", "tool_input": {"file_path": "/real/repo/src/x.py"},
+         "cwd": "/tmp/toy-project"},
+        env=env,
+    )
+    assert fake.body["repo_root"] == "/real/repo"
+
+
+def test_repo_root_falls_back_to_cwd_without_engine_env(monkeypatch):
+    fake = patch_judge(monkeypatch, result={"decision": "allow", "rationale": "ok"})
+    env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    hook_client.decide_from_payload(
+        {"tool_name": "Edit", "tool_input": {"file_path": "/repo/x"}, "cwd": "/repo"},
+        env=env,
+    )
+    assert fake.body["repo_root"] == "/repo"

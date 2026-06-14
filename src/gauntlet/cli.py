@@ -1,7 +1,8 @@
 """Gauntlet CLI entry point.
 
 P3 adds the run lifecycle (`new`, `run`, `status`, `approve`, `reject`,
-`resume`, `abort`, `rollback`); `init`/`doctor` land in P6 per the plan.
+`resume`, `abort`, `rollback`); P6 adds `init` (idempotent scaffolding) and
+`doctor` (environment validation).
 """
 
 from __future__ import annotations
@@ -31,6 +32,47 @@ def main() -> None:
 def version() -> None:
     """Print the installed gauntlet version."""
     typer.echo(f"gauntlet {__version__}")
+
+
+@app.command()
+def init(
+    from_repo: bool = typer.Option(
+        False, "--from-repo",
+        help="The repo already carries committed Gauntlet assets; only ensure "
+        "machine-local hook wiring + .gitignore guidance (team-adopter path).",
+    ),
+) -> None:
+    """Scaffold config/pipeline/prompts/policy + hook wiring (FR-1.2, idempotent)."""
+    from gauntlet.engine.init import init_repo
+
+    result = init_repo(Path.cwd(), from_repo=from_repo)
+    for a in result.actions:
+        suffix = f" — {a.detail}" if a.detail else ""
+        typer.echo(f"  {a.action:8} {a.path}{suffix}")
+    if result.missing:
+        typer.echo(
+            "\nmissing committed assets (expected with --from-repo on a "
+            "configured repo): " + ", ".join(a.path for a in result.missing)
+        )
+    typer.echo("\nnext: `gauntlet doctor`, then `gauntlet new <slug>` / `gauntlet run <slug>`")
+
+
+@app.command()
+def doctor() -> None:
+    """Validate the environment: CLIs, auth, hooks, judge, keys (FR-1.3, FR-1.5)."""
+    from gauntlet.engine.doctor import FAIL, OK, WARN, has_failure, run_doctor
+
+    glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
+    results = run_doctor(Path.cwd())
+    for r in results:
+        line = f"  {glyph.get(r.status, '?')} {r.name}: {r.detail}"
+        typer.echo(line)
+        if r.remedy and r.status in (WARN, FAIL):
+            typer.echo(f"      → {r.remedy}")
+    if has_failure(results):
+        typer.echo("\ndoctor found blocking problems (see ✗ above)", err=True)
+        raise typer.Exit(1)
+    typer.echo("\nenvironment OK")
 
 
 def _manager() -> "object":
@@ -111,6 +153,111 @@ def abort(slug: str) -> None:
 
 
 @app.command()
+def report(
+    slug: str,
+    trend: bool = typer.Option(
+        False, "--trend", help="Also show cross-run improvement metrics (FR-6.6)."
+    ),
+) -> None:
+    """Print the per-step / per-agent-profile cost breakdown for a run (FR-3.2).
+
+    With ``--trend``, also print the cross-run improvement metrics (findings per
+    round, %legitimate, fix-survival, test loops, judge ask-rate, cost/phase).
+    """
+    from gauntlet.engine.report import render_report
+    from gauntlet.engine.trend import render_trend
+
+    mgr = _manager()
+    man = mgr.status(slug)
+    typer.echo(render_report(man), nl=False)
+    if trend:
+        typer.echo("")
+        typer.echo(render_trend(mgr.trend(slug)), nl=False)
+
+
+@app.command()
+def feedback(slug: str) -> None:
+    """Capture human feedback for a run into retro/feedback.md (FR-6.1)."""
+    from gauntlet.engine.feedback import FeedbackData, TriageCorrection, VERDICTS
+
+    rating = typer.prompt("Outcome rating (e.g. good/mixed/poor)", default="")
+    misses = typer.prompt("What did the reviewers miss?", default="")
+    corrections: list[TriageCorrection] = []
+    typer.echo("Triage corrections (false legitimate / false bikeshedding). "
+               "Leave the finding id blank to finish.")
+    while True:
+        fid = typer.prompt("  finding id", default="")
+        if not fid.strip():
+            break
+        while True:
+            verdict = typer.prompt(f"  correct verdict {VERDICTS}", default="legitimate").strip()
+            if verdict in VERDICTS:
+                break
+            typer.echo(f"    '{verdict}' is not a valid verdict; choose one of {VERDICTS}")
+        note = typer.prompt("  note", default="")
+        corrections.append(
+            TriageCorrection(finding_id=fid.strip(), correct_verdict=verdict, note=note)
+        )
+    notes = typer.prompt("Freeform notes", default="")
+    data = FeedbackData(
+        outcome_rating=rating, reviewer_misses=misses,
+        triage_corrections=corrections, notes=notes,
+    )
+    mgr = _manager()
+    path = mgr.save_feedback(slug, data)
+    typer.echo(f"feedback saved to {path}")
+    # FR-6.1: feedback captured at run end or LATER must be able to drive
+    # proposal generation. The retro step already ran, so re-synthesise now with
+    # the feedback present (review F-001), appending any new pending proposals.
+    if typer.confirm(
+        "Regenerate improvement proposals from this feedback now?", default=True
+    ):
+        generated = mgr.regenerate_proposals(slug)
+        valid = sum(1 for p in generated if getattr(p, "valid", False))
+        typer.echo(
+            f"generated {len(generated)} proposal(s), {valid} applyable; "
+            f"review with `gauntlet proposals review --slug {slug}`"
+        )
+
+
+proposals_app = typer.Typer(no_args_is_help=True, help="Improvement proposals (FR-6.4).")
+app.add_typer(proposals_app, name="proposals")
+
+
+@proposals_app.command("review")
+def proposals_review(
+    slug: str = typer.Option(None, "--slug", help="Limit to one run slug (default: all)."),
+) -> None:
+    """Present pending proposals; approve/reject + apply approved diffs (FR-6.4)."""
+    mgr = _manager()
+    pending = [
+        (rd, p) for rd, p in mgr.list_proposals(slug)
+        if getattr(p, "status", "") == "pending" and getattr(p, "valid", False)
+    ]
+    if not pending:
+        typer.echo("no pending, applyable proposals")
+        return
+
+    def decide(proposal):
+        typer.echo("")
+        typer.echo(f"Proposal {proposal.name} (from {proposal.source_run})")
+        typer.echo(f"  targets: {', '.join(proposal.targets) or '(none)'}")
+        typer.echo(f"  rationale: {proposal.rationale.strip()[:500]}")
+        typer.echo("  diff:")
+        for line in proposal.diff.splitlines():
+            typer.echo(f"    {line}")
+        if typer.confirm("Approve and apply this proposal?", default=False):
+            return "approve", ""
+        notes = typer.prompt("Rejection notes", default="")
+        return "reject", notes
+
+    results = mgr.review_proposals(slug, decide=decide)
+    for r in results:
+        extra = r.get("sha", r.get("reason", ""))
+        typer.echo(f"  {r['proposal']}: {r['action']}" + (f" ({extra[:60]})" if extra else ""))
+
+
+@app.command()
 def rollback(
     slug: str,
     phase: int = typer.Option(..., "--phase", help="Roll the branch back to phase N."),
@@ -133,6 +280,10 @@ def judge_serve(
     ),
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8787, help="Bind port."),
+    repo_root: Path = typer.Option(
+        None, help="Authoritative repo boundary for path checks (#31); "
+        "the engine passes this so checks never depend on the agent's cwd."
+    ),
 ) -> None:
     """Run the localhost judge service (dev command; engine-managed in P3)."""
     from gauntlet.judge.runner import serve
@@ -143,4 +294,5 @@ def judge_serve(
         judge_model=judge_model,
         host=host,
         port=port,
+        repo_root=repo_root,
     )

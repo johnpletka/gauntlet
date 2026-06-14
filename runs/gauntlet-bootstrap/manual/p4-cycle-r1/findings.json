@@ -1,0 +1,78 @@
+{
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "blocking",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:236; src/gauntlet/engine/cycle.py:513; schemas/confirm.json:10",
+      "claim": "The confirm pass can omit prior findings or return verdicts for unknown IDs and the cycle will still converge.",
+      "evidence": "FR-9.5 requires a per-finding confirm verdict, and FR-10.5 says unresolved blockers escalate instead of being silently carried forward. The schema only requires each verdict to contain some string `finding_id`; `_open_after_confirm()` iterates whatever verdicts are present and never checks that their IDs exactly match the prior findings. If a blocking `F-001` is omitted, `open_items` and `open_blockers` stay empty, so `handle_adversarial_cycle()` returns DONE at lines 236-246.",
+      "suggested_fix": "Validate confirm output before interpreting it: require exactly one verdict for every prior finding ID, reject duplicates and unknown IDs, and treat missing IDs as unresolved/fail-closed. Add tests for omitted, duplicate, and unknown confirm IDs, including a blocking finding."
+    },
+    {
+      "id": "F-002",
+      "severity": "blocking",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:184; src/gauntlet/engine/cycle.py:469; PRD-gauntlet.md:346",
+      "claim": "Real deferred or upstream findings can be reported as convergence, including blocking findings after escalation.",
+      "evidence": "The loop defines `accepted` solely as triage verdicts with `action == \"fix_now\"`; if no such verdicts exist it returns DONE with `converged: accepted no findings` regardless of finding severity, verdict, `action: defer`, or `target_artifact`. F-009 only escalates blocking/low-confidence triage; once a high-confidence escalation verdict says `legitimate` + `defer`, the cycle parks nowhere. That contradicts FR-10.5 for open blockers and FR-10.4 for upstream defects, which must halt at a human gate rather than silently proceeding.",
+      "suggested_fix": "Before the `not accepted` convergence path, classify any `legitimate` blocking or `target_artifact`/upstream verdict as open and park for a human gate unless it is fixed in the current round. Add tests for blocking `defer` after escalation and for `target_artifact` with no current-artifact fix."
+    },
+    {
+      "id": "F-003",
+      "severity": "major",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:535",
+      "claim": "Non-blocking regressions reported in `confirm.new_findings` are ignored and can ship immediately.",
+      "evidence": "`confirm.json` allows `new_findings` at any severity, and the confirm prompt tells reviewers to put defects introduced by the diff there. `_open_after_confirm()` only appends new findings when `severity == \"blocking\"`; a new major/minor regression with all prior findings resolved leaves both open lists empty, so the cycle returns DONE at lines 236-246. The plan's P4 loop is review -> triage -> fix -> confirm within `max_rounds`, not 'ignore new major defects unless they are blocking'.",
+      "suggested_fix": "Convert every `new_findings` entry into a carried finding for the next round, with blocking ones also populating `open_blockers` for FR-10.5 escalation. Add a confirm-pass test where a major new finding prevents convergence."
+    },
+    {
+      "id": "F-004",
+      "severity": "major",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:143; src/gauntlet/engine/cycle.py:299",
+      "claim": "The reviewer-mutation guard does not run after failed or malformed review attempts, and schema retry can hand a dirty tree back to the reviewer.",
+      "evidence": "`_mutation_guard()` is called only after `_run_sub()` returns a successful review result. Inside `_run_sub()`, `MalformedOutputError` is caught and retried immediately without checking `git status`; if the reviewer wrote files and then emitted invalid JSON, the retry starts from a dirty worktree, violating FR-9.3. If retries are exhausted or the adapter raises another failure, the FR-9.6 commit/revert/halt policy never runs for that review step.",
+      "suggested_fix": "Wrap review attempts so `git status` is checked after every adapter invocation, including malformed-output and failed-call paths. If a retry is needed after a mutation, apply the configured mutation policy first or park rather than re-entering review on a dirty tree."
+    },
+    {
+      "id": "F-005",
+      "severity": "major",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:405; src/gauntlet/engine/cycle.py:447; src/gauntlet/engine/cycle.py:503",
+      "claim": "`reviewer_mutation: commit` records reviewer edits in git but never gives the mutation diff to triage, and the confirm diff later mixes reviewer and fixer changes without attribution.",
+      "evidence": "FR-9.6 says the commit policy records reviewer-applied changes so triage can evaluate them like any proposed change. The implementation commits the dirty worktree as `PN.rX` and returns no synthetic finding or mutation diff; `_triage()` receives only the original structured findings. Confirm then diffs the original `handoff` to `fix_sha`, so reviewer edits ride along with the fixer diff while the prompt contains only a plain combined diff, not the reviewer-attributed commit boundary.",
+      "suggested_fix": "For commit policy, add a synthetic mutation finding containing the status/diff or pass an explicit mutation section to triage. For confirm, either diff only the fixer commit or include commit metadata separating `PN.rX` reviewer changes from `PN.x` fixer changes."
+    },
+    {
+      "id": "F-006",
+      "severity": "major",
+      "category": "correctness",
+      "location": "src/gauntlet/engine/cycle.py:392; src/gauntlet/engine/gitops.py:194",
+      "claim": "`reviewer_mutation: revert` can leave reviewer-created real run-root files behind because cleanup excludes the entire run root instead of the live bookkeeping paths.",
+      "evidence": "The dirty check and backup use `ctx.excludes`, which narrowly excludes only the live run dir and active pointer. The revert path then calls `clean_untracked(..., exclude=[ctx.config.run_root])`, sparing all of `runs/`. A reviewer-created untracked file under `runs/<slug>/` but outside the live run dir is detected as a mutation, backed up, then not removed; the cycle continues without rechecking cleanliness, so the file can dirty the handoff or be swept into a later builder commit.",
+      "suggested_fix": "Use the same narrow `ctx.excludes` policy for post-revert cleanup, or explicitly preserve only the live bookkeeping paths that must survive. Recheck `git status` after revert and fail/park if any non-bookkeeping dirt remains."
+    },
+    {
+      "id": "F-007",
+      "severity": "major",
+      "category": "spec-gap",
+      "location": "src/gauntlet/engine/cycle.py:299; src/gauntlet/engine/steptypes.py:122; src/gauntlet/engine/orchestrator.py:237; src/gauntlet/logging/transcript.py:67",
+      "claim": "FR-4 transcripts lose failed agent attempts and malformed-output attempts, so `events.jsonl` is not lossless for the run.",
+      "evidence": "FR-4.2 requires every message from every agent, with `events.jsonl` as the lossless record. `StepLogger.log_result()` writes raw events only for a successful `AgentResult`. `_run_sub()` catches `MalformedOutputError` but records only partial usage, not `partial.raw_events`; `agent_task` logs only after `adapter.run()` returns; `AgentFailedError` and other adapter errors fall into the orchestrator's generic handler with no transcript write. A reviewer who fails schema validation after tool use can therefore leave no event log for that attempt.",
+      "suggested_fix": "On every adapter exception carrying a partial result, write a failure transcript/events file before retrying or failing. For retries, store attempts separately or append with attempt metadata so both transcript.md and events.jsonl preserve all raw events."
+    },
+    {
+      "id": "F-008",
+      "severity": "minor",
+      "category": "spec-gap",
+      "location": "schemas/triage.json:14; prompts/triage.md:61",
+      "claim": "The triage schema and prompt examples drift from the strict structured-output contract P4 says it is pinning.",
+      "evidence": "BOOTSTRAP-NOTES #20 says schemas intended for native structured output must require every property, with optional values represented as required-but-nullable. `schemas/triage.json` declares a root `summary` property but does not include it in `required`. The few-shot verdict examples in `prompts/triage.md` also omit `target_artifact`, even though the per-verdict schema requires it. That mismatch invites unnecessary schema retries and undercuts the rubric-first strict-JSON prompt required by FR-3.4.",
+      "suggested_fix": "Either remove the unused root `summary` property or make it required, and update every triage few-shot example to include `target_artifact: null` so examples conform to the actual verdict schema."
+    }
+  ],
+  "open_questions": [],
+  "summary": "The most serious failures are in the cycle's closure conditions: confirm omissions and deferred blocking/upstream findings can mark a round done without actually resolving or escalating the issue. Mutation handling and transcript logging also have fail-path holes, which matters because P4 is supposed to be the defensive primitive for later phases. The tests cover happy-path convergence and some mutation policies, but they miss adversarial confirm cardinality, non-blocking confirm regressions, mutation plus malformed output, and failure-attempt transcript fidelity."
+}

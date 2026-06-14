@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/findings.json",
+  "title": "Reviewer findings (PRD §7, FR-5.2)",
+  "description": "Structured output of an adversarial review step. The `findings` array is normative per PRD §7. `open_questions` and `summary` are P4 schema additions (BOOTSTRAP-NOTES #5): reviewers naturally emit questions that are not claims, and forcing them through the verdict enum is wrong — they get their own slot and the triager handles them first-class. The PRD §7 excerpt itself is unchanged. Strict-mode note (pinned, codex 0.139.0): native structured output requires EVERY property in `required`, so §7-optional fields are spelled required-but-nullable; `suggested_fix: null` means 'none offered'.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings", "open_questions", "summary"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "location", "claim", "evidence", "suggested_fix"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable finding ID, e.g. F-001; referenced by triage and confirm verdicts. Engine-synthesized findings (e.g. a reviewer-mutation record) carry suffixed IDs like F-R1-MUTATION."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "correctness",
+              "spec-gap",
+              "security",
+              "performance",
+              "principle-violation",
+              "style"
+            ]
+          },
+          "location": {
+            "type": "string",
+            "description": "File and line/section reference."
+          },
+          "claim": {
+            "type": "string",
+            "description": "What is wrong."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Why the reviewer believes it."
+          },
+          "suggested_fix": {
+            "type": ["string", "null"],
+            "description": "Optional per §7 — null when the reviewer offers none."
+          }
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "description": "Questions, not claims (BOOTSTRAP-NOTES #5). Triage treats each as data and may convert one into a finding.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question"],
+        "properties": {
+          "id": {"type": "string", "description": "e.g. OQ-1"},
+          "question": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "string"}
+  }
+}

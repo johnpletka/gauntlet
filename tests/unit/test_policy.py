@@ -130,6 +130,17 @@ def test_ask_categories(engine, cmd, category):
     assert decision.risk_category == category
 
 
+@pytest.mark.parametrize("cmd", ["env", "printenv", "printenv OPENAI_API_KEY"])
+def test_env_dump_not_terminally_allowed(engine, cmd):
+    # review: bare `env`/`printenv` dumps every var (API keys, judge token) into
+    # agent context. It must NOT fast-path allow — it escalates to the LLM
+    # classifier (None) instead, fail closed.
+    decision = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert decision is None or decision.decision != "allow", (
+        f"{cmd} wrongly fast-path allowed (leaks secrets)"
+    )
+
+
 def test_unmatched_returns_none(engine):
     # an exotic command no rule covers -> escalate to LLM (None)
     decision = engine.evaluate(
@@ -275,6 +286,32 @@ def test_write_inside_repo_not_denied(engine):
     # not denied by write-outside-repo; may be None (no rule) — the point is
     # it is not a deny
     assert decision is None or decision.decision != "deny"
+
+
+def test_edit_content_mentioning_outside_path_not_denied(engine):
+    # BOOTSTRAP-NOTES #32: editing an IN-repo file whose content (old/new
+    # string) mentions an absolute path outside the repo must NOT be judged as
+    # a write to that path. The target is file_path; content is content.
+    inside = REPO_ROOT / "src" / "gauntlet" / "engine" / "orchestrator.py"
+    decision = engine.evaluate(
+        "Edit",
+        {
+            "file_path": str(inside),
+            "old_string": "backup = '/tmp/old'  # path token in content",
+            "new_string": "backup = '/etc/secrets/key'  # still just content",
+        },
+        repo_root=REPO_ROOT,
+    )
+    assert decision is None or decision.matched_rule != "write-outside-repo"
+
+
+def test_bash_path_token_still_harvested(engine):
+    # The harvest must still apply to real shell commands: a path TOKEN in a
+    # Bash command (here a credential read outside the repo) is still caught.
+    decision = engine.evaluate(
+        "Bash", {"command": "cat ~/.ssh/id_rsa"}, repo_root=REPO_ROOT
+    )
+    assert decision is not None and decision.decision == "deny"
 
 
 def test_relative_dotdot_escape_denied(engine, tmp_path):

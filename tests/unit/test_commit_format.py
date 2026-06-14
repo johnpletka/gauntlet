@@ -44,3 +44,25 @@ def test_header_prefix_extraction():
     assert header_prefix("P3.1: x\n\ny") == "P3.1"
     assert header_prefix("P3.r2: x\n\ny") == "P3.r2"
     assert header_prefix("nope") is None
+
+
+# --- PRD/PLAN stage labels (FR-10.4 resolution, BOOTSTRAP-NOTES #28) ----------
+def test_accepts_document_cycle_stage_labels():
+    for header in ("PRD: Tighten the problem statement",
+                   "PRD.1: Address review — close 3 findings",
+                   "PLAN.2: Address review — rescope P6",
+                   "PLAN.r1: Reviewer-applied changes — 1 path(s)"):
+        assert validate_commit_message(header + "\n\nbody.") is None, header
+
+
+def test_stage_label_prefix_extraction():
+    assert header_prefix("PRD.1: x\n\ny") == "PRD.1"
+    assert header_prefix("PLAN.r1: x\n\ny") == "PLAN.r1"
+    assert header_prefix("PRD: x\n\ny") == "PRD"
+
+
+def test_rejects_arbitrary_word_prefixes():
+    # The amendment admits exactly PRD/PLAN, not free-text stage names.
+    for header in ("DOCS: update readme", "PRDX.1: sneaky", "PLANB: nope",
+                   "prd.1: lowercase"):
+        assert validate_commit_message(header + "\n\nbody.") is not None, header

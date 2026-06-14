@@ -44,18 +44,25 @@ def validate_pipeline(
 ) -> ValidationReport:
     report = ValidationReport()
     available: set[str] = set(seeds)
-    all_ids = {step.id for step in pipeline.all_steps()}
     for stage in pipeline.stages:
+        stage_ids = {step.id for step in stage.steps}
         for step in stage.steps:
             _validate_step(step, config, available, report)
-            if step.on_fail and step.on_fail.route_to not in all_ids:
+            # on_fail routing is stage-local: the runtime jumps within the
+            # current stage's step list, so a cross-stage target would validate
+            # then crash at runtime (review F-005). Reject it at load.
+            if step.on_fail and step.on_fail.route_to not in stage_ids:
                 report.errors.append(
-                    f"step {step.id!r} on_fail routes to unknown step "
-                    f"{step.on_fail.route_to!r}"
+                    f"step {step.id!r} on_fail routes to {step.on_fail.route_to!r}, "
+                    "which is not a step in the same stage (cross-stage routing "
+                    "is unsupported, FR-5.4 / review F-005)"
                 )
             output = step.get("output")
             if output:
                 available.add(output)
+            if step.type == "adversarial_cycle":
+                # the cycle registers its round outputs as named artifacts
+                available.update({"findings.json", "triage.json", "confirm.json"})
     if report.errors:
         raise PipelineValidationError(report.errors)
     return report
@@ -71,6 +78,16 @@ def _validate_step(
         report.errors.append(str(exc))
         return
 
+    # 1b. `max_turns` is unenforceable on the pinned CLIs (claude 2.1.172 has no
+    # --max-turns; codex exec has no turn cap) — reject it rather than silently
+    # ignore a claimed guard (review F-006). timeout_s + budget_usd are the
+    # working per-step halts (FR-3.3).
+    if step.max_turns is not None:
+        report.errors.append(
+            f"step {step.id!r} sets max_turns, but no installed adapter can honor "
+            "it; use timeout_s / budget_usd (FR-3.3 / review F-006)"
+        )
+
     # 2. dangling artifact dataflow (FR-5.3)
     for name in (step.get("inputs", []) or []):
         if name not in available:
@@ -85,6 +102,40 @@ def _validate_step(
             "point (dangling reference, FR-5.3)"
         )
 
+    # 2b. adversarial_cycle role bindings (FR-5.2): the three core roles are
+    # required, and capability checks are role-aware — the FIXER writes the
+    # repo (FR-2.3); the REVIEWER is intended read-only (FR-9.6), so a
+    # repo-write check on it would be exactly backwards.
+    if step.type == "adversarial_cycle":
+        for role in ("reviewer", "triager", "fixer"):
+            if not step.get(role):
+                report.errors.append(
+                    f"step {step.id!r} (adversarial_cycle) is missing required "
+                    f"role {role!r} (FR-5.2)"
+                )
+        fixer = step.get("fixer")
+        if fixer and fixer in config.agents:
+            if not config.profile(fixer).capabilities().repo_write:
+                report.errors.append(
+                    f"step {step.id!r} fixer {fixer!r} cannot write the repo "
+                    "(FR-2.3): fix rounds edit files"
+                )
+        if step.get("commit_each_fix_round") is False:
+            report.errors.append(
+                f"step {step.id!r} sets commit_each_fix_round=false, which "
+                "breaks the clean-handoff invariant (FR-9.3/9.4); unsupported"
+            )
+
+    # 2c. retrospective role bindings (FR-6.2): at least one self-critiquing
+    # agent is required; the proposer is optional (no proposer → self-critique
+    # only, generation skipped and recorded).
+    if step.type == "retrospective":
+        if not (step.get("agents") or []):
+            report.errors.append(
+                f"step {step.id!r} (retrospective) needs a non-empty `agents:` "
+                "list to self-critique (FR-6.2)"
+            )
+
     # 3. agent profile resolution + capabilities (FR-2.3) + banned flags (§8)
     agent_refs = _agent_refs(step, spec.needs_agent)
     for ref in agent_refs:
@@ -94,6 +145,11 @@ def _validate_step(
             )
             continue
         profile = config.profile(ref)
+        if profile.max_turns is not None:
+            report.errors.append(
+                f"agent profile {ref!r} sets max_turns, unenforceable on the "
+                "pinned CLIs; use step_timeout_s / budget_usd (review F-006)"
+            )
         caps = profile.capabilities()
         if spec.step_requires_repo_write(step) and not caps.repo_write:
             report.errors.append(
@@ -128,10 +184,15 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     refs: list[str] = []
     if step.agent:
         refs.append(step.agent)
-    for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer"):
+    for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer",
+                "escalation_agent", "proposer"):
         ref = step.get(key)
         if ref:
             refs.append(ref)
+    # The retrospective step fans out over a list of self-critiquing agents
+    # (FR-6.2); each must resolve to a profile like any other agent reference.
+    for ref in step.get("agents", []) or []:
+        refs.append(ref)
     return refs
 
 

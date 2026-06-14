@@ -73,6 +73,11 @@ class StepRecord(BaseModel):
     notes: str | None = None
     # foreach binding key, when this record is one iteration of a fan-out step
     iteration: str | None = None
+    # Step-emitted structured outcome counts for `gauntlet report --trend`
+    # (FR-6.6): an adversarial_cycle records rounds, finding/verdict/confirm
+    # tallies here so trend math reads the manifest, never the log dirs (the
+    # plan's P7 test strategy is "trend-metric math from fixture manifests").
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CommitRecord(BaseModel):
@@ -92,9 +97,19 @@ class Manifest(BaseModel):
     prompt_hashes: dict[str, str] = Field(default_factory=dict)
     status: str = RUN_RUNNING
     current_step: str | None = None
+    # Non-fatal anomalies surfaced rather than swallowed (data over inference) —
+    # e.g. a required final-gate artifact (FR-9.8 PR.md) that could not be
+    # rendered. Recorded so a completed run never silently hides a missing
+    # deliverable (review F-005).
+    warnings: list[str] = Field(default_factory=list)
     steps: list[StepRecord] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
     totals: UsageTotals = Field(default_factory=UsageTotals)
+    # Per-agent-profile usage (FR-3.2): `gauntlet report` needs the spend split
+    # by profile, not just by step — a single adversarial_cycle step bills the
+    # reviewer, triager, fixer, and escalation profiles, so step-level totals
+    # alone cannot answer "is triage < 5% of run cost?" (FR-3 acceptance).
+    agent_usage: dict[str, UsageTotals] = Field(default_factory=dict)
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

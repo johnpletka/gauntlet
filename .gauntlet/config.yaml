@@ -22,22 +22,35 @@ interrupted_step: park
 agents:
   builder:
     adapter: claude-code
-    model: claude-opus-latest
+    # Short alias form — the only spelling claude 2.1.172 resolves (pinned;
+    # `claude-opus-latest` 404s, caught live at P5 start, notes #24).
+    model: opus
     permission_mode: acceptEdits
     allowed_tools: [Bash, Read, Write, Edit, Grep, Glob]
     # claude loads the repo's PreToolUse hook only under project setting sources
     # (pins.yaml); the engine-managed judge cannot gate the builder without it.
     base_flags: ["--setting-sources", "project"]
+    # A bootstrap implement step is a long-running build; the adapter's 600s
+    # default would halt it mid-phase (FR-3.3 applies, just with a realistic
+    # ceiling — notes #25).
+    step_timeout_s: 5400
   reviewer:
     adapter: codex
     model: gpt-5.5
     sandbox: read-only        # pure review steps are read-only (FR-9.6)
+  # Cheap-tier models verified live on this machine (P1/P4 contract runs; only
+  # an OpenAI key is present and `claude-haiku-latest` does not resolve via
+  # LiteLLM — see pins.yaml). FR-3.1 tiering: mini for classification, full
+  # model for severity-aware triage escalation (P4, review F-009).
   triage:
     adapter: api
-    model: claude-haiku-latest
+    model: gpt-5-mini
+  escalation:
+    adapter: api
+    model: gpt-5
   judge_llm:
     adapter: api
-    model: claude-haiku-latest
+    model: gpt-5-mini
 
 # Per-agent commit identities (FR-9.7) so git log distinguishes who authored what.
 identities:

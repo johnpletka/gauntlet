@@ -244,3 +244,432 @@ process, and what it suggests for Gauntlet's design.
     agent profile expected to write has either a reachable `judge_llm` or
     interactive mode, and warn if a claude builder profile lacks project setting
     sources — both are silent live-gating failures otherwise.
+
+## 2026-06-11 — P4 implementation (adversarial_cycle + logger + triage corpus)
+
+17. **The handoff said `gauntlet/bootstrap`; the repo's history lives on
+    `main`.** At P4 session start the branch `gauntlet/bootstrap` did not
+    exist — every P1–P3 commit had landed directly on `main` (4 ahead of
+    origin/main), contradicting both CLAUDE.md §3 ("never commit directly on
+    the base branch") and the continuation prompt's recorded state. Created
+    `gauntlet/bootstrap` at the inherited HEAD (`080ade7`) and continued
+    there; the pre-existing main commits are history, not rewritten (no
+    force-push rule). *Design feedback:* FR-9.1's "creates (or resumes on) a
+    dedicated branch" is the engine-owned guarantee that prevents exactly
+    this manual-process drift; a `doctor`/session-start check could assert
+    "not on the base branch" before any bootstrap work.
+
+18. **P4's own commits are manual `git` — the expected switchover gap.**
+    Switchover #1 covers branch/commit/manifest mechanics "where a command
+    exists"; there is no standalone `gauntlet commit`, and P4 builds the very
+    cycle that would drive itself. Recorded per the plan's "record any gap
+    that forced you to fall back to manual." Switchover #2 lands at the END
+    of P4: `pipelines/bootstrap.yaml` + `runs/gauntlet-bootstrap/prd.md` +
+    prompt stubs now express P5–P7, and from P5 onward manual process
+    execution is a bug. *Design feedback:* a thin `gauntlet commit
+    --phase PN` (format-validate + identity + manifest record, no pipeline
+    needed) would close the last manual surface for future bootstraps.
+
+19. **The configured cheap model was unrunnable on this machine — caught by
+    the P4 accuracy harness, fixed as config.** `.gauntlet/config.yaml` had
+    `triage: claude-haiku-latest`, but only an OpenAI key is present in the
+    environment and LiteLLM does not resolve that alias at all. Switched the
+    triage/judge_llm profiles to `gpt-5-mini` (the cheap model P1's contract
+    suite verified) and added an `escalation: gpt-5` profile for P4's
+    severity-aware escalation (review F-009); both probed live before use and
+    pinned. *Design feedback:* `doctor` (P6) must validate that every `api`
+    profile's model actually resolves against the present credentials —
+    a config that parses but cannot run is a silent run-time failure.
+
+20. **codex `--output-schema` enforces OpenAI strict-mode schema rules —
+    "optional" must be spelled required-but-nullable.** The first live review
+    call failed with HTTP 400: `'required' is required ... including every
+    key in properties`. The §7 excerpt marks `suggested_fix` optional; the
+    normative `schemas/findings.json` expresses that as required +
+    `["string","null"]` (the same spelling the hand-built P1–P3 review
+    schemas already used — this is why they worked). Also dropped `pattern`
+    constraints to stay inside the strict-mode subset. Verified end-to-end
+    after the fix (live probe + the P4 cycle contract test) and pinned.
+    *Design feedback:* schemas intended for native structured output must be
+    authored in the strict subset from the start; a future `doctor` check or
+    schema lint could enforce it.
+
+21. **Triage-accuracy result (P4 assumption test): PASS — but the corpus
+    verdict-skew is real and recorded.** `gpt-5-mini` over the 36-finding
+    hand-labeled corpus: 94.4% verdict agreement, blocking row 9/9, zero
+    blocking→reject misses (escalated or otherwise); report with per-severity
+    confusion matrices at `runs/gauntlet-bootstrap/manual/
+    p4-triage-accuracy.md`. Caveat recorded in the report: 34/36 labels are
+    `legitimate` because the bootstrap's reviewers were good — a
+    constant-`legitimate` predictor scores ~94%, so the aggregate gate is
+    weak on this data and the operative checks are the blocking-miss
+    criterion and the matrix (review F-009). *Design feedback:* FR-6.5's
+    human-corrected triage cases are the designed source of non-legitimate
+    examples; until those accumulate, treat aggregate agreement as a smoke
+    signal, not a quality proof.
+
+22. **Round artifacts are run bookkeeping, not commit payload (resolves the
+    #13 question for the cycle).** findings/triage/confirm JSON are written
+    under `run_dir/artifacts/` (excluded from engine git ops) with lossless
+    per-sub-step copies under `steps/<id>/rN-*/`. Writing them into the
+    tracked artifact root would have dirtied the tree between the fix commit
+    and the next round's handoff — the confirm pass writes AFTER the commit —
+    breaking FR-9.3 inside the cycle itself. Tracked commits carry the work;
+    the durable audit trail is the run dir, committed deliberately (FR-4.5).
+
+23. **Manual review records bloat the FR-9.5 confirm range — engine design
+    already avoids it.** The P4 manual confirm's `<handoff>..<fix>` diff
+    initially weighed 520KB because the tracked `P4.r1` record commit (433KB
+    of captured review events) sat inside the range; the confirm prompt
+    excluded that bookkeeping explicitly and dropped to 59KB. Engine-driven
+    cycles are immune by construction: round records live under the
+    (excluded, self-ignored) run dir and never enter a range diff. Until the
+    manual process retires (P5, switchover #2), manual confirm prompts must
+    keep scoping their own records out. P4's review round itself worked
+    end-to-end: 8 schema-valid findings first try on the normative schema,
+    8/8 ratified-fixed-confirmed in one round, two real fail-path classes
+    (confirm-by-omission, defer-on-blocking) that the cycle now guards
+    against — the adversarial process catching holes in the adversarial
+    machinery is the dogfood working.
+
+## 2026-06-12 — P5 start (first engine-driven run)
+
+24. **Second unrunnable placeholder model, caught at the first live use —
+    `doctor` must probe every profile's model, not just the api ones.** The
+    first `gauntlet run gauntlet-bootstrap` failed in `p5-implement`:
+    claude 2.1.172 rejects `--model claude-opus-latest` with an in-band 404
+    (is_error=true, exit 1). The short alias `opus` resolves (to
+    claude-opus-4-8) and is now configured + pinned. This is #19's lesson
+    again on the claude side, and the P4.r1 F-007 fix earned its keep on its
+    first day: the failed attempt left `failure.txt` /
+    `transcript-failed.md` / `events-failed.jsonl` under the step dir, so
+    diagnosis was a file-read, not a rerun. *Design feedback:* `doctor`
+    (P6) needs a cheap per-profile model-resolution probe for the CLI
+    adapters too (a tool-less one-token round-trip per configured model),
+    and engine model-rejection errors should surface the adapter's in-band
+    message in the step notes, not just the exit code. Also: the engine
+    derives `gauntlet/gauntlet-bootstrap` from the slug while the manual
+    bootstrap lived on `gauntlet/bootstrap` (#2's two-slug pain, branch
+    edition) — resolved by pre-creating the derived branch name at the tip
+    before the first run; both names point into the same history.
+
+25. **Two operability gaps from the P5 restart, both fixed by config/hand.**
+    (a) The builder profile had no `step_timeout_s`, so the adapter's 600s
+    default would have halted the long p5-implement mid-edit; set to 5400s
+    (FR-3.3 still applies, with a realistic ceiling). (b) After killing the
+    seconds-old resume to apply that fix, the step record sat `running` with
+    a base SHA that predated the `P4.2` config commit — resume would have
+    false-parked on "head moved past base" even though the step never made
+    an edit. Resolved by hand-resetting the record to pending with the
+    reasoning written into its notes (worktree verified clean first).
+    *Design feedback:* the engine needs a guided `gauntlet reset-step
+    <slug> <step>` (clean-tree-checked, reason-recorded) so this manifest
+    surgery has a command path; and the resume disposition could distinguish
+    "head moved but tree clean and matches HEAD" (a human committed
+    something in between) from "tree dirty vs base" (real partial work) —
+    the former is re-runnable with a re-based boundary after confirmation.
+
+26. **The judge's LLM rung was non-functional with gpt-5 models — every
+    escalated tool call failed closed, and the first live builder correctly
+    refused to work blind.** `build_core` passed `temperature=0` (a P2-era
+    determinism choice); gpt-5-family models reject any non-default
+    temperature, litellm raised UnsupportedParamsError, and the classifier
+    rung denied EVERYTHING the policy fast-path didn't allow — including
+    `Read` of the plan. The builder's response was the process working: it
+    made zero changes, wrote a precise operational-halt report naming the
+    exact litellm error, and asked for a human fix (the engine still
+    recorded the step `done` because the adapter exited 0 — see design
+    feedback below). Fixes, all live-verified: drop temperature (rubric
+    provides the determinism), add a `reasoning_effort` passthrough to
+    ApiAdapter with the judge pinned to `minimal` (2.3-3.1 s/verdict AND
+    more rubric-faithful than `low`, which allowed an out-of-repo write in
+    the probe; default effort blew the 5 s budget entirely), and timeout
+    5→6.5 s for cold-start headroom (first call measured 4.9 s). *Design
+    feedback:* (a) P2's live red-team suite ran the classifier rung against
+    a DIFFERENT provider family than the config later pinned — judge model
+    changes must re-run the classifier contract test; (b) `agent_task`
+    completion should not be inferred from exit-code alone — the builder's
+    own PHASE COMPLETE / halt-report convention exists precisely so the
+    engine can distinguish "done" from "stopped deliberately" (candidate
+    for the P5+ standard pipeline prompts + a completion-signal check).
+    The gap bit AGAIN the same day: the builder's FR-10.4 upstream-conflict
+    halt (#28) was also recorded `done`, and the run burned a tests+commit
+    step rediscovering that nothing had been built.
+
+27. **`gauntlet run` does not refuse while a run is already active — a
+    second invocation silently creates a competing run.** Asked "can I run
+    `gauntlet run` again?" mid-flight, the honest answer was no: `start()`
+    unconditionally creates a fresh `run-<timestamp>/`, repoints
+    `active-run.txt` at it, and would spawn a second builder against the
+    same worktree the live run's builder is editing — racing agents on one
+    tree, and the first run's bookkeeping orphaned with no pointer back.
+    Nothing was harmed (the question was asked, not executed), but the
+    foot-gun is one CLI invocation away. *Design feedback:* `start()` must
+    check the active pointer and refuse when that run's manifest says
+    `running` (or a live process holds it), with "resume or abort first"
+    guidance — and `doctor` should flag an active-run pointer whose run is
+    in a non-terminal state with no corresponding process.
+
+28. **FR-10.4 resolution (ratified by John, 2026-06-12): PRD/plan review
+    cycles carry stage labels — the commit format admits `PRD`/`PLAN`
+    prefixes.** P5's builder halted correctly on a real spec gap: FR-5.1's
+    `standard.yaml` starts with `prd-cycle`/`plan-cycle` (no phase number),
+    but FR-9.2/9.4 define commit headers as phase-numbered and the engine
+    enforced `P<digits>` only — so the normative pipeline failed at its
+    first step, and a PRD/plan fix round had no legal commit label. Options
+    surfaced per the contract; the human ratified extending the format:
+    `PRD:`/`PRD.1:`/`PRD.r1:` (and `PLAN…`) are now valid alongside
+    `P<n>…`, with `prd-cycle`/`plan-cycle` carrying `phase: PRD`/`PLAN`.
+    Rollback semantics are untouched — `--phase N` targets remain numeric;
+    PRD/PLAN commits are simply not rollback boundaries. Recorded here as
+    the FR-10.4 "accepted deviation note": the approved plan/PRD texts are
+    NOT amended (they stay as written; this note + the ratifying gate are
+    the audit trail). *Design feedback:* the PRD's FR-5.1↔FR-9.2
+    interaction is exactly the class of cross-FR contradiction the PRD
+    adversarial-review prompt should hunt for (two normative sections, each
+    individually fine, jointly unsatisfiable).
+
+29. **The judge took the repo boundary from the agent's floating cwd — a
+    deny-loop the moment the builder worked in a scratch directory.**
+    `hook_client` computed `repo_root = payload["cwd"] or GAUNTLET_REPO_ROOT
+    or getcwd()` — cwd FIRST. P5's builder legitimately moves into a
+    toy/scratch project (FR-10.1 toy PRD lives in a separate repo), and
+    every Edit/Read it then made against the *real* checkout resolved as
+    "outside the repository tree": fast-path deny on `write-outside-repo`,
+    and a wrong `repo_root` poisoning the LLM rung's context too. It
+    oscillated — work-from-repo allowed, work-from-toy denied — and on the
+    third P5 attempt tipped into a sustained deny-loop (44+ denials, no
+    progress), so I killed the run. Fix: the run's repo boundary is
+    engine-injected (`GAUNTLET_REPO_ROOT`, set by `ManagedJudge` from the
+    real repo root) and the hook prefers it over cwd; cwd is only the
+    no-engine fallback. The priority was simply backwards. Partial builder
+    work preserved at `refs/gauntlet/backup/p5-*-20260612`; the dead run's
+    steps reset for a clean re-run. *Design feedback:* this is the third
+    distinct "config/wiring parses fine but is wrong against the live
+    environment" failure of P5 (#24 opus alias, #26 judge temperature,
+    now #29 repo-root source) — `doctor` and a pre-run smoke (one gated
+    in-repo edit from a scratch cwd) would have caught all three before a
+    20-minute builder burn. The fail-closed posture made every one of them
+    safe-but-blocking rather than dangerous, exactly as designed.
+
+30. **Cycle convergence policy made explicit (ratified by John, 2026-06-12):
+    severity-gated, regression-scoped — no bikeshedding/oscillation loop.**
+    The P4 cycle physically cannot loop forever (`max_rounds`, default 2, then
+    FR-10.5 escalation), but two things fed oscillation: each round re-ran a
+    FULL adversarial review (round 2 could invent fresh nitpicks), and a P4.r1
+    fix (F-003) made `major` confirm-regressions force another round. John
+    flagged this and chose option A. New behavior (config `cycle_convergence`,
+    default `"blocking"`; `"strict"` restores the P4 original):
+    - **blocking (P0):** the only severity that forces another round; loops to
+      `max_rounds`, then escalates to the human gate. Never silently shipped.
+    - **major (P1):** gets ONE fix attempt; if still open it is *surfaced* at
+      the human gate (recorded in `confirm.json` → `surfaced_for_gate`), not
+      looped on. Kills the "major continuously not addressed" oscillation.
+    - **minor/nit:** one shot in round 1, never loops.
+    - **rounds 2+ are regression-scoped** (`prompts/cycle-rereview.md`): the
+      re-reviewer confirms the carried (blocking) findings and may raise a new
+      finding only for a *blocking regression* — it does not hunt fresh issues.
+    Consistent with FR-10.5 ("satisfied" = no blocking/unresolved), so this is
+    an in-scope refinement recorded here, not a plan/PRD amendment. The
+    bootstrap's own P1–P4 cycles all converged in 1–2 rounds with mostly-
+    legitimate findings, so oscillation was never stress-tested in-house — the
+    policy is anticipatory, for the general-purpose use on other repos (the
+    tool's actual point). *Design feedback:* `report --trend` (P7/FR-6.6)
+    should track findings-per-round and the surfaced-vs-fixed ratio so a
+    reviewer/triager that drifts into nitpicking is visible in the metrics.
+
+31. **#29's hook-env fix didn't take on claude — made the judge SERVICE
+    authoritative for the repo boundary instead.** P5 attempt 4 deny-looped
+    again on in-repo edits despite the P4.7 hook fix being live in the
+    editable source: `GAUNTLET_REPO_ROOT` never reached the
+    `gauntlet-judge-hook` subprocess claude spawns (claude evidently does not
+    propagate the engine-injected env to its PreToolUse hook process). The
+    env-injection approach was the wrong layer. Correct architecture: the
+    repo boundary is a property of the RUN, known by the engine that starts
+    the judge — so `JudgeCore` now holds an authoritative `repo_root`
+    (threaded `ManagedJudge -> gauntlet judge serve --repo-root -> build_core
+    -> JudgeCore`) and uses it for every path check; the request-body
+    repo_root (and thus the agent cwd) is a fallback only, for the dev
+    `judge serve` with no `--repo-root`. The hook-side `GAUNTLET_REPO_ROOT`
+    preference (#29) stays as belt-and-suspenders. Verified live end-to-end:
+    an in-repo Edit from a `/tmp/toy-project` cwd now ALLOWS, while a write
+    to `/etc/passwd` still DENIES via `write-outside-repo`. Also: the judge
+    audit line now logs `repo_root` — the boundary used for the check is
+    diagnosable from the audit alone; had it been there, #29/#31 would have
+    been a one-look diagnosis instead of two burned runs. *Design feedback:*
+    trust/identity context (repo root, run id) belongs in the engine->judge
+    channel, never re-derived from the sandboxed agent's ambient state; a
+    `doctor` smoke that fires one in-repo edit through the managed judge from
+    a foreign cwd would catch any regression here.
+
+32. **Judge denied in-repo edits whose CONTENT mentioned an outside path —
+    the real P5 blocker (builder correctly identified it, then halted).**
+    With the repo boundary finally correct (#31), P5's builder still hit
+    `write-outside-repo` fast-path denials editing in-repo engine files. Root
+    cause: `_candidate_paths` ran the path-token regex over `_command_text`,
+    which for non-Bash tools FLATTENS every string field — including an Edit's
+    `old_string`/`new_string`. So editing a file whose content contains an
+    absolute path (pervasive in a path-handling codebase: `/tmp/...`,
+    `~/.aws/...`, doc examples) made the judge extract that CONTENT path and
+    judge the edit as a write to it. The builder diagnosed it precisely
+    ("policy.py scope-tightening"), refused to work around the safety layer
+    (CLAUDE.md §3), and halted for a human — the right call. Fix: harvest path
+    tokens ONLY from a real shell `command` (Bash), where a token IS an
+    operation target; structured file tools use their explicit path key only.
+    Verified: an in-repo Edit with `/Users/.../.aws/credentials` in
+    old_string no longer fast-path-denies, while a Write to `/etc/evil.txt`
+    via file_path still denies. *Design feedback:* the disguised-halt gap
+    (#26b) bit a THIRD time here — the builder's halt was recorded `done`
+    (exit 0), so the engine marched on to a doomed commit step; a
+    completion-signal contract for `agent_task` is now clearly P5-critical,
+    not nice-to-have.
+
+33. **P4.5's active-run.txt gitignore collided with the engine's exclude
+    pathspec — `git add` errored, failing the commit step.** Once
+    active-run.txt was gitignored (P4.5) AND still named in the engine's
+    `:(exclude)active-run.txt` pathspec, `git add -A` refused ("paths are
+    ignored ... use -f") — git errors when a pathspec explicitly names an
+    ignored path, even an exclude. Fix: stop naming it in the pathspec (gitignore
+    already keeps it out of status/add) and have the ENGINE write a slug-level
+    `.gitignore` (`active-run.txt`) so the pointer is ignored in every repo —
+    including throwaway fixture repos that lack the repo-level rule — not just
+    where `init` shipped the rule. `run_bookkeeping_excludes` now lists only
+    the run-instance dir. Verified in a fresh fixture: `git add` exits 0,
+    active-run.txt stays unstaged, the slug `.gitignore` is the only added
+    bookkeeping. *Design feedback:* engine-owned ignores beat depending on the
+    repo's own `.gitignore`; the run-instance dir already self-ignores, and
+    the pointer now does too at the slug level — symmetric and portable.
+
+34. **P5: `standard.yaml`'s artifact-mode plan cycle has no committed baseline
+    — FR-5.1's exact step sequence collides with FR-9.3.** FR-5.1 wires the
+    plan stage as `plan-author → plan-cycle` with no commit step between them,
+    so the freshly authored `plan.md` is *uncommitted* when control passes to
+    the reviewer. The P4 `adversarial_cycle` (exercised only on already-
+    committed artifacts — every artifact-mode test seeds + commits prd.md
+    first) requires a clean baseline: its round-1 clean-handoff guard would
+    fail, and worse, its post-review mutation check would read the whole
+    uncommitted plan.md as a "reviewer mutation". Resolved *without* deviating
+    from FR-5.1's sequence: the cycle, in artifact mode, commits the artifact
+    as an engine-composed `PLAN:`/`PRD:` baseline (no agent call) **only when
+    the single dirty path is the artifact itself** — a genuinely dirty handoff
+    (anything else uncommitted) still fails FR-9.3. prd.md is already committed
+    by its human author, so prd-cycle is a clean no-op; code_review cycles hand
+    off on the prior phase-commit, so they are too. *Design feedback:* the
+    artifact-mode/code-mode split in the cycle had an unstated precondition
+    (committed artifact) that only surfaced when the first *uncommitted*
+    artifact (an authored plan) actually ran through it — exactly the kind of
+    gap a dogfood end-to-end is meant to find.
+
+35. **P5: `standard`'s first step is a *review*, so the slug `.gitignore` had
+    to self-ignore.** The bootstrap pipeline's first step is a phase commit,
+    which sweeps the engine-written slug `.gitignore` into git before any
+    review. `standard.yaml` opens with `prd-cycle` — a review — so that
+    untracked `.gitignore` would dirty the worktree at the very first handoff
+    and fail FR-9.3. Fix: the slug `.gitignore` now lists itself (mirroring the
+    run-instance dir's `*` self-ignore, notes #33), so the slug-level
+    bookkeeping is invisible to the worktree-state machine in every pipeline
+    shape, commit-first or review-first.
+
+36. **P5: `PR.md` is engine-drafted but must stay out of the engine's own git
+    operations (FR-9.8 ↔ §2.2).** Drafting `runs/<slug>/PR.md` at the final
+    gate left the worktree dirty, which broke the clean-tree invariant for
+    post-run operations (rollback refused on the untracked PR.md). PR.md is
+    added to `run_bookkeeping_excludes`: the engine never auto-commits or
+    pushes it (opening the PR is a human action, §2.2), and clean/rollback
+    checks ignore it — but it stays plainly visible for the human to
+    `git add` deliberately (not gitignored, so no #33 pathspec clash). PR
+    drafting lives in `RunManager` (which owns the slug layout), not the
+    orchestrator, so a bare `adversarial_cycle` driven straight to DONE in a
+    unit test does not spuriously emit a PR.
+
+37. **P5: per-agent-profile cost attribution is needed for the FR-3 acceptance,
+    not just per-step.** `gauntlet report` must answer "is triage/judge/retro
+    < 5% of run cost?" — but a single `adversarial_cycle` step bills the
+    reviewer, triager, fixer, and escalation profiles, so the manifest's
+    per-step totals cannot attribute classification spend. Added
+    `manifest.agent_usage` (per-profile `UsageTotals`), populated from a new
+    `StepResult.usage_by_agent`: `agent_task`/`commit` report their one
+    profile; the cycle threads the agent name through `_run_sub` so the grand
+    total and the per-profile split fall out of one accumulator. Kept separate
+    from `totals`, never double-counted.
+
+38. **P5: the disguised-halt gap (#26b/#32) is closed for `agent_task` —
+    opt-in.** Per #32, an agent that exits 0 may still have *halted* (an
+    FR-10.4 upstream conflict), and exit-code-alone marched the engine on to a
+    doomed commit. `agent_task` now honours an opt-in completion-signal
+    contract: `halt_on:` (a marker that, if present in the final output, parks
+    the run for a human instead of recording `done`) and `require_signal:` (a
+    marker that, if absent, fails closed). Opt-in so document-authoring tasks
+    keep plain exit-code semantics; `standard.yaml`'s `plan-author` and
+    `implement` steps set `halt_on: "UPSTREAM CONFLICT"` (the CLAUDE.md §4
+    builder-conflict signal). Deferred: a positive `PHASE COMPLETE` structured
+    handshake and applying the contract to the live bootstrap implement steps
+    — recorded here rather than scope-crept into P5.
+
+39. **P5 operability: the session's own judge fail-closed-denied a benign
+    prompt-file `Write` mid-implementation (transient LLM-rung error).** While
+    writing `prompts/review-code.md`, the wired PreToolUse judge returned
+    "judge LLM error, failing closed" and blocked the write; an immediate retry
+    of the identical write succeeded. The fast path has no allow rule for
+    ordinary in-repo file writes, so they escalate to the LLM classifier rung,
+    which intermittently errors (timeout/rate) and — correctly — fails closed.
+    For a frontier-model interactive build session this is a real tax: dozens
+    of benign in-repo writes each gamble on the classifier. *Design feedback:*
+    a fast-path allow rule for in-repo writes under the run/repo root (the
+    judge already knows the boundary, notes #31/#32) would convert these from
+    LLM-rung gambles into deterministic sub-150ms allows — a strong FR-6.3
+    retro-proposal candidate from this very run.
+
+## 2026-06-12 — P6 (`init` / `doctor` / rollout packaging)
+
+40. **`init` ships the default assets as bundled package data, not by copying
+    the repo's own root files.** An installed `gauntlet` (via `uv tool install`
+    from a git URL, FR-1.1) has no repo checkout to copy from, so the scaffold
+    set lives under `src/gauntlet/scaffold/` and is bundled into the wheel
+    (verified: 20 files present in the built wheel). The shipped `policy.yaml`,
+    `pipelines/standard.yaml`, `prompts/*`, `schemas/*`, and
+    `.claude/settings.json` are byte-identical copies of the repo's canonical
+    assets; a unit drift-guard (`test_shipped_scaffold_matches_repo_canonical_assets`)
+    fails if they diverge. The scaffold `config.yaml` is *intentionally
+    different* — a clean default per PRD FR-2.1, not the bootstrap's
+    pin-specific config (short `opus` alias, `base_flags`, `step_timeout_s`) —
+    so it is excluded from the drift guard.
+
+41. **The repo-level codex hooks config is written but inert on the pinned
+    build, and its exact schema is unverified.** FR-1.2 requires `init` to write
+    "the repo-level Codex hooks config." Per #10 (ratified sandbox-primary),
+    `codex exec` 0.139.0 never fires PreToolUse hooks, so the file
+    (`.codex/hooks.json`) cannot be exercised to verify codex's expected schema.
+    `init` writes a forward-looking config that mirrors the shared
+    stdin-JSON / exit-2 / `permissionDecision` contract and documents its inert
+    status in-file; `doctor`'s `codex-hook` check reads the firing status from
+    the pin notes and reports "present (inert; sandbox-primary)" as **healthy,
+    not a failure** — failing on a hook the build cannot fire would be exactly
+    backwards. If a future codex build fires exec hooks, the same probe detects
+    it and the schema gets verified then (consistent with the project's
+    pin-verified-not-assumed ethos). Recorded as a known unverified-but-required
+    artifact, not a silent guess.
+
+42. **`doctor` is split into pure checks + injected probes so the "simulated
+    broken environment" tests run offline.** Each check returns a
+    `CheckResult(status, detail, remedy)`; CLI version lookup and the env
+    (for API-key presence) arrive through an injectable `DoctorProbes`. Real
+    invocation builds probes that shell out to `claude --version` /
+    `codex --version` and read `os.environ`; the unit suite injects fakes for
+    missing-CLI / stale-version / missing-key / secret-in-config cases. FR-1.5
+    version skew is a WARN (does not block); genuine blockers (absent CLI,
+    unwired hook, no API key for any configured api profile, credential literal
+    in repo config, unloadable policy/config) are FAILs that exit non-zero.
+    Observed live on this repo: `doctor` correctly WARNs that the installed
+    claude (2.1.177) has drifted from the pin-verified 2.1.172 — the pin file is
+    now one patch release behind the machine; left as-is (the contract suite
+    re-verifies and updates the pin, per #24's lesson, not a P6 edit).
+
+43. **Second-environment install test uses a throwaway `uv venv`, not
+    `uv tool install`.** The plan's ground rule asks before system/global
+    tooling. `uv tool install` writes to the user's global tool dir (machine
+    state); a disposable `uv venv` + `uv pip install <wheel>` is fully contained
+    in a tmp dir and proves the same thing (console scripts on PATH, scaffold
+    bundled, `init`/`doctor` run). The README documents the real
+    `uv tool install git+<url>` path for teammates; the test uses the contained
+    equivalent by default (container/global tooling deferred to human sign-off).

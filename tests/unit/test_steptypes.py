@@ -85,6 +85,96 @@ stages:
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: drafted"
 
 
+class RecordingDrafter:
+    """Captures the draft prompt and reports usage (F-008)."""
+
+    capabilities = FakeAdapter.capabilities
+
+    def __init__(self):
+        self.prompts = []
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+        from gauntlet.adapters.base import Usage
+
+        self.prompts.append(prompt)
+        return AgentResult(
+            text="P1: add new file\n\nbody.",
+            usage=Usage(input_tokens=100, output_tokens=10, cost_usd=0.002),
+            session_id="draft-sess",
+            exit_code=0,
+        )
+
+
+def test_commit_draft_sees_untracked_files_and_accounts_usage(fixture_repo):
+    # F-008: a NEW-file phase must not draft from an empty diff, and the
+    # message-agent's usage must land in the manifest totals.
+    (fixture_repo / "brand_new.py").write_text("print('new')\n")  # untracked
+    drafter = RecordingDrafter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    # the untracked new file is visible to the drafter (status section)
+    assert "brand_new.py" in drafter.prompts[0]
+    # the drafter's cost is accumulated into the run + step totals
+    assert orch.manifest.totals.cost_usd == 0.002
+    assert orch.manifest.record("commit").usage.cost_usd == 0.002
+    assert orch.manifest.record("commit").session_id == "draft-sess"
+
+
+class RedraftUsageAdapter:
+    """Bad draft (with usage) then a good one (with usage) — usage must sum."""
+
+    capabilities = FakeAdapter.capabilities
+
+    def __init__(self):
+        self.n = 0
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+        from gauntlet.adapters.base import Usage
+
+        self.n += 1
+        text = "bad header" if self.n == 1 else "P1: ok\n\nbody."
+        return AgentResult(
+            text=text,
+            usage=Usage(
+                input_tokens=50, output_tokens=5, cached_input_tokens=20, cost_usd=0.001
+            ),
+            session_id="s",
+            exit_code=0,
+        )
+
+
+def test_commit_redraft_usage_is_summed(fixture_repo):
+    # F-008 round 2: a rejected draft attempt's cost is real spend and must be
+    # counted, not overwritten by the accepted attempt.
+    (fixture_repo / "new.py").write_text("x\n")
+    drafter = RedraftUsageAdapter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage, max_redrafts: 2}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    assert drafter.n == 2  # one rejected + one accepted
+    # both attempts counted across every usage field: 2 x each
+    assert abs(orch.manifest.totals.cost_usd - 0.002) < 1e-9
+    assert orch.manifest.record("commit").usage.input_tokens == 100
+    assert orch.manifest.record("commit").usage.cached_input_tokens == 40
+
+
 def test_commit_bad_literal_message_fails(fixture_repo):
     (fixture_repo / "work.py").write_text("code\n")
     text = """

@@ -1,0 +1,46 @@
+{
+  "verdicts": [
+    {
+      "finding_id": "F-001",
+      "verdict": "resolved",
+      "notes": "The diff reconciles confirm verdicts against the prior finding IDs, treats missing accepted findings as unresolved, records unknown IDs, and records duplicate IDs with last verdict winning. That prevents omission or unknown-ID noise from silently closing an accepted blocker."
+    },
+    {
+      "finding_id": "F-002",
+      "verdict": "resolved",
+      "notes": "The new closure guard parks when a legitimate blocking finding is not fixed this round and when a non-rejected verdict carries target_artifact. This blocks the prior false convergence path before the accepted-empty exit."
+    },
+    {
+      "finding_id": "F-003",
+      "verdict": "resolved",
+      "notes": "Confirm new_findings at blocking or major severity now become open_items, so a major diff-scoped regression forces another round while blocking ones remain blockers. Minor and nit findings remain recorded without extending the round, matching the ratified scope."
+    },
+    {
+      "finding_id": "F-004",
+      "verdict": "resolved",
+      "notes": "The review call now installs a mutation guard as after_attempt, and _run_sub invokes it after success, malformed output, and AdapterError paths. That applies the configured mutation policy before any schema retry or propagated failure."
+    },
+    {
+      "finding_id": "F-005",
+      "verdict": "resolved",
+      "notes": "The commit mutation policy now appends a synthetic finding with the mutation status and truncated diff, so triage evaluates the reviewer edit. The confirm prompt also includes the commit list with authors, separating reviewer-attributed and fixer commits in the combined range."
+    },
+    {
+      "finding_id": "F-006",
+      "verdict": "resolved",
+      "notes": "The revert path now cleans untracked files using the same narrow ctx.excludes used for detection and then rechecks cleanliness. It parks on remaining residue, preventing real run-root files outside live bookkeeping from leaking forward."
+    },
+    {
+      "finding_id": "F-007",
+      "verdict": "resolved",
+      "notes": "Failed and malformed sub-agent attempts now persist partial transcript/events files with attempt suffixes when a partial AgentResult is available, and agent_task logs partial failures too. This addresses the loss of raw events on failed attempts without overwriting successful retry logs."
+    },
+    {
+      "finding_id": "F-008",
+      "verdict": "resolved",
+      "notes": "The triage schema no longer declares the unused optional root summary property, and all triage prompt examples now include target_artifact: null. The accuracy artifact was updated alongside the prompt change."
+    }
+  ],
+  "new_findings": [],
+  "summary": "All eight ratified findings are addressed by the diff; no new diff-scoped defects found."
+}
