@@ -56,14 +56,32 @@ amend an artifact that a human has approved (PRD, plan) because a later phase
 found it incomplete. Halt and surface the conflict. Humans ratify; agents
 propose.
 
+**Nothing lands on `main` directly.** Every change — code, docs, prompts,
+config — goes onto a dedicated feature branch (a git worktree is fine) and
+reaches `main` only through a pull request. Never commit, push, or
+fast-forward directly to `main`. No exceptions for "trivial" one-line edits;
+the PR is the audit boundary, not a formality.
+
 ---
 
 ## 3. When you are building Gauntlet (bootstrap / development work)
 
 ### Branch discipline
-All work goes on `gauntlet/bootstrap` (during bootstrap) or a
-`gauntlet/<slug>` branch thereafter. Never push to or commit directly on the
-base branch.
+All work goes on a feature branch — never commit, push, or fast-forward
+directly to `main` (or any other base branch). A git worktree off such a
+branch is fine.
+
+Branch names carry a type prefix so history is machine-classifiable:
+`<type>/<slug>`, where `<type>` is one of `fix`, `feat`, `sec`, `perf`,
+`docs`, `chore`, `test` (e.g. `fix/no-direct-main`, `feat/judge-policy`).
+Automated `gauntlet run` pipelines keep their spec'd `gauntlet/<slug>`
+branches (FR-9.1); the type-prefix convention governs manual development on
+this repo.
+
+Every branch lands through a pull request: open a PR against the base branch,
+let review/CI run, and merge through the PR. `main` only ever advances by
+merging a PR — never by a direct push. This holds for every change, however
+small.
 
 ### Phase discipline
 The implementation plan (`runs/gauntlet/plan.md`) defines phases. Work one
