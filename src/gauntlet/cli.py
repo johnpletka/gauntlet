@@ -81,9 +81,22 @@ def _manager() -> "object":
     return RunManager(Path.cwd())
 
 
+def _default_policy_path() -> Path:
+    """`<asset_root>/policy.yaml` from the repo config (review F-005): a fresh
+    adopter keeps the policy under `.gauntlet/`, so the bare `policy.yaml` default
+    would not load. Falls back to the bare name when no config is present."""
+    from gauntlet.engine.config import RunConfig
+
+    try:
+        asset_root = RunConfig.load(Path.cwd() / ".gauntlet/config.yaml").asset_root
+    except Exception:
+        asset_root = "."
+    return Path.cwd() / asset_root / "policy.yaml"
+
+
 @app.command()
 def new(slug: str) -> None:
-    """Scaffold runs/<slug>/ with a human-authored PRD stub (FR-8.1, FR-10.1)."""
+    """Scaffold the run dir (run_root/<slug>/, default .gauntlet/runs/) with a human-authored PRD stub (FR-8.1, FR-10.1)."""
     path = _manager().new(slug)
     typer.echo(f"scaffolded {path}; author the PRD, then `gauntlet run {slug}`")
 
@@ -101,7 +114,7 @@ def run(
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
-    path = pipeline_file or (Path.cwd() / "pipelines" / f"{pipeline}.yaml")
+    path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
     status = mgr.start(slug, path, use_judge=not no_judge)
     typer.echo(f"run status: {status}")
 
@@ -270,7 +283,8 @@ def rollback(
 @judge_app.command("serve")
 def judge_serve(
     policy: Path = typer.Option(
-        Path("policy.yaml"), help="Path to the fast-path policy file."
+        None, help="Fast-path policy file (default: <asset_root>/policy.yaml from "
+        ".gauntlet/config.yaml, else policy.yaml).",
     ),
     audit: Path = typer.Option(
         None, help="Path to append the judge audit log (judge-audit.jsonl)."
@@ -288,6 +302,8 @@ def judge_serve(
     """Run the localhost judge service (dev command; engine-managed in P3)."""
     from gauntlet.judge.runner import serve
 
+    if policy is None:
+        policy = _default_policy_path()
     serve(
         policy_path=policy,
         audit_path=audit,

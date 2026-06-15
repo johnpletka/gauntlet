@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/proposals.json",
   "title": "Improvement proposals (FR-6.3)",
-  "description": "The cheap-model synthesis output: concrete, path-contained diffs against versioned assets. Each proposal targets a SINGLE allowlisted asset (prompts/, pipelines/, schemas/, policy.yaml) and carries the literal unified diff plus a rationale. The engine re-validates path-containment (review F-001) and `git apply --check`s every diff before any human is asked to approve it (FR-6.4); a proposal never self-applies.",
+  "description": "The cheap-model synthesis output: concrete, path-contained diffs against versioned assets. Each proposal targets a SINGLE allowlisted asset — a prompt/pipeline/schema or the judge policy, by its exact repo-relative path under the repo's asset root — and carries the literal unified diff plus a rationale. The engine re-validates path-containment (review F-001) and `git apply --check`s every diff before any human is asked to approve it (FR-6.4); a proposal never self-applies.",
   "type": "object",
   "additionalProperties": false,
   "required": ["proposals"],
@@ -24,7 +24,7 @@
         },
         "target_path": {
           "type": "string",
-          "description": "Repo-relative path of the single versioned asset this diff edits. Must fall inside the allowlist (prompts/, pipelines/, schemas/, policy.yaml); anything else is rejected at parse time (review F-001)."
+          "description": "Repo-relative path of the single versioned asset this diff edits. Must be the exact repo-relative path of an allowlisted asset as shown to the synthesizer (a prompt/pipeline/schema or the judge policy.yaml, carrying any .gauntlet/ prefix); anything else is rejected at parse time (review F-001)."
         },
         "rationale": {
           "type": "string",

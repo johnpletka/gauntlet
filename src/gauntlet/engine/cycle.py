@@ -999,7 +999,7 @@ def _write_artifact(
 
 
 def _load_schema(ctx: StepContext, ref: str) -> dict:
-    return json.loads((ctx.repo_root / ref).read_text())
+    return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
 
 
 def _verdict_schema(triage_schema: dict) -> dict:
@@ -1015,7 +1015,7 @@ def _verdict_schema(triage_schema: dict) -> dict:
 
 def _template(ctx: StepContext, step: Step, key: str, default_ref: str, builtin: str) -> str:
     ref = step.get(key) or default_ref
-    path = ctx.repo_root / ref
+    path = ctx.repo_root / ctx.config.asset_root / ref
     return path.read_text() if path.exists() else builtin
 
 

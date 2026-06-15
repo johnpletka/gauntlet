@@ -329,8 +329,8 @@ def _check_codex_hook(repo_root: Path, pins: PinFile | None) -> CheckResult:
     return CheckResult("codex-hook", OK, note)
 
 
-def _check_judge(repo_root: Path) -> CheckResult:
-    policy = repo_root / "policy.yaml"
+def _check_judge(repo_root: Path, asset_root: str = ".") -> CheckResult:
+    policy = repo_root / asset_root / "policy.yaml"
     if not policy.exists():
         return CheckResult(
             "judge", FAIL, "policy.yaml missing",
@@ -362,11 +362,11 @@ _AGENT_REF_KEYS = ("agent", "reviewer", "triager", "fixer", "escalation_agent",
                    "message_agent")
 
 
-def _referenced_agents(repo_root: Path) -> set[str] | None:
+def _referenced_agents(repo_root: Path, asset_root: str = ".") -> set[str] | None:
     """Agent profile names the default pipeline references, or None if it cannot
     be loaded (the caller then treats every configured api profile as required —
     fail closed)."""
-    pipeline_path = repo_root / "pipelines" / "standard.yaml"
+    pipeline_path = repo_root / asset_root / "pipelines" / "standard.yaml"
     if not pipeline_path.exists():
         return None
     try:
@@ -443,10 +443,12 @@ def _check_api_keys(
     return CheckResult("api-keys", OK, detail)
 
 
-def _check_repo_secrets(repo_root: Path) -> CheckResult:
+def _check_repo_secrets(repo_root: Path, asset_root: str = ".") -> CheckResult:
     """FR-1.4: no credential literal may live in committed repo config."""
     offenders: list[str] = []
-    for rel in (".gauntlet/config.yaml", "policy.yaml", "pipelines/standard.yaml"):
+    for rel in (".gauntlet/config.yaml",
+                (Path(asset_root) / "policy.yaml").as_posix(),
+                (Path(asset_root) / "pipelines" / "standard.yaml").as_posix()):
         path = repo_root / rel
         if not path.exists():
             continue
@@ -493,23 +495,30 @@ def run_doctor(
         auth = _check_cli_auth(cli, probes)
         if auth is not None:
             results.append(auth)
-    results.append(_check_claude_hook(repo_root, probes))
-    results.append(_check_codex_hook(repo_root, pins))
-    results.append(_check_judge(repo_root))
-    results.append(_check_repo_secrets(repo_root))
-
-    # Config-dependent checks: load it once, and surface a clean FAIL if absent.
+    # Load the run config once up front: its `asset_root` tells the judge /
+    # secrets / pipeline checks where assets live (default "." = repo root). A
+    # missing/unloadable config is itself surfaced as a FAIL below.
     try:
         from gauntlet.engine.config import RunConfig
 
         config = RunConfig.load(repo_root / ".gauntlet" / "config.yaml")
+        config_error: Exception | None = None
     except Exception as exc:
+        config, config_error = None, exc
+    asset_root = config.asset_root if config is not None else "."
+
+    results.append(_check_claude_hook(repo_root, probes))
+    results.append(_check_codex_hook(repo_root, pins))
+    results.append(_check_judge(repo_root, asset_root))
+    results.append(_check_repo_secrets(repo_root, asset_root))
+
+    if config is None:
         results.append(CheckResult(
-            "config", FAIL, f".gauntlet/config.yaml not loadable: {exc}",
+            "config", FAIL, f".gauntlet/config.yaml not loadable: {config_error}",
             remedy="run `gauntlet init` to scaffold a config",
         ))
     else:
-        referenced = _referenced_agents(repo_root)
+        referenced = _referenced_agents(repo_root, asset_root)
         # The engine-managed judge always consumes the `judge_llm` profile when
         # configured, even though no pipeline step names it (FR-7.1) — count it
         # as referenced so its key is required, not treated as unused.

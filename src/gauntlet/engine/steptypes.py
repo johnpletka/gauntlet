@@ -195,7 +195,7 @@ def _completion_signal(step: Step, text: str):
 def _render_prompt(step: Step, ctx: StepContext) -> str:
     template_ref = step.get("prompt")
     if template_ref:
-        template_path = ctx.repo_root / template_ref
+        template_path = ctx.repo_root / ctx.config.asset_root / template_ref
         base = template_path.read_text()
     else:
         base = step.get("prompt_text", "") or ""
@@ -215,7 +215,7 @@ def _load_schema(step: Step, ctx: StepContext) -> dict | None:
     ref = step.get("findings_schema") or step.get("schema")
     if not ref:
         return None
-    return json.loads((ctx.repo_root / ref).read_text())
+    return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
 
 
 # --- commit (FR-9.2/9.7) -----------------------------------------------------
@@ -300,7 +300,7 @@ def _draft_commit_message(step: Step, ctx: StepContext):
     adapter = ctx.build_adapter(agent_name)
     change = _change_context(ctx)
     base_prompt = (
-        (ctx.repo_root / step.get("prompt")).read_text()
+        (ctx.repo_root / ctx.config.asset_root / step.get("prompt")).read_text()
         if step.get("prompt")
         else _DEFAULT_COMMIT_PROMPT
     )

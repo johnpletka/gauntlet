@@ -416,7 +416,7 @@ class RunManager:
         from gauntlet.engine.execution import run_bookkeeping_excludes
 
         timestamp = timestamp or _utc_stamp()
-        changelog = self.repo_root / "prompts" / "CHANGELOG.md"
+        changelog = self.repo_root / self.config.asset_root / "prompts" / "CHANGELOG.md"
         identity = self.config.identity("retro")
         results: list[dict] = []
         for run_dir, proposal in self.list_proposals(slug):
@@ -437,6 +437,7 @@ class RunManager:
                 sha = P.apply_proposal(
                     self.repo_root, proposal, identity=identity,
                     changelog_path=changelog, timestamp=timestamp,
+                    asset_root=self.config.asset_root,
                 )
                 results.append({"proposal": proposal.name, "action": "applied", "sha": sha})
             except P.ProposalError as exc:
@@ -588,7 +589,7 @@ class RunManager:
         if "judge_llm" in self.config.agents:
             judge_model = self.config.agents["judge_llm"].model
         judge = ManagedJudge(
-            policy_path=self.repo_root / "policy.yaml",
+            policy_path=self.repo_root / self.config.asset_root / "policy.yaml",
             audit_path=run_dir / "judge-audit.jsonl",
             run_id=man.run_id,
             judge_model=judge_model,
@@ -698,7 +699,7 @@ class RunManager:
 
         def record(ref: str | None) -> None:
             if ref and ref not in hashes:
-                path = self.repo_root / ref
+                path = self.repo_root / self.config.asset_root / ref
                 if path.exists():
                     hashes[ref] = content_hash(path.read_text())
 

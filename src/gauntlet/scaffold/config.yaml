@@ -11,8 +11,13 @@
 
 base_branch: main
 branch_prefix: "gauntlet/"
-# Single run-root for plan/transcripts/manifests under run_root/<slug>/.
-run_root: runs
+# Adopter layout: consolidate every gauntlet-owned file under .gauntlet/.
+# `asset_root` is where the engine resolves pipelines/prompts/schemas/policy;
+# `run_root` is where run output (manifests/transcripts) lands. Gauntlet's own
+# source repo overrides these (`asset_root: "."`, `run_root: runs`) to keep its
+# assets at the repo root.
+asset_root: .gauntlet
+run_root: .gauntlet/runs
 test_command: "uv run pytest"
 
 # On resume of a step killed mid-edit with a dirty worktree (FR-8.2):

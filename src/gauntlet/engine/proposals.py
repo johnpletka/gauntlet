@@ -42,11 +42,25 @@ _CHANGELOG_ANCHOR = "<!-- gauntlet:changelog -->"
 
 
 # --- path containment (the security control) ---------------------------------
-def path_allowed(path: str) -> bool:
+def _allowlist_for(asset_root: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Concrete ``(prefixes, files)`` allowlist under ``asset_root``.
+
+    The bare ALLOWLIST_* are repo-root-relative; an adopter's assets live under
+    ``asset_root`` (e.g. ``.gauntlet``), so the diff paths — and therefore the
+    allowlist they are checked against — carry that prefix. ``asset_root="."``
+    (the default / Gauntlet's own layout) yields the bare allowlist unchanged.
+    """
+    base = "" if asset_root.strip("/") in ("", ".") else asset_root.strip("/") + "/"
+    return (tuple(base + p for p in ALLOWLIST_PREFIXES),
+            tuple(base + f for f in ALLOWLIST_FILES))
+
+
+def path_allowed(path: str, asset_root: str = ".") -> bool:
     """True iff ``path`` is a repo-relative path inside the asset allowlist.
 
     Absolute paths, ``..`` traversal, and anything outside the allowlist are
     rejected — this is the parse-time containment the trust model relies on.
+    The allowlist is taken under ``asset_root`` (default "." = the repo root).
     """
     p = path.strip()
     if not p or p.startswith("/") or p.startswith("~"):
@@ -54,9 +68,10 @@ def path_allowed(path: str) -> bool:
     parts = p.split("/")
     if ".." in parts or "" in parts[:-1]:
         return False
-    if p in ALLOWLIST_FILES:
+    prefixes, files = _allowlist_for(asset_root)
+    if p in files:
         return True
-    return any(p.startswith(prefix) for prefix in ALLOWLIST_PREFIXES)
+    return any(p.startswith(prefix) for prefix in prefixes)
 
 
 def diff_target_paths(diff: str) -> list[str]:
@@ -89,10 +104,10 @@ def diff_target_paths(diff: str) -> list[str]:
     return paths
 
 
-def path_containment(diff: str) -> tuple[bool, list[str]]:
+def path_containment(diff: str, asset_root: str = ".") -> tuple[bool, list[str]]:
     """``(ok, offending_paths)`` — every touched path must be in the allowlist."""
     targets = diff_target_paths(diff)
-    offending = [p for p in targets if not path_allowed(p)]
+    offending = [p for p in targets if not path_allowed(p, asset_root)]
     return (not offending and bool(targets)), offending
 
 
@@ -195,6 +210,7 @@ def materialize_proposals(
     *,
     source_run: str,
     writer: RedactingWriter,
+    asset_root: str = ".",
 ) -> list[Proposal]:
     """Validate + write the synthesiser's raw proposals as ``pending`` files.
 
@@ -211,7 +227,7 @@ def materialize_proposals(
         slug = _slugify(item.get("slug", ""))
         declared = (item.get("target_path") or "").strip()
         targets = diff_target_paths(diff)
-        valid, reason = _validate_diff(repo_root, diff, declared, targets)
+        valid, reason = _validate_diff(repo_root, diff, declared, targets, asset_root)
         proposal = Proposal(
             number=number,
             slug=slug,
@@ -231,11 +247,11 @@ def materialize_proposals(
 
 
 def _validate_diff(
-    repo_root: Path, diff: str, declared: str, targets: list[str]
+    repo_root: Path, diff: str, declared: str, targets: list[str], asset_root: str = "."
 ) -> tuple[bool, str]:
     if not diff.strip():
         return False, "empty diff"
-    contained, offending = path_containment(diff)
+    contained, offending = path_containment(diff, asset_root)
     if not contained:
         if not targets:
             return False, "diff names no target file (unparseable)"
@@ -253,7 +269,7 @@ def _validate_diff(
             "a proposal must edit exactly one file (proposal contract), but the "
             f"diff touches {len(targets)}: {', '.join(targets)}"
         )
-    if declared and not path_allowed(declared):
+    if declared and not path_allowed(declared, asset_root):
         return False, f"declared target_path {declared!r} is outside the allowlist"
     if declared and declared not in targets:
         return False, (
@@ -288,6 +304,7 @@ def apply_proposal(
     identity: Identity,
     changelog_path: Path,
     timestamp: str,
+    asset_root: str = ".",
 ) -> str:
     """Apply an approved proposal: patch + CHANGELOG append + commit. Returns SHA.
 
@@ -315,7 +332,7 @@ def apply_proposal(
     # the targets from the diff and re-validate (containment + single-file +
     # applies-cleanly), so apply enforces exactly what generation did.
     targets = diff_target_paths(proposal.diff)
-    ok, reason = _validate_diff(repo_root, proposal.diff, "", targets)
+    ok, reason = _validate_diff(repo_root, proposal.diff, "", targets, asset_root)
     if not ok:
         raise ProposalError(
             f"proposal {proposal.name} failed apply-time revalidation: {reason} "

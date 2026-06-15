@@ -98,6 +98,66 @@ def _capture_diff(repo: Path, rel: str, new_content: str) -> str:
     return diff
 
 
+@pytest.fixture
+def adopter_repo(tmp_path: Path) -> Path:
+    """An adopter repo: every gauntlet asset lives under .gauntlet/ (asset_root)."""
+    repo = tmp_path / "adopter"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Fixture")
+    _git(repo, "config", "user.email", "fixture@gauntlet.local")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / ".gauntlet" / "prompts").mkdir(parents=True)
+    (repo / ".gauntlet" / "prompts" / "triage.md").write_text(
+        "rubric line one\nrubric line two\n"
+    )
+    (repo / ".gauntlet" / "policy.yaml").write_text("deny: []\n")
+    (repo / "README.md").write_text("readme\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "seed")
+    _git(repo, "branch", "-M", "main")
+    return repo
+
+
+def test_adopter_layout_proposal_validates_and_applies(adopter_repo: Path):
+    # F-002: with asset_root=.gauntlet, a diff targeting the real on-disk path
+    # (.gauntlet/prompts/triage.md — what the synthesis contract now steers the
+    # model to copy from the asset listing) passes containment, applies, and
+    # commits. Proves the adopter proposal flow end-to-end, not just path checks.
+    good = _capture_diff(adopter_repo, ".gauntlet/prompts/triage.md",
+                         "rubric line one IMPROVED\nrubric line two\n")
+    proposals_dir = adopter_repo / ".gauntlet/runs/demo/run-1/retro/proposals"
+    [proposal] = P.materialize_proposals(
+        adopter_repo, proposals_dir,
+        [{"slug": "improve", "target_path": ".gauntlet/prompts/triage.md",
+          "rationale": "sharpen the rubric", "diff": good}],
+        source_run="run-1", writer=RedactingWriter(), asset_root=".gauntlet",
+    )
+    assert proposal.valid, proposal.invalid_reason
+
+    changelog = adopter_repo / ".gauntlet" / "prompts" / "CHANGELOG.md"
+    P.apply_proposal(adopter_repo, proposal, identity=IDENTITY,
+                     changelog_path=changelog, timestamp="2026-06-14",
+                     asset_root=".gauntlet")
+    assert "IMPROVED" in (adopter_repo / ".gauntlet/prompts/triage.md").read_text()
+    assert "sharpen the rubric" in changelog.read_text()
+
+
+def test_adopter_layout_rejects_bare_root_path(adopter_repo: Path):
+    # The bare `prompts/triage.md` a non-asset_root-aware model might emit is
+    # OUTSIDE the .gauntlet allowlist — rejected before a human ever sees it.
+    diff = ("--- a/prompts/triage.md\n+++ b/prompts/triage.md\n"
+            "@@ -1 +1 @@\n-x\n+y\n")
+    proposals_dir = adopter_repo / ".gauntlet/runs/demo/run-1/retro/proposals"
+    [proposal] = P.materialize_proposals(
+        adopter_repo, proposals_dir,
+        [{"slug": "bare", "target_path": "prompts/triage.md",
+          "rationale": "wrong root", "diff": diff}],
+        source_run="run-1", writer=RedactingWriter(), asset_root=".gauntlet",
+    )
+    assert not proposal.valid and "allowlist" in proposal.invalid_reason
+
+
 # --- parse / render round-trip -----------------------------------------------
 def test_proposal_render_parse_round_trip(tmp_path: Path):
     diff = "--- a/prompts/triage.md\n+++ b/prompts/triage.md\n@@ -1 +1 @@\n-a\n+b\n"
