@@ -36,7 +36,17 @@ HOOK_TIMEOUT_S = 8.0
 
 
 def _emit(decision: str, reason: str) -> int:
-    """Write the permission-decision contract; return the process exit code."""
+    """Write the permission-decision contract; return the process exit code.
+
+    ``decision == "defer"`` emits NOTHING and exits 0: the hook expresses no
+    opinion, so the CLI's own permission handling (allowlist, then prompt if
+    needed) runs unchanged — exactly as if the hook were absent. This is the
+    correct way to stand aside. Emitting ``ask`` instead would FORCE a
+    confirmation prompt on every single tool call, overriding the user's
+    permission settings (the bug this avoids).
+    """
+    if decision == "defer":
+        return 0
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -75,15 +85,18 @@ def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int
     mode = env.get(MODE_ENV_VAR, "unattended")
 
     # Safe-by-default (review F-006): with no judge token configured we are not
-    # running under a gauntlet judge, so defer to the CLI's own permission
-    # handling (ask) rather than denying — a plain session in a repo whose
-    # settings wire this hook must not be bricked. A judge is only treated as
-    # "should be up" when a token is present.
+    # running under a gauntlet judge, so DEFER to the CLI's own permission
+    # handling — emit no decision and let the allowlist/prompt run exactly as if
+    # this hook were absent. A plain session in a repo whose settings wire this
+    # hook must be neither bricked NOR nagged: returning "ask" here forced a
+    # confirmation prompt on EVERY tool call, overriding the user's permission
+    # settings (the bug fixed here). A judge is only treated as "should be up"
+    # when a token is present.
     if not token:
         return (
-            "ask",
+            "defer",
             "no gauntlet judge configured (GAUNTLET_JUDGE_TOKEN unset); "
-            "deferring to normal permission handling",
+            "deferring to the CLI's normal permission handling",
             0,
         )
 

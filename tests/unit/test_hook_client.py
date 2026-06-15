@@ -127,9 +127,10 @@ def test_non_dict_judge_response_fails_closed(monkeypatch, env):
     assert decision == "deny"
 
 
-def test_no_token_defers_to_ask(monkeypatch):
-    # F-006: with no judge token configured, defer to normal handling (ask),
-    # never deny — a plain session must not be bricked. Judge is not consulted.
+def test_no_token_defers_to_normal_handling(monkeypatch):
+    # F-006: with no judge token configured, DEFER to the CLI's normal handling
+    # (emit no decision) — never deny, and never force a prompt. A plain session
+    # in a hook-wired repo must be neither bricked nor nagged. Judge not consulted.
     called = {"v": False}
 
     def fake(url, token, body):
@@ -141,7 +142,7 @@ def test_no_token_defers_to_ask(monkeypatch):
         {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
         env={},  # no GAUNTLET_JUDGE_TOKEN
     )
-    assert decision == "ask"
+    assert decision == "defer"
     assert code == 0
     assert called["v"] is False  # judge not even contacted
 
@@ -161,6 +162,17 @@ def test_emit_allow_exit_0(capsys):
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+def test_emit_defer_writes_nothing_and_exit_0(capsys):
+    # "defer" emits NO permissionDecision, so the CLI's own permission flow runs
+    # unchanged. Emitting anything here (especially "ask") would override the
+    # user's settings and force a prompt on every call — the bug this guards.
+    code = hook_client._emit("defer", "no judge configured")
+    assert code == 0
+    out = capsys.readouterr()
+    assert out.out == ""  # nothing on stdout -> hook expresses no opinion
+    assert out.err == ""
 
 
 def test_main_denies_on_invalid_json(monkeypatch, capsys):
