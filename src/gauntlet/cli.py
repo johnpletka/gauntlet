@@ -101,7 +101,7 @@ def run(
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
-    path = pipeline_file or (Path.cwd() / "pipelines" / f"{pipeline}.yaml")
+    path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
     status = mgr.start(slug, path, use_judge=not no_judge)
     typer.echo(f"run status: {status}")
 

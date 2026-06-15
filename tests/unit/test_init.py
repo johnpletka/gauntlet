@@ -33,21 +33,21 @@ REPO = Path(__file__).resolve().parents[2]
 EXPECTED_ASSETS = {
     ".gauntlet/config.yaml",
     ".gauntlet/pins.yaml",
-    "policy.yaml",
-    "pipelines/standard.yaml",
-    "schemas/findings.json",
-    "schemas/triage.json",
-    "schemas/confirm.json",
-    "prompts/review-document.md",
-    "prompts/review-code.md",
-    "prompts/plan-author.md",
-    "prompts/implement-phase.md",
-    "prompts/commit-message.md",
-    "prompts/cycle-review.md",
-    "prompts/cycle-rereview.md",
-    "prompts/cycle-fix.md",
-    "prompts/cycle-confirm.md",
-    "prompts/triage.md",
+    ".gauntlet/policy.yaml",
+    ".gauntlet/pipelines/standard.yaml",
+    ".gauntlet/schemas/findings.json",
+    ".gauntlet/schemas/triage.json",
+    ".gauntlet/schemas/confirm.json",
+    ".gauntlet/prompts/review-document.md",
+    ".gauntlet/prompts/review-code.md",
+    ".gauntlet/prompts/plan-author.md",
+    ".gauntlet/prompts/implement-phase.md",
+    ".gauntlet/prompts/commit-message.md",
+    ".gauntlet/prompts/cycle-review.md",
+    ".gauntlet/prompts/cycle-rereview.md",
+    ".gauntlet/prompts/cycle-fix.md",
+    ".gauntlet/prompts/cycle-confirm.md",
+    ".gauntlet/prompts/triage.md",
 }
 
 
@@ -67,12 +67,12 @@ def test_init_fresh_repo_creates_full_asset_set(tmp_path):
 def test_scaffolded_config_and_pipeline_validate(tmp_path):
     init_repo(tmp_path)
     config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
-    pipeline, phash = load_pipeline(tmp_path / "pipelines/standard.yaml")
+    pipeline, phash = load_pipeline(tmp_path / ".gauntlet/pipelines/standard.yaml")
     report = validate_pipeline(pipeline, config)
     assert report.ok()
     assert phash.startswith("sha256:")
     # the cycle's default prompt set + referenced schema all landed
-    assert (tmp_path / "schemas/findings.json").exists()
+    assert (tmp_path / ".gauntlet/schemas/findings.json").exists()
 
 
 def test_init_scaffolds_pin_file(tmp_path):
@@ -170,7 +170,7 @@ def test_gitignore_guidance_appended_once(tmp_path):
     init_repo(tmp_path)
     text = (tmp_path / ".gitignore").read_text()
     assert "__pycache__/" in text  # preserved
-    assert "runs/*/active-run.txt" in text
+    assert ".gauntlet/runs/*/active-run.txt" in text
     assert text.count("--- Gauntlet (added by") == 1
     init_repo(tmp_path)
     assert (tmp_path / ".gitignore").read_text().count("--- Gauntlet (added by") == 1
@@ -182,7 +182,7 @@ def test_from_repo_skips_asset_templates_but_wires_hooks(tmp_path):
     actions = {a.path: a.action for a in result.actions}
     # assets are not scaffolded; they are reported missing here (none committed)
     assert actions[".gauntlet/config.yaml"] == MISSING
-    assert actions["policy.yaml"] == MISSING
+    assert actions[".gauntlet/policy.yaml"] == MISSING
     assert result.missing  # surfaced for the operator
     # but the machine-local wiring is still ensured
     assert (tmp_path / ".claude/settings.json").exists()

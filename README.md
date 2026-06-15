@@ -273,8 +273,14 @@ agent tool calls ungated. Don't use it on real work.
 - **`.gauntlet/pins.yaml`** — the CLI versions and exact flags verified by the
   contract suite; `doctor` checks the installed CLIs against it.
 
-Pipelines live in `pipelines/*.yaml`; prompt templates (versioned data, not
-code) in `prompts/`; the judge fast-path allow/deny rules in `policy.yaml`.
+Pipelines, prompt templates (versioned data, not code), structured-output
+schemas, and the judge fast-path `policy.yaml` all live under `.gauntlet/` too
+— `.gauntlet/pipelines/*.yaml`, `.gauntlet/prompts/`, `.gauntlet/schemas/`,
+`.gauntlet/policy.yaml`. The config's `asset_root` (default `.gauntlet` in a
+scaffolded repo) is where the engine resolves them; everything is committable,
+so a teammate who clones the repo gets the identical workflow. (Gauntlet's own
+source repo sets `asset_root: "."` to keep these assets at the repo root as
+first-class source rather than tucked into a dotfile dir.)
 
 To repoint a tier at a different provider, edit the agent profile's `adapter`
 and `model` in `.gauntlet/config.yaml` and set that provider's key in your

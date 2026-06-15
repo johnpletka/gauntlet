@@ -1,6 +1,6 @@
 # PRD: Gauntlet — Adversarial Multi-Agent Development Harness
 
-**Status:** Draft v1.3 (v1.2 + stage progression contract FR-10, human-authored PRD entry contract)
+**Status:** Draft v1.4 (v1.3 + `.gauntlet/` asset consolidation for adopter repos via the `asset_root` config knob, FR-1.2)
 **Author:** John (with Claude)
 **Date:** 2026-06-10
 **Working name:** Gauntlet (every artifact runs the gauntlet of adversarial review before it ships)
@@ -150,7 +150,7 @@ class AgentAdapter(Protocol):
 ### FR-1: Team rollout (Req 1)
 
 - **FR-1.1** Install via `pipx install gauntlet` or `uv tool install gauntlet` from a private index or git URL. Single Python package; no system daemons.
-- **FR-1.2** `gauntlet init` in a repo scaffolds: `.gauntlet/config.yaml`, `pipelines/standard.yaml`, `prompts/` (versioned prompt templates), `policy.yaml` (judge rules), and writes the hook wiring into `.claude/settings.json` and the repo-level Codex hooks config. All of it is committable, so a teammate who clones the repo gets the identical workflow.
+- **FR-1.2** `gauntlet init` in a repo scaffolds, all under `.gauntlet/`: `config.yaml` (carrying `asset_root: .gauntlet`), `pipelines/standard.yaml`, `prompts/` (versioned prompt templates), `schemas/`, and `policy.yaml` (judge rules), plus the hook wiring into `.claude/settings.json` and the repo-level Codex hooks config (those two paths are dictated by the CLIs and necessarily stay outside `.gauntlet/`). All of it is committable, so a teammate who clones the repo gets the identical workflow. The engine resolves every asset path under the config's `asset_root` (default `"."` = the repo root — which is how Gauntlet's *own* source repo keeps its pipelines/prompts/schemas/policy as first-class top-level files); the init-scaffolded `asset_root: .gauntlet` is what consolidates an adopter project's tool files under one dotfile dir, out of the project's source tree.
 - **FR-1.3** `gauntlet doctor` validates the environment: CLIs installed and authenticated (`claude`, `codex`), hook files present and trusted, judge service startable, API keys present for ApiAdapter models. Exit non-zero with actionable messages.
 - **FR-1.4** Per-user secrets (API keys) live in env/keychain, never in repo config. Repo config references models, not credentials.
 - **FR-1.5** Pin behavior: config records minimum tested versions of `claude` and `codex`; `doctor` warns on mismatch (both CLIs change fast; hook semantics have shifted across releases).

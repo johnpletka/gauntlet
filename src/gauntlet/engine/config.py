@@ -97,6 +97,13 @@ class RunConfig(BaseModel):
     # transcripts, and manifests live under run_root/<slug>/. FR-4.1's
     # ".gauntlet/runs" is this same setting; the bootstrap pins it to "runs".
     run_root: str = "runs"
+    # Repo-relative root under which the engine resolves tool ASSETS —
+    # pipelines/, prompts/, schemas/, policy.yaml. Default "." = the repo root
+    # (Gauntlet's own source layout, and backward-compatible: "." collapses in a
+    # path join, so resolution is unchanged). `gauntlet init` scaffolds adopter
+    # repos with `asset_root: .gauntlet` so every gauntlet-owned file lives under
+    # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
+    asset_root: str = "."
     test_command: str = "uv run pytest"
     agents: dict[str, AgentProfile] = Field(default_factory=dict)
     identities: dict[str, Identity] = Field(default_factory=dict)

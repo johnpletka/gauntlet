@@ -263,7 +263,7 @@ def test_secret_literal_in_repo_config_fails(tmp_path):
 
 def test_missing_policy_fails_judge_check(tmp_path):
     repo = _healthy_repo(tmp_path)
-    (repo / "policy.yaml").unlink()
+    (repo / ".gauntlet/policy.yaml").unlink()  # init scaffolds policy under .gauntlet/
     results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
     judge = _by_name(results)["judge"]
     assert judge.status == FAIL

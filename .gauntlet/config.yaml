@@ -10,6 +10,11 @@
 
 base_branch: main
 branch_prefix: "gauntlet/"
+# This is Gauntlet's OWN source repo: its assets (pipelines/, prompts/, schemas/,
+# policy.yaml) live at the repo ROOT as first-class source, not under a dotfile
+# dir. asset_root "." keeps them there — adopters get .gauntlet/ via the
+# init-scaffolded default (`asset_root: .gauntlet`).
+asset_root: "."
 # Single run-root for plan/transcripts/manifests (BOOTSTRAP-NOTES #2 / #13).
 run_root: runs
 test_command: "uv run pytest"

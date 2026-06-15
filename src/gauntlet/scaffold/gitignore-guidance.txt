@@ -4,7 +4,7 @@
 # P2 judge contract-test artifact are ignored.
 #
 # Engine live-run pointers are bookkeeping, never commit payload.
-runs/*/active-run.txt
+.gauntlet/runs/*/active-run.txt
 .gauntlet/test-judge-audit.jsonl
 #
 # OPTIONAL: raw event streams are lossless but heavy. Teams that find them too

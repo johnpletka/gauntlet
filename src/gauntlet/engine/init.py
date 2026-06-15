@@ -6,10 +6,10 @@ it gets the identical workflow:
 * ``.gauntlet/config.yaml`` — agent profiles + identities (FR-2.1).
 * ``.gauntlet/pins.yaml`` — verified CLI versions ``gauntlet doctor`` checks
   installed versions against for drift (FR-1.5).
-* ``pipelines/standard.yaml`` — the default 3-gate pipeline (FR-5.1).
-* ``prompts/`` + ``schemas/`` — the versioned prompt templates and structured
-  output schemas the pipeline references.
-* ``policy.yaml`` — the judge fast-path rules (FR-7.6).
+* ``.gauntlet/pipelines/standard.yaml`` — the default 3-gate pipeline (FR-5.1).
+* ``.gauntlet/prompts/`` + ``.gauntlet/schemas/`` — the versioned prompt
+  templates and structured output schemas the pipeline references.
+* ``.gauntlet/policy.yaml`` — the judge fast-path rules (FR-7.6).
 * hook wiring into ``.claude/settings.json`` and the repo-level ``.codex``
   hooks config (FR-7.3).
 * ``.gitignore`` guidance (FR-4.5).
@@ -50,12 +50,17 @@ _ASSET_FILES = {
     # The pin file doctor checks installed CLI versions against (FR-1.5); a
     # fresh repo cannot validate drift without it (review F-003).
     "pins.yaml": ".gauntlet/pins.yaml",
-    "policy.yaml": "policy.yaml",
+    "policy.yaml": ".gauntlet/policy.yaml",
 }
+# Adopter repos consolidate every gauntlet-owned asset under .gauntlet/ — the
+# scaffolded config sets `asset_root: .gauntlet`, so the engine resolves them
+# there. (Gauntlet's own repo keeps these at the root via the default
+# `asset_root: "."`.) The scaffold source files carry bare, root-relative refs,
+# so they stay byte-identical to the repo's canonical assets regardless.
 _ASSET_DIRS = {
-    "pipelines": "pipelines",
-    "prompts": "prompts",
-    "schemas": "schemas",
+    "pipelines": ".gauntlet/pipelines",
+    "prompts": ".gauntlet/prompts",
+    "schemas": ".gauntlet/schemas",
 }
 
 # Action verbs recorded per touched path.

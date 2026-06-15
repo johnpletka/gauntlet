@@ -100,8 +100,9 @@ def test_init_scaffolds_a_runnable_repo(installed_env, tmp_path):
     # Command 1 of 3 (after install): scaffold the workflow into a fresh repo.
     out = _run(installed_env, "init", cwd=tmp_path)
     assert out.returncode == 0, out.stderr
-    for rel in (".gauntlet/config.yaml", "pipelines/standard.yaml", "policy.yaml",
-                ".claude/settings.json", ".codex/hooks.json", ".gitignore"):
+    for rel in (".gauntlet/config.yaml", ".gauntlet/pipelines/standard.yaml",
+                ".gauntlet/policy.yaml", ".claude/settings.json",
+                ".codex/hooks.json", ".gitignore"):
         assert (tmp_path / rel).exists(), rel
 
     # The scaffolded config + pipeline load and validate with the installed code.
@@ -110,7 +111,7 @@ def test_init_scaffolds_a_runnable_repo(installed_env, tmp_path):
     from gauntlet.engine.validate import validate_pipeline
 
     config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
-    pipeline, _ = load_pipeline(tmp_path / "pipelines/standard.yaml")
+    pipeline, _ = load_pipeline(tmp_path / ".gauntlet/pipelines/standard.yaml")
     assert validate_pipeline(pipeline, config).ok()
 
 
@@ -158,7 +159,7 @@ def test_run_starts_the_default_pipeline(installed_env, tmp_path):
     # A real, human-authored PRD clears the entry contract. The run then starts
     # the default pipeline; force the first agent step to fail fast (no agent CLI
     # on PATH, so no live call / cost) and confirm the orchestrator was reached.
-    (repo / "runs/toy/prd.md").write_text(TOY_PRD)
+    (repo / ".gauntlet/runs/toy/prd.md").write_text(TOY_PRD)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "author toy PRD")
 
@@ -170,7 +171,7 @@ def test_run_starts_the_default_pipeline(installed_env, tmp_path):
     except subprocess.TimeoutExpired:
         pass  # the run started; an agent CLI was reachable and we let it run long
 
-    run_dirs = list((repo / "runs/toy").glob("run-*"))
+    run_dirs = list((repo / ".gauntlet/runs/toy").glob("run-*"))
     assert run_dirs, "no run dir created — the default pipeline never started"
     assert (run_dirs[0] / "pipeline.yaml").exists()
     snapshot = (run_dirs[0] / "pipeline.yaml").read_text()
