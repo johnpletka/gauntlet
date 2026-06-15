@@ -4,10 +4,17 @@
 # 9/9 passed). Written from what the installed CLIs actually do — where
 # observed behavior differs from the PRD/prompt, this file and a
 # BOOTSTRAP-NOTES.md entry win.
-verified_date: "2026-06-10"
+#
+# 2026-06-14: claude CLI re-pinned 2.1.172 -> 2.1.177 after a local
+# auto-update. The integration contract suite was re-run against 2.1.177
+# (test_claude_contract / test_codex_contract / test_cycle_contract /
+# test_pipeline_contract / test_judge_live all green); the flag observations
+# below still hold. The historical "2.1.172" references in the prose notes
+# are left as the original audit record of when each behavior was first seen.
+verified_date: "2026-06-14"
 clis:
   claude:
-    version: "2.1.172"
+    version: "2.1.177"
     verified_flags:
       - flag: "-p --output-format json (prompt via stdin)"
         verified: >-
