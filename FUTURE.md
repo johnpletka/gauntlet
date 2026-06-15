@@ -23,3 +23,17 @@ so a partial fix accepted at a gate is tracked, not forgotten.
   by the pinned-Codex inert-hook note, but the required-wiring aspect is not fully
   met. Follow-up: decide whether Codex hook wiring should be a hard FAIL once the
   Codex hook surface is no longer inert, and tighten the check accordingly.
+
+## From #8 review (`.gauntlet/` asset_root consolidation) — deferred 2026-06-14
+
+- **F-003 [major, deferred] — `init` does not migrate a pre-existing root-layout
+  repo.** `gauntlet init` unconditionally scaffolds asset targets under
+  `.gauntlet/`, but a repo init'd under the previous root layout keeps
+  `asset_root: "."` (its committed config is skipped as idempotent). Plain
+  `init` then creates duplicate, INACTIVE `.gauntlet/` assets alongside the
+  active root ones, and `init --from-repo` reports the active root assets as
+  MISSING. Low real-world impact pre-1.0 (no deployed adopters on the old
+  layout), so deferred rather than blocking the consolidation PR (#8). Follow-up:
+  load an existing config before selecting asset targets and honour its
+  `asset_root`; treat a root→`.gauntlet` migration as an explicit, atomic
+  operation with legacy-layout tests.
