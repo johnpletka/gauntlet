@@ -55,7 +55,10 @@ def installed_env(tmp_path_factory):
 
     build = _uv("build", "--wheel", "--out-dir", str(dist), cwd=REPO)
     assert build.returncode == 0, build.stderr
-    wheels = list(dist.glob("gauntlet-*.whl"))
+    # The dist name is `gauntlet-spec`, so the wheel is `gauntlet_spec-*.whl`
+    # (PEP 503/427 normalises `-`→`_`). Match any gauntlet-prefixed wheel so the
+    # glob survives a future rename to plain `gauntlet`.
+    wheels = list(dist.glob("gauntlet*.whl"))
     assert wheels, "no wheel produced"
 
     venv = base / "venv"
