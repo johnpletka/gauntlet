@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
@@ -126,6 +126,29 @@ class RunConfig(BaseModel):
     # Configurable redaction list (FR-4.4), default-on; the transcript logger
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
+
+    @field_validator("asset_root")
+    @classmethod
+    def _validate_asset_root(cls, v: str) -> str:
+        """Fail closed (PRD §2): asset_root is joined into every pipeline/prompt/
+        schema/policy path, so an absolute value (which discards repo_root), a
+        ``..`` escape, or an empty value would breach the repo boundary. Reject
+        those, and normalise spelling (``./.gauntlet`` → ``.gauntlet``, ``.``
+        stays ``.``) so the on-disk path join and the proposals allowlist agree
+        (review F-006 / Copilot)."""
+        raw = (v or "").strip()
+        if not raw or raw.startswith("/") or raw.startswith("~"):
+            raise ValueError(
+                f"asset_root must be a non-empty, repo-relative path; got {v!r} "
+                "(absolute paths and ~ are rejected — they would escape the repo)"
+            )
+        parts = [p for p in raw.split("/") if p not in ("", ".")]
+        if ".." in parts:
+            raise ValueError(
+                f"asset_root must not contain '..' (it would escape the repo "
+                f"boundary); got {v!r}"
+            )
+        return "/".join(parts) or "."
 
     def profile(self, name: str) -> AgentProfile:
         try:

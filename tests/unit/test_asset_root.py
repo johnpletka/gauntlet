@@ -5,6 +5,9 @@ every resolution site; "." is a no-op in path joins, so it is transparent."""
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from gauntlet.engine import proposals as P
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.init import init_repo
@@ -71,3 +74,16 @@ def test_gauntlet_own_repo_keeps_root_layout():
     assert (REPO / "policy.yaml").exists()
     assert (REPO / "pipelines" / "standard.yaml").exists()
     assert not (REPO / ".gauntlet" / "pipelines").exists()
+
+
+def test_asset_root_validation_and_normalization():
+    # Normalises spelling so the path join and the proposals allowlist agree
+    # (Copilot): "./.gauntlet" and ".gauntlet/" both collapse to ".gauntlet".
+    assert RunConfig(asset_root="./.gauntlet").asset_root == ".gauntlet"
+    assert RunConfig(asset_root=".gauntlet/").asset_root == ".gauntlet"
+    assert RunConfig(asset_root="a/./b").asset_root == "a/b"
+    assert RunConfig(asset_root=".").asset_root == "."
+    # Fail closed (F-006) on anything that could escape the repo boundary.
+    for bad in ("/abs/path", "~/x", "../escape", "a/../../b", ""):
+        with pytest.raises(ValidationError):
+            RunConfig(asset_root=bad)

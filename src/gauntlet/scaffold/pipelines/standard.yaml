@@ -6,9 +6,10 @@
 # `pipelines/bootstrap.yaml` is the minimal switchover-#2 expression of the same
 # loop for Gauntlet's own P5–P7.
 #
-# ENTRY CONTRACT (FR-10.1): Gauntlet does not author PRDs. The human writes
-# runs/<slug>/prd.md and `gauntlet run` begins at adversarial review; the run
-# refuses to start while prd.md is absent or still the scaffolded stub.
+# ENTRY CONTRACT (FR-10.1): Gauntlet does not author PRDs. The human writes the
+# run's prd.md (under the configured run_root — .gauntlet/runs/<slug>/ by
+# default) and `gauntlet run` begins at adversarial review; the run refuses to
+# start while prd.md is absent or still the scaffolded stub.
 #
 # Commit labels (BOOTSTRAP-NOTES #28, ratified 2026-06-12): the PRD and plan
 # review loops are not numbered phases, so their cycles carry `phase: PRD` /

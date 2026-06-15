@@ -195,8 +195,8 @@ From the repository you want Gauntlet to work on:
 ```sh
 gauntlet init        # 1. scaffold config, pipeline, prompts, policy + wire hooks (idempotent)
 gauntlet doctor      # 2. validate CLIs, auth, hook wiring, judge, API keys
-gauntlet new myfeat  # 3a. scaffold runs/myfeat/ with a PRD stub
-#    ...author runs/myfeat/prd.md...
+gauntlet new myfeat  # 3a. scaffold .gauntlet/runs/myfeat/ with a PRD stub
+#    ...author .gauntlet/runs/myfeat/prd.md...
 gauntlet run myfeat  # 3b. start the pipeline
 ```
 
@@ -232,7 +232,7 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
   dirty tree before dying is parked or reset rather than re-run blindly.
 - **Approved artifacts are immutable.** A later phase that finds an approved
   PRD/plan incomplete *halts and surfaces the conflict* rather than amending it.
-- At the final gate a **`PR.md` draft** is written under `runs/<slug>/`
+- At the final gate a **`PR.md` draft** is written under `.gauntlet/runs/<slug>/`
   (it is **not** opened or pushed — that stays a human action).
 - After a run, `gauntlet feedback <slug>` captures your retrospective notes and
   triage corrections to feed the self-improvement loop.
@@ -245,7 +245,7 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
 |---|---|
 | `gauntlet init [--from-repo]` | Scaffold config/pipeline/prompts/policy + wire hooks (idempotent). |
 | `gauntlet doctor` | Validate environment: CLIs, auth, hooks, judge, keys. |
-| `gauntlet new <slug>` | Scaffold `runs/<slug>/` with a PRD stub. |
+| `gauntlet new <slug>` | Scaffold `.gauntlet/runs/<slug>/` with a PRD stub. |
 | `gauntlet run <slug> [--pipeline standard\|bootstrap] [--no-judge]` | Start a run on branch `gauntlet/<slug>`. |
 | `gauntlet status <slug>` | Show run status and each step's state. |
 | `gauntlet approve <slug> [--gate ID] [--notes …]` | Approve a parked gate, continue the run. |
@@ -335,7 +335,7 @@ contract suite, which requires authenticated CLIs and API keys.
   differs from `.gauntlet/pins.yaml`. Re-verify with the integration suite, or
   update the pin file if the new version is intended.
 - **A run parks unexpectedly / a step is `failed`** — `gauntlet status <slug>`
-  shows where; the step's transcript under `runs/<slug>/<run>/steps/` has the
+  shows where; the step's transcript under `.gauntlet/runs/<slug>/<run>/steps/` has the
   detail. `gauntlet resume <slug>` re-enters safely once the cause is cleared.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
