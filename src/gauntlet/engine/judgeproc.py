@@ -121,7 +121,8 @@ class ManagedJudge:
         # the operator's own standalone judge, or an unrelated listener), move to
         # a free ephemeral port rather than colliding and failing startup. The
         # hooks learn the URL from the injected env, so the port need not be fixed.
-        if not self._port_is_free(self.host, self.port):
+        port_free = self._port_is_free(self.host, self.port)
+        if not port_free:
             taken = self.port
             self.port = self._free_port(self.host)
             print(
@@ -129,6 +130,17 @@ class ManagedJudge:
                 f"engine-managed judge on free port {self.port} instead.",
                 file=sys.stderr,
             )
+        elif os.environ.get(TOKEN_ENV_VAR):
+            # No port conflict: adopt the operator's global GAUNTLET_JUDGE_TOKEN
+            # (e.g. exported in ~/.zshenv) instead of minting a fresh per-run
+            # token, so a manually-started judge and external tooling that share
+            # that token agree with the run's judge. We still start our OWN
+            # run-scoped judge (PR #16) — only the token VALUE is reused. On a
+            # port CONFLICT we keep the minted token: the default-port listener
+            # is someone else's judge, and reusing the global token for our
+            # moved-port judge would be misleading. (Trade-off: a long-lived
+            # global token rotates less often than a per-run one.)
+            self.token = os.environ[TOKEN_ENV_VAR]
         child_env = {**os.environ, TOKEN_ENV_VAR: self.token}
         argv = [
             sys.executable,

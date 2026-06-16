@@ -30,6 +30,11 @@ pytestmark = [pytest.mark.integration]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOKEN = "live-judge-test-token"
+# The hook gates ONLY gauntlet-run sessions, marked by GAUNTLET_RUN_ID (the
+# engine injects it for a real run). These tests simulate an in-run agent, so
+# they set it explicitly; without it the hook would (correctly) defer and gate
+# nothing. See gauntlet.judge.hook_client.decide_from_payload.
+RUN_ID = "live-judge-test-run"
 TIMEOUT_S = 300.0
 HOOK_BIN = shutil.which("gauntlet-judge-hook") or str(
     REPO_ROOT / ".venv" / "bin" / "gauntlet-judge-hook"
@@ -130,6 +135,7 @@ def _run_hook(command, judge, *, tool="Bash", mode="unattended", cwd=None):
         GAUNTLET_JUDGE_TOKEN=TOKEN,
         GAUNTLET_JUDGE_URL=judge["url"],
         GAUNTLET_JUDGE_MODE=mode,
+        GAUNTLET_RUN_ID=RUN_ID,
     )
     proc = subprocess.run(
         [HOOK_BIN], input=json.dumps(payload), env=env,
@@ -221,6 +227,7 @@ def _run_claude(repo, prompt, judge, *, mode="unattended"):
     env = dict(
         os.environ, GAUNTLET_JUDGE_TOKEN=TOKEN,
         GAUNTLET_JUDGE_URL=judge["url"], GAUNTLET_JUDGE_MODE=mode,
+        GAUNTLET_RUN_ID=RUN_ID,
     )
     return subprocess.run(
         ["claude", "-p", "--model", "haiku", "--allowedTools", "Bash",
@@ -294,6 +301,7 @@ def test_interactive_degraded_mode_does_not_deadlock(claude_repo):
     env = dict(
         os.environ, GAUNTLET_JUDGE_TOKEN=TOKEN,
         GAUNTLET_JUDGE_URL="http://127.0.0.1:1", GAUNTLET_JUDGE_MODE="interactive",
+        GAUNTLET_RUN_ID=RUN_ID,
     )
     proc = subprocess.run(
         ["claude", "-p", "--model", "haiku", "--allowedTools", "Bash",
