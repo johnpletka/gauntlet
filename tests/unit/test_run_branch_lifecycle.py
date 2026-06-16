@@ -229,15 +229,18 @@ def test_resume_refuses_when_run_branch_missing(fixture_repo):
         mgr.resume("demo", use_judge=False)
 
 
-def test_resume_refuses_when_branch_reset_behind_manifest(fixture_repo):
-    # F-1: a run branch reset behind its recorded commits is divergent -> refuse
-    # rather than silently resume a branch missing recorded work.
+def test_resume_refuses_reset_branch_without_rewinding_worktree(fixture_repo):
+    # F-1 follow-up: validate the branch REF before checkout, so a refused resume
+    # never rewinds the worktree onto the stale/reset branch. Stand on main with
+    # gauntlet/demo reset behind its recorded commit.
     mgr = _prepare(fixture_repo)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
-    # drop the recorded P1 commit off the branch tip
-    git(fixture_repo, "reset", "-q", "--hard", "HEAD~1")
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-f", "gauntlet/demo", "gauntlet/demo~1")  # drop P1
     with pytest.raises(RunBranchStateError, match="missing the manifest"):
         mgr.resume("demo", use_judge=False)
+    # the worktree was NOT switched onto the bad branch
+    assert gitops.current_branch(fixture_repo) == "main"
 
 
 def test_clean_refuses_dirty_worktree_on_branch(fixture_repo):
@@ -252,6 +255,22 @@ def test_clean_refuses_dirty_worktree_on_branch(fixture_repo):
     # nothing was deleted or moved
     assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
     assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+
+
+def test_clean_dirty_guard_does_not_hide_run_artifacts(fixture_repo):
+    # F-2 follow-up: the guard excludes only run-instance bookkeeping, NOT the
+    # whole run root — so an uncommitted run artifact (prd.md under runs/<slug>/)
+    # still blocks clean instead of being silently carried onto base. (With the
+    # prior whole-run_root exclude, prd.md was hidden and this would not raise.)
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    # prd.md is committed by the run; an uncommitted *edit* to it is real
+    # artifact dirt that must block clean (it was hidden under the old exclude).
+    prd = mgr.layout("demo").prd_path
+    prd.write_text(prd.read_text() + "\n<!-- edited after the run -->\n")
+    with pytest.raises(WorktreeDirtyError, match="dirty"):
+        mgr.clean("demo", force=True)
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
 
 
 def test_start_refuses_base_resolving_to_run_branch(fixture_repo):

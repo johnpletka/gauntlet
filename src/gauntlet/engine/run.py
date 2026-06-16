@@ -371,20 +371,22 @@ class RunManager:
                 "from base would drop the manifest's recorded commits. Restore "
                 "the branch (e.g. from refs/gauntlet/backup/) before resuming."
             )
-        gitops.checkout_branch(repo, man.branch)
+        # Validate the branch REF *before* checking it out — checking out first
+        # would rewind the worktree onto a stale/reset branch even though we are
+        # about to refuse. The last recorded commit must be reachable from the
+        # branch tip: a tip == last (normal interrupt) or slightly ahead (killed
+        # between commit and manifest persist) is fine; behind/divergent means
+        # recorded commits are missing (reset / recreated).
         if man.commits:
             last = man.commits[-1].sha
-            head = gitops.head_sha(repo)
-            # last must be reachable from HEAD: HEAD == last (normal interrupt) or
-            # HEAD slightly ahead (killed between commit and manifest persist) are
-            # fine; HEAD behind/divergent means recorded commits are missing.
-            if not gitops.is_ancestor(repo, last, head):
+            if not gitops.is_ancestor(repo, last, man.branch):
                 raise RunBranchStateError(
-                    f"resume: branch {man.branch!r} tip {head[:10]} is missing the "
-                    f"manifest's recorded commit {last[:10]} (reset or recreated); "
-                    "the branch and manifest disagree. Reconcile (restore the "
-                    "branch, or `gauntlet rollback`) before resuming."
+                    f"resume: branch {man.branch!r} is missing the manifest's "
+                    f"recorded commit {last[:10]} (reset or recreated); the branch "
+                    "and manifest disagree. Reconcile (restore the branch, or "
+                    "`gauntlet rollback`) before resuming."
                 )
+        gitops.checkout_branch(repo, man.branch)
         return self._drive(
             layout, run_dir, pipeline, man,
             use_judge=use_judge, adapter_factory=adapter_factory,
@@ -470,9 +472,14 @@ class RunManager:
                     "out another branch first, then `gauntlet clean`"
                 )
             # F-2: stepping off the branch with a dirty tree would carry the
-            # uncommitted changes onto the base (or fail mid-checkout). Refuse —
-            # the run-dir bookkeeping is excluded so it never reads as dirt.
-            if not gitops.is_clean(repo, exclude=[self.config.run_root]):
+            # uncommitted changes onto the base (or fail mid-checkout). Refuse.
+            # Exclude only the run-instance BOOKKEEPING (manifest/transcripts/
+            # PR.md) — NOT the whole run root, which would hide tracked artifacts
+            # like prd.md/plan.md and let their uncommitted edits ride onto base.
+            excludes = run_bookkeeping_excludes(
+                repo, layout.active_run_dir(), layout.slug_dir
+            )
+            if not gitops.is_clean(repo, exclude=excludes):
                 raise WorktreeDirtyError(
                     f"refusing clean: worktree is dirty and clean must step off "
                     f"{branch!r} onto {target!r}, which would carry the changes "

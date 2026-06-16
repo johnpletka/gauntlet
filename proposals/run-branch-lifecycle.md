@@ -118,15 +118,25 @@ fixed in the same PR:
   `resume` checks out the existing branch (never creates) and fails closed
   (`RunBranchStateError`) if the branch is missing or its tip no longer contains
   every recorded commit — mirroring rollback's divergence guard. The check is
-  reachability (`is_ancestor(last_recorded, HEAD)`), so it tolerates the legit
-  killed-between-commit-and-persist case (HEAD ahead) while catching reset /
-  recreate (HEAD behind/divergent).
+  reachability (`is_ancestor(last_recorded, branch)`), so it tolerates the legit
+  killed-between-commit-and-persist case (tip ahead) while catching reset /
+  recreate (tip behind/divergent).
+  - *Follow-up (round 2):* the reachability check now runs against the branch
+    **ref before checkout** — the first cut checked out `man.branch` and only
+    then validated, so a refused resume still rewound the worktree onto the bad
+    branch. Validation is now side-effect-free; checkout happens only on pass.
 - **F-2 [major] — `clean()` could relocate uncommitted work onto base.**
   Stepping off the run branch had no dirty-tree guard, so `git checkout <base>`
   would carry uncommitted changes onto the base (or fail mid-checkout). Now
   `clean` refuses on a dirty tree (`WorktreeDirtyError`) before stepping off —
   even under `--force` (force overrides the *merged* check, not the dirty
-  safety). Run-dir bookkeeping is excluded so it never reads as dirt.
+  safety).
+  - *Follow-up (round 2):* the guard now excludes only run-instance
+    **bookkeeping** via `run_bookkeeping_excludes`, not the whole run root. The
+    first cut excluded all of `run_root`, which hid tracked artifacts
+    (`prd.md`/`plan.md`) — re-introducing the very F-001 mistake that helper
+    exists to prevent — so an uncommitted artifact edit could still ride onto
+    base. Now such edits block `clean`.
 - **F-3 [minor] — `base: current` could resolve to a run branch.** Running from
   a `gauntlet/*` branch recorded a machine-owned branch as the base, later
   wedging `finish` (branch == base). `start()` now fails closed
