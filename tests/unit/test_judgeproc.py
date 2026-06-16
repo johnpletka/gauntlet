@@ -120,13 +120,79 @@ def test_spawn_moves_off_taken_port(monkeypatch, clean_managed_env):
 
     monkeypatch.setattr(judgeproc.subprocess, "Popen", _popen)
 
+    os.environ[TOKEN_ENV_VAR] = "operator-global-token"  # port conflict → NOT reused
     mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
     try:
         mj.start()
         assert mj.port == 54321
         assert "54321" in captured["argv"]
         assert mj.url == "http://127.0.0.1:54321"
+        # On a port CONFLICT the run keeps its freshly minted token: the listener
+        # on the default port is someone else's judge, so reusing the operator's
+        # global token for our moved-port judge would be misleading.
+        assert mj.token != "operator-global-token"
     finally:
         mj._proc = None  # don't let teardown touch the fake proc
+        for v in _MANAGED_ENV_VARS:
+            os.environ.pop(v, None)
+
+
+def _patch_spawn(monkeypatch, captured):
+    class _Proc:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+
+    def _popen(argv, env=None):
+        captured["argv"] = argv
+        captured["env"] = env
+        return _Proc()
+
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", _popen)
+
+
+def test_spawn_reuses_global_token_when_port_free(monkeypatch, clean_managed_env):
+    # No port conflict + a global GAUNTLET_JUDGE_TOKEN already in the env (e.g.
+    # exported in ~/.zshenv) → the run adopts THAT token instead of minting a
+    # fresh one, so a manually-started judge / external tooling sharing it stays
+    # consistent with the run's judge. The run still starts its OWN judge on the
+    # default port; only the token value is reused.
+    captured: dict = {}
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    _patch_spawn(monkeypatch, captured)
+    os.environ[TOKEN_ENV_VAR] = "operator-global-token"
+
+    mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
+    try:
+        injected = mj.start()
+        assert mj.port == judgeproc.DEFAULT_PORT  # stayed on the default port
+        assert mj.token == "operator-global-token"  # reused, not minted
+        assert injected[TOKEN_ENV_VAR] == "operator-global-token"
+        assert captured["env"][TOKEN_ENV_VAR] == "operator-global-token"
+    finally:
+        mj._proc = None
+        for v in _MANAGED_ENV_VARS:
+            os.environ.pop(v, None)
+
+
+def test_spawn_mints_token_when_port_free_but_no_global_token(monkeypatch, clean_managed_env):
+    # No port conflict and NO global token set → mint a fresh per-run token as
+    # before (clean_managed_env clears GAUNTLET_JUDGE_TOKEN). Guards against
+    # accidentally injecting an empty token when the operator hasn't exported one.
+    captured: dict = {}
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    _patch_spawn(monkeypatch, captured)
+
+    mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
+    try:
+        injected = mj.start()
+        assert mj.port == judgeproc.DEFAULT_PORT
+        assert mj.token  # a non-empty minted token
+        assert injected[TOKEN_ENV_VAR] == mj.token
+    finally:
+        mj._proc = None
         for v in _MANAGED_ENV_VARS:
             os.environ.pop(v, None)

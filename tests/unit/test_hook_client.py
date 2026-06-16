@@ -10,9 +10,13 @@ from gauntlet.judge import hook_client
 
 @pytest.fixture
 def env():
+    # An in-run env: GAUNTLET_RUN_ID marks "this is a gauntlet run", which is what
+    # makes the hook consult the judge at all (the engine injects it alongside the
+    # token/url). Without it the hook defers — see test_no_run_id_defers_*.
     return {
         "GAUNTLET_JUDGE_URL": "http://127.0.0.1:9999",
         "GAUNTLET_JUDGE_TOKEN": "tok",
+        "GAUNTLET_RUN_ID": "run1",
     }
 
 
@@ -68,7 +72,11 @@ def test_unreachable_unattended_fails_closed(monkeypatch):
     patch_judge(monkeypatch, exc=urllib.error.URLError("conn refused"))
     decision, reason, code = hook_client.decide_from_payload(
         {"tool_name": "Bash", "tool_input": {"command": "git status"}},
-        env={"GAUNTLET_JUDGE_MODE": "unattended", "GAUNTLET_JUDGE_TOKEN": "tok"},
+        env={
+            "GAUNTLET_JUDGE_MODE": "unattended",
+            "GAUNTLET_JUDGE_TOKEN": "tok",
+            "GAUNTLET_RUN_ID": "r",
+        },
     )
     assert decision == "deny"
     assert code == 2
@@ -79,7 +87,11 @@ def test_unreachable_interactive_asks_with_warning(monkeypatch):
     patch_judge(monkeypatch, exc=urllib.error.URLError("conn refused"))
     decision, reason, code = hook_client.decide_from_payload(
         {"tool_name": "Bash", "tool_input": {"command": "git status"}},
-        env={"GAUNTLET_JUDGE_MODE": "interactive", "GAUNTLET_JUDGE_TOKEN": "tok"},
+        env={
+            "GAUNTLET_JUDGE_MODE": "interactive",
+            "GAUNTLET_JUDGE_TOKEN": "tok",
+            "GAUNTLET_RUN_ID": "r",
+        },
     )
     assert decision == "ask"
     assert code == 0
@@ -127,10 +139,33 @@ def test_non_dict_judge_response_fails_closed(monkeypatch, env):
     assert decision == "deny"
 
 
-def test_no_token_defers_to_normal_handling(monkeypatch):
-    # F-006: with no judge token configured, DEFER to the CLI's normal handling
-    # (emit no decision) — never deny, and never force a prompt. A plain session
-    # in a hook-wired repo must be neither bricked nor nagged. Judge not consulted.
+def test_no_run_id_defers_even_with_global_token(monkeypatch):
+    # The interactive-session fix: a global GAUNTLET_JUDGE_TOKEN (e.g. exported in
+    # ~/.zshenv) must NOT make a non-run session consult the judge. The judge
+    # gates ONLY gauntlet-run sessions, marked by GAUNTLET_RUN_ID. Without it we
+    # DEFER and never contact the judge, so an unreachable/foreign judge can never
+    # brick an interactive session (the bug fixed on sec/judge-interactive-fallback).
+    called = {"v": False}
+
+    def fake(url, token, body):
+        called["v"] = True
+        return {"decision": "deny"}
+
+    monkeypatch.setattr(hook_client, "_ask_judge", fake)
+    decision, reason, code = hook_client.decide_from_payload(
+        {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
+        env={"GAUNTLET_JUDGE_TOKEN": "global-tok"},  # token but NO run id
+    )
+    assert decision == "defer"
+    assert code == 0
+    assert "not a gauntlet run" in reason
+    assert called["v"] is False  # judge not even contacted
+
+
+def test_in_run_without_token_defers(monkeypatch):
+    # F-006 (now secondary): inside a run (GAUNTLET_RUN_ID set) but with no token
+    # we cannot authenticate, so DEFER rather than call with an empty token. The
+    # engine always injects both together, so this is a should-not-happen guard.
     called = {"v": False}
 
     def fake(url, token, body):
@@ -140,7 +175,7 @@ def test_no_token_defers_to_normal_handling(monkeypatch):
     monkeypatch.setattr(hook_client, "_ask_judge", fake)
     decision, reason, code = hook_client.decide_from_payload(
         {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
-        env={},  # no GAUNTLET_JUDGE_TOKEN
+        env={"GAUNTLET_RUN_ID": "r"},  # run id but no token
     )
     assert decision == "defer"
     assert code == 0
@@ -197,6 +232,7 @@ def test_repo_root_prefers_engine_env_over_agent_cwd(monkeypatch):
     fake = patch_judge(monkeypatch, result={"decision": "allow", "rationale": "ok"})
     env = {
         "GAUNTLET_JUDGE_TOKEN": "tok",
+        "GAUNTLET_RUN_ID": "r",
         "GAUNTLET_REPO_ROOT": "/real/repo",
     }
     hook_client.decide_from_payload(
@@ -209,7 +245,7 @@ def test_repo_root_prefers_engine_env_over_agent_cwd(monkeypatch):
 
 def test_repo_root_falls_back_to_cwd_without_engine_env(monkeypatch):
     fake = patch_judge(monkeypatch, result={"decision": "allow", "rationale": "ok"})
-    env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    env = {"GAUNTLET_JUDGE_TOKEN": "tok", "GAUNTLET_RUN_ID": "r"}
     hook_client.decide_from_payload(
         {"tool_name": "Edit", "tool_input": {"file_path": "/repo/x"}, "cwd": "/repo"},
         env=env,

@@ -83,19 +83,35 @@ def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int
     url = env.get(URL_ENV_VAR, DEFAULT_URL)
     token = env.get(TOKEN_ENV_VAR, "")
     mode = env.get(MODE_ENV_VAR, "unattended")
+    run_id = env.get(RUN_ID_ENV_VAR)
 
-    # Safe-by-default (review F-006): with no judge token configured we are not
-    # running under a gauntlet judge, so DEFER to the CLI's own permission
-    # handling — emit no decision and let the allowlist/prompt run exactly as if
-    # this hook were absent. A plain session in a repo whose settings wire this
-    # hook must be neither bricked NOR nagged: returning "ask" here forced a
-    # confirmation prompt on EVERY tool call, overriding the user's permission
-    # settings (the bug fixed here). A judge is only treated as "should be up"
-    # when a token is present.
+    # The judge gates ONLY gauntlet-run sessions (FR-7.3). The reliable run
+    # marker is GAUNTLET_RUN_ID, which the engine injects for the run's lifetime
+    # (judgeproc.ManagedJudge.env) and clears on stop; a plain interactive
+    # session never has it. Gating on this marker — NOT on token presence — is
+    # what lets an interactive session DEFER to the CLI's normal permission
+    # handling even when the operator exports GAUNTLET_JUDGE_TOKEN globally
+    # (e.g. in ~/.zshenv). Token presence is the wrong signal: a global token
+    # makes every shell look judge-configured, so an unreachable or foreign
+    # judge would brick the session (fail-closed 401 / unattended-unreachable —
+    # the bug fixed here). Outside a run we express no opinion regardless of
+    # judge reachability, which is exactly "fall back to the normal interactive
+    # policy" (review F-004/F-006).
+    if not run_id:
+        return (
+            "defer",
+            "not a gauntlet run (GAUNTLET_RUN_ID unset); deferring to the "
+            "CLI's normal permission handling",
+            0,
+        )
+
+    # Inside a run the engine always injects a token alongside the run id; if one
+    # is somehow absent we cannot authenticate to the judge, so DEFER rather than
+    # call with an empty token (safe-by-default; should not occur in practice).
     if not token:
         return (
             "defer",
-            "no gauntlet judge configured (GAUNTLET_JUDGE_TOKEN unset); "
+            "no gauntlet judge token configured (GAUNTLET_JUDGE_TOKEN unset); "
             "deferring to the CLI's normal permission handling",
             0,
         )
@@ -115,7 +131,7 @@ def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int
         "tool_name": tool_name,
         "tool_input": tool_input,
         "repo_root": repo_root,
-        "run_id": env.get(RUN_ID_ENV_VAR),
+        "run_id": run_id,
         "step_id": env.get(STEP_ID_ENV_VAR),
     }
     try:
