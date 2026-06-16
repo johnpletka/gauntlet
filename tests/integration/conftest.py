@@ -9,9 +9,35 @@ these are the compensating control):
   never against this repo.
 """
 
+import os
 import subprocess
 
 import pytest
+
+from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
+
+
+@pytest.fixture(autouse=True)
+def _sanitize_gauntlet_env():
+    """Clear engine-managed GAUNTLET_* vars for each integration test, restoring
+    them after.
+
+    The suite assumes a clean process environment: several tests assert
+    `GAUNTLET_JUDGE_TOKEN not in os.environ` as a precondition, and the
+    engine/hook key judge gating on GAUNTLET_RUN_ID. An operator who exports
+    GAUNTLET_JUDGE_TOKEN (or other GAUNTLET_* vars) globally — e.g. in
+    ~/.zshenv — would otherwise leak them into os.environ and trip those
+    preconditions or alter behavior. Tests that need these vars set them
+    explicitly on the subprocess env they build, so clearing the inherited
+    values here is safe.
+    """
+    saved = {v: os.environ.pop(v, None) for v in _MANAGED_ENV_VARS}
+    try:
+        yield
+    finally:
+        for v, val in saved.items():
+            if val is not None:
+                os.environ[v] = val
 
 
 @pytest.fixture
