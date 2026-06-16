@@ -107,6 +107,32 @@ This is deliberately **deferred to a follow-up PR** because:
 
 Tracked in [FUTURE.md](../FUTURE.md).
 
+## 5a. PR review fixes (post-implementation hardening)
+
+PR review surfaced three fail-open gaps in the first cut, all legitimate and
+fixed in the same PR:
+
+- **F-1 [major] — `resume()` recreated the branch from base.** `resume` still
+  used `checkout_or_create_branch`, so a deleted/reset run branch was silently
+  recreated from `base_branch`, dropping the manifest's recorded commits. Now
+  `resume` checks out the existing branch (never creates) and fails closed
+  (`RunBranchStateError`) if the branch is missing or its tip no longer contains
+  every recorded commit — mirroring rollback's divergence guard. The check is
+  reachability (`is_ancestor(last_recorded, HEAD)`), so it tolerates the legit
+  killed-between-commit-and-persist case (HEAD ahead) while catching reset /
+  recreate (HEAD behind/divergent).
+- **F-2 [major] — `clean()` could relocate uncommitted work onto base.**
+  Stepping off the run branch had no dirty-tree guard, so `git checkout <base>`
+  would carry uncommitted changes onto the base (or fail mid-checkout). Now
+  `clean` refuses on a dirty tree (`WorktreeDirtyError`) before stepping off —
+  even under `--force` (force overrides the *merged* check, not the dirty
+  safety). Run-dir bookkeeping is excluded so it never reads as dirt.
+- **F-3 [minor] — `base: current` could resolve to a run branch.** Running from
+  a `gauntlet/*` branch recorded a machine-owned branch as the base, later
+  wedging `finish` (branch == base). `start()` now fails closed
+  (`BaseBranchError`) when the resolved base is the target branch or sits under
+  `branch_prefix`.
+
 ## 6. Test coverage
 
 `tests/unit/test_run_branch_lifecycle.py` — base:current resolution + recording,

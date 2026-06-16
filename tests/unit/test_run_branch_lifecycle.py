@@ -18,10 +18,13 @@ import pytest
 
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.run import (
+    BaseBranchError,
     FinishError,
     RunBranchNotMergedError,
+    RunBranchStateError,
     RunManager,
     StaleRunBranchError,
+    WorktreeDirtyError,
 )
 
 from conftest import FakeAdapter, git
@@ -210,6 +213,56 @@ def test_finish_refuses_dirty_worktree(fixture_repo):
     (fixture_repo / "dirt.py").write_text("uncommitted\n")
     with pytest.raises(FinishError, match="dirty"):
         mgr.finish("demo")
+
+
+# --- PR review fixes ---------------------------------------------------------
+def test_resume_refuses_when_run_branch_missing(fixture_repo):
+    # F-1: resume must not recreate the run branch from base (that drops the
+    # manifest's recorded commits). A missing branch fails closed.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED  # parked, resumable
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-D", "gauntlet/demo")
+    with pytest.raises(RunBranchStateError, match="missing"):
+        mgr.resume("demo", use_judge=False)
+
+
+def test_resume_refuses_when_branch_reset_behind_manifest(fixture_repo):
+    # F-1: a run branch reset behind its recorded commits is divergent -> refuse
+    # rather than silently resume a branch missing recorded work.
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    # drop the recorded P1 commit off the branch tip
+    git(fixture_repo, "reset", "-q", "--hard", "HEAD~1")
+    with pytest.raises(RunBranchStateError, match="missing the manifest"):
+        mgr.resume("demo", use_judge=False)
+
+
+def test_clean_refuses_dirty_worktree_on_branch(fixture_repo):
+    # F-2: clean must not carry uncommitted changes onto the base when it steps
+    # off the run branch. Dirty tree fails closed — even under --force.
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+    (fixture_repo / "uncommitted.py").write_text("work in progress\n")
+    with pytest.raises(WorktreeDirtyError, match="dirty"):
+        mgr.clean("demo", force=True)
+    # nothing was deleted or moved
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+
+
+def test_start_refuses_base_resolving_to_run_branch(fixture_repo):
+    # F-3: base:current while sitting on a gauntlet/* branch resolves the base to
+    # a machine-owned run branch -> fail closed (would later wedge `finish`).
+    mgr = _prepare(fixture_repo, CONFIG_BASE_CURRENT)
+    git(fixture_repo, "checkout", "-q", "-b", "gauntlet/demo")
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    with pytest.raises(BaseBranchError, match="run branch"):
+        mgr.start("demo", path, use_judge=False)
 
 
 def test_finish_aborts_on_conflict_and_returns_to_branch(fixture_repo):

@@ -67,6 +67,32 @@ class RunBranchNotMergedError(RuntimeError):
     """`clean()` refused: the run branch is not fully merged into its base."""
 
 
+class WorktreeDirtyError(RuntimeError):
+    """A branch-switching op refused because the worktree has uncommitted work.
+
+    Switching off the run branch with a dirty tree would carry the changes onto
+    the base (or fail mid-checkout on conflict) — fail closed instead (F-2).
+    """
+
+
+class RunBranchStateError(RuntimeError):
+    """`resume()` refused: the run branch is missing or disagrees with the manifest.
+
+    Resume must continue the SAME branch the run committed to. Recreating it
+    from base (the old behaviour) would silently drop the manifest's recorded
+    commits and resume a divergent branch — fail closed instead (F-1).
+    """
+
+
+class BaseBranchError(RuntimeError):
+    """`start()` refused: the resolved base is a machine-owned run branch (F-3).
+
+    `base_branch: current` while sitting on a `gauntlet/*` branch would record a
+    run branch as the base, which later wedges `finish` (branch == base). The
+    base must be an integration branch, never under ``branch_prefix``.
+    """
+
+
 class FinishError(RuntimeError):
     """`finish()` refused (run not done, dirty tree, or a merge conflict)."""
 
@@ -277,6 +303,16 @@ class RunManager:
 
         base_branch = self._resolve_base_branch()
         branch = f"{self.config.branch_prefix}{slug}"
+        # F-3: the base must be an integration branch, never a machine-owned run
+        # branch. `base: current` while on a gauntlet/* branch would otherwise
+        # record branch==base and later wedge `finish`.
+        if base_branch == branch or base_branch.startswith(self.config.branch_prefix):
+            raise BaseBranchError(
+                f"base resolves to a run branch {base_branch!r} (prefix "
+                f"{self.config.branch_prefix!r}); check out an integration branch "
+                "to run from (or set base_branch) — the base must not be a "
+                "gauntlet/* branch"
+            )
         self._prepare_run_branch(branch, base_branch)
 
         run_id = f"run-{_utc_stamp()}"
@@ -323,7 +359,32 @@ class RunManager:
                 f"({man.pipeline.hash} -> {phash}); resume refuses to run a "
                 "different pipeline against an existing manifest (FR-5.6)"
             )
-        gitops.checkout_or_create_branch(self.repo_root, man.branch, man.base_branch)
+        # F-1: resume continues the SAME branch the run committed to. Never
+        # recreate it from base (the old checkout_or_create_branch) — that would
+        # silently drop the manifest's recorded commits. Fail closed if the
+        # branch is gone or its tip no longer contains every recorded commit
+        # (reset / recreated / divergent), mirroring rollback's divergence guard.
+        repo = self.repo_root
+        if not gitops.branch_exists(repo, man.branch):
+            raise RunBranchStateError(
+                f"resume: run branch {man.branch!r} is missing; recreating it "
+                "from base would drop the manifest's recorded commits. Restore "
+                "the branch (e.g. from refs/gauntlet/backup/) before resuming."
+            )
+        gitops.checkout_branch(repo, man.branch)
+        if man.commits:
+            last = man.commits[-1].sha
+            head = gitops.head_sha(repo)
+            # last must be reachable from HEAD: HEAD == last (normal interrupt) or
+            # HEAD slightly ahead (killed between commit and manifest persist) are
+            # fine; HEAD behind/divergent means recorded commits are missing.
+            if not gitops.is_ancestor(repo, last, head):
+                raise RunBranchStateError(
+                    f"resume: branch {man.branch!r} tip {head[:10]} is missing the "
+                    f"manifest's recorded commit {last[:10]} (reset or recreated); "
+                    "the branch and manifest disagree. Reconcile (restore the "
+                    "branch, or `gauntlet rollback`) before resuming."
+                )
         return self._drive(
             layout, run_dir, pipeline, man,
             use_judge=use_judge, adapter_factory=adapter_factory,
@@ -407,6 +468,15 @@ class RunManager:
                 raise RunBranchNotMergedError(
                     f"on {branch!r} with no recorded base to step onto; check "
                     "out another branch first, then `gauntlet clean`"
+                )
+            # F-2: stepping off the branch with a dirty tree would carry the
+            # uncommitted changes onto the base (or fail mid-checkout). Refuse —
+            # the run-dir bookkeeping is excluded so it never reads as dirt.
+            if not gitops.is_clean(repo, exclude=[self.config.run_root]):
+                raise WorktreeDirtyError(
+                    f"refusing clean: worktree is dirty and clean must step off "
+                    f"{branch!r} onto {target!r}, which would carry the changes "
+                    "onto the base. Commit or discard them first."
                 )
             gitops.checkout_branch(repo, target)
         gitops.delete_branch(repo, branch)
