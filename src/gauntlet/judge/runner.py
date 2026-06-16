@@ -70,23 +70,34 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def classifier_status_message(judge_model: str | None) -> str:
+def classifier_status_message(
+    judge_model: str | None, *, resolve_error: str | None = None
+) -> str:
     """One-line startup status for the judge's LLM classifier rung (FR-7.2).
 
-    Emitted loudly (stderr) at startup: a judge with no classifier model fails
-    closed on every command the ``policy.yaml`` fast-path does not match (and
-    every ``ask`` rule). That is the correct posture, but a SILENT one is exactly
-    what "data over inference" (CLAUDE.md §2) warns against — the operator should
-    not have to deduce a forgotten ``--judge-model`` from a later wall of deny
-    errors (which is precisely how this footgun bites in practice)."""
-    if judge_model:
-        return f"judge: LLM classifier enabled ({judge_model})"
-    return (
-        "judge: WARNING — no --judge-model set; LLM classifier DISABLED. "
-        "Commands not matched by the policy.yaml fast-path allow/deny rules "
-        "(and every 'ask' rule) will FAIL CLOSED (deny). "
-        "Pass --judge-model <litellm-model-id> to enable classification."
-    )
+    Emitted loudly (stderr) at startup. Three states, because both an ABSENT and
+    an UNRESOLVABLE model fail the classifier closed on every command the
+    ``policy.yaml`` fast-path does not match — and "enabled" must never be
+    printed for a model that will not actually answer (PR #13 review: a typo like
+    ``claude-heroku`` was announced as enabled, then failed closed on every
+    call). ``resolve_error`` is the message from :func:`model_provider_error`;
+    ``None`` means resolvable (or unverifiable). Silently failing closed is
+    exactly what "data over inference" (CLAUDE.md §2) warns against."""
+    if not judge_model:
+        return (
+            "judge: WARNING — no --judge-model set; LLM classifier DISABLED. "
+            "Commands not matched by the policy.yaml fast-path allow/deny rules "
+            "(and every 'ask' rule) will FAIL CLOSED (deny). "
+            "Pass --judge-model <litellm-model-id> to enable classification."
+        )
+    if resolve_error:
+        return (
+            f"judge: WARNING — judge-model {judge_model!r} is SET but NOT "
+            f"resolvable by LiteLLM ({resolve_error}); the LLM classifier will "
+            "FAIL CLOSED on every command the policy.yaml fast-path does not "
+            "match. Use a valid LiteLLM model id."
+        )
+    return f"judge: LLM classifier enabled ({judge_model})"
 
 
 def serve(
@@ -117,9 +128,19 @@ def serve(
     app = create_app(core, token=resolved_token)
     print(f"gauntlet judge listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
+    # Resolve the model the SAME way doctor does, so "enabled" is never printed
+    # for an id that will fail every classify call closed (PR #13 review).
+    resolve_error = None
+    if judge_model:
+        from gauntlet.adapters.api import model_provider_error
+
+        resolve_error = model_provider_error(judge_model)
     # Classifier state goes to stderr so it never contaminates the token line on
     # stdout (which tooling/operators scrape) — but is still impossible to miss.
-    print(classifier_status_message(judge_model), file=sys.stderr)
+    print(
+        classifier_status_message(judge_model, resolve_error=resolve_error),
+        file=sys.stderr,
+    )
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

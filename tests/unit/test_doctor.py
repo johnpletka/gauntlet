@@ -71,15 +71,15 @@ def _probes(
     )
 
 
-def _set_judge_llm(repo: Path, model: str | None) -> None:
-    """Set (or, with model=None, remove) the scaffold's `judge_llm` api profile."""
+def _set_judge_llm(repo: Path, model: str | None, *, adapter: str = "api") -> None:
+    """Set (or, with model=None, remove) the scaffold's `judge_llm` profile."""
     cfg_path = repo / ".gauntlet/config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text())
     agents = cfg.setdefault("agents", {})
     if model is None:
         agents.pop("judge_llm", None)
     else:
-        agents["judge_llm"] = {"adapter": "api", "model": model}
+        agents["judge_llm"] = {"adapter": adapter, "model": model}
     cfg_path.write_text(yaml.safe_dump(cfg))
 
 
@@ -117,6 +117,20 @@ def test_judge_classifier_ok_when_model_resolvable(tmp_path):
     assert jc.status == OK
     assert "gpt-5-mini" in jc.detail
     assert not has_failure(results)
+
+
+def test_judge_classifier_fails_when_adapter_not_api(tmp_path):
+    # The engine always runs the classifier as an `api` (LiteLLM) call; a non-api
+    # judge_llm would pass api-keys (no key required) yet fail closed at runtime.
+    # doctor must FAIL, not silently OK it (PR #13 review).
+    repo = _healthy_repo(tmp_path)
+    _set_judge_llm(repo, "opus", adapter="claude-code")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    jc = _by_name(results)["judge-classifier"]
+    assert jc.status == FAIL
+    assert "claude-code" in jc.detail
+    assert jc.remedy and "adapter: api" in jc.remedy
+    assert has_failure(results)
 
 
 def test_judge_classifier_warns_when_no_profile(tmp_path):

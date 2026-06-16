@@ -71,20 +71,12 @@ def _no_auth_probe(_name: str) -> bool | None:
 
 
 def _real_judge_model_resolvable(model: str) -> str | None:
-    """None if LiteLLM can resolve a provider for ``model`` (no network call),
-    else a short one-line error. Catches unresolvable ids like ``claude-heroku``
-    — on which the judge's classifier rung fails *every* call closed (FR-7.2).
-    LiteLLM unavailable → None: we cannot verify offline, so we do not warn."""
-    try:
-        import litellm
+    """None if LiteLLM can resolve a provider for ``model``, else a short error.
+    Delegates to the shared :func:`model_provider_error` so doctor and the judge
+    startup path agree on what "resolvable" means (PR #13 review)."""
+    from gauntlet.adapters.api import model_provider_error
 
-        litellm.get_llm_provider(model)
-    except ImportError:
-        return None
-    except Exception as exc:
-        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-        return first[:200]
-    return None
+    return model_provider_error(model)
 
 
 @dataclass(frozen=True)
@@ -374,8 +366,9 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
     model, every command the policy fast-path does not match (and every ``ask``
     rule) fails closed — a silent footgun surfaced HERE, before a run, rather
     than left for the operator to infer from a later wall of deny errors. (The
-    key itself is covered by ``api-keys``; this check is purely about whether a
-    classifier is configured and its model id is resolvable.)"""
+    key itself is covered by ``api-keys``; this check is about whether a
+    classifier is configured, uses the ``api`` adapter the engine actually runs
+    it as, and has a resolvable model id.)"""
     profile = config.agents.get("judge_llm")
     model = getattr(profile, "model", None) if profile is not None else None
     if not model:
@@ -385,6 +378,22 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
             "policy.yaml fast-path does not match will fail closed",
             remedy="add a `judge_llm` agent profile (e.g. api / gpt-5-mini) to "
             "enable classification, or accept fail-closed-only operation",
+        )
+    # The engine's _with_judge() ALWAYS builds an ApiAdapter from judge_llm.model
+    # (the classifier is a non-agentic LiteLLM call by design), ignoring the
+    # configured adapter — and _check_api_keys() only validates keys for `api`
+    # profiles. So a non-`api` judge_llm would pass doctor yet fail closed at
+    # runtime with no key checked (PR #13 review). FAIL: enforce the config
+    # contract matches how the classifier is actually run.
+    adapter = getattr(profile, "adapter", None)
+    if adapter != "api":
+        return CheckResult(
+            "judge-classifier", FAIL,
+            f"judge_llm uses adapter {adapter!r}, but the engine always runs the "
+            "classifier as an `api` (LiteLLM) call — the configured adapter is "
+            "ignored and its key is not validated",
+            remedy="set judge_llm.adapter: api so doctor checks the key and the "
+            "config matches how the classifier actually runs",
         )
     err = probes.judge_model_resolvable(model)
     if err:

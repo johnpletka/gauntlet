@@ -178,3 +178,24 @@ def _response_to_dict(response: Any) -> dict[str, Any]:
             except Exception:
                 continue
     return {"type": "api.completion", "response": repr(response)}
+
+
+def model_provider_error(model: str) -> str | None:
+    """``None`` if LiteLLM can resolve a provider for ``model`` (a no-network
+    lookup), else a short one-line error.
+
+    The single source of truth for "is this model id usable", shared by the
+    judge startup path and ``gauntlet doctor`` so an unresolvable id (e.g.
+    ``claude-heroku``) is caught the SAME way in both — it would otherwise be
+    announced as an enabled classifier and then fail every call closed (FR-7.2).
+    LiteLLM unavailable → ``None``: we cannot verify offline, so we do not warn."""
+    try:
+        import litellm
+
+        litellm.get_llm_provider(model)
+    except ImportError:
+        return None
+    except Exception as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return first[:200]
+    return None
