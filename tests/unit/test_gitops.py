@@ -10,6 +10,22 @@ def test_clean_and_dirty(fixture_repo):
     assert not gitops.is_clean(fixture_repo)
 
 
+def test_is_clean_ignores_show_untracked_files_config(fixture_repo):
+    """Safety checks must not depend on adopter-local git config (review).
+
+    With ``status.showUntrackedFiles=no`` a bare ``git status --porcelain``
+    omits untracked files entirely — reporting a false "clean" tree — which
+    would silently bypass the FR-9.3 clean-handoff guard and FR-9.6 mutation
+    detection. ``status_porcelain`` pins ``--untracked-files`` explicitly, so
+    untracked work is still seen regardless of the config.
+    """
+    gitops._run(fixture_repo, "config", "status.showUntrackedFiles", "no")
+    (fixture_repo / "stray.txt").write_text("untracked work\n")
+    assert not gitops.is_clean(fixture_repo)
+    assert "stray.txt" in gitops.status_porcelain(fixture_repo)
+    assert "stray.txt" in gitops.status_porcelain(fixture_repo, untracked_all=True)
+
+
 def test_commit_all_uses_identity(fixture_repo):
     (fixture_repo / "f.py").write_text("code")
     sha = gitops.commit_all(

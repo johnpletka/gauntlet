@@ -82,19 +82,29 @@ def status_porcelain(
 ) -> str:
     """Porcelain status; empty string means a clean worktree.
 
-    ``untracked_all`` forces ``--untracked-files=all``. Git's default
-    (``normal``) collapses a fully-untracked directory into a single ``dir/``
-    entry — fine for a clean/dirty boolean, but lossy for any caller that
-    compares the reported paths against a specific file. A nested run-artifact
-    layout (``.gauntlet/runs/<slug>/prd.md``) collapses all the way up to
+    The untracked-files mode is ALWAYS pinned explicitly (never left to git
+    config). An adopter with ``status.showUntrackedFiles=no`` would otherwise
+    make ``--porcelain`` omit untracked files entirely, so ``is_clean`` could
+    report a clean tree while untracked work exists — silently bypassing the
+    FR-9.3 clean-handoff invariant and FR-9.6 mutation detection (review:
+    safety checks must not depend on adopter-local git config; fail closed,
+    determinism over cleverness). The explicit ``--untracked-files`` flag
+    overrides that config.
+
+    ``untracked_all`` selects ``all`` over the default ``normal``. ``normal``
+    collapses a fully-untracked directory into a single ``dir/`` entry — fine
+    for a clean/dirty boolean, but lossy for any caller that compares the
+    reported paths against a specific file. A nested run-artifact layout
+    (``.gauntlet/runs/<slug>/prd.md``) collapses all the way up to
     ``.gauntlet/runs/`` before anything under it is tracked, so a path-equality
     check never sees the file. Callers that match on individual paths must pass
     ``untracked_all=True``.
     """
-    args = ["status", "--porcelain"]
-    if untracked_all:
-        args.append("--untracked-files=all")
-    return _run(repo, *args, *_exclude_pathspec(exclude)).strip()
+    mode = "all" if untracked_all else "normal"
+    return _run(
+        repo, "status", "--porcelain", f"--untracked-files={mode}",
+        *_exclude_pathspec(exclude),
+    ).strip()
 
 
 def is_clean(repo: Path, *, exclude: list[str] | None = None) -> bool:
