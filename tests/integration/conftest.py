@@ -36,7 +36,9 @@ def _sanitize_gauntlet_env():
         yield
     finally:
         for v, val in saved.items():
-            if val is not None:
+            if val is None:
+                os.environ.pop(v, None)
+            else:
                 os.environ[v] = val
 
 
