@@ -19,7 +19,12 @@ import yaml
 from gauntlet.adapters.base import AgentResult, MalformedOutputError, Usage
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.cycle import DATA_BEGIN, DATA_END, needs_escalation
+from gauntlet.engine.cycle import (
+    DATA_BEGIN,
+    DATA_END,
+    _triage_integrity_stray,
+    needs_escalation,
+)
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
@@ -192,6 +197,35 @@ def test_no_findings_converges_without_commit(cycle_repo):
     assert status == M.RUN_DONE
     assert man.commits == []
     assert "no findings" in man.record("cycle").notes
+
+
+# --- artifact-desync guard (fix/cycle-artifact-desync) -----------------------
+def test_triage_integrity_stray_flags_unknown_finding_ids():
+    findings = [F("F-001"), F("F-002")]
+    # aligned verdicts -> no stray
+    assert _triage_integrity_stray(findings, [V("F-001"), V("F-002")]) == []
+    # a verdict for a finding that is not in this round -> stray
+    assert _triage_integrity_stray(findings, [V("F-001"), V("F-999")]) == ["F-999"]
+
+
+def test_stale_triage_artifact_is_cleared_when_new_findings_land(cycle_repo):
+    # A prior run left an artifacts/triage.json describing different findings.
+    # The reviewer now converges (no findings this round), so no fresh triage is
+    # written — the stale artifact must be GONE, never left to disagree with the
+    # current findings.json (the desync that surfaced a phantom escalation).
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    stale = run_dir / "artifacts" / "triage.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text('{"verdicts": [{"finding_id": "F-OLD"}]}')
+
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW()),  # converge: no findings
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, _man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert not stale.exists()  # cleared the instant findings.json was rewritten
 
 
 def test_converges_in_two_rounds(cycle_repo):
