@@ -19,7 +19,13 @@ import yaml
 from gauntlet.adapters.base import AgentResult, MalformedOutputError, Usage
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.cycle import DATA_BEGIN, DATA_END, needs_escalation
+from gauntlet.engine.cycle import (
+    DATA_BEGIN,
+    DATA_END,
+    _persist_round_triage,
+    _triage_integrity_stray,
+    needs_escalation,
+)
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
@@ -192,6 +198,112 @@ def test_no_findings_converges_without_commit(cycle_repo):
     assert status == M.RUN_DONE
     assert man.commits == []
     assert "no findings" in man.record("cycle").notes
+
+
+# --- artifact-desync guard (fix/cycle-artifact-desync) -----------------------
+def test_triage_integrity_stray_flags_unknown_finding_ids():
+    findings = [F("F-001"), F("F-002")]
+    # aligned verdicts -> no stray
+    assert _triage_integrity_stray(findings, [V("F-001"), V("F-002")]) == []
+    # a verdict for a finding that is not in this round -> stray
+    assert _triage_integrity_stray(findings, [V("F-001"), V("F-999")]) == ["F-999"]
+
+
+def test_stale_triage_artifact_is_cleared_when_new_findings_land(cycle_repo):
+    # A prior run left an artifacts/triage.json describing different findings.
+    # The reviewer now converges (no findings this round), so no fresh triage is
+    # written — the stale artifact must be GONE, never left to disagree with the
+    # current findings.json (the desync that surfaced a phantom escalation).
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    stale = run_dir / "artifacts" / "triage.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text('{"verdicts": [{"finding_id": "F-OLD"}]}')
+
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW()),  # converge: no findings
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, _man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert not stale.exists()  # cleared the instant findings.json was rewritten
+
+
+def test_converged_round_does_not_register_deleted_triage(cycle_repo):
+    # PR #14 F1: round 1 triages (writes + registers triage.json); round 2
+    # converges with no findings, clearing triage.json. The DONE result must NOT
+    # still register the now-deleted path — the orchestrator merges artifact_writes
+    # into ctx.artifacts, where a downstream step / `human_gate show:` would read
+    # a dangling reference.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1
+        REVIEW(),                                                            # r2: converge
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "esc": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "attempt 1\n", {})),
+    }
+    # Build the orchestrator inline so we can inspect its merged artifact map.
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [cycle_step(escalation_agent="esc")]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=run_dir, artifact_root=cycle_repo,
+        config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    status = orch.drive()
+    assert status == M.RUN_DONE
+    assert not (run_dir / "artifacts" / "triage.json").exists()  # cleared on r2
+    assert "triage.json" not in orch.artifacts                   # and not dangling
+    assert "findings.json" in orch.artifacts                     # sanity: map populated
+
+
+def _stub_ctx(run_dir):
+    class _Writer:
+        def write_text(self, path, content):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+    class _Ctx:
+        def __init__(self):
+            self.run_dir = run_dir
+            self.writer = _Writer()
+
+    return _Ctx()
+
+
+def test_persist_round_triage_diagnoses_mismatch_without_authoritative_write(tmp_path):
+    # PR #14 F2: a stray verdict must never reach the authoritative triage.json —
+    # only a diagnostic file — and the round signals a park.
+    writes: dict = {}
+    stray = _persist_round_triage(
+        _stub_ctx(tmp_path), [F("F-001")], [V("F-001"), V("F-999")],
+        schema=None, artifact_writes=writes,
+    )
+    assert stray == ["F-999"]
+    assert not (tmp_path / "artifacts" / "triage.json").exists()
+    assert (tmp_path / "artifacts" / "triage-mismatch.json").exists()
+    assert "triage.json" not in writes
+
+
+def test_persist_round_triage_writes_authoritative_when_aligned(tmp_path):
+    writes: dict = {}
+    stray = _persist_round_triage(
+        _stub_ctx(tmp_path), [F("F-001")], [V("F-001")],
+        schema=None, artifact_writes=writes,
+    )
+    assert stray == []
+    assert (tmp_path / "artifacts" / "triage.json").exists()
+    assert writes["triage.json"] == tmp_path / "artifacts" / "triage.json"
+    assert not (tmp_path / "artifacts" / "triage-mismatch.json").exists()
 
 
 def test_converges_in_two_rounds(cycle_repo):
