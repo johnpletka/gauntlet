@@ -212,13 +212,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             {"findings": findings, "open_questions": open_questions,
              "summary": (review.structured or {}).get("summary", "")},
         )
-        # Drop any prior round/run's triage.json the instant new findings land:
-        # an interruption before THIS round's triage rewrites it can otherwise
-        # leave findings.json and triage.json describing different finding sets —
-        # the desync that surfaced a phantom FR-10.4 escalation to a human (a
-        # stale verdict's `target_artifact` named an "upstream" finding that did
-        # not exist in the current findings). Absent triage > stale triage.
-        _invalidate_artifact(ctx, "triage.json")
+        # Drop any prior round/run's triage.json — from BOTH disk and the
+        # in-memory registry — the instant new findings land: an interruption
+        # before THIS round's triage rewrites it can otherwise leave findings.json
+        # and triage.json describing different finding sets (the desync that
+        # surfaced a phantom FR-10.4 escalation). Clearing the registry too keeps
+        # a converged DONE from registering a deleted path. Absent > stale.
+        _invalidate_artifact(ctx, "triage.json", artifact_writes)
         if not findings:
             return _finish(
                 StepResult(status=DONE, notes=f"converged: round-{rnd} review returned no findings"),
@@ -228,15 +228,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
         verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
         metrics.record_verdicts(verdicts)
-        artifact_writes["triage.json"] = _write_artifact(
-            ctx, "triage.json", {"verdicts": verdicts}, validate=triage_schema
+        # Integrity backstop BEFORE the authoritative write (data over inference):
+        # every verdict must map to a finding in THIS round. The triager forces
+        # finding_id = finding['id'] and the schema requires an id, so a stray id
+        # should be impossible — but if one ever appears we must NOT write it to
+        # the triage.json downstream steps and humans trust. _persist_round_triage
+        # writes mismatched verdicts to a diagnostic file and leaves triage.json
+        # absent; aligned verdicts are written and registered.
+        stray = _persist_round_triage(
+            ctx, findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
         )
-        # Integrity backstop (data over inference): every verdict must map to a
-        # finding in THIS round. The triager forces finding_id = finding['id'] and
-        # the schema requires an id, so a stray id should be impossible — but if
-        # one ever appears (a future code path, a finding lacking an id slipping
-        # the schema), park rather than surface a verdict mapped to nothing.
-        stray = _triage_integrity_stray(findings, verdicts)
         if stray:
             return _finish(
                 StepResult(status=PARKED, notes=(
@@ -1037,14 +1038,48 @@ def _write_artifact(
     return path
 
 
-def _invalidate_artifact(ctx: StepContext, name: str) -> None:
-    """Remove a stale round artifact so a torn re-run never leaves it disagreeing
-    with a freshly written sibling (data over inference). Used to drop a prior
-    triage.json when new findings land: an interruption before the new triage
-    completes then leaves triage ABSENT (unambiguous) rather than a stale verdict
-    set mapped to different findings — the failure mode that surfaced a phantom
-    FR-10.4 escalation. Idempotent; missing file is a no-op."""
+def _invalidate_artifact(
+    ctx: StepContext, name: str, artifact_writes: dict[str, Path]
+) -> None:
+    """Remove a stale round artifact from BOTH disk and the in-memory registry,
+    so a torn re-run never leaves it disagreeing with a freshly written sibling
+    (data over inference). Used to drop a prior triage.json when new findings
+    land: an interruption before the new triage completes then leaves triage
+    ABSENT (unambiguous) rather than a stale verdict set mapped to different
+    findings — the failure mode that surfaced a phantom FR-10.4 escalation.
+    Clearing ``artifact_writes`` too stops a converged DONE result from
+    registering a path that no longer exists, which the orchestrator would merge
+    into ``ctx.artifacts`` for downstream steps / ``human_gate show:`` (PR #14
+    review). Idempotent; a missing file / key is a no-op."""
     (ctx.run_dir / "artifacts" / name).unlink(missing_ok=True)
+    artifact_writes.pop(name, None)
+
+
+def _persist_round_triage(
+    ctx: StepContext,
+    findings: list[dict[str, Any]],
+    verdicts: list[dict[str, Any]],
+    *,
+    schema: dict | None,
+    artifact_writes: dict[str, Path],
+) -> list[str]:
+    """Persist a round's verdicts; return any stray finding_ids (empty == OK).
+
+    Integrity backstop applied BEFORE the authoritative write (PR #14 review): if
+    a verdict references a finding absent from this round (a findings/triage
+    desync — see :func:`_triage_integrity_stray`), the mismatched verdicts go to a
+    NON-authoritative ``triage-mismatch.json`` for the post-mortem and the
+    authoritative ``triage.json`` is left ABSENT — never written from data we
+    already know is inconsistent. Otherwise ``triage.json`` is written and
+    registered in ``artifact_writes``."""
+    stray = _triage_integrity_stray(findings, verdicts)
+    if stray:
+        _write_artifact(ctx, "triage-mismatch.json", {"verdicts": verdicts})
+        return stray
+    artifact_writes["triage.json"] = _write_artifact(
+        ctx, "triage.json", {"verdicts": verdicts}, validate=schema
+    )
+    return []
 
 
 def _load_schema(ctx: StepContext, ref: str) -> dict:
