@@ -10,6 +10,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+from gauntlet.engine import judgeproc
 from gauntlet.engine.judgeproc import (
     _MANAGED_ENV_VARS,
     ManagedJudge,
@@ -75,3 +78,55 @@ def test_stop_restores_prior_values():
         assert os.environ[TOKEN_ENV_VAR] == "outer-token"  # restored, not deleted
     finally:
         os.environ.pop(TOKEN_ENV_VAR, None)
+
+
+# --- free-port coexistence with an already-running judge -------------------------
+@pytest.fixture
+def clean_managed_env():
+    """Save/restore every managed GAUNTLET_* var so a test can set them freely."""
+    saved = {v: os.environ.get(v) for v in _MANAGED_ENV_VARS}
+    for v in _MANAGED_ENV_VARS:
+        os.environ.pop(v, None)
+    try:
+        yield
+    finally:
+        for v, val in saved.items():
+            if val is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = val
+
+
+def test_spawn_moves_off_taken_port(monkeypatch, clean_managed_env):
+    # The default port is busy (e.g. the operator's own standalone judge) → the
+    # run spawns its OWN run-scoped judge on a free port instead of colliding and
+    # dying ("judge exited during startup"). The run never attaches to that other
+    # judge (PR #16 review: that would lose the run's policy/audit/repo_root).
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: False))
+    monkeypatch.setattr(ManagedJudge, "_free_port", staticmethod(lambda h: 54321))
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+
+    def _popen(argv, env=None):
+        captured["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", _popen)
+
+    mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
+    try:
+        mj.start()
+        assert mj.port == 54321
+        assert "54321" in captured["argv"]
+        assert mj.url == "http://127.0.0.1:54321"
+    finally:
+        mj._proc = None  # don't let teardown touch the fake proc
+        for v in _MANAGED_ENV_VARS:
+            os.environ.pop(v, None)

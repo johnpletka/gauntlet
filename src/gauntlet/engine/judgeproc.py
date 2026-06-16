@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -86,6 +87,8 @@ class ManagedJudge:
 
     @property
     def url(self) -> str:
+        # Follows host:port; the port may have moved off the default if it was
+        # already taken when we spawned (see start()).
         return f"http://{self.host}:{self.port}"
 
     def env(self) -> dict[str, str]:
@@ -104,8 +107,28 @@ class ManagedJudge:
         return env
 
     def start(self) -> dict[str, str]:
+        # A `gauntlet run` always starts its OWN run-scoped judge so the run's
+        # policy.yaml, audit file (run_dir/judge-audit.jsonl), repo_root, and
+        # model are authoritative and the decisions are reconstructable from the
+        # run dir (FR-4/FR-7; PR #16 review). It never attaches to an arbitrary
+        # standalone judge, which would enforce a different policy and write its
+        # audit elsewhere. The operator's own session reuses their judge via the
+        # PreToolUse hook + GAUNTLET_JUDGE_* env — a path that does not go
+        # through ManagedJudge at all, so it is unaffected.
         if not self.judge_model:
             print(classifier_disabled_warning(), file=sys.stderr)
+        # If the default port is already taken (a stale judge from a killed run,
+        # the operator's own standalone judge, or an unrelated listener), move to
+        # a free ephemeral port rather than colliding and failing startup. The
+        # hooks learn the URL from the injected env, so the port need not be fixed.
+        if not self._port_is_free(self.host, self.port):
+            taken = self.port
+            self.port = self._free_port(self.host)
+            print(
+                f"gauntlet: judge port {taken} is in use; starting the "
+                f"engine-managed judge on free port {self.port} instead.",
+                file=sys.stderr,
+            )
         child_env = {**os.environ, TOKEN_ENV_VAR: self.token}
         argv = [
             sys.executable,
@@ -137,6 +160,21 @@ class ManagedJudge:
         env = self.env()
         os.environ.update(env)  # the bootstrap session + child agents see it
         return env
+
+    @staticmethod
+    def _port_is_free(host: str, port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return True
+            except OSError:
+                return False
+
+    @staticmethod
+    def _free_port(host: str) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            return s.getsockname()[1]
 
     def _await_healthy(self) -> None:
         deadline = time.monotonic() + self.startup_timeout_s
