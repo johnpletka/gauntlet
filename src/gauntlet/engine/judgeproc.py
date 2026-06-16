@@ -84,15 +84,12 @@ class ManagedJudge:
         self.token = secrets.token_urlsafe(32)
         self._proc: subprocess.Popen | None = None
         self._env_snapshot: dict[str, str | None] = {}
-        # Set when we attach to an externally-managed judge instead of spawning
-        # one (see start()). We did not start it, so stop() must not kill it.
-        self._external_url: str | None = None
 
     @property
     def url(self) -> str:
-        # A reused external judge keeps its own URL; ours follows host:port (the
-        # port may have moved off the default if it was already taken).
-        return self._external_url or f"http://{self.host}:{self.port}"
+        # Follows host:port; the port may have moved off the default if it was
+        # already taken when we spawned (see start()).
+        return f"http://{self.host}:{self.port}"
 
     def env(self) -> dict[str, str]:
         """The per-run judge env to inject for agent subprocesses (FR-7.3)."""
@@ -110,22 +107,19 @@ class ManagedJudge:
         return env
 
     def start(self) -> dict[str, str]:
-        # Reuse an already-running judge if the environment advertises one
-        # (GAUNTLET_JUDGE_URL + GAUNTLET_JUDGE_TOKEN) and it answers /healthz.
-        # This is the "attach to a judge that's already up" path: an operator's
-        # standalone `gauntlet judge serve`, or a judge a parent process started.
-        # We adopt its url+token (so the per-run hooks gate against it), inject
-        # only the per-run vars, and never stop it — we did not start it. The
-        # operator opted in by exporting the token, so we trust that endpoint;
-        # if it is the wrong judge the hook calls 401 and the run fails closed
-        # (loud and recoverable), never silently ungated.
-        if self._reuse_external():
-            return self._inject_env()
+        # A `gauntlet run` always starts its OWN run-scoped judge so the run's
+        # policy.yaml, audit file (run_dir/judge-audit.jsonl), repo_root, and
+        # model are authoritative and the decisions are reconstructable from the
+        # run dir (FR-4/FR-7; PR #16 review). It never attaches to an arbitrary
+        # standalone judge, which would enforce a different policy and write its
+        # audit elsewhere. The operator's own session reuses their judge via the
+        # PreToolUse hook + GAUNTLET_JUDGE_* env — a path that does not go
+        # through ManagedJudge at all, so it is unaffected.
         if not self.judge_model:
             print(classifier_disabled_warning(), file=sys.stderr)
-        # Nothing to reuse → spawn our own. If the default port is already taken
-        # (a stale judge from a killed run, or an unrelated listener), move to a
-        # free ephemeral port rather than colliding and failing startup. The
+        # If the default port is already taken (a stale judge from a killed run,
+        # the operator's own standalone judge, or an unrelated listener), move to
+        # a free ephemeral port rather than colliding and failing startup. The
         # hooks learn the URL from the injected env, so the port need not be fixed.
         if not self._port_is_free(self.host, self.port):
             taken = self.port
@@ -161,47 +155,11 @@ class ManagedJudge:
             argv += ["--repo-root", str(self.repo_root)]
         self._proc = subprocess.Popen(argv, env=child_env)
         self._await_healthy()
-        return self._inject_env()
-
-    def _inject_env(self) -> dict[str, str]:
         # Snapshot prior values of every managed var so stop() restores exactly.
         self._env_snapshot = {v: os.environ.get(v) for v in _MANAGED_ENV_VARS}
         env = self.env()
         os.environ.update(env)  # the bootstrap session + child agents see it
         return env
-
-    def _reuse_external(self) -> bool:
-        """Attach to an env-advertised, healthy judge instead of spawning.
-
-        Returns True (and adopts its url+token) when both GAUNTLET_JUDGE_URL and
-        GAUNTLET_JUDGE_TOKEN are set and the URL answers /healthz; False
-        otherwise (so the caller spawns its own). /healthz is unauthenticated,
-        matching the spawn path's own readiness probe.
-        """
-        url = os.environ.get(URL_ENV_VAR)
-        token = os.environ.get(TOKEN_ENV_VAR)
-        if not url or not token:
-            return False
-        if not self._healthz_ok(url):
-            return False
-        self._external_url = url
-        self.token = token
-        print(
-            f"gauntlet: reusing the externally-managed judge at {url} "
-            "(GAUNTLET_JUDGE_URL/TOKEN are set); not starting a new one.",
-            file=sys.stderr,
-        )
-        return True
-
-    @staticmethod
-    def _healthz_ok(url: str) -> bool:
-        """True iff ``url`` answers /healthz with 200. Its own seam so the reuse
-        path is unit-testable without driving real HTTP."""
-        try:
-            with urllib.request.urlopen(f"{url}/healthz", timeout=2.0) as r:
-                return r.status == 200
-        except (urllib.error.URLError, OSError):
-            return False
 
     @staticmethod
     def _port_is_free(host: str, port: int) -> bool:
@@ -237,22 +195,17 @@ class ManagedJudge:
         raise RuntimeError(f"judge did not become healthy in time: {last}")
 
     def stop(self) -> None:
-        # Restore every managed GAUNTLET_* var to its pre-run value (incl. the
-        # per-step GAUNTLET_STEP_ID set by the orchestrator) — no env leak into
-        # the parent session on success or failure (review F-009). This must run
-        # for a reused external judge too (no _proc of our own), or the per-run
-        # mode/run_id/repo_root we injected would leak past the run.
-        if self._env_snapshot:
-            for var, prior in self._env_snapshot.items():
-                if prior is None:
-                    os.environ.pop(var, None)
-                else:
-                    os.environ[var] = prior
-            self._env_snapshot = {}
-        # We only kill a judge we started. A reused external judge (and the bare
-        # never-started case) leaves _proc None and is left running.
         if self._proc is None:
             return
+        # Restore every managed GAUNTLET_* var to its pre-run value (incl. the
+        # per-step GAUNTLET_STEP_ID set by the orchestrator) — no env leak into
+        # the parent session on success or failure (review F-009).
+        for var, prior in (self._env_snapshot or {v: None for v in _MANAGED_ENV_VARS}).items():
+            if prior is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = prior
+        self._env_snapshot = {}
         self._proc.terminate()
         try:
             self._proc.wait(timeout=5.0)
