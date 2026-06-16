@@ -53,6 +53,30 @@ class ActiveRunError(RuntimeError):
     """`start()` refused because a non-terminal run is already active."""
 
 
+class StaleRunBranchError(RuntimeError):
+    """`start()` refused: the run branch exists with commits not in its base.
+
+    The branch is unmerged or divergent (e.g. a stale branch left at an older
+    base, the case that silently rewound a worktree before this guard). Failing
+    closed here is what makes "forgot to clean up" safe — the run never adopts a
+    branch it cannot prove is spent.
+    """
+
+
+class RunBranchNotMergedError(RuntimeError):
+    """`clean()` refused: the run branch is not fully merged into its base."""
+
+
+class FinishError(RuntimeError):
+    """`finish()` refused (run not done, dirty tree, or a merge conflict)."""
+
+
+# `base_branch: current` (case-insensitive) means "branch from whatever branch
+# is checked out now" — so a run stacks on the integration branch you are on
+# without a per-run flag. The resolved name is recorded in the manifest.
+_BASE_CURRENT_SENTINELS = frozenset({"current", "@current"})
+
+
 # A run in one of these states is finished and may be superseded by a fresh
 # `start()`. Any other state (running / parked) is still live — starting over it
 # would orphan it and risk competing agents against one worktree.
@@ -162,6 +186,51 @@ class RunManager:
                 "removed; a human must author a real PRD before a run (FR-10.1)"
             )
 
+    def _resolve_base_branch(self) -> str:
+        """Resolve ``config.base_branch``, expanding the ``current`` sentinel.
+
+        ``base_branch: current`` means "branch from whatever I'm on", so a run
+        stacks on an integration branch without a per-run flag. Fail closed on a
+        detached HEAD — there is no branch name to record or merge back into.
+        """
+        raw = (self.config.base_branch or "").strip()
+        if raw.lower() in _BASE_CURRENT_SENTINELS:
+            cur = gitops.current_branch(self.repo_root)
+            if cur == "HEAD":
+                raise EntryContractError(
+                    "base_branch is 'current' but HEAD is detached; check out a "
+                    "branch to run from before `gauntlet run`"
+                )
+            return cur
+        return raw
+
+    def _prepare_run_branch(self, branch: str, base: str) -> None:
+        """Put the worktree on a clean run branch ``branch`` based on ``base``.
+
+        Fail-closed branch lifecycle (replaces a bare ``checkout``, which once
+        silently rewound a worktree onto a stale branch):
+
+        * absent            -> create it off ``base``.
+        * merged into base  -> spent; discard and recreate fresh off ``base``.
+          (After ``finish``/merge into the base, re-running the slug self-heals.)
+        * unmerged/divergent -> REFUSE. The branch carries commits not in
+          ``base``; adopting it could rewind the tree or stack on stale work.
+          The human resolves it (`gauntlet clean`, merge, or rename).
+        """
+        repo = self.repo_root
+        if not gitops.branch_exists(repo, branch):
+            gitops.checkout_or_create_branch(repo, branch, base)
+            return
+        if gitops.is_ancestor(repo, branch, base):
+            gitops.recreate_branch(repo, branch, base)
+            return
+        raise StaleRunBranchError(
+            f"run branch {branch!r} already exists with commits not in base "
+            f"{base!r}; refusing to adopt it (it may be a stale or unfinished "
+            f"run). Run `gauntlet clean {branch.split('/')[-1]}` to discard it "
+            "if it is merged elsewhere, or merge/rename it, then retry."
+        )
+
     def _refuse_if_active_run(self, layout: "RunLayout") -> None:
         """Fail closed if a non-terminal run already owns this slug (review).
 
@@ -206,8 +275,9 @@ class RunManager:
         pipeline, phash = load_pipeline(pipeline_path)
         validate_pipeline(pipeline, self.config)
 
+        base_branch = self._resolve_base_branch()
         branch = f"{self.config.branch_prefix}{slug}"
-        gitops.checkout_or_create_branch(self.repo_root, branch, self.config.base_branch)
+        self._prepare_run_branch(branch, base_branch)
 
         run_id = f"run-{_utc_stamp()}"
         run_dir = layout.run_dir(run_id)
@@ -227,7 +297,9 @@ class RunManager:
             run_id=run_id,
             slug=slug,
             branch=branch,
-            base_branch=self.config.base_branch,
+            # Record the RESOLVED base (never the `current` sentinel) so resume,
+            # the PR draft, and `finish` all act on a concrete branch name.
+            base_branch=base_branch,
             pipeline=PipelineRef(name=pipeline.name, version=pipeline.version, hash=phash),
             prompt_hashes=self._prompt_hashes(pipeline),
         )
@@ -297,6 +369,120 @@ class RunManager:
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
         return man.status
+
+    # ---- clean (run-branch tidy) --------------------------------------------
+    def clean(self, slug: str, *, force: bool = False) -> str:
+        """Delete the run branch once it is merged; preserve the run record.
+
+        Safe by construction: refuse unless ``gauntlet/<slug>`` is fully merged
+        into its recorded base (``--force`` overrides). Removes only the
+        ephemeral branch + the live ``active-run.txt`` pointer — never the
+        committed run dir (prd.md, manifest, transcripts are the audit trail).
+        """
+        layout = self.layout(slug)
+        repo = self.repo_root
+        branch = f"{self.config.branch_prefix}{slug}"
+        if not gitops.branch_exists(repo, branch):
+            cleared = self._clear_active_pointer(layout)
+            return (
+                f"no branch {branch!r}"
+                + ("; cleared stale active-run pointer" if cleared else "; nothing to do")
+            )
+        base = self._recorded_base(layout)
+        if not force:
+            if base is None:
+                raise RunBranchNotMergedError(
+                    f"cannot determine the base for {branch!r} (no run manifest); "
+                    "merge it and retry, or pass --force to delete anyway"
+                )
+            if not gitops.is_ancestor(repo, branch, base):
+                raise RunBranchNotMergedError(
+                    f"refusing to delete {branch!r}: not fully merged into base "
+                    f"{base!r}. Merge it first (e.g. `gauntlet finish {slug}`), "
+                    "or pass --force to discard it."
+                )
+        if gitops.current_branch(repo) == branch:
+            target = base
+            if target is None or target == branch:
+                raise RunBranchNotMergedError(
+                    f"on {branch!r} with no recorded base to step onto; check "
+                    "out another branch first, then `gauntlet clean`"
+                )
+            gitops.checkout_branch(repo, target)
+        gitops.delete_branch(repo, branch)
+        self._clear_active_pointer(layout)
+        return f"deleted {branch!r}" + (" (forced)" if force else "")
+
+    # ---- finish (merge into base + tidy) ------------------------------------
+    def finish(self, slug: str) -> str:
+        """Merge a completed run into its base, then clean up (one-verb land).
+
+        Fail closed: requires the run to be ``done`` and the worktree clean,
+        then merges ``gauntlet/<slug>`` into its recorded base with a merge
+        commit, deletes the branch, and clears the active pointer. A merge
+        conflict is aborted (never left half-applied) and surfaced for a manual
+        merge. Wraps :meth:`clean`'s cleanup; ``clean`` stays the primitive for
+        teams whose gauntlet->base merge is itself a reviewed PR.
+        """
+        layout = self.layout(slug)
+        run_dir = layout.active_run_dir()
+        man = Manifest.load(run_dir / "manifest.json")
+        repo = self.repo_root
+        branch, base = man.branch, man.base_branch
+
+        if man.status != M.RUN_DONE:
+            raise FinishError(
+                f"run {man.run_id!r} is {man.status!r}, not done; finish merges "
+                "only a completed run — resume or approve its gates first"
+            )
+        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        if not gitops.is_clean(repo, exclude=excludes):
+            raise FinishError(
+                "refusing finish: worktree is dirty; commit or discard first"
+            )
+        if not gitops.branch_exists(repo, branch):
+            raise FinishError(f"run branch {branch!r} does not exist")
+        if not gitops.branch_exists(repo, base):
+            raise FinishError(f"base branch {base!r} does not exist")
+
+        # Already merged (e.g. landed via a PR): nothing to merge, just tidy.
+        if gitops.is_ancestor(repo, branch, base):
+            if gitops.current_branch(repo) == branch:
+                gitops.checkout_branch(repo, base)
+            gitops.delete_branch(repo, branch)
+            self._clear_active_pointer(layout)
+            return f"already merged into {base!r}; deleted {branch!r}"
+
+        gitops.checkout_branch(repo, base)
+        msg = f"Merge {branch} into {base} (gauntlet finish {slug}, run {man.run_id})"
+        try:
+            gitops.merge_branch(repo, branch, message=msg)
+        except gitops.GitError as exc:
+            gitops.merge_abort(repo)
+            gitops.checkout_branch(repo, branch)  # leave the human where they were
+            raise FinishError(
+                f"merge of {branch!r} into {base!r} conflicts; resolve it "
+                f"manually (merge aborted, back on {branch!r}). Details: {exc}"
+            )
+        gitops.delete_branch(repo, branch)
+        self._clear_active_pointer(layout)
+        return f"merged {branch!r} into {base!r} and deleted the branch"
+
+    def _recorded_base(self, layout: "RunLayout") -> str | None:
+        """The resolved base branch recorded by the run, or None if unreadable."""
+        try:
+            man = Manifest.load(layout.active_run_dir() / "manifest.json")
+        except (OSError, ValueError, FileNotFoundError):
+            return None
+        return man.base_branch
+
+    @staticmethod
+    def _clear_active_pointer(layout: "RunLayout") -> bool:
+        """Remove the live active-run pointer (gitignored bookkeeping). Idempotent."""
+        if layout.active_pointer.exists():
+            layout.active_pointer.unlink()
+            return True
+        return False
 
     # ---- status -------------------------------------------------------------
     def status(self, slug: str) -> Manifest:

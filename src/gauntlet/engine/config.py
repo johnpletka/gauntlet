@@ -91,6 +91,10 @@ class RunConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    # Branch a run is created from. A literal branch name (default "main"), or
+    # the sentinel "current" meaning "branch from whatever branch is checked out
+    # now" — so a run stacks on the integration branch you are on without a
+    # per-run flag (the resolved name is recorded in the manifest).
     base_branch: str = "main"
     branch_prefix: str = "gauntlet/"
     # Single run-root for every artifact of a run (BOOTSTRAP-NOTES #2): plan,
