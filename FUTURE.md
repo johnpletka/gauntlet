@@ -37,3 +37,15 @@ so a partial fix accepted at a gate is tracked, not forgotten.
   load an existing config before selecting asset targets and honour its
   `asset_root`; treat a root→`.gauntlet` migration as an explicit, atomic
   operation with legacy-layout tests.
+
+## From run-branch-lifecycle (0.2.0) — deferred 2026-06-15
+
+- **Worktree isolation for runs.** `gauntlet run` operates in the user's primary
+  worktree (in-place `git checkout` of `gauntlet/<slug>`). Running each run in
+  its own git worktree (separate directory) would mean branch switching never
+  touches the user's working copy, and would enable concurrent same-repo runs.
+  Deferred to its own PR: it's a larger architectural change (run cwd, adapter
+  working dirs, judge `repo_root`, run-dir path resolution), and the
+  stale-branch guard shipped in 0.2.0 already closes the worktree-clobber bug
+  class, so isolation is defense-in-depth rather than a fix. See
+  [proposals/run-branch-lifecycle.md](proposals/run-branch-lifecycle.md) §5.

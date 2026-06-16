@@ -166,6 +166,32 @@ def abort(slug: str) -> None:
 
 
 @app.command()
+def clean(
+    slug: str,
+    force: bool = typer.Option(
+        False, "--force",
+        help="Delete the branch even if it is not merged into its base (unsafe).",
+    ),
+) -> None:
+    """Delete a merged run branch + clear its pointer; keep the run record.
+
+    Refuses unless `gauntlet/<slug>` is fully merged into its recorded base
+    (pass --force to override). Never touches the committed run dir.
+    """
+    typer.echo(_manager().clean(slug, force=force))
+
+
+@app.command()
+def finish(slug: str) -> None:
+    """Merge a completed run into its base, then delete the branch + pointer.
+
+    Requires the run to be done and the worktree clean; a merge conflict is
+    aborted and surfaced for a manual merge.
+    """
+    typer.echo(_manager().finish(slug))
+
+
+@app.command()
 def report(
     slug: str,
     trend: bool = typer.Option(

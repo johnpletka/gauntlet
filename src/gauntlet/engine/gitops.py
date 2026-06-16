@@ -115,6 +115,50 @@ def checkout_or_create_branch(repo: Path, branch: str, base: str) -> None:
         _run(repo, "checkout", "-b", branch, base)
 
 
+def checkout_branch(repo: Path, branch: str) -> None:
+    """Check out an existing branch (no creation)."""
+    _run(repo, "checkout", branch)
+
+
+def recreate_branch(repo: Path, branch: str, start_point: str) -> None:
+    """Reset ``branch`` to ``start_point`` and check it out (``checkout -B``).
+
+    Used by the run-branch lifecycle guard to discard a *spent* run branch (one
+    already merged into its base) and start it fresh. ``-B`` handles both the
+    on-branch and off-branch cases. The caller MUST have verified the branch is
+    fully merged first — ``-B`` moves the ref unconditionally, so calling it on
+    unmerged work would orphan those commits.
+    """
+    _run(repo, "checkout", "-B", branch, start_point)
+
+
+def delete_branch(repo: Path, branch: str) -> None:
+    """Force-delete a branch ref (``branch -D``).
+
+    Callers gate this with their own merged-ness check (``is_ancestor``) so the
+    engine never relies on git's narrower ``-d`` notion of "merged" (merged into
+    HEAD/upstream, not into the run's recorded base).
+    """
+    _run(repo, "branch", "-D", branch)
+
+
+def merge_branch(repo: Path, branch: str, *, message: str) -> str:
+    """Merge ``branch`` into the current branch with a merge commit (``--no-ff``).
+
+    A human-territory action (``gauntlet finish``): it runs with the repo's own
+    configured git identity, not an engine identity. Raises :class:`GitError` on
+    conflict; the caller aborts the half-merge and fails closed. Returns the new
+    HEAD SHA.
+    """
+    _run(repo, "merge", "--no-ff", "-m", message, branch)
+    return head_sha(repo)
+
+
+def merge_abort(repo: Path) -> None:
+    """Abort an in-progress merge, restoring the pre-merge state."""
+    _run(repo, "merge", "--abort")
+
+
 @dataclass(frozen=True)
 class Identity:
     name: str
