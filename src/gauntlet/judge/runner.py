@@ -70,6 +70,25 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def classifier_status_message(judge_model: str | None) -> str:
+    """One-line startup status for the judge's LLM classifier rung (FR-7.2).
+
+    Emitted loudly (stderr) at startup: a judge with no classifier model fails
+    closed on every command the ``policy.yaml`` fast-path does not match (and
+    every ``ask`` rule). That is the correct posture, but a SILENT one is exactly
+    what "data over inference" (CLAUDE.md §2) warns against — the operator should
+    not have to deduce a forgotten ``--judge-model`` from a later wall of deny
+    errors (which is precisely how this footgun bites in practice)."""
+    if judge_model:
+        return f"judge: LLM classifier enabled ({judge_model})"
+    return (
+        "judge: WARNING — no --judge-model set; LLM classifier DISABLED. "
+        "Commands not matched by the policy.yaml fast-path allow/deny rules "
+        "(and every 'ask' rule) will FAIL CLOSED (deny). "
+        "Pass --judge-model <litellm-model-id> to enable classification."
+    )
+
+
 def serve(
     *,
     policy_path: Path,
@@ -81,6 +100,7 @@ def serve(
     repo_root: Path | None = None,
 ) -> None:  # pragma: no cover - exercised via the live contract suite
     import os
+    import sys
 
     import uvicorn
 
@@ -97,7 +117,16 @@ def serve(
     app = create_app(core, token=resolved_token)
     print(f"gauntlet judge listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
+    # Classifier state goes to stderr so it never contaminates the token line on
+    # stdout (which tooling/operators scrape) — but is still impossible to miss.
+    print(classifier_status_message(judge_model), file=sys.stderr)
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
-__all__ = ["build_core", "generate_token", "serve", "token_from_env"]
+__all__ = [
+    "build_core",
+    "classifier_status_message",
+    "generate_token",
+    "serve",
+    "token_from_env",
+]

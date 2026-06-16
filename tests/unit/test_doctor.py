@@ -51,16 +51,36 @@ def _probes(
     *,
     authed: dict[str, bool | None] | None = None,
     which: object | None = None,
+    judge_model_resolvable: object | None = None,
 ) -> DoctorProbes:
     # Default: every present CLI is authenticated and the hook binary is on PATH,
     # so a "healthy" environment passes without a real subprocess/PATH probe.
+    # Default judge model resolver says "resolvable" so the classifier check
+    # never reaches into LiteLLM during offline tests.
     auth_map = authed if authed is not None else {c: True for c in versions}
     return DoctorProbes(
         cli_version=lambda name: versions.get(name),
         env=env,
         cli_authenticated=lambda name: auth_map.get(name),
         which=which if which is not None else (lambda name: f"/usr/bin/{name}"),
+        judge_model_resolvable=(
+            judge_model_resolvable
+            if judge_model_resolvable is not None
+            else (lambda _model: None)
+        ),
     )
+
+
+def _set_judge_llm(repo: Path, model: str | None) -> None:
+    """Set (or, with model=None, remove) the scaffold's `judge_llm` api profile."""
+    cfg_path = repo / ".gauntlet/config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    agents = cfg.setdefault("agents", {})
+    if model is None:
+        agents.pop("judge_llm", None)
+    else:
+        agents["judge_llm"] = {"adapter": "api", "model": model}
+    cfg_path.write_text(yaml.safe_dump(cfg))
 
 
 _GOOD_VERSIONS = {"claude": "2.1.172", "codex": "codex-cli 0.139.0"}
@@ -87,6 +107,51 @@ def test_healthy_environment_passes(tmp_path):
     # codex hook present-but-inert is healthy, not a failure
     assert names["codex-hook"].status == OK
     assert "inert" in names["codex-hook"].detail
+
+
+def test_judge_classifier_ok_when_model_resolvable(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    _set_judge_llm(repo, "gpt-5-mini")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    jc = _by_name(results)["judge-classifier"]
+    assert jc.status == OK
+    assert "gpt-5-mini" in jc.detail
+    assert not has_failure(results)
+
+
+def test_judge_classifier_warns_when_no_profile(tmp_path):
+    # Without a judge_llm profile, the engine-managed judge runs with the
+    # classifier disabled (fail-closed on everything off the fast-path).
+    repo = _healthy_repo(tmp_path)
+    _set_judge_llm(repo, None)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    jc = _by_name(results)["judge-classifier"]
+    assert jc.status == WARN
+    assert "fail closed" in jc.detail
+    assert jc.remedy and "judge_llm" in jc.remedy
+    assert not has_failure(results)  # a missing classifier WARNs, never blocks
+
+
+def test_judge_classifier_warns_on_unresolvable_model(tmp_path):
+    # An invalid LiteLLM id (e.g. `claude-heroku`) makes the classifier fail
+    # every call closed — doctor catches it before a run, not via deny errors.
+    repo = _healthy_repo(tmp_path)
+    _set_judge_llm(repo, "claude-heroku")
+    results = run_doctor(
+        repo,
+        probes=_probes(
+            _GOOD_VERSIONS, _GOOD_ENV,
+            judge_model_resolvable=lambda m: (
+                "LLM Provider NOT provided" if m == "claude-heroku" else None
+            ),
+        ),
+    )
+    jc = _by_name(results)["judge-classifier"]
+    assert jc.status == WARN
+    assert "claude-heroku" in jc.detail
+    assert "not resolvable" in jc.detail
+    assert jc.remedy and "valid LiteLLM model id" in jc.remedy
+    assert not has_failure(results)
 
 
 def test_missing_claude_cli_fails(tmp_path):

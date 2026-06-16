@@ -10,9 +10,23 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS, ManagedJudge
+from gauntlet.engine.judgeproc import (
+    _MANAGED_ENV_VARS,
+    ManagedJudge,
+    classifier_disabled_warning,
+)
 from gauntlet.judge.hook_client import STEP_ID_ENV_VAR
 from gauntlet.judge.service import TOKEN_ENV_VAR
+
+
+def test_classifier_disabled_warning_is_actionable():
+    # The engine-managed judge's parallel to the standalone warning: when no
+    # judge_llm model is configured, the classifier is disabled and the run
+    # fails closed off the fast-path. The remedy is config-shaped, not a flag.
+    msg = classifier_disabled_warning()
+    assert "WARNING" in msg
+    assert "FAIL CLOSED" in msg
+    assert "judge_llm" in msg
 
 
 class _FakeProc:

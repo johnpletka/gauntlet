@@ -70,6 +70,23 @@ def _no_auth_probe(_name: str) -> bool | None:
     return None
 
 
+def _real_judge_model_resolvable(model: str) -> str | None:
+    """None if LiteLLM can resolve a provider for ``model`` (no network call),
+    else a short one-line error. Catches unresolvable ids like ``claude-heroku``
+    — on which the judge's classifier rung fails *every* call closed (FR-7.2).
+    LiteLLM unavailable → None: we cannot verify offline, so we do not warn."""
+    try:
+        import litellm
+
+        litellm.get_llm_provider(model)
+    except ImportError:
+        return None
+    except Exception as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return first[:200]
+    return None
+
+
 @dataclass(frozen=True)
 class DoctorProbes:
     """Injectable environment access so checks are testable offline."""
@@ -83,6 +100,9 @@ class DoctorProbes:
     # PATH lookup for the hook console script (injected so tests are
     # deterministic regardless of the runner's PATH).
     which: Callable[[str], str | None] = shutil.which
+    # judge_llm model id -> None if LiteLLM resolves a provider, else a short
+    # error string. Injected so the classifier check runs offline/deterministic.
+    judge_model_resolvable: Callable[[str], str | None] = _real_judge_model_resolvable
 
 
 def _real_cli_version(name: str) -> str | None:
@@ -146,6 +166,7 @@ def real_probes() -> DoctorProbes:
         env=os.environ,
         cli_authenticated=_real_cli_authenticated,
         which=shutil.which,
+        judge_model_resolvable=_real_judge_model_resolvable,
     )
 
 
@@ -348,6 +369,37 @@ def _check_judge(repo_root: Path, asset_root: str = ".") -> CheckResult:
     return CheckResult("judge", OK, "policy.yaml loads; judge startable")
 
 
+def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
+    """FR-7.2: the judge's LLM classifier rung. With no resolvable ``judge_llm``
+    model, every command the policy fast-path does not match (and every ``ask``
+    rule) fails closed — a silent footgun surfaced HERE, before a run, rather
+    than left for the operator to infer from a later wall of deny errors. (The
+    key itself is covered by ``api-keys``; this check is purely about whether a
+    classifier is configured and its model id is resolvable.)"""
+    profile = config.agents.get("judge_llm")
+    model = getattr(profile, "model", None) if profile is not None else None
+    if not model:
+        return CheckResult(
+            "judge-classifier", WARN,
+            "no `judge_llm` profile: LLM classifier disabled — commands the "
+            "policy.yaml fast-path does not match will fail closed",
+            remedy="add a `judge_llm` agent profile (e.g. api / gpt-5-mini) to "
+            "enable classification, or accept fail-closed-only operation",
+        )
+    err = probes.judge_model_resolvable(model)
+    if err:
+        return CheckResult(
+            "judge-classifier", WARN,
+            f"judge_llm model {model!r} is not resolvable by LiteLLM: {err}",
+            remedy="use a valid LiteLLM model id (e.g. `gpt-5-mini` or "
+            "`anthropic/claude-haiku-4-5`); an unresolvable model fails every "
+            "classifier call closed",
+        )
+    return CheckResult(
+        "judge-classifier", OK, f"LLM classifier model {model!r} resolvable"
+    )
+
+
 def _required_key(model: str) -> str | None:
     low = model.lower()
     for prefix, var in _KEY_BY_PREFIX.items():
@@ -525,6 +577,7 @@ def run_doctor(
         if referenced is not None and "judge_llm" in config.agents:
             referenced = referenced | {"judge_llm"}
         results.append(_check_api_keys(config, probes, referenced))
+        results.append(_check_judge_classifier(config, probes))
     results.append(_check_pin_file(repo_root, pins))
     return results
 

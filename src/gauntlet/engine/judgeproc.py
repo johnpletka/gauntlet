@@ -43,6 +43,20 @@ _MANAGED_ENV_VARS = (
 )
 
 
+def classifier_disabled_warning() -> str:
+    """The stderr warning emitted when the engine starts a judge with no
+    classifier model (FR-7.2). Mirrors the standalone ``gauntlet judge serve``
+    warning, but its remedy is config-shaped (add a ``judge_llm`` profile), since
+    the engine derives the model from config — not a CLI flag. Surfaced loudly so
+    a fail-closed judge is never a silent surprise (data over inference)."""
+    return (
+        "gauntlet: WARNING — engine-managed judge has no judge_llm model; the "
+        "LLM classifier is DISABLED, so any command the policy.yaml fast-path "
+        "does not match will FAIL CLOSED. Add a `judge_llm` agent profile to "
+        ".gauntlet/config.yaml to enable classification."
+    )
+
+
 class ManagedJudge:
     def __init__(
         self,
@@ -90,6 +104,8 @@ class ManagedJudge:
         return env
 
     def start(self) -> dict[str, str]:
+        if not self.judge_model:
+            print(classifier_disabled_warning(), file=sys.stderr)
         child_env = {**os.environ, TOKEN_ENV_VAR: self.token}
         argv = [
             sys.executable,
