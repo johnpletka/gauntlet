@@ -77,9 +77,34 @@ def _exclude_pathspec(exclude: list[str] | None) -> list[str]:
     return spec
 
 
-def status_porcelain(repo: Path, *, exclude: list[str] | None = None) -> str:
-    """Porcelain status; empty string means a clean worktree."""
-    return _run(repo, "status", "--porcelain", *_exclude_pathspec(exclude)).strip()
+def status_porcelain(
+    repo: Path, *, exclude: list[str] | None = None, untracked_all: bool = False
+) -> str:
+    """Porcelain status; empty string means a clean worktree.
+
+    The untracked-files mode is ALWAYS pinned explicitly (never left to git
+    config). An adopter with ``status.showUntrackedFiles=no`` would otherwise
+    make ``--porcelain`` omit untracked files entirely, so ``is_clean`` could
+    report a clean tree while untracked work exists — silently bypassing the
+    FR-9.3 clean-handoff invariant and FR-9.6 mutation detection (review:
+    safety checks must not depend on adopter-local git config; fail closed,
+    determinism over cleverness). The explicit ``--untracked-files`` flag
+    overrides that config.
+
+    ``untracked_all`` selects ``all`` over the default ``normal``. ``normal``
+    collapses a fully-untracked directory into a single ``dir/`` entry — fine
+    for a clean/dirty boolean, but lossy for any caller that compares the
+    reported paths against a specific file. A nested run-artifact layout
+    (``.gauntlet/runs/<slug>/prd.md``) collapses all the way up to
+    ``.gauntlet/runs/`` before anything under it is tracked, so a path-equality
+    check never sees the file. Callers that match on individual paths must pass
+    ``untracked_all=True``.
+    """
+    mode = "all" if untracked_all else "normal"
+    return _run(
+        repo, "status", "--porcelain", f"--untracked-files={mode}",
+        *_exclude_pathspec(exclude),
+    ).strip()
 
 
 def is_clean(repo: Path, *, exclude: list[str] | None = None) -> bool:

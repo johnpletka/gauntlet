@@ -858,6 +858,15 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
     The freshly authored/edited artifact is the *only* expected dirt before an
     artifact-mode review; anything else uncommitted is a genuinely dirty handoff
     that must fail (FR-9.3), so the baseline commit fires only in the clean case.
+
+    Uses ``untracked_all`` so the comparison sees the artifact's individual
+    path. In git's default untracked mode a brand-new artifact under a not-yet-
+    tracked run tree (``.gauntlet/runs/<slug>/prd.md``) is reported as the
+    collapsed parent directory (``.gauntlet/runs/``), which never equals the
+    file path — so the guard would silently decline and the run would fail the
+    round-1 clean-handoff check with a misleading "worktree dirty" error
+    instead of committing the baseline. (This is the adopter-layout failure
+    mode; gauntlet's own root layout happened to dodge it.)
     """
     name = step.get("artifact")
     if not name:
@@ -868,7 +877,9 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
         ).as_posix()
     except ValueError:
         return False
-    status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+    status = gitops.status_porcelain(
+        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+    )
     paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
     return paths == [rel]
 

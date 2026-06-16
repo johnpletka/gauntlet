@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -22,6 +23,7 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import (
     DATA_BEGIN,
     DATA_END,
+    _only_artifact_dirty,
     _persist_round_triage,
     _triage_integrity_stray,
     needs_escalation,
@@ -304,6 +306,40 @@ def test_persist_round_triage_writes_authoritative_when_aligned(tmp_path):
     assert (tmp_path / "artifacts" / "triage.json").exists()
     assert writes["triage.json"] == tmp_path / "artifacts" / "triage.json"
     assert not (tmp_path / "artifacts" / "triage-mismatch.json").exists()
+
+
+# --- artifact-mode baseline guard: adopter nested-layout untracked collapse ----
+def test_only_artifact_dirty_sees_nested_untracked_artifact(fixture_repo):
+    """Adopter layout: a fresh prd.md under a not-yet-tracked run tree.
+
+    Git's default untracked mode collapses the whole untracked tree to the
+    parent dir (``.gauntlet/runs/``), which never equals the artifact's file
+    path — so without ``untracked_all`` the guard declines, the baseline commit
+    is skipped, and round-1 fails with a misleading "worktree dirty" error
+    (the estimation-improvements adopter failure). The guard must still see the
+    artifact as the sole dirty path.
+    """
+    slug_dir = fixture_repo / ".gauntlet" / "runs" / "estimation-improvements"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "prd.md").write_text("PRD body\n")
+    # The bug: default-mode porcelain collapses the untracked tree to a parent
+    # directory entry, never the artifact's own path.
+    collapsed = [ln[3:] for ln in gitops.status_porcelain(fixture_repo).splitlines()]
+    assert collapsed == [c for c in collapsed if c.endswith("/")]  # all dirs
+    assert ".gauntlet/runs/estimation-improvements/prd.md" not in collapsed
+    ctx = SimpleNamespace(repo_root=fixture_repo, artifact_root=slug_dir, excludes=[])
+    assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is True
+
+
+def test_only_artifact_dirty_false_when_a_second_path_is_dirty(fixture_repo):
+    """A genuinely dirty handoff (anything beyond the artifact) must still fail
+    the guard so it is never swept into a baseline commit (FR-9.3)."""
+    slug_dir = fixture_repo / ".gauntlet" / "runs" / "slug"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "prd.md").write_text("PRD\n")
+    (fixture_repo / "stray.txt").write_text("unexpected uncommitted work\n")
+    ctx = SimpleNamespace(repo_root=fixture_repo, artifact_root=slug_dir, excludes=[])
+    assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is False
 
 
 def test_converges_in_two_rounds(cycle_repo):
