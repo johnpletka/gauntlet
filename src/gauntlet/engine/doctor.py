@@ -409,6 +409,24 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
     )
 
 
+def _check_test_command(config) -> CheckResult:
+    """Issue #18: a config left with the un-configured placeholder would fail
+    every phase's test gate. Surface it as a WARN here, before a run, rather than
+    leaving the operator to decode a failed shell step mid-pipeline."""
+    from gauntlet.engine.detect import is_placeholder_command
+
+    command = getattr(config, "test_command", None)
+    if is_placeholder_command(command):
+        return CheckResult(
+            "test-command", WARN,
+            "test_command is the un-configured placeholder (gauntlet init could "
+            "not auto-detect one)",
+            remedy="set test_command in .gauntlet/config.yaml to the command that "
+            "runs this project's tests (must exit non-zero on failure)",
+        )
+    return CheckResult("test-command", OK, f"test_command: {command!r}")
+
+
 def _required_key(model: str) -> str | None:
     low = model.lower()
     for prefix, var in _KEY_BY_PREFIX.items():
@@ -587,6 +605,7 @@ def run_doctor(
             referenced = referenced | {"judge_llm"}
         results.append(_check_api_keys(config, probes, referenced))
         results.append(_check_judge_classifier(config, probes))
+        results.append(_check_test_command(config))
     results.append(_check_pin_file(repo_root, pins))
     return results
 

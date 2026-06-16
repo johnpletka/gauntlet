@@ -197,6 +197,53 @@ def test_from_repo_reports_present_when_assets_exist(tmp_path):
     assert not result.missing
 
 
+def test_init_detects_test_command_for_python_repo(tmp_path):
+    # issue #18: a Python/uv repo gets `uv run pytest` written into the config.
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_x.py").write_text("def test_x():\n    assert True\n")
+    init_repo(tmp_path)
+    config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
+    assert config.test_command == "uv run pytest"
+
+
+def test_init_detects_node_test_command(tmp_path):
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
+    init_repo(tmp_path)
+    config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
+    assert config.test_command == "npm test"
+
+
+def test_init_writes_placeholder_for_unrecognised_repo(tmp_path):
+    # An empty repo cannot be auto-detected; init writes a fail-closed placeholder
+    # (not a wrong default) plus guidance, and the config still loads.
+    from gauntlet.engine.detect import is_placeholder_command
+
+    result = init_repo(tmp_path)
+    config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
+    assert is_placeholder_command(config.test_command)
+    text = (tmp_path / ".gauntlet/config.yaml").read_text()
+    assert "could not determine a single test command" in text
+    detail = {a.path: a.detail for a in result.actions}[".gauntlet/config.yaml"]
+    assert "no recognised build markers" in detail
+
+
+def test_init_flags_multi_module_repo(tmp_path):
+    # issue #18 concern #2: backend + frontend has no single command.
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend/pyproject.toml").write_text("[tool.uv]\n")
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend/package.json").write_text('{"scripts": {"test": "jest"}}')
+    from gauntlet.engine.detect import is_placeholder_command
+
+    init_repo(tmp_path)
+    config = RunConfig.load(tmp_path / ".gauntlet/config.yaml")
+    assert is_placeholder_command(config.test_command)
+    text = (tmp_path / ".gauntlet/config.yaml").read_text()
+    assert "cd backend && uv run pytest" in text
+    assert "cd frontend && npm test" in text
+
+
 def test_shipped_scaffold_matches_repo_canonical_assets():
     """The bundled defaults must not drift from the repo's live assets.
 

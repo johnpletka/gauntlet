@@ -168,6 +168,29 @@ def test_judge_classifier_warns_on_unresolvable_model(tmp_path):
     assert not has_failure(results)
 
 
+def test_test_command_placeholder_warns(tmp_path):
+    # issue #18: an un-configured (placeholder) test_command WARNs before a run,
+    # rather than failing every phase's test gate mid-pipeline.
+    repo = _healthy_repo(tmp_path)  # init on an empty repo -> placeholder command
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    tc = _by_name(results)["test-command"]
+    assert tc.status == WARN
+    assert tc.remedy and "test_command" in tc.remedy
+    assert not has_failure(results)  # un-configured test command WARNs, never blocks
+
+
+def test_test_command_ok_when_detected(tmp_path):
+    # A repo with a detectable stack gets a real command and doctor reports OK.
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_x.py").write_text("def test_x():\n    assert True\n")
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    tc = _by_name(results)["test-command"]
+    assert tc.status == OK
+    assert "uv run pytest" in tc.detail
+
+
 def test_missing_claude_cli_fails(tmp_path):
     repo = _healthy_repo(tmp_path)
     results = run_doctor(
