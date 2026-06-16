@@ -37,3 +37,13 @@ so a partial fix accepted at a gate is tracked, not forgotten.
   load an existing config before selecting asset targets and honour its
   `asset_root`; treat a root→`.gauntlet` migration as an explicit, atomic
   operation with legacy-layout tests.
+
+## Feature proposals (pre-spec; require ratification)
+
+- **Interactive PRD authoring — `gauntlet new --interactive`.** Human-driven,
+  agent-assisted path to author a run's `prd.md` in place, with a pluggable
+  `--from` input source (Linear ticket, GitHub issue, local doc). Sits on the
+  *assist* side of FR-10.1 (interview-not-generate; human stays author of
+  record; entry contract + PRD review gate unchanged). Adds an FR delta, so it
+  needs ratification before engine work. Full proposal:
+  [proposals/interactive-prd-authoring.md](proposals/interactive-prd-authoring.md).
