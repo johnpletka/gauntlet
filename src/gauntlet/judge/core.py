@@ -47,7 +47,7 @@ class JudgeCore:
     ) -> JudgeDecision:
         start = time.monotonic()
         effective_root = self.repo_root or repo_root
-        decision = self._ladder(tool_name, tool_input, effective_root)
+        decision = self._ladder(tool_name, tool_input, effective_root, step_id)
         latency_ms = round((time.monotonic() - start) * 1000, 2)
         self._audit(
             tool_name, tool_input, decision, latency_ms, run_id, step_id,
@@ -56,11 +56,14 @@ class JudgeCore:
         return decision
 
     def _ladder(
-        self, tool_name: str, tool_input: dict, repo_root: Path
+        self, tool_name: str, tool_input: dict, repo_root: Path,
+        step_id: str | None = None,
     ) -> JudgeDecision:
-        # Rung 1: deterministic policy fast path.
+        # Rung 1: deterministic policy fast path. step_id lets context-aware
+        # rules (pipeline_step_only) gate in-run agents differently from the
+        # operator's interactive session.
         fast = self.policy_engine.evaluate(
-            tool_name, tool_input, repo_root=repo_root
+            tool_name, tool_input, repo_root=repo_root, step_id=step_id
         )
         if fast is not None and fast.decision in ("allow", "deny"):
             return fast

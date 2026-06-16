@@ -73,6 +73,12 @@ class PolicyRule(BaseModel):
     credential_path: bool = False  # path matches a credential pattern (any location)
     credential_outside_repo: bool = False  # credential pattern AND outside repo
     risk_category: str | None = None
+    # When True, the rule matches ONLY while a gauntlet pipeline step is active
+    # (the decide request carried a step_id). Lets the policy gate an action for
+    # in-run agents — FR-9.8 defense-in-depth (the pipeline must not autonomously
+    # push or open PRs) — while still allowing it in the operator's own
+    # interactive sessions, where push/PR is ordinary directed workflow.
+    pipeline_step_only: bool = False
 
     @field_validator("command_patterns")
     @classmethod
@@ -108,10 +114,14 @@ class PolicyEngine:
         tool_input: dict[str, Any],
         *,
         repo_root: Path,
+        step_id: str | None = None,
     ) -> JudgeDecision | None:
         command = self._command_text(tool_name, tool_input)
         paths = self._candidate_paths(tool_name, tool_input, command)
         chained = bool(_CHAINING_RE.search(command))
+        # A non-empty step_id means this call originates from inside a gauntlet
+        # pipeline step (an in-run agent), not the operator's free session.
+        in_pipeline_step = bool(step_id)
 
         # Deny-first: a single matching deny rule is terminal (FR-7.2). Allow
         # rules are skipped when the command chains/redirects (review F-001),
@@ -125,7 +135,9 @@ class PolicyEngine:
             if action == "allow" and chained:
                 continue
             for rule in rules:
-                if self._matches(rule, tool_name, command, paths, repo_root):
+                if self._matches(
+                    rule, tool_name, command, paths, repo_root, in_pipeline_step
+                ):
                     return JudgeDecision(
                         decision=action,  # type: ignore[arg-type]
                         source="fast-path",
@@ -144,8 +156,11 @@ class PolicyEngine:
         command: str,
         paths: list[Path],
         repo_root: Path,
+        in_pipeline_step: bool = False,
     ) -> bool:
         if rule.applies_to_tools is not None and tool_name not in rule.applies_to_tools:
+            return False
+        if rule.pipeline_step_only and not in_pipeline_step:
             return False
         # A rule with multiple matcher kinds requires ALL specified kinds to
         # match (AND), so e.g. credential_outside_repo is precise.

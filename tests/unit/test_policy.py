@@ -181,6 +181,64 @@ def test_force_push_still_denied_after_allowing_push(engine, cmd):
     assert d.matched_rule == "force-push"
 
 
+# --- context-aware: push/PR-create gated inside a pipeline step (FR-9.8) ----
+@pytest.mark.parametrize("cmd", ["git push origin feature", "gh pr create --fill"])
+def test_push_and_pr_create_denied_inside_pipeline_step(engine, cmd):
+    # An in-run agent (step_id set) must not push or open PRs — FR-9.8/§2.2
+    # defense-in-depth — even though the operator's own session allows it.
+    d = engine.evaluate(
+        "Bash", {"command": cmd}, repo_root=REPO_ROOT, step_id="implement"
+    )
+    assert d is not None and d.decision == "deny", f"{cmd} -> {d}"
+    assert d.matched_rule == "push-or-pr-open-in-pipeline-step"
+
+
+@pytest.mark.parametrize("cmd", ["git push origin feature", "gh pr create --fill"])
+def test_push_and_pr_create_allowed_in_operator_session(engine, cmd):
+    # Same commands with no pipeline step (the operator's own session) -> allowed.
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT, step_id=None)
+    assert d is not None and d.decision == "allow", f"{cmd} -> {d}"
+
+
+def test_pr_read_allowed_even_inside_pipeline_step(engine):
+    # Reading PR state is not an FR-9.8 concern; allowed in either context.
+    d = engine.evaluate(
+        "Bash", {"command": "gh pr view 15"}, repo_root=REPO_ROOT, step_id="review"
+    )
+    assert d is not None and d.decision == "allow"
+    assert d.matched_rule == "gh-pr-propose-and-read"
+
+
+# --- destructive push forms denied in EVERY context ------------------------
+@pytest.mark.parametrize(
+    "cmd,rule",
+    [
+        ("git push origin --delete feature", "git-push-remote-delete"),
+        ("git push -d origin feature", "git-push-remote-delete"),
+        ("git push origin :feature", "git-push-remote-delete"),
+        ("git push origin main", "git-push-to-base-branch"),
+        ("git push -u origin master", "git-push-to-base-branch"),
+        ("git push origin HEAD:main", "git-push-to-base-branch"),
+        ("git push origin feature:master", "git-push-to-base-branch"),
+    ],
+)
+@pytest.mark.parametrize("step_id", [None, "implement"])
+def test_destructive_push_denied_in_every_context(engine, cmd, rule, step_id):
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT, step_id=step_id)
+    assert d is not None and d.decision == "deny", f"{cmd} (step={step_id}) -> {d}"
+    assert d.matched_rule == rule
+
+
+def test_feature_branch_named_like_base_not_denied(engine):
+    # A feature branch whose name merely contains 'main' is ordinary publishing,
+    # not a push to the base branch.
+    d = engine.evaluate(
+        "Bash", {"command": "git push origin main-feature"}, repo_root=REPO_ROOT
+    )
+    assert d is not None and d.decision == "allow"
+    assert d.matched_rule == "git-push"
+
+
 @pytest.mark.parametrize("cmd", ["env", "printenv", "printenv OPENAI_API_KEY"])
 def test_env_dump_not_terminally_allowed(engine, cmd):
     # review: bare `env`/`printenv` dumps every var (API keys, judge token) into

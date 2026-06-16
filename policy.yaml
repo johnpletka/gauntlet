@@ -33,6 +33,28 @@ deny:
     command_patterns:
       - '\bgh\s+pr\s+merge\b'
 
+  - name: git-push-remote-delete
+    description: "Deleting a remote branch is destructive to shared state. Not a force-push (so the force-push rule misses it), but never part of ordinary feature-branch publishing — gate it in every context."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bgit\s+push\b[^\n]*\s(--delete|-d)\b'
+      - '\bgit\s+push\b[^\n]*\s:[\w./-]+'   # empty-source refspec (origin :branch) = delete
+
+  - name: git-push-to-base-branch
+    description: "Pushing directly to main/master bypasses the PR audit boundary (CLAUDE.md: nothing lands on main directly). Covers `… origin main` and refspec `…:main`. Custom base branches are additionally covered in-pipeline by push-or-pr-open-in-pipeline-step."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bgit\s+push\b[^\n]*\s(main|master)(\s|$)'
+      - '\bgit\s+push\b[^\n]*:(main|master)(\s|$)'
+
+  - name: push-or-pr-open-in-pipeline-step
+    description: "FR-9.8 / §2.2 defense-in-depth: a gauntlet pipeline must not autonomously push or open PRs (it drafts PR.md; the human opens it). So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though the operator's own interactive sessions allow them below."
+    applies_to_tools: [Bash]
+    pipeline_step_only: true
+    command_patterns:
+      - '\bgit\s+push\b'
+      - '\bgh\s+pr\s+create\b'
+
   - name: rm-rf-dangerous
     description: "Recursive force-delete of a root, home, or path outside the repo."
     applies_to_tools: [Bash]
@@ -128,13 +150,13 @@ allow:
       - '^\s*git\s+(add|commit(?![^\n]*--amend)|checkout(?![^\n]*-f\b)|switch|fetch|pull(?![^\n]*--force)|merge(?![^\n]*--abort)|restore|tag(?!\s+-d))\b'
 
   - name: git-push
-    description: "Push a branch to the remote. Force-push (--force/-f/+refspec) and history rewrites stay denied — those deny rules are evaluated first (deny-first), so this allow never covers them."
+    description: "Push a feature branch to the remote in an operator (non-pipeline) session. Deny-first rules evaluated above already block the unsafe forms in every context (force-push, history rewrite, remote-branch delete, push to main/master) and block ALL push inside a pipeline step — so this allow only ever covers ordinary feature-branch publishing the operator directed."
     applies_to_tools: [Bash]
     command_patterns:
       - '^\s*git\s+push\b'
 
   - name: gh-pr-propose-and-read
-    description: "Open a pull request and read PR state (create + view/list/diff/checks/status). Merging stays gated — see the gh-pr-merge deny rule."
+    description: "Operator session: open a PR (create) and read PR state (view/list/diff/checks/status). Merging stays denied (gh-pr-merge); `gh pr create` inside a pipeline step is denied (push-or-pr-open-in-pipeline-step) — FR-9.8 keeps PR-opening a human action for the harness while leaving it available to the operator."
     applies_to_tools: [Bash]
     command_patterns:
       - '^\s*gh\s+pr\s+(create|view|list|diff|checks|status)\b'
