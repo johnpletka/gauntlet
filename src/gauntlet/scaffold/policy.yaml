@@ -27,6 +27,12 @@ deny:
       - '\bgit\s+update-ref\s+-d\b'
       - '\bgit\s+branch\s+(-D|-M|--delete\s+--force)\b'
 
+  - name: gh-pr-merge
+    description: "Merging a PR lands code on a shared base branch — a human ratification step, not an agent action (CLAUDE.md §2: humans ratify, agents propose). Denied even in a chained command so a benign prefix cannot bless it."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '\bgh\s+pr\s+merge\b'
+
   - name: rm-rf-dangerous
     description: "Recursive force-delete of a root, home, or path outside the repo."
     applies_to_tools: [Bash]
@@ -120,6 +126,18 @@ allow:
     applies_to_tools: [Bash]
     command_patterns:
       - '^\s*git\s+(add|commit(?![^\n]*--amend)|checkout(?![^\n]*-f\b)|switch|fetch|pull(?![^\n]*--force)|merge(?![^\n]*--abort)|restore|tag(?!\s+-d))\b'
+
+  - name: git-push
+    description: "Push a branch to the remote. Force-push (--force/-f/+refspec) and history rewrites stay denied — those deny rules are evaluated first (deny-first), so this allow never covers them."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*git\s+push\b'
+
+  - name: gh-pr-propose-and-read
+    description: "Open a pull request and read PR state (create + view/list/diff/checks/status). Merging stays gated — see the gh-pr-merge deny rule."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*gh\s+pr\s+(create|view|list|diff|checks|status)\b'
 
   - name: read-inspect
     description: "Listing/reading/searching files within the workspace."

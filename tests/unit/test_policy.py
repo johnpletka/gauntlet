@@ -130,6 +130,57 @@ def test_ask_categories(engine, cmd, category):
     assert decision.risk_category == category
 
 
+# --- push + PR propose allowed; force-push and PR-merge stay denied -------
+@pytest.mark.parametrize(
+    "cmd,rule",
+    [
+        ("git push -u origin fix/foo", "git-push"),
+        ("git push origin feature", "git-push"),
+        ("gh pr create --fill --base main", "gh-pr-propose-and-read"),
+        ("gh pr view 15", "gh-pr-propose-and-read"),
+        ("gh pr list", "gh-pr-propose-and-read"),
+        ("gh pr diff 15", "gh-pr-propose-and-read"),
+        ("gh pr checks", "gh-pr-propose-and-read"),
+        ("gh pr status", "gh-pr-propose-and-read"),
+    ],
+)
+def test_push_and_pr_propose_allowed(engine, cmd, rule):
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert d is not None and d.decision == "allow", f"{cmd} -> {d}"
+    assert d.matched_rule == rule
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh pr merge 15",
+        "gh pr merge --squash 15",
+        # Deny-first wins even when a benign (allowed) prefix chains into merge.
+        "git push -u origin foo && gh pr merge 15",
+    ],
+)
+def test_pr_merge_denied(engine, cmd):
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert d is not None and d.decision == "deny", f"{cmd} -> {d}"
+    assert d.matched_rule == "gh-pr-merge"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push --force origin main",
+        "git push -f origin feature",
+        "git push --force-with-lease origin main",
+        "git push origin +main:main",
+    ],
+)
+def test_force_push_still_denied_after_allowing_push(engine, cmd):
+    # Allowing plain `git push` must not weaken the force-push deny (deny-first).
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert d is not None and d.decision == "deny", f"{cmd} -> {d}"
+    assert d.matched_rule == "force-push"
+
+
 @pytest.mark.parametrize("cmd", ["env", "printenv", "printenv OPENAI_API_KEY"])
 def test_env_dump_not_terminally_allowed(engine, cmd):
     # review: bare `env`/`printenv` dumps every var (API keys, judge token) into
