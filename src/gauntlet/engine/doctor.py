@@ -70,6 +70,15 @@ def _no_auth_probe(_name: str) -> bool | None:
     return None
 
 
+def _real_judge_model_resolvable(model: str) -> str | None:
+    """None if LiteLLM can resolve a provider for ``model``, else a short error.
+    Delegates to the shared :func:`model_provider_error` so doctor and the judge
+    startup path agree on what "resolvable" means (PR #13 review)."""
+    from gauntlet.adapters.api import model_provider_error
+
+    return model_provider_error(model)
+
+
 @dataclass(frozen=True)
 class DoctorProbes:
     """Injectable environment access so checks are testable offline."""
@@ -83,6 +92,9 @@ class DoctorProbes:
     # PATH lookup for the hook console script (injected so tests are
     # deterministic regardless of the runner's PATH).
     which: Callable[[str], str | None] = shutil.which
+    # judge_llm model id -> None if LiteLLM resolves a provider, else a short
+    # error string. Injected so the classifier check runs offline/deterministic.
+    judge_model_resolvable: Callable[[str], str | None] = _real_judge_model_resolvable
 
 
 def _real_cli_version(name: str) -> str | None:
@@ -146,6 +158,7 @@ def real_probes() -> DoctorProbes:
         env=os.environ,
         cli_authenticated=_real_cli_authenticated,
         which=shutil.which,
+        judge_model_resolvable=_real_judge_model_resolvable,
     )
 
 
@@ -348,6 +361,54 @@ def _check_judge(repo_root: Path, asset_root: str = ".") -> CheckResult:
     return CheckResult("judge", OK, "policy.yaml loads; judge startable")
 
 
+def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
+    """FR-7.2: the judge's LLM classifier rung. With no resolvable ``judge_llm``
+    model, every command the policy fast-path does not match (and every ``ask``
+    rule) fails closed — a silent footgun surfaced HERE, before a run, rather
+    than left for the operator to infer from a later wall of deny errors. (The
+    key itself is covered by ``api-keys``; this check is about whether a
+    classifier is configured, uses the ``api`` adapter the engine actually runs
+    it as, and has a resolvable model id.)"""
+    profile = config.agents.get("judge_llm")
+    model = getattr(profile, "model", None) if profile is not None else None
+    if not model:
+        return CheckResult(
+            "judge-classifier", WARN,
+            "no `judge_llm` profile: LLM classifier disabled — commands the "
+            "policy.yaml fast-path does not match will fail closed",
+            remedy="add a `judge_llm` agent profile (e.g. api / gpt-5-mini) to "
+            "enable classification, or accept fail-closed-only operation",
+        )
+    # The engine's _with_judge() ALWAYS builds an ApiAdapter from judge_llm.model
+    # (the classifier is a non-agentic LiteLLM call by design), ignoring the
+    # configured adapter — and _check_api_keys() only validates keys for `api`
+    # profiles. So a non-`api` judge_llm would pass doctor yet fail closed at
+    # runtime with no key checked (PR #13 review). FAIL: enforce the config
+    # contract matches how the classifier is actually run.
+    adapter = getattr(profile, "adapter", None)
+    if adapter != "api":
+        return CheckResult(
+            "judge-classifier", FAIL,
+            f"judge_llm uses adapter {adapter!r}, but the engine always runs the "
+            "classifier as an `api` (LiteLLM) call — the configured adapter is "
+            "ignored and its key is not validated",
+            remedy="set judge_llm.adapter: api so doctor checks the key and the "
+            "config matches how the classifier actually runs",
+        )
+    err = probes.judge_model_resolvable(model)
+    if err:
+        return CheckResult(
+            "judge-classifier", WARN,
+            f"judge_llm model {model!r} is not resolvable by LiteLLM: {err}",
+            remedy="use a valid LiteLLM model id (e.g. `gpt-5-mini` or "
+            "`anthropic/claude-haiku-4-5`); an unresolvable model fails every "
+            "classifier call closed",
+        )
+    return CheckResult(
+        "judge-classifier", OK, f"LLM classifier model {model!r} resolvable"
+    )
+
+
 def _required_key(model: str) -> str | None:
     low = model.lower()
     for prefix, var in _KEY_BY_PREFIX.items():
@@ -525,6 +586,7 @@ def run_doctor(
         if referenced is not None and "judge_llm" in config.agents:
             referenced = referenced | {"judge_llm"}
         results.append(_check_api_keys(config, probes, referenced))
+        results.append(_check_judge_classifier(config, probes))
     results.append(_check_pin_file(repo_root, pins))
     return results
 
