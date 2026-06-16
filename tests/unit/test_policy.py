@@ -220,6 +220,12 @@ def test_pr_read_allowed_even_inside_pipeline_step(engine):
         ("git push -u origin master", "git-push-to-base-branch"),
         ("git push origin HEAD:main", "git-push-to-base-branch"),
         ("git push origin feature:master", "git-push-to-base-branch"),
+        # Full-ref forms (PR #17 re-review): refs/heads/(main|master) as src or
+        # dst must be denied too — short-form-only regexes let these through.
+        ("git push origin HEAD:refs/heads/main", "git-push-to-base-branch"),
+        ("git push origin feature:refs/heads/master", "git-push-to-base-branch"),
+        ("git push origin refs/heads/main:refs/heads/main", "git-push-to-base-branch"),
+        ("git push origin main:refs/heads/main", "git-push-to-base-branch"),
     ],
 )
 @pytest.mark.parametrize("step_id", [None, "implement"])
@@ -229,13 +235,18 @@ def test_destructive_push_denied_in_every_context(engine, cmd, rule, step_id):
     assert d.matched_rule == rule
 
 
-def test_feature_branch_named_like_base_not_denied(engine):
-    # A feature branch whose name merely contains 'main' is ordinary publishing,
-    # not a push to the base branch.
-    d = engine.evaluate(
-        "Bash", {"command": "git push origin main-feature"}, repo_root=REPO_ROOT
-    )
-    assert d is not None and d.decision == "allow"
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git push origin main-feature",         # short name merely contains 'main'
+        "git push origin refs/heads/main-feature",  # full ref to a non-base branch
+    ],
+)
+def test_feature_branch_named_like_base_not_denied(engine, cmd):
+    # A branch whose name merely starts with 'main' is ordinary feature
+    # publishing, not a push to the base branch.
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT)
+    assert d is not None and d.decision == "allow", f"{cmd} -> {d}"
     assert d.matched_rule == "git-push"
 
 

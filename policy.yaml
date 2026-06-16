@@ -41,11 +41,12 @@ deny:
       - '\bgit\s+push\b[^\n]*\s:[\w./-]+'   # empty-source refspec (origin :branch) = delete
 
   - name: git-push-to-base-branch
-    description: "Pushing directly to main/master bypasses the PR audit boundary (CLAUDE.md: nothing lands on main directly). Covers `… origin main` and refspec `…:main`. Custom base branches are additionally covered in-pipeline by push-or-pr-open-in-pipeline-step."
+    description: "Pushing directly to main/master bypasses the PR audit boundary (CLAUDE.md: nothing lands on main directly). Covers short forms (`… origin main`, `…:main`) AND full-ref forms (`…:refs/heads/main`, `refs/heads/main:…`) as either source or destination ref. Custom base branches are additionally covered in-pipeline by push-or-pr-open-in-pipeline-step."
     applies_to_tools: [Bash]
     command_patterns:
       - '\bgit\s+push\b[^\n]*\s(main|master)(\s|$)'
       - '\bgit\s+push\b[^\n]*:(main|master)(\s|$)'
+      - '\bgit\s+push\b[^\n]*refs/heads/(main|master)(\s|$|:)'   # full-ref src or dst
 
   - name: push-or-pr-open-in-pipeline-step
     description: "FR-9.8 / §2.2 defense-in-depth: a gauntlet pipeline must not autonomously push or open PRs (it drafts PR.md; the human opens it). So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though the operator's own interactive sessions allow them below."
