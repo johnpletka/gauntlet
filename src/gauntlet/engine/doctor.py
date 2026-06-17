@@ -416,13 +416,25 @@ def _check_test_command(config) -> CheckResult:
     from gauntlet.engine.detect import is_placeholder_command
 
     command = getattr(config, "test_command", None)
+    remedy = (
+        "set test_command in .gauntlet/config.yaml to the command that runs this "
+        "project's tests (must exit non-zero on failure)"
+    )
+    # An empty / whitespace-only command runs nothing under shell=True yet exits 0,
+    # so the test gate would silently pass — a fail-open. WARN it like the
+    # placeholder rather than reporting OK.
+    if not command or not str(command).strip():
+        return CheckResult(
+            "test-command", WARN,
+            "test_command is empty — the test gate would run nothing and pass",
+            remedy=remedy,
+        )
     if is_placeholder_command(command):
         return CheckResult(
             "test-command", WARN,
             "test_command is the un-configured placeholder (gauntlet init could "
             "not auto-detect one)",
-            remedy="set test_command in .gauntlet/config.yaml to the command that "
-            "runs this project's tests (must exit non-zero on failure)",
+            remedy=remedy,
         )
     return CheckResult("test-command", OK, f"test_command: {command!r}")
 

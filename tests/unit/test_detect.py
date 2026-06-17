@@ -129,6 +129,43 @@ def test_skip_dirs_are_ignored(tmp_path):
     assert d.command == "uv run pytest"
 
 
+def test_nested_module_name_with_space_is_shell_quoted(tmp_path):
+    # A valid directory name with a space must not produce a broken `cd my app`.
+    (tmp_path / "my app").mkdir()
+    _write(tmp_path / "my app/package.json", json.dumps({"scripts": {"test": "jest"}}))
+    _write(tmp_path / "service/go.mod", "module x\n")
+    d = detect_test_command(tmp_path)
+    commands = {s.command for s in d.stacks}
+    assert "cd 'my app' && npm test" in commands
+
+
+def test_nested_module_name_with_metacharacters_is_quoted(tmp_path):
+    (tmp_path / "a;rm -rf b").mkdir()
+    _write(tmp_path / "a;rm -rf b/go.mod", "module x\n")
+    d = detect_test_command(tmp_path)
+    assert d.detected
+    # The whole directory name is a single quoted argument to cd.
+    assert d.command == "cd 'a;rm -rf b' && go test ./..."
+
+
+def test_malformed_node_scripts_does_not_crash(tmp_path):
+    # A non-object `scripts` value must fail closed (placeholder), not raise.
+    _write(tmp_path / "package.json", json.dumps({"scripts": "not-an-object"}))
+    d = detect_test_command(tmp_path)
+    assert d.detected  # still a node project
+    assert d.command == "npm test"
+    assert "no tests found" in d.note.lower()  # no real test script detected
+
+
+def test_nested_underscore_test_files_count_as_tests(tmp_path):
+    # tests/unit/foo_test.py should register as "has tests" (guidance note).
+    _write(tmp_path / "pyproject.toml", "[tool.uv]\n")
+    _write(tmp_path / "tests/unit/foo_test.py", "def test_x():\n    assert True\n")
+    d = detect_test_command(tmp_path)
+    assert d.detected
+    assert "no tests found" not in d.note.lower()
+
+
 def test_is_placeholder_command_predicate():
     assert not is_placeholder_command("uv run pytest")
     assert not is_placeholder_command(None)

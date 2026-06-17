@@ -16,6 +16,7 @@ with no network access and no heavy parsing.
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,7 +71,7 @@ def _python_has_tests(d: Path) -> bool:
         td = d / sub
         if td.is_dir() and (
             any(td.glob("test_*.py")) or any(td.glob("*_test.py"))
-            or any(td.rglob("test_*.py"))
+            or any(td.rglob("test_*.py")) or any(td.rglob("*_test.py"))
         ):
             return True
     return any(d.glob("test_*.py")) or any(d.glob("*_test.py"))
@@ -101,7 +102,11 @@ def _node_has_test_script(d: Path) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    script = (data.get("scripts") or {}).get("test")
+    # `scripts` may be malformed (null/string/list) in a hand-edited package.json;
+    # treat anything that is not a mapping as "no test script" rather than crashing
+    # detection (fail closed — the repo just gets the placeholder).
+    scripts = data.get("scripts")
+    script = scripts.get("test") if isinstance(scripts, dict) else None
     return isinstance(script, str) and bool(script.strip()) and "no test specified" not in script
 
 
@@ -160,7 +165,10 @@ def _scan(repo_root: Path) -> list[DetectedStack]:
         if found is None:
             continue
         # A nested module's command must cd into it (the gate runs at repo root).
-        command = f"cd {child.name} && {found.command}"
+        # Quote the dir name: it is interpolated into a shell command that later
+        # runs with shell=True, so a space or metacharacter ("my app", "a;b")
+        # would otherwise produce a broken or unsafe command.
+        command = f"cd {shlex.quote(child.name)} && {found.command}"
         stacks.append(DetectedStack(child.name, found.language, command, found.has_tests))
     return stacks
 

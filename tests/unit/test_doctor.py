@@ -179,6 +179,21 @@ def test_test_command_placeholder_warns(tmp_path):
     assert not has_failure(results)  # un-configured test command WARNs, never blocks
 
 
+def test_test_command_empty_warns(tmp_path):
+    # An empty test_command runs nothing under shell=True yet exits 0 — a
+    # fail-open the test gate would silently pass. doctor must WARN, not OK it.
+    repo = _healthy_repo(tmp_path)
+    cfg_path = repo / ".gauntlet/config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    cfg["test_command"] = "   "
+    cfg_path.write_text(yaml.safe_dump(cfg))
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    tc = _by_name(results)["test-command"]
+    assert tc.status == WARN
+    assert "empty" in tc.detail
+    assert not has_failure(results)
+
+
 def test_test_command_ok_when_detected(tmp_path):
     # A repo with a detectable stack gets a real command and doctor reports OK.
     (tmp_path / "pyproject.toml").write_text("[tool.uv]\n")
