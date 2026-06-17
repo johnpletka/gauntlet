@@ -1,6 +1,6 @@
 # PRD: Gauntlet Console — Supervisory Web UI for Runs
 
-**Status:** Draft v0.1
+**Status:** Draft v0.2 (v0.1 + resolved OQ-1…OQ-6: real engine-level active-run guard; clarified single-repo = all-slug/all-history browsing; `gauntlet run --watch` boots the console; confirm step for destructive verbs; in-tab notifications v1 / background push v2; keep note string-matching for v1 — see §11)
 **Author:** John (with Claude)
 **Date:** 2026-06-16
 **Working name:** Console (every run is now *visible* — list it, watch it, answer its gate, recover it)
@@ -55,7 +55,7 @@ A local-first **web console**, started with `gauntlet serve`, that is both a **r
 ### 2.2 Non-Goals (v1)
 
 - **Not a hosted/multi-tenant service.** Loopback-bound localhost only, like the judge. No remote access, no accounts.
-- **Not a multi-repo dashboard.** One `gauntlet serve` instance scopes to one repo (its `cwd`). A repo registry is deferred (§11).
+- **Not a multi-*repo* dashboard.** One `gauntlet serve` instance scopes to a single git repository (its `cwd`), and one *actively-controlled* run at a time. "Single-repo" constrains **repositories**, not slugs or history: within that repo, **every** slug under the run root and its **full run history** are browsable read-only (FR-1.1, FR-2.4). A cross-repo registry is deferred (§11/OQ-4).
 - **Not an editor.** The console never edits PRDs, plans, pipelines, policy, or code. It reads artifacts and issues sanctioned commands. (Config *guidance* for a budget/timeout bump is surfaced as text, not auto-applied.)
 - **No new autonomy.** It exposes exactly the verbs the CLI exposes — no merge/push/finish/rollback buttons (those remain human-only CLI actions, per "nothing lands on `main`").
 - **No true background Web Push in v1.** In-tab notifications ship in v1; service-worker/VAPID background push is deferred to v2 (§11).
@@ -123,13 +123,14 @@ A local-first **web console**, started with `gauntlet serve`, that is both a **r
 - **D4 — Poll + SSE, not watchdog + WebSocket.** mtime polling needs no new dependency and is trivially cheap on a handful of files; SSE fits the one-directional state→browser push (all client→server actions are discrete REST POSTs) and reconnects automatically. Both avoid new deps.
 - **D5 — Server-rendered (Jinja + HTMX), not a SPA.** `jinja2` is already a transitive dependency; HTMX is one vendored static file. The data is document-shaped and server-authoritative; partial HTML swaps over SSE match it without a build toolchain — consistent with the thin-by-design ethos.
 - **D6 — Inherit safety, don't re-implement it.** Because control = CLI verbs, the judge is never bypassed, the reviewer-read-only / no-push-to-main / don't-mutate-approved-artifacts guards all still execute *inside* the child process, and the console literally cannot reach past the CLI to weaken them.
+- **D7 — Exactly one sanctioned engine change: the active-run guard.** The console's *read* surface needs zero engine changes (it only parses on-disk state). The one deliberate change in `RunManager` is an advisory **active-run lock** (FR-10.5/OQ-1) that fail-closes `start`/`resume`/`approve` when a run is already being driven by a live process. This is real enforcement in the engine — not a UI heuristic — and it benefits the bare CLI too (it generalizes today's start-only guard). Everything else the console does stays strictly above the orchestrator.
 
 ---
 
 ## 5. Functional Requirements
 
 ### FR-1: Run list / dashboard
-- **FR-1.1** List every run across all slugs found under the configured run root, one row per active run (latest run per slug surfaced; historical runs reachable from the detail view). Columns: slug, status, current step (+ its status), cost-to-date, age/last-update, owned/observed badge.
+- **FR-1.1** List **every slug directory** found under the configured run root (`runs/`, or `.gauntlet/runs/` in adopter repos), one row per slug showing its **latest or active** run — including slugs whose newest run is long-finished. Columns: slug, status, current step (+ its status), cost-to-date, age/last-update, owned/observed badge. Per-slug run history is reachable from the detail view (FR-2.4).
 - **FR-1.2** Default sort is most-recently-updated first. Support sort by status and by slug, a status filter (running / parked / failed / done / aborted), and a free-text search over slug and branch.
 - **FR-1.3** Rows update live (no manual refresh) as runs progress, via the SSE channel (FR-8).
 - **FR-1.4** A run the console launched shows an **owned** badge; a run started elsewhere shows **observed**. A run believed to be actively running in another process shows **running (external)** and disables resume/approve (FR-10.5).
@@ -138,7 +139,7 @@ A local-first **web console**, started with `gauntlet serve`, that is both a **r
 - **FR-2.1** For a selected run, render the **step tree** from `manifest.steps`: id, type, status, agent, iteration, started/ended → duration, token/cost usage, and notes. `adversarial_cycle` steps expand to their nested rounds (`r<N>-{review,triage,fix,confirm}`).
 - **FR-2.2** Show a header summary: run status, branch → base, totals, per-agent usage, and any `warnings`.
 - **FR-2.3** Show a clear "where it is now" indicator derived from `manifest.current_step`, and a **recommended-action banner** (FR-5) when the run is parked or failed.
-- **FR-2.4** Reachable history: list prior `run-<timestamp>` directories for the slug and allow viewing a past run read-only.
+- **FR-2.4** **Full history browsing.** For any slug, list all prior `run-<timestamp>` directories and open any past run **read-only** — its step tree, transcripts, findings/triage/confirm, gate decisions, phase diffs, judge-audit, and cost — so a completed or failed PRD run can be reviewed long after it finished (a primary reason to keep `gauntlet serve` running, FR-12.3). The detail view defaults to the slug's latest/active run.
 
 ### FR-3: Step log & transcript drill-down
 - **FR-3.1** For any step, list and open its artifacts: `prompt.md`, `transcript.md` (rendered markdown), `events.jsonl` (parsed), and any structured output (`findings.json`, etc.).
@@ -154,7 +155,7 @@ A local-first **web console**, started with `gauntlet serve`, that is both a **r
 - **FR-4.5** Surface FR-10.4 **upstream conflicts**: if the parked step's notes indicate the agent signalled `UPSTREAM CONFLICT`, show the agent's conflict text from the transcript and frame it as a human reconciliation decision, not a resume.
 
 ### FR-5: Failure diagnosis & resume intelligence
-- **FR-5.1** Provide a pure classifier `resume_intel(manifest) → {state, recommended_action, rationale, available_controls}` computed from the current step's `status` + `notes`. No new manifest fields are required for v1 (v2 hardening in §11).
+- **FR-5.1** Provide a pure classifier `resume_intel(manifest) → {state, recommended_action, rationale, available_controls}` computed from the current step's `status` + `notes`. v1 deliberately reads the existing note text (string-matching) and adds **no** new manifest fields (OQ-2); a structured `halt_kind`/`gate_kind` enum on `StepRecord` is a future hardening, not scheduled. The classifier is table-tested over fixture manifests so a note-wording change is caught by a failing test, not silently mis-classified.
 - **FR-5.2** Mapping (detect → offer):
   - parked + step is `human_gate` → **Approve / Reject** (FR-4); resume is *not* the verb.
   - parked + step `interrupted` (mid-edit, dirty vs `base_sha`) → **Resume** (engine applies its `interrupted_step` reset/park policy); show that partial work is preserved.
@@ -192,13 +193,19 @@ A local-first **web console**, started with `gauntlet serve`, that is both a **r
 - **FR-10.2** The judge is never bypassed: each child run constructs its own `ManagedJudge`; the console has no judge knob beyond surfacing the existing `--no-judge` flag.
 - **FR-10.3** The reviewer-read-only contract, "nothing lands on `main`", and "don't mutate approved artifacts" remain enforced inside the child process; the console cannot weaken them. No merge/push/finish/rollback controls are exposed.
 - **FR-10.4** Bind `127.0.0.1` only (refuse non-loopback hosts, mirroring the judge). Require a per-serve token (constant-time compared, env-overridable `GAUNTLET_WEB_TOKEN`, distinct from the judge token), set as an httpOnly cookie so SSE/HTMX carry it; `/healthz` is the only unauthenticated route.
-- **FR-10.5** **Concurrency guard:** never `resume`/`approve` a run believed to be actively running elsewhere (`status == running` with a fresh manifest mtime) — disable those controls and show "running (external)". (`RunManager.start` already refuses a second start; `resume` has no such guard, so the console enforces it — see §11 for the upstream-hardening question.)
+- **FR-10.5** **Active-run guard (engine — the one sanctioned engine change, OQ-1).** Add an advisory **run-lock** to `RunManager`: a lockfile recording the `pid` + `started_at` of the process currently *driving* a run's orchestrator, acquired when driving begins (`start`/`resume`/`approve`) and released when the run parks, completes, or errors. `start`/`resume`/`approve` **fail closed** if the lock is held by a *live* pid ("run is being driven by pid N; wait or abort"); a lock held by a dead pid (the `kill -9` case) is reclaimed. This generalizes the existing start-only `_refuse_if_active_run` to all three driving verbs, so two orchestrators can never drive one worktree — whether invoked from the console, a terminal, or a `--watch` foreground run. The console **surfaces** this state (a run being driven shows "running" with resume/approve disabled) but the *enforcement is the engine lock*, not a UI mtime heuristic. (A foreground `gauntlet run`/`--watch` releases the lock the instant it parks at a gate, so the console can then drive it forward via a sanctioned `approve`/`resume` child without contention.)
 - **FR-10.6** CSRF protection on all state-changing POSTs (same-origin + hidden token on forms).
+- **FR-10.7** **Confirmation for destructive verbs (OQ-5).** Loopback + token (FR-10.4) is the *security* boundary — it stops unauthorized callers. On top of it, the UI requires an explicit **confirmation step** for the two *destructive* actions, **abort** (kills an in-flight, often multi-hour/expensive run) and **reject** (fails a gate), to prevent accidental loss from a misclick. This is UX-safety, not a security control (it adds nothing against a caller who already holds the token). `approve`/`resume` are non-destructive and need no extra confirmation.
 
 ### FR-11: Configuration & deployment
 - **FR-11.1** `gauntlet serve [--host 127.0.0.1] [--port N]` resolves config exactly like the CLI (`RunConfig.load(.gauntlet/config.yaml)`, `asset_root` fallback `"."`), and must be run inside a git repo (validated at startup, fail-closed otherwise).
-- **FR-11.2** v1 scopes to a single repo (the `cwd`). The token is printed on startup like the judge's.
+- **FR-11.2** v1 scopes to a single *repository* (the `cwd`) — but **all** of that repo's slugs and run history are browsable (FR-1.1, FR-2.4); see the §2.2 / OQ-4 clarification. The token is printed on startup like the judge's.
 - **FR-11.3** Near-zero new runtime dependencies: reuse FastAPI/uvicorn/httpx/jinja2 (all already present); HTMX vendored as a static asset; no `watchdog`, no `websockets`, no frontend build toolchain.
+
+### FR-12: Launch ergonomics (OQ-6)
+- **FR-12.1** `gauntlet run <slug> --watch` **ensures a console is running** (boots one on `127.0.0.1` if none is up, otherwise reuses the existing instance), prints (and optionally opens) its URL, then runs the pipeline in the foreground exactly as today. The console **observes** the run live (FR-1/FR-2/FR-3) and notifies on gate/failure/completion (FR-9). Because the foreground driver releases the active-run lock when it parks (FR-10.5), the operator can act on the gate from the console — which drives the run forward via a sanctioned `approve`/`resume` child — with no contention.
+- **FR-12.2** The console started by `--watch` **persists after the foreground run returns**, so gates, failures, and post-run review remain available in the UI rather than disappearing when the blocking command exits.
+- **FR-12.3** `gauntlet serve` remains a **first-class standalone command**: start it any time to browse history, review past runs across all slugs (FR-1.1/FR-2.4), or supervise without launching a new run. `run --watch` is the convenience path; `serve` is the durable one.
 
 ---
 
@@ -248,11 +255,11 @@ Each phase validates one assumption, ends in a commit, and grows the test suite 
 
 - **P1 — Read-only observer MVP.** *Assumption: the manifest + on-disk layout suffice to render full run state with zero engine changes.* Deliver `web/store.py`, `web/service.py` + `web/runner.py` (FastAPI clone of the judge: loopback + token + `/healthz`), the `gauntlet serve` command, read endpoints (`/api/runs`, `/api/runs/{slug}`, `/api/runs/{slug}/steps/{step}`), and minimal Jinja run-list + run-detail pages. *Test:* `TestClient` over fixture run dirs; loopback/token guards.
 - **P2 — Live freshness (poll + SSE).** *Assumption: ~1s mtime polling catches every transition; SSE pushes to the browser with no new dep.* Deliver `web/watcher.py`, `GET /events`, HTMX-live list rows + live log tail. *Test:* drive a fixture manifest through writes, assert one edge-triggered event per transition; assert SSE yields them.
-- **P3 — Supervised launch (owned runs).** *Assumption: a run launched as a `Popen` of `gauntlet run` is fully observable, controllable, reapable.* Deliver `web/jobproc.py` (`RunProcess`) + `web/supervisor.py`, `POST /api/runs`, `POST …/abort`, owned/observed badge. *Test:* launch a trivial fixture pipeline via the supervisor; assert `job.json`, running→done, captured log, process-group reap.
+- **P3 — Supervised launch + active-run lock.** *Assumption: a run launched as a `Popen` of `gauntlet run` is fully observable, controllable, reapable — and can never be double-driven.* Deliver `web/jobproc.py` (`RunProcess`) + `web/supervisor.py`, `POST /api/runs`, `POST …/abort`, owned/observed badge, **and the one engine change: the `RunManager` active-run lock (FR-10.5)** guarding `start`/`resume`/`approve`. *Test:* launch a trivial fixture pipeline via the supervisor (assert `job.json`, running→done, captured log, process-group reap); for the lock — a second `resume`/`approve` against a live-locked run fails closed, and a stale (dead-pid) lock is reclaimed.
 - **P4 — Re-attach + crash survival.** *Assumption: the server holds no authoritative state — restart re-discovers owned runs; an orphan is recoverable like `kill -9`.* Deliver startup re-discovery, liveness check, re-attach, interrupted classification. *Test (headline):* launch owned run, SIGKILL the server group, start a fresh server, assert re-discovery + correct classification + `resume` recovery to `done` with exactly one set of effects (parametrize kill timing).
-- **P5 — Gates + control actions.** *Assumption: the UI can resolve a parked gate's `show:` artifacts and drive approve/reject/resume via sanctioned verbs without bypassing any invariant.* Deliver `/api/runs/{slug}/gate`, `…/diff`, `POST …/approve|reject|resume`, `resume_intel`, the gate-review + failure/resume panels. *Test:* fixture run parked at a gate with real artifacts; assert resolved contents; assert approve launches `gauntlet approve` (inspect argv) + transition; table-driven `resume_intel` over each manifest shape.
+- **P5 — Gates + control actions.** *Assumption: the UI can resolve a parked gate's `show:` artifacts and drive approve/reject/resume via sanctioned verbs without bypassing any invariant.* Deliver `/api/runs/{slug}/gate`, `…/diff`, `POST …/approve|reject|resume`, `resume_intel`, the gate-review + failure/resume panels, and the **destructive-verb confirm step** for abort/reject (FR-10.7). *Test:* fixture run parked at a gate with real artifacts; assert resolved contents; assert approve launches `gauntlet approve` (inspect argv) + transition; table-driven `resume_intel` over each manifest shape; assert abort/reject require the confirm token.
 - **P6 — Notifications.** *Assumption: one watcher trigger fans out to macOS/Slack/in-tab, fail-soft, edge-triggered, with no run impact.* Deliver `web/notify.py` wired to the watcher; `web:` config + env. *Test:* inject transitions with a stub notifier; assert one fan-out per `(run_id, status)`; assert a raising notifier is swallowed; Slack call shape via mock transport.
-- **P7 — Polish + hardening.** *Assumption: safe and pleasant for daily supervision of concurrent runs.* Deliver list search/sort/filter, concurrency guard (FR-10.5), CSRF + token cookie, `--no-judge` warning, report view, empty/error states. *Test:* concurrency guard rejects resume of an external-running run; CSRF rejection; an `@pytest.mark.integration` end-to-end smoke (launch → gate → approve → done through the UI).
+- **P7 — Polish + ergonomics.** *Assumption: safe and pleasant for daily supervision, history review, and one-command watching.* Deliver list search/sort/filter, full-history browser per slug (FR-2.4), `gauntlet run --watch` (boot/reuse console then run, FR-12), CSRF + token cookie, `--no-judge` warning, report view, empty/error states. *Test:* `run --watch` boots a console and the run appears as observed then drives to a gate; CSRF rejection; an `@pytest.mark.integration` end-to-end smoke (launch → gate → approve → done through the UI).
 
 ---
 
@@ -263,21 +270,27 @@ Each phase validates one assumption, ends in a commit, and grows the test suite 
 - **M3 — Zero invisible runs:** every console-launched run is observable end-to-end and survives a server restart (FR-7 re-attach test passes).
 - **M4 — Zero new invariant violations:** the safety test suite (judge gating, read-only reviewer, no-push-to-main) is unaffected, because control = CLI verbs (FR-10).
 - **M5 — Dependency budget:** no new runtime dependency beyond already-resolved ones (FR-11.3).
+- **M6 — Post-mortem reach:** any past run of any slug is fully reviewable in the UI (step tree, transcripts, gate decisions, diffs, cost) without opening the filesystem (FR-1.1, FR-2.4).
 
 ## 10. Risks & Mitigations
 
-- **R1 — Two orchestrators against one worktree (highest).** `resume` lacks an active-run guard. *Mitigation:* console-side liveness guard (FR-10.5) + optional per-worktree advisory lock; open question on an upstream `resume` guard (§11).
+- **R1 — Two orchestrators against one worktree.** Was the highest risk (`resume`/`approve` had no active-run guard). **Resolved by design (OQ-1):** the engine-level active-run lock (FR-10.5) fail-closes all three driving verbs; the console only surfaces it. Residual risk is the lock's own staleness handling (see R2).
 - **R2 — Server-restart PID reuse.** *Mitigation:* store start-time + pgid in `job.json`; when in doubt, treat as dead/interrupted (fail closed; the engine's resume guards then vet).
-- **R3 — Halt/gate disambiguation relies on note substrings.** *Mitigation:* keep the classifier table-tested; pursue a structured `halt_kind`/`gate_kind` engine stamp in v2 (§11).
+- **R3 — Halt/gate disambiguation relies on note substrings.** Accepted for v1 (OQ-2). *Mitigation:* the `resume_intel` classifier is table-tested over fixture manifests so a note-wording change fails a test rather than silently mis-classifying; a structured `halt_kind`/`gate_kind` enum is a tracked future hardening, not scheduled.
 - **R4 — Web Push complexity.** *Mitigation:* in-tab notifications in v1; defer service-worker/VAPID push to v2.
 - **R5 — Log volume / SSE fan-out.** *Mitigation:* tail loops scoped to open viewers, byte-offset deltas, capped backfill.
 - **R6 — `approve`/`resume` are long-running, not quick RPCs.** *Mitigation:* treat them with the full `RunProcess` lifecycle (designed in FR-6.2).
 
-## 11. Open Questions
+## 11. Resolved decisions (OQ-1…OQ-6 review, 2026-06-16)
 
-- **OQ-1** Should we add a real active-run guard to `RunManager.resume` upstream (a small, separately-justified engine change), or is console-side enforcement (FR-10.5) sufficient for v1?
-- **OQ-2** Add a structured `halt_kind`/`gate_kind` enum to `StepRecord` so the UI reads an enum instead of string-matching notes? (Backward-compatible, but an engine change.)
-- **OQ-3** Confirm in-tab notifications are acceptable for v1, with background Web Push deferred to v2.
-- **OQ-4** Single-repo scope for v1 (recommended) vs. shaping the API for multi-repo now (`/api/repos/{id}/runs`)?
-- **OQ-5** Is loopback + token parity with the judge sufficient, or do destructive verbs (abort/reject) warrant an extra per-action confirmation?
-- **OQ-6** Should `gauntlet serve` optionally auto-start when absent (e.g. a `gauntlet run --watch` that also boots the console), or stay a separate explicit command?
+The v0.1 open questions were resolved by the operator; recorded here as the audit trail (with the FRs they shaped).
+
+- **OQ-1 [decided — add the guard].** Add a real active-run guard: an advisory run-lock in `RunManager` (FR-10.5), the single sanctioned engine change (D7). It fail-closes `start`/`resume`/`approve`, so the protection is engine-enforced rather than a UI heuristic. Downgrades risk R1 from "highest" to "resolved by design."
+- **OQ-2 [deferred].** Keep `resume_intel` note string-matching for v1 (FR-5.1); a structured `halt_kind`/`gate_kind` enum on `StepRecord` is a tracked future hardening, not scheduled. Mitigated by table-tests (R3).
+- **OQ-3 [decided — in-tab now, push later].** In-tab notifications in v1; background Web Push (service worker + VAPID) in v2 (FR-9.2, §2.2, R4).
+- **OQ-4 [clarified].** "Single-repo" = one git repository per `serve` instance (the `cwd`) and one *actively-controlled* run at a time — **not** one slug. Every slug under the run root and its **full run history** are browsable read-only, defaulting to the latest/active run (FR-1.1, FR-2.4, FR-11.2). A cross-repo registry stays deferred.
+- **OQ-5 [decided — confirm destructive verbs].** The security boundary stays loopback + token (parity with the judge); add a lightweight UI confirmation for the *destructive* verbs abort/reject to prevent accidental loss of long-running work (FR-10.7). Rationale: token + loopback stops unauthorized callers but does nothing against an authorized operator's misclick aborting a multi-hour run — the confirm is cheap insurance, not a security control.
+- **OQ-6 [decided — both].** `gauntlet run --watch` boots/reuses the console then runs (FR-12.1–12.2); `gauntlet serve` stays the durable standalone command for history and review (FR-12.3).
+
+### Remaining open questions
+None blocking v1. Revisit post-v1: the structured halt/gate enum (OQ-2), background Web Push (OQ-3), and a cross-repo registry (OQ-4) if multi-repo supervision becomes common.
