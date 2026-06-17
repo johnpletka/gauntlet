@@ -3,7 +3,10 @@
 Scaffolds the committable Gauntlet assets into a repo so a teammate who clones
 it gets the identical workflow:
 
-* ``.gauntlet/config.yaml`` — agent profiles + identities (FR-2.1).
+* ``.gauntlet/config.yaml`` — agent profiles + identities (FR-2.1). Its
+  ``test_command`` is detected from the repo's build markers rather than
+  hard-coded (issue #18); a multi-module or unrecognised repo gets a
+  fail-closed placeholder plus guidance instead of a wrong default.
 * ``.gauntlet/pins.yaml`` — verified CLI versions ``gauntlet doctor`` checks
   installed versions against for drift (FR-1.5).
 * ``.gauntlet/pipelines/standard.yaml`` — the default 3-gate pipeline (FR-5.1).
@@ -27,9 +30,12 @@ asset that is missing).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from gauntlet.engine.detect import TestCommandDetection, detect_test_command
 
 SCAFFOLD_DIR = Path(__file__).resolve().parent.parent / "scaffold"
 
@@ -45,8 +51,11 @@ GITIGNORE_MARKER = "# --- Gauntlet (added by `gauntlet init`"
 
 # scaffold-relative source -> repo-relative target for the committable assets.
 # Directories are expanded file-by-file so a re-run can skip/keep per file.
+# The config target gets per-project test-command detection on create (issue
+# #18), so it is written through ``_scaffold_config`` rather than copied verbatim.
+CONFIG_TARGET = ".gauntlet/config.yaml"
 _ASSET_FILES = {
-    "config.yaml": ".gauntlet/config.yaml",
+    "config.yaml": CONFIG_TARGET,
     # The pin file doctor checks installed CLI versions against (FR-1.5); a
     # fresh repo cannot validate drift without it (review F-003).
     "pins.yaml": ".gauntlet/pins.yaml",
@@ -118,6 +127,9 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
             result.add(dst_rel, SKIPPED, "exists; left unchanged")
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
+        if dst_rel == CONFIG_TARGET:
+            _scaffold_config(src, target, repo_root, result, dst_rel)
+            continue
         shutil.copyfile(src, target)
         result.add(dst_rel, CREATED)
 
@@ -125,6 +137,61 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
     _wire_codex_hook(repo_root, result, from_repo=from_repo)
     _ensure_gitignore_guidance(repo_root, result)
     return result
+
+
+# Matches the scaffold's single ``test_command:`` line (with optional inline
+# comment) so we can swap in the per-project detection (issue #18).
+_TEST_COMMAND_RE = re.compile(r"^test_command:.*$", re.MULTILINE)
+
+
+def _render_test_command_block(detection: TestCommandDetection) -> str:
+    """The ``test_command:`` line (plus guidance comment when not auto-detected)."""
+    command = detection.command.replace('"', '\\"')
+    line = f'test_command: "{command}"'
+    if detection.detected:
+        return line
+    # Ambiguous / unknown: precede the fail-closed placeholder with the reason so
+    # the operator knows exactly what to set, right where they will edit it.
+    lines = ["# gauntlet init could not determine a single test command for this repo:"]
+    lines += [f"#   {part}" for part in _wrap(detection.note)]
+    if detection.stacks:
+        # Each candidate on its own line so it stays copy-pasteable (not wrapped).
+        lines.append("# detected module commands:")
+        lines += [f"#   {s.module}: {s.command}" for s in detection.stacks]
+    lines.append("# The placeholder below fails the test gate on purpose — replace it.")
+    lines.append(line)
+    return "\n".join(lines)
+
+
+def _wrap(text: str, width: int = 74) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, width=width) or [text]
+
+
+def _scaffold_config(
+    src: Path, target: Path, repo_root: Path, result: InitResult, dst_rel: str
+) -> None:
+    """Write ``.gauntlet/config.yaml`` with a project-appropriate test_command.
+
+    The scaffold ships a Python/pytest default; on a fresh repo we detect the
+    actual stack and substitute it, or drop in a fail-closed placeholder when the
+    stack is multi-module or unrecognised (issue #18). The rest of the file is
+    untouched, so it stays byte-aligned with the canonical scaffold.
+    """
+    detection = detect_test_command(repo_root)
+    text = src.read_text()
+    block = _render_test_command_block(detection)
+    new_text, n = _TEST_COMMAND_RE.subn(lambda _m: block, text, count=1)
+    if n == 0:
+        # The scaffold should always carry a test_command line; if it ever does
+        # not, fail closed rather than silently shipping a config with none.
+        raise InitError(
+            "scaffold config.yaml has no `test_command:` line to substitute; "
+            "the bundled scaffold is malformed"
+        )
+    target.write_text(new_text)
+    result.add(dst_rel, CREATED, detection.note)
 
 
 def _hook_entry() -> dict:
