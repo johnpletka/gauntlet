@@ -590,6 +590,8 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
+    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "litellm" },
     { name = "pydantic" },
@@ -606,6 +608,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.111" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "jinja2", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.21" },
     { name = "litellm", specifier = ">=1.40" },
     { name = "pydantic", specifier = ">=2.7" },

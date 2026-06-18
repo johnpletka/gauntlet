@@ -306,6 +306,23 @@ def rollback(
     typer.echo(f"rolled back to {target[:10]}")
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
+    port: int = typer.Option(8765, help="Bind port."),
+) -> None:
+    """Run the local supervisory console over loopback (FR-11.1).
+
+    A read model + (in later phases) a run supervisor. Resolves config like the
+    CLI, validates it is inside a git repo (fail-closed), mints a per-serve token
+    and prints it + the URL on startup. The console scopes to this one repo; all
+    of its slugs and run history are browsable (FR-1.1/FR-2.4).
+    """
+    from gauntlet.web.runner import serve as serve_console
+
+    serve_console(Path.cwd(), host=host, port=port)
+
+
 @judge_app.command("serve")
 def judge_serve(
     policy: Path = typer.Option(

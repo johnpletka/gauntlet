@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Runs · Gauntlet Console{% endblock %}
+{% block body %}
+<h1>Runs</h1>
+{% if not rows %}
+  <p class="empty">No runs found under the run root yet.</p>
+{% else %}
+<table class="runs">
+  <thead>
+    <tr>
+      <th>Slug</th><th>Status</th><th>Current step</th><th>Cost</th>
+      <th>Steps</th><th>Updated</th><th>Source</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a href="/runs/{{ r.slug }}{% if token %}?token={{ token }}{% endif %}">{{ r.slug }}</a></td>
+      <td><span class="status status-{{ r.status }}">{{ r.status }}</span></td>
+      <td>
+        {{ r.current_step or "—" }}
+        {% if r.current_step_status %}<span class="muted">({{ r.current_step_status }})</span>{% endif %}
+      </td>
+      <td>{% if r.totals.cost_usd is not none %}${{ "%.2f"|format(r.totals.cost_usd) }}{% else %}—{% endif %}</td>
+      <td>{{ r.n_done }}/{{ r.n_steps }}</td>
+      <td class="muted">{{ r.updated or "—" }}</td>
+      <td><span class="badge badge-{{ 'owned' if r.owned else 'observed' }}">{{ 'owned' if r.owned else 'observed' }}</span></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

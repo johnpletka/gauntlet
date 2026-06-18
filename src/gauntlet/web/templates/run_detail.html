@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}{{ slug }} · Gauntlet Console{% endblock %}
+{% block body %}
+<p><a href="/{% if token %}?token={{ token }}{% endif %}">← all runs</a></p>
+<h1>{{ slug }}</h1>
+<section class="summary">
+  <span class="status status-{{ manifest.status }}">{{ manifest.status }}</span>
+  <span class="muted">run {{ manifest.run_id }}</span>
+  <span class="muted">{{ manifest.branch }} → {{ manifest.base_branch }}</span>
+  {% if manifest.totals.cost_usd is not none %}
+    <span class="muted">${{ "%.2f"|format(manifest.totals.cost_usd) }}</span>
+  {% endif %}
+  {% if manifest.current_step %}<span class="muted">at {{ manifest.current_step }}</span>{% endif %}
+</section>
+
+{% if manifest.warnings %}
+<ul class="warnings">
+  {% for w in manifest.warnings %}<li>⚠ {{ w }}</li>{% endfor %}
+</ul>
+{% endif %}
+
+<h2>Steps</h2>
+<table class="steps">
+  <thead>
+    <tr><th>Step</th><th>Type</th><th>Status</th><th>Agent</th><th>Duration</th><th>Cost</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+  {% for s in steps %}
+    <tr>
+      <td>{{ s.id }}{% if s.iteration is not none %}<span class="muted">[{{ s.iteration }}]</span>{% endif %}</td>
+      <td>{{ s.type }}</td>
+      <td><span class="status status-{{ s.status }}">{{ s.status }}</span></td>
+      <td>{{ s.agent or "—" }}</td>
+      <td>{% if s.duration_s is not none %}{{ "%.0f"|format(s.duration_s) }}s{% else %}—{% endif %}</td>
+      <td>{% if s.cost_usd is not none %}${{ "%.2f"|format(s.cost_usd) }}{% else %}—{% endif %}</td>
+      <td class="notes">{{ s.notes or "" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

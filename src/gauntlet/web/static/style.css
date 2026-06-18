@@ -1,0 +1,50 @@
+/* Gauntlet Console — minimal vendored stylesheet (P1, D5: no build step). */
+:root {
+  --fg: #1c1e21;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2563eb;
+  --bg: #fbfbfd;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+.topbar {
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+.brand { font-weight: 600; color: var(--fg); text-decoration: none; }
+main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 16px; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.muted { color: var(--muted); }
+.empty { color: var(--muted); }
+.notes { color: var(--muted); font-size: 13px; }
+.summary { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.warnings { color: #92400e; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 8px 12px; list-style: none; }
+.status {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 12px; font-weight: 600;
+  background: #eef2ff; color: #3730a3;
+}
+.status-running { background: #ecfdf5; color: #047857; }
+.status-parked  { background: #fffbeb; color: #b45309; }
+.status-failed  { background: #fef2f2; color: #b91c1c; }
+.status-aborted { background: #f3f4f6; color: #4b5563; }
+.status-done    { background: #eff6ff; color: #1d4ed8; }
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 4px;
+  font-size: 12px; border: 1px solid var(--line);
+}
+.badge-owned { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+.badge-observed { background: #f9fafb; color: var(--muted); }
