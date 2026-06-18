@@ -154,19 +154,32 @@ class RunStore:
     def __init__(self, repo_root: Path, config: RunConfig) -> None:
         self.repo_root = repo_root.resolve()
         self.config = config
+        # Belt-and-suspenders for FR-10.1 / review F-001: `RunConfig` already
+        # validates `run_root` as a repo-relative, non-escaping path, but a
+        # directly-constructed config (or a future loosening) could still point
+        # the run root outside the repo. Fail closed at construction so no later
+        # request can read outside the repo tree.
+        run_root = (self.repo_root / config.run_root).resolve()
+        if run_root != self.repo_root and self.repo_root not in run_root.parents:
+            raise UnsafePath(
+                f"run_root {config.run_root!r} escapes the repo root {self.repo_root}"
+            )
 
     @classmethod
     def from_repo(cls, repo_root: Path) -> "RunStore":
-        """Load config like the CLI, falling back to defaults if absent (FR-11.1).
+        """Load config like the CLI, falling back to defaults only if absent.
 
-        ``RunConfig.load`` raises when ``.gauntlet/config.yaml`` is missing; the
-        console must still serve a bare repo (defaults give ``run_root=runs``,
-        ``asset_root=.``), so a missing/invalid config degrades to defaults
-        rather than refusing to start.
+        ``RunConfig.load`` raises ``FileNotFoundError`` when
+        ``.gauntlet/config.yaml`` is missing; the console must still serve a bare
+        repo (defaults give ``run_root=runs``, ``asset_root=.``), so an *absent*
+        config degrades to defaults. A *present but malformed* config (bad YAML,
+        an invalid ``run_root``/``asset_root``) must fail closed instead of
+        silently serving the wrong run root (review F-002, plan ground rule:
+        parse errors fail closed) — those errors propagate to the caller.
         """
         try:
             config = RunConfig.load(repo_root / ".gauntlet/config.yaml")
-        except Exception:
+        except FileNotFoundError:
             config = RunConfig()
         return cls(repo_root, config)
 

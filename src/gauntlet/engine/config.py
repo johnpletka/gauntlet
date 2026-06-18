@@ -24,6 +24,30 @@ from gauntlet.logging.redact import RedactionSettings
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
 
+def _validate_repo_relative(field: str, v: str) -> str:
+    """Fail closed (PRD §2) on a repo-root-relative path that could escape.
+
+    ``asset_root`` and ``run_root`` are both joined onto ``repo_root`` and then
+    used as containment bases, so an absolute value (which discards repo_root),
+    a ``..`` escape, or an empty value would breach the repo boundary. Reject
+    those, and normalise spelling (``./.gauntlet`` → ``.gauntlet``, ``.`` stays
+    ``.``) so the on-disk path join and the proposals allowlist agree (review
+    F-006 / Copilot)."""
+    raw = (v or "").strip()
+    if not raw or raw.startswith("/") or raw.startswith("~"):
+        raise ValueError(
+            f"{field} must be a non-empty, repo-relative path; got {v!r} "
+            "(absolute paths and ~ are rejected — they would escape the repo)"
+        )
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if ".." in parts:
+        raise ValueError(
+            f"{field} must not contain '..' (it would escape the repo "
+            f"boundary); got {v!r}"
+        )
+    return "/".join(parts) or "."
+
+
 class AgentProfile(BaseModel):
     """One named agent profile (FR-2.1). Adapter-specific fields are passed
     through to the adapter constructor; engine-level budget guards (FR-3.3) are
@@ -134,25 +158,18 @@ class RunConfig(BaseModel):
     @field_validator("asset_root")
     @classmethod
     def _validate_asset_root(cls, v: str) -> str:
-        """Fail closed (PRD §2): asset_root is joined into every pipeline/prompt/
-        schema/policy path, so an absolute value (which discards repo_root), a
-        ``..`` escape, or an empty value would breach the repo boundary. Reject
-        those, and normalise spelling (``./.gauntlet`` → ``.gauntlet``, ``.``
-        stays ``.``) so the on-disk path join and the proposals allowlist agree
-        (review F-006 / Copilot)."""
-        raw = (v or "").strip()
-        if not raw or raw.startswith("/") or raw.startswith("~"):
-            raise ValueError(
-                f"asset_root must be a non-empty, repo-relative path; got {v!r} "
-                "(absolute paths and ~ are rejected — they would escape the repo)"
-            )
-        parts = [p for p in raw.split("/") if p not in ("", ".")]
-        if ".." in parts:
-            raise ValueError(
-                f"asset_root must not contain '..' (it would escape the repo "
-                f"boundary); got {v!r}"
-            )
-        return "/".join(parts) or "."
+        """asset_root is joined into every pipeline/prompt/schema/policy path;
+        reject anything that could escape the repo boundary (PRD §2, F-006)."""
+        return _validate_repo_relative("asset_root", v)
+
+    @field_validator("run_root")
+    @classmethod
+    def _validate_run_root(cls, v: str) -> str:
+        """run_root is joined onto repo_root and used as the containment base for
+        every run/artifact path the console reads; an absolute or ``..``-escaping
+        value would let ``gauntlet serve`` browse files outside the repo (review
+        F-001). Same repo-relative containment as asset_root."""
+        return _validate_repo_relative("run_root", v)
 
     def profile(self, name: str) -> AgentProfile:
         try:

@@ -326,6 +326,42 @@ def test_store_run_not_found_raises(store: RunStore):
         store.manifest("alpha", "run-does-not-exist")
 
 
+def test_run_root_escaping_repo_rejected_at_construction(tmp_path: Path):
+    # Belt-and-suspenders (F-001): even if a config slips an escaping run_root
+    # past validation (here simulated by bypassing the field validator), the
+    # store fails closed at construction rather than browsing outside the repo.
+    cfg = RunConfig()
+    cfg.run_root = "../outside"  # direct assignment skips the field validator
+    with pytest.raises(UnsafePath):
+        RunStore(tmp_path / "repo", cfg)
+
+
+# --- config resolution: missing falls back, malformed fails closed (F-002) ---
+
+
+def test_from_repo_missing_config_falls_back_to_defaults(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = RunStore.from_repo(repo)
+    assert store.config.run_root == "runs"
+
+
+def test_from_repo_malformed_yaml_fails_closed(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".gauntlet").mkdir(parents=True)
+    (repo / ".gauntlet" / "config.yaml").write_text("run_root: [unterminated\n")
+    with pytest.raises(Exception):
+        RunStore.from_repo(repo)
+
+
+def test_from_repo_invalid_run_root_fails_closed(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".gauntlet").mkdir(parents=True)
+    (repo / ".gauntlet" / "config.yaml").write_text("run_root: ../escape\n")
+    with pytest.raises(Exception):
+        RunStore.from_repo(repo)
+
+
 # --- server-rendered pages ---------------------------------------------------
 
 
