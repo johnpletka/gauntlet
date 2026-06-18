@@ -97,6 +97,17 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # P4 (FR-7.1/7.3): before serving, re-discover owned runs from disk and
+        # reconcile orphans — a restarted console holds no authoritative run
+        # state (D2). Guarded so read-only deployments and the minimal test
+        # stubs (no `reattach`) are untouched; fail-soft so a re-discovery error
+        # never blocks the console from coming up to observe runs.
+        reattach = getattr(supervisor, "reattach", None)
+        if callable(reattach):
+            try:
+                reattach()
+            except Exception:  # pragma: no cover - defensive; re-attach is best-effort
+                pass
         watcher.start()
         try:
             yield

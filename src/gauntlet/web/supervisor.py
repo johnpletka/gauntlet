@@ -25,6 +25,7 @@ from ``.serve/job.json`` on restart (P4).
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import signal
 import subprocess
@@ -43,9 +44,32 @@ from gauntlet.engine.run import DRIVING_LOCK_NAME, safe_run_segment
 from gauntlet.procident import ProcessIdentity, process_is_alive
 from gauntlet.web.jobproc import JOB_FILENAME, SERVE_DIRNAME, JobRecord, RunProcess
 
+log = logging.getLogger(__name__)
+
 # Terminal run states are read-only to the abort control path (review F-002),
 # mirroring web.store._TERMINAL_RUN_STATES / engine _TERMINAL_RUN_STATES.
 _TERMINAL_RUN_STATES = frozenset({RUN_DONE, RUN_ABORTED, RUN_FAILED})
+
+# Re-attach dispositions (P4, FR-7.1/7.2). A fresh server (no in-memory handles)
+# re-discovers every owned run from its `.serve/job.json` and classifies it into
+# exactly one of these — the server holds no authoritative state of its own (D2):
+#   - REATTACHED    — the recorded process is still the original live one
+#                     (PID-reuse-safe match, FR-7.2); re-adopt it (its captured
+#                     log is on disk for tailing, control rides job.json's pgid).
+#   - INTERRUPTED   — owned but dead/unverifiable AND a non-terminal manifest:
+#                     an orphan whose recovery is `resume`, the *same* path as a
+#                     `kill -9`'d run (FR-7.3). The stale sidecar is removed so it
+#                     falls back to that observed/resume path.
+#   - COMPLETED     — owned, dead, and the manifest is terminal (done/aborted/
+#                     failed): nothing to recover; the sidecar is kept so the run
+#                     keeps its owned badge for history (FR-1.4).
+#   - FAILED_LAUNCH — owned, dead, and NO manifest: the child died before the
+#                     engine wrote any run state (FR-6.1a). The captured log stays
+#                     diagnosable; it is never a phantom owned run in the list.
+REATTACHED = "reattached"
+INTERRUPTED = "interrupted"
+COMPLETED = "completed"
+FAILED_LAUNCH = "failed_launch"
 
 
 class AbortRefused(RuntimeError):
@@ -112,6 +136,40 @@ class Job:
         if not self.has_manifest:
             return "starting" if self.is_live() else "failed_launch"
         return "live" if self.is_live() else "exited"
+
+    def recovery_disposition(self, manifest: Manifest | None, *, live: bool) -> str:
+        """The P4 re-attach disposition of this owned run (FR-7.1/7.2).
+
+        A **pure** classifier — no side effects, so it is table-testable in
+        isolation. ``live`` is the caller's PID-reuse-safe liveness verdict
+        (computed once, since on macOS it shells out to ``ps``); ``manifest`` is
+        the run's manifest or ``None`` when absent/unreadable. The four outcomes
+        are documented on the module-level disposition constants. Fail-closed by
+        construction: an unverifiable/dead process with a non-terminal manifest
+        is always an :data:`INTERRUPTED` orphan, never a spurious re-attach.
+        """
+        if live:
+            return REATTACHED
+        if manifest is None:
+            return FAILED_LAUNCH
+        if manifest.status in _TERMINAL_RUN_STATES:
+            return COMPLETED
+        return INTERRUPTED
+
+
+@dataclass
+class RecoveryOutcome:
+    """One owned run's re-attach result at server startup (P4, FR-7.1)."""
+
+    slug: str
+    run_id: str
+    run_dir: Path
+    disposition: str
+
+    @property
+    def resume_available(self) -> bool:
+        """True for an interrupted orphan — recovery is ``resume`` (FR-7.3)."""
+        return self.disposition == INTERRUPTED
 
 
 @dataclass
@@ -342,6 +400,66 @@ class JobSupervisor:
     def is_owned(self, slug: str, run_id: str) -> bool:
         return (self._run_dir(slug, run_id) / SERVE_DIRNAME / JOB_FILENAME).exists()
 
+    # ---- re-attach / crash survival (P4, FR-7.1/7.2/7.3) ---------------------
+    def reattach(self) -> list[RecoveryOutcome]:
+        """Re-discover owned runs from disk and reconcile orphans (FR-7.1).
+
+        Called on server startup (the console keeps **no** authoritative run
+        state — disk does, D2): a fresh process re-scans every ``.serve/job.json``
+        and classifies each run with the PID-reuse-safe liveness check (FR-7.2).
+        Side effects are confined to the orphan case: an :data:`INTERRUPTED` run
+        (dead/unverifiable driver + non-terminal manifest) has its **stale
+        sidecar removed** so it falls back to the exact same recovery path a
+        ``kill -9``'d run already has — ``resume`` (FR-7.3). The captured
+        ``.serve/…log`` is deliberately left in place so the orphan stays
+        diagnosable. Live runs are reported :data:`REATTACHED` and need no action
+        (their captured log is on disk for tailing and control rides
+        ``job.json``'s recorded pgid, both already restart-safe from P3).
+
+        Returns one :class:`RecoveryOutcome` per discovered owned run, in slug /
+        run-id order, so a caller (or the startup log) can report what happened.
+        """
+        outcomes: list[RecoveryOutcome] = []
+        for job in self.jobs():
+            # Liveness is computed exactly once per job (it may shell out to `ps`
+            # on macOS) and threaded into the pure classifier.
+            live = job.is_live()
+            manifest = None if live else self._load_manifest(job.run_dir)
+            disposition = job.recovery_disposition(manifest, live=live)
+            if disposition == INTERRUPTED:
+                self._remove_stale_sidecar(job)
+            outcomes.append(
+                RecoveryOutcome(
+                    slug=job.slug,
+                    run_id=job.run_id,
+                    run_dir=job.run_dir,
+                    disposition=disposition,
+                )
+            )
+            log.info(
+                "reattach %s/%s -> %s", job.slug, job.run_id, disposition
+            )
+        return outcomes
+
+    def _remove_stale_sidecar(self, job: Job) -> None:
+        """Delete an orphan's dead ``job.json`` so recovery = ``resume`` (FR-7.3).
+
+        Fail-soft: a removal error is logged and swallowed (a re-discovery scan
+        must never crash the server). Only the sidecar is removed — the captured
+        log stays for diagnosis. Any stale in-memory handle for the same run is
+        dropped too (defensive — there are none right after a restart).
+        """
+        sidecar = job.run_dir / SERVE_DIRNAME / JOB_FILENAME
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:  # pragma: no cover - defensive (perms/races)
+            log.warning("could not remove stale sidecar %s: %s", sidecar, exc)
+        rp = self._procs.get(job.slug)
+        if rp is not None and getattr(rp, "run_id", None) == job.run_id:
+            del self._procs[job.slug]
+
     def reap(self) -> None:
         """Reap any console children that have exited this session (review F-004).
 
@@ -397,4 +515,15 @@ class JobSupervisor:
         )
 
 
-__all__ = ["JobSupervisor", "Job", "LockInfo", "AbortRefused", "AbortFailed"]
+__all__ = [
+    "JobSupervisor",
+    "Job",
+    "LockInfo",
+    "RecoveryOutcome",
+    "AbortRefused",
+    "AbortFailed",
+    "REATTACHED",
+    "INTERRUPTED",
+    "COMPLETED",
+    "FAILED_LAUNCH",
+]
