@@ -14,15 +14,18 @@ updates yet (P2), no control verbs (P3+), no gate resolution (P5).
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from gauntlet.web.sse import SSE_HEADERS, event_stream, log_tail_stream
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
 from gauntlet.web.views import register_views
+from gauntlet.web.watcher import Watcher
 
 TOKEN_ENV_VAR = "GAUNTLET_WEB_TOKEN"
 TOKEN_HEADER = "X-Gauntlet-Token"
@@ -53,8 +56,28 @@ def _token_dependency(token: str):
     return check
 
 
-def create_app(store: RunStore, *, token: str) -> FastAPI:
-    app = FastAPI(title="gauntlet-console", docs_url=None, redoc_url=None)
+def create_app(
+    store: RunStore, *, token: str, watcher: Watcher | None = None
+) -> FastAPI:
+    # The watcher (P2) drives live state. Created here unless injected (tests
+    # inject one they drive synchronously via `poll_once`). It is started/stopped
+    # by the ASGI lifespan — so `TestClient(app)` used *without* `with` (the P1
+    # read-only tests) never starts the poll loop, while `with TestClient(app)`
+    # gets a live watcher.
+    watcher = watcher if watcher is not None else Watcher(store)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        watcher.start()
+        try:
+            yield
+        finally:
+            await watcher.stop()
+
+    app = FastAPI(
+        title="gauntlet-console", docs_url=None, redoc_url=None, lifespan=lifespan
+    )
+    app.state.watcher = watcher
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     auth = Depends(_token_dependency(token))
 
@@ -93,7 +116,50 @@ def create_app(store: RunStore, *, token: str) -> FastAPI:
     ) -> dict:
         return store.step_detail(slug, step, run_id).model_dump()
 
-    # ---- server-rendered pages (FR-1/FR-2, static render only in P1) --------
+    # ---- step log tail (P2, FR-3.2) -----------------------------------------
+    @app.get("/api/runs/{slug}/steps/{step}/log", dependencies=[auth])
+    def api_step_log(
+        slug: str,
+        step: str,
+        run_id: str | None = Query(default=None),
+        from_: int = Query(default=0, alias="from", ge=0),
+        name: str | None = Query(default=None),
+    ) -> dict:
+        return store.step_log(
+            slug, step, run_id=run_id, name=name, offset=from_
+        ).model_dump()
+
+    @app.get("/api/runs/{slug}/steps/{step}/log/stream", dependencies=[auth])
+    async def api_step_log_stream(
+        request: Request,
+        slug: str,
+        step: str,
+        run_id: str | None = Query(default=None),
+        from_: int = Query(default=0, alias="from", ge=0),
+        name: str | None = Query(default=None),
+    ) -> StreamingResponse:
+        gen = log_tail_stream(
+            store,
+            slug,
+            step,
+            run_id=run_id,
+            name=name,
+            start=from_,
+            is_disconnected=request.is_disconnected,
+        )
+        return StreamingResponse(
+            gen, media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
+    # ---- live state SSE (P2, FR-8.2) ----------------------------------------
+    @app.get("/events", dependencies=[auth])
+    async def events(request: Request) -> StreamingResponse:
+        gen = event_stream(store, watcher, is_disconnected=request.is_disconnected)
+        return StreamingResponse(
+            gen, media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
+    # ---- server-rendered pages + live partials (FR-1/FR-2/FR-8) -------------
     register_views(app, store, auth)
 
     return app

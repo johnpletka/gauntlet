@@ -6,12 +6,18 @@
   <title>{% block title %}Gauntlet Console{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+{# `data-sse` names this page's live channel; live.js (P2) opens an EventSource
+   to it and, on each transition, re-fetches every [data-live-src] region. The
+   token rides in the query for the P1/P2 bootstrap (EventSource can't set
+   headers); P7 replaces it with the /login cookie. A page with no
+   [data-live-src] region simply ignores the stream. #}
+<body data-sse="/events{% if token %}?token={{ token }}{% endif %}">
   <header class="topbar">
     <a class="brand" href="/{% if token %}?token={{ token }}{% endif %}">Gauntlet Console</a>
   </header>
   <main>
     {% block body %}{% endblock %}
   </main>
+  <script src="/static/live.js" defer></script>
 </body>
 </html>

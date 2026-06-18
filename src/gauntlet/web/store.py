@@ -41,6 +41,17 @@ class RunNotFound(LookupError):
     """No run matches the requested slug / run_id (maps to HTTP 404)."""
 
 
+# Log files a step may expose for tailing (P2, FR-3.2). A *fixed allowlist* — the
+# `name` query param is user-controlled, so it must never resolve to an arbitrary
+# file inside the step dir (containment, FR-10.1 / review F-006). The default tail
+# target is the first of these that exists. The supervisor's `.serve/…log`
+# (FR-3.3) is owned-run only and lands in P3.
+ALLOWED_LOG_NAMES = ("events.jsonl", "transcript.md")
+# Cap a single tail read so one request can never pull an unbounded step log into
+# memory (R5: byte-offset deltas, capped backfill).
+DEFAULT_LOG_MAX_BYTES = 256 * 1024
+
+
 # --- view models -------------------------------------------------------------
 
 
@@ -94,6 +105,23 @@ class StepDetail(BaseModel):
     iteration: str | None = None
     artifacts: list[StepArtifact] = []
     rounds: list[StepRound] = []
+
+
+class LogChunk(BaseModel):
+    """A byte-offset slice of a step log (P2, FR-3.2).
+
+    The client tails by re-requesting with ``from=<end>`` of the prior chunk.
+    ``start`` is the offset actually read from — it differs from the requested
+    ``from`` only when the file shrank/rotated under us (``from`` past EOF), in
+    which case we reset to 0 and the client adopts ``start`` as its new cursor.
+    """
+
+    name: str
+    start: int
+    end: int
+    size: int
+    eof: bool
+    text: str
 
 
 def _safe_segment(seg: str, *, kind: str) -> str:
@@ -248,9 +276,98 @@ class RunStore:
             raise RunNotFound(f"no runs for slug {slug!r}")
         return names[-1]
 
+    def resolve_run_id(self, slug: str, run_id: str | None = None) -> str:
+        """Public: resolve to a concrete run id (explicit → active → latest).
+
+        Used by the live log-tail (P2) to pin a stream to one run dir before it
+        starts polling, so a tail never drifts onto a different run if a newer
+        one is minted mid-stream.
+        """
+        return self._resolve_run_id(slug, run_id)
+
     def run_dir(self, slug: str, run_id: str | None = None) -> Path:
         rid = self._resolve_run_id(slug, run_id)
         return self._assert_contained(self._slug_dir(slug) / rid)
+
+    def iter_manifests(self) -> list[tuple[str, str, Path]]:
+        """Every run's ``(slug, run_id, manifest_path)`` — all slugs, all history.
+
+        The watcher (P2) stats each of these once per tick to detect transitions.
+        Includes historical runs so the detail view and log tail of any past run
+        also get live updates while open.
+        """
+        out: list[tuple[str, str, Path]] = []
+        root = self.run_root_dir
+        if not root.exists():
+            return out
+        for slug in self.slugs():
+            slug_dir = root / slug
+            for rid in self._run_dirs(slug_dir):
+                out.append((slug, rid, slug_dir / rid / "manifest.json"))
+        return out
+
+    # ---- step log tail (FR-3.2) ---------------------------------------------
+    def step_log(
+        self,
+        slug: str,
+        step: str,
+        *,
+        run_id: str | None = None,
+        name: str | None = None,
+        offset: int = 0,
+        max_bytes: int = DEFAULT_LOG_MAX_BYTES,
+    ) -> LogChunk:
+        """Read a byte-offset slice of a step's log file (FR-3.2, R5).
+
+        ``name`` is restricted to :data:`ALLOWED_LOG_NAMES` (a user-controlled
+        param must not address an arbitrary file — review F-006); when omitted,
+        the first of those that exists is tailed. Bytes before ``offset`` are
+        never returned, so a client re-requesting with ``from=<prior end>`` sees
+        only appended bytes. If ``offset`` is past EOF (rotation/truncation) we
+        reset ``start`` to 0 so the client re-syncs rather than reading garbage.
+        """
+        run_dir = self.run_dir(slug, run_id)
+        _safe_segment(step, kind="step")
+        step_dir = self._assert_contained(run_dir / "steps" / step)
+        if not step_dir.exists() or not step_dir.is_dir():
+            raise RunNotFound(f"no step {step!r} in run {run_dir.name!r}")
+
+        if name is not None:
+            _safe_segment(name, kind="log")
+            if name not in ALLOWED_LOG_NAMES:
+                raise UnsafePath(f"log {name!r} is not a tailable step log")
+            candidates = [name]
+        else:
+            candidates = list(ALLOWED_LOG_NAMES)
+
+        path: Path | None = None
+        for cand in candidates:
+            p = self._assert_contained(step_dir / cand)
+            if p.exists() and p.is_file():
+                path = p
+                name = cand
+                break
+        if path is None:
+            raise RunNotFound(
+                f"no tailable log for step {step!r} in run {run_dir.name!r}"
+            )
+
+        size = path.stat().st_size
+        start = max(0, offset)
+        if start > size:  # the file shrank under us → resync from the top
+            start = 0
+        with path.open("rb") as fh:
+            fh.seek(start)
+            raw = fh.read(max_bytes)
+        end = start + len(raw)
+        return LogChunk(
+            name=name,
+            start=start,
+            end=end,
+            size=size,
+            eof=end >= size,
+            text=raw.decode("utf-8", errors="replace"),
+        )
 
     # ---- list view (FR-1.1) --------------------------------------------------
     def _row_for(self, slug: str) -> RunRow | None:
@@ -361,7 +478,9 @@ __all__ = [
     "StepDetail",
     "StepRound",
     "StepArtifact",
+    "LogChunk",
     "RunNotFound",
     "UnsafePath",
     "duration_seconds",
+    "ALLOWED_LOG_NAMES",
 ]

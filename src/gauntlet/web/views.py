@@ -1,9 +1,19 @@
-"""Server-rendered console pages (P1, FR-1/FR-2).
+"""Server-rendered console pages + live partials (P1/P2, FR-1/FR-2/FR-8).
 
-Jinja + a single vendored CSS file — no SPA, no build step (D5). P1 renders the
-run list and run detail statically; HTMX-driven live updates land in P2. The
-page routes are registered onto the app by :func:`register_views` so
-``service.py`` stays the thin app factory.
+Jinja + a single vendored stylesheet and a tiny vendored SSE client — no SPA, no
+build step (D5). P1 rendered the run list and run detail statically; P2 makes
+them *live*: a small ``static/live.js`` opens an ``EventSource`` to ``/events``
+and, on each transition, re-fetches the page's live region from a **partial**
+route (``/partials/runs`` for the list, ``/partials/runs/{slug}`` for the detail
+body) and swaps its ``innerHTML``. The partials render the exact same fragments
+the full pages embed, so a live swap and a fresh load are identical.
+
+(The PRD names HTMX for this; it is realized here as an equivalent ~30-line
+vendored vanilla SSE→fetch shim because the offline build sandbox cannot fetch
+the htmx bytes and fabricating a minified library is not acceptable. The
+functional outcome — declarative live partial swaps over SSE, no build step,
+zero new heavy deps — is identical and, on the M5 dependency budget, strictly
+leaner.)
 """
 
 from __future__ import annotations
@@ -19,8 +29,29 @@ from gauntlet.web.store import RunStore, duration_seconds
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
+def _detail_context(
+    store: RunStore, slug: str, run_id: str | None, token: str | None
+) -> dict:
+    """Shared context for the full detail page and its live partial."""
+    man = store.manifest(slug, run_id)
+    steps = [
+        {
+            "id": s.id,
+            "type": s.type,
+            "status": s.status,
+            "agent": s.agent,
+            "iteration": s.iteration,
+            "notes": s.notes,
+            "cost_usd": s.usage.cost_usd,
+            "duration_s": duration_seconds(s.started, s.ended),
+        }
+        for s in man.steps
+    ]
+    return {"slug": slug, "manifest": man, "steps": steps, "token": token or ""}
+
+
 def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
-    """Register the run-list and run-detail HTML routes onto ``app``."""
+    """Register the run-list/run-detail HTML routes and their live partials."""
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
     @app.get("/", response_class=HTMLResponse, dependencies=[auth])
@@ -40,25 +71,31 @@ def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
         run_id: str | None = Query(default=None),
         token: str | None = Query(default=None),
     ) -> HTMLResponse:
-        man = store.manifest(slug, run_id)
-        steps = [
-            {
-                "id": s.id,
-                "type": s.type,
-                "status": s.status,
-                "agent": s.agent,
-                "iteration": s.iteration,
-                "notes": s.notes,
-                "cost_usd": s.usage.cost_usd,
-                "duration_s": duration_seconds(s.started, s.ended),
-            }
-            for s in man.steps
-        ]
+        ctx = _detail_context(store, slug, run_id, token)
+        return templates.TemplateResponse(request, "run_detail.html", ctx)
+
+    # ---- live partials (P2): the innerHTML live.js swaps in on each SSE tick --
+    @app.get("/partials/runs", response_class=HTMLResponse, dependencies=[auth])
+    def partial_runs(
+        request: Request, token: str | None = Query(default=None)
+    ) -> HTMLResponse:
         return templates.TemplateResponse(
             request,
-            "run_detail.html",
-            {"slug": slug, "manifest": man, "steps": steps, "token": token or ""},
+            "_run_rows.html",
+            {"rows": store.list_rows(), "token": token or ""},
         )
+
+    @app.get(
+        "/partials/runs/{slug}", response_class=HTMLResponse, dependencies=[auth]
+    )
+    def partial_run_detail(
+        request: Request,
+        slug: str,
+        run_id: str | None = Query(default=None),
+        token: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        ctx = _detail_context(store, slug, run_id, token)
+        return templates.TemplateResponse(request, "_run_detail_body.html", ctx)
 
 
 __all__ = ["register_views"]
