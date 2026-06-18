@@ -29,6 +29,17 @@ from gauntlet.web.store import RunStore, duration_seconds
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
+def _lock_context(store: RunStore) -> dict:
+    """The worktree-lock surface shared by every page (FR-10.5).
+
+    ``locked`` disables Launch/Resume/Approve repo-wide; ``lock`` names the
+    holder for the banner. The console only *surfaces* this — the enforcement is
+    the engine lock.
+    """
+    lock = store.worktree_lock()
+    return {"locked": lock is not None, "lock": lock}
+
+
 def _detail_context(
     store: RunStore, slug: str, run_id: str | None, token: str | None
 ) -> dict:
@@ -47,7 +58,19 @@ def _detail_context(
         }
         for s in man.steps
     ]
-    return {"slug": slug, "manifest": man, "steps": steps, "token": token or ""}
+    lock = store.worktree_lock()
+    owned, attached, external = store._ownership(slug, man.run_id, lock)
+    ctx = {
+        "slug": slug,
+        "manifest": man,
+        "steps": steps,
+        "token": token or "",
+        "owned": owned,
+        "attached": attached,
+        "external": external,
+    }
+    ctx.update(_lock_context(store))
+    return ctx
 
 
 def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
@@ -58,11 +81,9 @@ def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
     def run_list(
         request: Request, token: str | None = Query(default=None)
     ) -> HTMLResponse:
-        return templates.TemplateResponse(
-            request,
-            "run_list.html",
-            {"rows": store.list_rows(), "token": token or ""},
-        )
+        ctx = {"rows": store.list_rows(), "token": token or ""}
+        ctx.update(_lock_context(store))
+        return templates.TemplateResponse(request, "run_list.html", ctx)
 
     @app.get("/runs/{slug}", response_class=HTMLResponse, dependencies=[auth])
     def run_detail(

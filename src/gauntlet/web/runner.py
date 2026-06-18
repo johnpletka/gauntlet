@@ -16,6 +16,7 @@ from pathlib import Path
 from gauntlet.engine import gitops
 from gauntlet.web.service import TOKEN_ENV_VAR, create_app
 from gauntlet.web.store import RunStore
+from gauntlet.web.supervisor import JobSupervisor
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -66,8 +67,9 @@ def serve(
         )
     resolved_token = token or os.environ.get(TOKEN_ENV_VAR) or generate_token()
     os.environ[TOKEN_ENV_VAR] = resolved_token
-    store = RunStore.from_repo(repo_root)
-    app = create_app(store, token=resolved_token)
+    supervisor = JobSupervisor(repo_root)
+    store = RunStore.from_repo(repo_root, supervisor=supervisor)
+    app = create_app(store, token=resolved_token, supervisor=supervisor)
     print(f"gauntlet console listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
     # The convenience URL goes to stderr so it never contaminates the token line

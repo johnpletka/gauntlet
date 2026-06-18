@@ -48,3 +48,18 @@ th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 }
 .badge-owned { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
 .badge-observed { background: #f9fafb; color: var(--muted); }
+.badge-external { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+
+/* P3 control surface (FR-6.1/FR-10.5). */
+.banner { border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; }
+.banner-locked { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+.launch { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.launch input[type=text] { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; }
+.launch button, .controls button {
+  padding: 5px 12px; border: 1px solid var(--accent); background: var(--accent);
+  color: #fff; border-radius: 4px; cursor: pointer; font-weight: 600;
+}
+.launch button[disabled] { background: var(--muted); border-color: var(--muted); cursor: not-allowed; }
+.controls { margin: 8px 0 16px; }
+.controls button { background: #b91c1c; border-color: #b91c1c; }
+.warn { color: #b45309; }

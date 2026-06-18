@@ -2,6 +2,29 @@
 {% block title %}Runs · Gauntlet Console{% endblock %}
 {% block body %}
 <h1>Runs</h1>
+
+{# FR-10.5: while a live process drives the worktree, name the holder and
+   disable launching. The console only surfaces this — the engine lock enforces. #}
+{% if locked %}
+<div class="banner banner-locked">
+  ⛔ Worktree is being driven by
+  <strong>{{ lock.slug }}{% if lock.run_id %}/{{ lock.run_id }}{% endif %}</strong>
+  (pid {{ lock.pid }}). Launch / Resume / Approve are disabled until it parks or finishes.
+</div>
+{% endif %}
+
+{# Launch a new run as a console-owned subprocess (FR-6.1). Disabled while the
+   worktree lock is held (FR-10.5). control.js POSTs to /api/runs. #}
+<form class="launch" data-launch data-token="{{ token }}">
+  <input type="text" name="slug" placeholder="slug" required {% if locked %}disabled{% endif %}>
+  <input type="text" name="pipeline" placeholder="pipeline (optional)" {% if locked %}disabled{% endif %}>
+  <label class="muted">
+    <input type="checkbox" name="no_judge" {% if locked %}disabled{% endif %}>
+    --no-judge <span class="warn">(unsafe; testing only)</span>
+  </label>
+  <button type="submit" {% if locked %}disabled{% endif %}>Launch run</button>
+</form>
+
 {# The list is always rendered (live.js swaps the tbody on each SSE tick, so an
    empty run root that later gains a run fills in without a manual refresh). #}
 <table class="runs">
@@ -15,4 +38,5 @@
     {% include "_run_rows.html" %}
   </tbody>
 </table>
+<script src="/static/control.js" defer></script>
 {% endblock %}

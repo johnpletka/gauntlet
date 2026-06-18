@@ -21,6 +21,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from gauntlet.web.sse import SSE_HEADERS, event_stream, log_tail_stream
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
@@ -56,8 +57,20 @@ def _token_dependency(token: str):
     return check
 
 
+class LaunchBody(BaseModel):
+    """``POST /api/runs`` body (§6 control surface)."""
+
+    slug: str
+    pipeline: str | None = None
+    no_judge: bool = False
+
+
 def create_app(
-    store: RunStore, *, token: str, watcher: Watcher | None = None
+    store: RunStore,
+    *,
+    token: str,
+    watcher: Watcher | None = None,
+    supervisor=None,
 ) -> FastAPI:
     # The watcher (P2) drives live state. Created here unless injected (tests
     # inject one they drive synchronously via `poll_once`). It is started/stopped
@@ -65,6 +78,12 @@ def create_app(
     # read-only tests) never starts the poll loop, while `with TestClient(app)`
     # gets a live watcher.
     watcher = watcher if watcher is not None else Watcher(store)
+    # The supervisor (P3) owns console-launched runs and surfaces the worktree
+    # lock. Wire it into the store so list rows carry the owned/observed/external
+    # badge (FR-1.4/FR-10.5). When absent (read-only deployments) every run is
+    # observed and the control endpoints fail closed with 503.
+    if supervisor is not None:
+        store.supervisor = supervisor
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -78,6 +97,7 @@ def create_app(
         title="gauntlet-console", docs_url=None, redoc_url=None, lifespan=lifespan
     )
     app.state.watcher = watcher
+    app.state.supervisor = supervisor
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     auth = Depends(_token_dependency(token))
 
@@ -107,7 +127,14 @@ def create_app(
         man = store.manifest(slug, run_id)
         # The full manifest is the §6 contract; resume_intel is P5, not here.
         body = man.model_dump(mode="json")
-        body["owned"] = False  # no supervisor in P1
+        # owned/observed badge now real (FR-1.4); external = a live foreign
+        # driver holds the worktree lock (FR-10.5).
+        owned, attached, external = store._ownership(
+            slug, man.run_id, store.worktree_lock()
+        )
+        body["owned"] = owned
+        body["attached"] = attached
+        body["external"] = external
         return body
 
     @app.get("/api/runs/{slug}/steps/{step}", dependencies=[auth])
@@ -150,6 +177,68 @@ def create_app(
         return StreamingResponse(
             gen, media_type="text/event-stream", headers=SSE_HEADERS
         )
+
+    # ---- owned-run captured log tail (P3, FR-3.3) ---------------------------
+    @app.get("/api/runs/{slug}/serve-log", dependencies=[auth])
+    def api_serve_log(
+        slug: str,
+        run_id: str | None = Query(default=None),
+        from_: int = Query(default=0, alias="from", ge=0),
+    ) -> dict:
+        return store.serve_log(slug, run_id=run_id, offset=from_).model_dump()
+
+    # ---- control surface: sanctioned CLI-verb children (P3, §6) -------------
+    def _require_supervisor():
+        if supervisor is None:
+            raise HTTPException(
+                status_code=503,
+                detail="run supervision is unavailable (no supervisor configured)",
+            )
+        return supervisor
+
+    def _refuse_if_worktree_locked(action: str) -> None:
+        """Fail fast if a live process is already driving the worktree (FR-10.5).
+
+        The engine lock is the real enforcement (a launched child would itself
+        fail closed); this just surfaces it as a clear 409 instead of a silent
+        failed-launch, mirroring the UI disabling Launch/Resume/Approve.
+        """
+        lock = supervisor.driving_lock()
+        if lock is not None and lock.live:
+            holder = f"{lock.slug}/{lock.run_id}" if lock.run_id else lock.slug
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot {action}: worktree is being driven by {holder} "
+                    f"(pid {lock.pid}); wait, or abort that run first (FR-10.5)"
+                ),
+            )
+
+    @app.post("/api/runs", dependencies=[auth])
+    def api_launch(body: LaunchBody) -> dict:
+        _require_supervisor()
+        _refuse_if_worktree_locked("launch a run")
+        proc = supervisor.launch_run(
+            body.slug, pipeline=body.pipeline, no_judge=body.no_judge
+        )
+        return {
+            "slug": proc.slug,
+            "run_id": proc.run_id,
+            "pid": proc.pid,
+            "log_path": str(proc.log_path),
+            "owned": True,
+            "status": "launched",
+        }
+
+    @app.post("/api/runs/{slug}/abort", dependencies=[auth])
+    def api_abort(slug: str) -> dict:
+        _require_supervisor()
+        supervisor.abort(slug)
+        try:
+            status = store.manifest(slug).status
+        except RunNotFound:
+            status = "unknown"
+        return {"slug": slug, "status": status}
 
     # ---- live state SSE (P2, FR-8.2) ----------------------------------------
     @app.get("/events", dependencies=[auth])

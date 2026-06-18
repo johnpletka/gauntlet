@@ -84,6 +84,10 @@ class RunRow(BaseModel):
     base_branch: str | None = None
     owned: bool = False
     attached: bool = False
+    # FR-1.4/FR-10.5: this run is believed to be actively driven by a live
+    # process the console does not own (it holds the worktree lock). Such a run
+    # shows "running (external)" and its driving controls are disabled.
+    external: bool = False
     n_steps: int = 0
     n_done: int = 0
     warnings_count: int = 0
@@ -194,11 +198,18 @@ def duration_seconds(started: str | None, ended: str | None) -> float | None:
 
 
 class RunStore:
-    """Read-only view over a repo's runs (one ``serve`` instance = one repo)."""
+    """Read-only view over a repo's runs (one ``serve`` instance = one repo).
 
-    def __init__(self, repo_root: Path, config: RunConfig) -> None:
+    An optional :class:`~gauntlet.web.supervisor.JobSupervisor` (P3) lets the
+    store mark runs the console launched as **owned** (FR-1.4) and surface the
+    worktree-lock holder (FR-10.5). The store stays read-only — it only *reads*
+    the supervisor's on-disk discovery; it never launches or reaps anything.
+    """
+
+    def __init__(self, repo_root: Path, config: RunConfig, *, supervisor=None) -> None:
         self.repo_root = repo_root.resolve()
         self.config = config
+        self.supervisor = supervisor
         # Belt-and-suspenders for FR-10.1 / review F-001: `RunConfig` already
         # validates `run_root` as a repo-relative, non-escaping path, but a
         # directly-constructed config (or a future loosening) could still point
@@ -211,7 +222,7 @@ class RunStore:
             )
 
     @classmethod
-    def from_repo(cls, repo_root: Path) -> "RunStore":
+    def from_repo(cls, repo_root: Path, *, supervisor=None) -> "RunStore":
         """Load config like the CLI, falling back to defaults only if absent.
 
         ``RunConfig.load`` raises ``FileNotFoundError`` when
@@ -226,7 +237,7 @@ class RunStore:
             config = RunConfig.load(repo_root / ".gauntlet/config.yaml")
         except FileNotFoundError:
             config = RunConfig()
-        return cls(repo_root, config)
+        return cls(repo_root, config, supervisor=supervisor)
 
     # ---- layout --------------------------------------------------------------
     @property
@@ -380,25 +391,66 @@ class RunStore:
                 f"no tailable log for step {step!r} in run {run_dir.name!r}"
             )
 
-        size = path.stat().st_size
-        start = max(0, offset)
-        if start > size:  # the file shrank under us → resync from the top
-            start = 0
-        with path.open("rb") as fh:
-            fh.seek(start)
-            raw = fh.read(max_bytes)
-        end = start + len(raw)
-        return LogChunk(
-            name=name,
-            start=start,
-            end=end,
-            size=size,
-            eof=end >= size,
-            text=raw.decode("utf-8", errors="replace"),
+        return _read_chunk(path, name, offset, max_bytes)
+
+    # ---- supervisor-derived ownership (P3, FR-1.4/FR-10.5) -------------------
+    def _ownership(self, slug: str, run_id: str, lock) -> tuple[bool, bool, bool]:
+        """``(owned, attached, external)`` for one run, given the worktree lock.
+
+        Owned/attached come from the supervisor's on-disk ``.serve/job.json``
+        discovery; ``external`` is true when a **live** lock holder is this run
+        but the console does not own it (so it is driven by another process,
+        FR-10.5). With no supervisor (P1/P2) every run is observed.
+        """
+        if self.supervisor is None:
+            return (False, False, False)
+        owned = self.supervisor.is_owned(slug, run_id)
+        attached = self.supervisor.is_attached(slug, run_id)
+        external = bool(
+            lock is not None
+            and lock.live
+            and lock.slug == slug
+            and lock.run_id == run_id
+            and not owned
         )
+        return (owned, attached, external)
+
+    def worktree_lock(self):
+        """The live worktree-lock holder, or ``None`` (FR-10.5 UI surface)."""
+        if self.supervisor is None:
+            return None
+        lock = self.supervisor.driving_lock()
+        return lock if (lock is not None and lock.live) else None
+
+    # ---- owned-run captured log tail (FR-3.3) -------------------------------
+    def serve_log(
+        self,
+        slug: str,
+        *,
+        run_id: str | None = None,
+        offset: int = 0,
+        max_bytes: int = DEFAULT_LOG_MAX_BYTES,
+    ) -> LogChunk:
+        """Tail an owned run's supervisor-captured stdout/stderr (FR-3.3).
+
+        This is the combined log the console wrote at launch
+        (``run_dir/.serve/run.log``) — "the thing that today scrolls past in a
+        backgrounded terminal". Same byte-offset delta protocol as
+        :meth:`step_log` (R5). 404 if the run was not console-launched (no
+        ``.serve`` log). The name is a fixed constant, not user-controlled, so
+        there is no traversal surface here.
+        """
+        run_dir = self.run_dir(slug, run_id)
+        path = self._assert_within(run_dir / ".serve" / "run.log", run_dir)
+        if not path.exists() or not path.is_file():
+            raise RunNotFound(
+                f"no captured serve log for run {run_dir.name!r} "
+                "(not a console-launched run)"
+            )
+        return _read_chunk(path, "run.log", offset, max_bytes)
 
     # ---- list view (FR-1.1) --------------------------------------------------
-    def _row_for(self, slug: str) -> RunRow | None:
+    def _row_for(self, slug: str, lock=None) -> RunRow | None:
         try:
             rid = self._resolve_run_id(slug, None)
         except RunNotFound:
@@ -411,6 +463,7 @@ class RunStore:
             return None
         cur = _current_record(man)
         started, ended = _started_ended(man)
+        owned, attached, external = self._ownership(slug, man.run_id, lock)
         return RunRow(
             slug=slug,
             run_id=man.run_id,
@@ -423,8 +476,9 @@ class RunStore:
             totals=man.totals.model_dump(),
             branch=man.branch,
             base_branch=man.base_branch,
-            owned=False,  # no supervisor in P1 — every run is observed
-            attached=False,
+            owned=owned,
+            attached=attached,
+            external=external,
             n_steps=len(man.steps),
             n_done=sum(1 for s in man.steps if s.status == DONE),
             warnings_count=len(man.warnings),
@@ -433,7 +487,10 @@ class RunStore:
 
     def list_rows(self) -> list[RunRow]:
         """One row per slug (its latest/active run), most-recently-updated first."""
-        rows = [r for slug in self.slugs() if (r := self._row_for(slug)) is not None]
+        lock = self.worktree_lock()
+        rows = [
+            r for slug in self.slugs() if (r := self._row_for(slug, lock)) is not None
+        ]
         rows.sort(key=lambda r: (r.updated or "", r.slug), reverse=True)
         return rows
 
@@ -486,6 +543,31 @@ class RunStore:
             artifacts=artifacts,
             rounds=rounds,
         )
+
+
+def _read_chunk(path: Path, name: str, offset: int, max_bytes: int) -> LogChunk:
+    """Read a byte-offset slice of ``path`` as a :class:`LogChunk` (R5).
+
+    Bytes before ``offset`` are never returned, so a client re-requesting with
+    ``from=<prior end>`` sees only appended bytes. If ``offset`` is past EOF
+    (rotation/truncation) ``start`` resets to 0 so the client re-syncs.
+    """
+    size = path.stat().st_size
+    start = max(0, offset)
+    if start > size:  # the file shrank under us → resync from the top
+        start = 0
+    with path.open("rb") as fh:
+        fh.seek(start)
+        raw = fh.read(max_bytes)
+    end = start + len(raw)
+    return LogChunk(
+        name=name,
+        start=start,
+        end=end,
+        size=size,
+        eof=end >= size,
+        text=raw.decode("utf-8", errors="replace"),
+    )
 
 
 def _list_artifacts(directory: Path) -> list[StepArtifact]:

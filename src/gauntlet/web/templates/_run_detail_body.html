@@ -2,14 +2,34 @@
    run_detail.html and served standalone by /partials/runs/{slug} for the P2
    live swap (live.js re-fetches this on each SSE tick). #}
 <section class="summary">
-  <span class="status status-{{ manifest.status }}">{{ manifest.status }}</span>
+  {% if external %}
+    <span class="status status-running">running (external)</span>
+  {% else %}
+    <span class="status status-{{ manifest.status }}">{{ manifest.status }}</span>
+  {% endif %}
   <span class="muted">run {{ manifest.run_id }}</span>
   <span class="muted">{{ manifest.branch }} → {{ manifest.base_branch }}</span>
+  {% if external %}
+    <span class="badge badge-external">external</span>
+  {% elif owned %}
+    <span class="badge badge-owned">owned{% if attached %} ·live{% endif %}</span>
+  {% else %}
+    <span class="badge badge-observed">observed</span>
+  {% endif %}
   {% if manifest.totals.cost_usd is not none %}
     <span class="muted">${{ "%.2f"|format(manifest.totals.cost_usd) }}</span>
   {% endif %}
   {% if manifest.current_step %}<span class="muted">at {{ manifest.current_step }}</span>{% endif %}
 </section>
+
+{# Abort is a control action (FR-6.2): stops a live owned driver and marks the
+   run aborted via `gauntlet abort`. control.js confirms before POSTing — the
+   full FR-10.7 server-side destructive-verb confirm token lands in P5. #}
+{% if owned %}
+<section class="controls">
+  <button data-abort data-slug="{{ slug }}" data-token="{{ token }}">Abort run</button>
+</section>
+{% endif %}
 
 {% if manifest.warnings %}
 <ul class="warnings">

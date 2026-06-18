@@ -111,11 +111,17 @@ def run(
     no_judge: bool = typer.Option(
         False, "--no-judge", help="Do not start the judge (unsafe; testing only)."
     ),
+    run_id: str = typer.Option(
+        None, "--run-id",
+        help="Pre-allocated run id (FR-6.1a handshake; the console supervisor "
+        "passes this so it knows run_dir before launch). Single-use: errors if "
+        "that run dir already exists.",
+    ),
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
-    status = mgr.start(slug, path, use_judge=not no_judge)
+    status = mgr.start(slug, path, use_judge=not no_judge, run_id=run_id)
     typer.echo(f"run status: {status}")
 
 
