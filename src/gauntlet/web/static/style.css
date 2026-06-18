@@ -63,3 +63,27 @@ th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 .controls { margin: 8px 0 16px; }
 .controls button { background: #b91c1c; border-color: #b91c1c; }
 .warn { color: #b45309; }
+
+/* P5 recovery / gate / escalation panel (FR-4/FR-5). */
+.recovery { border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin: 16px 0; background: #fff; }
+.recovery-gate { border-left: 4px solid #b45309; }
+.recovery-escalation { border-left: 4px solid #b91c1c; }
+.recovery-interrupted, .recovery-halted_timeout, .recovery-halted_budget, .recovery-halted_generic { border-left: 4px solid #2563eb; }
+.recovery-failed, .recovery-rejected { border-left: 4px solid #6b7280; }
+.recovery h2 { margin-top: 0; }
+.recovery .recommend { font-size: 14px; }
+.recovery details { margin: 6px 0; }
+.recovery summary { cursor: pointer; font-weight: 600; }
+.control-forms { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+.control-forms form { display: flex; gap: 6px; align-items: center; }
+.control-forms input[type=text] { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; }
+.control-forms button { padding: 5px 12px; border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 4px; cursor: pointer; font-weight: 600; }
+.control-forms button.danger { background: #b91c1c; border-color: #b91c1c; }
+pre.json, pre.artifact, pre.diff, pre.conflict {
+  background: #f6f8fa; border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 12px; overflow-x: auto; font-size: 12.5px; max-height: 480px;
+}
+table.findings td, table.audit td { font-size: 13px; }
+.status-allow { background: #ecfdf5; color: #047857; }
+.status-deny  { background: #fef2f2; color: #b91c1c; }
+.status-ask   { background: #fffbeb; color: #b45309; }

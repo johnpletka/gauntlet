@@ -1,0 +1,87 @@
+{# P5 recovery / gate / escalation panel (FR-4/FR-5). Rendered inside the detail
+   body so it lives-swaps with the rest; the heavier phase diff is a link to the
+   deliberate /runs/{slug}/diff page (not recomputed per SSE tick). `intel` is the
+   resume_intel verdict; `gate` (when present) is the resolved gate/escalation
+   evidence. Control forms are POSTed by control.js to the sanctioned CLI-verb
+   endpoints; destructive verbs (reject) carry the FR-10.7 confirm. #}
+{% set controls = intel.available_controls %}
+{% if intel.state not in ("running", "done") %}
+<section class="recovery recovery-{{ intel.state }}">
+  <h2>
+    {% if intel.state == "gate" %}Pending gate — your decision
+    {% elif intel.state == "escalation" %}Escalation — reconcile, then resume
+    {% elif intel.state == "interrupted" %}Interrupted — resume available
+    {% elif intel.state.startswith("halted") %}Halted — recovery
+    {% elif intel.state == "failed" %}Failed
+    {% elif intel.state == "rejected" %}Rejected (terminal)
+    {% else %}Recovery{% endif %}
+  </h2>
+  <p class="recommend"><strong>Recommended:</strong> {{ intel.recommended_action }}</p>
+  <p class="muted">{{ intel.rationale }}</p>
+
+  {# --- escalation evidence (FR-4.6): findings + triage verdicts assembled --- #}
+  {% if gate and gate.kind == "escalation" %}
+    {% if gate.target_artifacts %}
+      <p class="banner banner-locked">⚠ Bare Resume re-runs the cycle and re-parks.
+        Reconcile the upstream artifact(s) first: <strong>{{ gate.target_artifacts | join(", ") }}</strong>.</p>
+    {% endif %}
+    <table class="findings">
+      <thead><tr><th>ID</th><th>Sev</th><th>Category</th><th>Location</th><th>Claim</th><th>Verdict</th><th>Action</th><th>Target</th><th>Reasoning</th></tr></thead>
+      <tbody>
+      {% for f in gate.escalated %}
+        <tr>
+          <td>{{ f.finding_id }}</td><td>{{ f.severity or "—" }}</td><td>{{ f.category or "—" }}</td>
+          <td>{{ f.location or "—" }}</td><td>{{ f.claim or "—" }}</td>
+          <td>{{ f.verdict or "—" }}</td><td>{{ f.action or "—" }}</td>
+          <td>{{ f.target_artifact or "—" }}</td><td class="notes">{{ f.reasoning or "—" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+
+  {# --- gate show: artifacts (FR-4.3): rendered readably --- #}
+  {% if gate and gate.kind == "gate" %}
+    {% if gate.upstream_conflict %}
+      <details open><summary>⚠ UPSTREAM CONFLICT (builder-signalled, FR-4.5)</summary>
+        <pre class="conflict">{{ gate.upstream_conflict }}</pre></details>
+    {% endif %}
+    {% for a in gate.artifacts %}
+      <details {% if loop.first %}open{% endif %}>
+        <summary>{{ a.name }} <span class="muted">({{ a.kind }}{% if a.source %} · {{ a.source }}{% endif %})</span></summary>
+        {% if a.kind in ("findings", "triage", "confirm", "json") and a.parsed is not none %}
+          <pre class="json">{{ a.parsed | tojson(indent=2) }}</pre>
+        {% elif a.content is not none %}
+          <pre class="artifact">{{ a.content }}</pre>
+        {% elif a.kind == "missing" %}
+          <p class="muted">not written yet</p>
+        {% endif %}
+      </details>
+    {% endfor %}
+  {% endif %}
+
+  <p><a href="/runs/{{ slug }}/diff?run_id={{ manifest.run_id }}{% if token %}&token={{ token }}{% endif %}">View phase diff →</a>
+     · <a href="/runs/{{ slug }}/judge-audit?run_id={{ manifest.run_id }}{% if token %}&token={{ token }}{% endif %}">Judge audit →</a></p>
+
+  {# --- control forms: only the verbs resume_intel permits (FR-5.3) --- #}
+  {% if not external %}
+  <div class="controls control-forms" data-token="{{ token }}" data-slug="{{ slug }}">
+    {% if "approve" in controls %}
+      <form data-approve>
+        <input type="text" name="notes" placeholder="approval notes (optional)">
+        <button type="submit">Approve</button>
+      </form>
+    {% endif %}
+    {% if "reject" in controls %}
+      <form data-reject>
+        <input type="text" name="notes" placeholder="rejection notes (required)" required>
+        <button type="submit" class="danger">Reject…</button>
+      </form>
+    {% endif %}
+    {% if "resume" in controls %}
+      <form data-resume><button type="submit">Resume</button></form>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}

@@ -450,9 +450,23 @@ def test_post_runs_503_without_supervisor(tmp_path):
 def test_post_abort_invokes_supervisor(tmp_path):
     sup = _FakeSupervisor()
     client = _client(_bare_store(tmp_path), supervisor=sup)
-    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    # P5/FR-10.7: abort is a destructive verb and now requires explicit
+    # confirmation (`confirm: true`); the bare-POST contract from P3 is updated
+    # deliberately for the ratified confirm-step requirement.
+    resp = client.post(
+        "/api/runs/demo/abort", json={"confirm": True}, headers={TOKEN_HEADER: TOKEN}
+    )
     assert resp.status_code == 200
     assert sup.aborted == ["demo"]
+
+
+def test_post_abort_requires_confirm(tmp_path):
+    # FR-10.7: a POST without `confirm: true` fails closed (misclick guard).
+    sup = _FakeSupervisor()
+    client = _client(_bare_store(tmp_path), supervisor=sup)
+    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    assert resp.status_code == 400
+    assert sup.aborted == []  # never reached the supervisor
 
 
 def test_control_endpoints_require_token(tmp_path):
@@ -486,7 +500,9 @@ class _RaisingSupervisor(_FakeSupervisor):
 def test_post_abort_maps_refused_to_its_status_code(tmp_path):
     sup = _RaisingSupervisor(AbortRefused("nope", status_code=404))
     client = _client(_bare_store(tmp_path), supervisor=sup)
-    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    resp = client.post(
+        "/api/runs/demo/abort", json={"confirm": True}, headers={TOKEN_HEADER: TOKEN}
+    )
     assert resp.status_code == 404
     assert resp.json()["detail"] == "nope"
 
@@ -494,6 +510,8 @@ def test_post_abort_maps_refused_to_its_status_code(tmp_path):
 def test_post_abort_maps_failed_child_to_502(tmp_path):
     sup = _RaisingSupervisor(AbortFailed("`gauntlet abort` exited 7; see /x"))
     client = _client(_bare_store(tmp_path), supervisor=sup)
-    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    resp = client.post(
+        "/api/runs/demo/abort", json={"confirm": True}, headers={TOKEN_HEADER: TOKEN}
+    )
     assert resp.status_code == 502
     assert "exited 7" in resp.json()["detail"]

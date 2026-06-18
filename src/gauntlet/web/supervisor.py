@@ -72,13 +72,12 @@ COMPLETED = "completed"
 FAILED_LAUNCH = "failed_launch"
 
 
-class AbortRefused(RuntimeError):
-    """The P3 abort path refused the target run (review F-002).
+class ControlRefused(RuntimeError):
+    """A control verb refused the target run (fail closed, FR-5.3/review F-002).
 
     Carries the HTTP status the control surface should return: 404 when there
-    is no run to abort, 409 when the run is observed (not console-owned),
-    already terminal, or has no live attached driver. Fail closed — the P3
-    abort verb only stops a live, console-owned, non-terminal run.
+    is no run to act on, 409 when the run's state makes the verb meaningless
+    (observed-not-owned for abort, already-terminal, no live driver, etc.).
     """
 
     def __init__(self, message: str, *, status_code: int = 409) -> None:
@@ -86,13 +85,24 @@ class AbortRefused(RuntimeError):
         self.status_code = status_code
 
 
-class AbortFailed(RuntimeError):
-    """The sanctioned ``gauntlet abort`` child failed (review F-003).
+class ControlFailed(RuntimeError):
+    """A sanctioned ``gauntlet <verb>`` control child failed (review F-003).
 
-    A non-zero exit or a timeout from the abort verb must not be reported to
-    the operator as success (project fail-closed rule for unexpected external
-    command exits).
+    A non-zero exit or a timeout from a quick control verb (abort/reject) must
+    never be reported to the operator as success (project fail-closed rule for
+    unexpected external command exits).
     """
+
+
+class AbortRefused(ControlRefused):
+    """The P3 abort path refused the target run (review F-002).
+
+    The P3 abort verb only stops a live, console-owned, non-terminal run; an
+    observed/missing/terminal/driverless run fails closed."""
+
+
+class AbortFailed(ControlFailed):
+    """The sanctioned ``gauntlet abort`` child failed (review F-003)."""
 
 
 def _utc_stamp() -> str:
@@ -350,6 +360,101 @@ class JobSupervisor:
             )
         return rp
 
+    # ---- approve / resume / reject (FR-6.2, the human-value verbs) ----------
+    def _control_run_dir(self, slug: str) -> tuple[str, Path]:
+        """Resolve the slug's active run dir for a control verb (FR-6.1a).
+
+        For approve/resume/reject the run dir already exists, so we resolve it
+        from the slug's ``active-run.txt`` (no pre-allocation). A missing pointer
+        fails closed → :class:`ControlRefused` (404)."""
+        safe_run_segment(slug, kind="slug")  # FR-10.1 / review F-001
+        try:
+            run_id = self._active_run_id(slug)
+        except FileNotFoundError as exc:
+            raise ControlRefused(str(exc), status_code=404) from exc
+        return run_id, self._run_dir(slug, run_id)
+
+    def approve(
+        self, slug: str, *, gate: str | None = None, notes: str | None = None
+    ) -> RunProcess:
+        """Launch ``gauntlet approve`` as a long-lived owned driver (FR-6.2/R6).
+
+        Approve *drives the rest of the run*, so it is handled with the full
+        :class:`RunProcess` lifecycle (it records ``job.json`` and becomes the
+        console-owned driver), not a quick RPC. Control = the sanctioned CLI verb
+        a human would type (FR-10.1); the engine takes the worktree lock and
+        gates every tool call inside the child."""
+        run_id, run_dir = self._control_run_dir(slug)
+        flags: list[str] = []
+        if gate:
+            flags += ["--gate", gate]
+        if notes:
+            flags += ["--notes", notes]
+        return self._launch_driver("approve", slug, run_id, run_dir, flags)
+
+    def resume(self, slug: str) -> RunProcess:
+        """Launch ``gauntlet resume`` as a long-lived owned driver (FR-6.2/R6)."""
+        run_id, run_dir = self._control_run_dir(slug)
+        return self._launch_driver("resume", slug, run_id, run_dir, [])
+
+    def _launch_driver(
+        self, verb: str, slug: str, run_id: str, run_dir: Path, flags: list[str]
+    ) -> RunProcess:
+        rp = RunProcess(
+            verb=verb,
+            slug=slug,
+            run_id=run_id,
+            run_dir=run_dir,
+            repo_root=self.repo_root,
+            flags=flags,
+            python=self.python,
+        )
+        rp.start()
+        self._procs[slug] = rp
+        return rp
+
+    def reject(
+        self, slug: str, notes: str, *, gate: str | None = None
+    ) -> RunProcess:
+        """Run ``gauntlet reject`` as a quick, fail-closed control child.
+
+        Reject fails a parked gate and is **not** a driving verb (it takes no
+        worktree lock — it only marks the gate failed), so unlike approve/resume
+        it is a short-lived RPC we wait on. A non-zero exit or timeout raises
+        :class:`ControlFailed` so a failed reject never reads as success
+        (review F-003). ``notes`` is required by the CLI verb (FR-4.4)."""
+        if not notes or not notes.strip():
+            raise ControlRefused("reject requires notes (FR-4.4)", status_code=400)
+        run_id, run_dir = self._control_run_dir(slug)
+        flags = ["--notes", notes]
+        if gate:
+            flags += ["--gate", gate]
+        rp = RunProcess(
+            verb="reject",
+            slug=slug,
+            run_id=run_id,
+            run_dir=run_dir,
+            repo_root=self.repo_root,
+            flags=flags,
+            python=self.python,
+            record_job=False,
+        )
+        rp.start()
+        try:
+            code = rp.wait(timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            rp.stop()
+            raise ControlFailed(
+                f"`gauntlet reject` for {slug}/{run_id} timed out after 30s; "
+                f"see {rp.log_path}"
+            ) from exc
+        if code != 0:
+            raise ControlFailed(
+                f"`gauntlet reject` for {slug}/{run_id} exited {code}; "
+                f"see {rp.log_path}"
+            )
+        return rp
+
     @staticmethod
     def _load_manifest(run_dir: Path) -> Manifest | None:
         """The run's manifest, or ``None`` when absent/unreadable (pre-manifest
@@ -532,6 +637,8 @@ __all__ = [
     "Job",
     "LockInfo",
     "RecoveryOutcome",
+    "ControlRefused",
+    "ControlFailed",
     "AbortRefused",
     "AbortFailed",
     "REATTACHED",

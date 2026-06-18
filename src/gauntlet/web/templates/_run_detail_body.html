@@ -37,6 +37,10 @@
 </ul>
 {% endif %}
 
+{# P5 recovery / gate / escalation panel (FR-4/FR-5). `intel` is always present;
+   `gate` only when parked at a gate/escalation. #}
+{% if intel is defined %}{% include "_recovery.html" %}{% endif %}
+
 <h2>Steps</h2>
 <table class="steps">
   <thead>

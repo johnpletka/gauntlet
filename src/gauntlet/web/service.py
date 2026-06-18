@@ -24,9 +24,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+from gauntlet.web.gate import GateResolver, NoPendingGate, handoff_prompt
+from gauntlet.web.intel import resume_intel
 from gauntlet.web.sse import SSE_HEADERS, event_stream, log_tail_stream
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
-from gauntlet.web.supervisor import AbortFailed, AbortRefused
+from gauntlet.web.supervisor import ControlFailed, ControlRefused
 from gauntlet.web.views import register_views
 from gauntlet.web.watcher import Watcher
 
@@ -75,12 +77,34 @@ class LaunchBody(BaseModel):
         return safe_run_segment(value, kind="slug")
 
 
+class ApproveBody(BaseModel):
+    """``POST …/approve`` body (FR-4.4). Approve is non-destructive — no confirm."""
+
+    gate: str | None = None
+    notes: str | None = None
+
+
+class RejectBody(BaseModel):
+    """``POST …/reject`` body (FR-4.4). Notes required; confirm required (FR-10.7)."""
+
+    notes: str
+    gate: str | None = None
+    confirm: bool = False
+
+
+class AbortBody(BaseModel):
+    """``POST …/abort`` body. Confirm required for the destructive verb (FR-10.7)."""
+
+    confirm: bool = False
+
+
 def create_app(
     store: RunStore,
     *,
     token: str,
     watcher: Watcher | None = None,
     supervisor=None,
+    handoff_enabled: bool = False,
 ) -> FastAPI:
     # The watcher (P2) drives live state. Created here unless injected (tests
     # inject one they drive synchronously via `poll_once`). It is started/stopped
@@ -122,6 +146,8 @@ def create_app(
     )
     app.state.watcher = watcher
     app.state.supervisor = supervisor
+    app.state.handoff_enabled = handoff_enabled
+    gates = GateResolver(store)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     auth = Depends(_token_dependency(token))
 
@@ -141,16 +167,23 @@ def create_app(
     async def _unsafe_segment(_request: Request, exc: UnsafeRunSegment) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    # Abort fails closed: refused (not owned/live/non-terminal) → 404/409 from
-    # the exception (review F-002); the sanctioned child failing → 502 so a
-    # failed destructive action never reads as success (review F-003).
-    @app.exception_handler(AbortRefused)
-    async def _abort_refused(_request: Request, exc: AbortRefused) -> JSONResponse:
+    # Control verbs fail closed: refused (not owned/live/non-terminal, missing
+    # run, missing notes) → the exception's status (404/409/400, review F-002);
+    # the sanctioned child failing → 502 so a failed action never reads as
+    # success (review F-003). AbortRefused/AbortFailed subclass these, so the
+    # base handlers cover them via MRO lookup.
+    @app.exception_handler(ControlRefused)
+    async def _control_refused(_request: Request, exc: ControlRefused) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
-    @app.exception_handler(AbortFailed)
-    async def _abort_failed(_request: Request, exc: AbortFailed) -> JSONResponse:
+    @app.exception_handler(ControlFailed)
+    async def _control_failed(_request: Request, exc: ControlFailed) -> JSONResponse:
         return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+    # No pending gate/escalation to resolve → 404 (FR-4.1/4.6).
+    @app.exception_handler(NoPendingGate)
+    async def _no_gate(_request: Request, exc: NoPendingGate) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -166,8 +199,10 @@ def create_app(
     @app.get("/api/runs/{slug}", dependencies=[auth])
     def api_run(slug: str, run_id: str | None = Query(default=None)) -> dict:
         man = store.manifest(slug, run_id)
-        # The full manifest is the §6 contract; resume_intel is P5, not here.
+        # The full manifest is the §6 contract; P5 adds the computed
+        # resume_intel recovery classification (FR-5.1).
         body = man.model_dump(mode="json")
+        body["resume_intel"] = resume_intel(man).model_dump()
         # owned/observed badge now real (FR-1.4); external = a live foreign
         # driver holds the worktree lock (FR-10.5).
         owned, attached, external = store._ownership(
@@ -228,6 +263,41 @@ def create_app(
     ) -> dict:
         return store.serve_log(slug, run_id=run_id, offset=from_).model_dump()
 
+    # ---- gate / escalation resolution (P5, FR-4) ----------------------------
+    @app.get("/api/runs/{slug}/gate", dependencies=[auth])
+    def api_gate(slug: str, run_id: str | None = Query(default=None)) -> dict:
+        # Resolves a parked human_gate's show: artifacts OR a parked
+        # adversarial_cycle's escalation evidence (FR-4.2/4.6). NoPendingGate →
+        # 404; UnsafePath (a traversal in a show: name) → 400.
+        return gates.gate(slug, run_id).model_dump()
+
+    @app.get("/api/runs/{slug}/diff", dependencies=[auth])
+    def api_diff(
+        slug: str,
+        run_id: str | None = Query(default=None),
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = Query(default=None),
+    ) -> dict:
+        # Deterministic phase-diff selection when from/to omitted (FR-4.3), incl.
+        # the no-committed-diff sentinel; explicit SHAs override.
+        return gates.diff(slug, run_id=run_id, from_sha=from_, to_sha=to).model_dump()
+
+    @app.get("/api/runs/{slug}/judge-audit", dependencies=[auth])
+    def api_judge_audit(slug: str, run_id: str | None = Query(default=None)) -> dict:
+        return {"slug": slug, "entries": store.judge_audit(slug, run_id=run_id)}
+
+    @app.get("/api/runs/{slug}/handoff", dependencies=[auth])
+    def api_handoff(slug: str, run_id: str | None = Query(default=None)) -> dict:
+        # Opt-in scoped-analysis hand-off (FR-4.7): assemble a copy-pasteable,
+        # read-only prompt. The console spawns nothing and makes no model call.
+        # Off by default; 404 until enabled via config (the web: block, P7).
+        if not app.state.handoff_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="scoped-analysis hand-off is disabled (FR-4.7 opt-in)",
+            )
+        return handoff_prompt(gates.gate(slug, run_id)).model_dump()
+
     # ---- control surface: sanctioned CLI-verb children (P3, §6) -------------
     def _require_supervisor():
         if supervisor is None:
@@ -271,14 +341,74 @@ def create_app(
             "status": "launched",
         }
 
+    def _require_confirm(confirm: bool, verb: str) -> None:
+        """Destructive-verb confirmation (FR-10.7).
+
+        UX-safety against a misclick aborting/rejecting a long, expensive run —
+        *not* a security control (it adds nothing against a caller who holds the
+        token, FR-10.4). A POST without ``confirm: true`` fails closed."""
+        if not confirm:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"`{verb}` is destructive and requires explicit confirmation "
+                    "(send `confirm: true`) (FR-10.7)"
+                ),
+            )
+
     @app.post("/api/runs/{slug}/abort", dependencies=[auth])
-    def api_abort(slug: str) -> dict:
+    def api_abort(slug: str, body: AbortBody | None = None) -> dict:
         _require_supervisor()
+        _require_confirm(bool(body and body.confirm), "abort")
         # The supervisor fails closed: it raises AbortRefused (→404/409) for
         # observed/missing/terminal runs and AbortFailed (→502) if the
         # sanctioned `gauntlet abort` child exits non-zero or times out, so we
         # only reach here when the destructive action actually succeeded.
         rp = supervisor.abort(slug)
+        try:
+            status = store.manifest(slug).status
+        except RunNotFound:
+            status = "unknown"
+        return {"slug": slug, "run_id": rp.run_id, "status": status}
+
+    @app.post("/api/runs/{slug}/approve", dependencies=[auth])
+    def api_approve(slug: str, body: ApproveBody | None = None) -> dict:
+        # Approve drives the rest of the run (FR-6.2) — a driving verb, so it
+        # fails closed if the worktree is already being driven (FR-10.5).
+        _require_supervisor()
+        _refuse_if_worktree_locked("approve a gate")
+        body = body or ApproveBody()
+        proc = supervisor.approve(slug, gate=body.gate, notes=body.notes)
+        return {
+            "slug": proc.slug,
+            "run_id": proc.run_id,
+            "pid": proc.pid,
+            "owned": True,
+            "status": "approving",
+        }
+
+    @app.post("/api/runs/{slug}/resume", dependencies=[auth])
+    def api_resume(slug: str) -> dict:
+        # Resume is a driving verb (FR-10.5) — fails closed under the worktree lock.
+        _require_supervisor()
+        _refuse_if_worktree_locked("resume a run")
+        proc = supervisor.resume(slug)
+        return {
+            "slug": proc.slug,
+            "run_id": proc.run_id,
+            "pid": proc.pid,
+            "owned": True,
+            "status": "resuming",
+        }
+
+    @app.post("/api/runs/{slug}/reject", dependencies=[auth])
+    def api_reject(slug: str, body: RejectBody) -> dict:
+        # Reject fails a gate (destructive, FR-10.7) but is NOT a driving verb
+        # (it takes no worktree lock — it only marks the gate failed), so it is a
+        # quick, fail-closed child and needs no lock guard.
+        _require_supervisor()
+        _require_confirm(body.confirm, "reject")
+        rp = supervisor.reject(slug, body.notes, gate=body.gate)
         try:
             status = store.manifest(slug).status
         except RunNotFound:

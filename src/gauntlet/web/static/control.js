@@ -47,16 +47,53 @@
       .catch(function (err) { window.alert("Launch failed: " + err.message); });
   });
 
+  function runUrl(slug, verb) {
+    return "/api/runs/" + encodeURIComponent(slug) + "/" + verb;
+  }
+
   document.addEventListener("click", function (e) {
     var btn = e.target.closest && e.target.closest("[data-abort]");
     if (!btn) return;
     e.preventDefault();
     var slug = btn.getAttribute("data-slug");
-    // Lightweight misclick guard; the full FR-10.7 destructive-verb confirm
-    // token is P5.
+    // FR-10.7 destructive-verb confirm: the misclick guard here is paired with
+    // the server-side `confirm: true` requirement (the security boundary stays
+    // loopback + token).
     if (!window.confirm("Abort run " + slug + "? This stops an in-flight run.")) return;
-    post("/api/runs/" + encodeURIComponent(slug) + "/abort", btn.getAttribute("data-token") || "", null)
+    post(runUrl(slug, "abort"), btn.getAttribute("data-token") || "", { confirm: true })
       .then(function () { location.reload(); })
       .catch(function (err) { window.alert("Abort failed: " + err.message); });
+  });
+
+  // P5 gate / recovery control forms (FR-4.4/FR-5/FR-10.7). The forms live in a
+  // container carrying data-slug/data-token; each form declares its verb via a
+  // data-* attribute. resume_intel decides which forms are rendered, so only
+  // meaningful verbs ever appear (FR-5.3).
+  document.addEventListener("submit", function (e) {
+    var form = e.target.closest && e.target.closest("[data-approve],[data-reject],[data-resume]");
+    if (!form) return;
+    var box = form.closest("[data-slug]");
+    if (!box) return;
+    e.preventDefault();
+    var slug = box.getAttribute("data-slug");
+    var token = box.getAttribute("data-token") || "";
+    var verb, body;
+    if (form.hasAttribute("data-approve")) {
+      verb = "approve";
+      body = { notes: (form.notes && form.notes.value.trim()) || null };
+    } else if (form.hasAttribute("data-resume")) {
+      verb = "resume";
+      body = null;
+    } else {
+      verb = "reject";
+      var notes = (form.notes && form.notes.value.trim()) || "";
+      if (!notes) { window.alert("Reject requires notes."); return; }
+      // FR-10.7 destructive-verb confirm for reject.
+      if (!window.confirm("Reject this gate? The run fails.")) return;
+      body = { notes: notes, confirm: true };
+    }
+    post(runUrl(slug, verb), token, body)
+      .then(function () { location.reload(); })
+      .catch(function (err) { window.alert(verb + " failed: " + err.message); });
   });
 })();

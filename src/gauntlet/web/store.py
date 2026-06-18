@@ -14,6 +14,7 @@ repo tree.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -508,6 +509,39 @@ class RunStore:
             return Manifest.load(run_dir / "manifest.json")
         except (OSError, ValueError) as exc:
             raise RunNotFound(f"unreadable manifest for {slug!r}: {exc}") from exc
+
+    # ---- judge-audit view (FR-3.4) ------------------------------------------
+    def judge_audit(
+        self, slug: str, *, run_id: str | None = None, max_entries: int = 2000
+    ) -> list[dict]:
+        """Parsed ``judge-audit.jsonl`` decisions for a run (FR-3.4).
+
+        Returns one dict per audit line (tool / decision / source / rationale /
+        latency as the engine wrote them) so a judge-driven denial is
+        diagnosable in a readable view. A missing audit file → empty list (a run
+        with ``--no-judge`` or no tool calls writes none). The path is a fixed
+        constant under the run dir, so there is no traversal surface. Malformed
+        lines are skipped rather than failing the whole view (data over
+        inference: surface what parses)."""
+        run_dir = self.run_dir(slug, run_id)
+        path = self._assert_within(run_dir / "judge-audit.jsonl", run_dir)
+        if not path.exists() or not path.is_file():
+            return []
+        out: list[dict] = []
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+                if len(out) >= max_entries:
+                    break
+        return out
 
     def step_detail(
         self, slug: str, step: str, run_id: str | None = None

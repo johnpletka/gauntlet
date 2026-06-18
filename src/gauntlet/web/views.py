@@ -24,7 +24,9 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from gauntlet.web.store import RunStore, duration_seconds
+from gauntlet.web.gate import GateResolver, NoPendingGate
+from gauntlet.web.intel import resume_intel
+from gauntlet.web.store import RunNotFound, RunStore, UnsafePath, duration_seconds
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -60,6 +62,18 @@ def _detail_context(
     ]
     lock = store.worktree_lock()
     owned, attached, external = store._ownership(slug, man.run_id, lock)
+    # P5: the recovery classification drives the banner + which control forms to
+    # offer (FR-5). Cheap (pure over the manifest). Gate evidence is resolved
+    # only when parked at a gate/escalation (small JSON/artifact reads); the
+    # heavier phase diff stays a deliberate navigation (the /runs/{slug}/diff
+    # page), never recomputed on every live tick.
+    intel = resume_intel(man)
+    gate = None
+    if intel.state in ("gate", "escalation"):
+        try:
+            gate = GateResolver(store).gate(slug, run_id)
+        except (NoPendingGate, RunNotFound, UnsafePath, OSError):
+            gate = None
     ctx = {
         "slug": slug,
         "manifest": man,
@@ -68,6 +82,8 @@ def _detail_context(
         "owned": owned,
         "attached": attached,
         "external": external,
+        "intel": intel,
+        "gate": gate,
     }
     ctx.update(_lock_context(store))
     return ctx
@@ -94,6 +110,40 @@ def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
     ) -> HTMLResponse:
         ctx = _detail_context(store, slug, run_id, token)
         return templates.TemplateResponse(request, "run_detail.html", ctx)
+
+    # ---- phase diff + judge-audit (P5, FR-4.3/FR-3.4) — deliberate pages, not
+    # live-swapped (the diff shells out to git, so it is not on the SSE tick) ---
+    @app.get("/runs/{slug}/diff", response_class=HTMLResponse, dependencies=[auth])
+    def diff_page(
+        request: Request,
+        slug: str,
+        run_id: str | None = Query(default=None),
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = Query(default=None),
+        token: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        view = GateResolver(store).diff(
+            slug, run_id=run_id, from_sha=from_, to_sha=to
+        )
+        return templates.TemplateResponse(
+            request, "diff.html", {"slug": slug, "diff": view, "token": token or ""}
+        )
+
+    @app.get(
+        "/runs/{slug}/judge-audit", response_class=HTMLResponse, dependencies=[auth]
+    )
+    def judge_audit_page(
+        request: Request,
+        slug: str,
+        run_id: str | None = Query(default=None),
+        token: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        entries = store.judge_audit(slug, run_id=run_id)
+        return templates.TemplateResponse(
+            request,
+            "judge_audit.html",
+            {"slug": slug, "entries": entries, "token": token or ""},
+        )
 
     # ---- live partials (P2): the innerHTML live.js swaps in on each SSE tick --
     @app.get("/partials/runs", response_class=HTMLResponse, dependencies=[auth])
