@@ -84,6 +84,10 @@ pre.json, pre.artifact, pre.diff, pre.conflict {
   padding: 10px 12px; overflow-x: auto; font-size: 12.5px; max-height: 480px;
 }
 table.findings td, table.audit td { font-size: 13px; }
+.markdown { font-size: 14px; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 12px 0 6px; }
+.markdown ul, .markdown ol { margin: 6px 0 6px 20px; }
+.markdown code { background: #f6f8fa; padding: 1px 4px; border-radius: 4px; font-size: 12.5px; }
 .status-allow { background: #ecfdf5; color: #047857; }
 .status-deny  { background: #fef2f2; color: #b91c1c; }
 .status-ask   { background: #fffbeb; color: #b45309; }

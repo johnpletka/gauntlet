@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 
 from gauntlet.web.gate import GateResolver, NoPendingGate
 from gauntlet.web.intel import resume_intel
+from gauntlet.web.markdown import render_markdown
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath, duration_seconds
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -69,11 +70,20 @@ def _detail_context(
     # page), never recomputed on every live tick.
     intel = resume_intel(man)
     gate = None
+    gate_error: str | None = None
     if intel.state in ("gate", "escalation"):
         try:
             gate = GateResolver(store).gate(slug, run_id)
-        except (NoPendingGate, RunNotFound, UnsafePath, OSError):
+        except (NoPendingGate, RunNotFound, UnsafePath, OSError) as exc:
+            # Fail closed (review F-001): a gate/escalation whose evidence cannot
+            # be safely assembled — an unsafe `show:` path, an unreadable
+            # artifact, or a resolver/intel disagreement — must NOT silently
+            # degrade into a normal decision page. Surface the failure and let
+            # the template suppress the control forms, so no Approve/Reject/Resume
+            # can be issued without the required evidence; the same fail-closed
+            # posture as the /api/runs/{slug}/gate endpoint.
             gate = None
+            gate_error = str(exc) or exc.__class__.__name__
     ctx = {
         "slug": slug,
         "manifest": man,
@@ -84,6 +94,7 @@ def _detail_context(
         "external": external,
         "intel": intel,
         "gate": gate,
+        "gate_error": gate_error,
     }
     ctx.update(_lock_context(store))
     return ctx
@@ -92,6 +103,8 @@ def _detail_context(
 def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
     """Register the run-list/run-detail HTML routes and their live partials."""
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    # FR-4.3: gate `show:` markdown artifacts render *as markdown* (safe, no dep).
+    templates.env.filters["markdown"] = render_markdown
 
     @app.get("/", response_class=HTMLResponse, dependencies=[auth])
     def run_list(

@@ -118,12 +118,19 @@ class NoPendingGate(LookupError):
 
 
 def _classify_json(name: str, data: Any) -> str:
-    if name == "findings.json" or (isinstance(data, dict) and "findings" in data):
+    # Explicit filenames win over the structural heuristic (review F-003):
+    # confirm.json also carries a `verdicts` key, so the heuristic alone would
+    # mis-type it as triage and it would never render with its own table.
+    if name == "findings.json":
         return "findings"
-    if name == "triage.json" or (isinstance(data, dict) and "verdicts" in data):
+    if name == "triage.json":
         return "triage"
     if name == "confirm.json":
         return "confirm"
+    if isinstance(data, dict) and "findings" in data:
+        return "findings"
+    if isinstance(data, dict) and "verdicts" in data:
+        return "triage"
     return "json"
 
 

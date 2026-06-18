@@ -32,6 +32,7 @@ from gauntlet.engine.manifest import (
     StepRecord,
 )
 from gauntlet.web import intel as I
+from gauntlet.web.markdown import render_markdown
 from gauntlet.web.gate import GateResolver, NoPendingGate, handoff_prompt
 from gauntlet.web.intel import resume_intel
 from gauntlet.web.service import TOKEN_HEADER, create_app
@@ -528,6 +529,87 @@ def test_detail_page_renders_gate_panel(fixture_repo):
     assert "data-approve" in html and "data-reject" in html
     assert "data-resume" not in html  # not a resume verb for a gate (FR-5.2)
     assert "findings.json" in html
+
+
+def test_render_markdown_is_safe_and_structural():
+    # FR-4.3: markdown → HTML, but every byte is escaped first so an artifact
+    # under review can never smuggle active content into the console page.
+    out = str(render_markdown(
+        "# Title\n\nsome **bold** and `code`\n\n- a\n- b\n\n<script>x</script>\n"
+    ))
+    assert "<h1>Title</h1>" in out
+    assert "<strong>bold</strong>" in out and "<code>code</code>" in out
+    assert "<li>a</li>" in out and "<li>b</li>" in out
+    # The raw HTML is escaped, never emitted as a live tag.
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+
+def test_detail_page_fails_closed_on_unsafe_show(fixture_repo):
+    # FR-4 / review F-001: a gate whose show: name traverses cannot be safely
+    # assembled. The detail page must surface the failure and SUPPRESS the
+    # control forms — never degrade into a normal Approve/Reject page.
+    run_dir = _gate_run_with_artifacts(fixture_repo)
+    (run_dir / "pipeline.yaml").write_text(
+        "name: standard\nversion: 1\nstages:\n"
+        "  - id: impl\n    steps:\n"
+        "      - {id: impl-gate, type: human_gate, show: ['../../../etc/passwd']}\n"
+    )
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "controls are disabled" in html
+    assert "data-approve" not in html and "data-reject" not in html
+
+
+def _gate_run_all_artifacts(repo: Path) -> Path:
+    (repo / "runs").mkdir(exist_ok=True)
+    man = _man("demo", "run-1", status=RUN_PARKED, current_step="impl-gate",
+               steps=[_step("impl-gate", "human_gate", "parked",
+                            notes="awaiting human decision")])
+    run_dir = _write_run(repo, "demo", "run-1", man)
+    (run_dir / "pipeline.yaml").write_text(
+        "name: standard\nversion: 1\nstages:\n"
+        "  - id: impl\n    steps:\n"
+        "      - {id: impl-gate, type: human_gate, "
+        "show: [findings.json, triage.json, confirm.json, plan.md]}\n"
+    )
+    arts = run_dir / "artifacts"
+    arts.mkdir()
+    (arts / "findings.json").write_text(json.dumps({
+        "findings": [{"id": "F-042", "severity": "major", "category": "correctness",
+                      "location": "z.py:9", "claim": "off by one",
+                      "evidence": "loop overruns", "suggested_fix": "use <"}],
+        "open_questions": [], "summary": "one finding"}))
+    (arts / "triage.json").write_text(json.dumps({"verdicts": [
+        {"finding_id": "F-042", "verdict": "legitimate", "reasoning": "real bug",
+         "action": "fix_now", "confidence": "high", "target_artifact": None}]}))
+    (arts / "confirm.json").write_text(json.dumps({
+        "verdicts": [{"finding_id": "F-042", "verdict": "resolved",
+                      "notes": "addressed in fix round"}],
+        "new_findings": [], "summary": "all resolved"}))
+    (repo / "runs" / "demo" / "plan.md").write_text(
+        "# The Plan\n\n- step one\n- step two\n"
+    )
+    return run_dir
+
+
+def test_gate_panel_renders_artifact_tables_and_markdown(fixture_repo):
+    # FR-4.3: findings/triage/confirm render as readable tables (not raw JSON
+    # dumps), and markdown artifacts render as markdown.
+    _gate_run_all_artifacts(fixture_repo)
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    # Tables, not <pre class="json"> dumps.
+    assert 'class="json"' not in html
+    assert 'table class="findings"' in html
+    assert "<th>Evidence</th>" in html  # findings table shape
+    assert "F-042" in html and "off by one" in html  # findings cells
+    assert "fix_now" in html  # triage verdict cell
+    assert "addressed in fix round" in html  # confirm notes cell
+    # Markdown rendered as markdown (heading + list), not raw text.
+    assert "<h1>The Plan</h1>" in html
+    assert "<li>step one</li>" in html
+    assert "# The Plan" not in html
 
 
 def test_detail_page_renders_escalation_panel(fixture_repo):

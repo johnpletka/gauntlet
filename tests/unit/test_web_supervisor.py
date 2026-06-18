@@ -29,7 +29,14 @@ from gauntlet.engine.manifest import (
 from gauntlet.web.jobproc import JOB_FILENAME, SERVE_DIRNAME, JobRecord
 from gauntlet.web.service import TOKEN_HEADER, create_app
 from gauntlet.web.store import RunStore
-from gauntlet.web.supervisor import AbortFailed, AbortRefused, JobSupervisor, LockInfo
+from gauntlet.engine.run import UnsafeRunSegment
+from gauntlet.web.supervisor import (
+    AbortFailed,
+    AbortRefused,
+    ControlRefused,
+    JobSupervisor,
+    LockInfo,
+)
 
 from conftest import git
 
@@ -316,6 +323,49 @@ def test_abort_fails_closed_on_child_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr("gauntlet.web.supervisor.RunProcess", _HangingRP)
     with pytest.raises(AbortFailed, match="timed out"):
         sup.abort("live")
+
+
+# ---- control verbs validate the active-run pointer (review F-002) -----------
+
+
+def _seed_pointer(sup: JobSupervisor, slug: str, value: str) -> None:
+    """Write a raw (possibly corrupted) active-run pointer for ``slug``."""
+    d = sup.run_root / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "active-run.txt").write_text(value)
+
+
+@pytest.mark.parametrize("verb", ["approve", "resume", "reject"])
+@pytest.mark.parametrize("bad", ["../../../etc", "a/b", "a\\b", ".", "..", "x\x00y"])
+def test_control_refuses_traversal_active_pointer(tmp_path, verb, bad):
+    # A corrupted active-run.txt must never become a path segment that escapes
+    # the run root (review F-002): the control verb fails closed before launch.
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_pointer(sup, "ctl", bad)
+    call = {
+        "approve": lambda: sup.approve("ctl"),
+        "resume": lambda: sup.resume("ctl"),
+        "reject": lambda: sup.reject("ctl", "needs work"),
+    }[verb]
+    with pytest.raises(UnsafeRunSegment):
+        call()
+
+
+@pytest.mark.parametrize("verb", ["approve", "resume", "reject"])
+def test_control_refuses_pointer_to_nonexistent_run(tmp_path, verb):
+    # A well-formed but dangling pointer (no run dir / manifest) fails closed
+    # with 404 rather than letting a control child materialise a phantom dir.
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_pointer(sup, "ctl", "run-ghost")
+    call = {
+        "approve": lambda: sup.approve("ctl"),
+        "resume": lambda: sup.resume("ctl"),
+        "reject": lambda: sup.reject("ctl", "needs work"),
+    }[verb]
+    with pytest.raises(ControlRefused) as ei:
+        call()
+    assert ei.value.status_code == 404
+    assert "no manifest" in str(ei.value)
 
 
 # ---- session-child reaping (review F-004) -----------------------------------

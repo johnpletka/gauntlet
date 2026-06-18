@@ -229,6 +229,22 @@ class JobSupervisor:
     def _run_dir(self, slug: str, run_id: str) -> Path:
         return self._slug_dir(slug) / run_id
 
+    def _assert_within_run_root(self, path: Path) -> Path:
+        """Fail closed if ``path`` resolves outside the run root (FR-10.1 / F-002).
+
+        Mirrors ``RunStore._assert_within``: a control verb resolves its target
+        run dir from an untrusted on-disk pointer (``active-run.txt``), so the
+        resolved path is asserted to stay under ``run_root`` (following symlinks)
+        before any control child writes into it.
+        """
+        resolved = path.resolve()
+        root = self.run_root.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ControlRefused(
+                f"control target escapes run root: {path}", status_code=400
+            )
+        return resolved
+
     def _active_run_id(self, slug: str) -> str:
         pointer = self._slug_dir(slug) / "active-run.txt"
         if not pointer.exists():
@@ -238,6 +254,11 @@ class JobSupervisor:
         rid = pointer.read_text().strip()
         if not rid:
             raise FileNotFoundError(f"empty active-run pointer for slug {slug!r}")
+        # Containment (review F-002): the pointer is on-disk state we do not
+        # author, so its contents are untrusted — validate the run id as a
+        # single, traversal-free segment before it is joined into the run-root
+        # path (mirrors RunStore._resolve_run_id's treatment of the same pointer).
+        safe_run_segment(rid, kind="run_id")
         return rid
 
     # ---- launch (FR-6.1/6.1a) ------------------------------------------------
@@ -372,7 +393,22 @@ class JobSupervisor:
             run_id = self._active_run_id(slug)
         except FileNotFoundError as exc:
             raise ControlRefused(str(exc), status_code=404) from exc
-        return run_id, self._run_dir(slug, run_id)
+        run_dir = self._run_dir(slug, run_id)
+        # Belt-and-suspenders containment + existence (review F-002): the run id
+        # came from an untrusted on-disk pointer, so assert the resolved run dir
+        # stays under the slug run root and points at a real, manifested run
+        # before any control child writes into it (.serve/, logs, job.json). An
+        # unsafe run id is already rejected by `_active_run_id` (UnsafeRunSegment
+        # → the service's 400 handler); a pointer at a non-existent run fails
+        # closed here rather than letting `start()` materialise a phantom dir.
+        self._assert_within_run_root(run_dir)
+        if not (run_dir / "manifest.json").exists():
+            raise ControlRefused(
+                f"active run {slug}/{run_id} has no manifest on disk; "
+                "nothing to control",
+                status_code=404,
+            )
+        return run_id, run_dir
 
     def approve(
         self, slug: str, *, gate: str | None = None, notes: str | None = None
