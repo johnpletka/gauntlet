@@ -25,15 +25,50 @@ from ``.serve/job.json`` on restart (P4).
 from __future__ import annotations
 
 import json
+import secrets
 import signal
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.run import DRIVING_LOCK_NAME
+from gauntlet.engine.manifest import (
+    RUN_ABORTED,
+    RUN_DONE,
+    RUN_FAILED,
+    Manifest,
+)
+from gauntlet.engine.run import DRIVING_LOCK_NAME, safe_run_segment
 from gauntlet.procident import ProcessIdentity, process_is_alive
 from gauntlet.web.jobproc import JOB_FILENAME, SERVE_DIRNAME, JobRecord, RunProcess
+
+# Terminal run states are read-only to the abort control path (review F-002),
+# mirroring web.store._TERMINAL_RUN_STATES / engine _TERMINAL_RUN_STATES.
+_TERMINAL_RUN_STATES = frozenset({RUN_DONE, RUN_ABORTED, RUN_FAILED})
+
+
+class AbortRefused(RuntimeError):
+    """The P3 abort path refused the target run (review F-002).
+
+    Carries the HTTP status the control surface should return: 404 when there
+    is no run to abort, 409 when the run is observed (not console-owned),
+    already terminal, or has no live attached driver. Fail closed — the P3
+    abort verb only stops a live, console-owned, non-terminal run.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AbortFailed(RuntimeError):
+    """The sanctioned ``gauntlet abort`` child failed (review F-003).
+
+    A non-zero exit or a timeout from the abort verb must not be reported to
+    the operator as success (project fail-closed rule for unexpected external
+    command exits).
+    """
 
 
 def _utc_stamp() -> str:
@@ -152,9 +187,18 @@ class JobSupervisor:
         self, slug: str, *, pipeline: str | None = None, no_judge: bool = False
     ) -> RunProcess:
         """Launch ``gauntlet run <slug> --run-id <pre-allocated> [...]`` (FR-6.1)."""
+        # Containment first (FR-10.1 / review F-001): the slug flows straight
+        # into the run-root path below, so refuse a traversal/separator segment
+        # before any sidecar or log is written.
+        safe_run_segment(slug, kind="slug")
         run_id = self._allocate_run_id(slug)
         run_dir = self._run_dir(slug, run_id)
-        flags = ["--run-id", run_id]
+        # Single-use reservation token (FR-6.1a / review F-005): written under
+        # `run_dir/.serve/` and passed as `--reservation-token` so the child
+        # engine may adopt the pre-created run dir but no leftover dir can be
+        # reused without it.
+        token = secrets.token_hex(16)
+        flags = ["--run-id", run_id, "--reservation-token", token]
         if pipeline:
             flags += ["--pipeline", pipeline]
         if no_judge:
@@ -169,6 +213,7 @@ class JobSupervisor:
             repo_root=self.repo_root,
             flags=flags,
             python=self.python,
+            reservation_token=token,
         )
         rp.start()
         self._procs[slug] = rp
@@ -178,12 +223,45 @@ class JobSupervisor:
     def abort(self, slug: str) -> RunProcess:
         """Stop a live owned driver, then mark the run aborted via the CLI verb.
 
+        Fails closed (review F-002): the P3 abort path only stops a run this
+        console **owns**, that is currently **live/attached**, and whose
+        manifest is **non-terminal**. Observed, missing, or already-terminal
+        runs raise :class:`AbortRefused` (the caller maps it to 404/409) so the
+        verb can never mutate run history it did not launch, nor an outcome that
+        is already recorded.
+
         ``gauntlet abort`` is not a driving verb (it does not take the worktree
         lock), so it can record the aborted status even if a killed driver left
         a stale lock behind — that lock is reclaimed by the next driving verb.
         """
-        run_id = self._active_run_id(slug)
+        safe_run_segment(slug, kind="slug")  # FR-10.1 / review F-001
+        try:
+            run_id = self._active_run_id(slug)
+        except FileNotFoundError as exc:
+            raise AbortRefused(str(exc), status_code=404) from exc
         run_dir = self._run_dir(slug, run_id)
+        # Ownership: only runs the console launched (have a `.serve/job.json`)
+        # are abortable here; an observed CLI-started run is read-only (F-002).
+        if not self.is_owned(slug, run_id):
+            raise AbortRefused(
+                f"run {slug}/{run_id} is observed, not console-owned; the P3 "
+                "abort path only stops runs this console launched",
+                status_code=409,
+            )
+        # Non-terminal: terminal history is read-only (F-002).
+        man = self._load_manifest(run_dir)
+        if man is not None and man.status in _TERMINAL_RUN_STATES:
+            raise AbortRefused(
+                f"run {slug}/{run_id} is already {man.status}; terminal history "
+                "is read-only",
+                status_code=409,
+            )
+        # Liveness: the P3 abort path requires a live attached driver to stop.
+        if not self.is_attached(slug, run_id):
+            raise AbortRefused(
+                f"run {slug}/{run_id} has no live attached driver to abort",
+                status_code=409,
+            )
         self._stop_live(slug, run_dir)
         # Control = sanctioned CLI verb (FR-10.1). record_job=False so this quick
         # control child does not clobber the run's owned-run job.json.
@@ -197,8 +275,31 @@ class JobSupervisor:
             record_job=False,
         )
         rp.start()
-        rp.wait(timeout=30)
+        # Fail closed on the sanctioned child (review F-003): a non-zero exit or
+        # a timeout must not be reported to the operator as success.
+        try:
+            code = rp.wait(timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            rp.stop()
+            raise AbortFailed(
+                f"`gauntlet abort` for {slug}/{run_id} timed out after 30s; "
+                f"see {rp.log_path}"
+            ) from exc
+        if code != 0:
+            raise AbortFailed(
+                f"`gauntlet abort` for {slug}/{run_id} exited {code}; "
+                f"see {rp.log_path}"
+            )
         return rp
+
+    @staticmethod
+    def _load_manifest(run_dir: Path) -> Manifest | None:
+        """The run's manifest, or ``None`` when absent/unreadable (pre-manifest
+        starting runs have none yet, which is not itself terminal)."""
+        try:
+            return Manifest.load(run_dir / "manifest.json")
+        except (OSError, FileNotFoundError, ValueError):
+            return None
 
     def _stop_live(self, slug: str, run_dir: Path) -> None:
         """Reap a live owned driver: in-memory handle if we have one, else the
@@ -241,8 +342,31 @@ class JobSupervisor:
     def is_owned(self, slug: str, run_id: str) -> bool:
         return (self._run_dir(slug, run_id) / SERVE_DIRNAME / JOB_FILENAME).exists()
 
+    def reap(self) -> None:
+        """Reap any console children that have exited this session (review F-004).
+
+        Called on the list/refresh path before liveness is computed: an
+        unwaited child becomes a zombie that still passes the PID-liveness
+        check, so a finished owned run would otherwise keep showing as
+        live/attached. Reaping collects exit status and closes the captured log.
+        """
+        for rp in list(self._procs.values()):
+            rp.reap()
+
     def is_attached(self, slug: str, run_id: str) -> bool:
-        """Owned **and** the recorded process is the original live one (FR-7.2)."""
+        """Owned **and** the recorded process is the original live one (FR-7.2).
+
+        A child we launched this session is authoritative via its in-memory
+        handle: once it has exited we report detached (and reap it) even if a
+        not-yet-reaped zombie would still fool the PID-liveness check on
+        ``.serve/job.json`` (review F-004).
+        """
+        rp = self._procs.get(slug)
+        if rp is not None and rp.run_id == run_id:
+            if rp.poll() is None:
+                return True
+            rp.reap()
+            return False
         rec = self._read_job(self._run_dir(slug, run_id))
         return rec is not None and rec.is_live()
 
@@ -273,4 +397,4 @@ class JobSupervisor:
         )
 
 
-__all__ = ["JobSupervisor", "Job", "LockInfo"]
+__all__ = ["JobSupervisor", "Job", "LockInfo", "AbortRefused", "AbortFailed"]

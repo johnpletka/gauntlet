@@ -19,8 +19,11 @@ from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest
 from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
+    RESERVATION_FILENAME,
+    SERVE_DIRNAME,
     ActiveRunError,
     RunManager,
+    UnsafeRunSegment,
     WorktreeLockError,
     _LockHandle,
     _LockRecord,
@@ -136,6 +139,71 @@ def test_run_id_handshake_is_single_use(fixture_repo):
     # ...but the run dir of that id already exists → single-use error (FR-6.1a).
     with pytest.raises(ActiveRunError, match="single-use"):
         mgr.start("demo", path, use_judge=False, run_id="run-fixed")
+
+
+def test_run_id_handshake_adopts_matching_reservation(fixture_repo):
+    # The supervisor pre-creates `run_dir/.serve/` and writes a single-use
+    # reservation token before launch; a child carrying the matching
+    # `--reservation-token` may adopt that pre-existing dir (FR-6.1a, F-005).
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    run_id = "run-reserved-1"
+    serve = mgr.layout("demo").run_dir(run_id) / SERVE_DIRNAME
+    serve.mkdir(parents=True)
+    (serve / RESERVATION_FILENAME).write_text("tok-abc")
+    status = mgr.start(
+        "demo", path, use_judge=False, run_id=run_id, reservation_token="tok-abc",
+        adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}),
+    )
+    assert status == M.RUN_DONE
+    assert Manifest.load(
+        mgr.layout("demo").run_dir(run_id) / "manifest.json"
+    ).run_id == run_id
+
+
+def test_run_id_handshake_refuses_dir_without_matching_reservation(fixture_repo):
+    # A pre-existing run dir holding a prior launch's diagnostic state but no
+    # matching fresh reservation token must NOT be reused/overwritten — that
+    # would clobber a failed launch's sidecar/log (FR-6.1a single-use, F-005).
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    run_id = "run-leftover-1"
+    serve = mgr.layout("demo").run_dir(run_id) / SERVE_DIRNAME
+    serve.mkdir(parents=True)
+    (serve / "run.log").write_text("prior crash output\n")
+    # No token supplied → refused.
+    with pytest.raises(ActiveRunError, match="single-use"):
+        mgr.start("demo", path, use_judge=False, run_id=run_id)
+    # A non-matching token is equally refused.
+    (serve / RESERVATION_FILENAME).write_text("the-real-token")
+    with pytest.raises(ActiveRunError, match="single-use"):
+        mgr.start(
+            "demo", path, use_judge=False, run_id=run_id,
+            reservation_token="wrong-token",
+        )
+
+
+@pytest.mark.parametrize("bad", ["../escape", "a/b", "a\\b", "", ".", "..", "x\x00y"])
+def test_start_rejects_unsafe_run_id(fixture_repo, bad):
+    # `--run-id` flows straight into the run-root path; a traversal/separator/
+    # NUL segment is refused before any path is built (FR-10.1, F-001).
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    with pytest.raises(UnsafeRunSegment):
+        mgr.start("demo", path, use_judge=False, run_id=bad)
+
+
+@pytest.mark.parametrize("bad", ["../evil", "a/b", "a\\b", ".", "..", "x\x00y"])
+def test_start_rejects_unsafe_slug(fixture_repo, bad):
+    # The slug is a run-root path segment too; refuse traversal before the
+    # entry contract or any sidecar write (FR-10.1, F-001).
+    mgr = _prepare(fixture_repo)
+    path = _pipeline(fixture_repo, LINEAR)
+    with pytest.raises(UnsafeRunSegment):
+        mgr.start(bad, path, use_judge=False)
 
 
 # ---- lock fail-closed (FR-10.5) --------------------------------------------

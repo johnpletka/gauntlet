@@ -9,6 +9,7 @@ review F-010).
 from __future__ import annotations
 
 import atexit
+import hmac
 import json
 import os
 import secrets
@@ -37,6 +38,14 @@ from gauntlet.procident import (
 # at the resolved run root, gitignored.
 DRIVING_LOCK_NAME = ".driving.lock"
 
+# Console sidecar layout (also imported by web.jobproc so the two agree). The
+# engine needs these to honour the run-id reservation handshake (FR-6.1a,
+# review F-005): the console supervisor writes a single-use reservation token
+# under `run_dir/.serve/` *before* launching this child, and `start()` accepts a
+# pre-existing run dir only when it is exactly that fresh reservation.
+SERVE_DIRNAME = ".serve"
+RESERVATION_FILENAME = "reservation"
+
 # Bounded retries for the acquire loop when racing a stale-lock reclaim, so a
 # pathological churn raises rather than spins (fail closed).
 _LOCK_ACQUIRE_RETRIES = 50
@@ -64,6 +73,45 @@ class EntryContractError(RuntimeError):
 
 class RollbackGuardError(RuntimeError):
     """A rollback guard (review F-010) refused the operation."""
+
+
+class AbortGuardError(RuntimeError):
+    """`abort()` refused because the target run is terminal (review F-002)."""
+
+
+class UnsafeRunSegment(ValueError):
+    """A slug or run-id that is not a single, traversal-free path segment.
+
+    The write/control path's first line of FR-10.1 containment, mirroring the
+    read model's ``web.store._safe_segment`` (review F-001): a slug or
+    ``--run-id`` flows straight into filesystem paths, so anything containing a
+    path separator, ``.``/``..``, NUL, or that is empty is refused before any
+    path is built.
+    """
+
+
+def safe_run_segment(seg: str, *, kind: str) -> str:
+    """Reject a slug/run-id that could escape the run root (FR-10.1, F-001)."""
+    if not seg or seg in (".", "..") or "/" in seg or "\\" in seg or "\x00" in seg:
+        raise UnsafeRunSegment(f"unsafe {kind} segment: {seg!r}")
+    return seg
+
+
+def _reservation_matches(run_dir: Path, token: str | None) -> bool:
+    """True iff ``run_dir`` holds exactly the fresh reservation for ``token``.
+
+    The supervisor writes the single-use token under ``.serve/`` before launch
+    (FR-6.1a); this lets a child engine verify, race-free, that a pre-existing
+    run dir is its own fresh reservation rather than a prior run's leftover
+    diagnostic state, which must never be reused/overwritten (review F-005).
+    """
+    if not token:
+        return False
+    try:
+        existing = (run_dir / SERVE_DIRNAME / RESERVATION_FILENAME).read_text().strip()
+    except (OSError, ValueError):
+        return False
+    return bool(existing) and hmac.compare_digest(existing, token)
 
 
 class ActiveRunError(RuntimeError):
@@ -582,7 +630,14 @@ class RunManager:
         extra_context: dict | None = None,
         clock=None,
         run_id: str | None = None,
+        reservation_token: str | None = None,
     ) -> str:
+        # Containment first (FR-10.1 / review F-001): slug and a supplied run id
+        # flow straight into filesystem paths below, so refuse a traversal/
+        # separator/NUL segment before any path is built or any sidecar written.
+        safe_run_segment(slug, kind="slug")
+        if run_id is not None:
+            safe_run_segment(run_id, kind="run_id")
         self.check_entry_contract(slug)
         layout = self.layout(slug)
         # Run-id allocation handshake (FR-6.1a): the console supervisor
@@ -605,16 +660,27 @@ class RunManager:
         provided = run_id
         if provided:
             run_id = provided
-            # Single-use: error if a *run* already occupies this id (FR-6.1a).
-            # The signal is a written manifest, NOT a bare directory — the
-            # supervisor legitimately `mkdir -p`'s `run_dir/.serve/` (for the
-            # captured log + job.json) *before* launching this child, so the
-            # directory existing is expected; only a prior run's manifest means
-            # the id was already consumed.
-            if (layout.run_dir(run_id) / "manifest.json").exists():
+            # Single-use (FR-6.1a). A supplied id may reuse a pre-existing run
+            # dir ONLY when it is the supervisor's fresh, single-use reservation
+            # for this very launch: the supervisor writes a reservation token
+            # under `run_dir/.serve/` and passes it as `--reservation-token`
+            # *before* launching this child (it also pre-creates `.serve/` for
+            # the captured log + job.json). Any other pre-existing run dir —
+            # a prior run's manifest, or a failed launch's diagnostic
+            # sidecar/log with no matching token — is refused so its state is
+            # never reused or overwritten (review F-005).
+            rd = layout.run_dir(run_id)
+            if (rd / "manifest.json").exists():
                 raise ActiveRunError(
                     f"run {run_id!r} already exists for slug {slug!r}; a "
                     "pre-allocated --run-id must be single-use (FR-6.1a)"
+                )
+            if rd.exists() and not _reservation_matches(rd, reservation_token):
+                raise ActiveRunError(
+                    f"run dir for {run_id!r} already exists for slug {slug!r} "
+                    "with prior run/diagnostic state and no matching fresh "
+                    "reservation; a pre-allocated --run-id must be single-use "
+                    "(FR-6.1a)"
                 )
         else:
             run_id = f"run-{_utc_stamp()}"
@@ -775,6 +841,15 @@ class RunManager:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
+        # Terminal history is read-only (review F-002): never rewrite a
+        # done/aborted/failed run's status. Fail closed so neither a stray CLI
+        # `gauntlet abort` nor the console control path can corrupt a completed
+        # run's recorded outcome.
+        if man.status in _TERMINAL_RUN_STATES:
+            raise AbortGuardError(
+                f"run {man.run_id!r} for slug {slug!r} is already {man.status}; "
+                "terminal runs cannot be aborted (history is read-only)"
+            )
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
         return man.status

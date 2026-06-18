@@ -117,11 +117,20 @@ def run(
         "passes this so it knows run_dir before launch). Single-use: errors if "
         "that run dir already exists.",
     ),
+    reservation_token: str = typer.Option(
+        None, "--reservation-token", hidden=True,
+        help="Single-use reservation token paired with --run-id (FR-6.1a "
+        "handshake). Set by the console supervisor before launch so this child "
+        "may adopt the pre-created run dir; not for manual use.",
+    ),
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
-    status = mgr.start(slug, path, use_judge=not no_judge, run_id=run_id)
+    status = mgr.start(
+        slug, path, use_judge=not no_judge, run_id=run_id,
+        reservation_token=reservation_token,
+    )
     typer.echo(f"run status: {status}")
 
 

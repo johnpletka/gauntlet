@@ -21,10 +21,12 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
+from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
 from gauntlet.web.sse import SSE_HEADERS, event_stream, log_tail_stream
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
+from gauntlet.web.supervisor import AbortFailed, AbortRefused
 from gauntlet.web.views import register_views
 from gauntlet.web.watcher import Watcher
 
@@ -63,6 +65,14 @@ class LaunchBody(BaseModel):
     slug: str
     pipeline: str | None = None
     no_judge: bool = False
+
+    @field_validator("slug")
+    @classmethod
+    def _slug_is_a_safe_segment(cls, value: str) -> str:
+        # Containment at the body boundary (FR-10.1 / review F-001): the slug
+        # becomes a run-root path segment, so reject a traversal/separator/NUL
+        # segment before it ever reaches the supervisor's path construction.
+        return safe_run_segment(value, kind="slug")
 
 
 def create_app(
@@ -110,6 +120,23 @@ def create_app(
     @app.exception_handler(RunNotFound)
     async def _missing(_request: Request, exc: RunNotFound) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    # An unsafe slug/run-id reaching the control path (engine/supervisor) is a
+    # 400 — the caller asked for an out-of-tree segment (FR-10.1 / review F-001).
+    @app.exception_handler(UnsafeRunSegment)
+    async def _unsafe_segment(_request: Request, exc: UnsafeRunSegment) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # Abort fails closed: refused (not owned/live/non-terminal) → 404/409 from
+    # the exception (review F-002); the sanctioned child failing → 502 so a
+    # failed destructive action never reads as success (review F-003).
+    @app.exception_handler(AbortRefused)
+    async def _abort_refused(_request: Request, exc: AbortRefused) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+    @app.exception_handler(AbortFailed)
+    async def _abort_failed(_request: Request, exc: AbortFailed) -> JSONResponse:
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -233,12 +260,16 @@ def create_app(
     @app.post("/api/runs/{slug}/abort", dependencies=[auth])
     def api_abort(slug: str) -> dict:
         _require_supervisor()
-        supervisor.abort(slug)
+        # The supervisor fails closed: it raises AbortRefused (→404/409) for
+        # observed/missing/terminal runs and AbortFailed (→502) if the
+        # sanctioned `gauntlet abort` child exits non-zero or times out, so we
+        # only reach here when the destructive action actually succeeded.
+        rp = supervisor.abort(slug)
         try:
             status = store.manifest(slug).status
         except RunNotFound:
             status = "unknown"
-        return {"slug": slug, "status": status}
+        return {"slug": slug, "run_id": rp.run_id, "status": status}
 
     # ---- live state SSE (P2, FR-8.2) ----------------------------------------
     @app.get("/events", dependencies=[auth])

@@ -20,11 +20,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gauntlet.engine.manifest import DONE as STEP_DONE
-from gauntlet.engine.manifest import RUN_DONE, Manifest
+from gauntlet.engine.manifest import (
+    RUN_DONE,
+    RUN_PARKED,
+    Manifest,
+    PipelineRef,
+)
 from gauntlet.web.jobproc import JOB_FILENAME, SERVE_DIRNAME, JobRecord
 from gauntlet.web.service import TOKEN_HEADER, create_app
 from gauntlet.web.store import RunStore
-from gauntlet.web.supervisor import JobSupervisor, LockInfo
+from gauntlet.web.supervisor import AbortFailed, AbortRefused, JobSupervisor, LockInfo
 
 from conftest import git
 
@@ -87,6 +92,42 @@ def _build_repo(repo: Path, *, pipelines: dict[str, str], slug: str = "demo",
 def _job_record(run_dir: Path) -> JobRecord | None:
     jp = run_dir / SERVE_DIRNAME / JOB_FILENAME
     return JobRecord.from_json(jp.read_text()) if jp.exists() else None
+
+
+def _seed_run(
+    sup: JobSupervisor,
+    slug: str,
+    run_id: str,
+    *,
+    status: str,
+    owned: bool,
+    job_pid: int = 2**30,  # an unused pid → the recorded driver reads as dead
+    active: bool = True,
+) -> Path:
+    """Lay down a run on disk (manifest + optional owned-run sidecar) without
+    spawning, so the abort guards (F-002) can be exercised cheaply."""
+    run_dir = sup.run_root / slug / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    man = Manifest(
+        run_id=run_id,
+        slug=slug,
+        branch=f"gauntlet/{slug}",
+        base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="sha256:x"),
+        status=status,
+    )
+    man.write_atomic(run_dir / "manifest.json")
+    if active:
+        (sup.run_root / slug / "active-run.txt").write_text(run_id)
+    if owned:
+        serve = run_dir / SERVE_DIRNAME
+        serve.mkdir(parents=True, exist_ok=True)
+        rec = JobRecord(
+            pid=job_pid, pgid=job_pid, verb="run", slug=slug, run_id=run_id,
+            started_at="t", log_path=str(serve / "run.log"), proc_identity=None,
+        )
+        (serve / JOB_FILENAME).write_text(rec.to_json())
+    return run_dir
 
 
 def test_launch_writes_log_and_job_then_drives_to_done(tmp_path):
@@ -191,6 +232,134 @@ def test_owned_and_external_badges(tmp_path):
     assert row.external is False
 
 
+# ---- abort fails closed (review F-002 / F-003) ------------------------------
+
+
+def test_abort_refuses_observed_run(tmp_path):
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_run(sup, "obs", "run-o", status=RUN_PARKED, owned=False)
+    with pytest.raises(AbortRefused) as ei:
+        sup.abort("obs")
+    assert ei.value.status_code == 409
+    assert "observed" in str(ei.value)
+
+
+def test_abort_refuses_terminal_run(tmp_path):
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_run(sup, "term", "run-t", status=RUN_DONE, owned=True)
+    with pytest.raises(AbortRefused) as ei:
+        sup.abort("term")
+    assert ei.value.status_code == 409
+    assert "done" in str(ei.value)
+
+
+def test_abort_404_when_no_active_run(tmp_path):
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    with pytest.raises(AbortRefused) as ei:
+        sup.abort("nope")
+    assert ei.value.status_code == 404
+
+
+def test_abort_refuses_when_no_live_driver(tmp_path):
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    # Owned + non-terminal but the recorded driver pid is dead → not attached.
+    _seed_run(sup, "dead", "run-d", status=RUN_PARKED, owned=True)
+    with pytest.raises(AbortRefused) as ei:
+        sup.abort("dead")
+    assert ei.value.status_code == 409
+    assert "no live attached driver" in str(ei.value)
+
+
+def test_abort_fails_closed_when_child_exits_nonzero(tmp_path, monkeypatch):
+    # Guards pass (stubbed live driver) but the sanctioned `gauntlet abort`
+    # child exits non-zero → AbortFailed, never a silent success (F-003).
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_run(sup, "live", "run-l", status=RUN_PARKED, owned=True)
+    monkeypatch.setattr(sup, "is_attached", lambda s, r: True)
+    monkeypatch.setattr(sup, "_stop_live", lambda s, d: None)
+
+    class _FailingRP:
+        def __init__(self, **kw):
+            self.log_path = Path("/tmp/abort.log")
+
+        def start(self):
+            return self
+
+        def wait(self, timeout=None):
+            return 7
+
+    monkeypatch.setattr("gauntlet.web.supervisor.RunProcess", _FailingRP)
+    with pytest.raises(AbortFailed, match="exited 7"):
+        sup.abort("live")
+
+
+def test_abort_fails_closed_on_child_timeout(tmp_path, monkeypatch):
+    sup = _build_repo(tmp_path / "repo", pipelines={"simple": SLEEP_PIPELINE})
+    _seed_run(sup, "live", "run-l", status=RUN_PARKED, owned=True)
+    monkeypatch.setattr(sup, "is_attached", lambda s, r: True)
+    monkeypatch.setattr(sup, "_stop_live", lambda s, d: None)
+
+    class _HangingRP:
+        def __init__(self, **kw):
+            self.log_path = Path("/tmp/abort.log")
+            self.stopped = False
+
+        def start(self):
+            return self
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="abort", timeout=timeout)
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr("gauntlet.web.supervisor.RunProcess", _HangingRP)
+    with pytest.raises(AbortFailed, match="timed out"):
+        sup.abort("live")
+
+
+# ---- session-child reaping (review F-004) -----------------------------------
+
+
+class _StubProc:
+    def __init__(self, run_id: str, alive: bool):
+        self.run_id = run_id
+        self._alive = alive
+        self.reaped = False
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def reap(self):
+        if self._alive:
+            raise AssertionError("a live child must never be reaped")
+        self.reaped = True
+        return True
+
+
+def test_is_attached_reaps_and_detaches_exited_child(tmp_path):
+    sup = JobSupervisor(tmp_path / "repo")
+    sup._procs["demo"] = _StubProc("run-x", alive=False)
+    # An exited in-memory child reports detached and is reaped, even though a
+    # not-yet-reaped zombie would still pass the pid-liveness check (F-004).
+    assert sup.is_attached("demo", "run-x") is False
+    assert sup._procs["demo"].reaped is True
+
+
+def test_is_attached_keeps_live_child_attached(tmp_path):
+    sup = JobSupervisor(tmp_path / "repo")
+    sup._procs["demo"] = _StubProc("run-x", alive=True)
+    assert sup.is_attached("demo", "run-x") is True
+
+
+def test_reap_reaps_all_session_children(tmp_path):
+    sup = JobSupervisor(tmp_path / "repo")
+    a, b = _StubProc("run-a", alive=False), _StubProc("run-b", alive=False)
+    sup._procs = {"x": a, "y": b}
+    sup.reap()
+    assert a.reaped and b.reaped
+
+
 # ---- HTTP control surface (fake supervisor: argv/lock without spawning) -----
 
 
@@ -226,6 +395,9 @@ class _FakeSupervisor:
 
     def is_attached(self, slug, run_id):
         return False
+
+    def reap(self):
+        pass
 
 
 def _client(store, supervisor=None):
@@ -289,3 +461,39 @@ def test_control_endpoints_require_token(tmp_path):
     assert client.post("/api/runs", json={"slug": "demo"}).status_code == 401
     assert client.post("/api/runs/demo/abort").status_code == 401
     assert sup.launched == [] and sup.aborted == []
+
+
+@pytest.mark.parametrize("bad", ["../outside", "a/b", "a\\b", "", ".", "..", "x\x00y"])
+def test_post_runs_rejects_unsafe_slug(tmp_path, bad):
+    # The body slug becomes a run-root path segment; a traversal/separator/NUL
+    # segment fails closed at the boundary and never launches (FR-10.1, F-001).
+    sup = _FakeSupervisor()
+    client = _client(_bare_store(tmp_path), supervisor=sup)
+    resp = client.post("/api/runs", json={"slug": bad}, headers={TOKEN_HEADER: TOKEN})
+    assert resp.status_code >= 400
+    assert sup.launched == []
+
+
+class _RaisingSupervisor(_FakeSupervisor):
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def abort(self, slug):
+        raise self._exc
+
+
+def test_post_abort_maps_refused_to_its_status_code(tmp_path):
+    sup = _RaisingSupervisor(AbortRefused("nope", status_code=404))
+    client = _client(_bare_store(tmp_path), supervisor=sup)
+    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "nope"
+
+
+def test_post_abort_maps_failed_child_to_502(tmp_path):
+    sup = _RaisingSupervisor(AbortFailed("`gauntlet abort` exited 7; see /x"))
+    client = _client(_bare_store(tmp_path), supervisor=sup)
+    resp = client.post("/api/runs/demo/abort", headers={TOKEN_HEADER: TOKEN})
+    assert resp.status_code == 502
+    assert "exited 7" in resp.json()["detail"]

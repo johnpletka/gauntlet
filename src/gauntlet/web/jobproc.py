@@ -27,9 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from gauntlet.engine.run import RESERVATION_FILENAME, SERVE_DIRNAME
 from gauntlet.procident import ProcessIdentity, process_is_alive, read_process_identity
 
-SERVE_DIRNAME = ".serve"
 JOB_FILENAME = "job.json"
 
 
@@ -113,6 +113,7 @@ class RunProcess:
         flags: list[str] | None = None,
         python: str | None = None,
         record_job: bool = True,
+        reservation_token: str | None = None,
     ) -> None:
         self.verb = verb
         self.slug = slug
@@ -122,9 +123,11 @@ class RunProcess:
         self.flags = list(flags or [])
         self.python = python or sys.executable
         self.record_job = record_job
+        self.reservation_token = reservation_token
         self.serve_dir = self.run_dir / SERVE_DIRNAME
         self.log_path = self.serve_dir / f"{verb}.log"
         self.job_path = self.serve_dir / JOB_FILENAME
+        self.reservation_path = self.serve_dir / RESERVATION_FILENAME
         self._proc: subprocess.Popen | None = None
         self._log_fh = None
         self._pgid: int | None = None
@@ -137,6 +140,13 @@ class RunProcess:
 
     def start(self) -> "RunProcess":
         self.serve_dir.mkdir(parents=True, exist_ok=True)
+        # The run-id reservation handshake (FR-6.1a / review F-005): write the
+        # single-use token *before* launch so the child engine can verify,
+        # race-free, that this pre-created run dir is its own fresh reservation
+        # (it is also passed as `--reservation-token`). Without it the engine
+        # refuses to reuse any pre-existing run dir.
+        if self.reservation_token is not None:
+            _write_atomic(self.reservation_path, self.reservation_token)
         # Self-ignoring run-dir .gitignore so the captured log never dirties the
         # worktree (FR-6.3) — written before launch in case the engine's own
         # orchestrator (which also writes `*`) hasn't run yet. Idempotent.
@@ -188,6 +198,28 @@ class RunProcess:
     def poll(self) -> int | None:
         return self._proc.poll() if self._proc else None
 
+    def reap(self) -> bool:
+        """If the child has exited, ``wait()`` it and close the captured log.
+
+        A console child left unwaited becomes a zombie that still passes the
+        FR-7.2 PID-liveness check (``os.kill(pid, 0)`` + start identity), so a
+        completed owned run would keep reporting as live/attached (review
+        F-004). Reaping on the list/refresh path collects the exit status so
+        liveness reflects reality. Returns ``True`` when the child is gone (or
+        was never started); a still-running child is left untouched.
+        """
+        if self._proc is None:
+            self._close_log()
+            return True
+        if self._proc.poll() is None:
+            return False
+        try:
+            self._proc.wait(timeout=0)
+        except subprocess.TimeoutExpired:  # pragma: no cover - just polled dead
+            pass
+        self._close_log()
+        return True
+
     def wait(self, timeout: float | None = None) -> int:
         if self._proc is None:
             raise RuntimeError("RunProcess.wait() before start()")
@@ -230,4 +262,10 @@ class RunProcess:
             self._log_fh = None
 
 
-__all__ = ["RunProcess", "JobRecord", "SERVE_DIRNAME", "JOB_FILENAME"]
+__all__ = [
+    "RunProcess",
+    "JobRecord",
+    "SERVE_DIRNAME",
+    "JOB_FILENAME",
+    "RESERVATION_FILENAME",
+]

@@ -487,6 +487,13 @@ class RunStore:
 
     def list_rows(self) -> list[RunRow]:
         """One row per slug (its latest/active run), most-recently-updated first."""
+        # Reap finished console children before computing liveness so a
+        # completed owned run is never shown as still live/attached via an
+        # unreaped zombie's PID-liveness (review F-004). Read-only stores (no
+        # supervisor) and minimal stubs without `reap` are left untouched.
+        reap = getattr(self.supervisor, "reap", None)
+        if callable(reap):
+            reap()
         lock = self.worktree_lock()
         rows = [
             r for slug in self.slugs() if (r := self._row_for(slug, lock)) is not None
