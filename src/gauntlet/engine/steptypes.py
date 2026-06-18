@@ -142,10 +142,12 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # Completion-signal contract (BOOTSTRAP-NOTES #32): a headless agent that
     # exits 0 may still have *halted* — surfaced an FR-10.4 upstream conflict
     # instead of doing the work. Exit code alone read that as `done` and the
-    # engine marched on to a doomed commit. Opt-in per step so document-authoring
-    # tasks (plan-author) are unaffected: when `halt_on:` is set and its marker
-    # appears in the final output, park for a human (fail closed, never DONE);
-    # when `require_signal:` is set and absent, fail closed.
+    # engine marched on to a doomed commit. Opt-in per step: when `halt_on:` is
+    # set and its marker is *signalled* (line-leading, per `_marker_signalled`),
+    # park for a human (fail closed, never DONE); when `require_signal:` is set
+    # and absent, fail closed. Document-authoring tasks must not carry `halt_on:`
+    # — their output legitimately quotes such markers as prose (see plan-author
+    # in pipelines/standard.yaml); the line-leading match is the second guard.
     signal = _completion_signal(step, result.text)
     if signal is not None:
         status, note = signal
@@ -178,18 +180,38 @@ def _completion_signal(step: Step, text: str):
     the document-authoring tasks keep their plain exit-code semantics.
     """
     halt_on = step.get("halt_on")
-    if halt_on and halt_on in (text or ""):
+    if halt_on and _marker_signalled(halt_on, text):
         return PARKED, (
             f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
             "parked for a human instead of marking the step done (#32)"
         )
     require = step.get("require_signal")
-    if require and require not in (text or ""):
+    if require and not _marker_signalled(require, text):
         return FAILED, (
             f"agent did not emit the required completion signal {require!r}; "
             "failing closed rather than advancing on a silent non-completion (#32)"
         )
     return None
+
+
+def _marker_signalled(marker: str, text: str) -> bool:
+    """True when *marker* appears as a deliberate line-leading signal in *text*.
+
+    The contract (implement-phase.md) tells the agent to emit the marker as a
+    *clearly marked block* — i.e. at the start of its own line, optionally behind
+    Markdown decoration (``#``/``*``/``>``/`` ` ``/``-``). Matching only there,
+    not anywhere in the body, is what keeps a document that merely *discusses*
+    the marker in prose from being read as a genuine signal: a plan that quotes
+    the FR-10.4 protocol verbatim ("…is an **UPSTREAM CONFLICT** (FR-10.4)…")
+    used to false-positive the substring check, park the step, and lose the
+    authored ``output:`` (the write happens only on the non-signal path). This
+    stays fail-closed on a real signal (a marker on its own line still matches)
+    while refusing to invent one from incidental text.
+    """
+    if not marker:
+        return False
+    pattern = re.compile(rf"^[ \t#*>`\-]*{re.escape(marker)}", re.MULTILINE)
+    return pattern.search(text or "") is not None
 
 
 def _render_prompt(step: Step, ctx: StepContext) -> str:

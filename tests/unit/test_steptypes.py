@@ -13,7 +13,7 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
-from gauntlet.engine.steptypes import render_shell_command
+from gauntlet.engine.steptypes import _marker_signalled, render_shell_command
 
 from conftest import FakeAdapter
 
@@ -251,3 +251,68 @@ stages:
                  adapters={"builder": claude, "reviewer": codex})
     orch.drive()
     assert claude.calls and not codex.calls  # routed to the bound profile only
+
+
+# --- completion-signal marker matching (#32; halt_on false-positive fix) -----
+# The substring check used to read a plan that *quotes* the FR-10.4 protocol as
+# prose as a genuine halt, park plan-author, and discard the authored plan.md.
+# The signal must be line-leading (a "clearly marked block", implement-phase.md).
+@pytest.mark.parametrize("text", [
+    "UPSTREAM CONFLICT\nPhase: P1\nConflict: the PRD contradicts itself.",
+    "## UPSTREAM CONFLICT\nPhase: P3",
+    "**UPSTREAM CONFLICT**",
+    "> UPSTREAM CONFLICT",
+    "  - UPSTREAM CONFLICT: second engine seam needed",
+    "intro line\n\nUPSTREAM CONFLICT\nbody",
+])
+def test_marker_signalled_matches_line_leading_block(text):
+    assert _marker_signalled("UPSTREAM CONFLICT", text)
+
+
+@pytest.mark.parametrize("text", [
+    # the exact shape that broke the gauntlet-ui run: marker mid-sentence in prose
+    "- Any second engine change is an **UPSTREAM CONFLICT** (FR-10.4), not a quiet edit.",
+    "Treat a temptation to widen the seam as an UPSTREAM CONFLICT here.",
+    "no marker at all",
+    "",
+])
+def test_marker_signalled_ignores_inline_prose(text):
+    assert not _marker_signalled("UPSTREAM CONFLICT", text)
+
+
+def test_marker_signalled_empty_marker_is_false():
+    assert not _marker_signalled("", "anything at all")
+
+
+_HALT_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-author, type: agent_task, agent: builder, prompt_text: go,
+         output: plan.md, halt_on: "UPSTREAM CONFLICT"}
+"""
+
+
+def test_halt_marker_in_prose_completes_and_writes_output(fixture_repo):
+    """Regression: a plan quoting the protocol as prose is DONE, and the
+    authored output: lands on disk (was parked + discarded, #32)."""
+    prose_plan = (
+        "# Implementation Plan\n\n"
+        "- Any second engine change is an **UPSTREAM CONFLICT** (FR-10.4).\n"
+    )
+    orch = _orch(fixture_repo, _HALT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text=prose_plan)})
+    assert orch.drive() == M.RUN_DONE
+    assert (fixture_repo / "runs" / "demo" / "plan.md").read_text() == prose_plan
+
+
+def test_halt_marker_as_block_parks_without_writing_output(fixture_repo):
+    """A genuine line-leading UPSTREAM CONFLICT block still parks (fail closed),
+    and does not write a bogus output artifact."""
+    conflict = "UPSTREAM CONFLICT\nPhase: P1\nConflict: the PRD contradicts itself.\n"
+    orch = _orch(fixture_repo, _HALT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text=conflict)})
+    assert orch.drive() == M.RUN_PARKED
+    assert not (fixture_repo / "runs" / "demo" / "plan.md").exists()
