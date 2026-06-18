@@ -9,6 +9,7 @@ a re-read gate, review F-002).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -145,8 +146,14 @@ def test_two_distinct_gates_not_collapsed(repo: Path, store: RunStore):
     assert second[0].run_status == "parked"
 
 
-def test_semantic_noop_rewrite_emits_nothing(repo: Path, store: RunStore):
-    """An atomic rewrite that changes only mtime (same tuple) emits nothing."""
+def test_revision_change_emits_even_when_semantic_fields_identical(
+    repo: Path, store: RunStore
+):
+    """FR-8.1: ``manifest_revision`` (mtime) is part of the event identity, so a
+    rewrite that changes only the revision still emits (review F-001). The PRD
+    includes the revision so a re-entry into the same semantic state is observed;
+    suppressing duplicate *notifications* is FR-9.1's separate concern (P6).
+    """
     rd = _run_dir(repo, "alpha", "run-1")
     man = _manifest(
         "alpha", "run-1", status="running",
@@ -156,14 +163,24 @@ def test_semantic_noop_rewrite_emits_nothing(repo: Path, store: RunStore):
     _write(rd, man)
     w = Watcher(store)
     assert len(w.poll_once()) == 1
-
-    # Rewrite the *same* semantic state — new bytes/mtime, identical tuple.
-    man.totals.input_tokens += 7  # a non-identity field changes
-    _write(rd, man)
     mpath = rd / "manifest.json"
-    # Sanity: the file really did change on disk (mtime advanced / bytes differ).
-    assert mpath.stat().st_size > 0
-    assert w.poll_once() == []  # re-read happened, but no transition emitted
+    st = mpath.stat()
+
+    # Rewrite the *same* four semantic fields — only a non-identity field and the
+    # revision change. Force a strictly-later mtime so the assertion does not
+    # depend on filesystem mtime granularity.
+    man.totals.input_tokens += 7
+    _write(rd, man)
+    os.utime(mpath, ns=(st.st_atime_ns, st.st_mtime_ns + 1000))
+
+    evs = w.poll_once()
+    assert len(evs) == 1
+    # The four semantic fields are unchanged; only the revision advanced.
+    assert evs[0].run_status == "running"
+    assert evs[0].current_step == "impl"
+    assert evs[0].current_step_status == "running"
+    assert evs[0].revision == st.st_mtime_ns + 1000
+    assert w.poll_once() == []  # no further write → unchanged mtime → nothing
 
 
 def test_current_step_status_change_emits(repo: Path, store: RunStore):
@@ -246,13 +263,40 @@ def test_broken_then_valid_manifest_recovers(repo: Path, store: RunStore):
     assert len(evs) == 1 and evs[0].run_status == "running"
 
 
-def test_identity_tuple_is_the_four_fields():
+def test_identity_tuple_includes_revision():
     from gauntlet.web.watcher import WatchEvent
 
     ev = WatchEvent(
         slug="s", run_id="run-1", run_status="parked",
         current_step="gate", current_step_status="parked",
         current_step_notes="note", updated="2026-01-01T00:00:00",
+        revision=123456789,
     )
-    # mtime/updated and notes are NOT part of identity (review F-002 / FR-8.1).
-    assert ev.identity == ("run-1", "gate", "parked", "parked")
+    # FR-8.1 identity is the four semantic fields + manifest_revision (mtime ns);
+    # the ISO `updated` display string and `notes` are NOT part of it (F-001).
+    assert ev.identity == ("run-1", "gate", "parked", "parked", 123456789)
+
+
+def test_foreach_active_iteration_is_current(repo: Path, store: RunStore):
+    """`current_step` carries no iteration; the watcher must report the *active*
+    foreach iteration's status, not a completed earlier one (review F-003)."""
+    rd = _run_dir(repo, "alpha", "run-1")
+    # Two iterations of one fan-out step share id "review": iter 0 done, iter 1
+    # running. `current_step` is just "review" (no iteration).
+    _write(
+        rd,
+        _manifest(
+            "alpha", "run-1", status="running",
+            steps=[
+                StepRecord(id="review", type="agent_task", status="done", iteration="0"),
+                StepRecord(id="review", type="agent_task", status="running", iteration="1"),
+            ],
+            current_step="review",
+        ),
+    )
+    w = Watcher(store)
+    evs = w.poll_once()
+    assert len(evs) == 1
+    # Must reflect the running iteration (1), not the done one (0).
+    assert evs[0].current_step == "review"
+    assert evs[0].current_step_status == "running"

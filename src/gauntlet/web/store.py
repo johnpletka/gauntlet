@@ -25,12 +25,20 @@ from gauntlet.engine.manifest import (
     RUN_DONE,
     RUN_FAILED,
     DONE,
+    FAILED,
+    HALTED,
+    SKIPPED,
     Manifest,
     StepRecord,
 )
 
 # Run-level states that mean a run has finished (so an `ended` is meaningful).
 _TERMINAL_RUN_STATES = frozenset({RUN_DONE, RUN_ABORTED, RUN_FAILED})
+
+# Step states that mean an iteration has reached an end. Used to pick the
+# *active* iteration of a foreach fan-out (review F-003): `parked`/`interrupted`
+# are not terminal — they are the current iteration awaiting a human/resume.
+_TERMINAL_STEP_STATES = frozenset({DONE, FAILED, HALTED, SKIPPED})
 
 
 class UnsafePath(ValueError):
@@ -137,13 +145,22 @@ def _safe_segment(seg: str, *, kind: str) -> str:
 
 
 def _current_record(man: Manifest) -> StepRecord | None:
-    """The step record `current_step` points at (any iteration), or None."""
+    """The step record `current_step` points at, or None.
+
+    A ``foreach`` fan-out stores several records under one ``id`` (one per
+    ``iteration``) while the manifest's ``current_step`` carries only the id,
+    not the iteration (review F-003). Prefer the *active* (non-terminal) matching
+    record so live state reflects the running iteration rather than a completed
+    earlier one; fall back to the last matching record when every iteration is
+    terminal. For an ordinary single-record step this returns that record.
+    """
     if not man.current_step:
         return None
-    for rec in man.steps:
-        if rec.id == man.current_step:
-            return rec
-    return None
+    matches = [rec for rec in man.steps if rec.id == man.current_step]
+    if not matches:
+        return None
+    active = [rec for rec in matches if rec.status not in _TERMINAL_STEP_STATES]
+    return active[-1] if active else matches[-1]
 
 
 def _started_ended(man: Manifest) -> tuple[str | None, str | None]:
@@ -216,13 +233,20 @@ class RunStore:
     def run_root_dir(self) -> Path:
         return (self.repo_root / self.config.run_root).resolve()
 
-    def _assert_contained(self, path: Path) -> Path:
-        """Fail closed if ``path`` resolves outside the run root (FR-10.1)."""
-        root = self.run_root_dir
+    def _assert_within(self, path: Path, root: Path) -> Path:
+        """Fail closed if ``path`` resolves outside ``root`` (FR-10.1).
+
+        ``root`` must already be resolved. The check follows symlinks (``resolve``)
+        so an allowed-name symlink cannot escape the intended subtree.
+        """
         resolved = path.resolve()
         if resolved != root and root not in resolved.parents:
-            raise UnsafePath(f"path escapes the run root: {path}")
+            raise UnsafePath(f"path escapes {root}: {path}")
         return resolved
+
+    def _assert_contained(self, path: Path) -> Path:
+        """Fail closed if ``path`` resolves outside the run root (FR-10.1)."""
+        return self._assert_within(path, self.run_root_dir)
 
     def slugs(self) -> list[str]:
         root = self.run_root_dir
@@ -342,7 +366,11 @@ class RunStore:
 
         path: Path | None = None
         for cand in candidates:
-            p = self._assert_contained(step_dir / cand)
+            # Resolve each candidate against the *step* dir, not just the run root
+            # (review F-002): an allowed-name symlink (e.g. `events.jsonl` ->
+            # `../../plan.md`) stays inside the run root and would otherwise be read
+            # as this step's log. Containment against `step_dir` rejects that escape.
+            p = self._assert_within(step_dir / cand, step_dir)
             if p.exists() and p.is_file():
                 path = p
                 name = cand

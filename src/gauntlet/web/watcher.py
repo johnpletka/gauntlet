@@ -5,22 +5,28 @@ publishes a transition to an in-process async event bus, which feeds the SSE
 streams (P2) and, later, the notifier (P6). The watcher owns **no** run state —
 it only observes on-disk manifests — so a watcher error can never affect a run.
 
-**Two separate concerns (review F-002):**
+**Two uses of the manifest mtime (review F-001/F-002):**
 
-- *File-change detection* uses the manifest's ``st_mtime_ns`` purely as a cheap
-  gate: a changed mtime means "re-parse this file", an unchanged mtime means
-  "skip the read". mtime is **not** part of an emitted event's identity.
-- *Semantic-transition identity* is the tuple
-  ``(run_id, current_step, current_step_status, run_status)`` (FR-8.1). An event
-  is emitted only when that tuple changes after a re-parse.
+- *File-change detection* uses the manifest's ``st_mtime_ns`` as a cheap gate:
+  a changed mtime means "re-parse this file", an unchanged mtime means "skip the
+  read" without even parsing.
+- *Event identity* is the FR-8.1 tuple ``(run_id, current_step,
+  current_step_status, run_status, manifest_revision)``, where
+  ``manifest_revision`` is that same ``st_mtime_ns`` — the PRD's v1 revision
+  marker (``prd.md`` FR-8.1, "``mtime`` suffices"). Including the revision means
+  any manifest write is a new identity even when the four semantic fields are
+  unchanged, so a run that re-enters the *same* semantic state (e.g. parks at
+  gate A, leaves, parks at gate A again) is still observed rather than collapsed.
 
-Consequence: an atomic rewrite that preserves semantic state (``os.replace`` of
-a byte-changed-but-same-state manifest — new mtime, same tuple) triggers a
-re-read but emits **nothing**, so semantic no-op rewrites never produce phantom
-transitions or duplicate downstream notifications (P6). The coarser
-``(run_id, run_status)`` keying the PRD rejects would collapse a run parking at
-successive gates into one event; keying on ``current_step`` keeps each distinct
-gate transition observable exactly once (G3/G4).
+De-duplicating actual *notifications* across revision-only changes is FR-9.1's
+separate concern (its own ``(run_id, kind, current_step)`` key in P6), not the
+watcher's. The coarser ``(run_id, run_status)`` keying the PRD rejects would
+collapse a run parking at successive gates into one event; the finer identity
+keeps each distinct transition observable (G3/G4).
+
+NOTE (FR-8.1 vs plan deviation): the P2 plan text described a 4-field identity
+that excludes mtime; including ``manifest_revision`` here follows the
+higher-priority PRD (review F-001).
 """
 
 from __future__ import annotations
@@ -36,10 +42,11 @@ from gauntlet.web.store import RunStore, _current_record, _mtime_iso
 
 DEFAULT_INTERVAL_S = 1.0
 
-# The 4-field semantic identity of a transition (FR-8.1). `None` stands in for a
-# manifest we failed to parse, so a broken→valid recovery still reads as a
-# transition rather than being silently swallowed.
-Identity = tuple[str, str | None, str | None, str]
+# The FR-8.1 event identity: four semantic fields plus the manifest revision
+# (`st_mtime_ns`). The `None` semantic fields stand in for a manifest we failed
+# to parse, so a broken→valid recovery still reads as a transition rather than
+# being silently swallowed.
+Identity = tuple[str, str | None, str | None, str, int | None]
 
 
 class WatchEvent(BaseModel):
@@ -51,16 +58,22 @@ class WatchEvent(BaseModel):
     current_step: str | None = None
     current_step_status: str | None = None
     current_step_notes: str | None = None
-    updated: str | None = None  # manifest mtime (display only, not identity)
+    updated: str | None = None  # manifest mtime as ISO (display)
+    revision: int | None = None  # manifest mtime in ns: the FR-8.1 manifest_revision
 
     @property
     def identity(self) -> Identity:
-        """The semantic identity tuple the watcher de-dups on (FR-8.1)."""
+        """The FR-8.1 identity tuple the watcher de-dups on.
+
+        Includes ``manifest_revision`` (mtime ns) so a manifest write is a new
+        identity even when the four semantic fields are unchanged (review F-001).
+        """
         return (
             self.run_id,
             self.current_step,
             self.current_step_status,
             self.run_status,
+            self.revision,
         )
 
 
@@ -97,7 +110,9 @@ class Watcher:
             q.put_nowait(event)
 
     # ---- polling core --------------------------------------------------------
-    def _event_for(self, slug: str, man: Manifest, manifest_path: Path) -> WatchEvent:
+    def _event_for(
+        self, slug: str, man: Manifest, manifest_path: Path, mtime_ns: int
+    ) -> WatchEvent:
         cur = _current_record(man)
         return WatchEvent(
             slug=slug,
@@ -107,15 +122,17 @@ class Watcher:
             current_step_status=cur.status if cur else None,
             current_step_notes=cur.notes if cur else None,
             updated=_mtime_iso(manifest_path),
+            revision=mtime_ns,
         )
 
     def poll_once(self) -> list[WatchEvent]:
         """Stat/re-parse every manifest; emit + return each new transition.
 
         Emits on first observation of a run (it became visible — a transition
-        the list view wants live) and on every later semantic-identity change.
-        A re-parse that yields the same identity (semantic no-op rewrite) emits
-        nothing; an unchanged mtime is skipped without even re-parsing.
+        the list view wants live) and on every later identity change. Identity
+        includes the manifest revision (mtime), so any manifest rewrite is a
+        transition (FR-8.1, review F-001); an unchanged mtime is skipped without
+        even re-parsing.
         """
         events: list[WatchEvent] = []
         live: set[Path] = set()
@@ -136,7 +153,7 @@ class Watcher:
                 # rewrite still reads as a transition.
                 self._seen[manifest_path] = (mtime_ns, prev[1] if prev else None)
                 continue
-            event = self._event_for(slug, man, manifest_path)
+            event = self._event_for(slug, man, manifest_path, mtime_ns)
             identity = event.identity
             if prev is None or prev[1] != identity:
                 events.append(event)

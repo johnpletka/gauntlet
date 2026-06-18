@@ -10,7 +10,9 @@ user-selected file path the API exposes).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -261,6 +263,19 @@ def test_step_log_rejects_traversal_name(store: RunStore):
         store.step_log("alpha", "impl", name="../manifest.json")
 
 
+def test_step_log_rejects_symlink_escape(repo: Path, store: RunStore):
+    """An allowed-name symlink that escapes the step dir is rejected (review
+    F-002): it stays under the run root but points outside this step's dir, so it
+    must not be read as the step's log."""
+    step_dir = repo / "runs" / "alpha" / "run-1" / "steps" / "impl"
+    # `transcript.md` is an allowed name; point it at another file under the run
+    # root but outside the step dir (the manifest).
+    target = repo / "runs" / "alpha" / "run-1" / "manifest.json"
+    (step_dir / "transcript.md").symlink_to(target)
+    with pytest.raises(UnsafePath):
+        store.step_log("alpha", "impl", name="transcript.md")
+
+
 def test_step_log_traversal_step_rejected(store: RunStore):
     with pytest.raises(UnsafePath):
         store.step_log("alpha", "../../etc")
@@ -315,24 +330,99 @@ def test_events_endpoint_requires_token(store: RunStore):
     assert client.get("/events").status_code == 401
 
 
-def test_events_route_registered_and_streaming(store: RunStore):
-    # The `/events` stream is infinite by design, so a TestClient read of it
-    # would block on teardown; the stream *behaviour* is covered by the
-    # `event_stream` generator tests above. Here we just assert the route is
-    # wired and the app exposes its watcher (the live source) — no stream read.
-    app = create_app(store, token=TOKEN)
+def _sse_messages(body: str) -> list[str]:
+    """Split a collected SSE response body into its message blocks (``\\n\\n``-
+    separated), so a fully-read finite stream can be parsed one message at a time.
+
+    The repo's ``starlette.testclient`` buffers the whole response before
+    returning (it cannot read an *infinite* stream incrementally — a direct read
+    of the live `/events`/`/log/stream` endpoints deadlocks in
+    ``client.stream().__enter__``). So these HTTP-boundary tests bound the route's
+    generator (``max_events`` / ``max_iters`` via ``monkeypatch``) to make the
+    StreamingResponse finite, then assert over the collected body — exercising the
+    real route, auth, StreamingResponse, and lifespan-started watcher.
+    """
+    return [blk for blk in body.split("\n\n") if blk.strip()]
+
+
+def test_events_route_registered_and_streaming(
+    repo: Path, store: RunStore, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end `/events` wiring (review F-004): the StreamingResponse yields
+    the initial snapshot then a live transition pushed by the lifespan-started
+    watcher — exercising auth, the StreamingResponse, and the watcher hookup at
+    the HTTP boundary, not just the internal `event_stream` generator."""
+    watcher = Watcher(store, interval=0.02)
+    watcher.poll_once()  # prime running so the loop's first poll is a no-op
+    # Bound the route's generator so the (otherwise infinite) stream is finite and
+    # the buffering TestClient can return it: one snapshot + one transition.
+    monkeypatch.setattr(
+        "gauntlet.web.service.event_stream",
+        functools.partial(event_stream, max_events=1),
+    )
+    app = create_app(store, token=TOKEN, watcher=watcher)
     paths = {r.path for r in app.routes}  # type: ignore[attr-defined]
     assert "/events" in paths
-    assert "/api/runs/{slug}/steps/{step}/log/stream" in paths
     assert app.state.watcher.store is store
 
+    rd = repo / "runs" / "alpha" / "run-1"
+    stop = threading.Event()
 
-def test_log_stream_route_registered(store: RunStore):
-    # Same rationale: the SSE tail is infinite; its behaviour is covered by
-    # `test_log_tail_stream_emits_only_appended_bytes`.
+    def drive_transition() -> None:
+        # Rewrite to a parked state until the request completes; the lifespan
+        # watcher loop observes it and publishes a transition to the open stream
+        # (a repeated write guarantees one lands *after* the stream subscribes,
+        # regardless of TestClient/loop scheduling).
+        parked = _manifest(
+            "alpha", "run-1", status="parked",
+            steps=[StepRecord(id="g", type="human_gate", status="parked")],
+            current_step="g",
+        )
+        while not stop.is_set():
+            _write(rd, parked)
+            stop.wait(0.03)
+
+    driver = threading.Thread(target=drive_transition, daemon=True)
+    with TestClient(app) as client:  # lifespan starts the watcher poll loop
+        driver.start()
+        resp = client.get("/events", headers=_auth())
+        stop.set()
+        driver.join(timeout=2)
+
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    msgs = _sse_messages(resp.text)
+    ev0, data0 = _parse_sse(msgs[0])
+    assert ev0 == "snapshot"
+    assert any(r["slug"] == "alpha" for r in data0["rows"])
+    ev1, data1 = _parse_sse(msgs[1])
+    assert ev1 == "transition"
+    assert data1["run_status"] == "parked"
+    assert data1["current_step"] == "g"
+
+
+def test_log_stream_route_registered(store: RunStore, monkeypatch: pytest.MonkeyPatch):
+    """End-to-end `/log/stream` wiring (review F-004): the tail StreamingResponse
+    yields an `append` event carrying the step log's bytes over the HTTP
+    boundary, not just the internal `log_tail_stream` generator."""
+    monkeypatch.setattr(
+        "gauntlet.web.service.log_tail_stream",
+        functools.partial(log_tail_stream, max_iters=1, interval=0.0),
+    )
     app = create_app(store, token=TOKEN)
     paths = {r.path for r in app.routes}  # type: ignore[attr-defined]
-    assert "/api/runs/{slug}/steps/{step}/log" in paths
+    assert "/api/runs/{slug}/steps/{step}/log/stream" in paths
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/api/runs/alpha/steps/impl/log/stream", headers=_auth()
+        )
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    name, data = _parse_sse(_sse_messages(resp.text)[0])
+    assert name == "append"
+    assert data["text"] == '{"t":"start"}\n'
+    assert data["start"] == 0
 
 
 # --- live partials -----------------------------------------------------------
