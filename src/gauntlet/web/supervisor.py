@@ -421,13 +421,25 @@ class JobSupervisor:
         """
         outcomes: list[RecoveryOutcome] = []
         for job in self.jobs():
-            # Liveness is computed exactly once per job (it may shell out to `ps`
-            # on macOS) and threaded into the pure classifier.
-            live = job.is_live()
-            manifest = None if live else self._load_manifest(job.run_dir)
-            disposition = job.recovery_disposition(manifest, live=live)
-            if disposition == INTERRUPTED:
-                self._remove_stale_sidecar(job)
+            # Narrow per-job best-effort (review F-001): one unreconcilable run
+            # must not abort the whole re-discovery pass, but its failure is
+            # surfaced (logged), never silently swallowed. A *scan*-level failure
+            # (`self.jobs()` above) is deliberately NOT caught here — it
+            # propagates so the server's startup reattach pass fails closed
+            # rather than coming up with stale, unreconciled ownership state.
+            try:
+                # Liveness is computed exactly once per job (it may shell out to
+                # `ps` on macOS) and threaded into the pure classifier.
+                live = job.is_live()
+                manifest = None if live else self._load_manifest(job.run_dir)
+                disposition = job.recovery_disposition(manifest, live=live)
+                if disposition == INTERRUPTED:
+                    self._remove_stale_sidecar(job)
+            except Exception as exc:  # narrow per-job best-effort (review F-001)
+                log.warning(
+                    "reattach skipped %s/%s: %s", job.slug, job.run_id, exc
+                )
+                continue
             outcomes.append(
                 RecoveryOutcome(
                     slug=job.slug,

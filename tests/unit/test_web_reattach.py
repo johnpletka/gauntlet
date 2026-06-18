@@ -53,9 +53,25 @@ from gauntlet.web.supervisor import (
 )
 
 # Reuse the P3 supervisor + engine crash fixtures rather than re-deriving them.
+from conftest import git
 from test_resume_crash import CHILD, RecoverAdapter
 from test_resume_crash import _build_repo as _build_crash_repo
 from test_web_supervisor import LONG_PIPELINE, SLEEP_PIPELINE, _build_repo
+
+# A crash pipeline whose post-implement `tests` shell blocks on first run so a
+# kill lands *between* steps (implement recorded done, commit not yet started).
+# The block sentinel lives under `runs/` (excluded from the clean check) and
+# flips to a no-op on resume, so the re-run sails through to the commit step.
+BETWEEN_PIPELINE = """
+name: crash
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+      - {id: tests, type: shell, run: "if [ -f runs/.between_ready ]; then exit 0; else : > runs/.between_ready; sleep 60; fi"}
+      - {id: commit, type: commit, message: "P1: crash phase\\n\\nthe body."}
+"""
 
 TOKEN = "reattach-test-token"
 DEAD_PID = 2**30  # an unused pid → the recorded driver always reads as dead
@@ -319,7 +335,13 @@ def test_orphaned_owned_run_resumes_to_done(tmp_path, kill_delay):
     """The P4 headline (FR-7.3): an owned run killed mid-edit is re-discovered by
     a fresh supervisor as interrupted, its stale sidecar reclaimed, and ``resume``
     recovers it to DONE with exactly one set of effects — no lost or duplicated
-    work — the *same* recovery a ``kill -9``'d CLI run gets."""
+    work — the *same* recovery a ``kill -9``'d CLI run gets.
+
+    This is the **mid-step** member of the kill-timing matrix: all three
+    ``kill_delay`` values land while the ``implement`` agent step is still
+    running (the child blocks on ``.crash_ready`` *inside* that step). The
+    before-manifest and between-step members are covered by the two tests below
+    (review F-002)."""
     repo, mgr = _build_crash_repo(tmp_path / "repo", policy="reset_to_base")
 
     # Launch a real engine run that writes a partial edit then blocks mid-step.
@@ -363,6 +385,95 @@ def test_orphaned_owned_run_resumes_to_done(tmp_path, kill_delay):
     assert gitops._run(repo, "log", "--format=%s").count("P1: crash phase") == 1
 
 
+# ---- kill-timing matrix: before-manifest & between-step (review F-002) -------
+
+
+def test_orphaned_before_manifest_is_failed_launch(tmp_path):
+    """Kill-timing matrix (F-002): a child that dies BEFORE the engine writes any
+    manifest (the FR-6.1a crash-before-manifest case). The supervisor handshake
+    has already laid down ``.serve/job.json``, but no run state exists, so a
+    fresh supervisor re-discovers it as ``failed_launch`` — nothing to resume —
+    keeping the captured log diagnosable and never showing a phantom live run.
+
+    Uses a real process whose pid is killed (not a sentinel pid) so the
+    PID-reuse-safe liveness check is exercised honestly at this timing point."""
+    sup = _bare_supervisor(tmp_path)
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        identity = read_process_identity(proc.pid)
+        rd = _seed_owned_run(
+            sup.run_root, "demo", "run-1", status=None,
+            pid=proc.pid, identity=identity,
+        )
+    finally:
+        proc.kill()  # the child dies before any manifest is written
+        proc.wait(timeout=10)
+
+    (out,) = sup.reattach()
+    assert out.disposition == FAILED_LAUNCH
+    assert out.resume_available is False
+    assert _sidecar(rd).exists()  # kept: not an interrupted orphan, no resume path
+    assert (rd / SERVE_DIRNAME / "run.log").exists()  # still diagnosable
+
+
+@pytest.mark.parametrize("kill_delay", [0.0, 0.04])
+def test_orphaned_between_steps_resumes_to_done(tmp_path, kill_delay):
+    """Kill-timing matrix (F-002): an owned run killed BETWEEN steps — after the
+    ``implement`` agent step is recorded ``done`` but before the ``commit`` step
+    completes — is re-discovered as interrupted and ``resume`` recovers it to
+    DONE with exactly one commit (no lost or duplicated work), the same recovery
+    a ``kill -9``'d run gets. The kill is timed by a blocking ``tests`` shell
+    step so it lands in a genuinely different on-disk state than the mid-step
+    test above."""
+    repo, mgr = _build_crash_repo(tmp_path / "repo", policy="reset_to_base")
+    # Swap in the between-step pipeline and commit it so the worktree stays clean.
+    (repo / "pipelines" / "crash.yaml").write_text(BETWEEN_PIPELINE)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "between-step crash pipeline")
+
+    ready = repo / "runs" / ".between_ready"
+    if ready.exists():
+        ready.unlink()
+    # start_new_session so the child gets its own process group: killpg then
+    # reaps the engine *and* the blocking `sleep` of the tests shell step.
+    proc = subprocess.Popen(
+        [sys.executable, str(CHILD), str(repo), "demo", "between_step"],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 30
+    while not ready.exists() and time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"child exited early ({proc.returncode})")
+        time.sleep(0.01)
+    assert ready.exists(), "child never reached the between-step sentinel"
+
+    run_dir = mgr.layout("demo").active_run_dir()
+    # The defining property of this timing case: implement is already done.
+    assert Manifest.load(run_dir / "manifest.json").record("implement").status == M.DONE
+
+    _own_existing_run(run_dir, "demo", proc.pid)
+    time.sleep(kill_delay)
+    os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=10)
+
+    sup = JobSupervisor(repo)
+    out = next(o for o in sup.reattach() if o.run_id == run_dir.name)
+    assert out.disposition == INTERRUPTED
+    assert out.resume_available is True
+    assert not _sidecar(run_dir).exists()  # reclaimed → resume path (FR-7.3)
+
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: RecoverAdapter()
+    )
+    assert status == M.RUN_DONE
+    final = mgr.status("demo")
+    assert [c.phase for c in final.commits] == ["P1"]
+    assert gitops.commit_subject(repo, "HEAD") == "P1: crash phase"
+    assert (repo / "feature.py").read_text() == "RECOVERED — final content\n"
+    assert gitops.is_clean(repo, exclude=["runs"])
+    assert gitops._run(repo, "log", "--format=%s").count("P1: crash phase") == 1
+
+
 # ---- server startup runs re-attach (lifespan wiring) ------------------------
 
 
@@ -379,3 +490,49 @@ def test_app_startup_reattaches_orphans(tmp_path):
     assert _sidecar(rd).exists()  # present before boot
     with TestClient(app):  # lifespan startup triggers reattach()
         assert not _sidecar(rd).exists()  # reclaimed on startup
+
+
+def test_app_startup_fails_closed_when_reattach_scan_raises(tmp_path):
+    """Fail closed (review F-001): a *scan*-level re-discovery failure must abort
+    startup rather than let the console come up serving stale ownership state and
+    silently skipping P4's required reattach pass."""
+    sup = _bare_supervisor(tmp_path)
+
+    def boom():
+        raise RuntimeError("re-discovery scan failed")
+
+    sup.reattach = boom  # the whole reattach scan blows up, not one job
+    store = RunStore.from_repo(sup.repo_root, supervisor=sup)
+    app = create_app(store, token=TOKEN, supervisor=sup)
+    with pytest.raises(RuntimeError, match="re-discovery scan failed"):
+        with TestClient(app):  # lifespan startup must propagate, not swallow
+            pass
+
+
+def test_reattach_per_job_failure_is_skipped_not_fatal(tmp_path, monkeypatch):
+    """Best-effort per job (review F-001): one unreconcilable run is logged and
+    skipped, but the rest of the re-discovery pass still reconciles — only a
+    scan-level failure fails closed (asserted above), not a single bad run."""
+    sup = _bare_supervisor(tmp_path)
+    # `bad` sorts before `good`, so the failing job is hit first; the good one
+    # must still be reconciled afterwards.
+    bad = _seed_owned_run(
+        sup.run_root, "bad", "run-2", status=RUN_PARKED, pid=DEAD_PID, identity=None
+    )
+    good = _seed_owned_run(
+        sup.run_root, "good", "run-1", status=RUN_PARKED, pid=DEAD_PID, identity=None
+    )
+    real_load = sup._load_manifest
+
+    def flaky(run_dir):
+        if run_dir.name == "run-2":
+            raise OSError("manifest read blew up")
+        return real_load(run_dir)
+
+    monkeypatch.setattr(sup, "_load_manifest", flaky)
+
+    outs = sup.reattach()
+    assert [o.slug for o in outs] == ["good"]  # bad skipped, good reconciled
+    assert outs[0].disposition == INTERRUPTED
+    assert not _sidecar(good).exists()  # good's stale sidecar reclaimed
+    assert _sidecar(bad).exists()  # bad left untouched (skipped, not reconciled)

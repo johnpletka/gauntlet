@@ -100,14 +100,17 @@ def create_app(
         # P4 (FR-7.1/7.3): before serving, re-discover owned runs from disk and
         # reconcile orphans — a restarted console holds no authoritative run
         # state (D2). Guarded so read-only deployments and the minimal test
-        # stubs (no `reattach`) are untouched; fail-soft so a re-discovery error
-        # never blocks the console from coming up to observe runs.
+        # stubs (no `reattach`) are untouched. Fail CLOSED (review F-001): a
+        # re-discovery failure must NOT let the console come up pretending the
+        # reattach pass completed while serving stale ownership state — let it
+        # propagate so startup aborts. Per-run recovery is best-effort *inside*
+        # JobSupervisor.reattach() (one unreconcilable run is logged and
+        # skipped); an exception reaching here means the scan itself failed, and
+        # silently swallowing it would violate the fail-closed/process-fidelity
+        # guidance and skip P4's required reattach pass.
         reattach = getattr(supervisor, "reattach", None)
         if callable(reattach):
-            try:
-                reattach()
-            except Exception:  # pragma: no cover - defensive; re-attach is best-effort
-                pass
+            reattach()
         watcher.start()
         try:
             yield
