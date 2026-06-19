@@ -36,9 +36,13 @@ stages:
   # --- plan gate ------------------------------------------------------------
   - id: plan
     steps:
+      # No `halt_on:` here: plan-author returns ONLY the plan document
+      # (prompts/plan-author.md), which legitimately quotes the FR-10.4
+      # "UPSTREAM CONFLICT" protocol as prose — gating on that marker only ever
+      # false-positives and discards the authored plan.md. A genuinely broken
+      # PRD is caught downstream at plan-cycle / plan-approve.
       - {id: plan-author, type: agent_task, agent: builder,
-         prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md,
-         halt_on: "UPSTREAM CONFLICT"}
+         prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md}
       # plan.md is freshly authored and uncommitted; the artifact-mode cycle
       # commits it as the clean review baseline (PLAN: …) before reviewing.
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
