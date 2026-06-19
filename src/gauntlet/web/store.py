@@ -98,14 +98,18 @@ class RunRow(BaseModel):
 class StepArtifact(BaseModel):
     name: str
     size: int
+    path: str  # path relative to the step dir (the page's ?artifact= value)
 
 
 class StepRound(BaseModel):
-    """A nested round dir of an ``adversarial_cycle`` (e.g. ``r1-review``)."""
+    """A nested dir under a step — a cycle's ``r1-review`` / a retrospective's
+    ``synthesis`` — possibly itself containing further round dirs (e.g. a
+    triage round's per-finding ``F-001`` dirs)."""
 
     name: str
+    path: str  # path relative to the step dir
     artifacts: list[StepArtifact] = []
-    items: list[str] = []  # nested subdir names (e.g. per-finding triage dirs)
+    rounds: list["StepRound"] = []
 
 
 class StepDetail(BaseModel):
@@ -665,36 +669,38 @@ class RunStore:
         self,
         slug: str,
         step: str,
-        name: str,
+        relpath: str,
         *,
         run_id: str | None = None,
         max_bytes: int = DEFAULT_LOG_MAX_BYTES,
     ) -> str:
-        """Read one of a step's artifacts as text, contained + allowlisted.
+        """Read a file under a step's dir as text, path-contained (FR-10.1).
 
-        ``name`` is user-controlled (the ``?artifact=`` query of the step-detail
-        page), so it must never address an arbitrary path: it is validated as a
-        single safe segment, asserted to stay within the *step* dir (so an
-        allowed-name symlink cannot escape — same posture as :meth:`step_log`),
-        and rejected unless it is one of the names :meth:`step_detail` actually
-        reports for this step (its top-level artifacts). Anything else → 404, so
-        the page can only surface artifacts the read model already knows about.
-        Capped like a log tail (R5) so one request can never pull an unbounded
-        file into memory.
+        ``relpath`` is the artifact's path *relative to the step dir* — a single
+        name (``transcript.md``) or a nested one (``r1-review/findings.json``,
+        ``r1-triage/F-001/verdict.json``) for an artifact inside a round / sub-
+        step dir. It is user-controlled (the page's ``?artifact=`` query), so the
+        security boundary is **containment, not an allowlist**: every path
+        segment is validated (no ``.``/``..``/separator/NUL), the joined path is
+        ``resolve``-checked to stay within the step dir (so an allowed-name
+        symlink cannot escape — same posture as :meth:`step_log`), and only a
+        regular file is served. Any file the run itself wrote under its own step
+        dir is legitimately viewable (FR-3.1); nothing outside it ever is — and
+        an allowlist of "known" names adds no containment over that while
+        silently hiding real nested artifacts. Capped like a log tail (R5).
         """
-        detail = self.step_detail(slug, step, run_id)
-        allowed = {a.name for a in detail.artifacts}
         run_dir = self.run_dir(slug, run_id)
         _safe_segment(step, kind="step")
         step_dir = self._assert_contained(run_dir / "steps" / step)
-        _safe_segment(name, kind="artifact")
-        if name not in allowed:
-            raise RunNotFound(
-                f"artifact {name!r} is not an artifact of step {step!r}"
-            )
-        path = self._assert_within(step_dir / name, step_dir)
+        target = step_dir
+        for seg in relpath.split("/"):
+            target = target / _safe_segment(seg, kind="artifact")
+        # `_assert_within` resolves symlinks: an escaping component (any symlink
+        # pointing outside the step dir) already fails closed there. A symlink
+        # that resolves *within* the step dir is just another in-step file.
+        path = self._assert_within(target, step_dir)
         if not path.exists() or not path.is_file():
-            raise RunNotFound(f"artifact {name!r} not found for step {step!r}")
+            raise RunNotFound(f"artifact {relpath!r} not found for step {step!r}")
         with path.open("rb") as fh:
             raw = fh.read(max_bytes)
         return raw.decode("utf-8", errors="replace")
@@ -720,15 +726,7 @@ class RunStore:
             rec = next((r for r in man.steps if r.id == base), None)
 
         artifacts = _list_artifacts(step_dir)
-        rounds: list[StepRound] = []
-        for d in sorted(p for p in step_dir.iterdir() if p.is_dir()):
-            rounds.append(
-                StepRound(
-                    name=d.name,
-                    artifacts=_list_artifacts(d),
-                    items=sorted(c.name for c in d.iterdir() if c.is_dir()),
-                )
-            )
+        rounds = _list_rounds(step_dir)
         return StepDetail(
             slug=slug,
             run_id=rid,
@@ -799,15 +797,42 @@ def _read_chunk(path: Path, name: str, offset: int, max_bytes: int) -> LogChunk:
     )
 
 
-def _list_artifacts(directory: Path) -> list[StepArtifact]:
+_MAX_ROUND_DEPTH = 6  # bound the nested-dir walk (step → round → finding → …)
+
+
+def _list_artifacts(directory: Path, *, prefix: str = "") -> list[StepArtifact]:
     out: list[StepArtifact] = []
     for f in sorted(directory.iterdir()):
-        if f.is_file():
+        # Skip symlinks: the read path is containment-checked, but a symlink need
+        # never be *advertised* — list only real files the run wrote here.
+        if f.is_file() and not f.is_symlink():
             try:
                 size = f.stat().st_size
             except OSError:
                 size = 0
-            out.append(StepArtifact(name=f.name, size=size))
+            out.append(StepArtifact(name=f.name, size=size, path=prefix + f.name))
+    return out
+
+
+def _list_rounds(directory: Path, *, prefix: str = "", depth: int = 0) -> list["StepRound"]:
+    """Nested round/sub-step dirs under ``directory``, each with its files and
+    its own (recursively listed) sub-rounds. ``prefix`` is the path so far
+    relative to the step dir; ``path`` on each node is the ``?artifact=`` prefix
+    its files link under. Bounded depth + symlink-skipping keep the walk finite
+    and contained."""
+    if depth >= _MAX_ROUND_DEPTH:
+        return []
+    out: list[StepRound] = []
+    for d in sorted(p for p in directory.iterdir() if p.is_dir() and not p.is_symlink()):
+        rel = prefix + d.name
+        out.append(
+            StepRound(
+                name=d.name,
+                path=rel,
+                artifacts=_list_artifacts(d, prefix=rel + "/"),
+                rounds=_list_rounds(d, prefix=rel + "/", depth=depth + 1),
+            )
+        )
     return out
 
 

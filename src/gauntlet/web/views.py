@@ -166,17 +166,17 @@ def _step_detail_context(
         record = records[0] if records else None
 
     names = [a.name for a in detail.artifacts]
-    # An explicit ?artifact= is validated through the contained, allowlisted
-    # reader: an *unsafe* segment (traversal/separator/NUL) raises UnsafePath and
-    # is surfaced as a 400 by the app's exception handler — never silently
-    # downgraded to the default. A safe-but-absent name is shown as a content
-    # error. With no ?artifact=, default to transcript.md when present.
+    # `?artifact=` is a path relative to the step dir — a top-level name, or a
+    # nested `round/file` (e.g. `synthesis/proposals.json`) so round/sub-step
+    # artifacts are *viewable*, not just listed. The contained reader validates
+    # every segment: an unsafe one (traversal/separator/NUL) raises UnsafePath →
+    # surfaced as 400, never downgraded to the default; a safe-but-absent path is
+    # shown as a content error. With no `?artifact=`, default to the step's
+    # top-level transcript.md when present.
     selected = artifact or (("transcript.md") if "transcript.md" in names else None)
     content: str | None = None
     content_error: str | None = None
     if selected is not None:
-        if artifact is not None:
-            _safe_segment(artifact, kind="artifact")
         try:
             content = store.read_step_artifact(
                 slug, leaf, selected, run_id=run_id

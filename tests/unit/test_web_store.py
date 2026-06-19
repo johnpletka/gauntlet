@@ -368,8 +368,12 @@ def test_step_detail_renders_cycle_rounds(client: TestClient):
     artifact_names = {a["name"] for a in review["artifacts"]}
     assert {"prompt.md", "transcript.md", "findings.json"} <= artifact_names
     assert all(a["size"] > 0 for a in review["artifacts"])
+    # Each round artifact carries its step-relative path (the ?artifact= value),
+    # so a nested file is viewable, not just listed (containment-bounded reader).
+    assert any(a["path"] == "r1-review/findings.json" for a in review["artifacts"])
+    # Per-finding triage dirs are now nested rounds (recursive), not opaque names.
     triage = next(r for r in body["rounds"] if r["name"] == "r1-triage")
-    assert {"F-001", "F-002"} <= set(triage["items"])
+    assert {"F-001", "F-002"} <= {sub["name"] for sub in triage["rounds"]}
 
 
 def test_step_detail_unknown_step_404(client: TestClient):

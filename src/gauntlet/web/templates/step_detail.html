@@ -26,35 +26,41 @@
   {% if record and record.notes %}<dt>notes</dt><dd class="notes">{{ record.notes }}</dd>{% endif %}
 </dl>
 
+{# A file links by its path relative to the step dir (the ?artifact= value); a
+   recursive macro renders nested round / sub-step dirs (a cycle's review/triage
+   rounds and their per-finding dirs, the retrospective's builder/reviewer/
+   synthesis) so every nested file is viewable, not just listed. #}
+{% macro artifact_link(a) %}
+  <li>
+    <a href="/runs/{{ slug }}/steps/{{ step }}?run_id={{ run_id }}{% if iteration is not none %}&iteration={{ iteration }}{% endif %}&artifact={{ a.path }}"
+       {% if a.path == selected %}class="selected"{% endif %}>{{ a.name }}</a>
+    <span class="muted">{{ a.size }} B</span>
+  </li>
+{% endmacro %}
+{% macro render_round(r) %}
+  <details open>
+    <summary>{{ r.name }}
+      <span class="muted">({{ r.artifacts|length }} file(s){% if r.rounds %}, {{ r.rounds|length }} subdir(s){% endif %})</span>
+    </summary>
+    {% if r.artifacts %}<ul class="artifacts">{% for a in r.artifacts %}{{ artifact_link(a) }}{% endfor %}</ul>{% endif %}
+    {% for sub in r.rounds %}{{ render_round(sub) }}{% endfor %}
+  </details>
+{% endmacro %}
+
 <h2>Artifacts</h2>
-{% if artifact_names %}
+{% if detail.artifacts %}
 <ul class="artifacts">
-  {% for a in detail.artifacts %}
-    <li>
-      <a href="/runs/{{ slug }}/steps/{{ step }}?run_id={{ run_id }}{% if iteration is not none %}&iteration={{ iteration }}{% endif %}&artifact={{ a.name }}"
-         {% if a.name == selected %}class="selected"{% endif %}>{{ a.name }}</a>
-      <span class="muted">{{ a.size }} B</span>
-    </li>
-  {% endfor %}
+  {% for a in detail.artifacts %}{{ artifact_link(a) }}{% endfor %}
 </ul>
+{% elif detail.rounds %}
+<p class="muted">no top-level files for this step — see the rounds below</p>
 {% else %}
 <p class="muted">no artifacts on disk for this step yet</p>
 {% endif %}
 
-{# Nested round dirs (adversarial_cycle): findings/triage/confirm per round. #}
 {% if detail.rounds %}
 <h2>Rounds</h2>
-{% for r in detail.rounds %}
-  <details {% if loop.first %}open{% endif %}>
-    <summary>{{ r.name }} <span class="muted">({{ r.artifacts|length }} artifact(s))</span></summary>
-    {% if r.artifacts %}
-    <ul class="artifacts">
-      {% for a in r.artifacts %}<li>{{ a.name }} <span class="muted">{{ a.size }} B</span></li>{% endfor %}
-    </ul>
-    {% endif %}
-    {% if r.items %}<p class="muted">subdirs: {{ r.items | join(", ") }}</p>{% endif %}
-  </details>
-{% endfor %}
+{% for r in detail.rounds %}{{ render_round(r) }}{% endfor %}
 {% endif %}
 
 {% if selected %}

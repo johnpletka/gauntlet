@@ -204,6 +204,67 @@ def test_cycle_step_surfaces_nested_rounds(client: TestClient, repo: Path):
     assert "findings.json" in html
 
 
+def test_round_artifact_is_a_viewable_link(client: TestClient, repo: Path):
+    # Round / sub-step files are now LINKS (?artifact=<round>/<file>) and
+    # viewable, not just listed — the reported retrospective/plan-cycle gap.
+    # Containment, not an allowlist, is the boundary, so any file the run wrote
+    # under its step dir is viewable.
+    run_dir = _write_run(
+        repo, "demo", "run-1",
+        [StepRecord(id="retrospective", type="retrospective", status="done")],
+        current=None,
+    )
+    synth = run_dir / "steps" / "retrospective" / "synthesis"
+    synth.mkdir(parents=True)
+    (synth / "proposals.json").write_text('{"proposals": ["tighten the prompt"]}')
+    page = client.get(
+        "/runs/demo/steps/retrospective", headers=_auth(), params={"run_id": "run-1"}
+    ).text
+    assert "artifact=synthesis/proposals.json" in page  # rendered as a link
+    view = client.get(
+        "/runs/demo/steps/retrospective",
+        headers=_auth(),
+        params={"run_id": "run-1", "artifact": "synthesis/proposals.json"},
+    ).text
+    assert "tighten the prompt" in view  # and the file's content renders
+
+
+def test_deeply_nested_round_artifact_viewable(client: TestClient, repo: Path):
+    # Recursive: a file two levels deep (a cycle's per-finding triage verdict) is
+    # readable via its full step-relative path.
+    run_dir = _write_run(
+        repo, "demo", "run-1",
+        [StepRecord(id="plan-cycle", type="adversarial_cycle", status="done")],
+        current=None,
+    )
+    f001 = run_dir / "steps" / "plan-cycle" / "r1-triage" / "F-001"
+    f001.mkdir(parents=True)
+    (f001 / "verdict.json").write_text('{"verdict": "legitimate"}')
+    view = client.get(
+        "/runs/demo/steps/plan-cycle",
+        headers=_auth(),
+        params={"run_id": "run-1", "artifact": "r1-triage/F-001/verdict.json"},
+    ).text
+    assert "legitimate" in view
+
+
+def test_round_artifact_traversal_rejected(client: TestClient, repo: Path):
+    # A traversal segment anywhere in the nested relpath fails closed (400), so
+    # the reader can never escape the step dir (FR-10.1 containment).
+    run_dir = _write_run(
+        repo, "demo", "run-1",
+        [StepRecord(id="prd-cycle", type="adversarial_cycle", status="done")],
+        current=None,
+    )
+    (run_dir / "steps" / "prd-cycle" / "r1-review").mkdir(parents=True)
+    resp = client.get(
+        "/runs/demo/steps/prd-cycle",
+        headers=_auth(),
+        params={"run_id": "run-1", "artifact": "r1-review/../../manifest.json"},
+    )
+    assert resp.status_code == 400
+
+
 # --------------------------------------------------------------------------- #
 # containment (mirrors F-006 traversal tests)
 # --------------------------------------------------------------------------- #
