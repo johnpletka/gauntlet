@@ -108,7 +108,10 @@ def test_launch_gate_approve_done_through_ui(tmp_path):
         csrf = re.search(
             r'name="csrf-token" content="([^"]*)"', client.get("/").text
         ).group(1)
-        hdr = {CSRF_HEADER: csrf}
+        # A real browser sends Origin on a same-origin state-changing POST; the
+        # CSRF gate now requires it same-origin and fails closed otherwise
+        # (FR-10.6). TestClient's own origin is http://testserver.
+        hdr = {CSRF_HEADER: csrf, "Origin": "http://testserver"}
 
         # 2) Launch a run as an owned subprocess via the UI (cookie + CSRF POST).
         resp = client.post(

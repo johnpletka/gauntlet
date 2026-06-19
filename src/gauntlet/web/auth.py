@@ -38,10 +38,9 @@ CSRF_HEADER = "X-CSRF-Token"
 CSRF_FIELD = "_csrf"
 TOKEN_HEADER = "X-Gauntlet-Token"
 
-# Hosts a same-origin loopback request may legitimately originate from (FR-10.6
-# same-origin check). The console binds loopback only, so a real same-origin
-# POST always carries one of these in Origin/Referer; anything else is rejected.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+# Default ports by scheme, so an Origin lacking an explicit port compares equal to
+# the same scheme on its default port (FR-10.6 same-origin tuple).
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class Unauthenticated(Exception):
@@ -104,21 +103,44 @@ class SessionStore:
             self._sessions.pop(sid, None)
 
 
-def is_same_origin(origin: str | None) -> bool:
-    """True iff ``origin`` (an Origin/Referer header) is a loopback origin.
+def _origin_tuple(url: str | None) -> tuple[str, str | None, int | None] | None:
+    """Normalize a URL to its ``(scheme, hostname, port)`` origin tuple, or None.
 
-    A *missing* Origin/Referer returns ``True`` — the CSRF token match is the
-    primary defence and many same-origin fetches omit Referer; the same-origin
-    check is defence-in-depth that only ever *rejects* a present, cross-site
-    origin (FR-10.6). A present but unparseable/non-loopback origin is rejected.
+    An absent/unparseable URL, or one missing scheme or host, yields ``None`` (so
+    the caller fails closed). A port absent from the URL is filled in from the
+    scheme default, so ``http://h`` and ``http://h:80`` compare equal.
     """
-    if not origin:
-        return True
+    if not url:
+        return None
     try:
-        host = urlsplit(origin).hostname
+        parts = urlsplit(url)
     except ValueError:
-        return False
-    return host in _LOOPBACK_HOSTS
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(parts.scheme)
+    return (parts.scheme, parts.hostname, port)
+
+
+def is_same_origin(origin: str | None, expected: str | None) -> bool:
+    """True iff ``origin`` is same-origin with ``expected`` (FR-10.6).
+
+    Compares the full origin tuple — scheme, host, **and** port — of the browser's
+    Origin/Referer against the console's own request origin. A *missing* or
+    unparseable Origin/Referer fails closed: for an ambient cookie-authenticated
+    state-changing request the same-origin evidence is a required second factor
+    alongside the CSRF token, not optional defence-in-depth. So
+    ``http://127.0.0.1:9999`` no longer passes for a console on
+    ``http://127.0.0.1:8765``.
+    """
+    got = _origin_tuple(origin)
+    want = _origin_tuple(expected)
+    return got is not None and want is not None and got == want
 
 
 def authenticate(request, sessions: SessionStore) -> str:
@@ -153,7 +175,7 @@ def enforce_csrf(request, sessions: SessionStore) -> None:
     if not expected or not supplied or not hmac.compare_digest(supplied, expected):
         raise CsrfError("missing or invalid CSRF token (FR-10.6)")
     origin = request.headers.get("origin") or request.headers.get("referer")
-    if not is_same_origin(origin):
+    if not is_same_origin(origin, str(request.base_url)):
         raise CsrfError("cross-origin POST rejected (FR-10.6 same-origin)")
 
 

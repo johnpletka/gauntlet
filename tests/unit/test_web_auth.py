@@ -115,12 +115,25 @@ def test_cookie_post_without_csrf_is_rejected(client: TestClient):
 def test_cookie_post_with_session_csrf_passes_auth(client: TestClient):
     _login(client)
     csrf = _csrf_from(client.get("/").text)
-    # With the session CSRF header the request passes the auth/CSRF gate; with no
-    # supervisor configured the handler then returns 503 (not 401/403).
+    # With the session CSRF header AND a same-origin Origin the request passes the
+    # auth/CSRF gate; with no supervisor configured the handler returns 503.
+    resp = client.post(
+        "/api/runs",
+        json={"slug": "demo"},
+        headers={CSRF_HEADER: csrf, "Origin": "http://testserver"},
+    )
+    assert resp.status_code == 503
+
+
+def test_cookie_post_without_origin_is_rejected(client: TestClient):
+    # FR-10.6 fail-closed: a cookie POST that carries a valid CSRF token but no
+    # Origin/Referer (the same-origin second factor) is rejected, not accepted.
+    _login(client)
+    csrf = _csrf_from(client.get("/").text)
     resp = client.post(
         "/api/runs", json={"slug": "demo"}, headers={CSRF_HEADER: csrf}
     )
-    assert resp.status_code == 503
+    assert resp.status_code == 403
 
 
 def test_cross_origin_cookie_post_rejected(client: TestClient):
@@ -158,7 +171,9 @@ def test_logout_drops_session(client: TestClient):
     _login(client)
     csrf = _csrf_from(client.get("/").text)
     resp = client.post(
-        "/logout", headers={CSRF_HEADER: csrf}, follow_redirects=False
+        "/logout",
+        headers={CSRF_HEADER: csrf, "Origin": "http://testserver"},
+        follow_redirects=False,
     )
     assert resp.status_code == 303
     # After logout the cookie is cleared and pages bounce back to /login.
@@ -184,10 +199,20 @@ def test_safe_next_helper():
 
 
 def test_is_same_origin_helper():
-    assert is_same_origin(None) is True  # absent → CSRF token is the gate
-    assert is_same_origin("http://127.0.0.1:8765") is True
-    assert is_same_origin("http://localhost:8765") is True
-    assert is_same_origin("http://evil.example") is False
+    expected = "http://127.0.0.1:8765/"  # the console's own request origin
+    # Absent/unparseable origin now fails closed (required 2nd factor, FR-10.6).
+    assert is_same_origin(None, expected) is False
+    assert is_same_origin("", expected) is False
+    # Exact same-origin (scheme, host, port) passes — Origin or full Referer.
+    assert is_same_origin("http://127.0.0.1:8765", expected) is True
+    assert is_same_origin("http://127.0.0.1:8765/runs/demo", expected) is True
+    # A different port, host, or scheme is rejected (not just hostname-loopback).
+    assert is_same_origin("http://127.0.0.1:9999", expected) is False
+    assert is_same_origin("http://localhost:8765", expected) is False
+    assert is_same_origin("https://127.0.0.1:8765", expected) is False
+    assert is_same_origin("http://evil.example", expected) is False
+    # A console with no valid expected origin also fails closed.
+    assert is_same_origin("http://127.0.0.1:8765", None) is False
 
 
 def test_token_fingerprint_is_stable_and_non_reversible():

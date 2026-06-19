@@ -25,7 +25,6 @@ from gauntlet.web.registry import (
     build_record,
     console_log_path,
     is_reusable,
-    port_is_free,
     read_registry,
     remove_registry,
     write_registry,
@@ -97,22 +96,33 @@ def serve(
         base_url=f"http://{host}:{port}",
     )
 
-    # Console registry (FR-12.4): own the registry entry only if we will actually
-    # bind this port (the port is free, or any existing entry is not a live
-    # reusable console) — so a second serve against a port a *healthy* console
-    # already holds never clobbers that console's entry before failing to bind.
+    # Console registry (FR-12.4): a second `serve` (or one racing a `run --watch`
+    # console) must REUSE a live console rather than try to bind the port it
+    # already holds and crash. If a healthy reusable console is already
+    # registered, report its existing URL/login URL and exit cleanly — we never
+    # start a duplicate uvicorn on a port another console owns.
     existing = read_registry(run_root)
-    own_registry = port_is_free(host, port) or not is_reusable(existing)
-    if own_registry:
-        write_registry(
-            run_root,
-            build_record(
-                host=host,
-                port=port,
-                token=resolved_token,
-                log_path=console_log_path(run_root),
-            ),
-        )
+    if is_reusable(existing):
+        assert existing is not None  # narrowed by is_reusable
+        print(f"gauntlet console already listening on {existing.url}")
+        print("reusing it; this serve will not start a second console.")
+        # The login URL goes to stderr (token-free, FR-10.4); no token is printed
+        # because a reused console keeps its own — we only hold its fingerprint.
+        print(f"open {existing.url}/login", file=sys.stderr)
+        return
+
+    # No reusable console: own the registry entry and bind the port ourselves. A
+    # port held by an *unrelated* process (not a live gauntlet console) makes
+    # uvicorn.run fail closed below rather than silently picking another port.
+    write_registry(
+        run_root,
+        build_record(
+            host=host,
+            port=port,
+            token=resolved_token,
+            log_path=console_log_path(run_root),
+        ),
+    )
 
     print(f"gauntlet console listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")

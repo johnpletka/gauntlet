@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -302,10 +303,13 @@ def ensure_console(
             "port or pass a different --port (FR-12.4, fail-closed)"
         )
 
-    resolved_token = supplied
+    # Mint a token when neither an explicit token nor GAUNTLET_WEB_TOKEN exists,
+    # so the detached child uses *our* token (not one it generates privately) and
+    # the handle can surface it — otherwise the default `run --watch` flow prints
+    # /login but never the token needed to sign in (FR-12.1).
+    resolved_token = supplied or secrets.token_urlsafe(32)
     env = dict(os.environ)
-    if resolved_token:
-        env["GAUNTLET_WEB_TOKEN"] = resolved_token
+    env["GAUNTLET_WEB_TOKEN"] = resolved_token
 
     log_path = console_log_path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)

@@ -239,3 +239,62 @@ def test_ensure_console_boots_reuses_and_reclaims(tmp_path):
     finally:
         for pid in booted_pids:
             _kill_pgid(pid)
+
+
+@pytest.mark.skipif(
+    not __import__("shutil").which("git"), reason="git required to boot a console"
+)
+def test_ensure_console_mints_token_when_none_supplied(tmp_path, monkeypatch):
+    # The default `run --watch` flow passes no token and may have no
+    # GAUNTLET_WEB_TOKEN in env. ensure_console must then MINT a token, hand it to
+    # the detached child, and return it — otherwise the CLI prints /login but not
+    # the token needed to sign in (F-001).
+    from gauntlet.web.auth import token_fingerprint
+
+    monkeypatch.delenv("GAUNTLET_WEB_TOKEN", raising=False)
+    repo = _git_repo(tmp_path / "repo")
+    run_root = repo / "runs"
+    port = _free_port()
+    booted_pids: list[int] = []
+    try:
+        handle = ensure_console(
+            repo, run_root, host="127.0.0.1", port=port, token=None,
+            boot_timeout=20.0,
+        )
+        assert handle.reused is False
+        assert handle.pid is not None
+        booted_pids.append(handle.pid)
+        # A usable, non-empty token came back...
+        assert handle.token
+        # ...and it is the token the booted console actually authenticates with:
+        # the registry fingerprint matches it (the child used OUR token, not a
+        # private one it generated).
+        rec = read_registry(run_root)
+        assert rec is not None
+        assert rec.token_fingerprint == token_fingerprint(handle.token)
+    finally:
+        for pid in booted_pids:
+            _kill_pgid(pid)
+
+
+def test_serve_reuses_live_registered_console(tmp_path, monkeypatch, capsys):
+    # FR-12.4: a second `serve` against a port a live console already owns must
+    # REUSE it (report its URL and exit cleanly), not start a duplicate uvicorn
+    # that would fail to bind (F-002).
+    from gauntlet.web import runner
+
+    repo = _git_repo(tmp_path / "repo")
+    rec = _record(os.getpid(), port=4321)
+    monkeypatch.setattr(runner, "read_registry", lambda _run_root: rec)
+    monkeypatch.setattr(runner, "is_reusable", lambda _record: True)
+
+    def _no_bind(*_a, **_k):
+        raise AssertionError("serve must not start uvicorn when a console is reusable")
+
+    monkeypatch.setattr("uvicorn.run", _no_bind)
+
+    runner.serve(repo, host="127.0.0.1", port=8765)
+
+    out = capsys.readouterr()
+    assert rec.url in out.out  # reports the existing console URL on stdout
+    assert f"{rec.url}/login" in out.err  # and its token-free login URL on stderr
