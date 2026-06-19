@@ -621,14 +621,30 @@ class RunStore:
         already-validated ``slug``/``run_id``). An absent dir → empty list. The
         view is strictly read-only; control stays the CLI verb.
         """
-        from gauntlet.engine.proposals import list_proposals as _list_proposals
+        from gauntlet.engine.proposals import parse_proposal as _parse_proposal
 
         run_dir = self.run_dir(slug, run_id)
         proposals_dir = self._assert_within(
             run_dir / "retro" / "proposals", run_dir
         )
         out: list[dict] = []
-        for p in _list_proposals(proposals_dir):
+        if not proposals_dir.is_dir():
+            return out
+        # Proposal files are agent-authored, so the read must be contained
+        # (FR-10.1/F-003): `parse_proposal` does a bare `read_text()` that follows
+        # symlinks, so a symlinked `*.md` could otherwise render any server-
+        # readable file. Reject symlinks outright and re-assert each resolved path
+        # stays under the proposals dir before parsing — same posture as
+        # `read_step_artifact`. (Mirrors `engine.proposals.list_proposals`'s
+        # sorted-glob, with containment added.)
+        for path in sorted(proposals_dir.glob("*.md")):
+            if path.is_symlink():
+                continue
+            try:
+                self._assert_within(path, proposals_dir)
+            except UnsafePath:
+                continue
+            p = _parse_proposal(path)
             out.append(
                 {
                     "name": p.name,

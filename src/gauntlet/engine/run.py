@@ -30,7 +30,6 @@ from gauntlet.engine.validate import validate_pipeline
 from gauntlet.logging.redact import RedactingWriter, build_redactor
 from gauntlet.procident import (
     ProcessIdentity,
-    process_is_alive,
     read_process_identity,
 )
 
@@ -476,15 +475,38 @@ class RunManager:
 
     @staticmethod
     def _lock_is_live(rec: _LockRecord) -> bool:
-        """True iff the lock's pid is the original live process (FR-7.2).
+        """True unless the lock's holder is *proven* gone (FR-10.5).
 
-        PID-reuse-safe: `os.kill(pid, 0)` *and* an exact OS process-creation
-        identity match. A dead pid, a reused pid, or an unverifiable identity
-        (``proc_identity == null``, or unobtainable now) all read as not-live,
-        so the lock is reclaimable as stale.
+        A worktree lock must fail **closed**: reclaim only when we can prove the
+        holder is dead (`os.kill` → ``ProcessLookupError``) or has been replaced
+        by a different process (the recorded *and* a freshly-read identity are
+        both present and differ → PID reuse). An ``os.kill``-live pid whose
+        identity is *unverifiable* — recorded ``null`` at capture, or unreadable
+        now (a transient ``ps`` failure, or an unsupported platform) — is treated
+        as LIVE, so a possibly-running driver never has its lock stolen and two
+        orchestrators can never drive one worktree (review F-001).
+
+        This is the deliberate opposite of ``procident.process_is_alive``, which
+        fails closed the *other* way for re-attach (FR-7.2: unverifiable → treat
+        as orphaned → recover). For mutual exclusion, unverifiable must block.
         """
+        try:
+            os.kill(rec.pid, 0)
+        except ProcessLookupError:
+            return False  # proven dead → reclaimable as stale
+        except PermissionError:
+            pass  # exists (owned by another user) — the reuse check decides
+        except OSError:
+            return True  # cannot signal → do not assume gone; keep the lock
         recorded = ProcessIdentity.from_dict(rec.proc_identity)
-        return process_is_alive(rec.pid, recorded)
+        if recorded is None:
+            return True  # alive, identity unverifiable → cannot prove reuse
+        fresh = read_process_identity(rec.pid)
+        if fresh is None:
+            return True  # alive, fresh read failed → cannot prove reuse
+        # Both identities present: equal → same live process (block); differ →
+        # the pid was reused by a new process → the original is gone (reclaim).
+        return recorded.same_process(fresh)
 
     @staticmethod
     def _lock_busy_message(rec: _LockRecord) -> str:

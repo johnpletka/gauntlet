@@ -258,13 +258,31 @@ def test_pid_reused_lock_is_reclaimed(fixture_repo):
     assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
 
 
-def test_unverifiable_identity_lock_is_reclaimed(fixture_repo):
-    # proc_identity == null (unrecordable at capture) → unverifiable → fail
-    # closed to "not live" → reclaimable (FR-7.2).
+def test_unverifiable_identity_on_live_pid_blocks(fixture_repo):
+    # A lock held by a LIVE pid whose identity is unverifiable (proc_identity ==
+    # null at capture, or unreadable now) must FAIL CLOSED: the verb blocks
+    # rather than stealing a possibly-running driver's lock, so two orchestrators
+    # can never drive one worktree (review F-001, FR-10.5). This is the
+    # deliberate opposite of re-attach (FR-7.2), where unverifiable → recover.
+    # (Recovery from a genuinely wedged lock is the operator's `gauntlet abort`
+    # or removing `.driving.lock` — never an automatic steal of a live holder.)
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "demo")
     path = _pipeline(fixture_repo, GATED)
-    _write_lock(fixture_repo, pid=os.getpid(), identity=None)
+    _write_lock(fixture_repo, pid=os.getpid(), identity=None)  # live + unverifiable
+    with pytest.raises(WorktreeLockError, match="being driven by other"):
+        mgr.start("demo", path, use_judge=False)
+
+
+def test_unverifiable_identity_on_dead_pid_is_reclaimed(fixture_repo):
+    # Fail-closed must not deadlock: a DEAD holder whose identity is *also*
+    # unverifiable is still reclaimed — `os.kill` proves it gone before the
+    # identity check matters — so an unreadable identity never permanently
+    # wedges the worktree (review F-001).
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    _write_lock(fixture_repo, pid=2_000_000_000, identity=None)  # dead + unverifiable
     assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
 
 

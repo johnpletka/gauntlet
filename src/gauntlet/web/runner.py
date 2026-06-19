@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import socket
 import sys
 from pathlib import Path
 
@@ -123,9 +124,37 @@ def serve(
         print(f"open {existing.url}/login", file=sys.stderr)
         return
 
-    # No reusable console: own the registry entry and bind the port ourselves. A
-    # port held by an *unrelated* process (not a live gauntlet console) makes
-    # uvicorn.run fail closed below rather than silently picking another port.
+    # No reusable console: claim the port by binding it OURSELVES *before*
+    # writing the registry (review F-004). The OS bind is the real mutex — only
+    # one process can hold the listening socket — so a loser in a concurrent
+    # cold start fails the bind and returns WITHOUT ever writing (and so without
+    # later removing) a registry entry the winner owns. This guarantees the
+    # registry can only ever reflect the actual port owner.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError:
+        sock.close()
+        # The port was taken since our reuse check. A console that won a
+        # cold-start race is registered by now → reuse it; otherwise an
+        # *unrelated* process holds the port → fail closed. Either way we never
+        # touch a registry entry we do not own.
+        existing = read_registry(run_root)
+        if is_reusable(existing):
+            assert existing is not None
+            print(f"gauntlet console already listening on {existing.url}")
+            print("reusing it; this serve will not start a second console.")
+            print(f"open {existing.url}/login", file=sys.stderr)
+            return
+        raise SystemExit(
+            f"port {port} on {host} is already in use by another process; "
+            "stop it or pass a different --port."
+        )
+    sock.listen()
+    # We own the port: register now (the winner is immediately discoverable) and
+    # hand the already-bound socket to uvicorn, so there is no unbind/rebind
+    # window another starter could slip into.
     write_registry(
         run_root,
         build_record(
@@ -135,14 +164,13 @@ def serve(
             log_path=console_log_path(run_root),
         ),
     )
-
     print(f"gauntlet console listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
     # The login URL goes to stderr so it never contaminates the token line on
     # stdout that tooling/operators scrape. It is token-free (FR-10.4).
     print(f"open {login_url(host, port)}", file=sys.stderr)
     try:
-        uvicorn.run(app, host=host, port=port, log_level="warning")
+        uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[sock])
     finally:
         # Remove the registry entry only if it is still ours (defensive against a
         # racing console that re-registered on the same path), so a clean exit
@@ -150,6 +178,7 @@ def serve(
         rec = read_registry(run_root)
         if rec is not None and rec.pid == os.getpid():
             remove_registry(run_root)
+        sock.close()
 
 
 __all__ = [

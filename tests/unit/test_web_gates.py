@@ -26,6 +26,7 @@ from gauntlet.engine.manifest import (
     RUN_DONE,
     RUN_FAILED,
     RUN_PARKED,
+    RUN_RUNNING,
     CommitRecord,
     Manifest,
     PipelineRef,
@@ -661,3 +662,44 @@ def test_detail_page_renders_escalation_panel(fixture_repo):
     assert "data-resume" in html
     assert "data-approve" not in html and "data-reject" not in html
     assert "F-003" in html and "plan.md" in html  # escalated evidence + target
+
+
+# --------------------------------------------------------------------------- #
+# Abort control is gated on a non-terminal owned run (FR-5.3 / review F-005)
+# --------------------------------------------------------------------------- #
+class _OwnedSup(_FakeSup):
+    """A supervisor that owns and is attached to the run (live owned run)."""
+
+    def is_owned(self, s, r):
+        return True
+
+    def is_attached(self, s, r):
+        return True
+
+
+def test_abort_hidden_for_terminal_owned_run(tmp_path):
+    # A terminal run keeps its `.serve/job.json`, so it stays `owned`; but the
+    # supervisor refuses abort for done/failed/aborted. The UI must therefore NOT
+    # render the (meaningless) Abort control on it (FR-5.3, review F-005).
+    repo = tmp_path / "repo"
+    client = _client(repo, sup=_OwnedSup())
+    _write_run(
+        repo, "demo", "run-1",
+        _man("demo", "run-1", status=RUN_DONE, steps=[_step("s", "agent_task", "done")]),
+    )
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "data-abort" not in html
+    assert "Abort run" not in html
+
+
+def test_abort_shown_for_live_owned_run(tmp_path):
+    # The control IS offered for an owned, attached, *non-terminal* run.
+    repo = tmp_path / "repo"
+    client = _client(repo, sup=_OwnedSup())
+    _write_run(
+        repo, "demo", "run-1",
+        _man("demo", "run-1", status=RUN_RUNNING,
+             steps=[_step("s", "agent_task", "running")]),
+    )
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "data-abort" in html and "Abort run" in html

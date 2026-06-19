@@ -298,3 +298,29 @@ def test_serve_reuses_live_registered_console(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr()
     assert rec.url in out.out  # reports the existing console URL on stdout
     assert f"{rec.url}/login" in out.err  # and its token-free login URL on stderr
+
+
+def test_serve_fails_closed_on_taken_port_without_writing_registry(tmp_path, monkeypatch):
+    # A concurrent cold-start loser (or a serve against a port an *unrelated*
+    # process holds) must FAIL CLOSED without ever writing — and so without later
+    # removing — a registry entry the winner owns (review F-004). The OS bind is
+    # the mutex, performed *before* the registry write, so the loser never
+    # claims the registry it could otherwise clobber.
+    from gauntlet.web import runner
+
+    repo = _git_repo(tmp_path / "repo")
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen()
+    port = holder.getsockname()[1]
+    # No reusable console is registered; the port is held by something else.
+    monkeypatch.setattr(runner, "is_reusable", lambda _record: False)
+    wrote: list = []
+    monkeypatch.setattr(runner, "write_registry", lambda *a, **k: wrote.append(a))
+    try:
+        with pytest.raises(SystemExit):
+            runner.serve(repo, host="127.0.0.1", port=port)
+    finally:
+        holder.close()
+    assert wrote == []  # never claimed the registry → nothing to clobber/remove

@@ -87,6 +87,26 @@ def _store(repo: Path) -> RunStore:
     return RunStore(repo, RunConfig())
 
 
+def test_proposals_skips_symlinked_files(repo: Path):
+    # An agent-authored symlink in the proposals dir must NOT be followed out of
+    # containment (review F-003 / FR-10.1): `parse_proposal` does a bare
+    # `read_text()`, so a symlinked `*.md` could otherwise render any
+    # server-readable file in the console. The view rejects symlinks outright.
+    run_dir = _write_run(repo, "demo", "run-1")
+    _write_proposal(run_dir, 1, "legit-proposal")
+    secret = repo / "secret.txt"
+    secret.write_text("TOP SECRET — must never render in the console\n")
+    proposals_dir = run_dir / "retro" / "proposals"
+    (proposals_dir / "999-evil.md").symlink_to(secret)
+
+    props = _store(repo).proposals("demo", run_id="run-1")
+
+    assert [p["slug"] for p in props] == ["legit-proposal"]  # real one listed
+    assert all("evil" not in p["name"] for p in props)  # symlink skipped
+    blob = " ".join(p["rationale"] + p["diff"] for p in props)
+    assert "SECRET" not in blob  # the symlink target's content never surfaces
+
+
 # --------------------------------------------------------------------------- #
 # store method
 # --------------------------------------------------------------------------- #

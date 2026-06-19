@@ -27,6 +27,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from gauntlet.engine.manifest import RUN_ABORTED, RUN_DONE, RUN_FAILED
 from gauntlet.web.auth import COOKIE_NAME, SessionStore, safe_next
 from gauntlet.web.gate import GateResolver, NoPendingGate
 from gauntlet.web.intel import resume_intel
@@ -40,6 +41,10 @@ from gauntlet.web.store import (
 )
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+# Terminal run states: the supervisor refuses `abort` for these, so the UI must
+# not offer the Abort control on them (FR-5.3 — no meaningless controls; F-005).
+_TERMINAL_RUN_STATUSES = frozenset({RUN_DONE, RUN_ABORTED, RUN_FAILED})
 
 
 def _lock_context(store: RunStore) -> dict:
@@ -110,6 +115,12 @@ def _detail_context(store: RunStore, slug: str, run_id: str | None) -> dict:
         "gate": gate,
         "gate_error": gate_error,
         "n_proposals": n_proposals,
+        # FR-5.3 (F-005): a terminal run keeps its job.json so it stays `owned`,
+        # but the supervisor refuses abort for it — only offer Abort for an
+        # owned, attached, non-terminal run.
+        "can_abort": bool(
+            owned and attached and man.status not in _TERMINAL_RUN_STATUSES
+        ),
     }
     ctx.update(_lock_context(store))
     return ctx
@@ -133,7 +144,16 @@ def _step_detail_context(
     ``store.read_step_artifact`` (never an arbitrary path); it defaults to
     ``transcript.md`` when present so a step row lands on its transcript.
     """
-    detail = store.step_detail(slug, step, run_id)
+    # A foreach fan-out writes its artifacts under `steps/<id>.<iteration>` while
+    # the manifest record id stays `<id>` (review F-002). Resolve the real
+    # on-disk leaf so the drill-down opens the correct iteration's dir rather than
+    # a non-existent `steps/<id>`; a non-foreach step keeps its bare id. The
+    # iteration is validated as a safe segment before it is composed into the leaf.
+    leaf = step
+    if iteration is not None:
+        _safe_segment(iteration, kind="iteration")
+        leaf = f"{step}.{iteration}"
+    detail = store.step_detail(slug, leaf, run_id)
     man = store.manifest(slug, run_id)
     base = step.split(".")[0]
     records = [s for s in man.steps if s.id in (step, base)]
@@ -159,7 +179,7 @@ def _step_detail_context(
             _safe_segment(artifact, kind="artifact")
         try:
             content = store.read_step_artifact(
-                slug, step, selected, run_id=run_id
+                slug, leaf, selected, run_id=run_id
             )
         except RunNotFound as exc:
             content = None

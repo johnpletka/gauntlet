@@ -87,7 +87,10 @@ def _agent_step_run(repo: Path) -> Path:
         ],
         current="implement",
     )
-    step_dir = run_dir / "steps" / "implement"
+    # A foreach fan-out writes its artifacts under `steps/<id>.<iteration>` — the
+    # real engine layout — while the manifest record id stays `<id>` (review
+    # F-002). The earlier fixture wrongly used `steps/implement`, masking the bug.
+    step_dir = run_dir / "steps" / "implement.0"
     step_dir.mkdir(parents=True)
     (step_dir / "prompt.md").write_text("# Prompt\n\nbuild it please\n")
     (step_dir / "transcript.md").write_text(
@@ -111,7 +114,9 @@ def test_step_row_links_to_detail_page(client: TestClient, repo: Path):
 def test_transcript_renders_as_markdown_by_default(client: TestClient, repo: Path):
     _agent_step_run(repo)
     html = client.get(
-        "/runs/demo/steps/implement", headers=_auth(), params={"run_id": "run-1"}
+        "/runs/demo/steps/implement",
+        headers=_auth(),
+        params={"run_id": "run-1", "iteration": "0"},
     ).text
     # transcript.md is the default artifact and renders AS markdown, not raw text.
     assert '<div class="markdown">' in html
@@ -128,17 +133,50 @@ def test_select_prompt_and_events_artifacts(client: TestClient, repo: Path):
     prompt = client.get(
         "/runs/demo/steps/implement",
         headers=_auth(),
-        params={"run_id": "run-1", "artifact": "prompt.md"},
+        params={"run_id": "run-1", "iteration": "0", "artifact": "prompt.md"},
     ).text
     assert "build it please" in prompt and '<div class="markdown">' in prompt
     # events.jsonl → raw <pre> (not markdown).
     events = client.get(
         "/runs/demo/steps/implement",
         headers=_auth(),
-        params={"run_id": "run-1", "artifact": "events.jsonl"},
+        params={"run_id": "run-1", "iteration": "0", "artifact": "events.jsonl"},
     ).text
     assert '<pre class="artifact">' in events
     assert "&#34;event&#34;: &#34;start&#34;" in events or '"event": "start"' in events
+
+
+def test_drilldown_opens_the_requested_iteration(client: TestClient, repo: Path):
+    # The transcript for iteration N must come from `steps/<id>.<N>`, not a bare
+    # `steps/<id>` (review F-002). Two iterations with distinct transcripts prove
+    # the correct on-disk dir is opened per `?iteration=`.
+    run_dir = _write_run(
+        repo,
+        "demo",
+        "run-1",
+        [
+            StepRecord(
+                id="implement", type="agent_task", status="done",
+                agent="builder", iteration="0",
+            ),
+            StepRecord(
+                id="implement", type="agent_task", status="running",
+                agent="builder", iteration="2",
+            ),
+        ],
+        current="implement",
+    )
+    for it, marker in (("0", "FIRST iteration body"), ("2", "THIRD iteration body")):
+        d = run_dir / "steps" / f"implement.{it}"
+        d.mkdir(parents=True)
+        (d / "transcript.md").write_text(marker + "\n")
+    html = client.get(
+        "/runs/demo/steps/implement",
+        headers=_auth(),
+        params={"run_id": "run-1", "iteration": "2"},
+    ).text
+    assert "THIRD iteration body" in html
+    assert "FIRST iteration body" not in html
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +232,7 @@ def test_artifact_traversal_rejected_http(client: TestClient, repo: Path):
     resp = client.get(
         "/runs/demo/steps/implement",
         headers=_auth(),
-        params={"run_id": "run-1", "artifact": "../../manifest.json"},
+        params={"run_id": "run-1", "iteration": "0", "artifact": "../../manifest.json"},
     )
     # `..` segment → UnsafePath → 400.
     assert resp.status_code == 400
@@ -215,11 +253,12 @@ def test_read_step_artifact_rejects_non_artifact(repo: Path):
     store = _store(repo)
     # A name that is not one of the step's reported artifacts → RunNotFound (404),
     # so the page can only surface artifacts the read model already knows about.
+    # The store takes the on-disk leaf (`<id>.<iteration>` for a foreach step).
     with pytest.raises(RunNotFound):
-        store.read_step_artifact("demo", "implement", "manifest.json", run_id="run-1")
+        store.read_step_artifact("demo", "implement.0", "manifest.json", run_id="run-1")
     # A traversal segment → UnsafePath.
     with pytest.raises(UnsafePath):
-        store.read_step_artifact("demo", "implement", "../x", run_id="run-1")
+        store.read_step_artifact("demo", "implement.0", "../x", run_id="run-1")
 
 
 def test_unknown_step_404(client: TestClient, repo: Path):

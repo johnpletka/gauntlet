@@ -26,7 +26,7 @@
    run aborted via `gauntlet abort`. control.js confirms before POSTing and
    carries the session CSRF token (FR-10.6); the server requires `confirm: true`
    (FR-10.7). #}
-{% if owned %}
+{% if can_abort %}
 <section class="controls">
   <button data-abort data-slug="{{ slug }}">Abort run</button>
 </section>
