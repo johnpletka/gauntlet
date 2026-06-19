@@ -609,6 +609,42 @@ class RunStore:
                     break
         return out
 
+    # ---- improvement proposals (read-only view, FR-6.4 / §2.2) --------------
+    def proposals(self, slug: str, *, run_id: str | None = None) -> list[dict]:
+        """A run's improvement proposals, read-only (FR-6.4 / §2.2 "not an editor").
+
+        Reads from the **same** canonical source the CLI's ``gauntlet proposals
+        review`` uses — the per-proposal markdown files under
+        ``run_dir/retro/proposals/`` (parsed by ``engine.proposals``) — so the
+        console view and the CLI agree on what exists. The path is a fixed
+        constant under the contained run dir (no traversal surface beyond the
+        already-validated ``slug``/``run_id``). An absent dir → empty list. The
+        view is strictly read-only; control stays the CLI verb.
+        """
+        from gauntlet.engine.proposals import list_proposals as _list_proposals
+
+        run_dir = self.run_dir(slug, run_id)
+        proposals_dir = self._assert_within(
+            run_dir / "retro" / "proposals", run_dir
+        )
+        out: list[dict] = []
+        for p in _list_proposals(proposals_dir):
+            out.append(
+                {
+                    "name": p.name,
+                    "slug": p.slug,
+                    "status": p.status,
+                    "target_path": ", ".join(p.targets) if p.targets else "",
+                    "targets": list(p.targets),
+                    "rationale": p.rationale,
+                    "diff": p.diff,
+                    "valid": p.valid,
+                    "invalid_reason": p.invalid_reason,
+                    "source_run": p.source_run,
+                }
+            )
+        return out
+
     def read_step_artifact(
         self,
         slug: str,

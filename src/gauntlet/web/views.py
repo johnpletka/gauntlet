@@ -92,6 +92,13 @@ def _detail_context(store: RunStore, slug: str, run_id: str | None) -> dict:
             # posture as the /api/runs/{slug}/gate endpoint.
             gate = None
             gate_error = str(exc) or exc.__class__.__name__
+    # FR-6.4 read-only proposals link: shown when the run has any proposals on
+    # disk (the retrospective step generated some). Cheap directory glob; never a
+    # control surface — the link lands on a strictly read-only view.
+    try:
+        n_proposals = len(store.proposals(slug, run_id=run_id))
+    except (RunNotFound, UnsafePath, OSError):
+        n_proposals = 0
     ctx = {
         "slug": slug,
         "manifest": man,
@@ -102,6 +109,7 @@ def _detail_context(store: RunStore, slug: str, run_id: str | None) -> dict:
         "intel": intel,
         "gate": gate,
         "gate_error": gate_error,
+        "n_proposals": n_proposals,
     }
     ctx.update(_lock_context(store))
     return ctx
@@ -289,6 +297,27 @@ def register_views(
         ctx = _step_detail_context(store, slug, step, run_id, iteration, artifact)
         ctx["csrf_token"] = _csrf(request)
         return templates.TemplateResponse(request, "step_detail.html", ctx)
+
+    @app.get(
+        "/runs/{slug}/proposals", response_class=HTMLResponse, dependencies=[auth]
+    )
+    def proposals_page(
+        request: Request, slug: str, run_id: str | None = Query(default=None)
+    ) -> HTMLResponse:
+        # FR-6.4 / §2.2 "not an editor": a strictly READ-ONLY view of a run's
+        # improvement proposals (rationale + diff). No apply/reject/approve —
+        # control stays the `gauntlet proposals review` CLI verb.
+        proposals = store.proposals(slug, run_id=run_id)
+        return templates.TemplateResponse(
+            request,
+            "proposals.html",
+            {
+                "slug": slug,
+                "run_id": store.resolve_run_id(slug, run_id),
+                "proposals": proposals,
+                "csrf_token": _csrf(request),
+            },
+        )
 
     # ---- full-history browser + cost report (P7, FR-2.4) --------------------
     @app.get("/runs/{slug}/history", response_class=HTMLResponse, dependencies=[auth])
