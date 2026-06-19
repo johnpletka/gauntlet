@@ -499,6 +499,47 @@ def test_api_handoff_disabled_then_enabled(fixture_repo):
     assert "F-003" in body["prompt"] and body["invocation"].startswith("claude")
 
 
+def test_recovery_panel_hides_handoff_when_disabled(fixture_repo):
+    # FR-4.7 is opt-in: with the hand-off off, the recovery panel exposes no
+    # affordance and the endpoint refuses (404).
+    _escalation_run(fixture_repo)
+    client = _client(fixture_repo, handoff_enabled=False)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "data-handoff" not in html
+    assert "Open scoped analysis session" not in html
+    assert client.get(
+        "/api/runs/demo/handoff", headers={TOKEN_HEADER: TOKEN}
+    ).status_code == 404
+
+
+def test_recovery_panel_exposes_handoff_when_enabled(fixture_repo):
+    # Enabled: the parked panel shows the copy-pasteable affordance (a read-only
+    # textarea filled by control.js from the endpoint) and the endpoint serves
+    # the assembled prompt.
+    _escalation_run(fixture_repo)
+    client = _client(fixture_repo, handoff_enabled=True)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "data-handoff" in html
+    assert "data-handoff-text" in html and "readonly" in html
+    assert "Open scoped analysis session" in html
+    body = client.get(
+        "/api/runs/demo/handoff", headers={TOKEN_HEADER: TOKEN}
+    ).json()
+    assert "F-003" in body["prompt"]
+
+
+def test_handoff_affordance_absent_when_not_parked(fixture_repo):
+    # Even with the hand-off enabled, a done run (no gate/escalation) shows no
+    # affordance — there is no parked decision to analyse.
+    (fixture_repo / "runs").mkdir(exist_ok=True)
+    man = _man("demo", "run-1", status=RUN_DONE, current_step=None,
+               steps=[_step("b", "agent_task", "done")])
+    _write_run(fixture_repo, "demo", "run-1", man)
+    client = _client(fixture_repo, handoff_enabled=True)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "data-handoff" not in html
+
+
 def test_api_judge_audit(fixture_repo):
     run_dir = _gate_run_with_artifacts(fixture_repo)
     (run_dir / "judge-audit.jsonl").write_text(

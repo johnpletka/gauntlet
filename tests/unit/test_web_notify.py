@@ -386,6 +386,15 @@ def test_absent_web_block_uses_defaults():
     assert web.notify.slack is True
     assert web.notify.in_tab is True
     assert web.notify.slack_webhook is None
+    # FR-4.7 hand-off is opt-in: off unless turned on.
+    assert web.handoff is False
+
+
+def test_web_handoff_config_opts_in(tmp_path: Path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("asset_root: .\nweb:\n  handoff: true\n")
+    web = web_config_from(RunConfig.load(cfg_path))
+    assert web.handoff is True
 
 
 def test_malformed_web_block_fails_closed_at_console():

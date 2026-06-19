@@ -40,6 +40,11 @@ class WebConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     notify: WebNotifyConfig = Field(default_factory=WebNotifyConfig)
+    # FR-4.7 scoped-analysis hand-off. Off by default (opt-in): the console only
+    # assembles a copy-pasteable, read-only prompt — it spawns nothing and makes
+    # no model call (D8). Enabled here in the `web:` block or via `serve
+    # --enable-handoff`.
+    handoff: bool = False
 
 
 def web_config_from(config: object) -> WebConfig:

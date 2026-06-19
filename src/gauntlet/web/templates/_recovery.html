@@ -127,6 +127,20 @@
   <p><a href="/runs/{{ slug }}/diff?run_id={{ manifest.run_id }}">View phase diff →</a>
      · <a href="/runs/{{ slug }}/judge-audit?run_id={{ manifest.run_id }}">Judge audit →</a></p>
 
+  {# --- FR-4.7 scoped-analysis hand-off (opt-in). Only when enabled AND parked at
+        a gate/escalation. The console makes NO model call and spawns NOTHING — it
+        fetches the assembled prompt and shows it in a read-only, copy-pasteable
+        textarea (D8). control.js wires the button. #}
+  {% if handoff_enabled and intel.state in ("gate", "escalation") %}
+  <div class="handoff" data-handoff-slug="{{ slug }}" data-handoff-run="{{ manifest.run_id }}">
+    <button type="button" data-handoff>Open scoped analysis session</button>
+    <p class="muted">Assembles a read-only, copy-pasteable prompt for a separate
+      analysis session. The console runs nothing (FR-4.7/D8).</p>
+    <textarea data-handoff-text rows="14" readonly hidden
+      placeholder="The assembled scoped-analysis prompt will appear here."></textarea>
+  </div>
+  {% endif %}
+
   {# --- control forms: only the verbs resume_intel permits (FR-5.3), and never
         when gate evidence failed to assemble (review F-001, fail closed). --- #}
   {% if not external and not gate_error %}

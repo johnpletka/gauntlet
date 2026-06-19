@@ -100,4 +100,42 @@
       .then(function () { location.reload(); })
       .catch(function (err) { window.alert(verb + " failed: " + err.message); });
   });
+
+  // FR-4.7 scoped-analysis hand-off (opt-in). A read-only GET: fetch the
+  // assembled prompt and drop it into the textarea for copy-paste into a
+  // separate analysis session. The console makes NO model call and spawns
+  // NOTHING (D8) — this just shows the text. Delegated so it survives a
+  // live.js detail-region swap.
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("[data-handoff]");
+    if (!btn) return;
+    e.preventDefault();
+    var box = btn.closest("[data-handoff-slug]");
+    if (!box) return;
+    var slug = box.getAttribute("data-handoff-slug");
+    var runId = box.getAttribute("data-handoff-run") || "";
+    var ta = box.querySelector("[data-handoff-text]");
+    var url = "/api/runs/" + encodeURIComponent(slug) + "/handoff";
+    if (runId) url += "?run_id=" + encodeURIComponent(runId);
+    btn.disabled = true;
+    fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" } })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (data) {
+          if (r.status < 200 || r.status >= 300) {
+            throw new Error(data.detail || ("HTTP " + r.status));
+          }
+          return data;
+        });
+      })
+      .then(function (data) {
+        if (ta) {
+          ta.value = data.prompt || "";
+          ta.hidden = false;
+          ta.focus();
+          ta.select();
+        }
+      })
+      .catch(function (err) { window.alert("Hand-off unavailable: " + err.message); })
+      .then(function () { btn.disabled = false; });
+  });
 })();

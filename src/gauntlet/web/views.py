@@ -266,6 +266,7 @@ def register_views(
     ) -> HTMLResponse:
         ctx = _detail_context(store, slug, run_id)
         ctx["csrf_token"] = _csrf(request)
+        ctx["handoff_enabled"] = bool(getattr(app.state, "handoff_enabled", False))
         return templates.TemplateResponse(request, "run_detail.html", ctx)
 
     @app.get(
@@ -366,6 +367,7 @@ def register_views(
         request: Request, slug: str, run_id: str | None = Query(default=None)
     ) -> HTMLResponse:
         ctx = _detail_context(store, slug, run_id)
+        ctx["handoff_enabled"] = bool(getattr(app.state, "handoff_enabled", False))
         return templates.TemplateResponse(request, "_run_detail_body.html", ctx)
 
 

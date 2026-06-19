@@ -70,6 +70,7 @@ def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     token: str | None = None,
+    enable_handoff: bool | None = None,
 ) -> None:  # pragma: no cover - exercised via the live contract suite
     import uvicorn
 
@@ -85,6 +86,16 @@ def serve(
     supervisor = JobSupervisor(repo_root)
     store = RunStore.from_repo(repo_root, supervisor=supervisor)
     run_root = store.run_root_dir
+    # FR-4.7 hand-off is opt-in: a `serve --enable-handoff` flag overrides the
+    # `web.handoff` config key (default off). The console only assembles a
+    # read-only prompt; it spawns nothing (D8).
+    from gauntlet.web.config import web_config_from
+
+    handoff_enabled = (
+        enable_handoff
+        if enable_handoff is not None
+        else web_config_from(store.config).handoff
+    )
     # Enable notifications (FR-9) for a real serve, with a deep-link base so the
     # desktop/Slack messages carry an absolute URL to /runs/<slug>. The configured
     # channels (web.notify) are wired off the watcher's event bus, fail-soft.
@@ -92,6 +103,7 @@ def serve(
         store,
         token=resolved_token,
         supervisor=supervisor,
+        handoff_enabled=handoff_enabled,
         notifications=True,
         base_url=f"http://{host}:{port}",
     )

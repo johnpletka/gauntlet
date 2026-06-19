@@ -371,6 +371,14 @@ def rollback(
 def serve(
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8765, help="Bind port."),
+    enable_handoff: bool = typer.Option(
+        False,
+        "--enable-handoff",
+        help="Enable the FR-4.7 scoped-analysis hand-off (opt-in; off by "
+        "default). The console only assembles a copy-pasteable, read-only "
+        "prompt — it spawns nothing and makes no model call. Overrides the "
+        "`web.handoff` config key.",
+    ),
 ) -> None:
     """Run the local supervisory console over loopback (FR-11.1).
 
@@ -381,7 +389,14 @@ def serve(
     """
     from gauntlet.web.runner import serve as serve_console
 
-    serve_console(Path.cwd(), host=host, port=port)
+    # Only pass the flag through when explicitly set, so an unset CLI flag falls
+    # back to the `web.handoff` config key rather than forcing it off.
+    serve_console(
+        Path.cwd(),
+        host=host,
+        port=port,
+        enable_handoff=True if enable_handoff else None,
+    )
 
 
 @judge_app.command("serve")
