@@ -124,13 +124,13 @@
     {% endfor %}
   {% endif %}
 
-  <p><a href="/runs/{{ slug }}/diff?run_id={{ manifest.run_id }}{% if token %}&token={{ token }}{% endif %}">View phase diff →</a>
-     · <a href="/runs/{{ slug }}/judge-audit?run_id={{ manifest.run_id }}{% if token %}&token={{ token }}{% endif %}">Judge audit →</a></p>
+  <p><a href="/runs/{{ slug }}/diff?run_id={{ manifest.run_id }}">View phase diff →</a>
+     · <a href="/runs/{{ slug }}/judge-audit?run_id={{ manifest.run_id }}">Judge audit →</a></p>
 
   {# --- control forms: only the verbs resume_intel permits (FR-5.3), and never
         when gate evidence failed to assemble (review F-001, fail closed). --- #}
   {% if not external and not gate_error %}
-  <div class="controls control-forms" data-token="{{ token }}" data-slug="{{ slug }}">
+  <div class="controls control-forms" data-slug="{{ slug }}">
     {% if "approve" in controls %}
       <form data-approve>
         <input type="text" name="notes" placeholder="approval notes (optional)">

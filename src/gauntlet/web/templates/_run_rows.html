@@ -3,7 +3,7 @@
    P3 adds the real owned/observed/external badge (FR-1.4/FR-10.5). #}
 {% for r in rows %}
     <tr>
-      <td><a href="/runs/{{ r.slug }}{% if token %}?token={{ token }}{% endif %}">{{ r.slug }}</a></td>
+      <td><a href="/runs/{{ r.slug }}">{{ r.slug }}</a></td>
       <td>
         {% if r.external %}
           <span class="status status-running">running (external)</span>

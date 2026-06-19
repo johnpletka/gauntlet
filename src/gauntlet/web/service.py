@@ -15,15 +15,25 @@ updates yet (P2), no control verbs (P3+), no gate resolution (P5).
 from __future__ import annotations
 
 import contextlib
-import hmac
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+from gauntlet.web.auth import (
+    AUTH_COOKIE,
+    CsrfError,
+    LoginRequired,
+    SessionStore,
+    Unauthenticated,
+    authenticate,
+    enforce_csrf,
+)
+from gauntlet.web.auth import TOKEN_HEADER as TOKEN_HEADER  # re-export (tests/API)
 from gauntlet.web.config import web_config_from
 from gauntlet.web.gate import GateResolver, NoPendingGate, handoff_prompt
 from gauntlet.web.intel import resume_intel
@@ -35,30 +45,55 @@ from gauntlet.web.views import register_views
 from gauntlet.web.watcher import Watcher
 
 TOKEN_ENV_VAR = "GAUNTLET_WEB_TOKEN"
-TOKEN_HEADER = "X-Gauntlet-Token"
-TOKEN_QUERY = "token"
 
 _WEB_DIR = Path(__file__).resolve().parent
 STATIC_DIR = _WEB_DIR / "static"
 
+# Path prefixes whose unauthenticated requests get a 401 (API / SSE / partials,
+# all called by code), vs. browser page navigations that get a /login redirect.
+_API_PREFIXES = ("/api", "/events", "/partials", "/static", "/healthz")
 
-def _token_dependency(token: str):
-    """Build the per-app auth dependency (constant-time, header-or-query).
 
-    Mirrors the judge's foreign-caller rejection (constant-time
-    :func:`hmac.compare_digest`). Accepts the token from the ``X-Gauntlet-Token``
-    header (API-client parity with the judge) or the ``?token=`` query param (so
-    a browser can carry it in a link) — the P1 bootstrap delivery only; P7
-    replaces the query path with the ``/login`` cookie exchange.
+def _wants_login_redirect(request: Request) -> bool:
+    """A browser page GET (not an API/SSE/partial fetch) → redirect to /login.
+
+    An unauthenticated **page** navigation should land on the login form, not a
+    bare 401; an unauthenticated API/SSE/partial call (always issued by code that
+    can read a status) gets 401 so it fails closed loudly.
+    """
+    if request.method not in ("GET", "HEAD"):
+        return False
+    return not request.url.path.startswith(_API_PREFIXES)
+
+
+def _make_auth_dependency(sessions: SessionStore):
+    """Build the per-app auth + CSRF dependency (FR-10.4/10.6).
+
+    Authenticates a request by login-session **cookie** (browser) or
+    ``X-Gauntlet-Token`` **header** (API parity); the ``?token=`` query path of
+    P1–P6 is gone (the token must never ride in a URL, FR-10.4). On a
+    cookie-authenticated state-changing request it additionally enforces the
+    session-bound CSRF token + same-origin (FR-10.6); header-authenticated POSTs
+    are CSRF-exempt (header auth is not ambient and cannot be forged cross-site).
     """
 
-    def check(
-        x_gauntlet_token: str | None = Header(default=None, alias=TOKEN_HEADER),
-        token_q: str | None = Query(default=None, alias=TOKEN_QUERY),
-    ) -> None:
-        supplied = x_gauntlet_token or token_q
-        if not supplied or not hmac.compare_digest(supplied, token):
-            raise HTTPException(status_code=401, detail="bad or missing web token")
+    def check(request: Request) -> None:
+        try:
+            source = authenticate(request, sessions)
+        except Unauthenticated as exc:
+            if _wants_login_redirect(request):
+                nxt = request.url.path
+                if request.url.query:
+                    nxt = f"{nxt}?{request.url.query}"
+                raise LoginRequired(nxt) from exc
+            raise HTTPException(
+                status_code=401, detail="bad or missing web token"
+            ) from exc
+        if request.method not in ("GET", "HEAD", "OPTIONS") and source == AUTH_COOKIE:
+            try:
+                enforce_csrf(request, sessions)
+            except CsrfError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     return check
 
@@ -165,9 +200,22 @@ def create_app(
     app.state.watcher = watcher
     app.state.supervisor = supervisor
     app.state.handoff_enabled = handoff_enabled
+    # Per-serve login sessions + CSRF tokens (P7, FR-10.4/10.6). In-memory: the
+    # console holds no durable auth state — a restart invalidates cookies and the
+    # operator logs in again (fail-closed, like a fresh token).
+    sessions = SessionStore(token)
+    app.state.sessions = sessions
     gates = GateResolver(store)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-    auth = Depends(_token_dependency(token))
+    auth = Depends(_make_auth_dependency(sessions))
+
+    # A browser GET with no valid cookie is bounced to the login form (FR-10.4),
+    # preserving where it was headed via ?next= so login returns it there.
+    @app.exception_handler(LoginRequired)
+    async def _login_required(_request: Request, exc: LoginRequired) -> RedirectResponse:
+        return RedirectResponse(
+            f"/login?next={quote(exc.next_path, safe='')}", status_code=303
+        )
 
     # Fail-closed error mapping: a bad path segment is a 400 (the caller asked
     # for something unsafe), a missing run/slug/step is a 404.
@@ -211,8 +259,18 @@ def create_app(
 
     # ---- JSON read API (§6) -------------------------------------------------
     @app.get("/api/runs", dependencies=[auth])
-    def api_runs() -> list[dict]:
-        return [r.model_dump() for r in store.list_rows()]
+    def api_runs(
+        status: str | None = Query(default=None),
+        slug: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        sort: str | None = Query(default=None),
+    ) -> list[dict]:
+        # FR-1.2: status filter, slug/free-text search, and sort, applied in the
+        # read model so the JSON API and the rendered page agree.
+        return [
+            r.model_dump()
+            for r in store.list_rows(status=status, slug=slug, q=q, sort=sort)
+        ]
 
     @app.get("/api/runs/{slug}", dependencies=[auth])
     def api_run(slug: str, run_id: str | None = Query(default=None)) -> dict:
@@ -303,6 +361,17 @@ def create_app(
     @app.get("/api/runs/{slug}/judge-audit", dependencies=[auth])
     def api_judge_audit(slug: str, run_id: str | None = Query(default=None)) -> dict:
         return {"slug": slug, "entries": store.judge_audit(slug, run_id=run_id)}
+
+    @app.get("/api/runs/{slug}/history", dependencies=[auth])
+    def api_history(slug: str) -> dict:
+        # Full-history browser (FR-2.4): every run-<ts> dir of the slug, newest
+        # first, so a past run is addressable read-only via ?run_id=.
+        return {"slug": slug, "runs": store.run_history(slug)}
+
+    @app.get("/api/runs/{slug}/report", dependencies=[auth])
+    def api_report(slug: str, run_id: str | None = Query(default=None)) -> dict:
+        # Cost breakdown (FR-2.4/§6) — the same text `gauntlet report` prints.
+        return {"slug": slug, "report": store.report_text(slug, run_id=run_id)}
 
     @app.get("/api/runs/{slug}/handoff", dependencies=[auth])
     def api_handoff(slug: str, run_id: str | None = Query(default=None)) -> dict:
@@ -441,10 +510,10 @@ def create_app(
             gen, media_type="text/event-stream", headers=SSE_HEADERS
         )
 
-    # ---- server-rendered pages + live partials (FR-1/FR-2/FR-8) -------------
-    register_views(app, store, auth)
+    # ---- server-rendered pages + live partials + /login (FR-1/FR-2/FR-8/10.4)
+    register_views(app, store, auth, sessions)
 
     return app
 
 
-__all__ = ["create_app", "TOKEN_ENV_VAR", "TOKEN_HEADER", "TOKEN_QUERY"]
+__all__ = ["create_app", "TOKEN_ENV_VAR", "TOKEN_HEADER"]

@@ -15,7 +15,7 @@
 
 {# Launch a new run as a console-owned subprocess (FR-6.1). Disabled while the
    worktree lock is held (FR-10.5). control.js POSTs to /api/runs. #}
-<form class="launch" data-launch data-token="{{ token }}">
+<form class="launch" data-launch>
   <input type="text" name="slug" placeholder="slug" required {% if locked %}disabled{% endif %}>
   <input type="text" name="pipeline" placeholder="pipeline (optional)" {% if locked %}disabled{% endif %}>
   <label class="muted">
@@ -23,6 +23,25 @@
     --no-judge <span class="warn">(unsafe; testing only)</span>
   </label>
   <button type="submit" {% if locked %}disabled{% endif %}>Launch run</button>
+</form>
+
+{# FR-1.2: search / status filter / sort. A plain GET form so it works without
+   JS; the server applies the same filters to the JSON API and this page. #}
+<form class="filters" method="get" action="/">
+  <input type="search" name="q" value="{{ filter_q }}" placeholder="search slug or branch">
+  <select name="status">
+    <option value="">all statuses</option>
+    {% for s in ["running", "parked", "failed", "done", "aborted"] %}
+    <option value="{{ s }}" {% if filter_status == s %}selected{% endif %}>{{ s }}</option>
+    {% endfor %}
+  </select>
+  <select name="sort">
+    <option value="" {% if not filter_sort %}selected{% endif %}>latest</option>
+    <option value="slug" {% if filter_sort == "slug" %}selected{% endif %}>slug</option>
+    <option value="status" {% if filter_sort == "status" %}selected{% endif %}>status</option>
+  </select>
+  <button type="submit">Filter</button>
+  {% if filter_q or filter_status or filter_sort %}<a class="muted" href="/">clear</a>{% endif %}
 </form>
 
 {# The list is always rendered (live.js swaps the tbody on each SSE tick, so an
@@ -34,9 +53,10 @@
       <th>Steps</th><th>Updated</th><th>Source</th>
     </tr>
   </thead>
-  <tbody id="run-rows" data-live-src="/partials/runs{% if token %}?token={{ token }}{% endif %}">
+  <tbody id="run-rows" data-live-src="/partials/runs{{ live_query | default('') }}">
     {% include "_run_rows.html" %}
   </tbody>
 </table>
+{% if not rows %}<p class="muted empty">No runs match.</p>{% endif %}
 <script src="/static/control.js" defer></script>
 {% endblock %}

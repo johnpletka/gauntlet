@@ -486,8 +486,23 @@ class RunStore:
             updated=_mtime_iso(manifest_path),
         )
 
-    def list_rows(self) -> list[RunRow]:
-        """One row per slug (its latest/active run), most-recently-updated first."""
+    def list_rows(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        slug: str | None = None,
+        sort: str | None = None,
+    ) -> list[RunRow]:
+        """Run-list rows, filtered/sorted per the §6 query contract (FR-1.2).
+
+        One row per slug (its latest/active run). ``status`` keeps only that run
+        status; ``slug`` is a case-insensitive substring on the slug; ``q`` is a
+        free-text substring over slug **and** branch. ``sort`` is ``slug`` /
+        ``status`` (else most-recently-updated first). Filtering happens in the
+        read model, not the UI, so the JSON API and the server-rendered page
+        agree.
+        """
         # Reap finished console children before computing liveness so a
         # completed owned run is never shown as still live/attached via an
         # unreaped zombie's PID-liveness (review F-004). Read-only stores (no
@@ -497,10 +512,61 @@ class RunStore:
             reap()
         lock = self.worktree_lock()
         rows = [
-            r for slug in self.slugs() if (r := self._row_for(slug, lock)) is not None
+            r for s in self.slugs() if (r := self._row_for(s, lock)) is not None
         ]
-        rows.sort(key=lambda r: (r.updated or "", r.slug), reverse=True)
-        return rows
+        return _filter_sort_rows(rows, status=status, q=q, slug=slug, sort=sort)
+
+    # ---- full-history browser (FR-2.4) --------------------------------------
+    def run_history(self, slug: str) -> list[dict]:
+        """Every run of ``slug`` (newest first) for the history browser (FR-2.4).
+
+        One entry per ``run-<timestamp>`` dir with a readable manifest:
+        ``{run_id, status, current_step, started, ended, updated}``. A run with
+        an unreadable manifest is skipped rather than failing the whole list
+        (surface what parses). The active run id (``active-run.txt``) is flagged
+        so the UI can mark "latest/active". This is what makes a completed or
+        failed PRD run reviewable long after it finished.
+        """
+        slug_dir = self._slug_dir(slug)
+        try:
+            active = self._resolve_run_id(slug, None)
+        except RunNotFound:
+            return []
+        out: list[dict] = []
+        for rid in self._run_dirs(slug_dir):
+            manifest_path = slug_dir / rid / "manifest.json"
+            try:
+                man = Manifest.load(manifest_path)
+            except (OSError, ValueError):
+                continue
+            started, ended = _started_ended(man)
+            cur = _current_record(man)
+            out.append(
+                {
+                    "run_id": rid,
+                    "status": man.status,
+                    "current_step": man.current_step,
+                    "current_step_status": cur.status if cur else None,
+                    "started": started,
+                    "ended": ended,
+                    "updated": _mtime_iso(manifest_path),
+                    "active": rid == active,
+                }
+            )
+        out.sort(key=lambda e: e["run_id"], reverse=True)
+        return out
+
+    # ---- cost report (FR-2.4 / §6) ------------------------------------------
+    def report_text(self, slug: str, *, run_id: str | None = None) -> str:
+        """Render the per-step/per-agent cost breakdown for a run (§6 report).
+
+        Reuses the existing engine report renderer over the same manifest the
+        ``gauntlet report`` CLI prints, so the console's cost view and the CLI
+        agree byte-for-byte.
+        """
+        from gauntlet.engine.report import render_report
+
+        return render_report(self.manifest(slug, run_id))
 
     # ---- detail view (FR-2.1) ------------------------------------------------
     def manifest(self, slug: str, run_id: str | None = None) -> Manifest:
@@ -584,6 +650,38 @@ class RunStore:
             artifacts=artifacts,
             rounds=rounds,
         )
+
+
+def _filter_sort_rows(
+    rows: list[RunRow],
+    *,
+    status: str | None,
+    q: str | None,
+    slug: str | None,
+    sort: str | None,
+) -> list[RunRow]:
+    """Apply the §6 list filters + sort (FR-1.2). Pure over the row list."""
+    if status:
+        want = status.strip().lower()
+        rows = [r for r in rows if r.status.lower() == want]
+    if slug:
+        needle = slug.strip().lower()
+        rows = [r for r in rows if needle in r.slug.lower()]
+    if q:
+        needle = q.strip().lower()
+        rows = [
+            r
+            for r in rows
+            if needle in r.slug.lower() or needle in (r.branch or "").lower()
+        ]
+    key = (sort or "").strip().lower()
+    if key == "slug":
+        rows.sort(key=lambda r: r.slug)
+    elif key == "status":
+        rows.sort(key=lambda r: (r.status, r.updated or ""), reverse=False)
+    else:  # default: most-recently-updated first
+        rows.sort(key=lambda r: (r.updated or "", r.slug), reverse=True)
+    return rows
 
 
 def _read_chunk(path: Path, name: str, offset: int, max_bytes: int) -> LogChunk:

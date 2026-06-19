@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ slug }} cost report · Gauntlet Console{% endblock %}
+{% block body %}
+<p><a href="/runs/{{ slug }}">← {{ slug }}</a></p>
+<h1>Cost report — {{ slug }}</h1>
+{# FR-2.4/§6: the same per-step / per-agent breakdown `gauntlet report` prints,
+   rendered verbatim so the console and CLI agree. #}
+<pre class="artifact">{{ report }}</pre>
+{% endblock %}

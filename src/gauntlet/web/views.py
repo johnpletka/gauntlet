@@ -1,29 +1,33 @@
-"""Server-rendered console pages + live partials (P1/P2, FR-1/FR-2/FR-8).
+"""Server-rendered console pages + live partials (P1/P2/P5/P7, FR-1/FR-2/FR-8).
 
 Jinja + a single vendored stylesheet and a tiny vendored SSE client — no SPA, no
-build step (D5). P1 rendered the run list and run detail statically; P2 makes
-them *live*: a small ``static/live.js`` opens an ``EventSource`` to ``/events``
-and, on each transition, re-fetches the page's live region from a **partial**
-route (``/partials/runs`` for the list, ``/partials/runs/{slug}`` for the detail
-body) and swaps its ``innerHTML``. The partials render the exact same fragments
-the full pages embed, so a live swap and a fresh load are identical.
+build step (D5). P1 rendered the run list and run detail; P2 made them *live* (a
+small ``static/live.js`` opens an ``EventSource`` to ``/events`` and re-fetches
+each ``[data-live-src]`` region on a transition); P5 added the gate/recovery
+panel and the diff/judge-audit pages; P7 adds the durable auth surface (the
+``/login`` token exchange + the session CSRF token surfaced via a ``<meta>`` tag)
+and the full-history browser, cost report, and list search/sort/filter.
 
-(The PRD names HTMX for this; it is realized here as an equivalent ~30-line
-vendored vanilla SSE→fetch shim because the offline build sandbox cannot fetch
-the htmx bytes and fabricating a minified library is not acceptable. The
-functional outcome — declarative live partial swaps over SSE, no build step,
-zero new heavy deps — is identical and, on the M5 dependency budget, strictly
-leaner.)
+After P7 the page links carry **no token** — the browser authenticates by the
+``HttpOnly`` login cookie (FR-10.4), so a bare ``/runs/<slug>`` link suffices and
+the SSE handshake URL is token-free. State-changing fetches carry the
+session-bound CSRF token from the ``<meta name="csrf-token">`` tag (FR-10.6).
+
+(The PRD names HTMX for the live mechanism; it is realized as an equivalent
+~30-line vendored vanilla SSE→fetch shim — DEV-1, ratified — with identical
+behaviour and zero fetched dependency.)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from gauntlet.web.auth import COOKIE_NAME, SessionStore, safe_next
 from gauntlet.web.gate import GateResolver, NoPendingGate
 from gauntlet.web.intel import resume_intel
 from gauntlet.web.markdown import render_markdown
@@ -43,9 +47,7 @@ def _lock_context(store: RunStore) -> dict:
     return {"locked": lock is not None, "lock": lock}
 
 
-def _detail_context(
-    store: RunStore, slug: str, run_id: str | None, token: str | None
-) -> dict:
+def _detail_context(store: RunStore, slug: str, run_id: str | None) -> dict:
     """Shared context for the full detail page and its live partial."""
     man = store.manifest(slug, run_id)
     steps = [
@@ -88,7 +90,6 @@ def _detail_context(
         "slug": slug,
         "manifest": man,
         "steps": steps,
-        "token": token or "",
         "owned": owned,
         "attached": attached,
         "external": external,
@@ -100,29 +101,122 @@ def _detail_context(
     return ctx
 
 
-def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
-    """Register the run-list/run-detail HTML routes and their live partials."""
+def register_views(
+    app: FastAPI, store: RunStore, auth: Depends, sessions: SessionStore
+) -> None:
+    """Register the run-list/run-detail HTML routes, live partials, and /login."""
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     # FR-4.3: gate `show:` markdown artifacts render *as markdown* (safe, no dep).
     templates.env.filters["markdown"] = render_markdown
 
+    def _csrf(request: Request) -> str:
+        """The current session's CSRF token (empty for a header/no-cookie call).
+
+        Surfaced into the page `<meta>` so the live-update fetch shim can attach
+        it as ``X-CSRF-Token`` on cookie-authenticated POSTs (FR-10.6).
+        """
+        return sessions.session_csrf(request.cookies.get(COOKIE_NAME)) or ""
+
+    # ---- /login token exchange (FR-10.4) — the only auth'd-page exception ----
+    @app.get("/login", response_class=HTMLResponse)
+    def login_form(request: Request, next: str = Query(default="/")) -> HTMLResponse:
+        # Unauthenticated (the login exchange itself). The token is pasted into a
+        # POST form — never carried in a URL/query/history (FR-10.4). `next` is a
+        # local path we return to after login.
+        return templates.TemplateResponse(
+            request, "login.html", {"next": safe_next(next), "error": None}
+        )
+
+    @app.post("/login")
+    async def login(request: Request):
+        # Parse the urlencoded form body with stdlib (no python-multipart dep, so
+        # the M5 zero-new-deps budget holds). On a constant-time token match, mint
+        # a fresh session + CSRF (rotated per login) and set the HttpOnly cookie.
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        fields = parse_qs(raw, keep_blank_values=True)
+        supplied = (fields.get("token") or [""])[0]
+        nxt = safe_next((fields.get("next") or ["/"])[0])
+        if not sessions.verify_token(supplied):
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                {"next": nxt, "error": "Invalid token."},
+                status_code=401,
+            )
+        sid, _csrf_token = sessions.create_session()
+        resp = RedirectResponse(nxt, status_code=303)
+        # HttpOnly (no JS access) + SameSite=Strict (defence-in-depth on top of
+        # the CSRF token) + host-only Path=/; Secure omitted for loopback http.
+        resp.set_cookie(
+            COOKIE_NAME, sid, httponly=True, samesite="strict", path="/"
+        )
+        return resp
+
+    @app.post("/logout")
+    def logout(request: Request, _auth=auth):
+        # Drop the server-side session and clear the cookie. Guarded by `auth`
+        # (so it carries CSRF like any cookie POST); idempotent.
+        sessions.drop_session(request.cookies.get(COOKIE_NAME))
+        resp = RedirectResponse("/login", status_code=303)
+        resp.delete_cookie(COOKIE_NAME, path="/")
+        return resp
+
     @app.get("/", response_class=HTMLResponse, dependencies=[auth])
     def run_list(
-        request: Request, token: str | None = Query(default=None)
+        request: Request,
+        status: str | None = Query(default=None),
+        slug: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        sort: str | None = Query(default=None),
     ) -> HTMLResponse:
-        ctx = {"rows": store.list_rows(), "token": token or ""}
+        # FR-1.2: the same filters/sort as /api/runs, so the page and API agree.
+        rows = store.list_rows(status=status, slug=slug, q=q, sort=sort)
+        # Carry the active filter onto the live-partial fetch so an SSE swap keeps
+        # the same view (live.js re-fetches /partials/runs<live_query>).
+        params = {k: v for k, v in
+                  (("status", status), ("slug", slug), ("q", q), ("sort", sort)) if v}
+        live_query = ("?" + urlencode(params)) if params else ""
+        ctx = {
+            "rows": rows,
+            "csrf_token": _csrf(request),
+            "filter_status": status or "",
+            "filter_q": q or "",
+            "filter_sort": sort or "",
+            "live_query": live_query,
+        }
         ctx.update(_lock_context(store))
         return templates.TemplateResponse(request, "run_list.html", ctx)
 
     @app.get("/runs/{slug}", response_class=HTMLResponse, dependencies=[auth])
     def run_detail(
-        request: Request,
-        slug: str,
-        run_id: str | None = Query(default=None),
-        token: str | None = Query(default=None),
+        request: Request, slug: str, run_id: str | None = Query(default=None)
     ) -> HTMLResponse:
-        ctx = _detail_context(store, slug, run_id, token)
+        ctx = _detail_context(store, slug, run_id)
+        ctx["csrf_token"] = _csrf(request)
         return templates.TemplateResponse(request, "run_detail.html", ctx)
+
+    # ---- full-history browser + cost report (P7, FR-2.4) --------------------
+    @app.get("/runs/{slug}/history", response_class=HTMLResponse, dependencies=[auth])
+    def history_page(request: Request, slug: str) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "history.html",
+            {"slug": slug, "runs": store.run_history(slug), "csrf_token": _csrf(request)},
+        )
+
+    @app.get("/runs/{slug}/report", response_class=HTMLResponse, dependencies=[auth])
+    def report_page(
+        request: Request, slug: str, run_id: str | None = Query(default=None)
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "report.html",
+            {
+                "slug": slug,
+                "report": store.report_text(slug, run_id=run_id),
+                "csrf_token": _csrf(request),
+            },
+        )
 
     # ---- phase diff + judge-audit (P5, FR-4.3/FR-3.4) — deliberate pages, not
     # live-swapped (the diff shells out to git, so it is not on the SSE tick) ---
@@ -133,52 +227,51 @@ def register_views(app: FastAPI, store: RunStore, auth: Depends) -> None:
         run_id: str | None = Query(default=None),
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = Query(default=None),
-        token: str | None = Query(default=None),
     ) -> HTMLResponse:
         view = GateResolver(store).diff(
             slug, run_id=run_id, from_sha=from_, to_sha=to
         )
         return templates.TemplateResponse(
-            request, "diff.html", {"slug": slug, "diff": view, "token": token or ""}
+            request,
+            "diff.html",
+            {"slug": slug, "diff": view, "csrf_token": _csrf(request)},
         )
 
     @app.get(
         "/runs/{slug}/judge-audit", response_class=HTMLResponse, dependencies=[auth]
     )
     def judge_audit_page(
-        request: Request,
-        slug: str,
-        run_id: str | None = Query(default=None),
-        token: str | None = Query(default=None),
+        request: Request, slug: str, run_id: str | None = Query(default=None)
     ) -> HTMLResponse:
         entries = store.judge_audit(slug, run_id=run_id)
         return templates.TemplateResponse(
             request,
             "judge_audit.html",
-            {"slug": slug, "entries": entries, "token": token or ""},
+            {"slug": slug, "entries": entries, "csrf_token": _csrf(request)},
         )
 
     # ---- live partials (P2): the innerHTML live.js swaps in on each SSE tick --
     @app.get("/partials/runs", response_class=HTMLResponse, dependencies=[auth])
     def partial_runs(
-        request: Request, token: str | None = Query(default=None)
+        request: Request,
+        status: str | None = Query(default=None),
+        slug: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        sort: str | None = Query(default=None),
     ) -> HTMLResponse:
         return templates.TemplateResponse(
             request,
             "_run_rows.html",
-            {"rows": store.list_rows(), "token": token or ""},
+            {"rows": store.list_rows(status=status, slug=slug, q=q, sort=sort)},
         )
 
     @app.get(
         "/partials/runs/{slug}", response_class=HTMLResponse, dependencies=[auth]
     )
     def partial_run_detail(
-        request: Request,
-        slug: str,
-        run_id: str | None = Query(default=None),
-        token: str | None = Query(default=None),
+        request: Request, slug: str, run_id: str | None = Query(default=None)
     ) -> HTMLResponse:
-        ctx = _detail_context(store, slug, run_id, token)
+        ctx = _detail_context(store, slug, run_id)
         return templates.TemplateResponse(request, "_run_detail_body.html", ctx)
 
 

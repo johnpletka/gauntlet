@@ -23,11 +23,12 @@
 </section>
 
 {# Abort is a control action (FR-6.2): stops a live owned driver and marks the
-   run aborted via `gauntlet abort`. control.js confirms before POSTing — the
-   full FR-10.7 server-side destructive-verb confirm token lands in P5. #}
+   run aborted via `gauntlet abort`. control.js confirms before POSTing and
+   carries the session CSRF token (FR-10.6); the server requires `confirm: true`
+   (FR-10.7). #}
 {% if owned %}
 <section class="controls">
-  <button data-abort data-slug="{{ slug }}" data-token="{{ token }}">Abort run</button>
+  <button data-abort data-slug="{{ slug }}">Abort run</button>
 </section>
 {% endif %}
 

@@ -6,17 +6,21 @@
 (function () {
   "use strict";
 
-  function authHeaders(token) {
-    var h = { "Content-Type": "application/json" };
-    if (token) h["X-Gauntlet-Token"] = token;
-    return h;
+  // P7: the browser authenticates by the /login HttpOnly cookie (FR-10.4), so a
+  // POST carries no token header — it carries the session-bound CSRF token from
+  // the <meta> tag (FR-10.6) and the cookie rides along (credentials default to
+  // same-origin). Header (X-Gauntlet-Token) auth is the API-client path only.
+  function csrfToken() {
+    var m = document.querySelector('meta[name="csrf-token"]');
+    return (m && m.getAttribute("content")) || "";
   }
 
-  function post(url, token, body) {
+  function post(url, _token, body) {
     var status = 0;
     return fetch(url, {
       method: "POST",
-      headers: authHeaders(token),
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
       body: body ? JSON.stringify(body) : undefined,
     })
       .then(function (r) {

@@ -3,17 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# Session-bound CSRF token (FR-10.6): control.js reads it here and attaches it
+     as X-CSRF-Token on cookie-authenticated POSTs. Empty for read-only pages /
+     header-authenticated calls. #}
+  <meta name="csrf-token" content="{{ csrf_token | default('') }}">
   <title>{% block title %}Gauntlet Console{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 {# `data-sse` names this page's live channel; live.js (P2) opens an EventSource
-   to it and, on each transition, re-fetches every [data-live-src] region. The
-   token rides in the query for the P1/P2 bootstrap (EventSource can't set
-   headers); P7 replaces it with the /login cookie. A page with no
-   [data-live-src] region simply ignores the stream. #}
-<body data-sse="/events{% if token %}?token={{ token }}{% endif %}">
+   to it and, on each transition, re-fetches every [data-live-src] region. After
+   P7 the browser authenticates by the /login HttpOnly cookie (FR-10.4), so the
+   handshake URL is token-free (EventSource sends the cookie same-origin). A page
+   with no [data-live-src] region simply ignores the stream. #}
+<body data-sse="/events">
   <header class="topbar">
-    <a class="brand" href="/{% if token %}?token={{ token }}{% endif %}">Gauntlet Console</a>
+    <a class="brand" href="/">Gauntlet Console</a>
   </header>
   <main>
     {% block body %}{% endblock %}

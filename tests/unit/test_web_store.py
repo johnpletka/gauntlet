@@ -179,10 +179,11 @@ def test_api_runs_rejects_wrong_token(client: TestClient):
     assert resp.status_code == 401
 
 
-def test_token_accepted_via_query_param(client: TestClient):
-    # P1 browser bootstrap: token may ride in `?token=` (header parity is also OK).
-    resp = client.get("/api/runs", params={"token": TOKEN})
-    assert resp.status_code == 200
+def test_query_param_token_rejected(client: TestClient):
+    # P7 (FR-10.4): the ?token= bootstrap is retired — the token must never ride
+    # in a URL. A query token no longer authenticates; the API header does.
+    assert client.get("/api/runs", params={"token": TOKEN}).status_code == 401
+    assert client.get("/api/runs", headers=_auth()).status_code == 200
 
 
 def test_assert_loopback_guard():
@@ -228,6 +229,89 @@ def test_api_runs_sorted_recent_first(client: TestClient):
     rows = client.get("/api/runs", headers=_auth()).json()
     updated = [r["updated"] for r in rows]
     assert updated == sorted(updated, reverse=True)
+
+
+# --- list search / status filter / sort (FR-1.2) -----------------------------
+
+
+def _slugs(client: TestClient, **params) -> list[str]:
+    rows = client.get("/api/runs", headers=_auth(), params=params).json()
+    return [r["slug"] for r in rows]
+
+
+def test_api_runs_status_filter(client: TestClient):
+    assert _slugs(client, status="running") == ["alpha"]
+    assert _slugs(client, status="parked") == ["beta"]
+    assert _slugs(client, status="done") == []  # alpha's *latest* is running
+
+
+def test_api_runs_free_text_search(client: TestClient):
+    # q matches slug...
+    assert _slugs(client, q="beta") == ["beta"]
+    # ...and branch (gauntlet/alpha) — only alpha has it.
+    assert _slugs(client, q="gauntlet/alpha") == ["alpha"]
+    assert _slugs(client, q="nomatch") == []
+
+
+def test_api_runs_slug_substring_filter(client: TestClient):
+    assert _slugs(client, slug="alph") == ["alpha"]
+
+
+def test_api_runs_sort_by_slug(client: TestClient):
+    assert _slugs(client, sort="slug") == ["alpha", "beta"]
+
+
+# --- full-history browser + cost report (FR-2.4) -----------------------------
+
+
+def test_api_history_lists_all_runs_newest_first(client: TestClient):
+    body = client.get("/api/runs/alpha/history", headers=_auth()).json()
+    runs = body["runs"]
+    assert [r["run_id"] for r in runs] == [
+        "run-2026-02-02T00-00-00",
+        "run-2026-01-01T00-00-00",
+    ]
+    # the active/latest run is flagged.
+    active = {r["run_id"]: r["active"] for r in runs}
+    assert active["run-2026-02-02T00-00-00"] is True
+    assert active["run-2026-01-01T00-00-00"] is False
+    # statuses are carried through.
+    assert runs[1]["status"] == "done"
+
+
+def test_api_history_empty_slug(client: TestClient):
+    assert client.get("/api/runs/empty/history", headers=_auth()).json()["runs"] == []
+
+
+def test_api_report_renders_breakdown(client: TestClient):
+    body = client.get("/api/runs/alpha/report", headers=_auth()).json()
+    assert body["slug"] == "alpha"
+    # The report text is the same the CLI prints — non-empty and run-scoped.
+    assert isinstance(body["report"], str) and body["report"].strip()
+
+
+def test_api_report_honors_run_id(client: TestClient):
+    # FR-2.4: a historical run is addressable; an unknown id 404s.
+    ok = client.get(
+        "/api/runs/alpha/report", headers=_auth(),
+        params={"run_id": "run-2026-01-01T00-00-00"},
+    )
+    assert ok.status_code == 200
+    missing = client.get(
+        "/api/runs/alpha/report", headers=_auth(), params={"run_id": "run-nope"}
+    )
+    assert missing.status_code == 404
+
+
+def test_history_page_renders(client: TestClient):
+    html = client.get("/runs/alpha/history", headers=_auth()).text
+    assert "Run history" in html
+    assert "run-2026-01-01T00-00-00" in html
+
+
+def test_report_page_renders(client: TestClient):
+    html = client.get("/runs/alpha/report", headers=_auth()).text
+    assert "Cost report" in html
 
 
 # --- /api/runs/{slug} detail + run_id selection (FR-2.4) ---------------------
@@ -379,6 +463,19 @@ def test_html_run_detail_page(client: TestClient):
     assert "prd-cycle" in resp.text
 
 
-def test_html_pages_require_token(client: TestClient):
-    assert client.get("/").status_code == 401
-    assert client.get("/runs/alpha").status_code == 401
+def test_html_pages_redirect_to_login(client: TestClient):
+    # P7 (FR-10.4): an unauthenticated browser page navigation is bounced to the
+    # /login form (303), not a bare 401 — the API/SSE/partial routes still 401.
+    for path in ("/", "/runs/alpha"):
+        resp = client.get(path, follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"].startswith("/login?next=")
+    # the assembled `next` round-trips the original path
+    loc = client.get("/runs/alpha", follow_redirects=False).headers["location"]
+    assert "next=%2Fruns%2Falpha" in loc
+
+
+def test_api_routes_still_401_unauthenticated(client: TestClient):
+    # API/SSE/partial routes fail closed loudly (no redirect) when unauthenticated.
+    assert client.get("/api/runs").status_code == 401
+    assert client.get("/partials/runs").status_code == 401

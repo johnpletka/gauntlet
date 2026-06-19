@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ slug }} judge audit · Gauntlet Console{% endblock %}
 {% block body %}
-<p><a href="/runs/{{ slug }}{% if token %}?token={{ token }}{% endif %}">← {{ slug }}</a></p>
+<p><a href="/runs/{{ slug }}">← {{ slug }}</a></p>
 <h1>Judge audit — {{ slug }}</h1>
 {# FR-3.4: the judge's decisions in a readable view so a judge-driven denial is
    diagnosable. Columns are best-effort over whatever keys the engine wrote. #}
