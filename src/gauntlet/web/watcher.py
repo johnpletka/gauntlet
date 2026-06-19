@@ -106,6 +106,12 @@ class Watcher:
         self.notifier = notifier
         # manifest path → (last mtime_ns, last semantic identity-or-None)
         self._seen: dict[Path, tuple[int, Identity | None]] = {}
+        # Whether the watcher's *initial* scan has completed. Startup priming
+        # (suppress notifications for runs that predate the server) must apply
+        # only to that first scan — a run first *discovered* after the watcher is
+        # already polling is a real transition and must notify, even if first
+        # seen already parked/done (review F-001).
+        self._primed = False
         # SSE subscriber queues carry WatchEvent (transitions) AND Notification
         # objects (the in-tab notify channel publishes onto the same queues; the
         # SSE stream type-dispatches them to `transition`/`notify` events, P6).
@@ -147,13 +153,14 @@ class Watcher:
     def _dispatch_notify(self, event: WatchEvent, *, first: bool) -> None:
         """Hand an emitted transition to the notifier, fail-soft (FR-9.3).
 
-        A *first observation* of a manifest is **primed** (its de-dup key is
-        recorded but nothing is sent) so that starting ``gauntlet serve`` over a
-        tree of already-parked/finished runs does not flood the operator with
-        notifications for states that predate the server. Every later transition
-        is a real ``notify``. A notifier error is logged and swallowed here (on
-        top of the per-channel guard) so it can never reach the poll loop and
-        affect a run.
+        ``first`` means "prime, do not send": the manifest was first observed
+        during the watcher's **initial scan**, so its state predates the server
+        and notifying would flood the operator (starting ``gauntlet serve`` over
+        a tree of already-parked/finished runs). Every transition observed after
+        that initial scan — including a run *first discovered* already parked or
+        done while the watcher was already polling — is a real ``notify`` (review
+        F-001). A notifier error is logged and swallowed here (on top of the
+        per-channel guard) so it can never reach the poll loop and affect a run.
         """
         if self.notifier is None:
             return
@@ -215,17 +222,23 @@ class Watcher:
             if prev is None or prev[1] != identity:
                 events.append(event)
                 self._publish(event)
-                # Hand the transition to the notifier (P6). A run we have not yet
-                # recorded a *valid* identity for is **primed** (its de-dup key is
-                # set but nothing is sent) so a tree of pre-existing parked/done
-                # runs does not flood the operator on startup; everything after is
-                # a real notify. ``prev[1] is None`` keeps a run whose first read
-                # was torn (recorded with a None identity) primed too.
-                self._dispatch_notify(event, first=prev is None or prev[1] is None)
+                # Hand the transition to the notifier (P6). Prime (suppress) only
+                # during the watcher's *initial* scan, and then only for a run we
+                # have no valid identity for yet — a tree of pre-existing
+                # parked/done runs must not flood the operator on startup. Once
+                # the initial scan is done, any newly discovered manifest is a
+                # real transition and must notify, even if first seen already
+                # parked/done between polls (review F-001).
+                startup = not self._primed
+                first = startup and (prev is None or prev[1] is None)
+                self._dispatch_notify(event, first=first)
             self._seen[manifest_path] = (mtime_ns, identity)
         # Forget runs whose dir vanished (rare), so memory tracks live runs only.
         for gone in set(self._seen) - live:
             del self._seen[gone]
+        # The initial scan is complete; subsequent discoveries are real
+        # transitions, not startup state (review F-001).
+        self._primed = True
         return events
 
     # ---- async lifecycle -----------------------------------------------------

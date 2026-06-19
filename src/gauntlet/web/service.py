@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
 from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+from gauntlet.web.config import web_config_from
 from gauntlet.web.gate import GateResolver, NoPendingGate, handoff_prompt
 from gauntlet.web.intel import resume_intel
 from gauntlet.web.notify import build_notifier
@@ -126,7 +127,7 @@ def create_app(
     # *after* the watcher exists.
     if notifier is None and notifications:
         notifier = build_notifier(
-            store.config.web.notify, watcher=watcher, base_url=base_url
+            web_config_from(store.config).notify, watcher=watcher, base_url=base_url
         )
     watcher.notifier = notifier
     # The supervisor (P3) owns console-launched runs and surfaces the worktree

@@ -34,6 +34,19 @@
     });
   }
 
+  // Build a same-origin deep link to a run that authenticates under the active
+  // P1–P6 `?token=` scheme (review F-002). The in-tab notification is delivered
+  // to a tab that is already authenticated, so we carry *that tab's* token from
+  // the current URL rather than embedding it in the notification payload (which
+  // would leak the serve token to every channel). P7's cookie login retires the
+  // query token, at which point the bare `/runs/<slug>` link suffices.
+  function runLink(slug) {
+    var target = "/runs/" + encodeURIComponent(slug);
+    var tok = new URLSearchParams(window.location.search).get("token");
+    if (tok) target += "?token=" + encodeURIComponent(tok);
+    return target;
+  }
+
   // In-tab notification (P6, FR-9.2): the `notify` SSE event carries a
   // deduplicated Notification for the four "needs a human" moments. We ask for
   // permission lazily (on the first notify) and fail soft if the browser has no
@@ -52,7 +65,7 @@
       try {
         var n = new Notification(data.title, { body: data.body, tag: data.run_id });
         n.onclick = function () {
-          window.open(data.url || "/runs/" + data.slug, "_blank");
+          window.open(runLink(data.slug), "_blank");
         };
       } catch (e) {
         /* fail soft: notification is best-effort */

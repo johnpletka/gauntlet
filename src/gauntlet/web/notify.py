@@ -43,13 +43,13 @@ import threading
 import httpx
 from pydantic import BaseModel
 
-from gauntlet.engine.config import WebNotifyConfig
 from gauntlet.engine.manifest import (
     PARKED,
     RUN_DONE,
     RUN_FAILED,
     RUN_PARKED,
 )
+from gauntlet.web.config import WebNotifyConfig
 from gauntlet.web.watcher import WatchEvent
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,15 @@ class Notification(BaseModel):
     + note, and a deep link to ``/runs/<slug>`` — plus a rendered ``title`` /
     ``body`` the desktop and Slack channels reuse so the message is identical
     across channels.
+
+    **Deep-link auth (review F-002):** ``url`` is the bare ``/runs/<slug>`` path
+    with **no token embedded**, because the same payload feeds external channels
+    (Slack, desktop) where a leaked serve token would persist in chat history /
+    the macOS notification store. The in-tab channel re-authenticates the link in
+    the browser using the current tab's token (see ``static/live.js``). Under the
+    P1–P6 ``?token=`` scheme an external-channel link therefore resolves only
+    once the operator has an active session; the durable cross-channel deep link
+    waits on the P7 ``/login`` cookie flow (deferred by plan).
     """
 
     slug: str
@@ -192,6 +201,18 @@ def _osa_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+class SlackDeliveryError(Exception):
+    """A Slack send failure, **sanitized** so it never carries the webhook URL.
+
+    A Slack incoming-webhook URL embeds a secret token in its path, and
+    ``httpx`` errors (``HTTPStatusError``, ``ConnectError``, …) put the full
+    request URL in their message. Since :meth:`Notifier._dispatch` logs a failed
+    send with ``logger.exception``, letting a raw ``httpx`` error escape would
+    write the secret to the logs (review F-003). :meth:`SlackChannel.send` raises
+    this instead, with only a status code / error class — no URL.
+    """
+
+
 class SlackChannel:
     """Slack incoming-webhook POST (FR-9.2). Off-thread (network). The webhook is
     resolved once at build time; an absent webhook means this channel is never
@@ -212,9 +233,25 @@ class SlackChannel:
         self.timeout = timeout
 
     def send(self, note: Notification) -> None:
-        with httpx.Client(transport=self._transport, timeout=self.timeout) as client:
-            resp = client.post(self.webhook_url, json={"text": note.slack_text()})
+        # Wrap every httpx failure in a sanitized error: the webhook URL embeds a
+        # secret, and the caller logs failures with `logger.exception`, so a raw
+        # httpx error (whose message includes the URL) would leak it (F-003).
+        # `from None` drops the chained httpx exception so the original message
+        # (with the URL) never reaches the logged traceback either.
+        try:
+            with httpx.Client(transport=self._transport, timeout=self.timeout) as client:
+                resp = client.post(self.webhook_url, json={"text": note.slack_text()})
             resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise SlackDeliveryError(_sanitize_slack_error(exc)) from None
+
+
+def _sanitize_slack_error(exc: httpx.HTTPError) -> str:
+    """A webhook-URL-free description of a Slack send failure (review F-003)."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        return f"Slack webhook returned HTTP {status}"
+    return f"Slack webhook request failed: {type(exc).__name__}"
 
 
 class InTabChannel:
@@ -321,6 +358,7 @@ __all__ = [
     "build_notifier",
     "DesktopChannel",
     "SlackChannel",
+    "SlackDeliveryError",
     "InTabChannel",
     "KIND_GATE",
     "KIND_ESCALATION",

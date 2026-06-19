@@ -26,8 +26,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from gauntlet.engine.config import RunConfig, WebNotifyConfig
+from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
+from gauntlet.web.config import WebNotifyConfig, web_config_from
 from gauntlet.web.notify import (
     GAUNTLET_SLACK_WEBHOOK_ENV,
     KIND_COMPLETED,
@@ -37,6 +38,7 @@ from gauntlet.web.notify import (
     Notification,
     Notifier,
     SlackChannel,
+    SlackDeliveryError,
     build_notifier,
     classify_kind,
 )
@@ -283,13 +285,57 @@ def test_slack_channel_posts_expected_shape():
 
 
 def test_slack_channel_raises_on_error_status():
-    # raise_for_status lets the Notifier's fail-soft wrapper log+swallow.
+    # A non-2xx surfaces as a SlackDeliveryError, which the Notifier's fail-soft
+    # wrapper logs+swallows. The error must NOT carry the webhook URL (F-003).
+    secret_path = "T000/B000/XXXXSECRETXXXX"
+    webhook = f"https://hooks.slack.test/services/{secret_path}"
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="nope")
 
-    ch = SlackChannel("https://hooks.slack.test/abc", transport=httpx.MockTransport(handler))
-    with pytest.raises(httpx.HTTPStatusError):
+    ch = SlackChannel(webhook, transport=httpx.MockTransport(handler))
+    with pytest.raises(SlackDeliveryError) as excinfo:
         ch.send(Notification.build(_gate("gate"), KIND_GATE))
+    # Status code is reported; the webhook path/secret is not.
+    assert "500" in str(excinfo.value)
+    assert secret_path not in str(excinfo.value)
+    assert "hooks.slack.test" not in str(excinfo.value)
+
+
+def test_slack_error_does_not_leak_webhook_in_logs(caplog: pytest.LogCaptureFixture):
+    """Notifier._dispatch logs a failed send with logger.exception; the logged
+    output (message + traceback) must not contain the webhook secret (F-003)."""
+    secret_path = "T123/B456/SUPERSECRETTOKEN"
+    webhook = f"https://hooks.slack.test/services/{secret_path}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="forbidden")
+
+    ch = SlackChannel(webhook, transport=httpx.MockTransport(handler))
+    ch.background = False  # run inline so caplog captures it deterministically
+    n = Notifier([ch])
+    with caplog.at_level("ERROR"):
+        n.notify(_gate("gate"))  # must not raise; failure is logged+swallowed
+    full_log = caplog.text
+    assert secret_path not in full_log
+    assert webhook not in full_log
+    assert "hooks.slack.test" not in full_log
+
+
+def test_slack_connect_error_is_sanitized():
+    """A transport-level failure (no response) is also sanitized — its httpx
+    message would otherwise carry the webhook URL (F-003)."""
+    secret_path = "T999/B999/CONNSECRET"
+    webhook = f"https://hooks.slack.test/services/{secret_path}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    ch = SlackChannel(webhook, transport=httpx.MockTransport(handler))
+    with pytest.raises(SlackDeliveryError) as excinfo:
+        ch.send(Notification.build(_gate("gate"), KIND_GATE))
+    assert secret_path not in str(excinfo.value)
+    assert webhook not in str(excinfo.value)
 
 
 # --- build_notifier (config wiring, FR-9.4) ----------------------------------
@@ -325,17 +371,29 @@ def test_web_config_parses_from_yaml(tmp_path: Path):
         "    slack_webhook: https://hooks.slack.test/y\n"
     )
     cfg = RunConfig.load(cfg_path)
-    assert cfg.web.notify.desktop is False
-    assert cfg.web.notify.slack is True
-    assert cfg.web.notify.slack_webhook == "https://hooks.slack.test/y"
+    # The `web:` block rides on RunConfig as an extra field (it is NOT an engine
+    # schema field, review F-004); the console parses/validates it via
+    # web_config_from at serve time.
+    web = web_config_from(cfg)
+    assert web.notify.desktop is False
+    assert web.notify.slack is True
+    assert web.notify.slack_webhook == "https://hooks.slack.test/y"
 
 
 def test_absent_web_block_uses_defaults():
-    cfg = RunConfig()
-    assert cfg.web.notify.desktop is True
-    assert cfg.web.notify.slack is True
-    assert cfg.web.notify.in_tab is True
-    assert cfg.web.notify.slack_webhook is None
+    web = web_config_from(RunConfig())
+    assert web.notify.desktop is True
+    assert web.notify.slack is True
+    assert web.notify.in_tab is True
+    assert web.notify.slack_webhook is None
+
+
+def test_malformed_web_block_fails_closed_at_console():
+    """An unknown `web.notify` key fails closed when the console parses it
+    (WebNotifyConfig forbids extras) rather than silently degrading (F-004)."""
+    cfg = RunConfig.model_validate({"web": {"notify": {"bogus": True}}})
+    with pytest.raises(Exception):
+        web_config_from(cfg)
 
 
 # --- watcher → notifier integration ------------------------------------------
@@ -405,6 +463,52 @@ def test_watcher_primes_pre_existing_parked_run_on_startup(tmp_path: Path):
                          current_step="gate"))
     w.poll_once()  # first observation of an already-parked run
     assert rec.sent == []
+
+
+def test_watcher_notifies_run_first_seen_parked_after_startup(tmp_path: Path):
+    """A run first *discovered* already parked AFTER the watcher's initial scan
+    must notify — startup flood suppression must not bleed into later discovery
+    (review F-001). The bug: priming keyed on `prev is None` suppressed every
+    first observation, so a console/external run that started and parked between
+    1s polls was silently de-duplicated forever."""
+    repo = tmp_path / "repo"
+    (repo / "runs").mkdir(parents=True)
+    store = RunStore(repo, RunConfig())
+    rec = RecordingChannel()
+    w = Watcher(store, notifier=Notifier([rec]))
+
+    # The watcher is already running: an initial scan over the (empty) tree
+    # completes priming with nothing to suppress.
+    w.poll_once()
+    assert rec.sent == []
+
+    # Now a brand-new run appears and is first seen already parked at a gate (it
+    # started and parked between polls). This is a real transition, not startup
+    # state — it must notify.
+    rd = repo / "runs" / "beta" / "run-9"
+    _write(rd, _manifest("beta", "run-9", status="parked",
+                         steps=[StepRecord(id="gate", type="human_gate", status="parked")],
+                         current_step="gate"))
+    w.poll_once()
+    assert len(rec.sent) == 1 and rec.sent[0].current_step == "gate"
+
+
+def test_watcher_notifies_run_first_seen_done_after_startup(tmp_path: Path):
+    """Same as above for a completion: a run first observed already `done` after
+    startup notifies once (review F-001)."""
+    repo = tmp_path / "repo"
+    (repo / "runs").mkdir(parents=True)
+    store = RunStore(repo, RunConfig())
+    rec = RecordingChannel()
+    w = Watcher(store, notifier=Notifier([rec]))
+    w.poll_once()  # initial scan completes; priming done
+
+    rd = repo / "runs" / "gamma" / "run-3"
+    _write(rd, _manifest("gamma", "run-3", status="done",
+                         steps=[StepRecord(id="impl", type="agent_task", status="done")],
+                         current_step="impl"))
+    w.poll_once()
+    assert len(rec.sent) == 1 and rec.sent[0].kind == KIND_COMPLETED
 
 
 def test_watcher_unchanged_manifest_no_notify(tmp_path: Path):
