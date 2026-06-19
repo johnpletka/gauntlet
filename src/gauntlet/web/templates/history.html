@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}{{ slug }} history · Gauntlet Console{% endblock %}
+{% block body %}
+<p><a href="/runs/{{ slug }}">← {{ slug }}</a></p>
+<h1>Run history — {{ slug }}</h1>
+{# FR-2.4: every run of this slug, newest first, openable read-only via ?run_id=
+   so a completed/failed PRD run is reviewable long after it finished. #}
+{% if not runs %}
+  <p class="empty">No runs for this slug yet.</p>
+{% else %}
+<table class="runs">
+  <thead><tr><th>Run</th><th>Status</th><th>Current step</th><th>Started</th><th>Ended</th><th></th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td><a href="/runs/{{ slug }}?run_id={{ r.run_id }}">{{ r.run_id }}</a>
+          {% if r.active %}<span class="badge badge-owned">active</span>{% endif %}</td>
+      <td><span class="status status-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ r.current_step or "—" }}
+          {% if r.current_step_status %}<span class="muted">({{ r.current_step_status }})</span>{% endif %}</td>
+      <td class="muted">{{ r.started or "—" }}</td>
+      <td class="muted">{{ r.ended or "—" }}</td>
+      <td><a href="/runs/{{ slug }}/report?run_id={{ r.run_id }}">cost</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

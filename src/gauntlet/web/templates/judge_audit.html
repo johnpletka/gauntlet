@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}{{ slug }} judge audit · Gauntlet Console{% endblock %}
+{% block body %}
+<p><a href="/runs/{{ slug }}">← {{ slug }}</a></p>
+<h1>Judge audit — {{ slug }}</h1>
+{# FR-3.4: the judge's decisions in a readable view so a judge-driven denial is
+   diagnosable. Columns are best-effort over whatever keys the engine wrote. #}
+{% if not entries %}
+  <p class="empty">No judge-audit entries (a --no-judge run, or no tool calls).</p>
+{% else %}
+<table class="audit">
+  <thead><tr><th>Tool</th><th>Decision</th><th>Source</th><th>Rationale</th><th>Latency</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+    <tr>
+      <td>{{ e.tool or e.tool_name or "—" }}</td>
+      <td><span class="status status-{{ (e.decision or '') | lower }}">{{ e.decision or "—" }}</span></td>
+      <td>{{ e.source or "—" }}</td>
+      <td class="notes">{{ e.rationale or e.reason or "—" }}</td>
+      <td class="muted">{% if e.latency_ms is defined and e.latency_ms is not none %}{{ e.latency_ms }}ms{% else %}{{ e.latency or "—" }}{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -87,3 +87,15 @@ def test_asset_root_validation_and_normalization():
     for bad in ("/abs/path", "~/x", "../escape", "a/../../b", ""):
         with pytest.raises(ValidationError):
             RunConfig(asset_root=bad)
+
+
+def test_run_root_validation_and_normalization():
+    # run_root gets the same repo-relative containment as asset_root (F-001):
+    # an absolute or escaping value would let `gauntlet serve` browse outside
+    # the repo. Normalisation collapses redundant "./" segments.
+    assert RunConfig().run_root == "runs"
+    assert RunConfig(run_root="./.gauntlet/runs").run_root == ".gauntlet/runs"
+    assert RunConfig(run_root="runs/").run_root == "runs"
+    for bad in ("/abs/runs", "~/runs", "../outside", "a/../../b", ""):
+        with pytest.raises(ValidationError):
+            RunConfig(run_root=bad)

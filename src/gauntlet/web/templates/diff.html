@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}{{ slug }} diff · Gauntlet Console{% endblock %}
+{% block body %}
+<p><a href="/runs/{{ slug }}">← {{ slug }}</a></p>
+<h1>Phase diff — {{ slug }}</h1>
+{% if diff.no_committed_diff %}
+  <div class="banner banner-locked">No committed diff for this gate (FR-4.3).
+    {% if diff.fallback %}Showing the relevant artifact instead.{% endif %}</div>
+  {% if diff.fallback %}
+    <h2>{{ diff.fallback.name }} <span class="muted">({{ diff.fallback.kind }})</span></h2>
+    {% if diff.fallback.parsed is not none %}
+      <pre class="json">{{ diff.fallback.parsed | tojson(indent=2) }}</pre>
+    {% elif diff.fallback.content is not none %}
+      <pre class="artifact">{{ diff.fallback.content }}</pre>
+    {% endif %}
+  {% endif %}
+{% else %}
+  <p class="muted">
+    {% if diff.phase %}phase {{ diff.phase }} · {% endif %}
+    {{ diff.from_sha }} → {{ diff.to_sha }}
+  </p>
+  {% if diff.log %}<h2>Commits</h2><pre class="artifact">{{ diff.log }}</pre>{% endif %}
+  <h2>Diff</h2>
+  <pre class="diff">{{ diff.diff }}</pre>
+{% endif %}
+{% endblock %}

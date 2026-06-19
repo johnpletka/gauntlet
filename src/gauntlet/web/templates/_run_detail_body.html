@@ -1,0 +1,63 @@
+{# Run-detail live region: summary + warnings + step tree. Embedded by
+   run_detail.html and served standalone by /partials/runs/{slug} for the P2
+   live swap (live.js re-fetches this on each SSE tick). #}
+<section class="summary">
+  {% if external %}
+    <span class="status status-running">running (external)</span>
+  {% else %}
+    <span class="status status-{{ manifest.status }}">{{ manifest.status }}</span>
+  {% endif %}
+  <span class="muted">run {{ manifest.run_id }}</span>
+  <span class="muted">{{ manifest.branch }} → {{ manifest.base_branch }}</span>
+  {% if external %}
+    <span class="badge badge-external">external</span>
+  {% elif owned %}
+    <span class="badge badge-owned">owned{% if attached %} ·live{% endif %}</span>
+  {% else %}
+    <span class="badge badge-observed">observed</span>
+  {% endif %}
+  {% if manifest.totals.cost_usd is not none %}
+    <span class="muted">${{ "%.2f"|format(manifest.totals.cost_usd) }}</span>
+  {% endif %}
+  {% if manifest.current_step %}<span class="muted">at {{ manifest.current_step }}</span>{% endif %}
+</section>
+
+{# Abort is a control action (FR-6.2): stops a live owned driver and marks the
+   run aborted via `gauntlet abort`. control.js confirms before POSTing and
+   carries the session CSRF token (FR-10.6); the server requires `confirm: true`
+   (FR-10.7). #}
+{% if can_abort %}
+<section class="controls">
+  <button data-abort data-slug="{{ slug }}">Abort run</button>
+</section>
+{% endif %}
+
+{% if manifest.warnings %}
+<ul class="warnings">
+  {% for w in manifest.warnings %}<li>⚠ {{ w }}</li>{% endfor %}
+</ul>
+{% endif %}
+
+{# P5 recovery / gate / escalation panel (FR-4/FR-5). `intel` is always present;
+   `gate` only when parked at a gate/escalation. #}
+{% if intel is defined %}{% include "_recovery.html" %}{% endif %}
+
+<h2>Steps</h2>
+<table class="steps">
+  <thead>
+    <tr><th>Step</th><th>Type</th><th>Status</th><th>Agent</th><th>Duration</th><th>Cost</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+  {% for s in steps %}
+    <tr>
+      <td><a href="/runs/{{ slug }}/steps/{{ s.id }}?run_id={{ manifest.run_id }}{% if s.iteration is not none %}&iteration={{ s.iteration }}{% endif %}">{{ s.id }}{% if s.iteration is not none %}<span class="muted">[{{ s.iteration }}]</span>{% endif %}</a></td>
+      <td>{{ s.type }}</td>
+      <td><span class="status status-{{ s.status }}">{{ s.status }}</span></td>
+      <td>{{ s.agent or "—" }}</td>
+      <td>{% if s.duration_s is not none %}{{ "%.0f"|format(s.duration_s) }}s{% else %}—{% endif %}</td>
+      <td>{% if s.cost_usd is not none %}${{ "%.2f"|format(s.cost_usd) }}{% else %}—{% endif %}</td>
+      <td class="notes">{{ s.notes or "" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>

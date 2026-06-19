@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}proposals · {{ slug }} · Gauntlet Console{% endblock %}
+{% block body %}
+{# FR-6.4 / §2.2 "not an editor": a strictly READ-ONLY view of a run's
+   improvement proposals. No apply/reject/approve controls — review and apply
+   stay the `gauntlet proposals review` CLI verb. #}
+<p><a href="/runs/{{ slug }}?run_id={{ run_id }}">← {{ slug }}</a></p>
+<h1>Improvement proposals — {{ slug }}</h1>
+<p class="muted">run {{ run_id }}</p>
+
+{# Control stays a CLI verb (read-only console, §2.2). #}
+<p class="banner">Review and apply with
+  <code>gauntlet proposals review --slug {{ slug }}</code>.</p>
+
+{% if proposals %}
+{% for p in proposals %}
+<section class="proposal">
+  <h2>{{ p.name }}
+    <span class="status status-{{ p.status }}">{{ p.status }}</span>
+    {% if not p.valid %}<span class="badge badge-external">invalid</span>{% endif %}
+  </h2>
+  <dl class="meta">
+    <dt>slug</dt><dd>{{ p.slug }}</dd>
+    <dt>target_path</dt><dd>{{ p.target_path or "(none)" }}</dd>
+    {% if p.source_run %}<dt>source run</dt><dd>{{ p.source_run }}</dd>{% endif %}
+    {% if p.invalid_reason %}<dt>invalid reason</dt><dd class="notes">{{ p.invalid_reason }}</dd>{% endif %}
+  </dl>
+  <h3>Rationale</h3>
+  <p class="notes">{{ p.rationale or "(none given)" }}</p>
+  <h3>Diff</h3>
+  <pre class="artifact"><code>{{ p.diff }}</code></pre>
+</section>
+{% endfor %}
+{% else %}
+<p class="muted">no proposals for this run.</p>
+{% endif %}
+{% endblock %}

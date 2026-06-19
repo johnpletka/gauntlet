@@ -1,0 +1,31 @@
+{# Run-list <tbody> rows. Embedded by run_list.html and served standalone by
+   /partials/runs for the P2 live swap (live.js re-fetches this on each SSE tick).
+   P3 adds the real owned/observed/external badge (FR-1.4/FR-10.5). #}
+{% for r in rows %}
+    <tr>
+      <td><a href="/runs/{{ r.slug }}">{{ r.slug }}</a></td>
+      <td>
+        {% if r.external %}
+          <span class="status status-running">running (external)</span>
+        {% else %}
+          <span class="status status-{{ r.status }}">{{ r.status }}</span>
+        {% endif %}
+      </td>
+      <td>
+        {{ r.current_step or "—" }}
+        {% if r.current_step_status %}<span class="muted">({{ r.current_step_status }})</span>{% endif %}
+      </td>
+      <td>{% if r.totals.cost_usd is not none %}${{ "%.2f"|format(r.totals.cost_usd) }}{% else %}—{% endif %}</td>
+      <td>{{ r.n_done }}/{{ r.n_steps }}</td>
+      <td class="muted">{{ r.updated or "—" }}</td>
+      <td>
+        {% if r.external %}
+          <span class="badge badge-external">external</span>
+        {% elif r.owned %}
+          <span class="badge badge-owned">owned{% if r.attached %} ·live{% endif %}</span>
+        {% else %}
+          <span class="badge badge-observed">observed</span>
+        {% endif %}
+      </td>
+    </tr>
+{% endfor %}

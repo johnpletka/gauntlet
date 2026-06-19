@@ -1,0 +1,166 @@
+{# P5 recovery / gate / escalation panel (FR-4/FR-5). Rendered inside the detail
+   body so it lives-swaps with the rest; the heavier phase diff is a link to the
+   deliberate /runs/{slug}/diff page (not recomputed per SSE tick). `intel` is the
+   resume_intel verdict; `gate` (when present) is the resolved gate/escalation
+   evidence. Control forms are POSTed by control.js to the sanctioned CLI-verb
+   endpoints; destructive verbs (reject) carry the FR-10.7 confirm. #}
+{% set controls = intel.available_controls %}
+{% if intel.state not in ("running", "done") %}
+<section class="recovery recovery-{{ intel.state }}">
+  <h2>
+    {% if intel.state == "gate" %}Pending gate — your decision
+    {% elif intel.state == "escalation" %}Escalation — reconcile, then resume
+    {% elif intel.state == "interrupted" %}Interrupted — resume available
+    {% elif intel.state.startswith("halted") %}Halted — recovery
+    {% elif intel.state == "failed" %}Failed
+    {% elif intel.state == "rejected" %}Rejected (terminal)
+    {% else %}Recovery{% endif %}
+  </h2>
+  <p class="recommend"><strong>Recommended:</strong> {{ intel.recommended_action }}</p>
+  <p class="muted">{{ intel.rationale }}</p>
+
+  {# --- fail closed (review F-001): gate evidence could not be assembled (unsafe
+        show: path / unreadable artifact). Surface it and suppress the controls
+        below so no decision is made without the required evidence. #}
+  {% if gate_error %}
+    <p class="banner banner-locked">⚠ Gate evidence could not be assembled — controls are disabled until this is resolved. ({{ gate_error }})</p>
+  {% endif %}
+
+  {# --- escalation evidence (FR-4.6): findings + triage verdicts assembled --- #}
+  {% if gate and gate.kind == "escalation" %}
+    {% if gate.target_artifacts %}
+      <p class="banner banner-locked">⚠ Bare Resume re-runs the cycle and re-parks.
+        Reconcile the upstream artifact(s) first: <strong>{{ gate.target_artifacts | join(", ") }}</strong>.</p>
+    {% endif %}
+    <table class="findings">
+      <thead><tr><th>ID</th><th>Sev</th><th>Category</th><th>Location</th><th>Claim</th><th>Verdict</th><th>Action</th><th>Target</th><th>Reasoning</th></tr></thead>
+      <tbody>
+      {% for f in gate.escalated %}
+        <tr>
+          <td>{{ f.finding_id }}</td><td>{{ f.severity or "—" }}</td><td>{{ f.category or "—" }}</td>
+          <td>{{ f.location or "—" }}</td><td>{{ f.claim or "—" }}</td>
+          <td>{{ f.verdict or "—" }}</td><td>{{ f.action or "—" }}</td>
+          <td>{{ f.target_artifact or "—" }}</td><td class="notes">{{ f.reasoning or "—" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+
+  {# --- gate show: artifacts (FR-4.3): rendered readably --- #}
+  {% if gate and gate.kind == "gate" %}
+    {% if gate.upstream_conflict %}
+      <details open><summary>⚠ UPSTREAM CONFLICT (builder-signalled, FR-4.5)</summary>
+        <pre class="conflict">{{ gate.upstream_conflict }}</pre></details>
+    {% endif %}
+    {% for a in gate.artifacts %}
+      <details {% if loop.first %}open{% endif %}>
+        <summary>{{ a.name }} <span class="muted">({{ a.kind }}{% if a.source %} · {{ a.source }}{% endif %})</span></summary>
+        {% if a.error %}<p class="warn">could not parse: {{ a.error }}</p>{% endif %}
+        {# FR-4.3: findings/triage/confirm as readable tables, markdown as markdown. #}
+        {% if a.kind == "findings" and a.parsed is not none %}
+          <table class="findings">
+            <thead><tr><th>ID</th><th>Sev</th><th>Category</th><th>Location</th><th>Claim</th><th>Evidence</th><th>Suggested fix</th></tr></thead>
+            <tbody>
+            {% for f in a.parsed.get("findings") or [] %}
+              <tr>
+                <td>{{ f.get("id") or "—" }}</td><td>{{ f.get("severity") or "—" }}</td>
+                <td>{{ f.get("category") or "—" }}</td><td>{{ f.get("location") or "—" }}</td>
+                <td>{{ f.get("claim") or "—" }}</td><td class="notes">{{ f.get("evidence") or "—" }}</td>
+                <td class="notes">{{ f.get("suggested_fix") or "—" }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% if a.parsed.get("summary") %}<p class="muted">{{ a.parsed.get("summary") }}</p>{% endif %}
+        {% elif a.kind == "triage" and a.parsed is not none %}
+          <table class="findings">
+            <thead><tr><th>Finding</th><th>Verdict</th><th>Action</th><th>Confidence</th><th>Target</th><th>Reasoning</th></tr></thead>
+            <tbody>
+            {% for v in a.parsed.get("verdicts") or [] %}
+              <tr>
+                <td>{{ v.get("finding_id") or "—" }}</td><td>{{ v.get("verdict") or "—" }}</td>
+                <td>{{ v.get("action") or "—" }}</td><td>{{ v.get("confidence") or "—" }}</td>
+                <td>{{ v.get("target_artifact") or "—" }}</td><td class="notes">{{ v.get("reasoning") or "—" }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        {% elif a.kind == "confirm" and a.parsed is not none %}
+          <table class="findings">
+            <thead><tr><th>Finding</th><th>Verdict</th><th>Notes</th></tr></thead>
+            <tbody>
+            {% for v in a.parsed.get("verdicts") or [] %}
+              <tr>
+                <td>{{ v.get("finding_id") or "—" }}</td><td>{{ v.get("verdict") or "—" }}</td>
+                <td class="notes">{{ v.get("notes") or "—" }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% set newf = a.parsed.get("new_findings") or [] %}
+          {% if newf %}
+            <p class="muted">New findings in this round's diff:</p>
+            <table class="findings">
+              <thead><tr><th>Sev</th><th>Claim</th><th>Location</th></tr></thead>
+              <tbody>
+              {% for nf in newf %}
+                <tr><td>{{ nf.get("severity") or "—" }}</td><td>{{ nf.get("claim") or "—" }}</td><td>{{ nf.get("location") or "—" }}</td></tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+          {% if a.parsed.get("summary") %}<p class="muted">{{ a.parsed.get("summary") }}</p>{% endif %}
+        {% elif a.kind == "json" and a.parsed is not none %}
+          <pre class="json">{{ a.parsed | tojson(indent=2) }}</pre>
+        {% elif a.kind == "markdown" and a.content is not none %}
+          <div class="markdown">{{ a.content | markdown }}</div>
+        {% elif a.content is not none %}
+          <pre class="artifact">{{ a.content }}</pre>
+        {% elif a.kind == "missing" %}
+          <p class="muted">not written yet</p>
+        {% endif %}
+      </details>
+    {% endfor %}
+  {% endif %}
+
+  <p><a href="/runs/{{ slug }}/diff?run_id={{ manifest.run_id }}">View phase diff →</a>
+     · <a href="/runs/{{ slug }}/judge-audit?run_id={{ manifest.run_id }}">Judge audit →</a></p>
+
+  {# --- FR-4.7 scoped-analysis hand-off (opt-in). Only when enabled AND parked at
+        a gate/escalation. The console makes NO model call and spawns NOTHING — it
+        fetches the assembled prompt and shows it in a read-only, copy-pasteable
+        textarea (D8). control.js wires the button. #}
+  {% if handoff_enabled and intel.state in ("gate", "escalation") %}
+  <div class="handoff" data-handoff-slug="{{ slug }}" data-handoff-run="{{ manifest.run_id }}">
+    <button type="button" data-handoff>Open scoped analysis session</button>
+    <p class="muted">Assembles a read-only, copy-pasteable prompt for a separate
+      analysis session. The console runs nothing (FR-4.7/D8).</p>
+    <textarea data-handoff-text rows="14" readonly hidden
+      placeholder="The assembled scoped-analysis prompt will appear here."></textarea>
+  </div>
+  {% endif %}
+
+  {# --- control forms: only the verbs resume_intel permits (FR-5.3), and never
+        when gate evidence failed to assemble (review F-001, fail closed). --- #}
+  {% if not external and not gate_error %}
+  <div class="controls control-forms" data-slug="{{ slug }}">
+    {% if "approve" in controls %}
+      <form data-approve>
+        <input type="text" name="notes" placeholder="approval notes (optional)">
+        <button type="submit">Approve</button>
+      </form>
+    {% endif %}
+    {% if "reject" in controls %}
+      <form data-reject>
+        <input type="text" name="notes" placeholder="rejection notes (required)" required>
+        <button type="submit" class="danger">Reject…</button>
+      </form>
+    {% endif %}
+    {% if "resume" in controls %}
+      <form data-resume><button type="submit">Resume</button></form>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}

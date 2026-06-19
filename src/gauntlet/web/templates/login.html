@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Gauntlet Console{% endblock %}
+{% block body %}
+<h1>Gauntlet Console</h1>
+{# FR-10.4 login exchange: the serve token (printed at startup) is pasted into
+   this POST form and exchanged for an HttpOnly session cookie — it is never
+   placed in a URL/query/history. `next` returns the browser where it was headed. #}
+<form class="login" method="post" action="/login">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Serve token
+    <input type="password" name="token" autocomplete="off" autofocus required>
+  </label>
+  <button type="submit">Sign in</button>
+  {% if error %}<p class="warn">{{ error }}</p>{% endif %}
+</form>
+<p class="muted">The token is printed on <code>gauntlet serve</code> startup
+   (<code>GAUNTLET_WEB_TOKEN=…</code>).</p>
+{% endblock %}

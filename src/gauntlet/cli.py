@@ -111,12 +111,73 @@ def run(
     no_judge: bool = typer.Option(
         False, "--no-judge", help="Do not start the judge (unsafe; testing only)."
     ),
+    run_id: str = typer.Option(
+        None, "--run-id",
+        help="Pre-allocated run id (FR-6.1a handshake; the console supervisor "
+        "passes this so it knows run_dir before launch). Single-use: errors if "
+        "that run dir already exists.",
+    ),
+    reservation_token: str = typer.Option(
+        None, "--reservation-token", hidden=True,
+        help="Single-use reservation token paired with --run-id (FR-6.1a "
+        "handshake). Set by the console supervisor before launch so this child "
+        "may adopt the pre-created run dir; not for manual use.",
+    ),
+    watch: bool = typer.Option(
+        False, "--watch", help="Ensure the supervisory console is running "
+        "(boot/reuse it) and print its URL before running in the foreground "
+        "(FR-12.1).",
+    ),
+    console_host: str = typer.Option(
+        "127.0.0.1", "--console-host", help="Console bind host for --watch.",
+    ),
+    console_port: int = typer.Option(
+        8765, "--console-port", help="Console bind port for --watch.",
+    ),
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
+    if watch:
+        _ensure_watch_console(mgr, host=console_host, port=console_port)
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
-    status = mgr.start(slug, path, use_judge=not no_judge)
+    status = mgr.start(
+        slug, path, use_judge=not no_judge, run_id=run_id,
+        reservation_token=reservation_token,
+    )
     typer.echo(f"run status: {status}")
+
+
+def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
+    """Boot/reuse the detached console for `run --watch` (FR-12.1/12.4).
+
+    Fail-soft: the console is a convenience surface, so a boot failure (e.g. an
+    unrelated process on the port) is surfaced loudly but does **not** abort the
+    run — the foreground pipeline still runs exactly as today. The booted console
+    is detached and persists after the foreground run returns (FR-12.2).
+    """
+    from gauntlet.web.registry import ConsoleBootError, ensure_console
+
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    try:
+        handle = ensure_console(repo_root, run_root, host=host, port=port)
+    except ConsoleBootError as exc:
+        typer.echo(f"warning: {exc}", err=True)
+        typer.echo("continuing without a --watch console.", err=True)
+        return
+    if handle.reused:
+        typer.echo(f"reusing console at {handle.login_url}")
+        if handle.token_mismatch:
+            typer.echo(
+                "note: the running console uses a different token than your "
+                "GAUNTLET_WEB_TOKEN; it was not restarted — sign in with the "
+                "console's own token (FR-12.4).",
+                err=True,
+            )
+    else:
+        typer.echo(f"console started at {handle.login_url}")
+        if handle.token:
+            typer.echo(f"GAUNTLET_WEB_TOKEN={handle.token}", err=True)
 
 
 @app.command()
@@ -304,6 +365,38 @@ def rollback(
     """Reset the branch + manifest to a phase boundary (FR-9.9, guarded)."""
     target = _manager().rollback(slug, phase)
     typer.echo(f"rolled back to {target[:10]}")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
+    port: int = typer.Option(8765, help="Bind port."),
+    enable_handoff: bool = typer.Option(
+        False,
+        "--enable-handoff",
+        help="Enable the FR-4.7 scoped-analysis hand-off (opt-in; off by "
+        "default). The console only assembles a copy-pasteable, read-only "
+        "prompt — it spawns nothing and makes no model call. Overrides the "
+        "`web.handoff` config key.",
+    ),
+) -> None:
+    """Run the local supervisory console over loopback (FR-11.1).
+
+    A read model + (in later phases) a run supervisor. Resolves config like the
+    CLI, validates it is inside a git repo (fail-closed), mints a per-serve token
+    and prints it + the URL on startup. The console scopes to this one repo; all
+    of its slugs and run history are browsable (FR-1.1/FR-2.4).
+    """
+    from gauntlet.web.runner import serve as serve_console
+
+    # Only pass the flag through when explicitly set, so an unset CLI flag falls
+    # back to the `web.handoff` config key rather than forcing it off.
+    serve_console(
+        Path.cwd(),
+        host=host,
+        port=port,
+        enable_handoff=True if enable_handoff else None,
+    )
 
 
 @judge_app.command("serve")

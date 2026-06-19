@@ -8,8 +8,13 @@ review F-010).
 
 from __future__ import annotations
 
+import atexit
+import hmac
 import json
+import os
+import secrets
 import shutil
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +28,26 @@ from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.validate import validate_pipeline
 from gauntlet.logging.redact import RedactingWriter, build_redactor
+from gauntlet.procident import (
+    ProcessIdentity,
+    read_process_identity,
+)
+
+# The worktree-scoped active-run lockfile name (FR-10.5). One per repo/worktree,
+# at the resolved run root, gitignored.
+DRIVING_LOCK_NAME = ".driving.lock"
+
+# Console sidecar layout (also imported by web.jobproc so the two agree). The
+# engine needs these to honour the run-id reservation handshake (FR-6.1a,
+# review F-005): the console supervisor writes a single-use reservation token
+# under `run_dir/.serve/` *before* launching this child, and `start()` accepts a
+# pre-existing run dir only when it is exactly that fresh reservation.
+SERVE_DIRNAME = ".serve"
+RESERVATION_FILENAME = "reservation"
+
+# Bounded retries for the acquire loop when racing a stale-lock reclaim, so a
+# pathological churn raises rather than spins (fail closed).
+_LOCK_ACQUIRE_RETRIES = 50
 
 # Marker written into a scaffolded PRD; the entry contract refuses to run while
 # it is still present (FR-10.1 / review OQ-1: existence + non-stub-ness).
@@ -49,8 +74,57 @@ class RollbackGuardError(RuntimeError):
     """A rollback guard (review F-010) refused the operation."""
 
 
+class AbortGuardError(RuntimeError):
+    """`abort()` refused because the target run is terminal (review F-002)."""
+
+
+class UnsafeRunSegment(ValueError):
+    """A slug or run-id that is not a single, traversal-free path segment.
+
+    The write/control path's first line of FR-10.1 containment, mirroring the
+    read model's ``web.store._safe_segment`` (review F-001): a slug or
+    ``--run-id`` flows straight into filesystem paths, so anything containing a
+    path separator, ``.``/``..``, NUL, or that is empty is refused before any
+    path is built.
+    """
+
+
+def safe_run_segment(seg: str, *, kind: str) -> str:
+    """Reject a slug/run-id that could escape the run root (FR-10.1, F-001)."""
+    if not seg or seg in (".", "..") or "/" in seg or "\\" in seg or "\x00" in seg:
+        raise UnsafeRunSegment(f"unsafe {kind} segment: {seg!r}")
+    return seg
+
+
+def _reservation_matches(run_dir: Path, token: str | None) -> bool:
+    """True iff ``run_dir`` holds exactly the fresh reservation for ``token``.
+
+    The supervisor writes the single-use token under ``.serve/`` before launch
+    (FR-6.1a); this lets a child engine verify, race-free, that a pre-existing
+    run dir is its own fresh reservation rather than a prior run's leftover
+    diagnostic state, which must never be reused/overwritten (review F-005).
+    """
+    if not token:
+        return False
+    try:
+        existing = (run_dir / SERVE_DIRNAME / RESERVATION_FILENAME).read_text().strip()
+    except (OSError, ValueError):
+        return False
+    return bool(existing) and hmac.compare_digest(existing, token)
+
+
 class ActiveRunError(RuntimeError):
     """`start()` refused because a non-terminal run is already active."""
+
+
+class WorktreeLockError(RuntimeError):
+    """A driving verb refused: the worktree is already being driven (FR-10.5).
+
+    The repo/worktree-scoped active-run lock is held by a **live** process
+    driving some run (the same slug or a different one) against this worktree.
+    Failing closed here is what makes "two orchestrators against one worktree"
+    (R1) impossible by construction, not by UI heuristic.
+    """
 
 
 class StaleRunBranchError(RuntimeError):
@@ -122,6 +196,67 @@ def _normalize(text: str) -> str:
 
 
 @dataclass
+class _LockRecord:
+    """The on-disk content of ``<run_root>/.driving.lock`` (FR-10.5).
+
+    ``nonce`` is a fresh per-acquisition random token; the holder keeps it in
+    memory and releases the lock **only** if the file still carries that nonce
+    (review F-004), so a holder that was already reclaimed-as-stale can never
+    unlink a *new* owner's lock. ``proc_identity`` is the FR-7.2 OS
+    process-creation identity (or ``None`` if unobtainable → unverifiable).
+    """
+
+    nonce: str
+    slug: str
+    run_id: str | None
+    pid: int
+    pgid: int
+    started_at: str
+    host: str
+    proc_identity: dict | None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "nonce": self.nonce,
+                "slug": self.slug,
+                "run_id": self.run_id,
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "started_at": self.started_at,
+                "host": self.host,
+                "proc_identity": self.proc_identity,
+            },
+            indent=2,
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "_LockRecord | None":
+        try:
+            data = json.loads(text)
+            return cls(
+                nonce=data["nonce"],
+                slug=data["slug"],
+                run_id=data.get("run_id"),
+                pid=int(data["pid"]),
+                pgid=int(data.get("pgid", data["pid"])),
+                started_at=data.get("started_at", ""),
+                host=data.get("host", ""),
+                proc_identity=data.get("proc_identity"),
+            )
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+@dataclass
+class _LockHandle:
+    """An acquired worktree lock; carries the nonce that authorises release."""
+
+    path: Path
+    nonce: str
+
+
+@dataclass
 class RunLayout:
     repo_root: Path
     config: RunConfig
@@ -157,6 +292,10 @@ class RunManager:
         # The configured redaction list (FR-4.4) governs every byte the run
         # writes; default-on even with an empty `redaction:` section.
         self.writer = RedactingWriter(build_redactor(self.config.redaction))
+        # The worktree lock this manager currently holds, if any (FR-10.5). Kept
+        # in memory so an atexit fallback can release it on an unclean exit that
+        # bypasses the per-verb `finally`.
+        self._held_lock: _LockHandle | None = None
 
     def layout(self, slug: str) -> RunLayout:
         return RunLayout(self.repo_root, self.config, slug)
@@ -284,6 +423,224 @@ class RunManager:
                 "`gauntlet abort` to end it first."
             )
 
+    # ---- worktree-scoped active-run lock (FR-10.5, the one sanctioned engine
+    # change alongside the run-id handshake) ----------------------------------
+    #
+    # `_refuse_if_active_run` (above) is the *per-slug* orphan guard: it stops a
+    # `start` from clobbering a parked/running run of the **same** slug, read
+    # from that slug's `active-run.txt`. It does NOT stop slug A from being
+    # driven while slug B is driving the same worktree — and it is moot while a
+    # run is parked (the lock is released at a gate). The lock below is the
+    # complementary, *worktree-global* guard FR-10.5 adds: exactly one lockfile
+    # per repo/worktree, so holding it for one slug blocks every driving verb
+    # for every slug by construction. The two coexist (D7).
+
+    def _run_root_dir(self) -> Path:
+        return self.repo_root / self.config.run_root
+
+    def _lock_path(self) -> Path:
+        return self._run_root_dir() / DRIVING_LOCK_NAME
+
+    @staticmethod
+    def _ensure_run_root_gitignore(run_root: Path) -> None:
+        """Ignore the worktree-level bookkeeping under the run root (FR-10.5).
+
+        The lockfile (and the supervisor's bootstrap dir) live at the run root,
+        a sibling of the slug dirs — untracked, they would dirty the worktree at
+        the very first review handoff and break the clean-handoff invariant. A
+        self-ignoring ``<run_root>/.gitignore`` (which lists itself) keeps them
+        out of ``git status``; it never ignores tracked artifacts. Idempotent,
+        engine-owned so the guarantee never depends on the repo's own ignore
+        rules — mirroring :meth:`_ensure_slug_gitignore`.
+        """
+        run_root.mkdir(parents=True, exist_ok=True)
+        gi = run_root / ".gitignore"
+        existing = gi.read_text().split() if gi.exists() else []
+        wanted = [
+            ".gitignore",
+            DRIVING_LOCK_NAME,
+            DRIVING_LOCK_NAME + ".*",  # the transient acquire temp files
+            ".serve-bootstrap/",
+        ]
+        if any(w not in existing for w in wanted):
+            lines = list(dict.fromkeys(existing + wanted))  # dedup, stable order
+            gi.write_text("\n".join(lines) + "\n")
+
+    def _read_lock(self) -> _LockRecord | None:
+        try:
+            text = self._lock_path().read_text()
+        except (OSError, FileNotFoundError):
+            return None
+        return _LockRecord.from_json(text)
+
+    @staticmethod
+    def _lock_is_live(rec: _LockRecord) -> bool:
+        """True unless the lock's holder is *proven* gone (FR-10.5).
+
+        A worktree lock must fail **closed**: reclaim only when we can prove the
+        holder is dead (`os.kill` → ``ProcessLookupError``) or has been replaced
+        by a different process (the recorded *and* a freshly-read identity are
+        both present and differ → PID reuse). An ``os.kill``-live pid whose
+        identity is *unverifiable* — recorded ``null`` at capture, or unreadable
+        now (a transient ``ps`` failure, or an unsupported platform) — is treated
+        as LIVE, so a possibly-running driver never has its lock stolen and two
+        orchestrators can never drive one worktree (review F-001).
+
+        This is the deliberate opposite of ``procident.process_is_alive``, which
+        fails closed the *other* way for re-attach (FR-7.2: unverifiable → treat
+        as orphaned → recover). For mutual exclusion, unverifiable must block.
+        """
+        try:
+            os.kill(rec.pid, 0)
+        except ProcessLookupError:
+            return False  # proven dead → reclaimable as stale
+        except PermissionError:
+            pass  # exists (owned by another user) — the reuse check decides
+        except OSError:
+            return True  # cannot signal → do not assume gone; keep the lock
+        recorded = ProcessIdentity.from_dict(rec.proc_identity)
+        if recorded is None:
+            return True  # alive, identity unverifiable → cannot prove reuse
+        fresh = read_process_identity(rec.pid)
+        if fresh is None:
+            return True  # alive, fresh read failed → cannot prove reuse
+        # Both identities present: equal → same live process (block); differ →
+        # the pid was reused by a new process → the original is gone (reclaim).
+        return recorded.same_process(fresh)
+
+    @staticmethod
+    def _lock_busy_message(rec: _LockRecord) -> str:
+        who = f"{rec.slug}/{rec.run_id}" if rec.run_id else rec.slug
+        return (
+            f"worktree is being driven by {who} (pid {rec.pid}); wait, or "
+            "abort that run first (FR-10.5)"
+        )
+
+    def _new_lock_record(self, slug: str, run_id: str | None) -> _LockRecord:
+        pid = os.getpid()
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:  # pragma: no cover - platform without process groups
+            pgid = pid
+        identity = read_process_identity(pid)
+        return _LockRecord(
+            nonce=secrets.token_hex(16),
+            slug=slug,
+            run_id=run_id,
+            pid=pid,
+            pgid=pgid,
+            started_at=_utc_stamp(),
+            host=socket.gethostname(),
+            proc_identity=identity.to_dict() if identity is not None else None,
+        )
+
+    @staticmethod
+    def _link_into_place(lock_path: Path, nonce: str, payload: str) -> bool:
+        """Atomically publish ``payload`` at ``lock_path`` iff it does not exist.
+
+        Write the full content to a unique temp first, then ``os.link`` it into
+        place — ``link`` fails if the target exists, so it is an atomic
+        create-if-absent **and** the lock is *never* observed empty (unlike
+        ``O_CREAT|O_EXCL`` then write, which leaves a zero-byte window a racing
+        acquirer could misread as corrupt and reclaim). Returns ``True`` on win.
+        """
+        tmp = lock_path.with_name(f"{lock_path.name}.{nonce}.tmp")
+        tmp.write_text(payload)
+        try:
+            os.link(tmp, lock_path)
+            return True
+        except FileExistsError:
+            return False
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+    def _try_reclaim(
+        self, lock_path: Path, observed: _LockRecord | None, nonce: str, payload: str
+    ) -> bool:
+        """Best-effort reclaim of a stale/corrupt lock; True iff we now hold it.
+
+        Re-reads the lock immediately before removing it and unlinks **only** the
+        record we observed as stale (matching nonce) — never a *new* owner's
+        fresh lock (the F-004 inverse of ownership-validated release). Then races
+        to atomically link our record into place; a lost race (someone else
+        reclaimed first) returns ``False`` so the caller re-evaluates the holder.
+        """
+        current = self._read_lock()
+        if current is not None:
+            if self._lock_is_live(current):
+                return False  # became live (or a fresh owner) → caller fails closed
+            if observed is None or current.nonce != observed.nonce:
+                return False  # changed under us → re-evaluate, don't blind-unlink
+        # current is None (corrupt/vanished) or matches our observed stale record:
+        try:
+            os.unlink(lock_path)
+        except FileNotFoundError:
+            pass
+        return self._link_into_place(lock_path, nonce, payload)
+
+    def _acquire_worktree_lock(
+        self, slug: str, run_id: str | None
+    ) -> _LockHandle:
+        """Acquire the worktree lock or fail closed (FR-10.5).
+
+        Atomic create-if-absent via ``os.link`` so check-and-acquire has no
+        TOCTOU window and the lock is never observed empty. A lock held by a
+        **live** pid fails the verb closed regardless of slug; a
+        dead/reused/unverifiable lock is reclaimed as stale. Acquired **first**
+        by `start`/`resume`/`approve`, before any run dir / `active-run.txt` /
+        git mutation.
+        """
+        run_root = self._run_root_dir()
+        run_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_run_root_gitignore(run_root)
+        lock_path = self._lock_path()
+        record = self._new_lock_record(slug, run_id)
+        payload = record.to_json()
+        for _ in range(_LOCK_ACQUIRE_RETRIES):
+            if self._link_into_place(lock_path, record.nonce, payload):
+                return self._take_handle(lock_path, record.nonce)
+            existing = self._read_lock()
+            if existing is not None and self._lock_is_live(existing):
+                raise WorktreeLockError(self._lock_busy_message(existing))
+            if self._try_reclaim(lock_path, existing, record.nonce, payload):
+                return self._take_handle(lock_path, record.nonce)
+            # transient race (a concurrent reclaim/empty window) → re-evaluate
+        raise WorktreeLockError(
+            "could not acquire the worktree lock after repeated reclaim races "
+            f"({lock_path}); a driver may be churning — fail closed (FR-10.5)"
+        )
+
+    def _take_handle(self, lock_path: Path, nonce: str) -> _LockHandle:
+        handle = _LockHandle(path=lock_path, nonce=nonce)
+        self._held_lock = handle
+        atexit.register(self._release_worktree_lock, handle)
+        return handle
+
+    def _release_worktree_lock(self, handle: _LockHandle | None) -> None:
+        """Release the lock, but only if it still carries our nonce (F-004).
+
+        If the file now holds a different nonce, we were already reclaimed as
+        stale and a *new* owner is driving — unlinking would re-open
+        double-driving, so the release is a **no-op**. Idempotent: safe to call
+        from the per-verb ``finally`` and again from the atexit fallback.
+        """
+        if handle is None:
+            return
+        current = self._read_lock()
+        if current is not None and current.nonce == handle.nonce:
+            try:
+                os.unlink(handle.path)
+            except FileNotFoundError:
+                pass
+        if self._held_lock is handle:
+            self._held_lock = None
+        # No-op if already gone; clears the atexit fallback for this manager
+        # (it holds at most one lock at a time, so this never drops a live one).
+        atexit.unregister(self._release_worktree_lock)
+
     # ---- run (FR-8.1) -------------------------------------------------------
     def start(
         self,
@@ -294,56 +651,118 @@ class RunManager:
         adapter_factory=None,
         extra_context: dict | None = None,
         clock=None,
+        run_id: str | None = None,
+        reservation_token: str | None = None,
     ) -> str:
+        # Containment first (FR-10.1 / review F-001): slug and a supplied run id
+        # flow straight into filesystem paths below, so refuse a traversal/
+        # separator/NUL segment before any path is built or any sidecar written.
+        safe_run_segment(slug, kind="slug")
+        if run_id is not None:
+            safe_run_segment(run_id, kind="run_id")
         self.check_entry_contract(slug)
         layout = self.layout(slug)
-        self._refuse_if_active_run(layout)
-        pipeline, phash = load_pipeline(pipeline_path)
-        validate_pipeline(pipeline, self.config)
+        # Run-id allocation handshake (FR-6.1a): the console supervisor
+        # pre-allocates the id and passes it as `gauntlet run --run-id <id>` so
+        # it knows `run_dir` before launch and can place the captured log +
+        # `job.json`. A *provided* id is single-use — error if its run dir
+        # already exists; a *minted* id disambiguates a (rare) same-second
+        # restart with a suffix.
+        #
+        # NOTE (UPSTREAM CONFLICT, surfaced not worked-around): FR-6.1a also
+        # names "the GAUNTLET_RUN_ID env var" as an equivalent handshake input.
+        # That name is ALREADY taken by the judge (judge/hook_client.py
+        # RUN_ID_ENV_VAR) to tell an agent's PreToolUse hooks which run they
+        # belong to, and the engine exports it into os.environ during every
+        # judged run. Reading it here would make `start()` silently inherit a
+        # stale/ambient run id from the surrounding session. The `--run-id` flag
+        # (the §6 control-surface + FR-6.1a primary mechanism) is collision-free
+        # and is what the supervisor uses, so the env-var equivalent is left
+        # unwired pending human resolution of the name clash.
+        provided = run_id
+        if provided:
+            run_id = provided
+            # Single-use (FR-6.1a). A supplied id may reuse a pre-existing run
+            # dir ONLY when it is the supervisor's fresh, single-use reservation
+            # for this very launch: the supervisor writes a reservation token
+            # under `run_dir/.serve/` and passes it as `--reservation-token`
+            # *before* launching this child (it also pre-creates `.serve/` for
+            # the captured log + job.json). Any other pre-existing run dir —
+            # a prior run's manifest, or a failed launch's diagnostic
+            # sidecar/log with no matching token — is refused so its state is
+            # never reused or overwritten (review F-005).
+            rd = layout.run_dir(run_id)
+            if (rd / "manifest.json").exists():
+                raise ActiveRunError(
+                    f"run {run_id!r} already exists for slug {slug!r}; a "
+                    "pre-allocated --run-id must be single-use (FR-6.1a)"
+                )
+            if rd.exists() and not _reservation_matches(rd, reservation_token):
+                raise ActiveRunError(
+                    f"run dir for {run_id!r} already exists for slug {slug!r} "
+                    "with prior run/diagnostic state and no matching fresh "
+                    "reservation; a pre-allocated --run-id must be single-use "
+                    "(FR-6.1a)"
+                )
+        else:
+            run_id = f"run-{_utc_stamp()}"
+            suffix = 1
+            while (layout.run_dir(run_id) / "manifest.json").exists():
+                run_id = f"run-{_utc_stamp()}-{suffix}"
+                suffix += 1
 
-        base_branch = self._resolve_base_branch()
-        branch = f"{self.config.branch_prefix}{slug}"
-        # F-3: the base must be an integration branch, never a machine-owned run
-        # branch. `base: current` while on a gauntlet/* branch would otherwise
-        # record branch==base and later wedge `finish`.
-        if base_branch == branch or base_branch.startswith(self.config.branch_prefix):
-            raise BaseBranchError(
-                f"base resolves to a run branch {base_branch!r} (prefix "
-                f"{self.config.branch_prefix!r}); check out an integration branch "
-                "to run from (or set base_branch) — the base must not be a "
-                "gauntlet/* branch"
+        # Acquire the worktree lock FIRST — before any run dir / active-run.txt
+        # / git mutation (FR-10.5). Released in `finally` on park/done/error.
+        handle = self._acquire_worktree_lock(slug, run_id)
+        try:
+            self._refuse_if_active_run(layout)
+            pipeline, phash = load_pipeline(pipeline_path)
+            validate_pipeline(pipeline, self.config)
+
+            base_branch = self._resolve_base_branch()
+            branch = f"{self.config.branch_prefix}{slug}"
+            # F-3: the base must be an integration branch, never a machine-owned
+            # run branch. `base: current` while on a gauntlet/* branch would
+            # otherwise record branch==base and later wedge `finish`.
+            if base_branch == branch or base_branch.startswith(self.config.branch_prefix):
+                raise BaseBranchError(
+                    f"base resolves to a run branch {base_branch!r} (prefix "
+                    f"{self.config.branch_prefix!r}); check out an integration "
+                    "branch to run from (or set base_branch) — the base must "
+                    "not be a gauntlet/* branch"
+                )
+            self._prepare_run_branch(branch, base_branch)
+
+            run_dir = layout.run_dir(run_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            # The active-run pointer is live bookkeeping, never commit payload
+            # (BOOTSTRAP-NOTES #33). An engine-written slug-level .gitignore
+            # keeps it ignored in EVERY repo — including throwaway fixture repos
+            # that lack the init-provided `runs/*/active-run.txt` rule — so it
+            # never dirties the worktree and `git add` never collides with it.
+            self._ensure_slug_gitignore(layout)
+            # Snapshot the exact pipeline source into the run dir so resume
+            # reloads precisely what started the run (FR-5.6 reproducibility).
+            (run_dir / "pipeline.yaml").write_text(pipeline_path.read_text())
+            layout.active_pointer.write_text(run_id)
+
+            man = Manifest(
+                run_id=run_id,
+                slug=slug,
+                branch=branch,
+                # Record the RESOLVED base (never the `current` sentinel) so
+                # resume, the PR draft, and `finish` act on a concrete branch.
+                base_branch=base_branch,
+                pipeline=PipelineRef(name=pipeline.name, version=pipeline.version, hash=phash),
+                prompt_hashes=self._prompt_hashes(pipeline),
             )
-        self._prepare_run_branch(branch, base_branch)
-
-        run_id = f"run-{_utc_stamp()}"
-        run_dir = layout.run_dir(run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        # The active-run pointer is live bookkeeping, never commit payload
-        # (BOOTSTRAP-NOTES #33). An engine-written slug-level .gitignore keeps
-        # it ignored in EVERY repo — including throwaway fixture repos that
-        # lack the init-provided `runs/*/active-run.txt` rule — so it never
-        # dirties the worktree and `git add` never collides with it.
-        self._ensure_slug_gitignore(layout)
-        # Snapshot the exact pipeline source into the run dir so resume reloads
-        # precisely what started the run (FR-5.6 reproducibility).
-        (run_dir / "pipeline.yaml").write_text(pipeline_path.read_text())
-        layout.active_pointer.write_text(run_id)
-
-        man = Manifest(
-            run_id=run_id,
-            slug=slug,
-            branch=branch,
-            # Record the RESOLVED base (never the `current` sentinel) so resume,
-            # the PR draft, and `finish` all act on a concrete branch name.
-            base_branch=base_branch,
-            pipeline=PipelineRef(name=pipeline.name, version=pipeline.version, hash=phash),
-            prompt_hashes=self._prompt_hashes(pipeline),
-        )
-        return self._drive(
-            layout, run_dir, pipeline, man,
-            use_judge=use_judge, adapter_factory=adapter_factory,
-            extra_context=extra_context, clock=clock,
-        )
+            return self._drive(
+                layout, run_dir, pipeline, man,
+                use_judge=use_judge, adapter_factory=adapter_factory,
+                extra_context=extra_context, clock=clock,
+            )
+        finally:
+            self._release_worktree_lock(handle)
 
     # ---- resume (FR-8.2) ----------------------------------------------------
     def resume(self, slug: str, *, use_judge: bool = True, adapter_factory=None,
@@ -352,46 +771,54 @@ class RunManager:
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
-        pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")
-        if phash != man.pipeline.hash:
-            raise RuntimeError(
-                "pipeline content hash changed since the run started "
-                f"({man.pipeline.hash} -> {phash}); resume refuses to run a "
-                "different pipeline against an existing manifest (FR-5.6)"
-            )
-        # F-1: resume continues the SAME branch the run committed to. Never
-        # recreate it from base (the old checkout_or_create_branch) — that would
-        # silently drop the manifest's recorded commits. Fail closed if the
-        # branch is gone or its tip no longer contains every recorded commit
-        # (reset / recreated / divergent), mirroring rollback's divergence guard.
-        repo = self.repo_root
-        if not gitops.branch_exists(repo, man.branch):
-            raise RunBranchStateError(
-                f"resume: run branch {man.branch!r} is missing; recreating it "
-                "from base would drop the manifest's recorded commits. Restore "
-                "the branch (e.g. from refs/gauntlet/backup/) before resuming."
-            )
-        # Validate the branch REF *before* checking it out — checking out first
-        # would rewind the worktree onto a stale/reset branch even though we are
-        # about to refuse. The last recorded commit must be reachable from the
-        # branch tip: a tip == last (normal interrupt) or slightly ahead (killed
-        # between commit and manifest persist) is fine; behind/divergent means
-        # recorded commits are missing (reset / recreated).
-        if man.commits:
-            last = man.commits[-1].sha
-            if not gitops.is_ancestor(repo, last, man.branch):
-                raise RunBranchStateError(
-                    f"resume: branch {man.branch!r} is missing the manifest's "
-                    f"recorded commit {last[:10]} (reset or recreated); the branch "
-                    "and manifest disagree. Reconcile (restore the branch, or "
-                    "`gauntlet rollback`) before resuming."
+        # Resume is a driving verb (FR-10.5): take the worktree lock FIRST,
+        # before the branch checkout / drive. The lock record carries this run's
+        # id from the manifest so a concurrent verb's refusal names the holder.
+        handle = self._acquire_worktree_lock(slug, man.run_id)
+        try:
+            pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")
+            if phash != man.pipeline.hash:
+                raise RuntimeError(
+                    "pipeline content hash changed since the run started "
+                    f"({man.pipeline.hash} -> {phash}); resume refuses to run a "
+                    "different pipeline against an existing manifest (FR-5.6)"
                 )
-        gitops.checkout_branch(repo, man.branch)
-        return self._drive(
-            layout, run_dir, pipeline, man,
-            use_judge=use_judge, adapter_factory=adapter_factory,
-            extra_context=extra_context, clock=clock,
-        )
+            # F-1: resume continues the SAME branch the run committed to. Never
+            # recreate it from base (the old checkout_or_create_branch) — that
+            # would silently drop the manifest's recorded commits. Fail closed if
+            # the branch is gone or its tip no longer contains every recorded
+            # commit (reset / recreated / divergent), like rollback's guard.
+            repo = self.repo_root
+            if not gitops.branch_exists(repo, man.branch):
+                raise RunBranchStateError(
+                    f"resume: run branch {man.branch!r} is missing; recreating "
+                    "it from base would drop the manifest's recorded commits. "
+                    "Restore the branch (e.g. from refs/gauntlet/backup/) first."
+                )
+            # Validate the branch REF *before* checking it out — checking out
+            # first would rewind the worktree onto a stale/reset branch even
+            # though we are about to refuse. The last recorded commit must be
+            # reachable from the branch tip: tip == last (normal interrupt) or
+            # slightly ahead (killed between commit and manifest persist) is
+            # fine; behind/divergent means recorded commits are missing.
+            if man.commits:
+                last = man.commits[-1].sha
+                if not gitops.is_ancestor(repo, last, man.branch):
+                    raise RunBranchStateError(
+                        f"resume: branch {man.branch!r} is missing the "
+                        f"manifest's recorded commit {last[:10]} (reset or "
+                        "recreated); the branch and manifest disagree. "
+                        "Reconcile (restore the branch, or `gauntlet rollback`) "
+                        "before resuming."
+                    )
+            gitops.checkout_branch(repo, man.branch)
+            return self._drive(
+                layout, run_dir, pipeline, man,
+                use_judge=use_judge, adapter_factory=adapter_factory,
+                extra_context=extra_context, clock=clock,
+            )
+        finally:
+            self._release_worktree_lock(handle)
 
     # ---- gates --------------------------------------------------------------
     def approve(self, slug: str, gate: str | None = None, notes: str | None = None,
@@ -402,16 +829,23 @@ class RunManager:
         gate = gate or man.current_step
         if gate is None:
             raise ValueError("no gate to approve; run is not parked")
-        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-        # Approving a gate drives the rest of the run, so honor use_judge for it.
-        if use_judge:
-            return self._with_judge(man, run_dir, lambda env: self._approve_drive(
-                layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
-        orch = self._orchestrator(layout, run_dir, pipeline, man,
-                                  judge_env={}, adapter_factory=adapter_factory)
-        status = orch.approve_gate(gate, notes)
-        self._maybe_draft_pr(layout, run_dir, man, status)
-        return status
+        # Approve drives the rest of the run, so it is a driving verb (FR-10.5):
+        # take the worktree lock first, released in `finally` on the next park /
+        # done / error.
+        handle = self._acquire_worktree_lock(slug, man.run_id)
+        try:
+            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+            # Approving a gate drives the rest of the run, so honor use_judge.
+            if use_judge:
+                return self._with_judge(man, run_dir, lambda env: self._approve_drive(
+                    layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
+            orch = self._orchestrator(layout, run_dir, pipeline, man,
+                                      judge_env={}, adapter_factory=adapter_factory)
+            status = orch.approve_gate(gate, notes)
+            self._maybe_draft_pr(layout, run_dir, man, status)
+            return status
+        finally:
+            self._release_worktree_lock(handle)
 
     def reject(self, slug: str, notes: str, gate: str | None = None) -> str:
         layout = self.layout(slug)
@@ -429,6 +863,15 @@ class RunManager:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
+        # Terminal history is read-only (review F-002): never rewrite a
+        # done/aborted/failed run's status. Fail closed so neither a stray CLI
+        # `gauntlet abort` nor the console control path can corrupt a completed
+        # run's recorded outcome.
+        if man.status in _TERMINAL_RUN_STATES:
+            raise AbortGuardError(
+                f"run {man.run_id!r} for slug {slug!r} is already {man.status}; "
+                "terminal runs cannot be aborted (history is read-only)"
+            )
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
         return man.status

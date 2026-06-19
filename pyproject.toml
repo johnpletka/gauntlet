@@ -24,6 +24,11 @@ dependencies = [
     "litellm>=1.40",
     "jsonschema>=4.21",
     "pyyaml>=6.0",
+    # Console (web/) promotes two already-transitive deps to explicit so a
+    # future fastapi/litellm bump cannot silently drop them (FR-11.3): jinja2
+    # renders the server-side pages (P1), httpx posts Slack notifications (P6).
+    "jinja2>=3.1",
+    "httpx>=0.27",
 ]
 
 [project.urls]
