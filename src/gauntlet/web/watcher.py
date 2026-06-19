@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
 from gauntlet.engine.manifest import Manifest
 from gauntlet.web.store import RunStore, _current_record, _mtime_iso
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_S = 1.0
 
@@ -57,6 +61,7 @@ class WatchEvent(BaseModel):
     run_status: str
     current_step: str | None = None
     current_step_status: str | None = None
+    current_step_type: str | None = None  # step `type` (gate vs cycle) for FR-9.1
     current_step_notes: str | None = None
     updated: str | None = None  # manifest mtime as ISO (display)
     revision: int | None = None  # manifest mtime in ns: the FR-8.1 manifest_revision
@@ -85,22 +90,40 @@ class Watcher:
     P6's notifier can hang off the same call). ``run`` wraps it in the ~1s loop.
     """
 
-    def __init__(self, store: RunStore, *, interval: float = DEFAULT_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        store: RunStore,
+        *,
+        interval: float = DEFAULT_INTERVAL_S,
+        notifier: Any | None = None,
+    ) -> None:
         self.store = store
         self.interval = interval
+        # The P6 notifier (duck-typed: ``prime(event)`` / ``notify(event)``) so the
+        # watcher carries no import dependency on ``notify.py`` (which imports the
+        # watcher). Set here or assigned later (create_app wires it). When None,
+        # the watcher is a pure transition observer, exactly as in P2.
+        self.notifier = notifier
         # manifest path → (last mtime_ns, last semantic identity-or-None)
         self._seen: dict[Path, tuple[int, Identity | None]] = {}
-        self._subscribers: set[asyncio.Queue[WatchEvent]] = set()
+        # SSE subscriber queues carry WatchEvent (transitions) AND Notification
+        # objects (the in-tab notify channel publishes onto the same queues; the
+        # SSE stream type-dispatches them to `transition`/`notify` events, P6).
+        self._subscribers: set[asyncio.Queue[Any]] = set()
         self._task: asyncio.Task | None = None
 
     # ---- event bus -----------------------------------------------------------
-    def subscribe(self) -> asyncio.Queue[WatchEvent]:
-        """Register a subscriber queue (one per open SSE stream)."""
-        q: asyncio.Queue[WatchEvent] = asyncio.Queue()
+    def subscribe(self) -> asyncio.Queue[Any]:
+        """Register a subscriber queue (one per open SSE stream).
+
+        The queue carries both :class:`WatchEvent` transitions and (P6)
+        ``Notification`` objects; the SSE stream type-dispatches them.
+        """
+        q: asyncio.Queue[Any] = asyncio.Queue()
         self._subscribers.add(q)
         return q
 
-    def unsubscribe(self, q: asyncio.Queue[WatchEvent]) -> None:
+    def unsubscribe(self, q: asyncio.Queue[Any]) -> None:
         self._subscribers.discard(q)
 
     def _publish(self, event: WatchEvent) -> None:
@@ -108,6 +131,39 @@ class Watcher:
         # dropped by unsubscribe in the stream's `finally`.
         for q in list(self._subscribers):
             q.put_nowait(event)
+
+    def publish_notification(self, note: Any) -> None:
+        """Fan a :class:`~gauntlet.web.notify.Notification` to open SSE streams.
+
+        The in-tab notify channel (P6, FR-9.2) calls this so a deduplicated
+        notification reaches every connected browser as a distinct ``notify`` SSE
+        event. It rides the same subscriber queues as transitions; the stream
+        type-dispatches by object type, so ordering (transition then its notify)
+        is preserved.
+        """
+        for q in list(self._subscribers):
+            q.put_nowait(note)
+
+    def _dispatch_notify(self, event: WatchEvent, *, first: bool) -> None:
+        """Hand an emitted transition to the notifier, fail-soft (FR-9.3).
+
+        A *first observation* of a manifest is **primed** (its de-dup key is
+        recorded but nothing is sent) so that starting ``gauntlet serve`` over a
+        tree of already-parked/finished runs does not flood the operator with
+        notifications for states that predate the server. Every later transition
+        is a real ``notify``. A notifier error is logged and swallowed here (on
+        top of the per-channel guard) so it can never reach the poll loop and
+        affect a run.
+        """
+        if self.notifier is None:
+            return
+        try:
+            if first:
+                self.notifier.prime(event)
+            else:
+                self.notifier.notify(event)
+        except Exception:  # pragma: no cover - defense in depth (FR-9.3)
+            logger.exception("notifier raised on %s; swallowed (FR-9.3)", event.run_id)
 
     # ---- polling core --------------------------------------------------------
     def _event_for(
@@ -120,6 +176,7 @@ class Watcher:
             run_status=man.status,
             current_step=man.current_step,
             current_step_status=cur.status if cur else None,
+            current_step_type=cur.type if cur else None,
             current_step_notes=cur.notes if cur else None,
             updated=_mtime_iso(manifest_path),
             revision=mtime_ns,
@@ -158,6 +215,13 @@ class Watcher:
             if prev is None or prev[1] != identity:
                 events.append(event)
                 self._publish(event)
+                # Hand the transition to the notifier (P6). A run we have not yet
+                # recorded a *valid* identity for is **primed** (its de-dup key is
+                # set but nothing is sent) so a tree of pre-existing parked/done
+                # runs does not flood the operator on startup; everything after is
+                # a real notify. ``prev[1] is None`` keeps a run whose first read
+                # was torn (recorded with a None identity) primed too.
+                self._dispatch_notify(event, first=prev is None or prev[1] is None)
             self._seen[manifest_path] = (mtime_ns, identity)
         # Forget runs whose dir vanished (rare), so memory tracks live runs only.
         for gone in set(self._seen) - live:

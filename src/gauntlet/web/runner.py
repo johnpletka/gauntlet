@@ -69,7 +69,16 @@ def serve(
     os.environ[TOKEN_ENV_VAR] = resolved_token
     supervisor = JobSupervisor(repo_root)
     store = RunStore.from_repo(repo_root, supervisor=supervisor)
-    app = create_app(store, token=resolved_token, supervisor=supervisor)
+    # Enable notifications (FR-9) for a real serve, with a deep-link base so the
+    # desktop/Slack messages carry an absolute URL to /runs/<slug>. The configured
+    # channels (web.notify) are wired off the watcher's event bus, fail-soft.
+    app = create_app(
+        store,
+        token=resolved_token,
+        supervisor=supervisor,
+        notifications=True,
+        base_url=f"http://{host}:{port}",
+    )
     print(f"gauntlet console listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
     # The convenience URL goes to stderr so it never contaminates the token line

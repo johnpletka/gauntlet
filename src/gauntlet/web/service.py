@@ -26,6 +26,7 @@ from pydantic import BaseModel, field_validator
 from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
 from gauntlet.web.gate import GateResolver, NoPendingGate, handoff_prompt
 from gauntlet.web.intel import resume_intel
+from gauntlet.web.notify import build_notifier
 from gauntlet.web.sse import SSE_HEADERS, event_stream, log_tail_stream
 from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
 from gauntlet.web.supervisor import ControlFailed, ControlRefused
@@ -105,6 +106,9 @@ def create_app(
     watcher: Watcher | None = None,
     supervisor=None,
     handoff_enabled: bool = False,
+    notifier=None,
+    base_url: str = "",
+    notifications: bool = False,
 ) -> FastAPI:
     # The watcher (P2) drives live state. Created here unless injected (tests
     # inject one they drive synchronously via `poll_once`). It is started/stopped
@@ -112,6 +116,19 @@ def create_app(
     # read-only tests) never starts the poll loop, while `with TestClient(app)`
     # gets a live watcher.
     watcher = watcher if watcher is not None else Watcher(store)
+    # The notifier (P6, FR-9) hangs off the watcher's event bus, fail-soft. Built
+    # from the `web.notify` config block (per-channel on/off + Slack webhook,
+    # FR-9.4) only when `notifications=True` (the runner enables it for a real
+    # `gauntlet serve`); it defaults **off** so the many test apps that drive a
+    # live watcher via `with TestClient(app)` never fire a real desktop/Slack
+    # send. Tests that exercise notifications inject a stub `notifier` instead.
+    # Its in-tab channel publishes onto the watcher's SSE queues, so it is wired
+    # *after* the watcher exists.
+    if notifier is None and notifications:
+        notifier = build_notifier(
+            store.config.web.notify, watcher=watcher, base_url=base_url
+        )
+    watcher.notifier = notifier
     # The supervisor (P3) owns console-launched runs and surfaces the worktree
     # lock. Wire it into the store so list rows carry the owned/observed/external
     # badge (FR-1.4/FR-10.5). When absent (read-only deployments) every run is

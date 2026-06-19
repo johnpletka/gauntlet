@@ -110,6 +110,33 @@ class AgentProfile(BaseModel):
         return self.adapter_class().capabilities
 
 
+class WebNotifyConfig(BaseModel):
+    """Console notification settings (`web.notify`, FR-9.4).
+
+    Per-channel on/off plus the Slack webhook. Additive and backward-compatible:
+    an absent ``web:`` block leaves every channel at its default. The Slack
+    channel only actually fires when a webhook is resolved — from ``slack_webhook``
+    here or the ``GAUNTLET_SLACK_WEBHOOK`` env fallback (FR-9.4) — so ``slack:
+    true`` with no webhook is a safe no-op, not an error.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    desktop: bool = True  # macOS desktop (terminal-notifier / osascript)
+    slack: bool = True  # Slack incoming-webhook POST (needs a webhook to fire)
+    in_tab: bool = True  # browser in-tab Notification over SSE
+    slack_webhook: str | None = None  # falls back to GAUNTLET_SLACK_WEBHOOK
+
+
+class WebConfig(BaseModel):
+    """Optional `web:` block for the console (FR-9.4). Additive; defaults preserve
+    pre-console behavior."""
+
+    model_config = ConfigDict(extra="allow")
+
+    notify: WebNotifyConfig = Field(default_factory=WebNotifyConfig)
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -154,6 +181,11 @@ class RunConfig(BaseModel):
     # Configurable redaction list (FR-4.4), default-on; the transcript logger
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
+
+    # Optional console (`gauntlet serve`) settings — notifications for v1
+    # (FR-9.4). Additive: an absent block leaves the console at its defaults and
+    # does not affect any engine behavior.
+    web: WebConfig = Field(default_factory=WebConfig)
 
     @field_validator("asset_root")
     @classmethod

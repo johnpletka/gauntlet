@@ -34,11 +34,45 @@
     });
   }
 
+  // In-tab notification (P6, FR-9.2): the `notify` SSE event carries a
+  // deduplicated Notification for the four "needs a human" moments. We ask for
+  // permission lazily (on the first notify) and fail soft if the browser has no
+  // Notification API or the user denied it — a notification can never break the
+  // live view.
+  function notify(ev) {
+    if (typeof Notification === "undefined") return;
+    var data;
+    try {
+      data = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+    function show() {
+      if (Notification.permission !== "granted") return;
+      try {
+        var n = new Notification(data.title, { body: data.body, tag: data.run_id });
+        n.onclick = function () {
+          window.open(data.url || "/runs/" + data.slug, "_blank");
+        };
+      } catch (e) {
+        /* fail soft: notification is best-effort */
+      }
+    }
+    if (Notification.permission === "default") {
+      Notification.requestPermission().then(show);
+    } else {
+      show();
+    }
+  }
+
   var channel = document.body.getAttribute("data-sse");
   if (!channel || regions().length === 0) return;
 
   var source = new EventSource(channel);
-  // `snapshot` fires on (re)connect; `transition` on each edge-triggered change.
+  // `snapshot` fires on (re)connect; `transition` on each edge-triggered change;
+  // `notify` on a deduplicated FR-9.1 transition kind (gate / escalation / fail /
+  // complete).
   source.addEventListener("snapshot", refresh);
   source.addEventListener("transition", refresh);
+  source.addEventListener("notify", notify);
 })();

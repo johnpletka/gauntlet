@@ -19,8 +19,9 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+from gauntlet.web.notify import Notification
 from gauntlet.web.store import RunStore
-from gauntlet.web.watcher import Watcher
+from gauntlet.web.watcher import WatchEvent, Watcher
 
 # Headers that keep proxies/browsers from buffering an SSE stream.
 SSE_HEADERS = {
@@ -53,9 +54,13 @@ async def event_stream(
 
     On connect it first emits a ``snapshot`` of current run-list rows, so a
     fresh or auto-reconnected client always re-reads authoritative state and can
-    never miss a transition that fired while it was disconnected. Thereafter it
-    forwards each watcher transition as a ``transition`` event; a quiet stream
-    emits comment keepalives every ``keepalive`` seconds.
+    never miss a transition that fired while it was disconnected. Thereafter the
+    shared subscriber queue carries two object types, dispatched by type: a
+    :class:`~gauntlet.web.watcher.WatchEvent` is forwarded as a ``transition``
+    (drives the live partial re-fetch, P2), and a
+    :class:`~gauntlet.web.notify.Notification` (the P6 in-tab channel) as a
+    ``notify`` (drives the browser ``Notification``). A quiet stream emits comment
+    keepalives every ``keepalive`` seconds.
     """
     q = watcher.subscribe()
     sent = 0
@@ -65,11 +70,16 @@ async def event_stream(
             if await is_disconnected():
                 break
             try:
-                event = await asyncio.wait_for(q.get(), timeout=keepalive)
+                item = await asyncio.wait_for(q.get(), timeout=keepalive)
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
                 continue
-            yield pack("transition", event.model_dump())
+            if isinstance(item, Notification):
+                yield pack("notify", item.model_dump())
+            elif isinstance(item, WatchEvent):
+                yield pack("transition", item.model_dump())
+            else:  # pragma: no cover - defensive: unknown queue item
+                continue
             sent += 1
     finally:
         watcher.unsubscribe(q)
