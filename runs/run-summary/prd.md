@@ -1,4 +1,4 @@
-# PRD: RUN-SUMMARY.md — a committed build-narrative artifact
+/# PRD: RUN-SUMMARY.md — a committed build-narrative artifact
 
 **Status:** Draft v0.1
 **Author:** John (with Claude)
