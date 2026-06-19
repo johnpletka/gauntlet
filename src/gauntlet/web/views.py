@@ -31,7 +31,13 @@ from gauntlet.web.auth import COOKIE_NAME, SessionStore, safe_next
 from gauntlet.web.gate import GateResolver, NoPendingGate
 from gauntlet.web.intel import resume_intel
 from gauntlet.web.markdown import render_markdown
-from gauntlet.web.store import RunNotFound, RunStore, UnsafePath, duration_seconds
+from gauntlet.web.store import (
+    RunNotFound,
+    RunStore,
+    UnsafePath,
+    _safe_segment,
+    duration_seconds,
+)
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -99,6 +105,73 @@ def _detail_context(store: RunStore, slug: str, run_id: str | None) -> dict:
     }
     ctx.update(_lock_context(store))
     return ctx
+
+
+def _step_detail_context(
+    store: RunStore,
+    slug: str,
+    step: str,
+    run_id: str | None,
+    iteration: str | None,
+    artifact: str | None,
+) -> dict:
+    """Context for the step transcript drill-down page (FR-3.1).
+
+    Resolves the step's on-disk artifacts via ``store.step_detail`` and merges
+    in the manifest metadata for the matching record. A ``foreach`` fan-out
+    stores several records under one ``id`` differing by ``iteration`` — pick the
+    one named by ``?iteration=`` when given, else the first/only matching record.
+    The selected ``?artifact=`` is read through the contained, allowlisted
+    ``store.read_step_artifact`` (never an arbitrary path); it defaults to
+    ``transcript.md`` when present so a step row lands on its transcript.
+    """
+    detail = store.step_detail(slug, step, run_id)
+    man = store.manifest(slug, run_id)
+    base = step.split(".")[0]
+    records = [s for s in man.steps if s.id in (step, base)]
+    record = None
+    if iteration is not None:
+        record = next(
+            (s for s in records if (s.iteration or "") == iteration), None
+        )
+    if record is None:
+        record = records[0] if records else None
+
+    names = [a.name for a in detail.artifacts]
+    # An explicit ?artifact= is validated through the contained, allowlisted
+    # reader: an *unsafe* segment (traversal/separator/NUL) raises UnsafePath and
+    # is surfaced as a 400 by the app's exception handler — never silently
+    # downgraded to the default. A safe-but-absent name is shown as a content
+    # error. With no ?artifact=, default to transcript.md when present.
+    selected = artifact or (("transcript.md") if "transcript.md" in names else None)
+    content: str | None = None
+    content_error: str | None = None
+    if selected is not None:
+        if artifact is not None:
+            _safe_segment(artifact, kind="artifact")
+        try:
+            content = store.read_step_artifact(
+                slug, step, selected, run_id=run_id
+            )
+        except RunNotFound as exc:
+            content = None
+            content_error = str(exc) or exc.__class__.__name__
+
+    started = record.started if record else None
+    ended = record.ended if record else None
+    return {
+        "slug": slug,
+        "step": step,
+        "run_id": detail.run_id,
+        "detail": detail,
+        "record": record,
+        "iteration": iteration,
+        "duration_s": duration_seconds(started, ended),
+        "artifact_names": names,
+        "selected": selected,
+        "content": content,
+        "content_error": content_error,
+    }
 
 
 def register_views(
@@ -194,6 +267,27 @@ def register_views(
         ctx = _detail_context(store, slug, run_id)
         ctx["csrf_token"] = _csrf(request)
         return templates.TemplateResponse(request, "run_detail.html", ctx)
+
+    @app.get(
+        "/runs/{slug}/steps/{step}",
+        response_class=HTMLResponse,
+        dependencies=[auth],
+    )
+    def step_detail_page(
+        request: Request,
+        slug: str,
+        step: str,
+        run_id: str | None = Query(default=None),
+        iteration: str | None = Query(default=None),
+        artifact: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        # FR-3.1: the step transcript drill-down. Lists the step's artifacts and
+        # renders the selected one (transcript.md as markdown by default); the
+        # `?artifact=` choice is allowlisted in `store.read_step_artifact` so it
+        # can never address an arbitrary path (containment, FR-10.1).
+        ctx = _step_detail_context(store, slug, step, run_id, iteration, artifact)
+        ctx["csrf_token"] = _csrf(request)
+        return templates.TemplateResponse(request, "step_detail.html", ctx)
 
     # ---- full-history browser + cost report (P7, FR-2.4) --------------------
     @app.get("/runs/{slug}/history", response_class=HTMLResponse, dependencies=[auth])

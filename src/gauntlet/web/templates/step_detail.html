@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}{{ step }} · {{ slug }} · Gauntlet Console{% endblock %}
+{% block body %}
+{# FR-3.1: step transcript drill-down. Read-only — lists the step's on-disk
+   artifacts and renders the selected one (transcript.md as markdown by default).
+   The ?artifact= choice is allowlisted server-side (store.read_step_artifact). #}
+<p><a href="/runs/{{ slug }}?run_id={{ run_id }}">← {{ slug }}</a></p>
+<h1>{{ step }}{% if record and record.iteration is not none %}<span class="muted">[{{ record.iteration }}]</span>{% endif %}</h1>
+
+<section class="summary">
+  <span class="muted">run {{ run_id }}</span>
+  {% if record %}
+    {% if record.type %}<span class="muted">{{ record.type }}</span>{% endif %}
+    <span class="status status-{{ record.status }}">{{ record.status }}</span>
+    <span class="muted">agent {{ record.agent or "—" }}</span>
+    {% if duration_s is not none %}<span class="muted">{{ "%.0f"|format(duration_s) }}s</span>{% endif %}
+    {% if record.usage and record.usage.cost_usd is not none %}<span class="muted">${{ "%.2f"|format(record.usage.cost_usd) }}</span>{% endif %}
+  {% else %}
+    <span class="muted">(no manifest record)</span>
+  {% endif %}
+</section>
+
+<dl class="meta">
+  <dt>started</dt><dd>{{ record.started if record else "—" }}</dd>
+  <dt>ended</dt><dd>{{ record.ended if record else "—" }}</dd>
+  {% if record and record.notes %}<dt>notes</dt><dd class="notes">{{ record.notes }}</dd>{% endif %}
+</dl>
+
+<h2>Artifacts</h2>
+{% if artifact_names %}
+<ul class="artifacts">
+  {% for a in detail.artifacts %}
+    <li>
+      <a href="/runs/{{ slug }}/steps/{{ step }}?run_id={{ run_id }}{% if iteration is not none %}&iteration={{ iteration }}{% endif %}&artifact={{ a.name }}"
+         {% if a.name == selected %}class="selected"{% endif %}>{{ a.name }}</a>
+      <span class="muted">{{ a.size }} B</span>
+    </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">no artifacts on disk for this step yet</p>
+{% endif %}
+
+{# Nested round dirs (adversarial_cycle): findings/triage/confirm per round. #}
+{% if detail.rounds %}
+<h2>Rounds</h2>
+{% for r in detail.rounds %}
+  <details {% if loop.first %}open{% endif %}>
+    <summary>{{ r.name }} <span class="muted">({{ r.artifacts|length }} artifact(s))</span></summary>
+    {% if r.artifacts %}
+    <ul class="artifacts">
+      {% for a in r.artifacts %}<li>{{ a.name }} <span class="muted">{{ a.size }} B</span></li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if r.items %}<p class="muted">subdirs: {{ r.items | join(", ") }}</p>{% endif %}
+  </details>
+{% endfor %}
+{% endif %}
+
+{% if selected %}
+<h2>{{ selected }}</h2>
+{% if content_error %}
+  <p class="warn">could not read artifact: {{ content_error }}</p>
+{% elif content is not none %}
+  {% if selected.endswith(".md") %}
+    <div class="markdown">{{ content | markdown }}</div>
+  {% else %}
+    <pre class="artifact">{{ content }}</pre>
+  {% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}

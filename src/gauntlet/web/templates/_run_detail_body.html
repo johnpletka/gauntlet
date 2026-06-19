@@ -50,7 +50,7 @@
   <tbody>
   {% for s in steps %}
     <tr>
-      <td>{{ s.id }}{% if s.iteration is not none %}<span class="muted">[{{ s.iteration }}]</span>{% endif %}</td>
+      <td><a href="/runs/{{ slug }}/steps/{{ s.id }}?run_id={{ manifest.run_id }}{% if s.iteration is not none %}&iteration={{ s.iteration }}{% endif %}">{{ s.id }}{% if s.iteration is not none %}<span class="muted">[{{ s.iteration }}]</span>{% endif %}</a></td>
       <td>{{ s.type }}</td>
       <td><span class="status status-{{ s.status }}">{{ s.status }}</span></td>
       <td>{{ s.agent or "—" }}</td>

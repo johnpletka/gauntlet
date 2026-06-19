@@ -609,6 +609,44 @@ class RunStore:
                     break
         return out
 
+    def read_step_artifact(
+        self,
+        slug: str,
+        step: str,
+        name: str,
+        *,
+        run_id: str | None = None,
+        max_bytes: int = DEFAULT_LOG_MAX_BYTES,
+    ) -> str:
+        """Read one of a step's artifacts as text, contained + allowlisted.
+
+        ``name`` is user-controlled (the ``?artifact=`` query of the step-detail
+        page), so it must never address an arbitrary path: it is validated as a
+        single safe segment, asserted to stay within the *step* dir (so an
+        allowed-name symlink cannot escape — same posture as :meth:`step_log`),
+        and rejected unless it is one of the names :meth:`step_detail` actually
+        reports for this step (its top-level artifacts). Anything else → 404, so
+        the page can only surface artifacts the read model already knows about.
+        Capped like a log tail (R5) so one request can never pull an unbounded
+        file into memory.
+        """
+        detail = self.step_detail(slug, step, run_id)
+        allowed = {a.name for a in detail.artifacts}
+        run_dir = self.run_dir(slug, run_id)
+        _safe_segment(step, kind="step")
+        step_dir = self._assert_contained(run_dir / "steps" / step)
+        _safe_segment(name, kind="artifact")
+        if name not in allowed:
+            raise RunNotFound(
+                f"artifact {name!r} is not an artifact of step {step!r}"
+            )
+        path = self._assert_within(step_dir / name, step_dir)
+        if not path.exists() or not path.is_file():
+            raise RunNotFound(f"artifact {name!r} not found for step {step!r}")
+        with path.open("rb") as fh:
+            raw = fh.read(max_bytes)
+        return raw.decode("utf-8", errors="replace")
+
     def step_detail(
         self, slug: str, step: str, run_id: str | None = None
     ) -> StepDetail:
