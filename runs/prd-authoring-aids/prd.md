@@ -1,10 +1,14 @@
-# PRD: PRD-authoring aids — teach the repo its own PRD conventions
+# PRD: Assisted PRD authoring — help the human write a well-structured PRD
 
-**Status:** Draft v0.1
+**Status:** Draft v0.2 (unifies the prd-authoring-aids draft with proposal #11, interactive PRD authoring)
 **Author:** John (with Claude)
 **Date:** 2026-06-23
-**Working name:** PRD-authoring aids (the repo teaches you how to author a PRD for it)
-**Relationship to existing artifacts:** Extends `gauntlet init` scaffolding (FR-1.2) and the `gauntlet new` PRD stub (FR-10.1). It adds two committable aids alongside existing assets and **does not amend `PRD-gauntlet.md`**, the entry contract's *intent* (a human still authors the PRD), or any pipeline prompt. Builds on: the asset-copy machinery in `engine/init.py`, the `.claude/settings.json` hook-wiring pattern, the `_PRD_STUB` / `check_entry_contract` mechanism in `engine/run.py`, and the `prompts/prd-author.md` playbook.
+**Working name:** Assisted PRD authoring (slug stays `prd-authoring-aids`)
+**Relationship to existing artifacts:**
+- **Passive aids** (a skill + a structured stub) extend `gauntlet init` scaffolding (FR-1.2) and the `gauntlet new` stub (FR-10.1) — no amendment.
+- The **interactive path** proposes **FR-10.1a (assisted authoring)** as a ratified delta to `PRD-gauntlet.md` (absorbed from proposal #11). Its engine phases are gated on that ratification.
+- **Does not amend `PRD-gauntlet.md`** for the passive tier, and does not touch any approved `runs/*` artifact. Supersedes proposal `proposals/interactive-prd-authoring.md` (PR #11) and the standalone prd-authoring-aids draft.
+- Builds on: the asset-copy + `.claude` wiring in `engine/init.py`; `_PRD_STUB` / `check_entry_contract` in `engine/run.py`; the `ClaudeCodeAdapter` + judge wiring; and the `prompts/prd-author.md` playbook.
 
 ---
 
@@ -12,25 +16,26 @@
 
 ### 1.1 Problem statement
 
-Gauntlet's PRD-authoring conventions — the `prd-author.md` playbook, the section structure, *where* a PRD lives, and the fact that you run `gauntlet run <slug>` next — only help if the human already knows them. A fresh Claude session in a Gauntlet repo has no idea `prd-author.md` exists; `gauntlet new` emits a near-empty stub; and both common entry paths depend on tribal knowledge:
+Authoring a *well-structured* PRD before `gauntlet run` is friction-laden, and the friction has four faces:
 
-1. `gauntlet new <slug>` → author the stub. The author must know the structure and conventions unaided.
-2. A fresh session → "enter plan mode, write a PRD, save it to `<run_root>/<slug>/prd.md`." This depends entirely on the human remembering the path and the workflow.
-
-The `prd-author.md` playbook now ships into every install, but it is **inert**: nothing surfaces it to a session, so it is used only when the human manually points at it.
+1. **Cold start.** `gauntlet new` writes a near-empty stub. A human facing it has no scaffolding toward the structure the document reviewer (`prompts/review-document.md`) grades against — goals/non-goals, testable requirements, risks, phases.
+2. **Tribal knowledge.** The `prd-author.md` playbook now ships in every install but is **inert** — nothing surfaces it. A fresh Claude session does not know it exists, nor where the PRD must live, nor that `gauntlet run` comes next.
+3. **The detour.** Authors draft the PRD in a separate session or tool and hand-copy it into place — observed directly: a PRD authored in a side session targeting the wrong path (`docs/…`), needing manual relocation into `runs/<slug>/`.
+4. **Unused context.** PRDs often originate from a Linear ticket or GitHub issue; nothing pulls that into the authoring step.
 
 ### 1.2 Solution summary
 
-Make the repo *teach itself* by installing two committable aids:
+Tiered aids that all share **one** interview-not-generate playbook (`prompts/prd-author.md`):
 
-- **A Claude Code skill** (`.claude/skills/gauntlet-prd-author/SKILL.md`), installed by `gauntlet init`, that triggers on PRD-authoring intent and routes the session to the playbook and the conventions (where the PRD goes, scaffold with `gauntlet new`, run `gauntlet run` after). It is a **thin pointer** to `prd-author.md`, not a copy.
-- **A structured `gauntlet new` stub**: the playbook's section skeleton plus a one-line guidance hint per section, so authoring starts from the right shape — while **keeping the FR-10.1 marker** so an unfilled skeleton still cannot start a run.
+- **Passive tier** — a structured `gauntlet new` stub (section skeleton + guidance, keeping the FR-10.1 marker) and an `init`-installed Claude Code skill that routes any session to the playbook and the conventions. Addresses faces 1–2.
+- **Active tier** — `gauntlet new <slug> --interactive [--from <source>]`: scaffold the stub, then launch a **seeded, judge-gated session** that interviews the human and drafts into `prd.md` in place, optionally seeded from a ticket/issue/file. Addresses faces 3–4.
 
-The skill covers the Claude-session entry path; the structured stub covers the `gauntlet new` path and is CLI-agnostic. Both are committable, so a teammate who clones the repo inherits them (the FR-1.2 "identical workflow" goal).
+Every tier preserves FR-10.1: the human stays the author of record, and the entry contract + PRD review gate are unchanged. The same `prd-author.md` is what the skill points to *and* what seeds the interactive session — one source of truth, no duplicate prompt.
 
-### 1.3 The assumption this validates
+### 1.3 The assumptions this validates
 
-That a **per-repo, committable Claude Code skill is reliably discovered and triggered** from a natural-language PRD request on the pinned Claude Code version — and that a richer stub improves authoring **without weakening** the FR-10.1 human-author gate. Skills are a moving Claude Code feature; this is the riskiest external dependency, so it is validated first (§8 P1), mirroring how the core PRD front-loaded hook-semantics risk.
+- **(a)** A per-repo, committable Claude Code skill is reliably discovered and triggered on the pinned Claude Code version (passive tier; the riskiest *external* dependency, validated first).
+- **(b)** An interview-seeded session preserves FR-10.1's load-bearing property — *the artifact entering review carries human intent that exists independently of the agent* — i.e. **assisted ≠ autogenerated**. The seed prompt (the playbook) is solely responsible for this; it is the crux of the active tier (proposal #11: "the prompt is where this feature is won or lost").
 
 ## 2. Goals and Non-Goals
 
@@ -38,106 +43,141 @@ That a **per-repo, committable Claude Code skill is reliably discovered and trig
 
 | # | Goal | Addresses |
 |---|------|-----------|
-| G1 | A Claude session in an init'd repo auto-discovers how to author a PRD (skill → playbook + conventions) | "the playbook is inert; conventions are tribal knowledge" |
-| G2 | `gauntlet new` produces a structured, guidance-bearing stub instead of a near-empty one | both entry paths start from the right structure |
-| G3 | Single source of truth for the instructions — the skill references `prd-author.md`, never copies it | drift avoidance |
-| G4 | Both aids are committable and propagate via `gauntlet init` like every other asset | teammates inherit the workflow (FR-1.2) |
-| G5 | The FR-10.1 human-author gate is preserved exactly | a richer stub must not become a runnable non-PRD |
+| G1 | A Claude session in an init'd repo auto-discovers how to author a PRD (skill → playbook + conventions) | tribal knowledge |
+| G2 | `gauntlet new` produces a structured, guidance-bearing stub | cold start |
+| G3 | One playbook seeds everything (skill pointer, stub structure, interactive session) — zero duplication | drift avoidance |
+| G4 | Both passive aids are committable and propagate via `gauntlet init` | teammates inherit it (FR-1.2) |
+| G5 | The FR-10.1 human-author gate is preserved exactly across all tiers | review asymmetry survives |
+| G6 | `gauntlet new --interactive` drafts a PRD *in place*, ending the side-session-and-relocate detour | the detour |
+| G7 | Optional `--from` seeding from a Linear ticket / GitHub issue / local file | unused context |
+| G8 | The default `gauntlet new` path stays pure (no credential/CLI/adapter dependency unless `--interactive`) | testability, fail-closed |
 
 ### 2.2 Non-Goals (v1)
 
-- **No Codex / `AGENTS.md` pointer.** Skills are Claude-specific; the structured stub is the CLI-agnostic path for non-Claude sessions. A Codex equivalent is a future consideration.
-- **The skill never authors the PRD autonomously.** It routes and teaches; the human still writes and ratifies (FR-10.1 unchanged).
-- **No changes to pipeline prompts or the review/plan loop.** This is pre-`gauntlet run` authoring support only.
-- **Project-level skill only**, not a user-level (`~/.claude/skills`) global install — the aid must travel with the repo.
-- **No new CLI command.** This rides on existing `init` and `new`.
+- **Gauntlet autonomously generating a PRD** a human rubber-stamps. The interactive path interviews; it never invents scope.
+- **The skill or interactive session authoring the plan or implementation.** PRD = WHAT/WHY only; the plan is a separate, later stage.
+- **No Codex / `AGENTS.md` pointer.** The skill is Claude-specific; the structured stub and the interactive command are the CLI-agnostic paths.
+- **Project-level skill only**, not a user-level (`~/.claude/skills`) global install.
+- **No credential storage or bespoke source auth.** `--from` fetchers reuse existing surfaces (`gh`, an MCP, the filesystem) and fail closed; they never block the no-source interview.
+- **No changes to the review/plan prompts or the pipeline.**
 
 ## 3. Users and Personas
 
-- **Pipeline author** writing a PRD in Gauntlet's own repo or an adopter repo — the primary beneficiary; gets the skill prompt and the structured stub.
-- **Team adopter** who clones a repo that already carries the committed skill + stub — inherits the workflow with no extra setup.
-- **Pipeline maintainer** who may customize the skill description or the stub template — must not have customizations clobbered by a re-run.
+- **Pipeline author** writing a PRD — gets the structured stub, the skill prompt, and (active tier) the interactive command.
+- **Team adopter** who clones a repo carrying the committed aids — inherits the whole workflow with no setup.
+- **Pipeline maintainer** who may customize the playbook, skill, or stub — must not have customizations clobbered by a re-run.
 
 ## 4. System Architecture
 
 ### 4.1 Components
 
-- **`src/gauntlet/scaffold/skills/gauntlet-prd-author/SKILL.md` (new)** — the committable skill template; installed to `.claude/skills/gauntlet-prd-author/SKILL.md`.
-- **`src/gauntlet/scaffold/prd-stub.md` (new)** — the structured stub template (section headers + guidance comments + the FR-10.1 marker). Replaces the inline `_PRD_STUB` constant as the single stub source.
-- **`src/gauntlet/engine/init.py` (modified)** — installs the skill (create-if-absent, idempotent, never-clobber, asset_root-aware reference path); ensures `.gitignore` guidance keeps `.claude/skills/` committable.
-- **`src/gauntlet/engine/run.py` (modified)** — sources the stub from `prd-stub.md`; `check_entry_contract` compares against that same source.
-- **`prompts/prd-author.md` + scaffold twin (already shipped)** — the single instruction source the skill points to.
+- **`prompts/prd-author.md` (+ scaffold twin) — already shipped.** The single playbook. The skill points to it; the interactive session is seeded with it; the stub's headers align to it.
+- **`src/gauntlet/scaffold/skills/gauntlet-prd-author/SKILL.md` (new)** — installed to `.claude/skills/gauntlet-prd-author/SKILL.md` by `init`.
+- **`src/gauntlet/scaffold/prd-stub.md` (new)** — the structured stub template; replaces the inline `_PRD_STUB`.
+- **`src/gauntlet/engine/init.py` (modified)** — install the skill (create-if-absent, idempotent, never-clobber, asset_root-aware reference path); keep `.claude/skills/` committable.
+- **`src/gauntlet/engine/run.py` (modified)** — source the stub from `prd-stub.md`; `check_entry_contract` compares against that source.
+- **`src/gauntlet/cli.py` `new` (modified)** — add `--interactive` and `--from`; the default path is byte-unchanged and imports no adapter.
+- **`src/gauntlet/engine/draft.py` (new)** — interactive orchestration: scaffold the stub, then launch a `ClaudeCodeAdapter` session seeded with the playbook, judge-gated, repo-root bounded.
+- **`src/gauntlet/engine/sources/` (new)** — the `--from` fetcher registry (`linear:`, `github:`, bare path).
 
 ### 4.2 Key design decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Skill ↔ playbook | Skill **references** `prd-author.md`; no embedded copy | One instruction source; SKILL.md stays a thin pointer; no drift |
-| Stub source | A single committable template, shared by `new` and the entry contract | Teams can customize; one source means the "still a stub" check and the scaffold never disagree |
-| Stub ↔ playbook headers | A drift-guard test asserts the stub covers the playbook's mandatory sections | The one residual drift risk the "reference" choice leaves |
-| Skill scope | Project-level, committable | Teammates inherit it on clone (FR-1.2) |
-| FR-10.1 gate | Keep the stub marker; richer stub, same gate | A better starting structure must not weaken the human-author requirement |
-| Install posture | Mirror the judge-hook wiring: create-if-absent, idempotent, fail-closed on malformed state | Consistent, safe re-runs; never destroy a customized skill |
-| Reference path | Resolved under the repo's `asset_root` at install time | `prompts/prd-author.md` (asset_root ".") vs `.gauntlet/prompts/prd-author.md` (adopter) must both be correct |
+| One prompt vs two | Retire #11's separate `prd-author-interactive.md`; everything uses `prd-author.md` | Single source of truth; the skill, the stub, and the seeded session can never drift apart |
+| `gauntlet new` purity | Default path unchanged; `--interactive` scaffolds *then* launches; adapter imported lazily only under the flag | Keeps the boring, dependency-free path boring (proposal #11 §4.1, shape (a)) |
+| Input sources | One `--from <scheme>` registry, not per-origin flags | Extensible; sources only *seed* context — the interview still drives (#11 §4.2) |
+| Source trust | Fetched text is **data, not instructions** — wrapped, never executed | A ticket/issue is untrusted external input; mirrors the triager's treatment of findings (PRD §8) |
+| Session safety | Reuse the existing judge wiring + repo-root boundary | A drafting session is gated like any other (#11 §4.4) |
+| Skill ↔ playbook | Skill references the file; never embeds | Thin pointer; no copy to keep in sync |
+| Stub source | One committable template; drift-guard test vs the playbook's mandatory sections | The one residual drift risk the "reference" choice leaves |
+| FR-10.1 gate | Keep the stub marker; richer stub and interactive draft both still pass through `check_entry_contract` + review | A better starting point must never weaken the human-author requirement |
+| Spec posture | Passive tier needs no amendment; the interactive path is the FR-10.1a delta, ratified before its phases | "Approved artifacts change only through their own loop and gate" (CLAUDE.md §2) |
 
 ## 5. Functional Requirements
 
-### FR-1: Skill template + install
+### FR-1: Skill template + install (passive)
 
-- **FR-1.1** A committable skill template ships in the scaffold; `gauntlet init` installs it to `.claude/skills/gauntlet-prd-author/SKILL.md` when absent and skips it when present (idempotent; a customized skill is never overwritten). **Acceptance:** a fresh `init` creates the skill file; a re-run reports it skipped/unchanged; a pre-existing customized `SKILL.md` is left byte-for-byte intact.
-- **FR-1.2** `SKILL.md` frontmatter carries a `name` and a `description` worded to trigger on PRD-authoring intent (e.g. "write/draft/author a PRD", "start a Gauntlet run", "plan a PRD"). **Acceptance:** the description contains the documented trigger phrases; the pinned Claude Code enumerates the skill as available (integration-marked or a documented manual check, since NL-trigger reliability is not unit-testable).
-- **FR-1.3** The skill body is a thin pointer: it routes the session to read the playbook at the path resolved under the repo's `asset_root`, and states the conventions — the PRD lives at `<run_root>/<slug>/prd.md`, scaffold it with `gauntlet new <slug>`, run `gauntlet run <slug>` afterward. **Acceptance:** the installed `SKILL.md` references the correct asset_root-resolved playbook path for the repo it was installed in, and contains none of the playbook's prose verbatim.
-- **FR-1.4** The installed skill is committable — `init`'s `.gitignore` guidance does not exclude `.claude/skills/`. **Acceptance:** after `init`, `git check-ignore` does not match `.claude/skills/gauntlet-prd-author/SKILL.md`.
+- **FR-1.1** A committable skill template ships in the scaffold; `gauntlet init` installs it to `.claude/skills/gauntlet-prd-author/SKILL.md` when absent and skips it when present (never overwrites a customized skill). **Acceptance:** fresh `init` creates it; re-run reports it skipped; a customized `SKILL.md` is left intact.
+- **FR-1.2** `SKILL.md` frontmatter carries a `name` and a `description` worded to trigger on PRD-authoring intent ("write/draft/author a PRD", "start a Gauntlet run"). **Acceptance:** the description contains the documented trigger phrases; the pinned Claude Code enumerates the skill as available (integration-marked / documented manual check).
+- **FR-1.3** The skill body is a thin pointer: it routes the session to read the playbook at the path resolved under the repo's `asset_root`, and states the conventions — PRD lives at `<run_root>/<slug>/prd.md`, scaffold with `gauntlet new <slug>`, run `gauntlet run <slug>` afterward. **Acceptance:** the installed `SKILL.md` references the correct asset_root-resolved path and contains none of the playbook's prose verbatim.
+- **FR-1.4** The installed skill is committable — `init`'s `.gitignore` guidance does not exclude `.claude/skills/`. **Acceptance:** after `init`, `git check-ignore` does not match the installed skill.
 
-### FR-2: Structured PRD stub
+### FR-2: Structured PRD stub (passive)
 
-- **FR-2.1** `gauntlet new <slug>` writes a stub containing the playbook's section skeleton (Header block, §1–§11, mandatory and scale-with-size headers), each with a one-line guidance comment, plus the FR-10.1 stub marker. **Acceptance:** a freshly scaffolded `prd.md` contains every mandatory section header and the marker.
-- **FR-2.2** The stub is sourced from one committable template (`scaffold/prd-stub.md`); `_PRD_STUB` and `check_entry_contract` derive from that same source (no second copy). A drift-guard test asserts the stub's section headers cover the playbook's mandatory sections. **Acceptance:** the scaffolded file and the entry-contract comparison string are the same bytes; the drift test fails if a mandatory playbook section is missing from the stub.
-- **FR-2.3** The FR-10.1 entry contract is preserved. **Acceptance:** `check_entry_contract` raises on the fresh structured stub (marker present), raises on a marker-stripped-but-otherwise-unchanged stub, and passes once a section is authored and the marker removed.
+- **FR-2.1** `gauntlet new <slug>` writes a stub containing the playbook's section skeleton (Header block, §1–§11), each with a one-line guidance comment, plus the FR-10.1 stub marker. **Acceptance:** a freshly scaffolded `prd.md` contains every mandatory section header and the marker.
+- **FR-2.2** The stub is sourced from one committable template (`scaffold/prd-stub.md`); `_PRD_STUB` and `check_entry_contract` derive from that same source. A drift-guard test asserts the stub's headers cover the playbook's mandatory sections. **Acceptance:** the scaffolded file and the entry-contract comparison string are the same bytes; the drift test fails if a mandatory section is missing.
+- **FR-2.3** The FR-10.1 entry contract is preserved. **Acceptance:** `check_entry_contract` raises on the fresh structured stub (marker present), raises on a marker-stripped-but-unchanged stub, and passes once a section is authored and the marker removed.
 
-### FR-3: Propagation & idempotency
+### FR-3: Propagation & idempotency (passive)
 
-- **FR-3.1** Both aids propagate via `gauntlet init`: a fresh repo gets them created; a re-run on an existing adopter creates whichever is missing and skips whichever is present; `--from-repo` reports present/missing without writing. **Acceptance:** the three init modes behave as stated in a temp-repo test.
-- **FR-3.2** Installs fail closed on malformed pre-existing state at the skill path (e.g. the path exists but is not a regular file), mirroring the `settings.json` guard. **Acceptance:** `init` raises `InitError` rather than clobbering unexpected state at `.claude/skills/gauntlet-prd-author/`.
+- **FR-3.1** Both passive aids propagate via `gauntlet init`: fresh repo creates them; a re-run creates whichever is missing and skips whichever is present; `--from-repo` reports present/missing without writing. **Acceptance:** the three init modes behave as stated in a temp-repo test.
+- **FR-3.2** Installs fail closed on malformed pre-existing state at the skill path (e.g. the path exists but is not a regular file). **Acceptance:** `init` raises `InitError` rather than clobbering unexpected state.
+
+### FR-4: Interactive authoring command (active — gated on FR-10.1a)
+
+- **FR-4.1** `gauntlet new <slug> --interactive` scaffolds the structured stub first, then launches a drafting session; the default (no-flag) path is byte-for-byte unchanged and imports no agent adapter (lazy import under the flag). **Acceptance:** `new` without the flag scaffolds identically and has no adapter/CLI dependency; with the flag, it scaffolds then launches a session.
+- **FR-4.2** The session is seeded with `prd-author.md` (interview-not-generate) plus run context (`prd_path`, optional source); it drafts into `prd.md` under human direction, then stops — it does not run `gauntlet`, and does not review its own work. **Acceptance:** the seed prompt sent is the playbook's content plus the context block; the session writes only `prd.md` and halts without invoking the pipeline.
+- **FR-4.3** The session is judge-gated and repo-root bounded, reusing the existing wiring. **Acceptance:** PreToolUse decisions for the drafting session appear in the judge audit log.
+- **FR-4.4** FR-10.1 is preserved end-to-end: the drafted `prd.md` must still pass `check_entry_contract` and still goes through the full PRD adversarial cycle + human gate. **Acceptance:** a draft left as the stub/marker-only fails entry; a genuine human-directed draft passes and proceeds to review.
+
+### FR-5: Pluggable input sources (active — gated on FR-10.1a)
+
+- **FR-5.1** `--from <scheme>` is resolved by a fetcher registry — `linear:<KEY>`, `github:<owner>/<repo>#<n>`, bare `<path>` — and the fetched text seeds the session as *context*, not as the PRD. **Acceptance:** each scheme injects context; with a source supplying only title/body, the interview still elicits non-goals/exit-criteria.
+- **FR-5.2** Fail closed: an unresolvable or unauthenticated source aborts **before** any scaffold mutation or session launch. **Acceptance:** a bad `--from` errors with no `prd.md` written and no session started.
+- **FR-5.3** No source = pure interview with no external-credential dependency. **Acceptance:** `--interactive` with no `--from` needs no creds.
+- **FR-5.4** Source text is treated as data: wrapped as seed context, never executed as instructions (prompt-injection containment). **Acceptance:** a source whose body contains instruction-like text does not alter the session's hard rules; it appears only inside the delimited context block.
 
 ## 6. Data & Schemas (normative excerpts)
 
-- **`SKILL.md` frontmatter:** `name` (kebab id) + `description` (trigger sentence). Exact field set/limits confirmed against the pinned Claude Code in P1 (OQ-2).
-- **Stub template — mandatory section headers** the drift test enforces: Header block, §1 Overview (1.1/1.2/1.3), §2 Goals & Non-Goals, §5 Functional Requirements (with `Acceptance:`), §8 Implementation Plan, §9 Success Metrics, §11 Open Questions. Scale-with-size headers (§3, §4, §6, §7, §10) are present but the test does not require them filled.
+- **`SKILL.md` frontmatter:** `name` (kebab id) + `description` (trigger sentence); exact field set confirmed against the pinned Claude Code in P1 (OQ-2).
+- **Stub mandatory headers** the drift test enforces: Header block, §1 Overview (1.1/1.2/1.3), §2 Goals & Non-Goals, §5 Functional Requirements (with `Acceptance:`), §8 Implementation Plan, §9 Success Metrics, §11 Open Questions.
+- **`--from` grammar:** `linear:<KEY>` | `github:<owner>/<repo>#<n>` | `<path>` (bare = filesystem). Unknown scheme → fail closed.
+- **Seed context vars** passed to the playbook session: `prd_path`, `source_label`, `source_context` (the last two empty for a pure interview).
 
 ## 7. Security & Privacy
 
-The skill is inert instruction data — no execution, no new tool grants, no widening of the judge surface; installing under `.claude/` is the same trust boundary as the existing hook wiring. No secrets are read or written. The skill body must not instruct the agent to bypass any gate or the judge (it routes to authoring guidance only).
+The skill is inert instruction data. The interactive session runs through the existing judge wiring and repo-root boundary, so it is gated like any other session. `--from` fetchers reuse existing surfaces (`gh`/MCP/filesystem), store no credentials, touch the network only through those, and fail closed. Fetched source text is **untrusted external input**: it is wrapped as delimited context and never executed as instructions (prompt-injection containment, mirroring PRD §8 — reviewer findings are data to the triager). No secrets are read or written by the skill or stub.
 
 ## 8. Implementation Plan (phased, assumption-validating)
 
 | Phase | Deliverable | Assumption validated |
 |-------|-------------|----------------------|
-| **P1** | Skill template + `init` install (idempotent, asset_root-aware, fail-closed) + format pin | A per-repo committable Claude Code skill is discovered and triggers from NL PRD intent on the pinned version (the riskiest external dependency) |
-| **P2** | Structured stub as a single committable template; refactor `_PRD_STUB`/entry contract to that source; drift-guard test | A richer stub preserves the FR-10.1 human-author gate and never diverges from the playbook's mandatory sections |
-| **P3** | Fresh / re-run / `--from-repo` propagation + `.gitignore` committability + second-repo install check + README/CHANGELOG | An adopter re-running `init` picks up both aids without clobbering customizations |
+| **P1** | Skill template + `init` install (idempotent, asset_root-aware, fail-closed) + format pin | A per-repo committable Claude Code skill is discovered and triggers (riskiest external dependency) |
+| **P2** | Structured stub as a single committable template; refactor `_PRD_STUB`/entry contract to it; drift-guard test | A richer stub preserves the FR-10.1 gate and never drifts from the playbook |
+| **P3** | Fresh / re-run / `--from-repo` propagation + `.gitignore` committability + second-repo check + docs | An adopter re-running `init` picks up both passive aids without clobbering customizations |
+| **— ratify FR-10.1a —** | Human action: write the assisted-authoring FR delta into `PRD-gauntlet.md` via its revision process | (precondition for P4–P5; the passive tier above needs no amendment) |
+| **P4** | `gauntlet new --interactive` core: scaffold-then-seeded-session, judge-gated, lazy adapter, FR-10.1 preserved (no sources yet) | Assisted ≠ autogenerated — the interview seed holds, and `new` stays pure by default |
+| **P5** | Pluggable `--from` sources (linear/github/file), fail-closed, source-as-data | External context seeds without driving, and is injection-safe |
 
-Each phase ends with passing tests and a commit. P2 and P1 are independent; P1 is sequenced first because it carries the riskiest assumption. P3 polishes both and therefore follows them.
+P1–P3 are the shippable passive tier and carry no spec amendment, so they lead. P4–P5 are gated on the FR-10.1a ratification (a human gate, per CLAUDE.md §2). No phase depends on a later one; each ends in passing tests and a commit.
 
 ## 9. Success Metrics
 
-- A fresh `gauntlet init` produces both aids; a re-run is a no-op; a customized copy of either is never overwritten.
+- Fresh `gauntlet init` produces skill + structured stub; a re-run is a no-op; neither is clobbered if customized.
 - The entry contract still rejects an unfilled structured stub.
-- In a fresh Claude session in an init'd repo, a "help me write a PRD" request surfaces the skill and routes to `prd-author.md` (manual/integration check).
-- Zero duplication of the playbook text (the skill references it; the drift test keeps the stub's headers aligned).
+- In a fresh Claude session in an init'd repo, "help me write a PRD" surfaces the skill and routes to `prd-author.md` (manual/integration check).
+- `gauntlet new --interactive` drafts a PRD that passes the entry contract **in place** — no side-session relocation.
+- `--from linear:<KEY>` seeds context yet the interview still elicits non-goals/exit-criteria; a bad `--from` fails closed.
+- Zero duplication of the playbook text across the skill, stub, and interactive seed.
 
 ## 10. Risks & Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| Skill format/trigger semantics drift across Claude Code releases | Pin the format + `doctor` warn (mirror FR-1.5); P1 validates on the installed version; the structured stub is the format-independent fallback |
-| Stub headers drift from the playbook's sections | Drift-guard test (FR-2.2) |
-| Skill triggers too eagerly or not at all | Tune the `description`; it is advisory only (gates nothing), so a missed trigger degrades to today's manual behavior |
-| A team customized the skill or stub | Never-clobber idempotency (FR-1.1, FR-3.1) |
+| Rubber-stamping an AI draft | Interview-not-generate seed (the playbook); the `prd-approve` human gate; the document review cycle. Residual risk accepted, inherent to any assistance |
+| Skill format/trigger drift across Claude Code releases | Pin + `doctor` warn (mirror FR-1.5); P1 validates on the installed version; the stub + interactive command are the format-independent fallbacks |
+| Stub headers drift from the playbook | Drift-guard test (FR-2.2) |
+| `gauntlet new` purity regression | Lazy-import test: `new` without `--interactive` has no adapter/CLI dependency |
+| Source auth / prompt injection via `--from` | Fail-closed fetchers; source text wrapped as data, never executed (FR-5.2, FR-5.4) |
+| Scope/spec creep from FR-10.1a | Ratify the delta before P4; passive tier ships independently |
 
 ## 11. Open Questions
 
-- **OQ-1:** Does Gauntlet's *own* repo (asset_root `"."`) carry a committed skill, or is skill-install adopter-only via `init`? (Lean: Gauntlet commits its own skill directly; `init` handles adopters.)
+- **OQ-1:** Does Gauntlet's *own* repo (asset_root `"."`) carry a committed skill, or is skill-install adopter-only via `init`? (Lean: own repo commits it directly.)
 - **OQ-2:** Exact `SKILL.md` frontmatter fields/limits on the pinned Claude Code version — resolved in P1.
-- **OQ-3:** Should `gauntlet doctor` validate skill presence/format (as it does hooks), or is that v1 scope creep?
-- **OQ-4:** Should `gauntlet new`'s CLI output also print a pointer to the skill/playbook (cheap, CLI-agnostic reinforcement of the convention)?
+- **OQ-3:** Should `gauntlet doctor` validate skill presence/format (as it does hooks)?
+- **OQ-4:** Should `gauntlet new`'s CLI output print a pointer to the skill/playbook?
+- **OQ-5 (from #11):** Persist the interactive drafting transcript alongside the run (e.g. `prd-authoring.transcript.md`) for the "data over inference" audit trail?
+- **OQ-6 (from #11):** `--interactive` flag on `new` vs a sibling `gauntlet draft` command. (Lean: flag, per #11's recommendation.)
+- **OQ-7:** Final FR-10.1a numbering/wording at ratification.
