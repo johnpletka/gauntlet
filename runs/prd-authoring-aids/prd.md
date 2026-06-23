@@ -73,37 +73,83 @@ That a **per-repo, committable Claude Code skill is reliably discovered and trig
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Skill ↔ playbook | Skill **references** `prd-author.md`; no embedded copy | One instruction source; SKILL.md stays a thin pointer; no drift |
-| Stub source | A single committable template, shared by `new` and the entry contract | Teams can customize; one source means the "still a stub" check and the scaffold never disagree |
-| Stub ↔ playbook headers | A drift-guard test asserts the stub covers the playbook's mandatory sections | The one residual drift risk the "reference" choice leaves |
+| Stub source | A single committable template installed into the adopter repo (see §4.3); `new` and the entry contract read the **installed repo copy**, falling back to package data only when it is absent | Teams can customize one file; one source means the "still a stub" check and the scaffold never disagree |
+| Stub ↔ playbook headers | A drift-guard test compares the stub against the playbook's machine-readable section manifest (§6) | The one residual drift risk the "reference" choice leaves |
+| Customizable-template safety | `new` and the entry contract validate the installed stub against template invariants (§4.4) and fail closed if violated | A customizable gate-input template must not be able to silently disable the human-author gate |
 | Skill scope | Project-level, committable | Teammates inherit it on clone (FR-1.2) |
 | FR-10.1 gate | Keep the stub marker; richer stub, same gate | A better starting structure must not weaken the human-author requirement |
 | Install posture | Mirror the judge-hook wiring: create-if-absent, idempotent, fail-closed on malformed state | Consistent, safe re-runs; never destroy a customized skill |
-| Reference path | Resolved under the repo's `asset_root` at install time | `prompts/prd-author.md` (asset_root ".") vs `.gauntlet/prompts/prd-author.md` (adopter) must both be correct |
+| Provenance / stale handling | Generated aids carry provenance metadata (§4.5); re-run may refresh an **unmodified** generated file to the current template, never a customized one | Reconciles "never-clobber" with config-dependent generated paths going stale |
+| Reference path | A **repository-relative** path (e.g. `prompts/prd-author.md` for asset_root `"."`, `.gauntlet/prompts/prd-author.md` for an adopter) — never an absolute filesystem path | The committed skill must keep working after the repo is cloned or copied to a different absolute location (FR-1.3, G4) |
+
+### 4.3 Stub template: destination, source, and lookup precedence
+
+- **Package source:** `src/gauntlet/scaffold/prd-stub.md` ships in the package.
+- **Adopter destination:** `gauntlet init` installs the template to `<asset_root>/prd-stub.md` (i.e. `prd-stub.md` at the repo root for asset_root `"."`, `.gauntlet/prd-stub.md` for an adopter). This installed copy is the customizable, committable file.
+- **Lookup precedence — both `gauntlet new` and `check_entry_contract` resolve the stub identically:**
+  1. If `<asset_root>/prd-stub.md` exists in the repo, read **that** file.
+  2. Otherwise fall back to the packaged `scaffold/prd-stub.md`.
+- **Single source per repo:** within one repo, `new` (which writes the scaffold) and `check_entry_contract` (which decides whether the scaffold is "still a stub") read the *same* resolved file, so they can never disagree about what an unfilled stub is.
+- **Missing-file behavior:** neither tool errors merely because the repo copy is absent — the packaged fallback always exists, so the stub source is always resolvable. (A missing packaged resource is a packaging bug, surfaced by `gauntlet doctor`, not a runtime branch.)
+
+### 4.4 Stub-template invariants (fail-closed validation)
+
+Because the same template both seeds new PRDs and defines what the entry-contract gate rejects, a malformed customization could silently weaken the FR-10.1 human-author gate. Before either `gauntlet new` or `check_entry_contract` uses the resolved stub, it validates these invariants:
+
+- The template contains **exactly one** FR-10.1 stub marker (not zero, not duplicated).
+- The template contains every mandatory section header from the §6 manifest.
+- The template is non-empty after normalization.
+
+If any invariant is violated, the tool **fails closed**: `gauntlet new` raises (refuses to scaffold from a broken template) and `check_entry_contract` raises rather than passing — a malformed gate input is treated as "cannot prove this is human-authored," never as "authored." The error names the offending invariant and file path. This mirrors FR-3.2's fail-closed posture for malformed skill state.
+
+### 4.5 Provenance and stale-generated-file handling
+
+Generated aids (the skill, and the installed stub template) carry provenance metadata so `init` can distinguish an untouched generated file from a user customization:
+
+- The generated `SKILL.md` frontmatter carries `x-gauntlet-generated: true` and `x-gauntlet-template-version: <N>`; the generated stub carries an equivalent provenance comment.
+- **On re-run, per file:**
+  - **Absent** → create at the current template version.
+  - **Present, byte-identical to a checksum Gauntlet has shipped** (i.e. an unmodified prior-generated file) → it is *not* a customization. If the current template or the resolved config-dependent path differs, `init` **refreshes** it to the current template (the only overwrite `init` ever performs) and logs the refresh; otherwise it reports it unchanged.
+  - **Present and matching no shipped checksum** (a customization) → **never overwritten.** If it carries provenance and looks stale (e.g. references a playbook path that no longer matches the current asset_root), `init` emits a **warning** naming the file and the drift, but does not modify it.
+
+This keeps the never-clobber guarantee for customizations while preventing an unmodified generated file from silently carrying obsolete config-dependent paths forever.
 
 ## 5. Functional Requirements
 
 ### FR-1: Skill template + install
 
-- **FR-1.1** A committable skill template ships in the scaffold; `gauntlet init` installs it to `.claude/skills/gauntlet-prd-author/SKILL.md` when absent and skips it when present (idempotent; a customized skill is never overwritten). **Acceptance:** a fresh `init` creates the skill file; a re-run reports it skipped/unchanged; a pre-existing customized `SKILL.md` is left byte-for-byte intact.
-- **FR-1.2** `SKILL.md` frontmatter carries a `name` and a `description` worded to trigger on PRD-authoring intent (e.g. "write/draft/author a PRD", "start a Gauntlet run", "plan a PRD"). **Acceptance:** the description contains the documented trigger phrases; the pinned Claude Code enumerates the skill as available (integration-marked or a documented manual check, since NL-trigger reliability is not unit-testable).
-- **FR-1.3** The skill body is a thin pointer: it routes the session to read the playbook at the path resolved under the repo's `asset_root`, and states the conventions — the PRD lives at `<run_root>/<slug>/prd.md`, scaffold it with `gauntlet new <slug>`, run `gauntlet run <slug>` afterward. **Acceptance:** the installed `SKILL.md` references the correct asset_root-resolved playbook path for the repo it was installed in, and contains none of the playbook's prose verbatim.
-- **FR-1.4** The installed skill is committable — `init`'s `.gitignore` guidance does not exclude `.claude/skills/`. **Acceptance:** after `init`, `git check-ignore` does not match `.claude/skills/gauntlet-prd-author/SKILL.md`.
+- **FR-1.1** A committable skill template ships in the scaffold; `gauntlet init` installs it to `.claude/skills/gauntlet-prd-author/SKILL.md` when absent and skips it when present (idempotent). A **customized** skill (provenance absent or content matching no shipped checksum) is never overwritten; an **unmodified generated** skill may be refreshed per §4.5. **Acceptance:** a fresh `init` creates the skill file with provenance metadata; a re-run with the current template reports it unchanged; a re-run after a template/config change refreshes only a byte-identical generated file and logs the refresh; a pre-existing customized `SKILL.md` is left byte-for-byte intact (and warned about if §4.5 detects staleness).
+- **FR-1.2** `SKILL.md` frontmatter carries a `name` and a `description` worded to trigger on PRD-authoring intent (e.g. "write/draft/author a PRD", "start a Gauntlet run", "plan a PRD"). **Acceptance:** the description contains the documented trigger phrases. Natural-language *trigger* reliability is validated separately by the recorded trigger test in FR-1.6 (not by metadata inspection, which proves only discovery).
+- **FR-1.3** The skill body is a thin pointer: it routes the session to read the playbook at a **repository-relative** path resolved under the repo's `asset_root` (e.g. `prompts/prd-author.md` or `.gauntlet/prompts/prd-author.md`) — never an absolute filesystem path — and states the conventions: the PRD lives at `<run_root>/<slug>/prd.md`, scaffold it with `gauntlet new <slug>`, run `gauntlet run <slug>` afterward. **Acceptance:** (a) the installed `SKILL.md` references the correct repository-relative playbook path for the repo's asset_root and contains no absolute path; (b) after copying or cloning the repo to a *different absolute location*, the committed skill's playbook reference still resolves to the playbook (no embedded source-machine path); (c) verbatim-duplication is bounded per FR-1.3a.
+- **FR-1.3a** (measurable no-duplication rule, replaces "contains none of the prose verbatim") The skill must not copy the playbook's *prose*. Concretely: after normalizing whitespace to single spaces and lowercasing, no normalized substring of **12 or more consecutive words** may appear in both `SKILL.md` and `prd-author.md`. Section headings, command names (`gauntlet new`, `gauntlet run`), file paths, and the literal conventions sentence are exempt (they are shared vocabulary, not copied prose). **Acceptance:** a test computes the longest shared normalized word-run excluding the exempted tokens and asserts it is `< 12`.
+- **FR-1.4** The installed skill is committable. `init`'s own `.gitignore` guidance does not exclude `.claude/skills/`, **and** `init` checks whether any effective ignore source — repo `.gitignore`, parent-directory `.gitignore`, `.git/info/exclude`, or the global core.excludesFile — would exclude the installed skill (via `git check-ignore`). If one would, `init` does **not** silently override the maintainer's rule: it emits a **warning** naming the ignoring rule's source and the remediation (commit with `git add -f` or amend the rule), and proceeds without editing the foreign rule. **Acceptance:** after `init` with no pre-existing exclusion, `git check-ignore` does not match the skill; with a pre-existing parent-directory or `info/exclude` rule that matches `.claude/skills/`, `init` warns (naming the source) and does not modify that rule.
+- **FR-1.5** (format pin + doctor — resolves OQ-3 as **in scope, warn-only**) The skill's required frontmatter shape is pinned by the normative schema fixed in P1 (FR-1.6 / §6). `gauntlet doctor` validates that the installed skill exists and parses against that pinned shape and emits a **warning** (never a hard error — the skill gates nothing) when it is missing, unparseable, or its provenance looks stale (§4.5). **Acceptance:** `doctor` warns on an absent or malformed installed skill and is silent on a well-formed one.
+- **FR-1.6** (recorded natural-language trigger test — the riskiest external dependency) P1 produces a reproducible trigger check on the **named pinned Claude Code version** (recorded explicitly, e.g. in `BOOTSTRAP-NOTES.md` or an `@pytest.mark.integration` test). It specifies: the exact prompt(s) (at minimum "help me write a PRD"), the expected observation (the `gauntlet-prd-author` skill is selected/invoked, not merely enumerated), and the failure criterion (skill not selected). **Acceptance:** the recorded artifact names the Claude Code version, the prompts, the expected selection observation, and the pass/fail criterion, and was run with its result recorded. Enumeration or metadata inspection alone does **not** satisfy this requirement.
 
 ### FR-2: Structured PRD stub
 
-- **FR-2.1** `gauntlet new <slug>` writes a stub containing the playbook's section skeleton (Header block, §1–§11, mandatory and scale-with-size headers), each with a one-line guidance comment, plus the FR-10.1 stub marker. **Acceptance:** a freshly scaffolded `prd.md` contains every mandatory section header and the marker.
-- **FR-2.2** The stub is sourced from one committable template (`scaffold/prd-stub.md`); `_PRD_STUB` and `check_entry_contract` derive from that same source (no second copy). A drift-guard test asserts the stub's section headers cover the playbook's mandatory sections. **Acceptance:** the scaffolded file and the entry-contract comparison string are the same bytes; the drift test fails if a mandatory playbook section is missing from the stub.
-- **FR-2.3** The FR-10.1 entry contract is preserved. **Acceptance:** `check_entry_contract` raises on the fresh structured stub (marker present), raises on a marker-stripped-but-otherwise-unchanged stub, and passes once a section is authored and the marker removed.
+- **FR-2.1** `gauntlet new <slug>` writes a stub containing the playbook's section skeleton (the mandatory and scale-with-size headers enumerated in the §6 manifest), each with a one-line guidance comment, plus the FR-10.1 stub marker. The stub source and lookup precedence are per §4.3; the resolved template is validated per §4.4 before scaffolding. **Acceptance:** a freshly scaffolded `prd.md` contains every mandatory section header from the §6 manifest and exactly one marker; scaffolding from a template that violates a §4.4 invariant raises rather than writing.
+- **FR-2.2** The stub is sourced from one resolved template (§4.3); `_PRD_STUB` and `check_entry_contract` derive from that same resolved source (no second copy). A drift-guard test compares the stub against the playbook's **machine-readable section manifest** (§6) — extracted from `prd-author.md` by the documented parser, not a hand-restated list. **Acceptance:** the scaffolded file and the entry-contract comparison string are the same bytes; the drift test fails if **adding, renaming, or removing** a mandatory section in `prd-author.md` is not mirrored in the stub (i.e. the test is driven off the parsed playbook, so a change to the playbook alone trips it).
+- **FR-2.3** The FR-10.1 entry contract is preserved, using a deterministic **authored-content predicate** (FR-2.4). **Acceptance:** `check_entry_contract` raises on the fresh structured stub (marker present), raises on a marker-stripped-but-otherwise-unchanged stub, and passes once substantive content is authored and the marker removed.
+- **FR-2.4** (deterministic authored-content predicate — closes the "what counts as authored" gap) A PRD passes the entry contract iff **both**: (1) it contains **no** FR-10.1 marker, **and** (2) it has **authored content** relative to the resolved stub template. "Authored content" is defined by normalizing both the candidate and the template — strip the marker, drop HTML/Markdown guidance comments, drop section-heading lines, collapse whitespace — and requiring the normalized candidate to be **non-empty and not equal to** the normalized template. **Acceptance cases:**
+  - whitespace-only change to the stub → **reject** (normalized form unchanged);
+  - comment-only edit (editing/adding guidance comments) → **reject** (comments dropped);
+  - heading-only edit (renaming/adding a heading, no body) → **reject** (headings dropped);
+  - duplicating the marker, or stub with marker present → **reject** (marker present);
+  - adding substantive body prose under any section, marker removed → **accept**.
 
 ### FR-3: Propagation & idempotency
 
-- **FR-3.1** Both aids propagate via `gauntlet init`: a fresh repo gets them created; a re-run on an existing adopter creates whichever is missing and skips whichever is present; `--from-repo` reports present/missing without writing. **Acceptance:** the three init modes behave as stated in a temp-repo test.
-- **FR-3.2** Installs fail closed on malformed pre-existing state at the skill path (e.g. the path exists but is not a regular file), mirroring the `settings.json` guard. **Acceptance:** `init` raises `InitError` rather than clobbering unexpected state at `.claude/skills/gauntlet-prd-author/`.
+- **FR-3.1** Both aids — the skill (`.claude/skills/gauntlet-prd-author/SKILL.md`) and the stub template (`<asset_root>/prd-stub.md`, §4.3) — propagate via `gauntlet init`: a fresh repo gets both created; a re-run on an existing adopter creates whichever is missing, refreshes an unmodified generated file per §4.5, and otherwise skips a present/customized one; `--from-repo` reports present/missing/customized for both without writing. **Acceptance:** the three init modes behave as stated for *both* aids in a temp-repo test, including the refresh-vs-preserve distinction of §4.5.
+- **FR-3.2** Installs fail closed on malformed pre-existing state at either generated path (e.g. the path exists but is not a regular file), mirroring the `settings.json` guard. **Acceptance:** `init` raises `InitError` rather than clobbering unexpected state at `.claude/skills/gauntlet-prd-author/` or `<asset_root>/prd-stub.md`.
+- **FR-3.3** The resolved stub template is validated against the §4.4 invariants at the point of use: `gauntlet new` and `check_entry_contract` fail closed (raise) when the installed template has zero or duplicate markers, is missing a mandatory §6 header, or is empty after normalization — so a broken customization cannot disable the human-author gate. **Acceptance:** with an installed `prd-stub.md` whose marker has been deleted (or duplicated, or a mandatory header removed), both `gauntlet new` and `check_entry_contract` raise a validation error naming the violated invariant.
 
 ## 6. Data & Schemas (normative excerpts)
 
-- **`SKILL.md` frontmatter:** `name` (kebab id) + `description` (trigger sentence). Exact field set/limits confirmed against the pinned Claude Code in P1 (OQ-2).
-- **Stub template — mandatory section headers** the drift test enforces: Header block, §1 Overview (1.1/1.2/1.3), §2 Goals & Non-Goals, §5 Functional Requirements (with `Acceptance:`), §8 Implementation Plan, §9 Success Metrics, §11 Open Questions. Scale-with-size headers (§3, §4, §6, §7, §10) are present but the test does not require them filled.
+- **`SKILL.md` frontmatter:** `name` (kebab id) + `description` (trigger sentence) + provenance fields `x-gauntlet-generated` / `x-gauntlet-template-version` (§4.5). The exact required field set/limits are fixed as the **normative schema produced in P1** (FR-1.6) against the named pinned Claude Code version; until P1 records it, that schema is the single source the format pin and `doctor` (FR-1.5) check against.
+- **Canonical mandatory-section manifest (machine-readable, the drift-guard source of truth).** The manifest is **extracted from `prompts/prd-author.md` by a documented parser**, not hand-restated, so a change to the playbook changes the manifest. Extraction rule: the parser collects every ATX Markdown heading (`#`…`######`) in `prd-author.md` and classifies each by a marker the playbook carries inline — a heading tagged **mandatory** is required in the stub; a heading tagged **scale-with-size** is present in the stub but not required to be filled. The manifest is the ordered list of `(level, normalized-heading-text, class)` tuples the parser returns.
+  - **"Header block" disambiguation:** the PRD metadata block (Status / Author / Date lines) is **not** a Markdown heading and is classified as the synthetic mandatory entry `header-block`, matched by the presence of the `Status:` / `Author:` labels rather than by a heading. This removes the ambiguity of calling a non-heading a "header."
+  - As of this playbook revision the mandatory set is: `header-block`, §1 Overview (1.1/1.2/1.3), §2 Goals & Non-Goals, §5 Functional Requirements (with an `Acceptance:` label), §8 Implementation Plan, §9 Success Metrics, §11 Open Questions; scale-with-size: §3, §4, §6, §7, §10. **This prose list is informative only** — the test asserts against the parser's output, so adding, renaming, or removing a mandatory heading in `prd-author.md` trips the drift guard even if this paragraph is not updated.
 
 ## 7. Security & Privacy
 
@@ -113,31 +159,35 @@ The skill is inert instruction data — no execution, no new tool grants, no wid
 
 | Phase | Deliverable | Assumption validated |
 |-------|-------------|----------------------|
-| **P1** | Skill template + `init` install (idempotent, asset_root-aware, fail-closed) + format pin | A per-repo committable Claude Code skill is discovered and triggers from NL PRD intent on the pinned version (the riskiest external dependency) |
-| **P2** | Structured stub as a single committable template; refactor `_PRD_STUB`/entry contract to that source; drift-guard test | A richer stub preserves the FR-10.1 human-author gate and never diverges from the playbook's mandatory sections |
-| **P3** | Fresh / re-run / `--from-repo` propagation + `.gitignore` committability + second-repo install check + README/CHANGELOG | An adopter re-running `init` picks up both aids without clobbering customizations |
+| **P1** | Skill template (repo-relative reference path) + `init` install (idempotent, asset_root-aware, provenance/refresh per §4.5, fail-closed) + format pin + normative frontmatter schema (resolves OQ-2) + **recorded NL trigger test (FR-1.6)** | A per-repo committable Claude Code skill is discovered **and triggers** from NL PRD intent on the named pinned version (the riskiest external dependency) |
+| **P2** | Structured stub as a single committable template (§4.3 destination/precedence); refactor `_PRD_STUB`/entry contract to that resolved source; §4.4 template-invariant validation; FR-2.4 authored-content predicate; machine-readable manifest + drift-guard test (§6) | A richer, customizable stub preserves the FR-10.1 human-author gate (fail-closed on malformed templates) and never diverges from the playbook's parsed mandatory sections |
+| **P3** | Fresh / re-run / `--from-repo` propagation of *both* aids + clone-to-different-path portability test (FR-1.3 acceptance (b)) + `.gitignore` committability incl. foreign-ignore-rule warning (FR-1.4) + `doctor` warn-only check (FR-1.5) + second-repo install check + README/CHANGELOG | An adopter re-running `init` picks up both aids without clobbering customizations, and the committed aids survive cloning |
 
-Each phase ends with passing tests and a commit. P2 and P1 are independent; P1 is sequenced first because it carries the riskiest assumption. P3 polishes both and therefore follows them.
+**Pre-approval decisions (resolves F-006).** OQ-1 and OQ-3 are decided in §11 below and are not deferred. OQ-2 is genuinely empirical (depends on the pinned Claude Code): **P1 must halt for human ratification** of the recorded frontmatter schema before P2/P3 build on it — the phase produces the schema, a human ratifies it, and only then does dependent work proceed. No phase carries an unresolved open question that shapes its own deliverables.
+
+Each phase ends with passing tests and a commit. P2 and P1 are independent; P1 is sequenced first because it carries the riskiest assumption (and its trigger test, FR-1.6). P3 polishes both and therefore follows them.
 
 ## 9. Success Metrics
 
-- A fresh `gauntlet init` produces both aids; a re-run is a no-op; a customized copy of either is never overwritten.
-- The entry contract still rejects an unfilled structured stub.
-- In a fresh Claude session in an init'd repo, a "help me write a PRD" request surfaces the skill and routes to `prd-author.md` (manual/integration check).
-- Zero duplication of the playbook text (the skill references it; the drift test keeps the stub's headers aligned).
+- A fresh `gauntlet init` produces both aids; a re-run is a no-op for an unchanged config, refreshes only an unmodified generated file when the template/config changed (§4.5), and never overwrites a customized copy of either.
+- The entry contract still rejects an unfilled structured stub and every FR-2.4 trivial-edit case (whitespace-/comment-/heading-only).
+- The recorded FR-1.6 trigger test passes on the named pinned Claude Code version: the prompt "help me write a PRD" *selects* the skill, which routes to `prd-author.md`. (Metadata enumeration alone does not count.)
+- No prose duplication, measured per FR-1.3a: the longest normalized shared word-run between `SKILL.md` and `prd-author.md` (excluding headings, command names, and paths) is under 12 words; the drift test keeps the stub's headers aligned to the parsed playbook manifest.
 
 ## 10. Risks & Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| Skill format/trigger semantics drift across Claude Code releases | Pin the format + `doctor` warn (mirror FR-1.5); P1 validates on the installed version; the structured stub is the format-independent fallback |
+| Skill format/trigger semantics drift across Claude Code releases | Pin the format + `doctor` warn (FR-1.5); P1's recorded trigger test (FR-1.6) validates on the named installed version; the structured stub is the format-independent fallback |
 | Stub headers drift from the playbook's sections | Drift-guard test (FR-2.2) |
 | Skill triggers too eagerly or not at all | Tune the `description`; it is advisory only (gates nothing), so a missed trigger degrades to today's manual behavior |
 | A team customized the skill or stub | Never-clobber idempotency (FR-1.1, FR-3.1) |
 
 ## 11. Open Questions
 
-- **OQ-1:** Does Gauntlet's *own* repo (asset_root `"."`) carry a committed skill, or is skill-install adopter-only via `init`? (Lean: Gauntlet commits its own skill directly; `init` handles adopters.)
-- **OQ-2:** Exact `SKILL.md` frontmatter fields/limits on the pinned Claude Code version — resolved in P1.
-- **OQ-3:** Should `gauntlet doctor` validate skill presence/format (as it does hooks), or is that v1 scope creep?
-- **OQ-4:** Should `gauntlet new`'s CLI output also print a pointer to the skill/playbook (cheap, CLI-agnostic reinforcement of the convention)?
+Items below marked **Resolved** are decisions, not open work; they shaped the requirements above (F-006). Only OQ-4 remains genuinely optional.
+
+- **OQ-1 — Resolved:** Gauntlet's *own* repo (asset_root `"."`) carries a committed skill, generated by the same template and committed directly into this repo; `init` installs the skill into adopter repos. (P1 produces the template and commits Gauntlet's own copy.)
+- **OQ-2 — Resolved-by-gate:** the exact `SKILL.md` frontmatter fields/limits are empirical on the pinned Claude Code version. P1 produces the normative schema (§6) and **halts for human ratification** before P2/P3 depend on it (§8). It is not left open through approval — it is an explicit phase gate.
+- **OQ-3 — Resolved:** `gauntlet doctor` **is** in v1 scope, as a **warn-only** presence/format check (FR-1.5), consistent with the §10 mitigation. It never hard-fails, since the skill gates nothing.
+- **OQ-4 (still open, non-blocking):** Should `gauntlet new`'s CLI output also print a pointer to the skill/playbook (cheap, CLI-agnostic reinforcement of the convention)? This shapes no required deliverable or acceptance test and may be decided during P3 or deferred post-v1.
