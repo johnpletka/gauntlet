@@ -441,17 +441,18 @@ stages:
     assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
 
 
-def test_malformed_plan_phases_before_gate_parks_with_reason(fixture_repo):
-    # Mirrors the real run: a human_gate precedes the phases stage, but the
-    # context built to even process the gate eagerly parses plan.md. A malformed
-    # block must park with the parse error recorded, not crash before the gate.
+def test_malformed_plan_does_not_block_steps_that_ignore_phases(fixture_repo):
+    # `plan.phases` is parsed lazily: a step that never reads it must run even
+    # when the gauntlet-phases block is malformed (so the deterministic plan-lint
+    # gate, not an eager parse in some earlier step's context, is what reports
+    # the defect). The parse is deferred to the foreach, where it fails closed.
     text = """
 name: demo
 version: 1
 stages:
-  - id: plan
+  - id: pre
     steps:
-      - {id: plan-approve, type: human_gate, show: [plan.md]}
+      - {id: noop, type: shell, run: "true"}
   - id: phases
     foreach: plan.phases
     steps:
@@ -460,7 +461,9 @@ stages:
     orch = _build(fixture_repo, text)
     (orch.artifact_root / "plan.md").write_text(MALFORMED_PLAN)
     assert orch.drive() == M.RUN_PARKED
+    # The phases-agnostic step ran instead of being pre-empted by the parse...
+    assert orch.manifest.record("noop").status == M.DONE
+    # ...and the run still failed closed at the foreach, with the reason persisted.
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
-    # The park reason is persisted data, not something a human must infer.
-    assert any("plan.md" in w for w in reloaded.warnings), reloaded.warnings
+    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings

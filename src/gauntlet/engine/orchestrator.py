@@ -47,6 +47,39 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _LazyPlanPhases:
+    """Defer parsing plan.md's phase list until ``plan.phases`` is read.
+
+    ``foreach: plan.phases`` is the only expression that reads the phase list,
+    and only the phases stage — which runs *after* the plan gate — does. Parsing
+    eagerly in every ``_context()`` (built once per step) meant a malformed
+    ``gauntlet-phases`` block crashed the context for *unrelated* steps: it
+    pre-empted the deterministic ``plan-lint`` gate and broke the FR-10.2
+    contract that the foreach "only resolves after the plan gate". Deferring the
+    parse to attribute access restores both — the lint handler is the one place
+    that reports a structural defect, and the foreach is the fail-closed backstop
+    (its raise is caught in ``drive()``).
+    """
+
+    __slots__ = ("_plan_path",)
+
+    def __init__(self, plan_path: Path) -> None:
+        self._plan_path = plan_path
+
+    @property
+    def phases(self) -> list[Any]:
+        from gauntlet.engine.planphases import load_plan_phases
+
+        phases = load_plan_phases(self._plan_path)
+        if phases is None:
+            # No plan / no phase block yet: surface as a missing attribute so
+            # `foreach` resolution fails closed with its own "does not resolve"
+            # error rather than fanning out over a guess. A *malformed* block
+            # raises PlanPhasesError here instead, which propagates to drive().
+            raise AttributeError("phases")
+        return phases
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -427,11 +460,11 @@ class Orchestrator:
             ctx["item"] = item
         return ctx
 
-    def _plan_context(self) -> dict[str, Any]:
-        from gauntlet.engine.planphases import load_plan_phases
-
-        phases = load_plan_phases(self.artifact_root / "plan.md")
-        return {"phases": phases} if phases is not None else {}
+    def _plan_context(self) -> _LazyPlanPhases:
+        # Lazy: parsing is deferred to `.phases` access (see _LazyPlanPhases), so
+        # a malformed plan.md only surfaces where the phase list is actually used
+        # — the phases foreach — not while building context for every step.
+        return _LazyPlanPhases(self.artifact_root / "plan.md")
 
     def _seed_artifacts(self) -> None:
         for name in ("prd.md", "plan.md"):

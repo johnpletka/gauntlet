@@ -316,3 +316,54 @@ def test_halt_marker_as_block_parks_without_writing_output(fixture_repo):
                  adapters={"builder": FakeAdapter(text=conflict)})
     assert orch.drive() == M.RUN_PARKED
     assert not (fixture_repo / "runs" / "demo" / "plan.md").exists()
+
+
+# --- phase_lint: deterministic plan-gate structural check --------------------
+_PHASE_LINT_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-lint, type: phase_lint, artifact: plan.md}
+"""
+
+_VALID_PLAN = (
+    "# Plan\n\n```gauntlet-phases\n"
+    "- id: P1\n  title: Build it\n  goal: Implement the widget end-to-end.\n"
+    "```\n"
+)
+
+
+def test_phase_lint_passes_a_valid_block(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text(_VALID_PLAN)
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.DONE
+    assert "valid" in rec.notes and "P1" in rec.notes
+
+
+def test_phase_lint_halts_on_malformed_block(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    # Unquoted `schema:` colon — the exact defect the prose reviewer missed.
+    (orch.artifact_root / "plan.md").write_text(
+        "# Plan\n\n```gauntlet-phases\n"
+        "- id: P1\n  title: Broken\n"
+        "  goal: the implement step has no schema: field and must not change\n"
+        "```\n"
+    )
+    # A structurally unrunnable plan must not reach approval: it parks here.
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "invalid" in rec.notes
+
+
+def test_phase_lint_halts_when_block_absent(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text("# Plan\n\nProse only, no block.\n")
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "no gauntlet-phases block" in rec.notes
