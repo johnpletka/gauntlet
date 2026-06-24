@@ -35,7 +35,7 @@ When an agent halts with an `UPSTREAM CONFLICT`, it does not mark the step done 
 
 **Why not extend `approve`/`reject`?**
 - `approve` (run.py:824) marks the step done and skips to the next step — no re-run
-- `reject` (run.py:850) fails the step and triggers on_fail retry logic — not a resume with fresh context
+- `reject` (run.py:850) fails the whole run and halts it (orchestrator.py:123-129); the notes never reach a re-run
 - Neither feeds human text back into a re-run of the agent
 
 `--response` is a new path: re-run the agent with the human's context injected so it can re-evaluate.
@@ -109,8 +109,8 @@ Examples:
 ### FR-2: Manifest recording (audit trail)
 - **Acceptance:** Each `--response` invocation records in step's metadata:
   - `response_text` (the instruction, verbatim)
-  - `timestamp` (ISO 8601)
-  - `user` (from `config.identity()` per existing identity plumbing, not new source)
+  - `timestamp` (ISO 8601, from injected orchestrator clock for determinism)
+  - `user` (from `git config user.email`, with override via `GAUNTLET_USER_EMAIL` env var — records the human operator, not agent identity)
   - `attempt_number` (mapped to StepRecord.attempts field)
 - Under `steps[N].human_responses` array (append-only, immutable in git history)
 - Persists across future resumes (all prior responses visible to next agent re-run)
@@ -121,7 +121,7 @@ Examples:
 Responses fall into three categories; handlers differ:
 
 **(a) Conflict-resolution responses** — resolve the conflict *in place* without amending approved artifacts
-- Example: "Ratify option 1: remove asset_root change from test strategy" (conflict is already resolved by understanding it better)
+- Example: "The asset_root change case is now clarified: as expected, it's a customization (treated as stale-warn per F-004). Template-version bump → refresh as expected. No contradiction remains." (conflict resolved through understanding, not artifact editing)
 - Handler: Builder proceeds; implements no artifact changes; may commit as-is
 - **Acceptance:** Builder output acknowledges the response, describes how conflict is resolved, commits
 
@@ -148,14 +148,14 @@ Responses fall into three categories; handlers differ:
     Response: <response_text>
     
     Timestamp: <ISO 8601>
-    User: <identity>
+    User: <human operator email>
     
     [Metadata for audit]
     ```
-  - Artifact is added to step's inputs before prompt render
-  - Agent-task prompt template includes: `## Human decision\n\n{{inputs.human-response.md}}`
-  - Builder receives the response as part of its normal artifact context (no special interpolation needed)
-- **Acceptance:** Builder receives response in prompt and acknowledges it in output
+  - Artifact is added to step's `inputs:` list before prompt render
+  - Builder receives the response as a `--- input artifact: human-response.md ---` block (appended by existing _render_prompt path, steptypes.py:217-233)
+  - No new {{}} token interpolation needed; artifact is auto-appended like all other inputs
+- **Acceptance:** Builder receives response in artifact blocks and acknowledges it in output
 
 ### FR-5: Builder resume logic
 
@@ -191,10 +191,10 @@ Responses fall into three categories; handlers differ:
 
 ## 6. Data sources (reuse — do not reinvent)
 
-- **User identity:** Use existing `config.identity()` plumbing (steptypes.py:291) — do not invent new env-var source
-- **Timestamp:** Use `datetime.utcnow().isoformat()` (standard Python, used elsewhere in manifest)
+- **User identity:** Source from operator's git config `user.email` (with override via `GAUNTLET_USER_EMAIL` env var). Records the human who made the decision, not agent identity (config.identity() returns agent@gauntlet.local, defeating audit trail purpose).
+- **Timestamp:** Use injected orchestrator clock (`RunManager.clock`, default `datetime.now(timezone.utc).isoformat()`; orchestrator.py:45,63). Enables deterministic test replay; avoids deprecated naive datetime forms.
 - **Attempt tracking:** Map to existing `StepRecord.attempts` field (manifest.py:61, incremented on every resume)
-- **Artifact injection:** Mimic existing input-artifact flow (orchestrator.py _render_prompt, line 217) — add synthetic input, not new interpolation path
+- **Artifact injection:** Mimic existing input-artifact flow (_render_prompt, steptypes.py:217-233) — add synthetic input to `inputs:` list, auto-appended as artifact blocks; no new interpolation path
 - **Parked-step detection:** Reuse existing `status == "parked"` check (manifest.py:27) — no new metadata field needed for v1
 
 ---
@@ -218,7 +218,8 @@ Responses fall into three categories; handlers differ:
 ### Manifest
 - ✓ Response + metadata recorded in `manifest.json` under `steps[N].human_responses` array
 - ✓ Array persists across multiple resume attempts (append-only)
-- ✓ User identity sourced from config.identity(), not new env-var
+- ✓ User identity sourced from git config user.email (with GAUNTLET_USER_EMAIL override)
+- ✓ Timestamp sourced from injected orchestrator clock (deterministic, no ad-hoc datetime calls)
 
 ### Prompt injection
 - ✓ Synthetic `human-response.md` artifact created and passed to agent
