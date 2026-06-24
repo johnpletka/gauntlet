@@ -46,6 +46,12 @@ class StepResult:
     # mutation commits) reports every (phase-prefix, sha) it created, in order.
     commits: list[tuple[str, str]] = field(default_factory=list)
     notes: str = ""
+    # Conflict-park discriminator (FR-2.1): set to
+    # ``PARKED_REASON_UPSTREAM_CONFLICT`` ONLY when this step halted on an
+    # UPSTREAM CONFLICT signal; ``None`` for every other outcome (including a
+    # park on a *different* ``halt_on`` marker, a human_gate, or a budget halt).
+    # ``_finalize`` copies this onto the record so the field stays current-state.
+    parked_reason: str | None = None
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
     # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent

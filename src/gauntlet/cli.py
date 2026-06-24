@@ -214,10 +214,25 @@ def reject(
 @app.command()
 def resume(
     slug: str,
+    response: str = typer.Option(
+        None, "--response",
+        help='Human decision for a step parked on an UPSTREAM CONFLICT '
+             '(FR-10.4): re-runs the builder with this context injected instead '
+             'of re-surfacing the conflict. Required to resume a conflict park; '
+             'passed verbatim, no parsing.',
+    ),
     no_judge: bool = typer.Option(False, "--no-judge"),
 ) -> None:
-    """Resume an interrupted run at its last incomplete step (FR-8.2)."""
-    typer.echo(f"run status: {_manager().resume(slug, use_judge=not no_judge)}")
+    """Resume an interrupted run at its last incomplete step (FR-8.2).
+
+    For a step parked on an UPSTREAM CONFLICT, supply
+    `--response "<decision>"` to record your decision (audited in the manifest)
+    and re-run the builder with it. Other parks resume as before.
+    """
+    typer.echo(
+        "run status: "
+        f"{_manager().resume(slug, response=response, use_judge=not no_judge)}"
+    )
 
 
 @app.command()

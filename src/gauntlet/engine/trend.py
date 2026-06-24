@@ -71,10 +71,14 @@ def build_run_trend(manifest: Any, *, judge_audit_path: Path | None = None) -> T
     )
     findings_per_round = findings_total / rounds if rounds else None
 
+    # `attempts` IS the failure counter now (FR-6): a tests step that failed
+    # twice then passed has attempts == 2 → 2 failed loops, and a single
+    # fail-then-pass has attempts == 1 → 1 loop. (The old `attempts - 1` undercounted
+    # by one and dropped single-failure runs entirely — review F-004.)
     test_failure_loops = sum(
-        max((rec.attempts or 0) - 1, 0)
+        rec.attempts or 0
         for rec in manifest.steps
-        if rec.type == "shell" and (rec.attempts or 0) > 1
+        if rec.type == "shell"
     )
 
     phases = _count_phases(manifest)

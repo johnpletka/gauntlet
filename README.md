@@ -224,6 +224,7 @@ gauntlet status myfeat           # see current step + every step's state
 gauntlet approve myfeat          # accept the parked gate; drive to the next one
 gauntlet reject myfeat --notes "…"   # send the phase back for another fix round
 gauntlet resume myfeat           # resume after an interruption (kill -9 safe)
+gauntlet resume myfeat --response "…"   # decide an upstream conflict (see below)
 gauntlet report myfeat           # per-step / per-agent cost + token breakdown
 ```
 
@@ -232,10 +233,55 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
   dirty tree before dying is parked or reset rather than re-run blindly.
 - **Approved artifacts are immutable.** A later phase that finds an approved
   PRD/plan incomplete *halts and surfaces the conflict* rather than amending it.
+  You resolve that conflict with `gauntlet resume <slug> --response "…"` (see
+  **Resolving an upstream conflict** below), which routes any artifact change
+  back through its own gate rather than letting the builder amend it in place.
 - At the final gate a **`PR.md` draft** is written under `.gauntlet/runs/<slug>/`
   (it is **not** opened or pushed — that stays a human action).
 - After a run, `gauntlet feedback <slug>` captures your retrospective notes and
   triage corrections to feed the self-improvement loop.
+
+---
+
+## Resolving an upstream conflict
+
+When a builder finds that the approved PRD or plan is wrong or under-specified,
+it **halts with an `UPSTREAM CONFLICT`** instead of working around the approved
+artifact (FR-10.4). The step parks; the run is stuck until you decide. The
+standard, audited way to decide is:
+
+```sh
+gauntlet resume <slug> --response "<your decision, in plain text>"
+```
+
+The decision is recorded verbatim in the manifest (timestamped, attributed to
+your operator identity) and injected into a fresh builder run, which
+**re-evaluates** the conflict in light of it rather than re-surfacing it. The
+builder then emits one of three outcomes:
+
+- **Proceeds** — the decision resolves the conflict within what the approved
+  artifacts already allow (e.g. ratifying one of the options they leave open, or
+  deferring out-of-scope follow-up to `FUTURE.md`). The run un-sticks and
+  continues.
+- **Re-parks for an artifact amendment** — the decision would require changing
+  approved PRD/plan text (**including** "proceed even though this contradicts the
+  plan"). There is **no** proceed-now-amend-later path: amend that artifact on
+  its **own** branch, take it through **its own** review-and-gate cycle
+  (FR-10.4), then resume again with a decision that no longer contradicts it.
+- **Re-parks for clarification** — the decision was ambiguous; the builder names
+  what it still needs. Supply another `--response`.
+
+Notes:
+
+- `--response` is **required** to resume a step parked on an upstream conflict.
+  Other parks (e.g. a `human_gate`) are unaffected — use `approve` / `reject`
+  for those, and a plain `gauntlet resume` for a non-conflict agent park.
+- **Conflicts do not consume the retry budget** — only genuine failures do. You
+  can supply as many `--response` cycles as it takes; you decide when to stop or
+  abort.
+- The whole history of your decisions is preserved in the manifest
+  (`steps[N].human_responses`, append-only) and reaches git history, so the audit
+  trail of who decided what, and when, is never lost.
 
 ---
 
@@ -251,6 +297,7 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
 | `gauntlet approve <slug> [--gate ID] [--notes …]` | Approve a parked gate, continue the run. |
 | `gauntlet reject <slug> --notes … [--gate ID]` | Reject a parked gate. |
 | `gauntlet resume <slug>` | Resume an interrupted run at its last incomplete step. |
+| `gauntlet resume <slug> --response "…"` | Decide a step parked on an upstream conflict (FR-10.4); records the decision and re-runs the builder with it. Required for conflict parks. |
 | `gauntlet abort <slug>` | Abort a run. |
 | `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown. |
 | `gauntlet feedback <slug>` | Capture human feedback + triage corrections (FR-6.1). |
