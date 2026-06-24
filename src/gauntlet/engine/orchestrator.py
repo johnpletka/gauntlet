@@ -37,6 +37,7 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.planphases import PlanPhasesError
 from gauntlet.engine.pipeline import Pipeline, Stage, Step
 from gauntlet.logging.redact import RedactingWriter
 from gauntlet.logging.transcript import write_run_index
@@ -44,6 +45,39 @@ from gauntlet.logging.transcript import write_run_index
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class _LazyPlanPhases:
+    """Defer parsing plan.md's phase list until ``plan.phases`` is read.
+
+    ``foreach: plan.phases`` is the only expression that reads the phase list,
+    and only the phases stage — which runs *after* the plan gate — does. Parsing
+    eagerly in every ``_context()`` (built once per step) meant a malformed
+    ``gauntlet-phases`` block crashed the context for *unrelated* steps: it
+    pre-empted the deterministic ``plan-lint`` gate and broke the FR-10.2
+    contract that the foreach "only resolves after the plan gate". Deferring the
+    parse to attribute access restores both — the lint handler is the one place
+    that reports a structural defect, and the foreach is the fail-closed backstop
+    (its raise is caught in ``drive()``).
+    """
+
+    __slots__ = ("_plan_path",)
+
+    def __init__(self, plan_path: Path) -> None:
+        self._plan_path = plan_path
+
+    @property
+    def phases(self) -> list[Any]:
+        from gauntlet.engine.planphases import load_plan_phases
+
+        phases = load_plan_phases(self._plan_path)
+        if phases is None:
+            # No plan / no phase block yet: surface as a missing attribute so
+            # `foreach` resolution fails closed with its own "does not resolve"
+            # error rather than fanning out over a guess. A *malformed* block
+            # raises PlanPhasesError here instead, which propagates to drive().
+            raise AttributeError("phases")
+        return phases
 
 
 class Orchestrator:
@@ -106,11 +140,25 @@ class Orchestrator:
         """
         self.manifest.status = M.RUN_RUNNING
         self._persist()
-        for stage in self.pipeline.stages:
-            status = self._run_stage(stage)
-            if status != DONE:
-                return self._set_run_status(status)
-        return self._set_run_status(DONE)
+        try:
+            for stage in self.pipeline.stages:
+                status = self._run_stage(stage)
+                if status != DONE:
+                    return self._set_run_status(status)
+            return self._set_run_status(DONE)
+        except PlanPhasesError as exc:
+            # A malformed `gauntlet-phases` block in plan.md is a builder-authored
+            # artifact defect, not an orchestrator fault — and `_plan_context`
+            # parses it while building the context for *any* step (a gate, a
+            # foreach), so an uncaught raise here kills `drive()` mid-walk and
+            # leaves the write-ahead RUN_RUNNING status persisted: `gauntlet
+            # status` then reads as a live run that is actually dead. Fail closed
+            # (CLAUDE.md §2): record the precise parse error and park for a human
+            # via HALTED -> RUN_PARKED, the same terminal-park path a budget/
+            # timeout halt takes. The human fixes plan.md and `gauntlet resume`
+            # re-drives — reaching the plan gate and parking normally.
+            self.manifest.warnings.append(f"plan.md gauntlet-phases unparseable: {exc}")
+            return self._set_run_status(HALTED)
 
     def approve_gate(self, step_id: str, notes: str | None = None) -> str:
         rec = self._find_parked_gate(step_id)
@@ -412,11 +460,11 @@ class Orchestrator:
             ctx["item"] = item
         return ctx
 
-    def _plan_context(self) -> dict[str, Any]:
-        from gauntlet.engine.planphases import load_plan_phases
-
-        phases = load_plan_phases(self.artifact_root / "plan.md")
-        return {"phases": phases} if phases is not None else {}
+    def _plan_context(self) -> _LazyPlanPhases:
+        # Lazy: parsing is deferred to `.phases` access (see _LazyPlanPhases), so
+        # a malformed plan.md only surfaces where the phase list is actually used
+        # — the phases foreach — not while building context for every step.
+        return _LazyPlanPhases(self.artifact_root / "plan.md")
 
     def _seed_artifacts(self) -> None:
         for name in ("prd.md", "plan.md"):

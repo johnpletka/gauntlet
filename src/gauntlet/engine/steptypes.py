@@ -31,6 +31,7 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine import gitops
 from gauntlet.engine.pipeline import Step
+from gauntlet.engine.planphases import PlanPhasesError, extract_phases
 from gauntlet.logging.transcript import StepLogger
 
 _CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
@@ -100,6 +101,50 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
     return StepResult(
         status=PARKED,
         notes=f"awaiting human decision; review: {', '.join(show) or '(nothing listed)'}",
+    )
+
+
+# --- phase_lint --------------------------------------------------------------
+def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
+    """Structurally validate plan.md's ``gauntlet-phases`` block at the plan gate.
+
+    The plan-cycle reviewer reads plan.md as *prose* — it never parses the
+    fenced ``gauntlet-phases`` block — so a structurally broken block (e.g. an
+    unquoted ``schema:`` colon that YAML reads as a nested mapping) sails through
+    review and only detonates later, when the phases stage tries to fan out over
+    ``plan.phases`` and :func:`load_plan_phases` raises. This deterministic,
+    no-agent check closes that gap: it runs the *same* parser the foreach uses,
+    so a plan can only pass the gate if the engine can actually execute it.
+
+    Fail closed (CLAUDE.md §2): a missing/empty/malformed block HALTS — which
+    parks the run for a human (HALTED -> RUN_PARKED) with the precise reason —
+    rather than letting a known-unrunnable plan reach human approval.
+    """
+    artifact = step.get("artifact", "plan.md")
+    path = ctx.artifact_root / artifact
+    if not path.exists():
+        return StepResult(
+            status=HALTED,
+            notes=f"phase lint: {artifact} is missing at the plan gate",
+        )
+    try:
+        phases = extract_phases(path.read_text())
+    except PlanPhasesError as exc:
+        return StepResult(
+            status=HALTED,
+            notes=f"phase lint: {artifact} gauntlet-phases block is invalid — {exc}",
+        )
+    if not phases:
+        return StepResult(
+            status=HALTED,
+            notes=(
+                f"phase lint: {artifact} declares no gauntlet-phases block; the "
+                "phases stage would have nothing to fan out over (FR-5.1)"
+            ),
+        )
+    ids = ", ".join(p["id"] for p in phases)
+    return StepResult(
+        status=DONE, notes=f"phase lint: {len(phases)} phase(s) valid ({ids})"
     )
 
 
@@ -482,6 +527,10 @@ SPECS: dict[str, StepSpec] = {
     "human_gate": StepSpec(
         type="human_gate",
         handler=handle_human_gate,
+    ),
+    "phase_lint": StepSpec(
+        type="phase_lint",
+        handler=handle_phase_lint,  # read-only: parses plan.md, touches nothing
     ),
     "commit": StepSpec(
         type="commit",

@@ -49,6 +49,12 @@ stages:
          phase: PLAN, reviewer: reviewer, triager: triage, fixer: builder,
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-document.md}
+      # Deterministic structural gate (FR-5.1): the prose reviewer above never
+      # parses the gauntlet-phases block, so a malformed block (e.g. an unquoted
+      # `schema:` colon) would pass review and only crash later when the phases
+      # stage fans out. plan-lint runs the same parser the foreach uses, so a
+      # structurally unrunnable plan halts here instead of reaching approval.
+      - {id: plan-lint, type: phase_lint, artifact: plan.md}
       - {id: plan-approve, type: human_gate,
          show: [plan.md, findings.json, triage.json, confirm.json]}
 
