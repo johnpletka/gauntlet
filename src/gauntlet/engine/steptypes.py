@@ -43,6 +43,12 @@ _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
 # this string verbatim (pipelines/standard.yaml `halt_on: "UPSTREAM CONFLICT"`).
 UPSTREAM_CONFLICT_MARKER = "UPSTREAM CONFLICT"
 
+# FR-4: the single, fixed-name synthetic artifact that carries the full
+# chronological human-decision history into a `--response` resume. There is
+# exactly one file with this name; each resume regenerates it from the manifest
+# (so repeated resumes never accumulate differently-named files / collide).
+HUMAN_RESPONSE_ARTIFACT = "human-response.md"
+
 
 # --- shell -------------------------------------------------------------------
 def render_shell_command(template: str, config) -> str:
@@ -250,9 +256,22 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
         base = template_path.read_text()
     else:
         base = step.get("prompt_text", "") or ""
+    # FR-4: feed the human-decision history (if any) to the builder via the
+    # EXISTING input-artifact path — no new `{{}}` interpolation. The synthetic
+    # `human-response.md` is added to an INVOCATION-LOCAL copy of the inputs list
+    # and an invocation-local artifact-path map; `step.inputs`, the pipeline
+    # definition, and manifest.json are never mutated (FR-4.1). The artifact is
+    # rebuilt fresh from `human_responses` on every render (chronological), so
+    # repeated resumes regenerate one file rather than accumulating files.
+    inputs = list(step.get("inputs", []) or [])
+    artifacts = dict(ctx.artifacts)
+    history_path = _write_human_response_artifact(ctx)
+    if history_path is not None:
+        inputs.append(HUMAN_RESPONSE_ARTIFACT)
+        artifacts[HUMAN_RESPONSE_ARTIFACT] = history_path
     parts = [base]
-    for name in step.get("inputs", []) or []:
-        path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+    for name in inputs:
+        path = artifacts.get(name) or (ctx.artifact_root / name)
         content = Path(path).read_text() if Path(path).exists() else ""
         parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
     if ctx.iteration_item is not None:
@@ -260,6 +279,44 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
         rendered = item if isinstance(item, str) else json.dumps(item, indent=2)
         parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{rendered}")
     return "".join(parts)
+
+
+def render_human_responses(responses) -> str:
+    """Render the full ordered human-decision history in the FR-4 block format.
+
+    One block per recorded response, oldest first, under a single heading. Pure
+    and derived: the manifest's ``human_responses`` array is the only source, so
+    the rendered file is fully reconstructible and a stale on-disk copy is
+    harmless (FR-4.1). Kept as a standalone function so it is unit-testable
+    without driving a whole resume.
+    """
+    parts = ["# Human decisions (chronological)\n"]
+    for r in responses:
+        parts.append(
+            f"## Response {r.response_id} — attempt {r.response_attempt}\n"
+            f"Response: {r.response_text}\n"
+            f"Timestamp: {r.timestamp}\n"
+            f"User: {r.user}\n"
+        )
+    return "\n".join(parts)
+
+
+def _write_human_response_artifact(ctx: StepContext) -> Path | None:
+    """Rebuild ``human-response.md`` from the manifest into the render area (FR-4).
+
+    Returns the path to the regenerated file, or ``None`` when the step carries
+    no recorded responses (the ordinary first-run / non-conflict case, where no
+    block is injected). The file is written under the step's log dir — inside the
+    gitignored live run dir — so it is an ephemeral render input: never committed
+    as a step artifact, overwritten on the next resume, and harmless if left
+    stale because it is fully derived from ``human_responses`` (FR-4.1).
+    """
+    responses = ctx.record.human_responses
+    if not responses:
+        return None
+    path = step_log_dir(ctx) / HUMAN_RESPONSE_ARTIFACT
+    ctx.writer.write_text(path, render_human_responses(responses))
+    return path
 
 
 def _load_schema(step: Step, ctx: StepContext) -> dict | None:

@@ -796,6 +796,152 @@ def test_recovery_dirty_base_park_keeps_pending(tmp_path):
     assert rec.attempts == 0
 
 
+# --- FR-4: chronological human-response.md prompt injection -----------------
+def test_render_human_responses_block_format(tmp_path):
+    # FR-4 block format, asserted on the pure renderer (no resume needed).
+    from gauntlet.engine.steptypes import render_human_responses
+
+    responses = [
+        HumanResponse(
+            response_id="implement-resp-1", response_text="first",
+            timestamp="2026-06-24T00:00:01+00:00", user="a@b.c",
+            response_attempt=1, state=M.RESPONSE_CONSUMED,
+        ),
+        HumanResponse(
+            response_id="implement-resp-2", response_text="second",
+            timestamp="2026-06-24T00:00:02+00:00", user="a@b.c",
+            response_attempt=2, state=M.RESPONSE_PENDING,
+        ),
+    ]
+    rendered = render_human_responses(responses)
+    assert rendered == (
+        "# Human decisions (chronological)\n\n"
+        "## Response implement-resp-1 — attempt 1\n"
+        "Response: first\n"
+        "Timestamp: 2026-06-24T00:00:01+00:00\n"
+        "User: a@b.c\n\n"
+        "## Response implement-resp-2 — attempt 2\n"
+        "Response: second\n"
+        "Timestamp: 2026-06-24T00:00:02+00:00\n"
+        "User: a@b.c\n"
+    )
+
+
+
+def _history_artifact(mgr: RunManager) -> Path:
+    """The regenerated render input under the (gitignored) step log dir."""
+    return _run_dir(mgr) / "steps" / "implement" / "human-response.md"
+
+
+def test_response_injected_as_single_artifact_block(tmp_path):
+    # FR-4: the builder receives the decision via the EXISTING input-artifact
+    # path as one `--- input artifact: human-response.md ---` block.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = ScriptedAdapter("proceed")
+    mgr.resume(
+        "demo", response="Ratify option 1.", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    prompt = adapter.prompts[-1]
+    assert prompt.count("--- input artifact: human-response.md ---") == 1
+    assert "# Human decisions (chronological)" in prompt
+    assert "## Response implement-resp-1 — attempt 1" in prompt
+    assert "Response: Ratify option 1." in prompt
+    assert "User: fixture@gauntlet.local" in prompt
+    # The artifact is written to the gitignored render area, not committed.
+    assert _history_artifact(mgr).exists()
+
+
+def test_response_history_accumulates_chronologically(tmp_path):
+    # FR-4: repeated resumes regenerate ONE file holding the full ordered
+    # history, oldest first — not one differently-named file per response.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    mgr.resume(
+        "demo", response="first decision", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("conflict"), clock=_clock(),
+    )
+    adapter = ScriptedAdapter("proceed")
+    mgr.resume(
+        "demo", response="second decision", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    prompt = adapter.prompts[-1]
+    assert prompt.count("--- input artifact: human-response.md ---") == 1
+    # both responses present, oldest first (chronological)
+    assert prompt.index("implement-resp-1") < prompt.index("implement-resp-2")
+    assert "Response: first decision" in prompt
+    assert "Response: second decision" in prompt
+    assert "## Response implement-resp-1 — attempt 1" in prompt
+    assert "## Response implement-resp-2 — attempt 2" in prompt
+
+
+def test_injection_does_not_mutate_definition_or_persist_artifact(tmp_path):
+    # FR-4/FR-4.1: the synthetic artifact is invocation-local — the pipeline
+    # definition, the persisted run-copy pipeline, the step's `inputs`, and
+    # manifest.json are all unchanged; the file has no manifest entry.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    run_dir = _run_dir(mgr)
+    src_pipeline = (repo / "pipelines" / "respond.yaml").read_bytes()
+    run_pipeline = (run_dir / "pipeline.yaml").read_bytes()
+
+    mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
+    )
+
+    # No byte changed in either pipeline definition.
+    assert (repo / "pipelines" / "respond.yaml").read_bytes() == src_pipeline
+    assert (run_dir / "pipeline.yaml").read_bytes() == run_pipeline
+    # The implement step's persisted `inputs:` never gained the synthetic name.
+    from gauntlet.engine.pipeline import load_pipeline
+    pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+    implement = next(
+        s for stage in pipeline.stages for s in stage.steps if s.id == "implement"
+    )
+    assert "human-response.md" not in (implement.get("inputs", []) or [])
+    # The manifest never records the derived render input as an artifact.
+    assert "human-response.md" not in (run_dir / "manifest.json").read_text()
+
+
+def test_artifact_regenerated_from_manifest_when_stale_copy_gone(tmp_path):
+    # FR-4.1: the file is fully derived from `human_responses`; a missing/stale
+    # on-disk copy is rebuilt from the manifest on the next resume.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    mgr.resume(
+        "demo", response="first", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("conflict"), clock=_clock(),
+    )
+    art = _history_artifact(mgr)
+    assert art.exists()
+    art.unlink()  # simulate a vanished render input between resumes
+
+    adapter = ScriptedAdapter("proceed")
+    mgr.resume(
+        "demo", response="second", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert art.exists()  # regenerated from the durable array, not relied upon
+    prompt = adapter.prompts[-1]
+    assert "Response: first" in prompt
+    assert "Response: second" in prompt
+
+
+def test_first_run_has_no_human_response_block(tmp_path):
+    # FR-4: an ordinary run with no recorded responses injects no block.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    adapter = ScriptedAdapter("conflict")
+    mgr.start(
+        "demo", repo / "pipelines" / "respond.yaml",
+        use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert "human-response.md" not in adapter.prompts[-1]
+    assert not _history_artifact(mgr).exists()
+
+
 def test_manifest_is_human_readable_json(tmp_path):
     repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
     _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
