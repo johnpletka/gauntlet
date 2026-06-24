@@ -520,6 +520,90 @@ def test_resume_disposition_schema_bound_invocation_locally(tmp_path):
     assert implement.get("findings_schema") is None
 
 
+# --- F-001: a conflict re-park must hand off a CLEAN worktree ----------------
+def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
+    # Review F-001 / clean-handoff invariant (CLAUDE.md §1): the builder runs with
+    # repo-write access. If it writes implementation edits and THEN re-parks on a
+    # conflict (write=True + a re-park disposition), those uncommitted edits must
+    # not survive to the human handoff — a later `--response` resume re-enters the
+    # PARKED step with resuming=False, bypassing the dirty-base recovery, and would
+    # otherwise re-run over and silently commit them. The engine restores the clean
+    # tree before finalizing the park, having snapshotted the work to a backup ref.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(_disposition("new_conflict"), write=True)
+    status = mgr.resume(
+        "demo", response="ambiguous", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_PARKED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    # The builder's uncommitted edit was discarded; no implementation change
+    # survives to the handoff (the only residual dirt is engine bookkeeping,
+    # which the clean-handoff invariant deliberately excludes).
+    assert not (repo / "feature.py").exists()
+    assert "feature.py" not in gitops.status_porcelain(repo)
+    # ...and preserved losslessly in a backup ref carrying that very edit.
+    refs = gitops._run(
+        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/backup"
+    ).splitlines()
+    backup = [r for r in refs if "conflict" in r]
+    assert backup, "a dirty conflict park must snapshot the work to a backup ref"
+    tree = gitops._run(repo, "ls-tree", "-r", "--name-only", backup[0])
+    assert "feature.py" in tree
+
+
+def test_clean_repark_creates_no_backup(tmp_path):
+    # The negative control: when the builder honors the classify-don't-implement
+    # contract (write=False), a re-park leaves the tree already clean, so the guard
+    # is a no-op — no needless reset, no backup ref.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(_disposition("new_conflict"), write=False)
+    status = mgr.resume(
+        "demo", response="ambiguous", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_PARKED
+    # No implementation edit to discard → the guard is a no-op: no backup ref.
+    refs = gitops._run(
+        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/backup"
+    ).strip()
+    assert refs == ""
+
+
+def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):
+    # End-to-end: a dirty re-park followed by a `--response` proceed must not carry
+    # the first attempt's discarded edits into the phase commit. With the clean
+    # restore, the proceed run re-implements from a clean base and the committed
+    # tree reflects only the proceed's own output.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE)
+    _drive_to_conflict(repo, mgr, PIPELINE)
+    # First resume: the builder writes, then re-parks — edits must be discarded.
+    reparked = DispositionAdapter(_disposition("new_conflict"), write=True)
+    assert mgr.resume(
+        "demo", response="ambiguous", use_judge=False,
+        adapter_factory=lambda n: reparked, clock=_clock(),
+    ) == M.RUN_PARKED
+    assert not (repo / "feature.py").exists()
+    # Second resume: a clean proceed lands the phase commit normally.
+    proceed = DispositionAdapter(
+        _disposition(
+            "proceed_in_place",
+            responses=("implement-resp-1", "implement-resp-2"),
+        ),
+        write=True,
+    )
+    assert mgr.resume(
+        "demo", response="now resolved", use_judge=False,
+        adapter_factory=lambda n: proceed, clock=_clock(),
+    ) == M.RUN_DONE
+    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    assert (repo / "feature.py").read_text() == "implemented\n"
+
+
 def test_responses_considered_lists_consumed_id(tmp_path):
     # FR-5/FR-10 observable property: the disposition references the consumed
     # response_id; a second resume references both.

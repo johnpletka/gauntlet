@@ -372,6 +372,15 @@ class Orchestrator:
             result = StepResult(status=FAILED, notes=f"handler error: {exc}")
 
         result = self._apply_budget_guard(step, rec, result)
+        # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
+        # whether signalled by the textual UPSTREAM CONFLICT marker (first
+        # conflict) or a re-park disposition (amendment_required/new_conflict) —
+        # hands control to a human, so the worktree MUST be clean. The builder
+        # runs with repo-write access; if it wrote implementation edits and THEN
+        # signalled a conflict, those edits are still uncommitted. Restore the
+        # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
+        # `--response` resume never re-runs over — and commits — stale edits.
+        result = self._restore_clean_after_conflict_park(step, spec, rec, result)
         consumed = self._finalize(rec, result)
         self._persist()  # WRITE-AHEAD: after the side effect, terminal state
         # The consume flip, the FAILED attempt-increment, and the status all
@@ -469,6 +478,71 @@ class Orchestrator:
                 "interrupted_step=park)"
             ),
         )
+
+    def _restore_clean_after_conflict_park(
+        self, step: Step, spec, rec: StepRecord, result: StepResult
+    ) -> StepResult:
+        """Restore the clean-worktree invariant on a conflict park (review F-001).
+
+        A conflict park (``parked_reason == upstream_conflict``) returns control
+        to a human, so the worktree must be clean (CLAUDE.md §1). But the builder
+        ran with repo-write access and may have written implementation edits
+        before deciding to signal the conflict; those edits are uncommitted (the
+        checkpoint commits stage ONLY bookkeeping, never the implementation
+        diff). Left in place they would be re-run over — and silently committed —
+        by the next ``--response`` resume, which re-enters the PARKED step with
+        ``resuming=False`` and so bypasses the dirty-base recovery in
+        ``_resume_disposition``.
+
+        Unlike a mid-edit *kill* (whose salvageability is ambiguous and governed
+        by ``interrupted_step``), a deliberate conflict park is an unambiguous "I
+        am not implementing" signal — partial edits are definitionally unwanted,
+        so we always restore clean regardless of policy. Nothing is lost: the
+        dirty tree is snapshotted to a backup ref first. We reset to HEAD (NOT
+        ``base_sha``): HEAD already carries the engine bookkeeping checkpoints
+        (e.g. the pending-response commit), and its implementation tree equals
+        ``base_sha``'s — no phase/impl commit lands on a park — so resetting to it
+        discards only the builder's uncommitted edits while preserving every
+        checkpoint (the rewind-past-checkpoint hazard ``_resume_disposition``
+        guards against does not arise here).
+        """
+        if (
+            result.status != PARKED
+            or result.parked_reason != M.PARKED_REASON_UPSTREAM_CONFLICT
+            or rec.base_sha is None
+            or not spec.step_touches_worktree(step)
+        ):
+            return result
+        # Scope the dirty check (and the discard) to OUTSIDE the run root: the
+        # builder's implementation edits land in the source tree, while prd.md,
+        # plan.md, declared outputs, and engine bookkeeping all live under
+        # `run_root`. Excluding the whole run root therefore isolates exactly the
+        # implementation leakage F-001 is about, and avoids touching real run
+        # artifacts (the same exclusion the `clean` below and `_resume_disposition`
+        # use). A clean result here means the builder honored the
+        # classify-don't-implement contract — nothing to restore.
+        run_root = [self.config.run_root]
+        if gitops.is_clean(self.repo_root, exclude=run_root):
+            return result
+        ts = self.clock().replace(":", "-")
+        backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-conflict-{ts}"
+        gitops.backup_dirty_worktree(
+            self.repo_root,
+            backup,
+            f"conflict-park partial work for {rec.id} (F-001)",
+            exclude=run_root,
+        )
+        gitops.reset_hard(self.repo_root, self._head_sha())
+        # `reset --hard` leaves untracked files; clear the builder's untracked
+        # edits too, sparing the whole run root so the manifest/transcripts/
+        # authored artifacts under it survive.
+        gitops.clean_untracked(self.repo_root, exclude=run_root)
+        note = (
+            f"conflict park left an uncommitted worktree; backed up to {backup} "
+            "and restored the clean tree before handoff (F-001)"
+        )
+        result.notes = f"{result.notes}\n{note}" if result.notes else note
+        return result
 
     def _apply_budget_guard(
         self, step: Step, rec: StepRecord, result: StepResult

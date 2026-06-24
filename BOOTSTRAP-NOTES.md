@@ -705,3 +705,34 @@ process, and what it suggests for Gauntlet's design.
     the diff does not touch. Authorship: any commit path outside the engine's
     commit step (manual bootstrap commits) should reuse `config.identity(builder)`
     rather than inheriting whatever git identity the drafting session ran under.
+
+## 2026-06-24 — resume-response feature, final PR (#31) review
+
+45. **All six phase commits (P1–P6) are authored by `Gauntlet Triage`, not the
+    builder (review F-003).** `git show -s --format='%an <%ae>'` on
+    `7d2f4f4`, `2a85816`, `e641beb`, `f01a397`, `b5956a5`, `70d53f0` all report
+    `Gauntlet Triage <triage@gauntlet.local>`; the `PN.1` fix commits correctly
+    report `Gauntlet Builder`. The engine-side fix for exactly this
+    (commit AUTHORSHIP is the implementer's, never the message drafter's —
+    `steptypes.py` `handle_commit`, "review F-003") landed in `d65190c` (P1.1).
+    *Root cause:* P2–P6 were committed **after** `d65190c`, yet still carry the
+    pre-fix authorship — which is only possible if the live `gauntlet` engine
+    driving this self-hosting run **predated the fix**. The editable install
+    (`uv tool install -e .`) was not refreshed mid-run, so the running process
+    kept the old drafter-as-author behavior for the whole pipeline even as the
+    working tree fixed it. The current code is correct; a fresh install will not
+    reproduce this.
+    *Why recorded, not rewritten:* same rationale as note 44 and CLAUDE.md §3 —
+    rewriting six commits on a pushed branch with an open PR requires explicit
+    human instruction, and would invalidate every SHA already baked into
+    `runs/gauntlet-resume-response/PR.md`, `manifest.json`, `RUN.md`, and the
+    transcripts. The human chose to document rather than rewrite (the PR is
+    accurate about what happened). True provenance is not lost: the run manifest
+    records `agent: builder` on every `implement` step, so the builder/triage
+    split (FR-9.7's purpose) remains recoverable from data — data over inference.
+    *Action items:* (1) reinstall the engine (`uv tool install -e .`) before the
+    next self-hosting run so a stale process cannot silently re-introduce a fixed
+    bug; (2) consider a `gauntlet doctor` check that compares the installed engine
+    version/commit against the working-tree `HEAD` and WARNs on drift, since "the
+    code is fixed but the running engine isn't" is an invisible failure mode that
+    has now bitten provenance twice.
