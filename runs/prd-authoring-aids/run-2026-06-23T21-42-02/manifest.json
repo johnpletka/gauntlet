@@ -161,14 +161,14 @@
     {
       "id": "implement",
       "type": "agent_task",
-      "status": "parked",
+      "status": "done",
       "agent": "builder",
       "session_id": "00ebe4fc-f3d6-4242-a0e7-8ae35c0a7f96",
       "started": "2026-06-24T01:49:43.130296+00:00",
-      "ended": "2026-06-24T20:29:21.308298+00:00",
+      "ended": "2026-06-24T21:38:26.838199+00:00",
       "attempts": 3,
       "base_sha": "8cd9008ac80e696866f1da4e4300d2aed5b44bb1",
-      "parked_reason": "upstream_conflict",
+      "parked_reason": null,
       "human_responses": [
         {
           "response_id": "implement-resp-1",
@@ -184,16 +184,16 @@
           "timestamp": "2026-06-24T21:36:15.088233+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 2,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 14969,
-        "output_tokens": 75215,
-        "cached_input_tokens": 6578233,
-        "cost_usd": 10.2504135
+        "input_tokens": 15102,
+        "output_tokens": 79074,
+        "cached_input_tokens": 6850365,
+        "cost_usd": 13.2319295
       },
-      "notes": "operator recovery: failed resume re-parked failed->parked after the FR-10 resume-disposition schema fix (PR #32, BOOTSTRAP-NOTES #46) landed; implement-resp-1 (consumed) and attempts kept for the audit trail",
+      "notes": "agent 'builder' completed",
       "iteration": "0",
       "metrics": {}
     }
@@ -216,10 +216,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 285338,
-    "output_tokens": 164738,
-    "cached_input_tokens": 10107828,
-    "cost_usd": 15.56577285
+    "input_tokens": 285471,
+    "output_tokens": 168597,
+    "cached_input_tokens": 10379960,
+    "cost_usd": 18.54728885
   },
   "agent_usage": {
     "reviewer": {
@@ -235,10 +235,10 @@
       "cost_usd": 0.024913499999999998
     },
     "builder": {
-      "input_tokens": 23692,
-      "output_tokens": 137308,
-      "cached_input_tokens": 10050740,
-      "cost_usd": 15.494459100000002
+      "input_tokens": 23825,
+      "output_tokens": 141167,
+      "cached_input_tokens": 10322872,
+      "cost_usd": 18.475975100000003
     },
     "judge_llm": {
       "input_tokens": 65429,
