@@ -602,3 +602,67 @@ stages:
     assert gitops.head_sha(fixture_repo) == landed  # no second commit
     assert len(orch.manifest.commits) == 1
     assert orch.manifest.commits[0].sha == landed
+
+
+# A gauntlet-phases block whose `goal:` carries an unquoted `schema:` — a
+# colon-space mid-scalar that YAML reads as a nested mapping ("mapping values
+# are not allowed here"). This is the exact defect that crashed the
+# gauntlet-resume-response run's resume.
+MALFORMED_PLAN = (
+    "# Plan\n\n"
+    "```gauntlet-phases\n"
+    "- id: P1\n"
+    "  title: Broken phase\n"
+    "  goal: the implement step has no schema: field and must not change\n"
+    "```\n"
+)
+
+
+def test_malformed_plan_phases_parks_instead_of_crashing(fixture_repo):
+    text = """
+name: demo
+version: 1
+stages:
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: implement, type: shell, run: "true"}
+"""
+    orch = _build(fixture_repo, text)
+    (orch.artifact_root / "plan.md").write_text(MALFORMED_PLAN)
+    # A malformed block must not escape drive() as an uncaught PlanPhasesError
+    # (which would leave the write-ahead RUN_RUNNING persisted); it parks.
+    assert orch.drive() == M.RUN_PARKED
+    # The persisted manifest reflects the park — never a stale "running" that
+    # `gauntlet status` would report as a live run.
+    reloaded = Manifest.load(orch.manifest_path)
+    assert reloaded.status == M.RUN_PARKED
+    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+
+
+def test_malformed_plan_does_not_block_steps_that_ignore_phases(fixture_repo):
+    # `plan.phases` is parsed lazily: a step that never reads it must run even
+    # when the gauntlet-phases block is malformed (so the deterministic plan-lint
+    # gate, not an eager parse in some earlier step's context, is what reports
+    # the defect). The parse is deferred to the foreach, where it fails closed.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: pre
+    steps:
+      - {id: noop, type: shell, run: "true"}
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: implement, type: shell, run: "true"}
+"""
+    orch = _build(fixture_repo, text)
+    (orch.artifact_root / "plan.md").write_text(MALFORMED_PLAN)
+    assert orch.drive() == M.RUN_PARKED
+    # The phases-agnostic step ran instead of being pre-empted by the parse...
+    assert orch.manifest.record("noop").status == M.DONE
+    # ...and the run still failed closed at the foreach, with the reason persisted.
+    reloaded = Manifest.load(orch.manifest_path)
+    assert reloaded.status == M.RUN_PARKED
+    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
