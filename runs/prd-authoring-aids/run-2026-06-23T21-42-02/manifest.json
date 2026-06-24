@@ -161,14 +161,14 @@
     {
       "id": "implement",
       "type": "agent_task",
-      "status": "failed",
+      "status": "parked",
       "agent": "builder",
       "session_id": "00ebe4fc-f3d6-4242-a0e7-8ae35c0a7f96",
       "started": "2026-06-24T01:49:43.130296+00:00",
       "ended": "2026-06-24T20:29:21.308298+00:00",
       "attempts": 3,
       "base_sha": "8cd9008ac80e696866f1da4e4300d2aed5b44bb1",
-      "parked_reason": null,
+      "parked_reason": "upstream_conflict",
       "human_responses": [
         {
           "response_id": "implement-resp-1",
@@ -185,7 +185,7 @@
         "cached_input_tokens": 6578233,
         "cost_usd": 10.2504135
       },
-      "notes": "handler error: claude reported failure: exit code 1; stderr: ",
+      "notes": "operator recovery: failed resume re-parked failed->parked after the FR-10 resume-disposition schema fix (PR #32, BOOTSTRAP-NOTES #46) landed; implement-resp-1 (consumed) and attempts kept for the audit trail",
       "iteration": "0",
       "metrics": {}
     }

@@ -12,7 +12,7 @@
 | [plan-author](steps/plan-author/transcript.md) | agent_task | done | 217s | 2510in/10284out $0.7674 | agent 'builder' completed |
 | [plan-cycle](steps/plan-cycle/) | adversarial_cycle | done | 716s | 130057in/41026out $2.9064 | converged in round 1 (blocking policy): no open blocking; 8 fixed, 0 non-blocking item(s) surfaced for the gate |
 | plan-approve | human_gate | done | 9786s | 0in/0out (tokens only) | approved |
-| [implement.0](steps/implement.0/transcript.md) | agent_task | failed | 67178s | 14969in/75215out $10.2504 | handler error: claude reported failure: exit code 1; stderr:  |
+| [implement.0](steps/implement.0/transcript.md) | agent_task | parked | 67178s | 14969in/75215out $10.2504 | operator recovery: failed resume re-parked failed->parked after the FR-10 resume-disposition schema fix (PR #32, BOOTSTRAP-NOTES #46) landed; implement-resp-1 (consumed) and attempts kept for the audit trail |
 
 ## Commits
 
