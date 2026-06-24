@@ -16,6 +16,7 @@ and per-step budget halts (FR-3.3).
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +47,37 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Author/committer for orchestrator-owned manifest-checkpoint commits (FR-2.2).
+# A response's *operator* identity (FR-9) is recorded IN the manifest entry's
+# ``user`` field — it is deliberately NOT the commit author, which is the fixed
+# engine identity so bookkeeping commits are attributable to the engine, never
+# mislabelled as a human's work.
+ENGINE_IDENTITY = gitops.Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
+
+
+@dataclass
+class ResponseAction:
+    """A planned ``gauntlet resume --response`` transition (FR-1/FR-2/FR-7.1).
+
+    Built by :class:`~gauntlet.engine.run.RunManager` after it has run every
+    guard and resolved operator identity, so the orchestrator only *applies* an
+    already-validated decision:
+
+    - ``append``  — a new response: append a ``pending`` entry + commit, then the
+      stage walk re-executes the parked step.
+    - ``recover`` — a prior invocation crashed with a still-``pending`` entry:
+      reuse it (its ``pending`` checkpoint is flushed before re-launch); never
+      re-append.
+    - ``none``    — a plain resume with no response handling.
+    """
+
+    kind: str  # "append" | "recover" | "none"
+    step_id: str | None = None
+    iteration: str | None = None
+    text: str | None = None
+    user: str | None = None
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -61,6 +93,7 @@ class Orchestrator:
         adapter_factory: Callable[[str], Any] | None = None,
         extra_context: dict[str, Any] | None = None,
         clock: Callable[[], str] = _utcnow,
+        response_action: "ResponseAction | None" = None,
     ) -> None:
         self.repo_root = repo_root
         self.run_dir = run_dir
@@ -73,6 +106,7 @@ class Orchestrator:
         self.adapter_factory = adapter_factory
         self.extra_context = extra_context or {}
         self.clock = clock
+        self.response_action = response_action
         self.manifest_path = run_dir / "manifest.json"
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
@@ -106,6 +140,7 @@ class Orchestrator:
         """
         self.manifest.status = M.RUN_RUNNING
         self._persist()
+        self._apply_response_action()
         for stage in self.pipeline.stages:
             status = self._run_stage(stage)
             if status != DONE:
@@ -226,7 +261,11 @@ class Orchestrator:
                 self._finalize(rec, short)
                 return short
 
-        rec.attempts += 1
+        # NOTE: `rec.attempts` is NO LONGER incremented here. FR-6 redefines it
+        # as the failure-retry counter: it advances exactly once, in `_finalize`,
+        # only on a FAILED outcome — never on success, conflict park, halt,
+        # interruption, or a `--response` continuation. Relocating it there is
+        # what keeps conflict/response resumes from consuming the retry budget.
         rec.status = M.RUNNING
         rec.started = rec.started or self.clock()
         self.manifest.current_step = step.id
@@ -252,8 +291,18 @@ class Orchestrator:
             result = StepResult(status=FAILED, notes=f"handler error: {exc}")
 
         result = self._apply_budget_guard(step, rec, result)
-        self._finalize(rec, result)
+        consumed = self._finalize(rec, result)
         self._persist()  # WRITE-AHEAD: after the side effect, terminal state
+        # The consume flip, the FAILED attempt-increment, and the status all
+        # landed in the single `_persist` above — one atomic on-disk transaction
+        # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
+        # the `consumed` checkpoint, so a crash here leaves the entry already
+        # `consumed` on disk and recovery merely flushes this commit, never
+        # re-executing or double-counting.
+        if consumed is not None:
+            self._commit_manifest_checkpoint(
+                f"gauntlet: response {consumed.response_id} consumed"
+            )
         return result
 
     def _resume_disposition(
@@ -336,7 +385,7 @@ class Orchestrator:
             return result
         return result
 
-    def _finalize(self, rec: StepRecord, result: StepResult) -> None:
+    def _finalize(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
         rec.status = {
             DONE: M.DONE,
             FAILED: M.FAILED,
@@ -384,6 +433,30 @@ class Orchestrator:
         if result.status == DONE:
             for name, path in result.artifact_writes.items():
                 self.artifacts[name] = path
+        # Failure-only attempt increment (FR-6): the audit retry counter advances
+        # ONLY when a run ends in failure — relocated here from `_execute`'s old
+        # unconditional top-of-run bump. DONE / PARKED / HALTED / INTERRUPTED do
+        # not advance it, so arbitrarily many conflict or `--response` cycles
+        # never exhaust `max_retries`; a genuine response failure still counts
+        # once, like any other failed run.
+        if result.status == FAILED:
+            rec.attempts += 1
+        # Consume a pending `--response` on a terminal agent outcome (FR-2 /
+        # FR-7.1): proceed (DONE), re-park (PARKED), or genuine failure (FAILED).
+        # An INTERRUPTED mid-edit park or a HALTED budget checkpoint is NOT a
+        # terminal agent outcome, so the response stays `pending` for the next
+        # resume to reconcile. The flip rides the same `_persist` as the status
+        # and the FAILED increment above (atomic; F-003), and is returned so the
+        # caller can commit the matching `consumed` checkpoint only once durable.
+        consumed: "M.HumanResponse | None" = None
+        if rec.human_responses:
+            latest = rec.human_responses[-1]
+            if latest.state == M.RESPONSE_PENDING and result.status in (
+                DONE, FAILED, PARKED
+            ):
+                latest.state = M.RESPONSE_CONSUMED
+                consumed = latest
+        return consumed
 
     # ---- helpers -------------------------------------------------------------
     def _make_context(
@@ -489,6 +562,104 @@ class Orchestrator:
             self.manifest.current_step = None
         self._persist()
         return self.manifest.status
+
+    # ---- response handling (FR-2, FR-2.2, FR-7.1) ---------------------------
+    def _apply_response_action(self) -> None:
+        """Apply a planned `--response` transition at the start of a resume.
+
+        Order matters for crash recovery (FR-7.1): FIRST flush the latest
+        response step's CURRENT state to git, so a crash between an atomic
+        manifest write and its checkpoint commit can never leave that state
+        unreachable in history — and, for a recovered `pending` entry, so a
+        distinct `pending` commit always precedes the later `consumed` one
+        (F-002). THEN, only for a brand-new response, append the `pending` entry
+        and commit it before the stage walk re-executes the parked step.
+        """
+        self._reconcile_response_checkpoint()
+        action = self.response_action
+        if action is None or action.kind in ("none", "recover"):
+            return
+        if action.kind == "append":
+            rec = self.manifest.record(action.step_id, action.iteration)
+            if rec is None:  # defensive: validated in RunManager before we drive
+                return
+            self._append_response(rec, action.text, action.user)
+
+    def _reconcile_response_checkpoint(self) -> None:
+        """Idempotently flush the latest response step's current-state commit."""
+        rec = self._latest_response_step()
+        if rec is None:
+            return
+        entry = rec.human_responses[-1]
+        self._commit_manifest_checkpoint(
+            f"gauntlet: response {entry.response_id} {entry.state}"
+        )
+
+    def _latest_response_step(self) -> StepRecord | None:
+        """The most recently active step carrying `--response` history.
+
+        Steps are appended in execution order, so the last record with a
+        non-empty `human_responses` list is the one whose checkpoint commit may
+        still be un-flushed after a crash. At most one is ever in flight.
+        """
+        target: StepRecord | None = None
+        for rec in self.manifest.steps:
+            if rec.human_responses:
+                target = rec
+        return target
+
+    def _append_response(self, rec: StepRecord, text: str, user: str) -> M.HumanResponse:
+        """Append one `pending` response entry, persist, and commit it (FR-2).
+
+        `response_id` (`<step_id>-resp-<ordinal>`) and `response_attempt` are
+        both the 1-based position in the array, assigned once and never changed —
+        the stable handle the builder references (FR-5/FR-10) and recovery
+        deduplicates on (FR-7.1). The `pending` write is atomic and committed
+        BEFORE the agent launches.
+        """
+        ordinal = len(rec.human_responses) + 1
+        entry = M.HumanResponse(
+            response_id=f"{rec.id}-resp-{ordinal}",
+            response_text=text,
+            timestamp=self.clock(),
+            user=user,
+            response_attempt=ordinal,
+            state=M.RESPONSE_PENDING,
+        )
+        rec.human_responses.append(entry)
+        self._persist()  # atomic write-ahead of the pending entry (FR-2.2)
+        self._commit_manifest_checkpoint(
+            f"gauntlet: response {entry.response_id} pending"
+        )
+        return entry
+
+    def _commit_manifest_checkpoint(self, message: str) -> str | None:
+        """Commit run bookkeeping (manifest.json + RUN.md) as an engine commit.
+
+        The orchestrator is the sole committer of manifest state (FR-2.2); the
+        builder gets no direct-write path. Stages ONLY the two bookkeeping paths
+        (never the implementation diff) under the fixed engine identity, forcing
+        past the run-dir gitignore. Idempotent — a no-op when nothing changed —
+        so recovery can call it to flush a not-yet-landed state safely.
+        """
+        # Keep RUN.md consistent with the manifest we are about to commit (the
+        # manifest is authoritative; RUN.md is its derived index).
+        write_run_index(self.run_dir, self.manifest, self.writer)
+        root = self.repo_root.resolve()
+        paths: list[str] = []
+        for name in ("manifest.json", "RUN.md"):
+            p = self.run_dir / name
+            if not p.exists():
+                continue
+            try:
+                paths.append(p.resolve().relative_to(root).as_posix())
+            except ValueError:
+                pass
+        if not paths:
+            return None
+        return gitops.commit_run_bookkeeping(
+            self.repo_root, message, paths, identity=ENGINE_IDENTITY
+        )
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)

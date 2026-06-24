@@ -26,6 +26,15 @@ from pydantic import BaseModel, Field
 # conflict metadata is deferred, PRD §7). v1 has exactly one value.
 PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"
 
+# --- human-response lifecycle states (FR-2, FR-7.1) --------------------------
+# A `--response` entry is born ``pending`` (appended before the agent launches)
+# and flips to ``consumed`` once the resumed agent reaches a terminal outcome
+# (proceeds, re-parks, or fails). The ``state`` field is the single source of
+# truth for idempotent crash recovery: a recovered ``pending`` entry is
+# re-launched, never re-appended; a ``consumed`` entry is never re-executed.
+RESPONSE_PENDING = "pending"
+RESPONSE_CONSUMED = "consumed"
+
 # --- step lifecycle states ---------------------------------------------------
 PENDING = "pending"
 RUNNING = "running"

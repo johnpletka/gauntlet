@@ -22,9 +22,10 @@ from pathlib import Path
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.execution import run_bookkeeping_excludes
+from gauntlet.engine.identity import resolve_operator_identity
 from gauntlet.engine.judgeproc import ManagedJudge
 from gauntlet.engine.manifest import Manifest, PipelineRef
-from gauntlet.engine.orchestrator import Orchestrator
+from gauntlet.engine.orchestrator import Orchestrator, ResponseAction
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.validate import validate_pipeline
 from gauntlet.logging.redact import RedactingWriter, build_redactor
@@ -765,7 +766,8 @@ class RunManager:
             self._release_worktree_lock(handle)
 
     # ---- resume (FR-8.2) ----------------------------------------------------
-    def resume(self, slug: str, *, use_judge: bool = True, adapter_factory=None,
+    def resume(self, slug: str, *, response: str | None = None,
+               use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
@@ -812,13 +814,113 @@ class RunManager:
                         "before resuming."
                     )
             gitops.checkout_branch(repo, man.branch)
+            # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
+            # FR-7.1 idempotent recovery). All validation and operator-identity
+            # resolution happen HERE, before driving; the orchestrator only
+            # applies an already-validated, fail-closed decision.
+            action = self._plan_response_action(man, response)
             return self._drive(
                 layout, run_dir, pipeline, man,
                 use_judge=use_judge, adapter_factory=adapter_factory,
                 extra_context=extra_context, clock=clock,
+                response_action=action,
             )
         finally:
             self._release_worktree_lock(handle)
+
+    def _plan_response_action(
+        self, man: Manifest, response: str | None
+    ) -> ResponseAction:
+        """Validate `gauntlet resume [--response]` and decide the transition.
+
+        Guard order is deliberate and fails closed (CLAUDE.md §2): crash
+        recovery is checked FIRST (a pending entry preempts every other path),
+        then the response-less scoping (FR-1.1), then the new-append guards
+        (FR-1/FR-8) with operator identity resolved last (FR-9) so an
+        unresolvable identity errors before anything is appended.
+        """
+        # FR-7.1 — recovery: a prior invocation crashed mid-transition.
+        pending = self._step_with_pending_response(man)
+        if pending is not None:
+            latest = pending.human_responses[-1]
+            if response is not None and response != latest.response_text:
+                raise ValueError(
+                    f"a pending response ({latest.response_id}) is awaiting "
+                    f"processing; re-run `gauntlet resume {man.slug}` to finish "
+                    "it, or abort the run — do not supply a new response over a "
+                    "pending one."
+                )
+            return ResponseAction(
+                kind="recover", step_id=pending.id, iteration=pending.iteration
+            )
+
+        # No pending entry.
+        if response is None:
+            # FR-1.1: a conflict park REQUIRES --response; every other park keeps
+            # its existing response-less re-run behavior unchanged.
+            parked = self._parked_step(man)
+            if (
+                parked is not None
+                and parked.type == "agent_task"
+                and parked.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+            ):
+                raise ValueError(
+                    f"step '{parked.id}' parked on an upstream conflict; resume "
+                    'it with --response "<decision>" '
+                    "(see `gauntlet resume --help`)"
+                )
+            return ResponseAction(kind="none")
+
+        # FR-1/FR-8: a new --response was supplied; it requires a parked
+        # agent_task. Resolve identity LAST so a fail-closed identity error
+        # (FR-9) leaves the manifest untouched (no entry appended).
+        if man.status != M.RUN_PARKED:
+            raise ValueError(
+                f"run '{man.run_id}' is not parked; cannot resume with --response"
+            )
+        parked = self._parked_step(man)
+        if parked is None:
+            raise ValueError(
+                f"run '{man.run_id}' is not parked; cannot resume with --response"
+            )
+        if parked.type == "human_gate":
+            raise ValueError(
+                "use `gauntlet approve` or `gauntlet reject` for human_gate "
+                "steps; --response is for agent_task steps"
+            )
+        if parked.type != "agent_task":
+            raise ValueError(
+                f"step '{parked.id}' is a {parked.type}; --response only applies "
+                "to agent_task steps"
+            )
+        user = resolve_operator_identity(self.repo_root)
+        return ResponseAction(
+            kind="append", step_id=parked.id, iteration=parked.iteration,
+            text=response, user=user,
+        )
+
+    @staticmethod
+    def _step_with_pending_response(man: Manifest):
+        """The step whose latest `--response` entry is still `pending`, if any.
+
+        At most one is ever in flight; the last in execution order wins.
+        """
+        target = None
+        for rec in man.steps:
+            if (
+                rec.human_responses
+                and rec.human_responses[-1].state == M.RESPONSE_PENDING
+            ):
+                target = rec
+        return target
+
+    @staticmethod
+    def _parked_step(man: Manifest):
+        """The single parked StepRecord (the run parks one step at a time)."""
+        for rec in man.steps:
+            if rec.status == M.PARKED:
+                return rec
+        return None
 
     # ---- gates --------------------------------------------------------------
     def approve(self, slug: str, gate: str | None = None, notes: str | None = None,
@@ -1250,17 +1352,18 @@ class RunManager:
         return match
 
     def _drive(self, layout, run_dir, pipeline, man, *, use_judge, adapter_factory,
-               extra_context, clock) -> str:
+               extra_context, clock, response_action=None) -> str:
         if not use_judge:
             orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                       adapter_factory=adapter_factory,
-                                      extra_context=extra_context, clock=clock)
+                                      extra_context=extra_context, clock=clock,
+                                      response_action=response_action)
             status = orch.drive()
         else:
             status = self._with_judge(man, run_dir, lambda env: self._orchestrator(
                 layout, run_dir, pipeline, man, judge_env=env,
                 adapter_factory=adapter_factory, extra_context=extra_context,
-                clock=clock).drive())
+                clock=clock, response_action=response_action).drive())
         self._maybe_draft_pr(layout, run_dir, man, status)
         return status
 
@@ -1367,7 +1470,8 @@ class RunManager:
         return status
 
     def _orchestrator(self, layout, run_dir, pipeline, man, *, judge_env,
-                      adapter_factory=None, extra_context=None, clock=None) -> Orchestrator:
+                      adapter_factory=None, extra_context=None, clock=None,
+                      response_action=None) -> Orchestrator:
         kwargs = dict(
             repo_root=self.repo_root,
             run_dir=run_dir,
@@ -1379,6 +1483,7 @@ class RunManager:
             judge_env=judge_env,
             adapter_factory=adapter_factory,
             extra_context=extra_context or {},
+            response_action=response_action,
         )
         if clock is not None:
             kwargs["clock"] = clock

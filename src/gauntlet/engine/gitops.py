@@ -240,6 +240,35 @@ def commit_paths(
     return head_sha(repo)
 
 
+def commit_run_bookkeeping(
+    repo: Path, message: str, paths: list[str], *, identity: Identity
+) -> str | None:
+    """Force-stage gitignored run-bookkeeping paths and commit them alone.
+
+    The live run dir is gitignored (its manifest/RUN.md must never dirty the
+    worktree or pollute phase commits), so a response checkpoint (FR-2.2) has to
+    ``add -f`` past that ignore rule. It then commits ONLY the named paths
+    (path-limited ``commit``), so a dirty implementation tree can never smuggle
+    agent edits into a bookkeeping commit. **Idempotent:** if the named paths
+    carry no change vs HEAD, returns ``None`` and creates no empty commit — so
+    crash recovery can call it to flush a not-yet-landed state whether or not the
+    commit already happened. The message is passed on stdin (``-F -``); no
+    agent-authored text reaches argv. Returns the new SHA, or ``None``.
+    """
+    _run(repo, "add", "-f", "--", *paths)
+    # Scope the change check to OUR paths so unrelated staged/worktree state
+    # never makes this look "dirty" (or get swept into the commit below).
+    if not _run(repo, "diff", "--cached", "--name-only", "--", *paths).strip():
+        return None
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit", "-F", "-", "--", *paths,
+    ]
+    _run(repo, *args, stdin=message)
+    return head_sha(repo)
+
+
 def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
