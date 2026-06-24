@@ -32,6 +32,7 @@ from gauntlet.engine.execution import (
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
     PARKED_REASON_UPSTREAM_CONFLICT,
+    RESPONSE_CONSUMED,
     RESPONSE_PENDING,
 )
 from gauntlet.engine.pipeline import Step
@@ -549,7 +550,16 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # Narrow exclusion (review F-001): commit real artifacts (plan.md, outputs);
     # keep only the engine's own bookkeeping out of the commit and the checks.
     exclude = ctx.excludes
-    message, draft_usage, draft_session, drafter = _commit_message(step, ctx)
+    # PRD §8 / appendix: a phase commit that lands after a `gauntlet resume
+    # --response` must reference the human decision(s) it implements, linking the
+    # committed code back to the ratifying response in git history. The consumed
+    # responses are passed into message generation (so a drafted body can cite
+    # them) AND an audit trailer is appended deterministically below — data over
+    # inference: the linkage never depends on the drafter remembering to add it.
+    consumed = _consumed_responses(step, ctx)
+    message, draft_usage, draft_session, drafter = _commit_message(step, ctx, consumed)
+    if consumed:
+        message = _append_response_trailer(message, [r.response_id for r in consumed])
     usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
     if err is not None:
@@ -606,24 +616,25 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
-def _commit_message(step: Step, ctx: StepContext):
+def _commit_message(step: Step, ctx: StepContext, consumed=()):
     """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
     are None for a literal message (no model call)."""
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
-    return _draft_commit_message(step, ctx)
+    return _draft_commit_message(step, ctx, consumed)
 
 
-def _draft_commit_message(step: Step, ctx: StepContext):
+def _draft_commit_message(step: Step, ctx: StepContext, consumed=()):
     """Draft a commit message via the message_agent with bounded redraft.
 
     The agent sees the change as data — both the tracked diff AND the untracked
     files `git add -A` will sweep in (review F-008: a new-file phase otherwise
-    drafts from an empty diff) — plus an optional plan section. The engine
-    validates the format and asks for a redraft on violation (FR-9.2). Returns
-    ``(message, usage, session_id, drafter)`` so the commit step records the
-    drafter's cost (FR-3.2/§7).
+    drafts from an empty diff) — plus an optional plan section and, after a
+    `--response` resume, the human decision(s) being implemented (PRD §8). The
+    engine validates the format and asks for a redraft on violation (FR-9.2).
+    Returns ``(message, usage, session_id, drafter)`` so the commit step records
+    the drafter's cost (FR-3.2/§7).
     """
     agent_name = step.get("message_agent")
     if not agent_name:
@@ -643,7 +654,7 @@ def _draft_commit_message(step: Step, ctx: StepContext):
     plan_section = _plan_section(step, ctx)
     header = (
         f"{base_prompt}\n\nRequired header phase prefix: {phase_hint or '(infer PN)'}\n"
-        f"{plan_section}"
+        f"{plan_section}{_response_section(consumed)}"
     )
     prompt = f"{header}\n{change}\n"
     max_redrafts = int(step.get("max_redrafts", 2))
@@ -731,6 +742,63 @@ def _change_context(ctx: StepContext) -> str:
     return (
         f"--- git status (incl. untracked) ---\n{status}\n"
         f"\n--- diff (tracked, vs HEAD) ---\n{diff}"
+    )
+
+
+def _consumed_responses(step: Step, ctx: StepContext) -> list:
+    """The `--response` decisions consumed in this commit's stage (PRD §8).
+
+    A phase commit follows the agent_task(s) it commits the work of; scope the
+    audit linkage to the stage containing this commit step, matching iteration so
+    a `foreach: plan.phases` fan-out references only its own phase's responses.
+    Consumed-state only — a still-`pending` entry has no committed outcome yet.
+    Returns the `HumanResponse` entries in execution order (oldest first).
+    """
+    stage = next(
+        (s for s in ctx.pipeline.stages if any(st.id == step.id for st in s.steps)),
+        None,
+    )
+    if stage is None:
+        return []
+    consumed: list = []
+    for st in stage.steps:
+        rec = ctx.manifest.record(st.id, ctx.record.iteration)
+        if rec is None:
+            continue
+        consumed.extend(
+            r for r in rec.human_responses if r.state == RESPONSE_CONSUMED
+        )
+    return consumed
+
+
+def _append_response_trailer(message: str, response_ids: list[str]) -> str:
+    """Append the consumed-response audit trailer to a phase commit body (PRD §8).
+
+    Engine-appended (not left to the message drafter) so the link from the
+    committed code to the ratifying human decision is deterministic and always
+    present — fail closed, data over inference. A git-trailer-shaped line keeps
+    the reference machine-greppable in history.
+    """
+    body = message.rstrip("\n")
+    return f"{body}\n\nGauntlet-Response: {', '.join(response_ids)}\n"
+
+
+def _response_section(consumed) -> str:
+    """An optional commit-draft section naming the human decision(s) implemented.
+
+    Lists only the response_id(s), not the verbatim response text: the text may
+    be credential-shaped (it reaches the builder verbatim but the on-disk audit
+    copy is redacted), and it must not bleed into a commit message. Gives the
+    message_agent enough to cite the decision; the audit link itself is
+    guaranteed by the engine-appended trailer regardless of drafting.
+    """
+    if not consumed:
+        return ""
+    ids = ", ".join(r.response_id for r in consumed)
+    return (
+        "\n--- human decision(s) this commit implements ---\n"
+        f"This commit lands work directed by `gauntlet resume --response`. "
+        f"Reference the consumed response id(s) in the body: {ids}\n"
     )
 
 

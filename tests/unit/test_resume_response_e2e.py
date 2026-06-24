@@ -88,6 +88,16 @@ def test_e2e_conflict_resume_proceeds_unsticks_run(tmp_path):
     assert "## Response implement-resp-1 — attempt 1" in resume_prompt
     assert decision in resume_prompt
 
+    # P5 / FR-10: the run's behaviour is driven by the builder's STRUCTURED
+    # disposition, not just text — assert the exact fields the fixture emitted
+    # (the deterministic oracle PRD §8/FR-10 require, not prompt substrings). The
+    # proceed cycle emitted exactly one disposition, naming the consumed response.
+    assert len(adapter.dispositions) == 1
+    disp = adapter.dispositions[0]
+    assert disp["disposition"] == "proceed_in_place"
+    assert disp["responses_considered"] == ["implement-resp-1"]
+    assert disp["conflict"] is None  # proceed carries no conflict body
+
     # P3 / FR-2.2: both response states reach git history under the engine
     # identity, pending before consumed, and the consumed checkpoint names the
     # consumed response_id (a commit referencing it, PRD §8 e2e).
@@ -98,6 +108,12 @@ def test_e2e_conflict_resume_proceeds_unsticks_run(tmp_path):
     # The phase commit itself landed (the proceed path committed real work).
     assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
     assert (repo / "feature.py").exists()
+    # PRD §8 / appendix: the implementation phase commit BODY references the
+    # consumed response_id, linking the committed code to the human decision that
+    # ratified it — the audit linkage the bookkeeping checkpoint alone cannot
+    # stand in for (F-001).
+    phase_body = gitops.commit_message(repo, "HEAD")
+    assert "Gauntlet-Response: implement-resp-1" in phase_body
 
 
 def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
@@ -109,9 +125,10 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
     _drive_to_conflict(repo, mgr)
 
     # First decision is still ambiguous → the builder re-parks (new_conflict).
+    repark = ScriptedAdapter("conflict")
     status = mgr.resume(
         "demo", response="do the right thing", use_judge=False,
-        adapter_factory=lambda n: ScriptedAdapter("conflict"), clock=_clock(),
+        adapter_factory=lambda n: repark, clock=_clock(),
     )
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
@@ -119,6 +136,18 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+
+    # FR-10: the re-park is driven by a structured `new_conflict` disposition that
+    # names the consumed response and carries a conflict body whose
+    # `requested_input` states what the supplied decision still did not provide
+    # (asserted on the structured fields directly, PRD §8, not prose).
+    assert len(repark.dispositions) == 1
+    repark_disp = repark.dispositions[0]
+    assert repark_disp["disposition"] == "new_conflict"
+    assert repark_disp["responses_considered"] == ["implement-resp-1"]
+    assert repark_disp["conflict"]["requested_input"] == (
+        "a decision that unambiguously resolves it"
+    )
 
     # Second decision resolves it → the run completes.
     adapter = ScriptedAdapter("proceed")
@@ -141,6 +170,17 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
     # Two conflict cycles, zero failures (FR-6).
     assert rec.attempts == 0
 
+    # FR-10: the resolving cycle emitted a `proceed_in_place` disposition that
+    # considered the FULL ordered response history (both ids), with no conflict
+    # body — the structured oracle for "the run is genuinely unblocked".
+    assert len(adapter.dispositions) == 1
+    final_disp = adapter.dispositions[0]
+    assert final_disp["disposition"] == "proceed_in_place"
+    assert final_disp["responses_considered"] == [
+        "implement-resp-1", "implement-resp-2"
+    ]
+    assert final_disp["conflict"] is None
+
     # P4: the second resume's prompt carries the FULL ordered history.
     final_prompt = adapter.prompts[-1]
     assert final_prompt.count("--- input artifact: human-response.md ---") == 1
@@ -154,3 +194,8 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
         "Gauntlet Engine|gauntlet: response implement-resp-2 consumed",
     ]
     assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    # PRD §8 / appendix: the phase commit body references BOTH consumed responses
+    # — the full audit linkage from the committed code to every human decision in
+    # the cycle that produced it (F-001).
+    phase_body = gitops.commit_message(repo, "HEAD")
+    assert "Gauntlet-Response: implement-resp-1, implement-resp-2" in phase_body

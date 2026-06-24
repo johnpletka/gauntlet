@@ -91,6 +91,10 @@ class ScriptedAdapter:
     def __init__(self, behavior: str = "conflict") -> None:
         self.behavior = behavior
         self.prompts: list[str] = []
+        # Retain every structured disposition this adapter emits (FR-10) so the
+        # e2e gate can assert the exact disposition / responses_considered /
+        # conflict fields the run actually produced — not just run status.
+        self.dispositions: list[dict] = []
 
     def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
         self.prompts.append(prompt)
@@ -105,6 +109,7 @@ class ScriptedAdapter:
         considered = _prompt_response_ids(prompt)
         if self.behavior == "conflict":
             disposition = {**_NEW_CONFLICT_DISPOSITION, "responses_considered": considered}
+            self.dispositions.append(disposition)
             return AgentResult(
                 text=CONFLICT_TEXT, structured=disposition,
                 session_id="s", exit_code=0,
@@ -113,6 +118,7 @@ class ScriptedAdapter:
             raise AdapterError("genuine agent failure (not a conflict)")
         (Path(cwd) / "feature.py").write_text("implemented\n")
         disposition = {**_PROCEED_DISPOSITION, "responses_considered": considered}
+        self.dispositions.append(disposition)
         return AgentResult(
             text="done implementing", structured=disposition,
             session_id="s", exit_code=0,

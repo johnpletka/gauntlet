@@ -4,6 +4,18 @@
 the `uv run pytest` gate (PRD §8). This file is a procedure; its evidence lands
 beside it under `runs/prd-authoring-aids/`.
 
+> **No parked run is present yet (read before precondition 1).** As committed on
+> this branch, `runs/prd-authoring-aids/` holds only `prd.md` (plus this runbook),
+> and the `gauntlet/prd-authoring-aids` branch holds only `prd.md` and `plan.md`.
+> There is **no** persisted run here: no `active-run.txt` pointer and no
+> `run-*/manifest.json` with a parked `agent_task`, so `gauntlet status
+> prd-authoring-aids` has nothing to resume. The original real conflict that
+> motivated this feature was not captured as a committed parked run. Precondition
+> 1 is therefore a **re-establish-then-confirm** step, not a given — you must
+> first drive the run to its `UPSTREAM CONFLICT` halt (below) before the
+> remaining preconditions and the single authorized invocation apply. Until then
+> this dogfood is **not** executable.
+
 ## Why this is a runbook, not a test
 
 The repeatable CI gate for resume-with-response is the synthetic, disposable
@@ -19,12 +31,26 @@ re-asserted on every CI run (PRD §8).
 
 Before the single authorized invocation, confirm all of the following:
 
-1. The `prd-authoring-aids` run exists and is **parked on an upstream conflict**:
+1. A `prd-authoring-aids` run is present and **parked on an upstream conflict**.
+   Because no parked run is committed on this branch (see the note above), first
+   re-establish it on the `gauntlet/prd-authoring-aids` branch — which carries the
+   approved `prd.md` + `plan.md` — by driving the pipeline until the builder halts
+   on the canonical `UPSTREAM CONFLICT` marker:
+   ```sh
+   git switch gauntlet/prd-authoring-aids        # the approved prd.md + plan.md live here
+   gauntlet run prd-authoring-aids               # runs until the P1 builder halts on UPSTREAM CONFLICT
+   ```
+   This writes the run pointer `runs/prd-authoring-aids/active-run.txt` and the
+   run instance `runs/prd-authoring-aids/run-<timestamp>/manifest.json` (the
+   engine force-commits the manifest as a bookkeeping checkpoint). Then confirm
+   the parked state — the precondition this dogfood actually needs:
    ```sh
    gauntlet status prd-authoring-aids
    ```
-   The parked step is an `agent_task` whose manifest record shows
-   `parked_reason == "upstream_conflict"`.
+   The parked step must be an `agent_task` whose manifest record shows
+   `parked_reason == "upstream_conflict"`. If the run instead completes or parks
+   for another reason, the original conflict did not reproduce: **stop** and treat
+   that as an upstream finding rather than forcing this procedure.
 2. Operator identity resolves (FR-9) — the audit `user` must not be blank:
    ```sh
    echo "${GAUNTLET_USER_EMAIL:-$(git config user.email)}"
