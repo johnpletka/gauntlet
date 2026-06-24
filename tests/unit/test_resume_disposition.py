@@ -50,11 +50,16 @@ def _disposition(
     requested_input: str = "the missing detail",
     artifact: str | None = None,
 ) -> dict:
-    """Build a schema-valid disposition object for the scripted adapter."""
+    """Build a schema-valid disposition object for the scripted adapter.
+
+    `conflict` is always present (required-but-nullable, F-002): an object for the
+    re-park dispositions, null for the proceed dispositions.
+    """
     obj: dict = {
         "disposition": disposition,
         "responses_considered": list(responses),
         "action_summary": f"{disposition} action",
+        "conflict": None,
     }
     if disposition in ("amendment_required", "new_conflict"):
         obj["conflict"] = {
@@ -79,9 +84,16 @@ class DispositionAdapter:
         repo_write=True, structured_output="native", resume=True
     )
 
-    def __init__(self, structured: dict | None, *, write: bool = False) -> None:
+    def __init__(
+        self,
+        structured: dict | None,
+        *,
+        write: bool = False,
+        text: str = "resume disposition emitted",
+    ) -> None:
         self.structured = structured
         self.write = write
+        self.text = text
         self.prompts: list[str] = []
         self.schemas: list[dict | None] = []
 
@@ -91,7 +103,7 @@ class DispositionAdapter:
         if self.write:
             (Path(cwd) / "feature.py").write_text("implemented\n")
         return AgentResult(
-            text="resume disposition emitted",
+            text=self.text,
             structured=self.structured,
             session_id="s",
             exit_code=0,
@@ -121,10 +133,55 @@ class ConflictAdapter:
 
 
 # --- schema validity (FR-10 oracle) -----------------------------------------
-def test_proceed_dispositions_validate_without_conflict():
+def test_proceed_dispositions_validate_with_null_conflict():
+    # conflict is required-but-nullable (F-002): a proceed disposition carries it
+    # as null and validates; the allOf forbids an object there.
     schema = _schema()
     for d in ("proceed_in_place", "proceed_with_deviation"):
-        validate_schema(_disposition(d), schema)  # no raise
+        obj = _disposition(d)
+        assert obj["conflict"] is None
+        validate_schema(obj, schema)  # no raise
+
+
+def test_schema_strict_mode_lists_every_property_required():
+    # F-002: codex 0.139.0 native structured output (strict mode) requires EVERY
+    # property to appear in `required`; conflict is spelled required-but-nullable
+    # (mirrors findings.json). Assert the top-level object and the nested conflict
+    # object both list all their properties as required.
+    schema = _schema()
+    assert set(schema["required"]) == set(schema["properties"])
+    assert "conflict" in schema["required"]
+    assert schema["properties"]["conflict"]["type"] == ["object", "null"]
+    conflict = schema["properties"]["conflict"]
+    assert set(conflict["required"]) == set(conflict["properties"])
+
+
+def test_schema_rejects_empty_semantic_evidence():
+    # F-003: the oracle must reject empty response evidence and empty clarification
+    # text — minItems/minLength enforce non-empty semantic fields.
+    schema = _schema()
+    # empty responses_considered (no response evidence)
+    with pytest.raises(ValueError):
+        validate_schema(
+            {
+                "disposition": "proceed_in_place",
+                "responses_considered": [],
+                "action_summary": "x",
+                "conflict": None,
+            },
+            schema,
+        )
+    # empty clarification request inside a re-park conflict
+    with pytest.raises(ValueError):
+        validate_schema(
+            {
+                "disposition": "new_conflict",
+                "responses_considered": ["implement-resp-1"],
+                "action_summary": "x",
+                "conflict": {"summary": "s", "requested_input": "", "artifact": None},
+            },
+            schema,
+        )
 
 
 def test_repark_dispositions_validate_with_conflict():
@@ -270,6 +327,157 @@ def test_malformed_disposition_fails_closed(tmp_path):
     assert rec.status == M.FAILED
     assert rec.attempts == 1  # one genuine failure (FR-6)
     assert rec.human_responses[-1].state == M.RESPONSE_CONSUMED
+
+
+# --- responses_considered must reference the consumed response (review F-001) -
+def test_disposition_omitting_consumed_response_fails_closed(tmp_path):
+    # A disposition whose responses_considered does not name the pending response
+    # is response-unaware: it must NOT pass the conflict gate (fail closed), even
+    # though the disposition enum itself is well-formed.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(
+        _disposition("proceed_in_place", responses=()), write=False
+    )
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.attempts == 1  # a malformed resume is a genuine failure (FR-6)
+    assert rec.human_responses[-1].state == M.RESPONSE_CONSUMED
+
+
+def test_disposition_unknown_response_id_fails_closed(tmp_path):
+    # An id that is not in the recorded history is fabricated evidence → fail closed.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(
+        _disposition("proceed_in_place", responses=("implement-resp-99",)),
+        write=False,
+    )
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    assert mgr.status("demo").record("implement").status == M.FAILED
+
+
+def test_disposition_duplicate_response_id_fails_closed(tmp_path):
+    # A duplicated id is malformed evidence → fail closed (no advancing on it).
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(
+        _disposition(
+            "proceed_in_place",
+            responses=("implement-resp-1", "implement-resp-1"),
+        ),
+        write=False,
+    )
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    assert mgr.status("demo").record("implement").status == M.FAILED
+
+
+def test_amendment_required_without_artifact_fails_closed(tmp_path):
+    # FR-3(b) / review F-003: an amendment_required must name the approved artifact
+    # it diverges from. A null target is malformed — fail closed rather than a
+    # silent re-park with no named amendment site.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(
+        _disposition("amendment_required", artifact=None), write=False
+    )
+    status = mgr.resume(
+        "demo", response="rewrite something", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.attempts == 1
+
+
+# --- proceed preserves the normal completion contract (review F-004) ---------
+PIPELINE_OUTPUT = """
+name: respond
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go,
+         halt_on: "UPSTREAM CONFLICT", output: built.md}
+"""
+
+PIPELINE_REQUIRE_SIGNAL = """
+name: respond
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go,
+         halt_on: "UPSTREAM CONFLICT", require_signal: "DONE SIGNAL"}
+"""
+
+
+def test_proceed_resume_writes_declared_output_artifact(tmp_path):
+    # F-004: a response-resumed agent_task with `output:` must still write its
+    # declared artifact on a proceed disposition — the proceed branch no longer
+    # short-circuits before the artifact write.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_OUTPUT)
+    _drive_to_conflict(repo, mgr, PIPELINE_OUTPUT)
+    artifact = mgr.layout("demo").slug_dir / "built.md"
+    assert not artifact.exists()  # the conflict park wrote nothing
+    adapter = DispositionAdapter(
+        _disposition("proceed_in_place"), write=True, text="the built artifact body"
+    )
+    status = mgr.resume(
+        "demo", response="Ratify option 1.", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    assert mgr.status("demo").record("implement").status == M.DONE
+    assert artifact.read_text() == "the built artifact body"
+
+
+def test_proceed_resume_honors_require_signal_when_absent(tmp_path):
+    # F-004: `require_signal` must still bind on a proceed resume. A proceed
+    # disposition whose output text lacks the required completion signal fails
+    # closed — the resume branch no longer ignores require_signal.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_REQUIRE_SIGNAL)
+    _drive_to_conflict(repo, mgr, PIPELINE_REQUIRE_SIGNAL)
+    adapter = DispositionAdapter(
+        _disposition("proceed_in_place"), write=False, text="no signal here"
+    )
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    assert mgr.status("demo").record("implement").status == M.FAILED
+
+
+def test_proceed_resume_completes_when_require_signal_present(tmp_path):
+    # The complement: when the required signal IS emitted, the proceed resume
+    # completes normally (the halt_on marker is suppressed, require_signal passes).
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_REQUIRE_SIGNAL)
+    _drive_to_conflict(repo, mgr, PIPELINE_REQUIRE_SIGNAL)
+    adapter = DispositionAdapter(
+        _disposition("proceed_in_place"), write=True,
+        text="DONE SIGNAL\nfinished the work",
+    )
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    assert mgr.status("demo").record("implement").status == M.DONE
 
 
 # --- invocation-local schema binding (FR-10 / FR-4.1) -----------------------

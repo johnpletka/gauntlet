@@ -13,6 +13,7 @@ re-running the resume — asserting exactly one entry and one logical re-executi
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -98,26 +99,46 @@ class ScriptedAdapter:
         # serves the FIRST conflict (no response yet): there `structured` is
         # ignored and the textual UPSTREAM CONFLICT marker parks via `halt_on`, so
         # returning both keeps one fixture valid on both the first run and resume.
+        # `responses_considered` is derived from the human-response.md block in the
+        # prompt so it names exactly the consumed (pending) response and prior
+        # history — the engine fails closed on a response-unaware result (F-001).
+        considered = _prompt_response_ids(prompt)
         if self.behavior == "conflict":
+            disposition = {**_NEW_CONFLICT_DISPOSITION, "responses_considered": considered}
             return AgentResult(
-                text=CONFLICT_TEXT, structured=_NEW_CONFLICT_DISPOSITION,
+                text=CONFLICT_TEXT, structured=disposition,
                 session_id="s", exit_code=0,
             )
         if self.behavior == "fail":
             raise AdapterError("genuine agent failure (not a conflict)")
         (Path(cwd) / "feature.py").write_text("implemented\n")
+        disposition = {**_PROCEED_DISPOSITION, "responses_considered": considered}
         return AgentResult(
-            text="done implementing", structured=_PROCEED_DISPOSITION,
+            text="done implementing", structured=disposition,
             session_id="s", exit_code=0,
         )
 
 
+def _prompt_response_ids(prompt: str) -> list[str]:
+    """The response_ids the human-response.md block lists, in order (FR-4).
+
+    A real builder reports the response(s) it consumed from that block; mirroring
+    that here keeps the fixture's `responses_considered` valid against the engine's
+    F-001 check (names the pending response + only known ids). Empty on the first
+    conflict run (no block yet), where the disposition is not consumed anyway.
+    """
+    return re.findall(r"^## Response (\S+) ", prompt, re.MULTILINE)
+
+
 # Schema-valid resume dispositions (FR-10) the ScriptedAdapter returns on a
 # `--response` resume: proceed_in_place completes the step; new_conflict re-parks.
+# `conflict` is null for proceed (required-but-nullable, strict-mode) and an
+# object for the re-park; `responses_considered` is filled in per-invocation.
 _PROCEED_DISPOSITION = {
     "disposition": "proceed_in_place",
     "responses_considered": [],
     "action_summary": "conflict resolved in place; proceeding",
+    "conflict": None,
 }
 _NEW_CONFLICT_DISPOSITION = {
     "disposition": "new_conflict",

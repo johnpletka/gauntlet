@@ -190,7 +190,20 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # to the step status here so a schema-valid `new_conflict` re-parks instead of
     # being marked DONE; the FR-3.0 classification itself lives in the prompt.
     if consuming_response:
-        return _resume_disposition_result(agent_name, result, usage_by_agent)
+        outcome = _resume_disposition_result(
+            agent_name, result, usage_by_agent, ctx.record.human_responses
+        )
+        # A re-park (amendment_required/new_conflict) or a fail-closed disposition
+        # lands nothing: return immediately, skipping completion-signal handling
+        # and the `output:` artifact write (review F-004 — a re-park must not
+        # produce the step's declared artifact).
+        if outcome.status != DONE:
+            return outcome
+        # proceed_*: the structured disposition resolved the conflict and is
+        # authoritative, so the obsolete textual UPSTREAM CONFLICT marker is
+        # suppressed below (check_halt=False). But a proceed completes the step
+        # NORMALLY (FR-5 / FR-1.1): fall through so `require_signal` is still
+        # honored and the declared `output:` artifact is still written (F-004).
 
     # Completion-signal contract (BOOTSTRAP-NOTES #32): a headless agent that
     # exits 0 may still have *halted* — surfaced an FR-10.4 upstream conflict
@@ -201,7 +214,9 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # and absent, fail closed. Document-authoring tasks must not carry `halt_on:`
     # — their output legitimately quotes such markers as prose (see plan-author
     # in pipelines/standard.yaml); the line-leading match is the second guard.
-    signal = _completion_signal(step, result.text)
+    # On a proceed-disposition resume, halt_on is suppressed (the structured
+    # disposition already governed the conflict) while require_signal still binds.
+    signal = _completion_signal(step, result.text, check_halt=not consuming_response)
     if signal is not None:
         status, note, parked_reason = signal
         return StepResult(
@@ -226,7 +241,7 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
-def _completion_signal(step: Step, text: str):
+def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     """Read an agent_task's final output for a halt/completion contract (#32).
 
     Returns ``None`` to proceed normally, or ``(status, note, parked_reason)`` to
@@ -238,9 +253,14 @@ def _completion_signal(step: Step, text: str):
     ``halt_on`` marker is *exactly* the canonical :data:`UPSTREAM_CONFLICT_MARKER`
     (FR-2.1) — a step parking on a *different* ``halt_on`` marker, or failing on a
     missing ``require_signal``, carries no ``parked_reason``.
+
+    ``check_halt=False`` suppresses only the ``halt_on`` check (review F-004): on a
+    proceed-disposition `--response` resume the textual UPSTREAM CONFLICT marker is
+    obsolete — the structured disposition already governed the conflict — but
+    ``require_signal`` still binds, so the completion contract is preserved.
     """
     halt_on = step.get("halt_on")
-    if halt_on and _marker_signalled(halt_on, text):
+    if check_halt and halt_on and _marker_signalled(halt_on, text):
         parked_reason = (
             PARKED_REASON_UPSTREAM_CONFLICT
             if halt_on == UPSTREAM_CONFLICT_MARKER
@@ -406,7 +426,9 @@ def _resume_disposition_schema(ctx: StepContext) -> dict:
     return json.loads(path.read_text())
 
 
-def _resume_disposition_result(agent_name, result, usage_by_agent) -> StepResult:
+def _resume_disposition_result(
+    agent_name, result, usage_by_agent, human_responses
+) -> StepResult:
     """Map a builder's structured `disposition` to the step outcome (FR-3/FR-5).
 
     proceed_* → DONE (the run proceeds to commit); amendment_required /
@@ -415,20 +437,43 @@ def _resume_disposition_result(agent_name, result, usage_by_agent) -> StepResult
     next decision (FR-3(b)/FR-10.4 gate). Fail closed (CLAUDE.md §2): a missing or
     unrecognized disposition is NEVER read as success — it fails the step rather
     than letting a malformed resume silently land work.
+
+    Two semantic rules the schema cannot express are enforced here, both
+    fail-closed (review F-001/F-003): the disposition must reference the consumed
+    (pending) response and only known response_ids — a response-unaware result is
+    rejected rather than allowed past the conflict gate — and an
+    amendment_required must name a non-empty approved artifact (FR-3(b)).
     """
-    disposition = _disposition_value(result.structured)
+    structured = result.structured
+    disposition = _disposition_value(structured)
     outcome = _DISPOSITION_OUTCOMES.get(disposition)
     if outcome is None:
-        return StepResult(
-            status=FAILED,
-            session_id=result.session_id,
-            usage=result.usage,
-            usage_by_agent=usage_by_agent,
-            notes=(
-                f"resume disposition missing or unrecognized ({disposition!r}); "
-                "failing closed rather than advancing on an unparseable resume "
-                "(FR-10)"
-            ),
+        return _resume_failure(
+            result,
+            usage_by_agent,
+            f"resume disposition missing or unrecognized ({disposition!r}); "
+            "failing closed rather than advancing on an unparseable resume (FR-10)",
+        )
+    # FR-1/FR-5/FR-10 (review F-001): the disposition must be a function of the
+    # response it consumed. A result that omits the pending response, or names an
+    # unknown/duplicate response_id, is response-unaware — fail closed rather than
+    # let it pass the conflict gate.
+    responses_error = _validate_responses_considered(structured, human_responses)
+    if responses_error is not None:
+        return _resume_failure(
+            result,
+            usage_by_agent,
+            f"{responses_error}; failing closed rather than advancing on a "
+            "response-unaware resume (FR-1/FR-5/FR-10)",
+        )
+    # FR-3(b) (review F-003): an amendment_required must name the approved
+    # artifact it diverges from; a null/empty target is malformed → fail closed.
+    if disposition == "amendment_required" and not _amendment_artifact(structured):
+        return _resume_failure(
+            result,
+            usage_by_agent,
+            "amendment_required disposition names no approved artifact "
+            "(conflict.artifact null or empty); failing closed (FR-3(b))",
         )
     status, parked_reason = outcome
     return StepResult(
@@ -439,6 +484,50 @@ def _resume_disposition_result(agent_name, result, usage_by_agent) -> StepResult
         parked_reason=parked_reason,
         notes=f"resume disposition: {disposition} (FR-3/FR-5/FR-10)",
     )
+
+
+def _resume_failure(result, usage_by_agent, note: str) -> StepResult:
+    """A fail-closed resume outcome (FR-10): FAILED, carrying the agent's cost."""
+    return StepResult(
+        status=FAILED,
+        session_id=result.session_id,
+        usage=result.usage,
+        usage_by_agent=usage_by_agent,
+        notes=note,
+    )
+
+
+def _validate_responses_considered(structured, human_responses) -> str | None:
+    """Check ``responses_considered`` against the recorded history; None if valid.
+
+    Returns a short failure reason (review F-001) when the array is missing/
+    malformed, names an unknown or duplicated response_id, or omits the consumed
+    (pending) response — the latest ``human_responses`` entry, which is the one
+    this invocation is processing. ``human_responses`` is non-empty here: this
+    runs only while a pending response is being consumed.
+    """
+    considered = structured.get("responses_considered") if isinstance(structured, dict) else None
+    if not isinstance(considered, list) or not all(isinstance(x, str) for x in considered):
+        return "resume disposition carries no valid responses_considered list"
+    known = {r.response_id for r in human_responses}
+    pending_id = human_responses[-1].response_id  # the response being consumed
+    seen: set[str] = set()
+    for rid in considered:
+        if rid in seen:
+            return f"responses_considered repeats response id {rid!r}"
+        seen.add(rid)
+        if rid not in known:
+            return f"responses_considered names unknown response id {rid!r}"
+    if pending_id not in seen:
+        return f"responses_considered omits the consumed response {pending_id!r}"
+    return None
+
+
+def _amendment_artifact(structured) -> bool:
+    """True when ``conflict.artifact`` is a non-empty string (FR-3(b), F-003)."""
+    conflict = structured.get("conflict") if isinstance(structured, dict) else None
+    artifact = conflict.get("artifact") if isinstance(conflict, dict) else None
+    return isinstance(artifact, str) and bool(artifact.strip())
 
 
 def _disposition_value(structured) -> str | None:
