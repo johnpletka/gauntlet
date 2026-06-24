@@ -28,7 +28,7 @@ Key code anchors this plan binds to (verified against the current tree):
 - `RunManager.resume()` — `run.py:768`; `approve()` `:824`; `reject()` `:850`; clock passed through to `_drive`.
 - Orchestrator re-executes any non-`DONE`/`SKIPPED` step on `drive()`; a PARKED agent_task is re-executed via `_execute` (`orchestrator.py:151-177`, `:208-252`), and `resuming` is only true for `RUNNING`/`INTERRUPTED` (`:211`), so a conflict park re-runs the handler fresh.
 - `max_retries` is governed by the **in-memory `retries` dict** in `_run_steps` and only advances on `status == FAILED` via `on_fail` (`orchestrator.py:170-175`); PARKED returns at `:176` and never touches it. `StepRecord.attempts` (`manifest.py:69`) currently increments on **every** `_execute` (`orchestrator.py:224`) — FR-6 requires decoupling this (see P3).
-- Atomic manifest write already exists: `Manifest.write_atomic` (`manifest.py:130-154`, tempfile + fsync + `os.replace`); the orchestrator commits manifest checkpoints on its existing path (`_persist`, `orchestrator.py:470-474`).
+- Atomic manifest write already exists: `Manifest.write_atomic` (`manifest.py:130-154`, tempfile + fsync + `os.replace`). **But `_persist` (`orchestrator.py:470-474`) only writes the manifest atomically and regenerates `RUN.md`; it creates no git commit** — ordinary runs reach git history only through a separate `commit` step (`handle_commit`, `steptypes.py:244`, e.g. `phase-commit`). FR-2.2 requires *both* the `pending` and the `consumed` state of a response to be reachable in git history, which a single later phase commit cannot preserve (it would collapse the two intermediate states into one). P3 therefore adds an **orchestrator-owned manifest-checkpoint commit** built on `gitops.commit_paths` (`gitops.py:223`) + a fixed engine `Identity` (`gitops.py:188`).
 - Prompt rendering appends `--- input artifact: {name} ---` blocks by iterating `step.inputs` against `ctx.artifacts` / `ctx.artifact_root` (`steptypes.py:217-233`). Conflict parks are produced by the `halt_on` completion signal (`steptypes.py:182-187`); budget/timeout halts go through a different path (`_apply_budget_guard`, `orchestrator.py:304-332`).
 - Schemas are Draft-07, `additionalProperties:false`, validated like `schemas/findings.json`. Identity fallback `agent@gauntlet.local` lives at `config.py:187-194` and must **not** be used for the audit field (FR-9).
 
@@ -44,15 +44,43 @@ Key code anchors this plan binds to (verified against the current tree):
   - `parked_reason: str | None = None` (single enum-valued field; FR-2.1). Introduce a module constant/`Literal` for the only v1 value, `"upstream_conflict"`.
   - `human_responses: list[HumanResponse] = Field(default_factory=list)` (append-only; FR-2).
   - new `HumanResponse` pydantic model with fields exactly per FR-2: `response_id: str`, `response_text: str`, `timestamp: str`, `user: str`, `response_attempt: int`, `state: Literal["pending","consumed"]`.
-- `orchestrator.py`: when an **agent_task** parks via its `halt_on` completion signal, set `rec.parked_reason = "upstream_conflict"` in `_finalize` (`:334-376`). Carry the reason on `StepResult` from the steptypes handler (`steptypes.py:182-187`) so the orchestrator does not re-parse marker text. Budget/timeout halts (`_apply_budget_guard`) and human_gate parks leave `parked_reason` **unset**.
+- `orchestrator.py`: `parked_reason` is **current-state, not a latch** (FR-2.1
+  lifecycle). `_finalize` (`:334-376`) **defaults `rec.parked_reason` to unset
+  (`None`) on every terminal outcome it records** — `done`, `failed`, `halted`,
+  `interrupted`, and any park — and re-sets it to `"upstream_conflict"` only when
+  the just-finished execution carried the conflict signal on its `StepResult`.
+  Because a `StepRecord` is reused across re-executions (`_execute` `:210-216`),
+  this *clear-then-maybe-set on each finalize* is what guarantees a conflict park
+  that is later resumed to a `done` / `failed` / non-conflict-park outcome ends
+  with `parked_reason` unset — so a stale `upstream_conflict` can never cause a
+  later generic park to be misclassified as a conflict park (which would wrongly
+  require `--response`). This is FR-2.1's current-state acceptance.
+- The conflict discriminator is set **specifically for the `UPSTREAM CONFLICT`
+  halt, not for any `halt_on` completion signal.** Introduce the canonical
+  marker as a module constant and have `_completion_signal` / `handle_agent_task`
+  (`steptypes.py:151-157,175-194`) carry a typed `parked_reason="upstream_conflict"`
+  on the returned `StepResult` **only** when the matched marker is that constant;
+  a step configured with a *different* `halt_on` marker parks with
+  `parked_reason` unset. The orchestrator reads that field off `StepResult` in
+  `_finalize` and never re-parses marker text. Budget/timeout halts
+  (`_apply_budget_guard`) and human_gate parks carry no `parked_reason` and so
+  leave it unset.
 - No CLI/recording/injection yet — those are explicit deferrals below.
 
 **Test strategy (`tests/unit/test_human_response_manifest.py`, extend `test_manifest.py`):**
 
 - Round-trip a `Manifest` containing a `StepRecord` with `parked_reason` and two `human_responses`; assert byte-stable JSON and full field fidelity through `write_atomic` → `load`.
 - **Back-compat:** load a fixture manifest JSON that lacks both new fields; assert it loads and the fields default to `None` / `[]`.
-- Drive a fixture pipeline (extend `test_orchestrator.py` harness, `FakeAdapter`) where the agent emits the `halt_on` marker → assert `status == parked` **and** `parked_reason == "upstream_conflict"`.
+- Drive a fixture pipeline (extend `test_orchestrator.py` harness, `FakeAdapter`) where the agent emits the `UPSTREAM CONFLICT` marker → assert `status == parked` **and** `parked_reason == "upstream_conflict"`.
 - Drive a human_gate park and a budget/timeout halt → assert `parked_reason` stays unset in both.
+- **Non-conflict `halt_on`:** a step configured with a *different* `halt_on`
+  marker that signals → parks with `parked_reason` **unset** (only the canonical
+  `UPSTREAM CONFLICT` marker sets it).
+- **Lifecycle transitions (FR-2.1):** a step that parks on a conflict
+  (`parked_reason == "upstream_conflict"`), then on its next finalize reaches
+  (a) `done`, (b) `failed`, (c) a non-conflict park — assert `parked_reason` is
+  **unset** at each of those outcomes, proving the field tracks current state and
+  is not a latch.
 
 **Exit criteria:** `uv run pytest` green; one commit `P1: Add conflict-park discriminator + human_responses schema`. Commit body cites FR-2, FR-2.1; notes deferrals.
 
@@ -88,7 +116,7 @@ Key code anchors this plan binds to (verified against the current tree):
 
 ## P3 — CLI `--response` + idempotent recording + commit ownership + retry-budget decoupling
 
-**Assumption validated (the determinism core):** a `gauntlet resume --response` is a **single idempotent state transition** — append-pending → re-execute → mark-consumed — that (a) the orchestrator persists atomically and commits on its existing checkpoint path, (b) survives `kill -9` between any two steps without duplicating an entry or double-counting, and (c) **never** advances the failure-retry budget on a conflict re-run (FR-6). This is the highest-risk plumbing; it is validated with `FakeAdapter`s before any real builder prompt exists.
+**Assumption validated (the determinism core):** a `gauntlet resume --response` is a **single idempotent state transition** — append-pending → re-execute → mark-consumed — that (a) the orchestrator persists atomically and commits via a new **orchestrator-owned manifest-checkpoint commit** (defined below — `_persist` does not commit today), (b) survives `kill -9` at any point in the append→launch→consume window — including after the write-ahead `RUNNING` checkpoint and after terminal finalize but before the consume persist — without duplicating an entry or double-counting, and (c) **never** advances the failure-retry budget on a conflict re-run (FR-6). This is the highest-risk plumbing; it is validated with `FakeAdapter`s before any real builder prompt exists.
 
 **Deliverables:**
 
@@ -98,19 +126,125 @@ Key code anchors this plan binds to (verified against the current tree):
   - parked step not an `agent_task` (e.g. human_gate) → error directing to `approve`/`reject`.
   - `agent_task` with `parked_reason == "upstream_conflict"` and **no** `--response` → error requiring `--response`.
   - `agent_task` parked **without** `upstream_conflict` → existing response-less re-run unchanged; `--response` accepted+recorded but not required.
+- **Orchestrator-owned response checkpoint commit (FR-2.2):** a new
+  `Orchestrator._commit_manifest_checkpoint(message)` helper that, after
+  `write_atomic`, stages **only the run-bookkeeping paths** (`manifest.json` and
+  the regenerated `RUN.md` under the run dir) via `gitops.commit_paths`
+  (`gitops.py:223`) under a fixed engine identity (`Gauntlet Engine
+  <engine@gauntlet.local>` — the response's operator `user` is recorded *in* the
+  manifest entry per FR-9; it is **not** the commit author). The message names
+  the transition and `response_id`, e.g. `gauntlet: response <response_id>
+  pending` / `… consumed`.
+  - **Path selection / clean-worktree behavior:** the checkpoint commits the
+    manifest and `RUN.md` only — never the implementation diff — so it composes
+    with phase-commit discipline and the central clean-worktree invariant: a
+    genuine `UPSTREAM CONFLICT` halt leaves the worktree clean, and a response
+    checkpoint touches only run bookkeeping, so it can never smuggle agent edits
+    into history. The helper uses path-scoped staging (not `commit -a`); if a
+    non-bookkeeping path is unexpectedly dirty at checkpoint time, it is simply
+    not staged (the dirty-base case is handled by the crash-recovery rules below,
+    not by this commit).
+  - **Crash reconciliation (commit lands before manifest bookkeeping, and vice
+    versa):** the on-disk manifest is `write_atomic`-d *before* the commit, so
+    the authoritative `state` is always the committed/on-disk manifest. Die after
+    `write_atomic` but before the commit → the next resume loads the on-disk
+    manifest (already showing the new `state`) and the next checkpoint commit
+    captures it; die after the commit → the state is already in git. This reuses
+    the same "branch tip slightly ahead of the manifest's last recorded commit is
+    fine" reconciliation `resume()` already encodes (`run.py:806-821`) rather than
+    inventing a second rule.
+  - **Interaction with phase commit:** response checkpoints are independent of the
+    `commit` step that later drafts the `PN:` phase commit; they record no
+    `CommitRecord` phase and never trigger the message-agent drafting path, so
+    phase-commit discipline is unaffected.
 - **Append protocol (FR-2, FR-2.2, FR-7.1):**
   - If latest `human_responses` entry is `state=="pending"` (crash recovery): do **not** append; an identical `--response` (or none) re-launches the existing pending entry; a **different** `--response` errors with the exact FR-7.1 message.
-  - Otherwise resolve identity (P2), assign `response_id = "<step_id>-resp-<ordinal>"`, set `response_attempt` = 1-based count, `timestamp = clock()` (injected `RunManager.clock`), `state="pending"`; append; persist atomically; commit as an ordinary manifest checkpoint **before** the agent launches.
-- **Re-execution + consume:** drive re-executes the parked agent_task (existing `_execute` path; `resuming` stays false for PARKED). On terminal outcome, transition the latest pending entry to `state="consumed"`, persist, commit. The orchestrator remains the sole committer; the builder gets no direct-write path.
-- **Retry-budget decoupling (FR-6):** ensure a conflict-resume re-execution does **not** advance the failure-retry budget. Concretely: the `on_fail`/`retries` path already only triggers on `FAILED` (`:170`), so conflict re-parks never consume `max_retries`. Additionally decouple `StepRecord.attempts` so the **conflict-resume** re-execution does not increment the failure-retry counter (it is a human-driven continuation, not a failure retry), while genuine handler failures continue to increment as today. **Decision/risk to surface to review:** `StepRecord.attempts` increments unconditionally at `orchestrator.py:224` today and `test_resume_crash.py` asserts it grows on crash-resume — this phase must preserve that failure/interruption behavior while exempting only the conflict-resume continuation. The chosen seam is to skip the increment when re-executing a step whose latest `human_responses` entry is `pending` (a `--response` continuation), leaving all other `_execute` increments untouched.
+  - Otherwise resolve identity (P2), assign `response_id = "<step_id>-resp-<ordinal>"`, set `response_attempt` = 1-based count, `timestamp = clock()` (injected `RunManager.clock`), `state="pending"`; append; `write_atomic`; then `_commit_manifest_checkpoint` (above) **before** the agent launches.
+- **Re-execution + consume:** drive re-executes the parked agent_task (existing `_execute` path; `resuming` stays false for a clean PARKED re-entry). On terminal outcome, transition the latest pending entry to `state="consumed"`, `write_atomic`, then `_commit_manifest_checkpoint`. The orchestrator remains the sole committer; the builder gets no direct-write path.
+- **Cross-state crash recovery (FR-7.1, the full append→consume window):** the
+  pending→consumed transition keys on the **`state` field, independent of
+  `StepRecord.status`**. `_execute` flips the record `PARKED → RUNNING` and
+  write-aheads (`:225,234`) *before* invoking the adapter (`:238`), so a `kill -9`
+  can leave a pending response attached to a `RUNNING` (or, after
+  `_resume_disposition`, `INTERRUPTED`) record — not only a `PARKED` one. The
+  recovery check in `RunManager.resume` (latest entry `pending` → re-launch the
+  existing entry, do **not** append, reuse its `response_id`) therefore runs for
+  `PARKED`, `RUNNING`, and `INTERRUPTED` alike, so a crash anywhere in the
+  window re-enters with the same single pending entry — no duplicate, no
+  double attempt-count.
+  - **Dirty-worktree handling:** a genuine `UPSTREAM CONFLICT` halt leaves the
+    worktree clean (the agent halted instead of writing), so the normal conflict
+    re-launch is a clean re-entry (`_resume_disposition` returns `None` on a clean
+    base, `:278-279`). If a crash left the record `RUNNING`/`INTERRUPTED` with a
+    **dirty** base, the existing `interrupted_step` policy
+    (`park | reset_to_base`, `_resume_disposition` `:254-302`) governs the
+    worktree exactly as for any other interrupted agent write: `reset_to_base`
+    snapshots a backup ref then re-launches the still-`pending` response cleanly;
+    `park` leaves the step `INTERRUPTED` with the response still `pending` for a
+    human to reconcile, and a later `gauntlet resume` (recovery path, **no** new
+    `--response`) re-enters once reconciled. The pending response is never lost or
+    double-consumed because its `state` is the single source of truth.
+  - **Attempt accounting in these states:** consistent with the FR-6 relocation
+    below — a `RUNNING`/`INTERRUPTED` re-entry that ultimately proceeds or
+    re-parks does **not** advance `StepRecord.attempts`; only a `FAILED` outcome
+    does, once.
+- **Retry-budget decoupling (FR-6):** FR-6 redefines `StepRecord.attempts` as the
+  **failure-retry counter — it increments only when a run ends in failure**, never
+  on success, conflict park, halt, interruption, or human-driven response
+  continuation. The fix is to **relocate** the `rec.attempts += 1` that today runs
+  unconditionally at the top of `_execute` (`orchestrator.py:224`) onto the
+  terminal/failure path: increment **exactly once, in `_finalize`, only when
+  `result.status == FAILED`**. The seam is therefore **outcome-driven, not keyed on
+  whether a response is pending** — which is what makes a pending-response
+  invocation that then *fails* still record exactly one attempt (the rejected
+  "skip when pending" seam would have recorded *zero* for that genuine failure).
+  Exact behavior for every outcome:
+  - `DONE` (ordinary success, incl. a response resume that proceeds) → **no** increment.
+  - `PARKED` (a conflict park or any other park) → **no** increment, so arbitrarily
+    many `--response`/conflict cycles never advance the counter.
+  - `HALTED` (budget/timeout checkpoint) and `INTERRUPTED` (mid-edit park) → **no**
+    increment — recoverable checkpoints, not failures.
+  - `FAILED` (genuine agent/handler error, including a response resume that
+    genuinely fails) → increment **once**.
+  - **Persistence across restarts:** the increment is immediately followed by the
+    existing write-ahead `_persist` (`:251`), so the failure count is durable before
+    control returns; a crash after the `FAILED` finalize re-runs the step and
+    re-reaches the same `FAILED` terminal state, incrementing once — never twice
+    for one logical failure.
+  - The in-memory `on_fail`/`retries` dict (`:149,170-175`) already triggers only on
+    `FAILED`, so conflict re-parks never consumed `max_retries` regardless; this
+    change aligns the *persisted* `StepRecord.attempts` audit counter with that same
+    failure-only semantics. **Compatibility:** the only suite assertion on
+    `attempts` is `test_orchestrator.py:151` (a `shell` step that fails twice →
+    `attempts == 2`), which still holds under failure-only increment (two `FAILED`
+    finalizes → two increments); `test_resume_crash.py` makes no `attempts`
+    assertion, so nothing there changes.
 
 **Test strategy (`tests/unit/test_resume_response.py`, extend `test_resume_crash.py`):**
 
-- Append: one `--response` on a conflict park → exactly one entry, `state` goes `pending`→`consumed`; both states reachable in git history (assert via committed manifest SHAs).
-- Idempotency: kill after the pending append, re-run resume → still exactly one entry (now `consumed`), one re-execution; `response_attempt` and `attempts` unchanged from a clean single run.
+- Append: one `--response` on a conflict park → exactly one entry, `state` goes `pending`→`consumed`; both states reachable in git history (assert via the two committed manifest SHAs, i.e. one checkpoint commit shows `pending`, a later one shows `consumed`).
+- **Checkpoint-commit shape (FR-2.2):** each response checkpoint commit changes **only** `manifest.json` + `RUN.md` (assert the commit's name-only diff carries no other path — no implementation diff), and its author is the fixed engine identity, **not** the operator `user` recorded in the manifest entry.
+- Idempotency / fault injection across the **full** append→consume window — kill
+  at each checkpoint, then re-run resume, asserting exactly one entry (ending
+  `consumed`), one logical re-execution, and `response_attempt`/`attempts`
+  unchanged from a clean single run:
+  - after the pending append (record still `PARKED`).
+  - after the write-ahead `RUNNING` checkpoint (`:234`) but before the adapter returns.
+  - during adapter execution.
+  - after terminal finalization but **before** the consume persist/commit (entry
+    still reads `pending` on disk → re-launch is idempotent to the same outcome).
+  - dirty-base crash under each `interrupted_step` policy: `reset_to_base`
+    re-launches the pending response cleanly to one `consumed` entry; `park`
+    leaves it `INTERRUPTED` with the response `pending`, and the next
+    response-less `gauntlet resume` consumes it once.
 - Mismatched-response-over-pending → errors with the FR-7.1 string.
 - Guards: not-parked / human_gate / conflict-park-without-`--response` / non-conflict-park-without-`--response` (still works) → each asserts the exact PRD message or unchanged behavior.
-- **FR-6:** with `max_retries=N`, resume `>N` times where the fake adapter re-parks on conflict each time → run never FAILED; assert `StepRecord.attempts` is not advanced by conflict resumes while `len(human_responses)` grows. Then `N+1` genuine fake failures → budget exhausts.
+- **FR-6 (per-outcome attempt accounting), each driven independently:**
+  - `>N` conflict resumes with `max_retries=N` → run never `FAILED`; `StepRecord.attempts` unchanged while `len(human_responses)` grows; then `N+1` genuine fake failures → budget exhausts.
+  - response resume that **proceeds** (`DONE`) → `attempts` unchanged.
+  - response resume that **genuinely fails** (`FAILED`) → `attempts` increments exactly once.
+  - ordinary (non-response) success → `attempts` unchanged.
+  - crash after a `FAILED` finalize, then resume → `attempts` reflects a single increment for that failure, not two.
 - Identity fail-closed (P2 wired): both sources blank → resume errors and manifest is unchanged (no entry appended).
 
 **Exit criteria:** `uv run pytest` green (incl. unchanged `test_resume_crash.py` failure-path assertions); one commit `P3: Record --response idempotently; decouple retry budget`.
@@ -147,7 +281,36 @@ Key code anchors this plan binds to (verified against the current tree):
 
 **Deliverables:**
 
-- `schemas/resume-disposition.json` (Draft-07, `additionalProperties:false`, mirroring `findings.json`): `disposition` enum (`proceed_in_place | amendment_required | proceed_with_deviation | new_conflict`), `responses_considered: [string]`, `action_summary: string`, optional `conflict` object (`summary`, `requested_input`, `artifact`); `conflict` **required** when disposition is `amendment_required` or `new_conflict`, else null/omitted. Validated via the same structured-output path agent_task already uses (`steptypes.py:113,236-240`).
+- `schemas/resume-disposition.json` (Draft-07, `additionalProperties:false`, mirroring `findings.json`): `disposition` enum (`proceed_in_place | amendment_required | proceed_with_deviation | new_conflict`), `responses_considered: [string]`, `action_summary: string`, optional `conflict` object (`summary`, `requested_input`, `artifact`); `conflict` **required** when disposition is `amendment_required` or `new_conflict`, else null/omitted.
+- **Invocation-local schema binding (FR-10) — the schema must actually reach the
+  adapter.** The approved `implement` step (`pipelines/standard.yaml:59-61`) has
+  **no `schema:` field**, and `_load_schema` (`steptypes.py:236-240`) reads only
+  the persisted step config — so merely adding `schemas/resume-disposition.json`
+  and editing the prompt would leave the resume invocation unvalidated, and
+  editing the approved pipeline snapshot is prohibited (FR-4.1 / approved-artifact
+  rule). The fix mirrors P4's invocation-local inputs copy: during a `--response`
+  resume re-execution **only**, the orchestrator binds
+  `schemas/resume-disposition.json` as the step's schema for that one invocation
+  (an invocation-local override passed into `handle_agent_task` / `_load_schema`,
+  not a mutation of `step` or the YAML). The adapter then validates the
+  disposition through the existing structured-output path
+  (`steptypes.py:113,128,236-240`); the persisted step config and pipeline YAML
+  are byte-for-byte unchanged.
+- **Engine disposition→outcome mapping (FR-3/FR-5) — the disposition must drive
+  the step status.** Today `handle_agent_task` returns `DONE` unless the textual
+  `halt_on` marker fires (`steptypes.py:151-172`); nothing reads
+  `result.structured`, so a schema-valid `new_conflict` would be marked `DONE`.
+  On a `--response` resume, after the agent returns the orchestrator maps
+  `result.structured["disposition"]`:
+  - `amendment_required` or `new_conflict` → `PARKED` with
+    `parked_reason="upstream_conflict"` (re-park for the human / FR-10.4 gate;
+    matches FR-3(b)/FR-5). The mapping sets `parked_reason` on the `StepResult`
+    so P1's `_finalize` clear/set logic records it correctly.
+  - `proceed_in_place` / `proceed_with_deviation` → normal completion (`DONE` →
+    commit path).
+  Once a response is being consumed, this **structured** disposition is
+  authoritative for the outcome — not just the textual `UPSTREAM CONFLICT` marker
+  (which remains the *first*-conflict signal, before any response exists).
 - Update the builder prompt asset (`prompts/implement-phase.md`, with an append-only `prompts/CHANGELOG.md` entry below the `<!-- gauntlet:changelog -->` marker): inject a `## Human decision` handling section encoding **FR-3.0 precedence** (step 1 artifact-contradiction → `amendment_required` even when asked to "proceed despite"; step 2 ambiguous → `new_conflict`; step 3 fully-consistent → `proceed_in_place`/`proceed_with_deviation`; tie → earlier/fail-closed), the FR-3(b) halt-and-regate message, the requirement to list consumed `response_id`(s) in `responses_considered`, and the FR-6 note ("conflicts don't consume the retry budget").
 - A **deterministic adapter fixture** (scripted/replay adapter returning canned disposition objects) added to the test harness, per FR-10.
 
@@ -155,6 +318,16 @@ Key code anchors this plan binds to (verified against the current tree):
 
 - Schema validity: every fixture disposition validates; `conflict` presence rule enforced (missing when required → reject; present when forbidden → reject).
 - FR-3.0 mapping via scripted dispositions: artifact-contradicting (incl. "proceed despite") → `amendment_required`, no implementation lands; ambiguous → `new_conflict` whose `conflict.requested_input` names what the supplied response did **not** provide (asserted on the structured field, not prose); fully-consistent → `proceed_in_place` / `proceed_with_deviation`.
+- **Engine outcome mapping (assert orchestration status, not just standalone
+  fixtures):** driving a resume through the orchestrator with a scripted adapter,
+  assert the resulting **step status** and `parked_reason`:
+  `new_conflict` → step `PARKED`, `parked_reason == "upstream_conflict"`;
+  `amendment_required` → step `PARKED`, `parked_reason == "upstream_conflict"`,
+  and no implementation/commit lands; `proceed_in_place` /
+  `proceed_with_deviation` → step `DONE`.
+- **Invocation-local schema binding:** assert the resume invocation's adapter
+  received the `resume-disposition` schema, while the persisted `step` config and
+  `pipelines/standard.yaml` are byte-for-byte unchanged before/after the resume.
 - FR-5 observable property: `responses_considered` lists the consumed `response_id`(s); a `new_conflict` carries a non-empty `requested_input`.
 - Assertions are exclusively on structured fields (no substring matching of prose).
 
@@ -164,19 +337,19 @@ Key code anchors this plan binds to (verified against the current tree):
 
 ---
 
-## P6 — End-to-end synthetic test + dogfood integration
+## P6 — End-to-end synthetic test + one-time dogfood
 
 **Assumption validated:** the assembled mechanism actually **un-sticks a parked run** and leaves a complete, auditable trail (§8 e2e, §11). This is last because it exercises every prior phase together.
 
 **Deliverables:**
 
-- **Synthetic e2e (`tests/unit/test_resume_response_e2e.py`, deterministic adapter fixture, FR-10):** a fresh run that triggers an upstream conflict, then `resume --response` driving the scripted disposition; assert the full cycle on structured fields and the manifest audit trail (ids/state/user/timestamp, `attempts` vs `len(human_responses)`), reproducible in CI with no live model.
-- **Dogfood integration (`tests/integration/test_dogfood_resume.py`, `@pytest.mark.integration`):** resume the parked `prd-authoring-aids` run with `--response`; verify the manifest audit trail, that the step commits and the run proceeds (or re-parks with a `new_conflict` carrying `requested_input`), and that `human_responses` persists across resumes. Run locally before review handoff (CI runs `-m "not integration"`).
-- Operator docs: document `gauntlet resume <slug> --response "..."` as the standard conflict-resolution path (§11) and that artifact amendments route through their own gate (FR-10.4).
+- **Synthetic e2e — the repeatable CI gate (`tests/unit/test_resume_response_e2e.py`, deterministic adapter fixture, FR-10):** per PRD §8, the repeatable gate runs on an **isolated, disposable run created fresh and torn down within the test** — it triggers an upstream conflict, then `resume --response` driving the scripted disposition, and asserts the full cycle on structured fields and the manifest audit trail (ids/state/user/timestamp, `attempts` vs `len(human_responses)`). Deterministic, no live creds, no real run mutated, safe to run before every handoff.
+- **One-time dogfood — a human-gated procedure, NOT a pytest (PRD §8):** resuming the real parked `prd-authoring-aids` run with `--response` is a **one-time, human-authorized validation**, not an automated test. It mutates one real parked run and depends on live creds, branch state, and operator identity, so it **cannot satisfy its preconditions twice** — it is run **once**. It ships as a documented runbook (in the operator docs below), **not** as `tests/integration/test_dogfood_resume.py`, and is **not** part of the `pytest` gate that must pass before every handoff. Its evidence — the manifest audit trail (ids/state/user/timestamp), the commit SHA, and the run-proceeds (or re-parks-with-`new_conflict`-carrying-`requested_input`) outcome — is **captured in the run artifacts** under `runs/prd-authoring-aids/`.
+- Operator docs: document `gauntlet resume <slug> --response "..."` as the standard conflict-resolution path (§11), that artifact amendments route through their own gate (FR-10.4), and the one-time dogfood runbook above (preconditions, the single authorized invocation, and where its evidence lands).
 
-**Test strategy:** synthetic test is the CI gate (deterministic); dogfood test is the integration-marked manual gate. Assert: run transitions out of parked, manifest shows responses with correct ids/state/user, commit lands referencing the consumed `response_id`.
+**Test strategy:** the **only** automated gate is the synthetic disposable-run e2e (deterministic, unit-marked) — there is **no** integration-marked dogfood pytest. It asserts the run transitions out of parked, the manifest shows responses with correct ids/state/user, and a commit lands referencing the consumed `response_id`. The one-time dogfood is performed by a human via the runbook; its evidence lives in `runs/prd-authoring-aids/`, not in a test assertion.
 
-**Exit criteria:** `uv run pytest` green and `uv run pytest -m integration` green locally; one commit `P6: End-to-end + dogfood resume-with-response (FR-7/§8)`.
+**Exit criteria:** `uv run pytest` green (includes the synthetic e2e); **no** `pytest -m integration` requirement is added by this phase (the dogfood is not a pytest). The one-time dogfood, when performed, leaves its evidence under `runs/prd-authoring-aids/`. One commit `P6: End-to-end synthetic gate + one-time dogfood runbook (FR-7/§8)`.
 
 **Deferrals:** none — feature complete for v1.
 
@@ -196,20 +369,20 @@ Key code anchors this plan binds to (verified against the current tree):
 ```gauntlet-phases
 - id: P1
   title: Manifest schema + conflict-park discriminator
-  goal: Add parked_reason and human_responses to StepRecord and set parked_reason="upstream_conflict" only on agent_task halt parks. Validates that conflict parks are durably distinguishable from all other parks and the new fields round-trip without breaking existing manifests.
+  goal: Add parked_reason and human_responses to StepRecord. parked_reason is current-state (FR-2.1), not a latch — _finalize clears it on every non-conflict outcome (done/failed/non-conflict park) and sets "upstream_conflict" only on the specific UPSTREAM CONFLICT halt, not any halt_on marker. Validates that conflict parks are durably distinguishable from all other parks, the lifecycle prevents stale-reason misclassification, and the new fields round-trip without breaking existing manifests.
 - id: P2
   title: Operator identity resolution (fail-closed)
   goal: Resolve the audit user via GAUNTLET_USER_EMAIL→git config with trimming and fail-closed errors (FR-9). Validates that a present, non-empty audit identity can be guaranteed before any response is appended.
 - id: P3
   title: CLI --response + idempotent recording + retry-budget decoupling
-  goal: Add --response, record entries idempotently (pending→consumed) with atomic persist and orchestrator-owned commits, surviving kill -9, and ensure conflict resumes never consume the failure-retry budget (FR-1/FR-2/FR-6/FR-7.1). Validates the determinism and crash-recovery core with fake adapters.
+  goal: Add --response, record entries idempotently (pending→consumed) with atomic persist plus a new orchestrator-owned manifest-checkpoint commit (_persist does not commit today) so both states reach git history, surviving kill -9 across the full append→launch→consume window (PARKED/RUNNING/INTERRUPTED, incl. dirty-base recovery), and relocate StepRecord.attempts to a failure-only increment so conflict/response resumes never consume the failure-retry budget while a genuine response failure still counts once (FR-1/FR-2/FR-6/FR-7.1). Validates the determinism and crash-recovery core with fake adapters.
 - id: P4
   title: Prompt injection of chronological response history
   goal: Rebuild human-response.md from the manifest into an invocation-local inputs copy rendered via the existing artifact path, with no mutation of the pipeline definition or persisted inputs (FR-4/FR-4.1). Validates that history reaches the builder without touching approved artifacts.
 - id: P5
   title: Builder resume logic + resume-disposition schema
-  goal: Add schemas/resume-disposition.json and the FR-3.0 precedence prompt so the builder emits a machine-checkable disposition, tested via a deterministic adapter fixture (FR-3/FR-5/FR-10). Validates deterministic classification without live-model judgment.
+  goal: Add schemas/resume-disposition.json and the FR-3.0 precedence prompt, bind the schema as an invocation-local override on the response resume (the approved implement step has no schema: field and the snapshot must not change), and map the structured disposition to the step outcome (amendment_required/new_conflict→PARKED with parked_reason=upstream_conflict; proceed_*→DONE) so a schema-valid new_conflict cannot be marked DONE. Tested via a deterministic adapter fixture asserting real orchestration status, not just standalone schema fixtures (FR-3/FR-5/FR-10). Validates deterministic classification without live-model judgment.
 - id: P6
-  title: End-to-end synthetic test + dogfood integration
-  goal: Drive a full conflict→resume→resolution cycle on deterministic fixtures and resume the real prd-authoring-aids run, asserting the manifest audit trail and that the run un-sticks (§8/§11). Validates the assembled mechanism end to end.
+  title: End-to-end synthetic gate + one-time dogfood runbook
+  goal: Drive a full conflict→resume→resolution cycle on an isolated, disposable run with deterministic fixtures as the repeatable CI gate, and document the one-time human-gated dogfood of the real prd-authoring-aids run as a runbook whose evidence lands in run artifacts — NOT a repeatable integration pytest and NOT part of the pytest gate (PRD §8). Validates the assembled mechanism end to end.
 ```
