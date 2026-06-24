@@ -501,6 +501,83 @@ def test_finalize_is_current_state_not_a_latch(fixture_repo):
     assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
 
 
+def test_conflict_parked_agent_task_is_not_approvable_as_a_gate(fixture_repo):
+    # F-001: an agent_task halted on an UPSTREAM CONFLICT parks (status PARKED),
+    # but it is NOT a human_gate. Approving it would drive the run to `done`
+    # while leaving parked_reason="upstream_conflict" live — a false current
+    # state (FR-2.1). The gate path must refuse it.
+    import pytest
+
+    adapter = FakeAdapter(text="UPSTREAM CONFLICT\nplan contradicts the impl")
+    orch = _build(fixture_repo, CONFLICT_PIPELINE, adapters={"builder": adapter})
+    assert orch.drive() == M.RUN_PARKED
+    with pytest.raises(ValueError, match="not parked at a human gate"):
+        orch.approve_gate("implement", notes="ship it")
+    with pytest.raises(ValueError, match="not parked at a human gate"):
+        orch.reject_gate("implement", notes="nope")
+    # the conflict discriminator is untouched by the refused attempts
+    assert orch.manifest.record("implement").parked_reason == (
+        M.PARKED_REASON_UPSTREAM_CONFLICT
+    )
+
+
+def test_approve_gate_clears_stale_parked_reason(fixture_repo):
+    # F-001: approving a gate is a direct terminal transition; it must clear any
+    # parked_reason so a finished step never carries a stale discriminator.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: gate, type: human_gate}
+"""
+    orch = _build(fixture_repo, text)
+    assert orch.drive() == M.RUN_PARKED
+    orch.manifest.record("gate").parked_reason = M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert orch.approve_gate("gate") == M.RUN_DONE
+    rec = orch.manifest.record("gate")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None
+
+
+def test_reject_gate_clears_stale_parked_reason(fixture_repo):
+    # F-001: rejecting a gate must likewise clear parked_reason on the record.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: gate, type: human_gate}
+"""
+    orch = _build(fixture_repo, text)
+    assert orch.drive() == M.RUN_PARKED
+    orch.manifest.record("gate").parked_reason = M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
+    rec = orch.manifest.record("gate")
+    assert rec.status == M.FAILED
+    assert rec.parked_reason is None
+
+
+def test_mark_skipped_clears_parked_reason(fixture_repo):
+    # F-001: a skip is a direct terminal transition too — it must not leave a
+    # stale conflict discriminator behind (FR-2.1).
+    orch = _build(fixture_repo, CONFLICT_PIPELINE)
+    orch.manifest.upsert(
+        StepRecord(
+            id="implement",
+            type="agent_task",
+            status=M.PARKED,
+            parked_reason=M.PARKED_REASON_UPSTREAM_CONFLICT,
+        )
+    )
+    orch._mark_skipped("implement", None)
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.SKIPPED
+    assert rec.parked_reason is None
+
+
 def test_resume_mid_commit_reconciles_without_double_commit(fixture_repo):
     base = gitops.head_sha(fixture_repo)
     # Simulate: engine recorded base + ran commit, the commit landed, then the

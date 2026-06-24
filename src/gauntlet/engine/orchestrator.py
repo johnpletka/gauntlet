@@ -116,6 +116,10 @@ class Orchestrator:
         rec = self._find_parked_gate(step_id)
         rec.status = M.DONE
         rec.ended = self.clock()
+        # Current-state invariant (FR-2.1, F-001): a direct terminal transition
+        # clears parked_reason so a finished step never carries a stale conflict
+        # discriminator. (A human_gate park never sets it, but be explicit.)
+        rec.parked_reason = None
         rec.notes = f"approved: {notes}" if notes else "approved"
         self._persist()
         return self.drive()
@@ -124,6 +128,7 @@ class Orchestrator:
         rec = self._find_parked_gate(step_id)
         rec.status = M.FAILED
         rec.ended = self.clock()
+        rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
         rec.notes = f"rejected: {notes}"
         self._persist()
         return self._set_run_status(FAILED)
@@ -444,17 +449,29 @@ class Orchestrator:
             self.manifest.upsert(rec)
         rec.status = M.SKIPPED
         rec.ended = self.clock()
+        rec.parked_reason = None  # never carry a stale conflict reason (FR-2.1, F-001)
 
     def _find_parked_gate(self, step_id: str) -> StepRecord:
         # Scan across iterations so a gate parked inside a foreach (record
         # `gate` with iteration `1`) is reachable by approve/reject (F-004).
+        # Only a parked *human_gate* is an approve/reject target (F-001): an
+        # agent_task halted on an UPSTREAM CONFLICT also carries status PARKED
+        # (with parked_reason set), but approving it would drive the run to
+        # `done` while leaving that conflict discriminator live — a false
+        # current state (FR-2.1). A conflict park is resolved upstream, not
+        # rubber-stamped through the gate path.
         for rec in self.manifest.steps:
-            if rec.id == step_id and rec.status == M.PARKED:
+            if (
+                rec.id == step_id
+                and rec.status == M.PARKED
+                and rec.type == "human_gate"
+            ):
                 return rec
         existing = self.manifest.record(step_id)
         raise ValueError(
-            f"step {step_id!r} is not parked at a gate "
-            f"(status: {existing.status if existing else 'absent'})"
+            f"step {step_id!r} is not parked at a human gate "
+            f"(status: {existing.status if existing else 'absent'}, "
+            f"type: {existing.type if existing else 'absent'})"
         )
 
     def _head_sha(self) -> str:

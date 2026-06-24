@@ -229,7 +229,17 @@ def _marker_signalled(marker: str, text: str) -> bool:
     """
     if not marker:
         return False
-    pattern = re.compile(rf"^[ \t#*>`\-]*{re.escape(marker)}", re.MULTILINE)
+    # The marker must OWN its line, not merely begin it (review F-002). A
+    # prefix-only match also fired on lines that extend the token into a
+    # different word or sentence — "UPSTREAM CONFLICTS: none" (plural) or
+    # "UPSTREAM CONFLICT resolved" — parking a step that emitted no genuine
+    # signal. After the leading decoration + marker, allow only: a trailing
+    # field colon ("MARKER: <reason>", the compact one-line form), or closing
+    # Markdown decoration (`*`/`` ` ``/`#`) and whitespace to end-of-line.
+    pattern = re.compile(
+        rf"^[ \t#*>`\-]*{re.escape(marker)}(?=:|[ \t]*[*`#]*[ \t]*$)",
+        re.MULTILINE,
+    )
     return pattern.search(text or "") is not None
 
 
@@ -306,7 +316,13 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             notes="commit step found a clean worktree with nothing to commit",
         )
 
-    agent_name = step.agent or step.get("message_agent") or "builder"
+    # Commit AUTHORSHIP is the implementer's, never the message drafter's
+    # (FR-9.7, review F-003): a phase commit records the builder's work, so the
+    # message_agent (typically `triage`) drafting the text must not bleed into
+    # the commit identity — that mislabels implementation work as triage-
+    # authored and breaks the builder/triage provenance split. An explicit
+    # `agent:` on the commit step overrides; otherwise the builder authors it.
+    agent_name = step.agent or "builder"
     identity = ctx.config.identity(agent_name)
     sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
     return StepResult(
