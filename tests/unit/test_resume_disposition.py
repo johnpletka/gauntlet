@@ -135,7 +135,8 @@ class ConflictAdapter:
 # --- schema validity (FR-10 oracle) -----------------------------------------
 def test_proceed_dispositions_validate_with_null_conflict():
     # conflict is required-but-nullable (F-002): a proceed disposition carries it
-    # as null and validates; the allOf forbids an object there.
+    # as null and validates. The object-vs-null discriminator is enforced
+    # engine-side, not by a schema allOf (BOOTSTRAP-NOTES #46).
     schema = _schema()
     for d in ("proceed_in_place", "proceed_with_deviation"):
         obj = _disposition(d)
@@ -201,16 +202,23 @@ def test_conflict_required_when_reparking():
         validate_schema(bad, schema)
 
 
-def test_conflict_forbidden_when_proceeding():
-    schema = _schema()
-    bad = {
-        "disposition": "proceed_in_place",
-        "responses_considered": ["implement-resp-1"],
-        "action_summary": "x",
-        "conflict": {"summary": "s", "requested_input": "q", "artifact": None},
-    }
-    with pytest.raises(ValueError):
-        validate_schema(bad, schema)
+def test_disposition_schema_has_no_top_level_combinators():
+    # BOOTSTRAP-NOTES #46: this schema is handed to the builder as NATIVE
+    # structured output on a --response resume, and the Anthropic API rejects a
+    # top-level oneOf/allOf/anyOf in a tool input_schema (400
+    # tools.N.custom.input_schema). The repo's live schema and the bundled
+    # scaffold copy must both stay free of top-level combinators; the
+    # conflict object-vs-null discriminator is enforced engine-side instead.
+    repo_root = Path(__file__).resolve().parents[2]
+    for rel in (
+        "schemas/resume-disposition.json",
+        "src/gauntlet/scaffold/schemas/resume-disposition.json",
+    ):
+        schema = json.loads((repo_root / rel).read_text())
+        assert not ({"oneOf", "anyOf", "allOf"} & set(schema)), (
+            f"{rel} has a top-level combinator the Anthropic structured-output "
+            "API rejects (BOOTSTRAP-NOTES #46)"
+        )
 
 
 def test_unknown_disposition_rejected():
@@ -396,6 +404,57 @@ def test_amendment_required_without_artifact_fails_closed(tmp_path):
     )
     status = mgr.resume(
         "demo", response="rewrite something", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.attempts == 1
+
+
+# --- conflict object-vs-null discriminator, now engine-enforced (#46) --------
+def test_proceed_with_conflict_object_fails_closed(tmp_path):
+    # BOOTSTRAP-NOTES #46: the discriminator moved from a top-level schema allOf
+    # (which the Anthropic structured-output API rejects) to engine enforcement.
+    # The bound schema now permits conflict as object-or-null for ANY disposition,
+    # so a proceed disposition carrying a (schema-valid) conflict object must be
+    # rejected by the engine — a proceed must carry a null conflict. Fail closed.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    bad = {
+        "disposition": "proceed_in_place",
+        "responses_considered": ["implement-resp-1"],
+        "action_summary": "x",
+        "conflict": {"summary": "s", "requested_input": "q", "artifact": None},
+    }
+    adapter = DispositionAdapter(bad, write=False)
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.attempts == 1
+    assert not (repo / "feature.py").exists()  # nothing landed
+
+
+def test_repark_with_null_conflict_fails_closed(tmp_path):
+    # The complement (#46): a re-park disposition (new_conflict) MUST carry a
+    # conflict object now that the schema no longer requires it via allOf. A null
+    # conflict is a contentless re-park → fail closed rather than parking with no
+    # body telling the human what is still blocked.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    bad = {
+        "disposition": "new_conflict",
+        "responses_considered": ["implement-resp-1"],
+        "action_summary": "x",
+        "conflict": None,
+    }
+    adapter = DispositionAdapter(bad, write=False)
+    status = mgr.resume(
+        "demo", response="ambiguous", use_judge=False,
         adapter_factory=lambda n: adapter, clock=_clock(),
     )
     assert status == M.RUN_FAILED
