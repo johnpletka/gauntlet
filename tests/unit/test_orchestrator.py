@@ -403,3 +403,64 @@ stages:
     assert gitops.head_sha(fixture_repo) == landed  # no second commit
     assert len(orch.manifest.commits) == 1
     assert orch.manifest.commits[0].sha == landed
+
+
+# A gauntlet-phases block whose `goal:` carries an unquoted `schema:` — a
+# colon-space mid-scalar that YAML reads as a nested mapping ("mapping values
+# are not allowed here"). This is the exact defect that crashed the
+# gauntlet-resume-response run's resume.
+MALFORMED_PLAN = (
+    "# Plan\n\n"
+    "```gauntlet-phases\n"
+    "- id: P1\n"
+    "  title: Broken phase\n"
+    "  goal: the implement step has no schema: field and must not change\n"
+    "```\n"
+)
+
+
+def test_malformed_plan_phases_parks_instead_of_crashing(fixture_repo):
+    text = """
+name: demo
+version: 1
+stages:
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: implement, type: shell, run: "true"}
+"""
+    orch = _build(fixture_repo, text)
+    (orch.artifact_root / "plan.md").write_text(MALFORMED_PLAN)
+    # A malformed block must not escape drive() as an uncaught PlanPhasesError
+    # (which would leave the write-ahead RUN_RUNNING persisted); it parks.
+    assert orch.drive() == M.RUN_PARKED
+    # The persisted manifest reflects the park — never a stale "running" that
+    # `gauntlet status` would report as a live run.
+    reloaded = Manifest.load(orch.manifest_path)
+    assert reloaded.status == M.RUN_PARKED
+    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+
+
+def test_malformed_plan_phases_before_gate_parks_with_reason(fixture_repo):
+    # Mirrors the real run: a human_gate precedes the phases stage, but the
+    # context built to even process the gate eagerly parses plan.md. A malformed
+    # block must park with the parse error recorded, not crash before the gate.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-approve, type: human_gate, show: [plan.md]}
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: implement, type: shell, run: "true"}
+"""
+    orch = _build(fixture_repo, text)
+    (orch.artifact_root / "plan.md").write_text(MALFORMED_PLAN)
+    assert orch.drive() == M.RUN_PARKED
+    reloaded = Manifest.load(orch.manifest_path)
+    assert reloaded.status == M.RUN_PARKED
+    # The park reason is persisted data, not something a human must infer.
+    assert any("plan.md" in w for w in reloaded.warnings), reloaded.warnings

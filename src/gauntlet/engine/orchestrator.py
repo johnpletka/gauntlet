@@ -37,6 +37,7 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.planphases import PlanPhasesError
 from gauntlet.engine.pipeline import Pipeline, Stage, Step
 from gauntlet.logging.redact import RedactingWriter
 from gauntlet.logging.transcript import write_run_index
@@ -106,11 +107,25 @@ class Orchestrator:
         """
         self.manifest.status = M.RUN_RUNNING
         self._persist()
-        for stage in self.pipeline.stages:
-            status = self._run_stage(stage)
-            if status != DONE:
-                return self._set_run_status(status)
-        return self._set_run_status(DONE)
+        try:
+            for stage in self.pipeline.stages:
+                status = self._run_stage(stage)
+                if status != DONE:
+                    return self._set_run_status(status)
+            return self._set_run_status(DONE)
+        except PlanPhasesError as exc:
+            # A malformed `gauntlet-phases` block in plan.md is a builder-authored
+            # artifact defect, not an orchestrator fault — and `_plan_context`
+            # parses it while building the context for *any* step (a gate, a
+            # foreach), so an uncaught raise here kills `drive()` mid-walk and
+            # leaves the write-ahead RUN_RUNNING status persisted: `gauntlet
+            # status` then reads as a live run that is actually dead. Fail closed
+            # (CLAUDE.md §2): record the precise parse error and park for a human
+            # via HALTED -> RUN_PARKED, the same terminal-park path a budget/
+            # timeout halt takes. The human fixes plan.md and `gauntlet resume`
+            # re-drives — reaching the plan gate and parking normally.
+            self.manifest.warnings.append(f"plan.md gauntlet-phases unparseable: {exc}")
+            return self._set_run_status(HALTED)
 
     def approve_gate(self, step_id: str, notes: str | None = None) -> str:
         rec = self._find_parked_gate(step_id)
