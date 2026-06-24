@@ -1,7 +1,9 @@
 # PRD: Resume-with-response — human decision mechanism for upstream conflicts
 
 **Feature slug:** `gauntlet-resume-response`  
-**Status:** Draft for adversarial review (revised again to address this round's F-001 through F-011)  
+**Status:** Approved; amended post-approval per FR-10.4 to ratify two upstream
+clarifications surfaced by `plan-cycle` (F-006: `parked_reason` lifecycle in
+FR-2.1; F-007: one-time dogfood in §8). Human-ratified by the author.  
 **Date:** 2026-06-24  
 **Author:** John Pletka
 
@@ -150,6 +152,17 @@ the behavior change so existing flows are not broken:
   unset or set to their own value. This is the **only** signal `--response`
   uses to decide whether a parked step is a conflict park (see FR-1.1). It
   is a single enum field, not the structured-conflict metadata deferred in §7.
+- **Lifecycle (current-state, not a latch):** `parked_reason` describes the
+  step's *current* park, not its history. Because a `StepRecord` is reused
+  across re-executions, the orchestrator **clears `parked_reason` (back to
+  unset) on every non-conflict finalization** of the step — when it next
+  completes (`done`), fails, or parks for a different reason — and re-sets it
+  only when that execution again halts with `UPSTREAM CONFLICT`. A stale
+  `upstream_conflict` value therefore can never cause a later generic park to be
+  misclassified as a conflict park (which would wrongly require `--response`).
+- **Acceptance:** a step that parks on a conflict and is then resumed to a
+  non-conflict outcome (done / failed / non-conflict park) has `parked_reason`
+  unset at that outcome; only a live conflict park carries `upstream_conflict`.
 
 #### FR-2.2: Durability and commit ownership
 - The manifest is written **atomically** (write to a temp file in the same
@@ -505,7 +518,16 @@ against.
 ### End-to-end test (deterministic fixtures, FR-10)
 - ✓ Driven by a scripted adapter fixture returning canned dispositions — assertions are on structured fields, reproducible in CI, no live-model judgment
 - ✓ Synthetic test: trigger upstream conflict, provide --response, assert builder disposition is `proceed_in_place` or `new_conflict` per fixture
-- ✓ Dogfood validation: resume prd-authoring-aids run with --response, verify manifest audit trail (ids/state/user), verify step commits and proceeds
+- ✓ Repeatable CI gate = the **synthetic** e2e on an **isolated, disposable**
+  run (created fresh and torn down within the test): deterministic, no live
+  creds, safe to run before every handoff.
+- ✓ The **prd-authoring-aids dogfood is a one-time, human-gated validation —
+  not a repeatable pytest.** It mutates one real parked run and depends on live
+  creds, branch state, and operator identity, so it cannot satisfy the same
+  preconditions twice. It is run **once**; its evidence (manifest audit trail
+  with ids/state/user, the commit SHA, and the run-proceeds outcome) is
+  **captured in the run artifacts**, and it is **not** part of the `pytest` gate
+  that must pass before every handoff.
 
 ---
 
