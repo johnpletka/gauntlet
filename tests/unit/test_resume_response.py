@@ -696,6 +696,85 @@ def test_recovery_dirty_base_reset_preserves_response_checkpoints(tmp_path):
     ]
 
 
+def _seed_dirty_running_with_committed_pending(repo: Path, mgr: RunManager) -> str:
+    """Realistic dirty-base-with-checkpoint crash state: base_sha is the pre-agent
+    implementation baseline, a real *committed* pending checkpoint sits on top of
+    it, the record is RUNNING, and the worktree is dirty mid-edit. Returns the
+    pending checkpoint sha."""
+    run_dir = _run_dir(mgr)
+    man = Manifest.load(run_dir / "manifest.json")
+    rec = man.record("implement")
+    rec.base_sha = gitops.head_sha(repo)  # implementation baseline, pre-checkpoint
+    rec.status = M.RUNNING
+    rec.human_responses.append(HumanResponse(
+        response_id="implement-resp-1", response_text="Ratify option 1.",
+        timestamp="2026-06-24T00:00:00+00:00", user="fixture@gauntlet.local",
+        response_attempt=1, state=M.RESPONSE_PENDING,
+    ))
+    man.write_atomic(run_dir / "manifest.json")
+    run_rel = run_dir.resolve().relative_to(repo.resolve()).as_posix()
+    gitops.commit_run_bookkeeping(
+        repo, "gauntlet: response implement-resp-1 pending",
+        [f"{run_rel}/manifest.json"], identity=ENGINE_IDENTITY,
+    )
+    pending_sha = gitops.head_sha(repo)
+    assert pending_sha != rec.base_sha  # the checkpoint really advanced HEAD
+    (repo / "partial.py").write_text("half-written before the kill")  # dirty base
+    return pending_sha
+
+
+def test_recovery_dirty_base_reset_survives_crash_in_rewind_window(tmp_path, monkeypatch):
+    # FR-2.2/FR-7.1 / review F-001: inject a kill -9 in the dirty-base recovery
+    # window — right after the implementation tree is rewound, BEFORE the manifest
+    # is re-persisted/reconciled. The pending response must still be on disk after
+    # the crash (the rewind's reset target carried the manifest, so it was never
+    # momentarily deleted), and a subsequent process must recover it to exactly
+    # one consumed entry — never lost, never re-appended, never double-counted.
+    repo, mgr = _build_repo(
+        tmp_path / "repo", PIPELINE_SOLO,
+        config=CONFIG + "interrupted_step: reset_to_base\n",
+    )
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    _seed_dirty_running_with_committed_pending(repo, mgr)
+
+    # `clean_untracked` runs immediately after the rewind reset and before the
+    # final persist/reconcile — patch it to die there, simulating the kill in the
+    # exact F-001 window (with the old reset-to-base code this is the instant the
+    # response was unrecoverable: manifest deleted from disk, checkpoint orphaned).
+    def _crash(*a, **k):
+        raise RuntimeError("simulated kill -9 mid-rewind")
+    monkeypatch.setattr(gitops, "clean_untracked", _crash)
+
+    with pytest.raises(RuntimeError, match="simulated kill -9"):
+        mgr.resume(
+            "demo", use_judge=False,
+            adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
+        )
+
+    # Durability: despite the crash, the pending response is still on disk.
+    crashed = Manifest.load(_run_dir(mgr) / "manifest.json").record("implement")
+    assert len(crashed.human_responses) == 1
+    assert crashed.human_responses[0].state == M.RESPONSE_PENDING
+
+    # A subsequent process recovers it cleanly.
+    monkeypatch.undo()
+    adapter = ScriptedAdapter("proceed")
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    rec = mgr.status("demo").record("implement")
+    assert len(rec.human_responses) == 1  # NOT re-appended
+    assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+    assert rec.attempts == 0
+    assert not (repo / "partial.py").exists()  # partial work discarded
+    assert len(adapter.prompts) == 1  # one logical re-execution
+    assert _checkpoint_log(repo) == [
+        "Gauntlet Engine|gauntlet: response implement-resp-1 pending",
+        "Gauntlet Engine|gauntlet: response implement-resp-1 consumed",
+    ]
+
+
 def test_recovery_dirty_base_park_keeps_pending(tmp_path):
     # FR-7.1: under the park policy a dirty-base crash leaves the step
     # INTERRUPTED with the response STILL pending for a human to reconcile — the

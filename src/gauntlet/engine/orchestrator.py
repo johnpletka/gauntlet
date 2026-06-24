@@ -367,21 +367,44 @@ class Orchestrator:
                 self.repo_root, backup, f"interrupted {rec.id} partial work",
                 exclude=self.excludes,
             )
-            gitops.reset_hard(self.repo_root, rec.base_sha)
+            # Flush the authoritative in-memory manifest to disk BEFORE the
+            # rewind, so the bookkeeping the rewind preserves carries the latest
+            # response state (e.g. a still-`pending` entry the re-run consumes).
+            self._persist()
+            # F-001: base_sha predates the engine bookkeeping commits stacked on
+            # top of it — notably the pending-response checkpoint (FR-2.2/FR-7.1).
+            # A plain `reset --hard base_sha` would delete the force-committed
+            # manifest from disk AND orphan that checkpoint, so a kill in the gap
+            # before it was re-persisted would lose the human response. Instead,
+            # rewind the implementation to base_sha in a single reset whose target
+            # commit still carries the manifest — the response is never, even for
+            # an instant, absent from both disk and reachable history. Label that
+            # commit with the canonical response-checkpoint subject so it stands in
+            # as the pending checkpoint itself (the post-rewind reconcile below is
+            # then a no-op rather than stacking a duplicate).
+            paths = self._bookkeeping_paths()
+            if paths and gitops.head_sha(self.repo_root) != rec.base_sha:
+                message = (
+                    self._response_checkpoint_message()
+                    or f"gauntlet: rewind implementation to base for re-run ({rec.id})"
+                )
+                gitops.rewind_impl_preserving_bookkeeping(
+                    self.repo_root, rec.base_sha, paths, message,
+                    identity=ENGINE_IDENTITY,
+                )
+            else:
+                # No checkpoint sits above base_sha (HEAD == base_sha, or no
+                # bookkeeping on disk): the plain rewind is already crash-safe.
+                gitops.reset_hard(self.repo_root, rec.base_sha)
             # `clean` is broader than the dirty check on purpose: it spares the
             # whole run root so the reset never wipes the run pointer, manifests,
             # the authored prd.md, or prior declared artifacts — the re-run
             # regenerates its own outputs over them.
             gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
-            # F-001: base_sha predates the engine bookkeeping commits stacked on
-            # top of it — notably the pending-response checkpoint (FR-2.2/FR-7.1),
-            # whose state MUST stay reachable in git history. The reset above just
-            # rewound HEAD past them. They carry no implementation diff (only
-            # manifest.json + RUN.md), so the implementation baseline is unchanged;
-            # re-flush the current manifest as a checkpoint to restore them. The
-            # reset reverted the on-disk manifest to base_sha, so persist the
-            # authoritative in-memory state first, then commit it (still `pending`
-            # here — the re-run consumes it and lands the `consumed` checkpoint).
+            # The rewind restored the on-disk manifest to base_sha's tree + the
+            # overlaid bookkeeping; re-persist the authoritative in-memory state
+            # over it and idempotently flush the checkpoint (still `pending` here
+            # — the re-run consumes it and lands the `consumed` checkpoint).
             self._persist()
             self._reconcile_response_checkpoint()
             return None  # tree restored to base; checkpoints preserved; re-run cleanly
@@ -626,13 +649,23 @@ class Orchestrator:
 
     def _reconcile_response_checkpoint(self) -> None:
         """Idempotently flush the latest response step's current-state commit."""
-        rec = self._latest_response_step()
-        if rec is None:
+        message = self._response_checkpoint_message()
+        if message is None:
             return
+        self._commit_manifest_checkpoint(message)
+
+    def _response_checkpoint_message(self) -> str | None:
+        """Canonical checkpoint subject for the latest response entry, or None.
+
+        The single source of the ``gauntlet: response <id> <state>`` wording, so
+        the reconcile flush and the F-001 dirty-base rewind label the checkpoint
+        identically — the rewind commit can then stand in as that very checkpoint.
+        """
+        rec = self._latest_response_step()
+        if rec is None or not rec.human_responses:
+            return None
         entry = rec.human_responses[-1]
-        self._commit_manifest_checkpoint(
-            f"gauntlet: response {entry.response_id} {entry.state}"
-        )
+        return f"gauntlet: response {entry.response_id} {entry.state}"
 
     def _latest_response_step(self) -> StepRecord | None:
         """The most recently active step carrying `--response` history.
@@ -684,6 +717,21 @@ class Orchestrator:
         # Keep RUN.md consistent with the manifest we are about to commit (the
         # manifest is authoritative; RUN.md is its derived index).
         write_run_index(self.run_dir, self.manifest, self.writer)
+        paths = self._bookkeeping_paths()
+        if not paths:
+            return None
+        return gitops.commit_run_bookkeeping(
+            self.repo_root, message, paths, identity=ENGINE_IDENTITY
+        )
+
+    def _bookkeeping_paths(self) -> list[str]:
+        """Repo-relative paths of the two on-disk run-bookkeeping files.
+
+        The manifest is authoritative; RUN.md is its derived index. Returns only
+        the files that currently exist, repo-root-relative and POSIX-formatted —
+        the exact set every engine bookkeeping commit (and the F-001 rewind)
+        force-stages.
+        """
         root = self.repo_root.resolve()
         paths: list[str] = []
         for name in ("manifest.json", "RUN.md"):
@@ -694,11 +742,7 @@ class Orchestrator:
                 paths.append(p.resolve().relative_to(root).as_posix())
             except ValueError:
                 pass
-        if not paths:
-            return None
-        return gitops.commit_run_bookkeeping(
-            self.repo_root, message, paths, identity=ENGINE_IDENTITY
-        )
+        return paths
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)
