@@ -93,12 +93,42 @@ class ScriptedAdapter:
 
     def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
         self.prompts.append(prompt)
+        # P5: a builder consuming a `--response` emits a structured disposition
+        # (FR-10), which is authoritative for the outcome. The same instance also
+        # serves the FIRST conflict (no response yet): there `structured` is
+        # ignored and the textual UPSTREAM CONFLICT marker parks via `halt_on`, so
+        # returning both keeps one fixture valid on both the first run and resume.
         if self.behavior == "conflict":
-            return AgentResult(text=CONFLICT_TEXT, session_id="s", exit_code=0)
+            return AgentResult(
+                text=CONFLICT_TEXT, structured=_NEW_CONFLICT_DISPOSITION,
+                session_id="s", exit_code=0,
+            )
         if self.behavior == "fail":
             raise AdapterError("genuine agent failure (not a conflict)")
         (Path(cwd) / "feature.py").write_text("implemented\n")
-        return AgentResult(text="done implementing", session_id="s", exit_code=0)
+        return AgentResult(
+            text="done implementing", structured=_PROCEED_DISPOSITION,
+            session_id="s", exit_code=0,
+        )
+
+
+# Schema-valid resume dispositions (FR-10) the ScriptedAdapter returns on a
+# `--response` resume: proceed_in_place completes the step; new_conflict re-parks.
+_PROCEED_DISPOSITION = {
+    "disposition": "proceed_in_place",
+    "responses_considered": [],
+    "action_summary": "conflict resolved in place; proceeding",
+}
+_NEW_CONFLICT_DISPOSITION = {
+    "disposition": "new_conflict",
+    "responses_considered": [],
+    "action_summary": "still ambiguous; need more",
+    "conflict": {
+        "summary": "the response did not resolve the conflict",
+        "requested_input": "a decision that unambiguously resolves it",
+        "artifact": None,
+    },
+}
 
 
 def _clock():
@@ -120,6 +150,15 @@ def _build_repo(
     (repo / ".gauntlet" / "config.yaml").write_text(config)
     (repo / "pipelines").mkdir()
     (repo / "pipelines" / "respond.yaml").write_text(pipeline)
+    # Engine-owned schemas live under asset_root (repo root here), exactly as in
+    # gauntlet's own tree — the resume-disposition schema (P5) is bound
+    # invocation-locally from there on a `--response` resume. Mirror that so the
+    # fixture is production-like (tracked + committed, not a dirty add).
+    src_schemas = Path(__file__).resolve().parents[2] / "schemas"
+    (repo / "schemas").mkdir()
+    (repo / "schemas" / "resume-disposition.json").write_text(
+        (src_schemas / "resume-disposition.json").read_text()
+    )
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "init")
     git(repo, "branch", "-M", "main")

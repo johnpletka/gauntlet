@@ -256,7 +256,9 @@ def test_shipped_scaffold_matches_repo_canonical_assets():
         SCAFFOLD_DIR / "pipelines/standard.yaml": REPO / "pipelines/standard.yaml",
         SCAFFOLD_DIR / "claude-settings.json": REPO / ".claude/settings.json",
     }
-    for schema in ("findings.json", "triage.json", "confirm.json"):
+    for schema in (
+        "findings.json", "triage.json", "confirm.json", "resume-disposition.json",
+    ):
         checks[SCAFFOLD_DIR / "schemas" / schema] = REPO / "schemas" / schema
     for prompt in (SCAFFOLD_DIR / "prompts").glob("*"):
         checks[prompt] = REPO / "prompts" / prompt.name

@@ -30,7 +30,10 @@ from gauntlet.engine.execution import (
     StepSpec,
 )
 from gauntlet.engine import gitops
-from gauntlet.engine.manifest import PARKED_REASON_UPSTREAM_CONFLICT
+from gauntlet.engine.manifest import (
+    PARKED_REASON_UPSTREAM_CONFLICT,
+    RESPONSE_PENDING,
+)
 from gauntlet.engine.pipeline import Step
 from gauntlet.logging.transcript import StepLogger
 
@@ -48,6 +51,27 @@ UPSTREAM_CONFLICT_MARKER = "UPSTREAM CONFLICT"
 # exactly one file with this name; each resume regenerates it from the manifest
 # (so repeated resumes never accumulate differently-named files / collide).
 HUMAN_RESPONSE_ARTIFACT = "human-response.md"
+
+# FR-10: the structured-disposition schema the builder must emit on a `--response`
+# resume. It is bound INVOCATION-LOCALLY (only while a step consumes a pending
+# response) rather than added to the approved pipeline definition — the
+# `implement` step carries no `schema:` field and the approved snapshot must not
+# be mutated (FR-4.1). Lives under the configured asset_root, like every schema.
+RESUME_DISPOSITION_SCHEMA = "schemas/resume-disposition.json"
+
+# FR-3 / FR-5 / FR-10: how a builder's structured `disposition` drives the step
+# outcome on a `--response` resume. The enum maps 1:1 to the FR-3 categories —
+# proceed_* completes the step (DONE → commit); amendment_required / new_conflict
+# re-park it for a human (parked_reason=upstream_conflict, the FR-10.4 gate). This
+# structured signal — not the textual UPSTREAM CONFLICT marker — is authoritative
+# once a response is being consumed (the marker is only the FIRST-conflict signal,
+# before any response exists).
+_DISPOSITION_OUTCOMES: dict[str, tuple[str, str | None]] = {
+    "proceed_in_place": (DONE, None),
+    "proceed_with_deviation": (DONE, None),
+    "amendment_required": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
+    "new_conflict": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
+}
 
 
 # --- shell -------------------------------------------------------------------
@@ -123,7 +147,15 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         return StepResult(status=FAILED, notes="agent_task step has no `agent:`")
     adapter = ctx.build_adapter(agent_name)
     prompt = _render_prompt(step, ctx)
-    schema = _load_schema(step, ctx)
+    # FR-10: while this invocation is consuming a pending `--response`, bind the
+    # resume-disposition schema invocation-locally and let the structured
+    # disposition drive the outcome — without touching the approved pipeline.
+    consuming_response = _consuming_response(ctx)
+    schema = (
+        _resume_disposition_schema(ctx)
+        if consuming_response
+        else _load_schema(step, ctx)
+    )
     # Per-step timeout overrides the profile's step_timeout_s, which overrides
     # the adapter default (FR-3.3). A timeout raises AgentTimeoutError, which the
     # orchestrator turns into a HALTED checkpoint.
@@ -151,6 +183,14 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         raise
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     usage_by_agent = {agent_name: result.usage} if result.usage else {}
+
+    # FR-3/FR-5/FR-10: on a `--response` resume the builder's STRUCTURED
+    # disposition is authoritative for the outcome, not the textual `halt_on`
+    # marker (which only signals the FIRST conflict, before any response). Map it
+    # to the step status here so a schema-valid `new_conflict` re-parks instead of
+    # being marked DONE; the FR-3.0 classification itself lives in the prompt.
+    if consuming_response:
+        return _resume_disposition_result(agent_name, result, usage_by_agent)
 
     # Completion-signal contract (BOOTSTRAP-NOTES #32): a headless agent that
     # exits 0 may still have *halted* — surfaced an FR-10.4 upstream conflict
@@ -339,6 +379,79 @@ def _load_schema(step: Step, ctx: StepContext) -> dict | None:
     if not ref:
         return None
     return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
+
+
+def _consuming_response(ctx: StepContext) -> bool:
+    """True when this invocation is consuming a pending `--response` (FR-5/FR-10).
+
+    The latest `human_responses` entry is ``pending`` only while a `--response`
+    resume re-executes the parked step; ``Orchestrator._finalize`` flips it to
+    ``consumed`` on the terminal outcome. Keying on that same discriminator means
+    the schema binding and disposition mapping fire on exactly the invocations
+    that carry a human decision — and never on an ordinary first run (no
+    responses) or a non-conflict park.
+    """
+    responses = ctx.record.human_responses
+    return bool(responses) and responses[-1].state == RESPONSE_PENDING
+
+
+def _resume_disposition_schema(ctx: StepContext) -> dict:
+    """Load the invocation-local resume-disposition schema (FR-10).
+
+    Bound only while consuming a response, so the adapter validates the builder's
+    disposition through the existing structured-output path without the approved
+    pipeline definition ever gaining a ``schema:`` field (FR-4.1).
+    """
+    path = ctx.repo_root / ctx.config.asset_root / RESUME_DISPOSITION_SCHEMA
+    return json.loads(path.read_text())
+
+
+def _resume_disposition_result(agent_name, result, usage_by_agent) -> StepResult:
+    """Map a builder's structured `disposition` to the step outcome (FR-3/FR-5).
+
+    proceed_* → DONE (the run proceeds to commit); amendment_required /
+    new_conflict → PARKED with ``parked_reason=upstream_conflict`` so P1's
+    current-state ``_finalize`` records the re-park and the human is asked for the
+    next decision (FR-3(b)/FR-10.4 gate). Fail closed (CLAUDE.md §2): a missing or
+    unrecognized disposition is NEVER read as success — it fails the step rather
+    than letting a malformed resume silently land work.
+    """
+    disposition = _disposition_value(result.structured)
+    outcome = _DISPOSITION_OUTCOMES.get(disposition)
+    if outcome is None:
+        return StepResult(
+            status=FAILED,
+            session_id=result.session_id,
+            usage=result.usage,
+            usage_by_agent=usage_by_agent,
+            notes=(
+                f"resume disposition missing or unrecognized ({disposition!r}); "
+                "failing closed rather than advancing on an unparseable resume "
+                "(FR-10)"
+            ),
+        )
+    status, parked_reason = outcome
+    return StepResult(
+        status=status,
+        session_id=result.session_id,
+        usage=result.usage,
+        usage_by_agent=usage_by_agent,
+        parked_reason=parked_reason,
+        notes=f"resume disposition: {disposition} (FR-3/FR-5/FR-10)",
+    )
+
+
+def _disposition_value(structured) -> str | None:
+    """Pull the `disposition` enum off the adapter's structured output, or None.
+
+    The adapter already validated `structured` against the bound schema, so a
+    well-formed resume carries a dict with a string `disposition`. Anything else
+    (None, non-dict, missing key) returns None and the caller fails closed.
+    """
+    if isinstance(structured, dict):
+        value = structured.get("disposition")
+        return value if isinstance(value, str) else None
+    return None
 
 
 # --- commit (FR-9.2/9.7) -----------------------------------------------------
