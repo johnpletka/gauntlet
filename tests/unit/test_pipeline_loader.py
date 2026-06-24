@@ -79,6 +79,40 @@ stages:
         validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
 
 
+def test_reserved_human_response_input_rejected(tmp_path):
+    # review F-002: declaring the reserved synthetic artifact as an input would
+    # let a `--response` resume silently replace it and emit two identically
+    # named blocks. Validation must reject it deterministically at load.
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, output: plan.md, prompt_text: go}
+      - {id: implement, type: agent_task, agent: builder, inputs: [plan.md, human-response.md]}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="reserved.*human-response"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_reserved_human_response_output_rejected(tmp_path):
+    # review F-002: a step that PRODUCES `human-response.md` collides with the
+    # engine-generated synthetic artifact just as an input does.
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, output: human-response.md, prompt_text: go}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="reserved.*human-response"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
 def test_capability_violation_repo_write_on_api(tmp_path):
     text = """
 name: d

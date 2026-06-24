@@ -265,14 +265,25 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
     # repeated resumes regenerate one file rather than accumulating files.
     inputs = list(step.get("inputs", []) or [])
     artifacts = dict(ctx.artifacts)
-    history_path = _write_human_response_artifact(ctx)
-    if history_path is not None:
+    # FR-1 verbatim requirement (review F-001): the builder must receive the
+    # human-decision history EXACTLY as recorded. The on-disk copy is written
+    # through the RedactingWriter (credential-shaped substrings become
+    # placeholders), so re-reading it for the prompt would feed the adapter a
+    # non-verbatim, redacted version that also diverges from the manifest record.
+    # Inject the unmodified rendered text directly; the redacted copy stays on
+    # disk only for the audit trail.
+    history_text = _write_human_response_artifact(ctx)
+    verbatim: dict[str, str] = {}
+    if history_text is not None:
         inputs.append(HUMAN_RESPONSE_ARTIFACT)
-        artifacts[HUMAN_RESPONSE_ARTIFACT] = history_path
+        verbatim[HUMAN_RESPONSE_ARTIFACT] = history_text
     parts = [base]
     for name in inputs:
-        path = artifacts.get(name) or (ctx.artifact_root / name)
-        content = Path(path).read_text() if Path(path).exists() else ""
+        if name in verbatim:
+            content = verbatim[name]
+        else:
+            path = artifacts.get(name) or (ctx.artifact_root / name)
+            content = Path(path).read_text() if Path(path).exists() else ""
         parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
     if ctx.iteration_item is not None:
         item = ctx.iteration_item
@@ -301,22 +312,26 @@ def render_human_responses(responses) -> str:
     return "\n".join(parts)
 
 
-def _write_human_response_artifact(ctx: StepContext) -> Path | None:
-    """Rebuild ``human-response.md`` from the manifest into the render area (FR-4).
+def _write_human_response_artifact(ctx: StepContext) -> str | None:
+    """Rebuild ``human-response.md`` from the manifest (FR-4); return it verbatim.
 
-    Returns the path to the regenerated file, or ``None`` when the step carries
-    no recorded responses (the ordinary first-run / non-conflict case, where no
-    block is injected). The file is written under the step's log dir — inside the
-    gitignored live run dir — so it is an ephemeral render input: never committed
-    as a step artifact, overwritten on the next resume, and harmless if left
-    stale because it is fully derived from ``human_responses`` (FR-4.1).
+    Returns the rendered history text — the EXACT string the builder must
+    receive (FR-1, review F-001) — or ``None`` when the step carries no recorded
+    responses (the ordinary first-run / non-conflict case, where no block is
+    injected). A *redacted* copy is also written under the step's log dir —
+    inside the gitignored live run dir — for the audit trail: never committed as
+    a step artifact, overwritten on the next resume, and harmless if left stale
+    because it is fully derived from ``human_responses`` (FR-4.1). The returned
+    value is the pre-redaction text so the invocation prompt stays verbatim even
+    when a response contains credential-shaped substrings.
     """
     responses = ctx.record.human_responses
     if not responses:
         return None
+    rendered = render_human_responses(responses)
     path = step_log_dir(ctx) / HUMAN_RESPONSE_ARTIFACT
-    ctx.writer.write_text(path, render_human_responses(responses))
-    return path
+    ctx.writer.write_text(path, rendered)  # redacted on disk; audit trail only
+    return rendered
 
 
 def _load_schema(step: Step, ctx: StepContext) -> dict | None:

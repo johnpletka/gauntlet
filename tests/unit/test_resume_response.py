@@ -853,6 +853,31 @@ def test_response_injected_as_single_artifact_block(tmp_path):
     assert _history_artifact(mgr).exists()
 
 
+def test_credential_shaped_response_reaches_builder_verbatim(tmp_path):
+    # FR-1 / review F-001: a human response containing credential-shaped text
+    # must reach the builder EXACTLY as recorded — never as a redaction
+    # placeholder. The on-disk copy is redacted for the audit trail, but the
+    # invocation prompt carries the verbatim original. The token is assembled at
+    # runtime from an obviously-synthetic body (no real-looking secret literal in
+    # the source) yet still trips the openai-style-key fallback regex.
+    secret = "sk-" + ("z" * 36)  # matches r"\bsk-[A-Za-z0-9_-]{20,}\b"
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = ScriptedAdapter("proceed")
+    mgr.resume(
+        "demo", response=f"Proceed using {secret} for the call.",
+        use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    prompt = adapter.prompts[-1]
+    # The builder sees the verbatim token, not a placeholder.
+    assert secret in prompt
+    assert "[REDACTED" not in prompt
+    # The on-disk render copy IS redacted (audit trail).
+    on_disk = _history_artifact(mgr).read_text()
+    assert secret not in on_disk
+    assert "[REDACTED:openai-style-key]" in on_disk
+
+
 def test_response_history_accumulates_chronologically(tmp_path):
     # FR-4: repeated resumes regenerate ONE file holding the full ordered
     # history, oldest first — not one differently-named file per response.
