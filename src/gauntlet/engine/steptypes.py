@@ -30,11 +30,18 @@ from gauntlet.engine.execution import (
     StepSpec,
 )
 from gauntlet.engine import gitops
+from gauntlet.engine.manifest import PARKED_REASON_UPSTREAM_CONFLICT
 from gauntlet.engine.pipeline import Step
 from gauntlet.logging.transcript import StepLogger
 
 _CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
 _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
+
+# Canonical FR-10.4 halt marker. Only a `halt_on:` whose value is *exactly* this
+# marker sets the conflict-park discriminator (FR-2.1); a step configured with a
+# different `halt_on:` marker parks with `parked_reason` unset. Pipelines use
+# this string verbatim (pipelines/standard.yaml `halt_on: "UPSTREAM CONFLICT"`).
+UPSTREAM_CONFLICT_MARKER = "UPSTREAM CONFLICT"
 
 
 # --- shell -------------------------------------------------------------------
@@ -150,10 +157,11 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # in pipelines/standard.yaml); the line-leading match is the second guard.
     signal = _completion_signal(step, result.text)
     if signal is not None:
-        status, note = signal
+        status, note, parked_reason = signal
         return StepResult(
             status=status, session_id=result.session_id, usage=result.usage,
             usage_by_agent=usage_by_agent, notes=note,
+            parked_reason=parked_reason,
         )
 
     artifact_writes: dict[str, Path] = {}
@@ -175,22 +183,33 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
 def _completion_signal(step: Step, text: str):
     """Read an agent_task's final output for a halt/completion contract (#32).
 
-    Returns ``None`` to proceed normally, or ``(status, note)`` to short-circuit.
-    Both checks are opt-in (absent keys → no contract), so existing steps and
-    the document-authoring tasks keep their plain exit-code semantics.
+    Returns ``None`` to proceed normally, or ``(status, note, parked_reason)`` to
+    short-circuit. Both checks are opt-in (absent keys → no contract), so
+    existing steps and the document-authoring tasks keep their plain exit-code
+    semantics.
+
+    ``parked_reason`` is ``PARKED_REASON_UPSTREAM_CONFLICT`` only when the matched
+    ``halt_on`` marker is *exactly* the canonical :data:`UPSTREAM_CONFLICT_MARKER`
+    (FR-2.1) — a step parking on a *different* ``halt_on`` marker, or failing on a
+    missing ``require_signal``, carries no ``parked_reason``.
     """
     halt_on = step.get("halt_on")
     if halt_on and _marker_signalled(halt_on, text):
+        parked_reason = (
+            PARKED_REASON_UPSTREAM_CONFLICT
+            if halt_on == UPSTREAM_CONFLICT_MARKER
+            else None
+        )
         return PARKED, (
             f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
             "parked for a human instead of marking the step done (#32)"
-        )
+        ), parked_reason
     require = step.get("require_signal")
     if require and not _marker_signalled(require, text):
         return FAILED, (
             f"agent did not emit the required completion signal {require!r}; "
             "failing closed rather than advancing on a silent non-completion (#32)"
-        )
+        ), None
     return None
 
 

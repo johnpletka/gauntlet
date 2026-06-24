@@ -14,9 +14,17 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+# --- park reasons (FR-2.1) ---------------------------------------------------
+# Single enum-valued discriminator that tells an UPSTREAM CONFLICT park from
+# every other park (human_gate, budget/timeout halt, generic agent re-run). It
+# is the ONLY signal `gauntlet resume --response` uses to decide whether a
+# parked step is a conflict park; it carries no conflict content (the rich
+# conflict metadata is deferred, PRD §7). v1 has exactly one value.
+PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"
 
 # --- step lifecycle states ---------------------------------------------------
 PENDING = "pending"
@@ -58,6 +66,25 @@ class UsageTotals(BaseModel):
             self.cost_usd = (self.cost_usd or 0.0) + usage.cost_usd
 
 
+class HumanResponse(BaseModel):
+    """One `gauntlet resume --response` decision, appended for the audit trail.
+
+    Append-only (FR-2): once written, an entry's ``response_id`` never changes —
+    it is how the builder references a response (FR-5/FR-10) and how crash
+    recovery deduplicates (FR-7.1). ``state`` drives that idempotent recovery:
+    ``pending`` immediately after append (before the agent launches), flipped to
+    ``consumed`` once the resumed agent reaches a terminal outcome. The append /
+    consume wiring lands in P3; P1 only defines the durable shape.
+    """
+
+    response_id: str
+    response_text: str
+    timestamp: str
+    user: str
+    response_attempt: int
+    state: Literal["pending", "consumed"]
+
+
 class StepRecord(BaseModel):
     id: str
     type: str
@@ -69,6 +96,15 @@ class StepRecord(BaseModel):
     attempts: int = 0
     # Transaction boundary (F-003): HEAD before the step touched the worktree.
     base_sha: str | None = None
+    # Conflict-park discriminator (FR-2.1). CURRENT-STATE, not a latch: the
+    # orchestrator clears it (back to None) on every non-conflict finalization of
+    # the step and re-sets PARKED_REASON_UPSTREAM_CONFLICT only when that
+    # execution halted on an UPSTREAM CONFLICT. A stale value therefore can never
+    # cause a later generic park to be misclassified as a conflict park.
+    parked_reason: str | None = None
+    # Append-only audit trail of human `--response` decisions on this step
+    # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
+    human_responses: list[HumanResponse] = Field(default_factory=list)
     usage: UsageTotals = Field(default_factory=UsageTotals)
     notes: str | None = None
     # foreach binding key, when this record is one iteration of a fan-out step

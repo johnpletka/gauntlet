@@ -341,6 +341,12 @@ class Orchestrator:
             INTERRUPTED: M.INTERRUPTED,
         }[result.status]
         rec.ended = self.clock()
+        # Conflict-park discriminator is CURRENT-STATE, not a latch (FR-2.1):
+        # copy the just-finished execution's parked_reason onto the record. It is
+        # PARKED_REASON_UPSTREAM_CONFLICT only when this run halted on an UPSTREAM
+        # CONFLICT, and None for every other outcome — so a conflict park later
+        # resumed to done/failed/non-conflict-park clears the stale value here.
+        rec.parked_reason = result.parked_reason
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:
