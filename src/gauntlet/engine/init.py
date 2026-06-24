@@ -78,6 +78,8 @@ SKIPPED = "skipped"      # asset already present; left untouched (idempotent)
 WIRED = "wired"          # hook wiring / gitignore guidance added
 PRESENT = "present"      # wiring already in place; nothing to do
 MISSING = "missing"      # --from-repo: a required committed asset is absent
+REFRESHED = "refreshed"  # an unmodified generated file updated to the current template (§4.5)
+WARNED = "warned"        # advisory: a customization that looks stale; left untouched
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,9 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
         shutil.copyfile(src, target)
         result.add(dst_rel, CREATED)
 
+    # The skill resolves its playbook reference under the repo's asset_root, so
+    # install it after the config (which carries asset_root) has been written.
+    _scaffold_skill(repo_root, result, from_repo=from_repo)
     _wire_claude_hook(repo_root, result)
     _wire_codex_hook(repo_root, result, from_repo=from_repo)
     _ensure_gitignore_guidance(repo_root, result)
@@ -192,6 +197,85 @@ def _scaffold_config(
         )
     target.write_text(new_text)
     result.add(dst_rel, CREATED, detection.note)
+
+
+def _resolve_asset_root(repo_root: Path) -> str:
+    """The repo's configured ``asset_root`` (default ``"."``).
+
+    The skill's playbook reference is rendered under this root (FR-1.3). On a
+    fresh ``init`` the scaffolded ``.gauntlet/config.yaml`` already carries the
+    adopter default (``.gauntlet``); Gauntlet's own repo pins ``"."``. An absent
+    or unreadable config falls back to ``"."`` — the engine's own default — so a
+    transient config fault never aborts skill install (the skill gates nothing).
+    """
+    cfg = repo_root / ".gauntlet" / "config.yaml"
+    if cfg.exists():
+        try:
+            from gauntlet.engine.config import RunConfig
+
+            return RunConfig.load(cfg).asset_root
+        except Exception:
+            pass
+    return "."
+
+
+def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
+    """Install the committable ``gauntlet-prd-author`` skill (FR-1.1, §4.5).
+
+    Posture mirrors the judge-hook wiring: create-if-absent, idempotent,
+    never-clobber a customization, fail-closed on malformed pre-existing state.
+    Recognition of a prior-generated file is the version-keyed
+    re-render-and-compare in :mod:`gauntlet.engine.skill` (review F-004), so an
+    *unmodified* generated file may be refreshed to the current template/path
+    (§4.5) while a customization is only ever warned about, never modified.
+    """
+    from gauntlet.engine import skill as S
+
+    rel = S.SKILL_REL
+    target = repo_root / rel
+    # Fail closed on malformed pre-existing state (FR-3.2): a non-regular node at
+    # the skill path must never be silently clobbered, mirroring _wire_claude_hook.
+    if target.exists() and not target.is_file():
+        raise InitError(
+            f"{rel} exists but is not a regular file; refusing to clobber "
+            "unexpected state. Move it aside and re-run `gauntlet init`."
+        )
+
+    if from_repo:
+        # The committed skill is authoritative; never write it (full
+        # present/missing/customized classification is P3).
+        result.add(rel, PRESENT if target.exists() else MISSING)
+        return
+
+    asset_root = _resolve_asset_root(repo_root)
+    rendered = S.render_skill(S.current_template_path().read_text(), asset_root)
+
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered)
+        result.add(rel, CREATED, "PRD-authoring skill (thin pointer)")
+        return
+
+    existing = target.read_text()
+    if S.classify_skill(existing, asset_root) == "generated":
+        # Unmodified generated file: refresh it when the current template or the
+        # resolved playbook path has moved on (§4.5 — the only overwrite init does).
+        if existing != rendered:
+            target.write_text(rendered)
+            result.add(rel, REFRESHED, "updated unmodified generated skill to current template")
+        else:
+            result.add(rel, SKIPPED, "generated skill up to date")
+        return
+
+    # A customization: never overwrite. Warn (only) when it looks stale (§4.5).
+    if S.skill_looks_stale(existing, asset_root):
+        result.add(
+            rel, WARNED,
+            f"customized skill looks stale: playbook ref {S.playbook_ref(asset_root)!r} "
+            "not found; review it (re-run does not modify a customization)",
+        )
+    else:
+        result.add(rel, SKIPPED, "customized; left unchanged")
 
 
 def _hook_entry() -> dict:

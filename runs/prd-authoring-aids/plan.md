@@ -50,7 +50,7 @@ A **per-repo, committable Claude Code skill** placed at `.claude/skills/gauntlet
 - **Unit (`tests/unit/test_init.py`, offline, `fixture_repo`):**
   - Fresh `init` creates the skill file with provenance frontmatter and the correct repo-relative playbook path for the repo's asset_root.
   - Re-run with unchanged template/config reports the skill unchanged (no write).
-  - Re-run after a template-version/asset_root change refreshes a byte-identical generated file and logs the refresh.
+  - Re-run after a template-version change refreshes a byte-identical generated file and logs the refresh.
   - A pre-existing **customized** `SKILL.md` (provenance stripped or content altered) is left byte-for-byte intact.
   - Malformed pre-existing state at `.claude/skills/gauntlet-prd-author/` (e.g. a non-regular file) raises `InitError`.
   - **FR-1.3a duplication test:** compute the longest shared normalized word-run between the installed `SKILL.md` and `prd-author.md`, excluding exempt tokens (headings, command names, paths, the literal conventions sentence); assert `< 12`.

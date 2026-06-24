@@ -71,3 +71,18 @@ so a partial fix accepted at a gate is tracked, not forgotten.
   stale-branch guard shipped in 0.2.0 already closes the worktree-clobber bug
   class, so isolation is defense-in-depth rather than a fix. See
   [proposals/run-branch-lifecycle.md](proposals/run-branch-lifecycle.md) §5.
+
+## From prd-authoring-aids run (P1) — deferred 2026-06-24
+
+- **Upstream-conflict decision mechanism — SHIPPED 2026-06-24 (PR #31).** This
+  P1 park surfaced the gap: when a builder halts with an `UPSTREAM CONFLICT`
+  (FR-10.4), there was no formalized way to signal the human's decision to
+  `gauntlet resume` — the only workaround was manually editing the artifact and
+  re-running (which the builder re-surfaced unchanged). It was specced and built
+  as its own run (`runs/gauntlet-resume-response/`) and merged via PR #31:
+  `gauntlet resume <slug> --response "<decision>"` records the response
+  (timestamped, audited, `pending`→`consumed`) in the manifest and injects it
+  into the builder's prompt so it re-evaluates rather than re-surfaces. This
+  prd-authoring-aids run was the first real consumer of that mechanism. No
+  follow-up remains; entry kept as the provenance trail for why the feature
+  exists.

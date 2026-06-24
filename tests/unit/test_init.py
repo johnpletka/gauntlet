@@ -13,13 +13,16 @@ from pathlib import Path
 
 import pytest
 
+from gauntlet.engine import skill as S
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.init import (
     CREATED,
     MISSING,
     PRESENT,
+    REFRESHED,
     SCAFFOLD_DIR,
     SKIPPED,
+    WARNED,
     WIRED,
     InitError,
     init_repo,
@@ -264,3 +267,97 @@ def test_shipped_scaffold_matches_repo_canonical_assets():
         checks[prompt] = REPO / "prompts" / prompt.name
     for bundled, canonical in checks.items():
         assert bundled.read_bytes() == canonical.read_bytes(), f"drift: {bundled.name}"
+
+
+# ---- PRD-authoring skill install (P1: FR-1.1, FR-1.3, FR-3.2, §4.5) ---------
+
+def test_init_creates_skill_with_provenance_and_adopter_playbook_path(tmp_path):
+    result = init_repo(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    assert skill_file.exists()
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == CREATED
+    text = skill_file.read_text()
+    # A fresh adopter init scaffolds asset_root .gauntlet, so the skill points at
+    # the adopter-relative playbook path — repo-relative, never absolute (FR-1.3).
+    assert "`.gauntlet/prompts/prd-author.md`" in text
+    assert S.PLAYBOOK_PLACEHOLDER not in text
+    assert S.validate_skill_frontmatter(text) == []
+    assert S.classify_skill(text, ".gauntlet") == "generated"
+
+
+def test_init_skill_install_is_idempotent(tmp_path):
+    init_repo(tmp_path)
+    before = (tmp_path / S.SKILL_REL).read_text()
+    result = init_repo(tmp_path)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == SKIPPED
+    assert (tmp_path / S.SKILL_REL).read_text() == before
+
+
+def test_init_does_not_clobber_customized_skill(tmp_path):
+    init_repo(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    custom = skill_file.read_text() + "\n<!-- hand-tuned by the maintainer -->\n"
+    skill_file.write_text(custom)
+    result = init_repo(tmp_path)
+    assert skill_file.read_text() == custom  # byte-for-byte intact
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] in (SKIPPED, WARNED)
+
+
+def test_init_refreshes_unmodified_generated_skill(tmp_path, monkeypatch):
+    # §4.5: an unmodified generated file is refreshed when the current template
+    # moves on (a version bump), and never otherwise. Simulate a v2 template while
+    # resolving the installed file's v1 to its original template so it is still
+    # recognized as generated (not a customization).
+    init_repo(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    original_tmpl = S.current_template_path().read_text()
+
+    new_tmpl = tmp_path / "new_template.md"
+    new_tmpl.write_text(original_tmpl + "\n<!-- template v2 line -->\n")
+    orig_tmpl = tmp_path / "orig_template.md"
+    orig_tmpl.write_text(original_tmpl)
+    monkeypatch.setattr(S, "current_template_path", lambda: new_tmpl)
+    monkeypatch.setattr(S, "version_template_path", lambda v: orig_tmpl if v == 1 else None)
+
+    result = init_repo(tmp_path)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == REFRESHED
+    assert "template v2 line" in skill_file.read_text()
+
+
+def test_init_warns_on_stale_provenance_bearing_skill(tmp_path, monkeypatch):
+    # A generated skill whose asset_root later changed no longer matches the
+    # re-render (fail safe → customization), but it carries provenance and a
+    # drifted playbook path → init WARNS (naming the drift) and never modifies it.
+    init_repo(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    before = skill_file.read_text()  # references .gauntlet/prompts/prd-author.md
+    # Flip the repo's asset_root to "." so the rendered ref would now differ.
+    cfg = tmp_path / ".gauntlet/config.yaml"
+    cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
+    result = init_repo(tmp_path)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == WARNED
+    assert skill_file.read_text() == before  # never modified
+
+
+def test_init_fails_closed_on_malformed_skill_state(tmp_path):
+    # FR-3.2: a non-regular node where the skill file belongs is malformed
+    # pre-existing state — refuse rather than clobber, mirroring the settings guard.
+    skill_path = tmp_path / S.SKILL_REL
+    skill_path.mkdir(parents=True)  # a directory where the SKILL.md should be
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+
+
+def test_from_repo_reports_skill_present_or_missing(tmp_path):
+    # --from-repo never writes the skill; it reports present/missing (full
+    # customized classification is P3).
+    missing = init_repo(tmp_path, from_repo=True)
+    assert {a.path: a.action for a in missing.actions}[S.SKILL_REL] == MISSING
+    init_repo(tmp_path)  # now scaffold it
+    present = init_repo(tmp_path, from_repo=True)
+    assert {a.path: a.action for a in present.actions}[S.SKILL_REL] == PRESENT

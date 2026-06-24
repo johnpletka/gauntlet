@@ -736,7 +736,6 @@ process, and what it suggests for Gauntlet's design.
     version/commit against the working-tree `HEAD` and WARNs on drift, since "the
     code is fixed but the running engine isn't" is an invisible failure mode that
     has now bitten provenance twice.
-
 ## 2026-06-24 — resume-response feature, first live use (FR-10 schema bug)
 
 46. **The resume-disposition schema (FR-10) used a top-level `allOf` the
@@ -768,3 +767,97 @@ process, and what it suggests for Gauntlet's design.
     the structural regression test is the cheap proxy. A general invariant worth
     adding: no adapter-facing structured-output schema should use a top-level
     combinator (only resume-disposition did; the others are already clean).
+## 2026-06-23 — PRD-authoring aids, P1 (`gauntlet-prd-author` skill)
+
+47. **FR-1.6 recorded natural-language trigger test — methodology fixed, live
+    run PENDING human execution.** The PRD's riskiest external dependency (§1.3)
+    is that a per-repo committable Claude Code skill at
+    `.claude/skills/gauntlet-prd-author/SKILL.md` is *discovered and actually
+    triggered* from NL PRD intent on the pinned version — not merely enumerated.
+    The reproducible check is `tests/integration/test_skill_trigger.py`
+    (`@pytest.mark.integration`, additionally gated behind
+    `GAUNTLET_RUN_SKILL_TRIGGER=1` so a live, cost-bearing, non-deterministic
+    model session never fires implicitly). Recorded specification:
+    - **Pinned Claude Code version:** the version in `.gauntlet/pins.yaml`
+      (`claude` 2.1.177 at this revision; re-record on a bump).
+    - **Prompt(s):** at minimum `"help me write a PRD"`.
+    - **Expected observation:** the `gauntlet-prd-author` skill is *selected /
+      invoked* — a `Skill` tool-use naming it appears in the `stream-json` event
+      stream. Enumeration / metadata inspection alone does NOT satisfy FR-1.6
+      (that is the offline unit coverage in `tests/unit/test_skill.py`).
+    - **Failure criterion:** the skill is not selected for any trigger prompt.
+    - **How to run / record:**
+      `GAUNTLET_RUN_SKILL_TRIGGER=1 uv run pytest -m integration
+      tests/integration/test_skill_trigger.py -s`, then record version, prompt,
+      observed selection, and pass/fail here.
+    - **Result: PENDING.** The build session's tool sandbox denies external
+      `claude` invocation, so neither this trigger test nor the wider
+      integration suite could be executed from the builder session (a
+      stop-and-ask per plan review F-007 — recorded, never silently skipped).
+      Per the plan, a *failed* trigger is an UPSTREAM CONFLICT that blocks
+      P2/P3; a passing trigger is required for P1 to truly complete. The temp
+      repo the test builds wires ONLY the skill (no judge PreToolUse hook) so
+      the nested session is not gated by an absent judge.
+
+48. **OQ-2 normative SKILL.md frontmatter schema — produced, awaiting human
+    ratification (explicit P1 gate).** `schemas/skill-frontmatter.json` (mirrored
+    byte-for-byte by `SKILL_FRONTMATTER_SCHEMA` in `engine/skill.py`, drift-guarded
+    in the unit suite) pins the required field set: `name` (kebab), `description`
+    (carries the FR-1.2 trigger phrases), `x-gauntlet-generated: true`,
+    `x-gauntlet-template-version: <int>`; extra keys permitted (the skill gates
+    nothing, FR-1.5 is warn-only). The exact required fields/limits are empirical
+    on the pinned Claude Code version, so per §8/OQ-2 P1 HALTS for human
+    ratification of this schema before P2/P3 depend on it.
+
+## 2026-06-24 — PRD-authoring aids, P1 human-gate resolution (operator)
+
+49. **All three P1 gates resolved by the operator; run resumed via
+    `gauntlet resume --response` (the resume-response mechanism, PR #31).** The
+    `implement` step parked on 2026-06-24 with an `UPSTREAM CONFLICT` over note
+    47/48's open gates plus an `asset_root`-refresh contradiction. Resolution,
+    recorded as the FR-1.6/§8 evidence the build session could not produce:
+    - **(a) asset_root contradiction → plan amended, not implementation.** The P1
+      test-strategy bullet's "template-version/**asset_root** change refreshes a
+      byte-identical generated file" clause contradicted F-004's never-clobber
+      algorithm (an `asset_root` change is a *customization* → WARN, never
+      refreshed). The bullet was amended (the `asset_root` clause removed) so it
+      matches the implemented behavior: **template-version bump → REFRESH;
+      asset_root change → WARN**. The human ratified option 1 (the builder's
+      recommendation); the implementation was not changed. *Process note:* the
+      plan edit was made in-tree on this run's branch rather than via a separate
+      gated PR; the human ratified it and it lands through this branch's PR (the
+      audit boundary), with the ratifying decision linked in the P1 commit's
+      `--response` trailer.
+    - **(b) FR-1.6 live trigger → PASS.** Run by the operator session (the build
+      sandbox denied external `claude`, hence note 47's PENDING). Observed:
+      genuine `Skill` tool-use `{"skill": "gauntlet-prd-author"}` in the
+      `stream-json` event stream for prompt `"help me write a PRD"` (selection,
+      not enumeration — the subsequent Read of `SKILL.md` is the skill *running*).
+      Exit 0, ~$0.034, `--model haiku`. **Version drift:** run on `claude`
+      **2.1.190**, not the pinned **2.1.177** (local auto-update). The trigger is
+      re-verified on 2.1.190; the full contract-suite re-pin (per the 2026-06-14
+      precedent) is a deferred follow-up — `.gauntlet/pins.yaml` is left unchanged
+      rather than claiming a contract re-verification that was not run (fail
+      closed). *Test-hardening note:* `_skill_selected` matches `SKILL_NAME` in
+      any tool_use name **or** serialized input, so a `Read`/`Glob` of the skill
+      file path alone would also pass; tighten it to require `name == "Skill"`.
+      Not blocking here — a genuine `Skill` invocation was confirmed.
+    - **(c) OQ-2 frontmatter schema → ratified as-is** by the human operator:
+      required `name` (kebab) / `description` / `x-gauntlet-generated: true` /
+      `x-gauntlet-template-version` (int ≥ 1), `additionalProperties: true`.
+      P2/P3 may now depend on `schemas/skill-frontmatter.json`.
+
+50. **This run was the resume-response feature's first live consumer and hit the
+    FR-10 schema bug recorded in note 46.** The first `gauntlet resume
+    prd-authoring-aids --response "..."` recorded the response correctly
+    (`implement-resp-1`, `pending`→`consumed`, operator identity
+    `john.pletka@gmail.com`, `human-response.md` rebuilt and injected as an input
+    artifact — the mechanism's plumbing is sound), but the builder's claude
+    invocation died in 306 ms on the top-level-`allOf` API rejection (note 46).
+    The agent_task failed (a genuine failure, not a conflict park), so
+    `implement.attempts` went 2→3 and the run went `failed`; the response stayed
+    `consumed` and the P1 WIP intact. Fixed via PR #32 (note 46), merged to main
+    and into this branch; the engine was reinstalled and the run recovered
+    `failed`→`parked` with the audit trail preserved (implement-resp-1 and the
+    attempts history kept), then re-resumed with a fresh response so the builder
+    re-evaluates against the fixed schema.
