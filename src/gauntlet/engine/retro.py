@@ -208,14 +208,16 @@ def _common_summary(ctx: StepContext) -> str:
 
 
 def _test_failure_loops(man: Any) -> dict[str, int]:
-    """Per-shell-step failed-attempt count (FR-6.6 input): attempts beyond the
-    first that produced a pass. A tests step that failed twice then passed ran
-    three times → 2 loops."""
+    """Per-shell-step failure count (FR-6.6 input). `attempts` IS the failure
+    counter now (FR-6): a tests step that failed twice then passed has
+    attempts == 2 → 2 failed loops, and a single fail-then-pass has
+    attempts == 1 → 1 loop. (The old `attempts - 1` undercounted by one and
+    omitted single-failure runs entirely — review F-004.)"""
     loops: dict[str, int] = {}
     for rec in man.steps:
-        if rec.type == "shell" and rec.attempts > 1:
+        if rec.type == "shell" and rec.attempts > 0:
             leaf = rec.id if rec.iteration is None else f"{rec.id}.{rec.iteration}"
-            loops[leaf] = rec.attempts - 1
+            loops[leaf] = rec.attempts
     return loops
 
 

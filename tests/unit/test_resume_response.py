@@ -21,6 +21,7 @@ from gauntlet.adapters.base import AdapterCapabilities, AdapterError, AgentResul
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.identity import GAUNTLET_USER_EMAIL
 from gauntlet.engine.manifest import HumanResponse, Manifest
+from gauntlet.engine.orchestrator import ENGINE_IDENTITY
 from gauntlet.engine.run import RunManager
 
 from conftest import git
@@ -55,6 +56,19 @@ stages:
     steps:
       - {id: implement, type: agent_task, agent: builder, prompt_text: go,
          halt_on: "UPSTREAM CONFLICT"}
+"""
+
+# An always-failing shell step that retries itself, for the persisted-retry-budget
+# tests (FR-6 / review F-003). `run` exits non-zero every time; on_fail reroutes
+# back to the same step with a budget of 2 retries (so the 3rd failure exhausts).
+PIPELINE_RETRY = """
+name: respond
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: tests, type: shell, run: "exit 7",
+         on_fail: {route_to: tests, max_retries: 2}}
 """
 
 CONFLICT_TEXT = "UPSTREAM CONFLICT\nPhase: P1\nplan says X; impl reveals Y\n"
@@ -404,6 +418,72 @@ def test_genuine_response_failure_increments_attempts_once(tmp_path):
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
 
 
+def test_retry_budget_uses_persisted_attempts(tmp_path):
+    # FR-6 / review F-003: the retry budget is the PERSISTED `StepRecord.attempts`,
+    # not an invocation-local tally. A single drive of an always-failing step with
+    # max_retries=2 exhausts on the N+1-th (3rd) genuine failure.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_RETRY)
+    status = mgr.start(
+        "demo", repo / "pipelines" / "respond.yaml",
+        use_judge=False, adapter_factory=lambda n: ScriptedAdapter("proceed"),
+        clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("tests")
+    assert rec.attempts == 3  # 1 initial + 2 retries = 3 failures, then exhausted
+
+
+def test_retry_budget_does_not_reset_across_resume(tmp_path):
+    # FR-6 / review F-003: a resume must NOT hand the step a fresh budget. With an
+    # invocation-local counter (the bug) a resumed exhausted step would retry 2
+    # more times; with the persisted counter it fails again immediately.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_RETRY)
+    mgr.start(
+        "demo", repo / "pipelines" / "respond.yaml",
+        use_judge=False, adapter_factory=lambda n: ScriptedAdapter("proceed"),
+        clock=_clock(),
+    )
+    assert mgr.status("demo").record("tests").attempts == 3
+
+    # Resume the failed run: the exhausted budget stays exhausted, so the step
+    # fails exactly ONE more time (no fresh reroutes) — attempts advances by 1,
+    # not by another full budget of 3.
+    status = mgr.resume(
+        "demo", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    assert mgr.status("demo").record("tests").attempts == 4
+
+
+def test_consumed_failure_is_not_reexecuted_on_resume(tmp_path):
+    # FR-7.1 / review F-002: a step persisted as FAILED with its --response
+    # already CONSUMED is a terminal, reconciled outcome. A later (response-less)
+    # resume must reconcile bookkeeping only — never re-invoke the adapter or
+    # advance the failure counter a second time.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    # Genuinely fail the responded re-run: persists implement FAILED, attempts 1,
+    # response consumed, run FAILED.
+    status = mgr.resume(
+        "demo", response="proceed please", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("fail"), clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+
+    # A plain resume over that terminal failure must not re-run the agent.
+    adapter = ScriptedAdapter("proceed")  # would WRITE + succeed if re-executed
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED  # still failed; not silently driven to done
+    assert adapter.prompts == []  # adapter never invoked
+    rec = mgr.status("demo").record("implement")
+    assert rec.attempts == 1  # exactly one failure, not double-counted
+    assert len(rec.human_responses) == 1
+    assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+
+
 # --- FR-7.1: idempotent crash recovery --------------------------------------
 def _seed_pending(mgr: RunManager, text: str = "the human decision") -> str:
     """Simulate a crash AFTER the atomic pending append but BEFORE its checkpoint
@@ -556,6 +636,64 @@ def test_recovery_dirty_base_reset_relaunches_pending(tmp_path):
     assert rec.attempts == 0
     assert not (repo / "partial.py").exists()  # partial work discarded
     assert len(adapter.prompts) == 1  # one logical re-execution
+
+
+def test_recovery_dirty_base_reset_preserves_response_checkpoints(tmp_path):
+    # FR-2.2/FR-7.1 / review F-001: a real pending checkpoint commit precedes a
+    # dirty-base crash. Recovery under reset_to_base rewinds the worktree to the
+    # implementation baseline (base_sha), which sits BEHIND that engine
+    # bookkeeping commit — so the reset must not leave the pending (or the later
+    # consumed) checkpoint unreachable. Both must remain ancestors of HEAD.
+    repo, mgr = _build_repo(
+        tmp_path / "repo", PIPELINE_SOLO,
+        config=CONFIG + "interrupted_step: reset_to_base\n",
+    )
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+
+    # Seed the realistic sequence a crash leaves: base_sha is the pre-agent
+    # baseline (HEAD before the pending checkpoint), the manifest carries a real
+    # *committed* pending checkpoint on top of it, the record is RUNNING, and the
+    # worktree is dirty mid-edit.
+    run_dir = _run_dir(mgr)
+    man = Manifest.load(run_dir / "manifest.json")
+    rec = man.record("implement")
+    rec.base_sha = gitops.head_sha(repo)  # implementation baseline, pre-checkpoint
+    rec.status = M.RUNNING
+    rec.human_responses.append(HumanResponse(
+        response_id="implement-resp-1", response_text="Ratify option 1.",
+        timestamp="2026-06-24T00:00:00+00:00", user="fixture@gauntlet.local",
+        response_attempt=1, state=M.RESPONSE_PENDING,
+    ))
+    man.write_atomic(run_dir / "manifest.json")
+    # A real pending checkpoint commit on top of base_sha (the state a crash
+    # AFTER the pending flush but mid-edit would have on disk).
+    run_rel = run_dir.resolve().relative_to(repo.resolve()).as_posix()
+    gitops.commit_run_bookkeeping(
+        repo, "gauntlet: response implement-resp-1 pending",
+        [f"{run_rel}/manifest.json"], identity=ENGINE_IDENTITY,
+    )
+    pending_sha = gitops.head_sha(repo)
+    assert pending_sha != rec.base_sha  # the checkpoint really advanced HEAD
+    (repo / "partial.py").write_text("half-written before the kill")  # dirty base
+
+    adapter = ScriptedAdapter("proceed")
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    rec = mgr.status("demo").record("implement")
+    assert len(rec.human_responses) == 1
+    assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+    assert rec.attempts == 0
+    assert not (repo / "partial.py").exists()  # partial work discarded
+    assert len(adapter.prompts) == 1  # one logical re-execution
+
+    # Both checkpoints are reachable from HEAD, in order — the reset did not drop
+    # the pending checkpoint that base_sha sits behind (F-001).
+    assert _checkpoint_log(repo) == [
+        "Gauntlet Engine|gauntlet: response implement-resp-1 pending",
+        "Gauntlet Engine|gauntlet: response implement-resp-1 consumed",
+    ]
 
 
 def test_recovery_dirty_base_park_keeps_pending(tmp_path):

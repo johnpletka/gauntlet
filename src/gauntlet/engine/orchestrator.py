@@ -186,7 +186,6 @@ class Orchestrator:
 
     def _run_steps(self, stage: Stage, *, iteration: str | None, item: Any) -> str:
         index = {step.id: i for i, step in enumerate(stage.steps)}
-        retries: dict[str, int] = {}
         ptr = 0
         while ptr < len(stage.steps):
             step = stage.steps[ptr]
@@ -194,6 +193,14 @@ class Orchestrator:
             if rec is not None and rec.status in (M.DONE, M.SKIPPED):
                 ptr += 1
                 continue
+            # A consumed-response terminal FAILURE is reconciled bookkeeping-only,
+            # never re-executed (FR-7.1, review F-002): the human's --response was
+            # processed and the step genuinely failed, persisted as FAILED with the
+            # response already CONSUMED (and its checkpoint flushed at drive start).
+            # Re-running it would re-invoke the adapter and double-count the failure
+            # on every later resume; surface the failure instead.
+            if self._is_consumed_terminal_failure(rec):
+                return FAILED
             if not eval_when(step.when, self._context(item, iteration)):
                 self._mark_skipped(step.id, iteration)
                 self._persist()
@@ -208,13 +215,34 @@ class Orchestrator:
                 ptr += 1
                 continue
             if status == FAILED and step.on_fail is not None:
-                if retries.get(step.id, 0) < step.on_fail.max_retries:
-                    retries[step.id] = retries.get(step.id, 0) + 1
+                # FR-6 / review F-003: route on the PERSISTED failure counter
+                # (`StepRecord.attempts`, advanced in `_finalize` on this failure),
+                # NOT an invocation-local tally. That makes the retry budget
+                # survive crashes and span separate resume invocations — a budget
+                # that reset each process restart could retry unboundedly. Exhaust
+                # when attempts exceeds max_retries (the N+1-th genuine failure).
+                rec = self.manifest.record(step.id, iteration)
+                if rec is not None and rec.attempts <= step.on_fail.max_retries:
                     self._reset_for_retry(stage, step.on_fail.route_to, iteration)
                     ptr = index[step.on_fail.route_to]
                     continue
             return status  # FAILED, PARKED, HALTED, or INTERRUPTED
         return DONE
+
+    @staticmethod
+    def _is_consumed_terminal_failure(rec: StepRecord | None) -> bool:
+        """True for a FAILED record whose latest `--response` is already consumed.
+
+        Such a record is a terminal, already-reconciled outcome (FR-7.1): a prior
+        invocation launched the response, it failed, and the finalize flipped the
+        entry to ``consumed`` and counted the one failure. It must never re-run.
+        """
+        return (
+            rec is not None
+            and rec.status == M.FAILED
+            and bool(rec.human_responses)
+            and rec.human_responses[-1].state == M.RESPONSE_CONSUMED
+        )
 
     def _run_step_foreach(self, step: Step) -> str:
         items = resolve_list(step.foreach, self._context())
@@ -345,7 +373,18 @@ class Orchestrator:
             # the authored prd.md, or prior declared artifacts — the re-run
             # regenerates its own outputs over them.
             gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
-            return None  # tree restored to base; re-run cleanly
+            # F-001: base_sha predates the engine bookkeeping commits stacked on
+            # top of it — notably the pending-response checkpoint (FR-2.2/FR-7.1),
+            # whose state MUST stay reachable in git history. The reset above just
+            # rewound HEAD past them. They carry no implementation diff (only
+            # manifest.json + RUN.md), so the implementation baseline is unchanged;
+            # re-flush the current manifest as a checkpoint to restore them. The
+            # reset reverted the on-disk manifest to base_sha, so persist the
+            # authoritative in-memory state first, then commit it (still `pending`
+            # here — the re-run consumes it and lands the `consumed` checkpoint).
+            self._persist()
+            self._reconcile_response_checkpoint()
+            return None  # tree restored to base; checkpoints preserved; re-run cleanly
         return StepResult(
             status=INTERRUPTED,
             notes=(

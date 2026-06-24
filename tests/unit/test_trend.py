@@ -37,8 +37,12 @@ def _manifest() -> Manifest:
             "confirm_counts": {"resolved": 2, "unresolved": 1},
         },
     ))
-    # A tests shell step that failed twice before passing (3 runs → 2 loops).
-    man.steps.append(StepRecord(id="tests", type="shell", attempts=3, iteration="0"))
+    # `attempts` IS the failure count (FR-6): a tests step that failed twice
+    # then passed has attempts == 2 → 2 loops (review F-004).
+    man.steps.append(StepRecord(id="tests", type="shell", attempts=2, iteration="0"))
+    # A single fail-then-pass (attempts == 1) → 1 loop. The old `attempts - 1`
+    # math dropped this case entirely (review F-004); it must count now.
+    man.steps.append(StepRecord(id="tests", type="shell", attempts=1, iteration="1"))
     man.commits.append(CommitRecord(step_id="phase-commit", phase="P1", sha="a" * 40))
     man.commits.append(CommitRecord(step_id="impl-cycle", phase="P1.1", sha="b" * 40))
     man.totals = UsageTotals(input_tokens=1000, output_tokens=200, cost_usd=2.0)
@@ -55,7 +59,9 @@ def test_trend_math_from_fixture_manifest():
     # 2 of 3 ACCEPTED fixes survived the confirm pass (declined findings'
     # expected `unresolved` verdicts are excluded from the denominator — F-004)
     assert t.fix_survival == pytest.approx(2 / 3 * 100)
-    assert t.test_failure_loops == 2
+    # 2 (failed-twice) + 1 (single fail-then-pass) loops — the single-failure
+    # step is no longer dropped (review F-004).
+    assert t.test_failure_loops == 3
     # one numbered phase (P1); P1.1 collapses to P1
     assert t.phases == 1
     assert t.cost_per_phase == pytest.approx(2.0)
