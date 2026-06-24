@@ -104,6 +104,28 @@ def test_missing_git_binary_fails_closed(monkeypatch, tmp_path: Path) -> None:
         resolve_operator_identity(tmp_path)
 
 
+def test_hung_git_config_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    """A git config lookup that exceeds the timeout fails closed (CLAUDE.md §2).
+
+    A hung git (pathological config include, stalled filesystem) must surface as
+    an unresolved lookup raising the exact ``OperatorIdentityError`` rather than
+    blocking the FR-2 append forever.
+    """
+    monkeypatch.delenv(GAUNTLET_USER_EMAIL, raising=False)
+
+    def _hang(*args, **kwargs):
+        assert kwargs.get("timeout") is not None  # the call must be bounded
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", _hang)
+    with pytest.raises(OperatorIdentityError) as exc:
+        resolve_operator_identity(tmp_path)
+    assert str(exc.value) == (
+        "cannot resolve operator identity for the audit trail: set "
+        "`GAUNTLET_USER_EMAIL` or `git config user.email`"
+    )
+
+
 def test_malformed_but_nonblank_value_recorded_verbatim(monkeypatch, tmp_path: Path) -> None:
     """v1 enforces non-empty only — a non-RFC-5322 value is returned verbatim."""
     monkeypatch.setenv(GAUNTLET_USER_EMAIL, "  not-an-email  ")

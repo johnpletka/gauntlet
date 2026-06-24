@@ -23,6 +23,12 @@ from typing import Mapping
 #: Env var that overrides ``git config user.email`` for the audit field.
 GAUNTLET_USER_EMAIL = "GAUNTLET_USER_EMAIL"
 
+#: Wall-clock bound (seconds) on the ``git config`` lookup. A local config read
+#: is sub-millisecond; this only guards a hung git (pathological config include,
+#: stalled filesystem) so the lookup fails closed (CLAUDE.md §2) instead of
+#: blocking forever before the FR-2 append.
+_GIT_CONFIG_TIMEOUT_S = 15.0
+
 #: Verbatim FR-9 fail-closed message (asserted by tests; do not paraphrase).
 _UNRESOLVED_MESSAGE = (
     "cannot resolve operator identity for the audit trail: set "
@@ -39,16 +45,18 @@ def _git_config_email(repo: Path) -> str | None:
     """``git config user.email`` for ``repo``, trimmed, or ``None``.
 
     Returns ``None`` — not a blank string — when git config is missing, the
-    invocation exits non-zero, or the git binary is unavailable (``OSError``),
-    so the caller cannot mistake a failed lookup for an empty-but-present value.
+    invocation exits non-zero, the git binary is unavailable (``OSError``), or
+    the lookup exceeds ``_GIT_CONFIG_TIMEOUT_S`` (``TimeoutExpired``), so the
+    caller cannot mistake a failed or hung lookup for an empty-but-present value.
     """
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), "config", "user.email"],
             capture_output=True,
             text=True,
+            timeout=_GIT_CONFIG_TIMEOUT_S,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
