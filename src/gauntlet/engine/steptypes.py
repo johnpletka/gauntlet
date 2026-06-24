@@ -500,6 +500,15 @@ def _resume_disposition_result(
             f"resume disposition missing or unrecognized ({disposition!r}); "
             "failing closed rather than advancing on an unparseable resume (FR-10)",
         )
+    # FR-10 (BOOTSTRAP-NOTES #46): the conflict object-vs-null discriminator used
+    # to be a top-level `allOf` in the schema, but the Anthropic API rejects a
+    # top-level oneOf/allOf/anyOf in a structured-output input_schema, so the rule
+    # moved engine-side. A re-park must carry a conflict object; a proceed must
+    # carry a null conflict — fail closed on a mismatch the bound schema no longer
+    # catches (the schema only constrains conflict to object-or-null).
+    conflict_error = _conflict_shape_error(disposition, outcome[0], structured)
+    if conflict_error is not None:
+        return _resume_failure(result, usage_by_agent, conflict_error)
     # FR-1/FR-5/FR-10 (review F-001): the disposition must be a function of the
     # response it consumed. A result that omits the pending response, or names an
     # unknown/duplicate response_id, is response-unaware — fail closed rather than
@@ -566,6 +575,33 @@ def _validate_responses_considered(structured, human_responses) -> str | None:
             return f"responses_considered names unknown response id {rid!r}"
     if pending_id not in seen:
         return f"responses_considered omits the consumed response {pending_id!r}"
+    return None
+
+
+def _conflict_shape_error(disposition, status, structured) -> str | None:
+    """Enforce the conflict object-vs-null discriminator (FR-10); None if valid.
+
+    Re-park dispositions (amendment_required/new_conflict, ``status == PARKED``)
+    must carry a non-null ``conflict`` object; proceed dispositions must carry a
+    null/absent ``conflict``. This was a top-level ``allOf``/``if``/``then``/
+    ``else`` in the schema until it had to move engine-side: the Anthropic API
+    forbids a top-level ``oneOf``/``allOf``/``anyOf`` in the structured-output
+    ``input_schema`` (BOOTSTRAP-NOTES #46). The bound schema still constrains
+    ``conflict`` to object-or-null, so only the per-disposition rule is checked
+    here, fail closed (CLAUDE.md §2).
+    """
+    conflict = structured.get("conflict") if isinstance(structured, dict) else None
+    if status == PARKED:
+        if not isinstance(conflict, dict):
+            return (
+                f"{disposition} disposition carries no conflict object "
+                "(required when re-parking); failing closed (FR-10)"
+            )
+    elif conflict is not None:
+        return (
+            f"{disposition} disposition carries a non-null conflict "
+            "(must be null when proceeding); failing closed (FR-10)"
+        )
     return None
 
 

@@ -736,3 +736,35 @@ process, and what it suggests for Gauntlet's design.
     version/commit against the working-tree `HEAD` and WARNs on drift, since "the
     code is fixed but the running engine isn't" is an invisible failure mode that
     has now bitten provenance twice.
+
+## 2026-06-24 — resume-response feature, first live use (FR-10 schema bug)
+
+46. **The resume-disposition schema (FR-10) used a top-level `allOf` the
+    Anthropic API rejects as structured output; the feature's fixture-only tests
+    never caught it.** The first real `gauntlet resume --response` (the
+    prd-authoring-aids dogfood) failed in 306 ms: `API Error: 400
+    tools.N.custom.input_schema: input_schema does not support oneOf, allOf, or
+    anyOf at the top level`. On a `--response` resume the builder is handed
+    `schemas/resume-disposition.json` as **native structured output**; that schema
+    encoded the `conflict`-object-vs-null discriminator with a top-level
+    `allOf`/`if`/`then`/`else`, which the Anthropic API forbids in a tool
+    `input_schema`. The author had hardened the schema for *codex* strict-mode
+    (required-but-nullable fields) but the *Anthropic* top-level-combinator rule
+    is a distinct constraint. *Why the tests missed it:* per FR-10's own testing
+    protocol, P2 and the e2e drive the builder through a **deterministic adapter
+    fixture** returning canned dispositions — the live structured-output path that
+    registers the schema with the API was never exercised. The fixture bought
+    determinism at the cost of never validating the schema is API-acceptable.
+    *Fix:* removed the top-level `allOf` from the schema (and its scaffold copy,
+    kept byte-identical for the init drift guard); moved the object-vs-null rule
+    into the engine (`steptypes._conflict_shape_error`, called from
+    `_resume_disposition_result`), fail-closed like the two other semantic rules
+    already enforced there (responses_considered must name the consumed response;
+    amendment_required must name an artifact). *Coverage added:* a regression test
+    asserting both schema copies carry no top-level `oneOf`/`anyOf`/`allOf`, plus
+    engine tests that a proceed-with-conflict-object and a re-park-with-null-
+    conflict each fail closed. *Residual gap:* there is still no LIVE contract
+    test that round-trips this schema through a real adapter (would need creds);
+    the structural regression test is the cheap proxy. A general invariant worth
+    adding: no adapter-facing structured-output schema should use a top-level
+    combinator (only resume-disposition did; the others are already clean).
