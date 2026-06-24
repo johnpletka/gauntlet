@@ -175,6 +175,51 @@ stages:
     assert orch.manifest.record("commit").usage.cached_input_tokens == 40
 
 
+def test_commit_authored_by_builder_not_message_agent(fixture_repo):
+    # F-003: the message_agent (triage) drafts only the message TEXT; the commit
+    # must be AUTHORED by the builder (the implementer), or implementation work
+    # is mislabelled as triage-authored, breaking provenance (FR-9.7).
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = RecordingDrafter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    from gauntlet.engine import gitops
+
+    author = gitops._run(fixture_repo, "log", "-1", "--format=%an <%ae>", "HEAD").strip()
+    assert author == "Gauntlet builder <builder@gauntlet.local>"
+    assert "triage" not in author
+
+
+def test_commit_explicit_agent_overrides_author(fixture_repo):
+    # An explicit `agent:` on the commit step still wins as the author identity.
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = RecordingDrafter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, agent: reviewer, message_agent: triage}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    from gauntlet.engine import gitops
+
+    author = gitops._run(fixture_repo, "log", "-1", "--format=%ae", "HEAD").strip()
+    assert author == "reviewer@gauntlet.local"
+
+
 def test_commit_bad_literal_message_fails(fixture_repo):
     (fixture_repo / "work.py").write_text("code\n")
     text = """
@@ -280,6 +325,18 @@ def test_marker_signalled_ignores_inline_prose(text):
     assert not _marker_signalled("UPSTREAM CONFLICT", text)
 
 
+@pytest.mark.parametrize("text", [
+    # review F-002: the marker must OWN the line. A line-leading token that
+    # extends into another word or sentence is NOT the canonical signal.
+    "UPSTREAM CONFLICTS: none",          # plural — not the marker
+    "UPSTREAM CONFLICT resolved",        # trailing word continues the sentence
+    "## UPSTREAM CONFLICT has been resolved",  # decorated, but still trailing prose
+    "- UPSTREAM CONFLICTING changes detected",
+])
+def test_marker_signalled_rejects_line_leading_boundary_violations(text):
+    assert not _marker_signalled("UPSTREAM CONFLICT", text)
+
+
 def test_marker_signalled_empty_marker_is_false():
     assert not _marker_signalled("", "anything at all")
 
@@ -316,3 +373,54 @@ def test_halt_marker_as_block_parks_without_writing_output(fixture_repo):
                  adapters={"builder": FakeAdapter(text=conflict)})
     assert orch.drive() == M.RUN_PARKED
     assert not (fixture_repo / "runs" / "demo" / "plan.md").exists()
+
+
+# --- phase_lint: deterministic plan-gate structural check --------------------
+_PHASE_LINT_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-lint, type: phase_lint, artifact: plan.md}
+"""
+
+_VALID_PLAN = (
+    "# Plan\n\n```gauntlet-phases\n"
+    "- id: P1\n  title: Build it\n  goal: Implement the widget end-to-end.\n"
+    "```\n"
+)
+
+
+def test_phase_lint_passes_a_valid_block(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text(_VALID_PLAN)
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.DONE
+    assert "valid" in rec.notes and "P1" in rec.notes
+
+
+def test_phase_lint_halts_on_malformed_block(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    # Unquoted `schema:` colon — the exact defect the prose reviewer missed.
+    (orch.artifact_root / "plan.md").write_text(
+        "# Plan\n\n```gauntlet-phases\n"
+        "- id: P1\n  title: Broken\n"
+        "  goal: the implement step has no schema: field and must not change\n"
+        "```\n"
+    )
+    # A structurally unrunnable plan must not reach approval: it parks here.
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "invalid" in rec.notes
+
+
+def test_phase_lint_halts_when_block_absent(fixture_repo):
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text("# Plan\n\nProse only, no block.\n")
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "no gauntlet-phases block" in rec.notes

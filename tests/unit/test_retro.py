@@ -291,3 +291,17 @@ def test_agent_summaries_are_role_specific_across_all_rounds(tmp_path: Path):
     full = R.build_run_summary(ctx)
     assert "round 1" in full and "round 2" in full
     assert "converged in round 2" in full
+
+
+def test_test_failure_loops_treats_attempts_as_failure_count():
+    # FR-6 / review F-004: `attempts` IS the failure count. A step that failed
+    # twice then passed has attempts == 2 → 2 loops; a single fail-then-pass has
+    # attempts == 1 → 1 loop (the old `attempts - 1` undercounted and dropped the
+    # single-failure case). A clean step (attempts == 0) contributes nothing.
+    man = Manifest(run_id="run-1", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    man.steps.append(StepRecord(id="tests", type="shell", attempts=2, iteration="0"))
+    man.steps.append(StepRecord(id="tests", type="shell", attempts=1, iteration="1"))
+    man.steps.append(StepRecord(id="tests", type="shell", attempts=0, iteration="2"))
+    loops = R._test_failure_loops(man)
+    assert loops == {"tests.0": 2, "tests.1": 1}  # the clean attempt is omitted

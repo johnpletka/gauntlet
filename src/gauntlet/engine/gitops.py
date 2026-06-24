@@ -240,6 +240,35 @@ def commit_paths(
     return head_sha(repo)
 
 
+def commit_run_bookkeeping(
+    repo: Path, message: str, paths: list[str], *, identity: Identity
+) -> str | None:
+    """Force-stage gitignored run-bookkeeping paths and commit them alone.
+
+    The live run dir is gitignored (its manifest/RUN.md must never dirty the
+    worktree or pollute phase commits), so a response checkpoint (FR-2.2) has to
+    ``add -f`` past that ignore rule. It then commits ONLY the named paths
+    (path-limited ``commit``), so a dirty implementation tree can never smuggle
+    agent edits into a bookkeeping commit. **Idempotent:** if the named paths
+    carry no change vs HEAD, returns ``None`` and creates no empty commit — so
+    crash recovery can call it to flush a not-yet-landed state whether or not the
+    commit already happened. The message is passed on stdin (``-F -``); no
+    agent-authored text reaches argv. Returns the new SHA, or ``None``.
+    """
+    _run(repo, "add", "-f", "--", *paths)
+    # Scope the change check to OUR paths so unrelated staged/worktree state
+    # never makes this look "dirty" (or get swept into the commit below).
+    if not _run(repo, "diff", "--cached", "--name-only", "--", *paths).strip():
+        return None
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit", "-F", "-", "--", *paths,
+    ]
+    _run(repo, *args, stdin=message)
+    return head_sha(repo)
+
+
 def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
@@ -289,6 +318,57 @@ def create_ref(repo: Path, ref: str, sha: str) -> None:
 
 def reset_hard(repo: Path, sha: str) -> None:
     _run(repo, "reset", "--hard", sha)
+
+
+def rewind_impl_preserving_bookkeeping(
+    repo: Path,
+    base_sha: str,
+    bookkeeping: list[str],
+    message: str,
+    *,
+    identity: Identity,
+) -> str:
+    """Rewind tracked implementation files to ``base_sha`` in a single
+    ``reset --hard`` whose target commit STILL carries the run ``bookkeeping``.
+
+    A plain ``reset --hard base_sha`` is unsafe when an engine checkpoint sits
+    between ``base_sha`` and HEAD (a pending-response checkpoint, FR-2.2/FR-7.1):
+    the force-committed ``manifest.json`` is tracked at HEAD but absent from
+    ``base_sha``'s tree, so the reset *deletes it from disk* and moves the branch
+    off the checkpoint — a kill in the gap before it is re-persisted permanently
+    loses the human response (review F-001).
+
+    Instead, build a commit on top of ``base_sha`` whose tree is ``base_sha``'s
+    tree with ``bookkeeping`` overlaid from the current working tree, then point
+    HEAD at it with one reset. The commit carries ONLY the bookkeeping diff vs
+    ``base_sha`` (the implementation is unchanged), so passing the canonical
+    checkpoint ``message`` makes it the single reachable replacement for the
+    pending-response checkpoint — collapsing any redundant intermediate
+    checkpoints rather than orphaning the state. Because the reset target already
+    contains the bookkeeping, ``manifest.json`` is never momentarily removed and
+    the response is, at every instant, present both on disk and in a reachable
+    commit. Returns the new HEAD sha.
+
+    Only the index is touched before the final reset (``read-tree``/``write-tree``
+    leave HEAD, the branch ref, and the working tree alone), so a crash anywhere
+    ahead of the reset leaves the pre-existing on-disk manifest and checkpoint
+    intact for recovery to redo the rewind.
+    """
+    # Stage base_sha's tree, then overlay the live bookkeeping on top of it.
+    _run(repo, "read-tree", base_sha)
+    _run(repo, "add", "-f", "--", *bookkeeping)
+    tree = _run(repo, "write-tree").strip()
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        # commit-tree reads the log message from stdin when no -m/-F is given,
+        # so no model-derived text ever reaches argv (it never does here — the
+        # message is a fixed engine string — but keep the invariant uniform).
+        "commit-tree", tree, "-p", base_sha,
+    ]
+    new = _run(repo, *args, stdin=message).strip()
+    reset_hard(repo, new)
+    return new
 
 
 def apply_patch_check(repo: Path, patch: str) -> bool:

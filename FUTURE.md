@@ -5,6 +5,28 @@ then surfaced to the human at a phase gate (convergence policy A: a major findin
 gets one fix, then the human decides rather than the cycle looping). Recorded here
 so a partial fix accepted at a gate is tracked, not forgotten.
 
+## From #31 review (resume-with-response) — deferred 2026-06-24
+
+- **F-002 [latent, deferred] — `on_fail` on a response-consuming step can strip
+  the disposition gate / drop the route.** A `--response` failure is finalized
+  FAILED *and* the pending response is flipped to `consumed` in the same atomic
+  transaction; `_is_consumed_terminal_failure` then makes that record terminal on
+  recovery (the P3-era F-002 fix, to avoid double-counting). Two interactions
+  follow IF a response-consuming `agent_task` *also* carries `on_fail`: (a) an
+  in-invocation retry re-runs with the response already consumed, so
+  `_consuming_response` is false and the resume-disposition schema is not re-bound;
+  (b) a crash between FAILED-finalize and `on_fail` routing terminates as FAILED on
+  recovery instead of routing. **Not reachable in the shipped `standard` pipeline:**
+  the only response-consuming step (`implement`, which parks on UPSTREAM CONFLICT)
+  has no `on_fail`; `on_fail` lives on `tests` (a shell step that carries no
+  response), and its route-back to `implement` happens only *after* `implement`
+  already proceeded with the response consumed — so not re-binding the schema there
+  is correct, not a bypass. Deferred as a latent trap for user-authored pipelines.
+  Follow-up: reject (or warn on) `on_fail` attached to a step that can consume a
+  `--response`, or re-bind the disposition schema whenever a still-relevant
+  response is present on a retry — whichever is cheaper once a non-standard
+  pipeline actually needs that shape.
+
 ## From P6 (init / doctor / packaging) — accepted at p6-gate 2026-06-12
 
 - **F-004 [major, partially_resolved] — `doctor` CLI-auth false positive.**

@@ -673,3 +673,66 @@ process, and what it suggests for Gauntlet's design.
     bundled, `init`/`doctor` run). The README documents the real
     `uv tool install git+<url>` path for teammates; the test uses the contained
     equivalent by default (container/global tooling deferred to human sign-off).
+
+## 2026-06-24 — resume-response feature (FR-9), P2 review
+
+44. **A P2 phase commit landed with materially false audit metadata
+    (review F-001).** Commit `2a85816` ("P2: add operator identity module and
+    unit tests") was authored AND committed by `Gauntlet Triage
+    <triage@gauntlet.local>` rather than the builder, and its body claims work
+    the diff never contains — "deterministic key creation, public-key
+    derivation, basic sign/verify," and FR-2.1 / FR-3.3 / FR-7.2. The actual
+    diff only adds `src/gauntlet/engine/identity.py` (the FR-9 operator-email
+    resolution primitive: `GAUNTLET_USER_EMAIL` → `git config user.email`
+    precedence, fail-closed) plus its unit tests. The correct attribution is the
+    builder, and the body should cite FR-9 and note the P3 wiring deferral
+    (recording/consume of the resolved `user` into the response audit entry).
+    This recurs the earlier P1 finding F-003 (commit drafter's identity bleeding
+    into the commit author), even though the commit step already resolves
+    authorship to the builder by default (`steptypes.py:319-327`) — so a manual /
+    out-of-engine commit path reintroduced it here.
+    *Why recorded, not rewritten:* the false commit is durable shared history.
+    Per CLAUDE.md §2 ("approved artifacts / shared history change only through
+    their own loop and gate") and §3 (no history rewrite without explicit human
+    instruction), the fixer does not amend or force-push it. The accurate record
+    lives here and in the fix-round commit's audit body (FR-9.4); a human ratifies
+    any history correction.
+    *Design feedback:* the false body is a model hallucination that the commit
+    drafter / format check passed — `commit_format.py` validates shape, not
+    whether the body's claims match the diff. A cheap guard: cross-check
+    FR-citations and "added file" claims in the drafted message against the
+    staged diff before committing, and reject a body that asserts files or FRs
+    the diff does not touch. Authorship: any commit path outside the engine's
+    commit step (manual bootstrap commits) should reuse `config.identity(builder)`
+    rather than inheriting whatever git identity the drafting session ran under.
+
+## 2026-06-24 — resume-response feature, final PR (#31) review
+
+45. **All six phase commits (P1–P6) are authored by `Gauntlet Triage`, not the
+    builder (review F-003).** `git show -s --format='%an <%ae>'` on
+    `7d2f4f4`, `2a85816`, `e641beb`, `f01a397`, `b5956a5`, `70d53f0` all report
+    `Gauntlet Triage <triage@gauntlet.local>`; the `PN.1` fix commits correctly
+    report `Gauntlet Builder`. The engine-side fix for exactly this
+    (commit AUTHORSHIP is the implementer's, never the message drafter's —
+    `steptypes.py` `handle_commit`, "review F-003") landed in `d65190c` (P1.1).
+    *Root cause:* P2–P6 were committed **after** `d65190c`, yet still carry the
+    pre-fix authorship — which is only possible if the live `gauntlet` engine
+    driving this self-hosting run **predated the fix**. The editable install
+    (`uv tool install -e .`) was not refreshed mid-run, so the running process
+    kept the old drafter-as-author behavior for the whole pipeline even as the
+    working tree fixed it. The current code is correct; a fresh install will not
+    reproduce this.
+    *Why recorded, not rewritten:* same rationale as note 44 and CLAUDE.md §3 —
+    rewriting six commits on a pushed branch with an open PR requires explicit
+    human instruction, and would invalidate every SHA already baked into
+    `runs/gauntlet-resume-response/PR.md`, `manifest.json`, `RUN.md`, and the
+    transcripts. The human chose to document rather than rewrite (the PR is
+    accurate about what happened). True provenance is not lost: the run manifest
+    records `agent: builder` on every `implement` step, so the builder/triage
+    split (FR-9.7's purpose) remains recoverable from data — data over inference.
+    *Action items:* (1) reinstall the engine (`uv tool install -e .`) before the
+    next self-hosting run so a stale process cannot silently re-introduce a fixed
+    bug; (2) consider a `gauntlet doctor` check that compares the installed engine
+    version/commit against the working-tree `HEAD` and WARNs on drift, since "the
+    code is fixed but the running engine isn't" is an invisible failure mode that
+    has now bitten provenance twice.

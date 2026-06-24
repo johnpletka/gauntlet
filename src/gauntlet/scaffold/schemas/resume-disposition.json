@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/resume-disposition.json",
+  "title": "Builder resume disposition (PRD gauntlet-resume-response, FR-10)",
+  "description": "Machine-checkable outcome a builder emits at the end of every `gauntlet resume --response` re-evaluation; the deterministic test oracle for the FR-3.0 precedence and FR-5 outcomes, so tests assert on these fields, not on prose. The disposition enum maps 1:1 to the FR-3 categories: proceed_in_place/proceed_with_deviation complete the step (DONE then commit); amendment_required/new_conflict re-park it (parked_reason=upstream_conflict) for a human / the FR-10.4 gate. conflict is ALWAYS required at the top level (strict-mode compatibility, below) and is an object when the disposition re-parks, null when it proceeds — the object-vs-null discriminator is enforced by the allOf conditional. Strict-mode note (mirrors findings.json, codex 0.139.0): native structured output requires EVERY property in `required`, so conflict is spelled required-but-nullable; the allOf conditional is enforced by the engine's Draft-07 jsonschema validation. Two semantic rules the schema cannot express are enforced fail-closed by the engine (steptypes._resume_disposition_result): responses_considered must name the consumed (pending) response and only known response_ids (FR-1/FR-5/FR-10), and conflict.artifact must be a non-empty string when disposition=amendment_required (FR-3(b)).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["disposition", "responses_considered", "action_summary", "conflict"],
+  "properties": {
+    "disposition": {
+      "type": "string",
+      "enum": [
+        "proceed_in_place",
+        "amendment_required",
+        "proceed_with_deviation",
+        "new_conflict"
+      ],
+      "description": "FR-3.0 classification of the latest response. proceed_in_place: conflict resolved through understanding, no artifact change. proceed_with_deviation: a deviation the approved artifacts already permit. amendment_required: the response requests, or proceeds despite, a divergence from approved PRD/plan text — routed back through the artifact's own gate (FR-3(b), no in-place amend). new_conflict: the response is ambiguous or impossible and does not resolve the conflict."
+    },
+    "responses_considered": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "description": "The response_id(s) (e.g. implement-resp-1) the builder consumed from human-response.md; the response(s) this disposition is a function of (FR-5/FR-10). Must be non-empty and must name the consumed (pending) response — the engine fails closed otherwise."
+    },
+    "action_summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-line description of what the builder did or will do."
+    },
+    "conflict": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["summary", "requested_input", "artifact"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1, "description": "What is still blocked."},
+        "requested_input": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the human must supply or change next. For new_conflict, names what the supplied response did NOT provide (FR-5) — not a verbatim repeat of the prior park."
+        },
+        "artifact": {
+          "type": ["string", "null"],
+          "description": "PRD §X / plan FR-Y. Required (non-null, non-empty) when disposition=amendment_required — enforced fail-closed by the engine since the shared conflict subschema (also used by new_conflict, where artifact may be null) cannot express the per-disposition rule; may be null for new_conflict."
+        }
+      },
+      "description": "Required when disposition is amendment_required or new_conflict; null/omitted otherwise (enforced by the allOf conditional below)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "disposition": {"enum": ["amendment_required", "new_conflict"]}
+        }
+      },
+      "then": {
+        "required": ["conflict"],
+        "properties": {"conflict": {"type": "object"}}
+      },
+      "else": {
+        "properties": {"conflict": {"type": "null"}}
+      }
+    }
+  ]
+}
