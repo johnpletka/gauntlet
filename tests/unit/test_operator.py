@@ -21,6 +21,12 @@ from gauntlet.procident import read_process_identity
 
 THIS_HOST = "test-host"
 
+# Sentinel distinguishing an *omitted* proc_identity (→ default to a valid
+# identity) from an *explicit* ``None`` (→ serialize a recorded-null identity).
+# Without it, ``proc_identity=None`` silently wrote a valid identity, so the
+# recorded-null case was never actually exercised (review F-004).
+_OMITTED = object()
+
 
 # --- fixtures / builders -----------------------------------------------------
 def _identity(value: int = 1_750_000_000) -> dict:
@@ -33,7 +39,7 @@ def _write_lock(
     slug: str = "demo",
     pid: int = 4242,
     host: str = THIS_HOST,
-    proc_identity: dict | None = None,
+    proc_identity: dict | None = _OMITTED,
     nonce: str = "nonce-1",
     pgid: int | None = None,
     started_at: str = "2026-06-25T16-41-22",
@@ -44,7 +50,7 @@ def _write_lock(
     if raw is not None:
         path.write_text(raw)
         return
-    if proc_identity is None:
+    if proc_identity is _OMITTED:
         proc_identity = _identity()
     rec = {
         "nonce": nonce,
@@ -140,14 +146,18 @@ def test_row_e_live_verified_same_host_is_alive(tmp_path, host, probe, identity_
     assert op.driver_liveness(tmp_path, "demo") == op.LIVENESS_ALIVE
 
 
-def test_row_f_identity_unobtainable_is_indeterminate_not_orphaned(
+def test_row_f_recorded_identity_null_is_indeterminate_not_orphaned(
     tmp_path, host, probe, identity_read
 ):
-    # Live PID, recorded proc_identity null → indeterminate, NOT orphaned
-    # (the false-orphaned-on-a-live-driver case §1.3 forbids).
+    # Live PID, *recorded* proc_identity null even though a fresh read succeeds →
+    # indeterminate, NOT orphaned (the false-orphaned-on-a-live-driver case §1.3
+    # forbids). The explicit `None` must serialize as recorded null — otherwise
+    # this exercises a valid identity and never the recorded-null trigger (F-004).
     probe("alive")
     _write_lock(tmp_path, proc_identity=None)
-    identity_read(None)
+    serialized = json.loads((tmp_path / ".driving.lock").read_text())
+    assert serialized["proc_identity"] is None
+    identity_read(op.ProcessIdentity.from_dict(_identity()))  # fresh read succeeds
     assert op.driver_liveness(tmp_path, "demo") == op.LIVENESS_INDETERMINATE
 
 
@@ -244,6 +254,14 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_FAILED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
          op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+        # The ACTUAL engine representation (orchestrator._set_run_status, FR-3.3):
+        # a budget/timeout halt or a mid-step interruption parks the *run*
+        # (RUN_PARKED) while the *step* keeps its HALTED/INTERRUPTED status. These
+        # must classify as halted/interrupted, never `unknown` (F-001).
+        (M.RUN_PARKED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
+         op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+        (M.RUN_PARKED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
+         op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_DONE, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,
          op.STATE_DONE, []),
         (M.RUN_ABORTED, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,
@@ -270,6 +288,18 @@ def test_parked_for_response_classifies_cycle_escalation():
     assert rstate.parked.step_id == "cyc.0"  # rendered with iteration
 
 
+def test_parked_run_with_halted_step_reports_failure_descriptor():
+    # The real engine representation (FR-3.3): RUN_PARKED + a HALTED step. The
+    # failure descriptor and current_step must name that step, not be `unknown`.
+    man = _manifest(M.RUN_PARKED, [_step("impl", "agent_task", M.HALTED, iteration="1")])
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    assert rstate.state == op.STATE_HALTED
+    assert rstate.failure is not None
+    assert rstate.failure.step_id == "impl.1"
+    assert rstate.failure.status == M.HALTED
+    assert rstate.current_step == "impl.1"
+
+
 # --- §6.3a: contradictions → unknown → read-only only ------------------------
 @pytest.mark.parametrize(
     "status, steps",
@@ -283,6 +313,12 @@ def test_parked_for_response_classifies_cycle_escalation():
         (M.RUN_PARKED, [_step("s", "agent_task", M.PARKED)]),
         # parked with an unknown reason value
         (M.RUN_PARKED, [_step("g", "human_gate", M.PARKED, reason="mystery")]),
+        # parked run mixing a PARKED step and a HALTED step → ambiguous
+        (M.RUN_PARKED,
+         [_step("g", "human_gate", M.PARKED), _step("s", "agent_task", M.HALTED)]),
+        # parked run with two halt/interrupt steps → ambiguous
+        (M.RUN_PARKED,
+         [_step("a", "agent_task", M.HALTED), _step("b", "agent_task", M.INTERRUPTED)]),
         # failed run with no terminal failure step
         (M.RUN_FAILED, [_step("s", "agent_task", M.DONE)]),
         # descriptor present under a `—` status (running with a failed step)
@@ -324,6 +360,30 @@ def test_footer_driver_line_shows_pid_host_since():
     lines = op.render_footer(driver, rstate)
     assert any("driver: alive" in ln and "pid 4242" in ln and "host h1" in ln
                and "since 2026-06-25T16-41-22" in ln for ln in lines)
+
+
+def test_footer_reconciliation_matching_nonce_says_finalize():
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    recon = op.Reconciliation("impl.1", True, "gauntlet recover demo")
+    line = next(ln for ln in op.render_footer(driver, rstate, reconciliation=recon)
+                if ln.startswith("reconciliation:"))
+    assert "(finalize)" in line and "to finalize it" in line
+
+
+def test_footer_reconciliation_stale_nonce_is_not_contradictory():
+    # A mismatched nonce discards the intent as stale; the footer must NOT then
+    # tell the operator to run the command "to finalize it" (F-005).
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    recon = op.Reconciliation("impl.1", False, "gauntlet recover demo")
+    line = next(ln for ln in op.render_footer(driver, rstate, reconciliation=recon)
+                if ln.startswith("reconciliation:"))
+    assert "(discard as stale)" in line
+    assert "to finalize it" not in line  # no contradictory finalize instruction
+    assert "to reconcile it" in line
 
 
 # --- FR-1.3: unknown / indeterminate suggest no mutating verb ----------------
@@ -579,3 +639,32 @@ def test_intent_symlink_escape_refused_no_outside_read(tmp_path):
     # Refused with no out-of-tree read: no fabricated reconciliation object.
     assert recon is None
     assert anomaly is not None
+
+
+def test_intent_cyclic_symlink_yields_anomaly_not_crash(tmp_path):
+    # A self-referential recovery-intent symlink must surface an anomaly, never
+    # crash `gauntlet status` (FR-5.6).
+    run_dir = tmp_path / "run-x"
+    run_dir.mkdir()
+    link = run_dir / ".recovery-intent.json"
+    os.symlink(str(link), str(link))  # points at itself
+    recon, anomaly = op.read_recovery_intent(tmp_path, run_dir, "demo")
+    assert recon is None
+    assert anomaly is not None and "recovery-intent" in anomaly
+
+
+def test_intent_resolution_error_yields_anomaly(tmp_path, monkeypatch):
+    # A path that cannot be resolved (e.g. a symlink loop deep enough to raise
+    # RuntimeError, or an OSError mid-resolution) must be caught and reported as
+    # an anomaly rather than propagating out of `read_recovery_intent` (FR-5.6).
+    run_dir = tmp_path / "run-x"
+    run_dir.mkdir()
+    _write_intent(run_dir)  # a well-formed intent so we reach the resolve() step
+
+    def _boom(self, *args, **kwargs):
+        raise RuntimeError("Symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    recon, anomaly = op.read_recovery_intent(tmp_path, run_dir, "demo")
+    assert recon is None
+    assert anomaly is not None and "recovery-intent" in anomaly

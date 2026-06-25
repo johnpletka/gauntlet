@@ -486,10 +486,20 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
             return STATE_UNKNOWN, None, None
         return (STATE_DONE if status == M.RUN_DONE else STATE_ABORTED), None, None
 
-    # P2: parked — the unique parked step's (type, reason) classifies it (§6.3a).
+    # P2: parked — a genuine human/response park OR a budget/timeout halt / a
+    # mid-step interruption. The engine records the latter by parking the *run*
+    # (RUN_PARKED) while the *step* keeps its HALTED/INTERRUPTED status
+    # (orchestrator._set_run_status, FR-3.3), so a real halted/interrupted run is
+    # RUN_PARKED with a single halt/interrupt step and no PARKED step. Classify
+    # by which the unique non-terminal step is; a mix, or zero/multiple of
+    # either, is a contradiction → unknown.
     if status == M.RUN_PARKED:
-        if len(parked_steps) != 1:
-            return STATE_UNKNOWN, None, None  # zero or multiple → contradiction
+        halt_steps = [s for s in man.steps if s.status in (M.HALTED, M.INTERRUPTED)]
+        if len(halt_steps) == 1 and not parked_steps:
+            hs = halt_steps[0]
+            return hs.status, None, FailureDescriptor(render_step_id(hs), hs.status)
+        if len(parked_steps) != 1 or halt_steps:
+            return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
         ps = parked_steps[0]
         if ps.parked_reason in _RESPONSE_REASONS:
             return (
@@ -601,8 +611,14 @@ def read_recovery_intent(
     if not path.is_symlink() and not path.exists():
         return (None, None)
     # Containment: a symlink escaping the run tree is refused with no read.
-    real = path.resolve()
-    if not _within(real, run_instance_dir.resolve()):
+    # `resolve()` can itself raise on a self-referential symlink (RuntimeError)
+    # or an otherwise unresolvable target (OSError); fail closed to the anomaly
+    # notice rather than crashing `gauntlet status` (FR-5.6).
+    try:
+        real = path.resolve()
+        if not _within(real, run_instance_dir.resolve()):
+            return (None, anomaly)
+    except (OSError, RuntimeError):
         return (None, anomaly)
     try:
         data = json.loads(path.read_text())
@@ -679,11 +695,18 @@ def render_footer(
         lines.append("next actions: (none — the run is finished)")
 
     if reconciliation is not None:
-        finalize = "finalize" if reconciliation.nonce_matches_lock else "discard as stale"
+        if reconciliation.nonce_matches_lock:
+            disposition = "finalize"
+            verb = "finalize it"
+        else:
+            # Mismatched nonce: the normative contract discards the intent as
+            # stale, so the command reconciles it — it does NOT finalize it.
+            disposition = "discard as stale"
+            verb = "reconcile it"
         lines.append(
             f"reconciliation: a pending recovery intent for step "
-            f"{reconciliation.intent_step_id} survives ({finalize}); run "
-            f"`{reconciliation.recommended_command}` to finalize it"
+            f"{reconciliation.intent_step_id} survives ({disposition}); run "
+            f"`{reconciliation.recommended_command}` to {verb}"
         )
     if anomaly is not None:
         lines.append(f"reconciliation: {anomaly}")

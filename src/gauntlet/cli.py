@@ -201,9 +201,34 @@ def status(slug: str) -> None:
     recovery intent is *reported*, never finalized (FR-5.6).
     """
     from gauntlet.engine import operator
+    from gauntlet.engine.manifest import Manifest
+    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
 
     mgr = _manager()
-    man = mgr.status(slug)
+    # FR-10.1 containment: the slug and the active-run pointer both flow into
+    # filesystem paths, so validate the slug, resolve the instance through the
+    # safe resolver (which validates active-run.txt), and confirm the resolved
+    # instance stays under the slug dir BEFORE reading the manifest or a
+    # recovery intent — never via the unchecked `active_run_dir()` (F-002).
+    layout = mgr.layout(slug)
+    try:
+        safe_run_segment(slug, kind="slug")
+        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
+    except (UnsafeRunSegment, RunResolutionError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
+    except ValueError as exc:
+        typer.echo(
+            f"error: resolved run instance {run_instance_dir} escapes the run "
+            f"tree for {slug!r}; refusing to read it",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    man = Manifest.load(run_instance_dir / "manifest.json")
     typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
     for rec in man.steps:
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
@@ -212,7 +237,6 @@ def status(slug: str) -> None:
     run_root = mgr.repo_root / mgr.config.run_root
     driver = operator.driver_info(run_root, slug)
     rstate = operator.compute_run_state(man, driver.state)
-    run_instance_dir = mgr.layout(slug).active_run_dir()
     recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly
