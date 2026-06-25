@@ -319,10 +319,13 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
 - **FR-4.1** `gauntlet status <slug> --json` emits a single JSON object
   conforming to `schemas/status.json` (§6), carrying `schema_version`, raw
   manifest `run_status`, the **computed composite `state`** (§6.3), `current_step`,
-  driver liveness, the parked/failure descriptor (if any), the step list, and
-  `next_actions`. *Acceptance:* output validates against the schema for every
+  driver liveness, the parked/failure descriptor (if any), the report-only
+  `reconciliation` notice (non-null only when a surviving recovery intent is
+  detected; §6.1/FR-5.6), the step list, and `next_actions`. All of this is a
+  single JSON object (FR-4.3 preserved) — a surviving-intent notice is a field, not
+  an extra stdout line. *Acceptance:* output validates against the schema for every
   composite state in the §6.3 decision table (parametrized test, one case per
-  class).
+  class), including a case with a non-null `reconciliation`.
 - **FR-4.2 (structured, safely-executable actions).** Each `next_actions` entry
   is an object with `label`, `kind` (`observe`/`decide`/`control`/`recover`),
   `argv` (a JSON **array** of already-split, fully-resolved argument tokens — no
@@ -378,8 +381,13 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
   audit trail is complete. *Acceptance:* a test asserts post-state is
   `INTERRUPTED` step + resumable run + a recovery record matching §6.4 (actor,
   timestamp, lock nonce, pid/pgid/identity, signal outcome, prior→resulting
-  states) + no lock; that a subsequent `gauntlet resume` is accepted; and that a
-  second `recover` appends a second record rather than replacing the first.
+  states) + no lock; that a subsequent `gauntlet resume` is accepted; and that,
+  **after that resume re-acquires a fresh lock and a new in-flight step reaches
+  `running`**, a second `recover` appends a second record rather than replacing the
+  first. (The immediate post-recovery state — lock absent, step `INTERRUPTED` —
+  cannot itself satisfy a second `recover`, since FR-5.1 and the FR-5.6 running-step
+  guard both fail; a second recovery is only reachable once a resume has re-wedged a
+  newly-running driver.)
 - **FR-5.4** `recover` refuses fail-closed when it cannot verify the target and
   prints why and the safe alternatives (wait, or `gauntlet status`/`logs`).
   *Acceptance:* the refusal message in the unverifiable case names the reason and
@@ -424,7 +432,10 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
      concurrently; re-run `gauntlet status`." This is the race against a normally
      completing driver, closed.
   4. **Persist the recovery intent durably *before* any signal.** Atomically
-     write `<run_instance_dir>/.recovery-intent.json` (write-temp-then-`rename`)
+     write `<run_instance_dir>/.recovery-intent.json` (write to a temp file,
+     `flush`+`fsync` the temp file, `rename` it into place, then `fsync` the
+     containing directory so both the file contents and the directory entry
+     survive power loss — atomic rename alone is not durable across power loss)
      capturing the just-verified, now-frozen facts: the lock `nonce`, `pid`,
      `pgid`, `proc_identity`, `host`, the target `step_id`, the `prior_step_status`
      / `prior_run_status`, and the invoking `actor`/`actor_source`/`ts` (schema in
@@ -433,44 +444,76 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
      valid — i.e. before the PID can become dead. Every crash from here on is
      finalizable from the intent alone, without re-running the FR-5.1 liveness
      gate (which would now fail precisely *because* the kill succeeded).
-  5. **Signal** the recorded process group (FR-5.2: SIGTERM, then SIGKILL after a
-     bounded grace).
+  5. **Re-verify identity, then signal.** Immediately before sending any signal —
+     after the durable intent write of step 4, and despite the step-1 gate — re-run
+     the full FR-5.1 identity gate against the frozen intent: a freshly-read
+     `proc_identity` that **exactly matches** the intent's recorded one **and**
+     `os.getpgid(pid) == intent.pgid`. The target can exit and its PID/PGID can be
+     reused across steps 2–4 while the lock nonce is unchanged, so this final gate
+     closes that TOCTOU window. On an exact match, **signal** the recorded process
+     group (FR-5.2: SIGTERM, then SIGKILL after a bounded grace). On mismatch
+     (PID/PGID reused) or an absent/dead target, send **no signal** and set
+     `signal_outcome: already_dead`; the durable intent already pins the verified
+     target, so proceed to step 6 and finalize without signalling.
   6. **Atomic manifest update:** mark the step `INTERRUPTED` and append the
      recovery record (§6.4), built from the intent plus the observed
-     `signal_outcome`, in a single write-temp-then-`rename` so a crash leaves
-     either the old manifest or the fully-updated one — never a torn write.
+     `signal_outcome`, in a single write-temp-then-`rename` (temp file
+     `flush`+`fsync`ed before the rename, the containing directory `fsync`ed after
+     it) so a crash — or a power loss — leaves either the old manifest or the
+     fully-updated one, never a torn or non-durable write.
   7. **Clear the intent:** unlink `.recovery-intent.json` only after step 6's
-     rename is durable — its content is now folded into the persisted recovery
-     record, so a surviving intent always means "manifest not yet finalized."
+     rename is durable, then `fsync` the containing directory so the deletion is
+     itself durable before reconciliation is considered complete. Its content is
+     now folded into the persisted recovery record, so a surviving intent always
+     means "manifest not yet finalized."
   8. **Release the lock** only if it still carries the recorded `nonce`
      (ownership release, mirroring the engine's existing nonce-guarded release —
      never unlink a new owner's lock).
 
-  **Crash reconciliation (deterministic restart).** On *every* `recover` (and the
-  read-only `status`) invocation, before anything else, reconcile any surviving
-  `.recovery-intent.json` for the selected run instance. Its presence means a
+  **Crash reconciliation (deterministic restart).** Reconciliation is a
+  **mutating** operation and therefore runs **only in mutating contexts**: at the
+  start of every `recover` invocation and on the engine's run-startup / `resume`
+  path (both of which already open and may rewrite the run instance), before
+  anything else, reconcile any surviving `.recovery-intent.json` for the selected
+  run instance. **Read-only `status` never reconciles** — it must not mutate the
+  manifest, lock, or intent (FR-3 / P1). Instead, `status` *detects and reports* a
+  surviving intent without finalizing it: a footer note in human mode and the
+  nullable `reconciliation` object in `--json` (§6.1), recommending `gauntlet
+  recover <slug>` (or a `resume`) to finalize. This removes the forward-phase
+  dependency (P1's read-only `status` needs no P4 reconciliation machinery) while
+  keeping `status` the diagnosis surface. A surviving intent's presence means a
   prior `recover` reached step 4 but did not durably complete step 6 — including
   the otherwise-unreconcilable window where the process group was already killed
   (step 5 done) but the manifest is still `running` with no recovery record. The
   reconciliation is keyed on the intent, **not** on a fresh liveness gate, so a
   now-dead target does not strand the run:
-  - **Stale intent (superseded run):** if the lock is gone or its `nonce` ≠ the
-    intent's `nonce`, the run was relaunched since the intent was written; the
-    intent is stale. Discard it (unlink) **without signalling and without mutating
-    the manifest**, and report "stale recovery intent discarded; run
-    relaunched — re-run `gauntlet status`."
-  - **Live intent (finalize the interrupted recovery):** otherwise (lock absent or
-    its `nonce` still matches, and the target step is still `running`), finalize
-    idempotently. The target PID being dead is the **expected** post-signal
-    outcome, not a gate failure, so finalization trusts the intent's frozen
-    identity rather than re-verifying liveness. It (re-)signals the recorded group
-    only if it is still alive — a no-op SIGKILL when already dead, safe because the
-    intent's identity still pins the group — then performs steps 6–8: writes the
-    `INTERRUPTED` transition + the §6.4 recovery record (`signal_outcome:
-    already_dead` when the group was already gone), clears the intent, and releases
-    the lock under the nonce guard. The FR-5.3 audit record is therefore **always**
-    written for any recovery that passed step 4; `resume` is never relied on to
-    create it.
+  - **Stale intent (superseded run):** **only** when the lock is **present** and
+    its `nonce` ≠ the intent's `nonce` — a relaunched driver holds a fresh lock, so
+    the run was relaunched since the intent was written and the intent is stale.
+    Discard it (unlink) **without signalling and without mutating the manifest**,
+    and report "stale recovery intent discarded; run relaunched — re-run `gauntlet
+    status`." A *missing* lock is **not** stale (it appears only in the live branch
+    below): absence means the verified target was already killed and nothing
+    relaunched.
+  - **Live intent (finalize the interrupted recovery):** in **all other cases** —
+    the lock is **absent** (the verified target was already killed and nothing
+    relaunched), **or** the lock is present with a `nonce` that still matches — and
+    the target step is still `running`: finalize idempotently. The target PID being
+    dead is the **expected** post-signal outcome, not a gate failure. Before any
+    optional re-signal, finalization **re-runs the FR-5.1 identity gate** against
+    the frozen intent — a freshly-read `proc_identity` that **exactly matches** the
+    intent's recorded one **and** `os.getpgid(pid) == intent.pgid`. Bare liveness of
+    a possibly-reused process group is **not** sufficient: only on an exact identity
+    match may it (re-)signal the recorded group (a no-op SIGKILL of the still-present
+    same target). On identity mismatch (the PID/PGID was reused) **or** target
+    absent, it sends **no signal** and records `signal_outcome: already_dead` — this
+    closes the reused-PGID double-kill hole. Either way it then performs steps 6–8:
+    writes the `INTERRUPTED` transition + the §6.4 recovery record (`signal_outcome:
+    already_dead` when no signal was sent), clears the intent, and releases the lock
+    under the nonce guard. The FR-5.3 audit record is therefore **always** written
+    by reconciliation (on the next `recover` or run-startup) for any recovery that
+    passed step 4; it is never left to `resume`'s ordinary stale-lock reclaim to
+    create.
 
   A crash *before* step 4 leaves no intent and no signal, so a fresh `recover`
   simply re-runs the full FR-5.1 gate (the PID is still live) — no special path
@@ -482,11 +525,19 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
   manifest, no double-kill of a reused PID) — i.e. the operation is idempotent;
   **(d) crash injected between step 5 (signal sent, group dead) and step 6
   (manifest write) — intent persisted, manifest still `running`, no recovery
-  record — is reconciled by the next `recover`/`status` into an `INTERRUPTED` step
-  + a §6.4 recovery record (`signal_outcome: already_dead`) + cleared intent +
+  record — is reconciled by the next `recover` (or the engine run-startup /
+  `resume` path) — never by read-only `status` — into an `INTERRUPTED` step + a
+  §6.4 recovery record (`signal_outcome: already_dead`) + cleared intent +
   released lock, with the manifest never left stranded `running` and the audit
-  record present; (e) an intent whose lock `nonce` no longer matches (relaunched
-  run) is discarded with no signal and no manifest mutation.**
+  record present; (e) an intent for which the lock is **present with a different
+  `nonce`** (a relaunched run) is discarded with no signal and no manifest
+  mutation, whereas an intent whose lock is **absent** is finalized (the live
+  branch), not discarded; (f) a reused-PGID injection — the verified target is
+  dead and a **different** process now occupies the recorded `pgid` — finalizes by
+  sending **no signal** (the FR-5.1 identity re-check fails) and recording
+  `signal_outcome: already_dead`, writing the `INTERRUPTED` transition + §6.4
+  record + cleared intent + released lock, and never leaves the manifest stranded
+  `running`.**
 
 ### FR-6 — Operator skill + playbook
 
@@ -524,20 +575,33 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
   and frontmatter, mirroring the prd-author checks (warn-only where prd-author is
   warn-only). *Acceptance:* `doctor` reports a missing/invalid operator skill at
   the same severity it reports the prd-author skill.
-- **FR-6.6 (empirical triggering — fixed denominator, deterministic pass).**
-  *(Recorded integration test, like prd-author's FR-1.6.)* The acceptance
-  denominator is exactly the **seven** FR-6.2 phrases. The pinned environment is
-  the Claude Code version recorded in the run's environment manifest / `gauntlet
-  doctor` output at acceptance time, and the recorded test names that version so
-  the result is reproducible. **Automated acceptance** is a recorded
-  `@pytest.mark.integration` test that asserts the skill activates on **all 7/7**
-  phrases on that pinned version (matching G6's 100%); a phrase that fails to
-  activate is a failing test, not a soft miss. **Manual evidence is separate:** a
-  documented manual transcript may *supplement* but does **not** satisfy automated
-  acceptance — the two are recorded distinctly so ratification rests on the
-  deterministic 7/7 automated result. *Acceptance:* the integration test
-  enumerates the seven phrases, records the pinned Claude Code version, and
-  passes only when all seven activate the skill.
+- **FR-6.6 (empirical triggering — fixed denominator, release-qualification
+  check, not a deterministic gate).** *(Recorded integration check, like
+  prd-author's FR-1.6.)* Skill activation is decided by an **external model
+  service** whose model, configuration, and sampling can change independently of
+  the recorded Claude Code CLI version, so a 7/7 result is **not deterministically
+  reproducible** and this is therefore **not** a CI gate and **not** run in
+  `pytest -m "not integration"`. It is an **empirical release-qualification**
+  check, executed and recorded at acceptance time. To make it as reproducible as
+  the medium allows, the recorded run pins and records all of: the exact **model
+  id** and any **configuration/system context** used, the **invocation protocol**
+  (how each phrase is presented to a fresh session), the **activation oracle** (the
+  observable signal that proves the `gauntlet-operator` skill fired), the **retry
+  policy** (each phrase is attempted up to a recorded N times; activation on any
+  attempt counts as a pass for that phrase), and the **Claude Code CLI version**
+  from the environment manifest / `gauntlet doctor`. The acceptance denominator is
+  exactly the **seven** FR-6.2 phrases; the target is all **7/7** activating
+  (matching G6's 100%). Because the outcome can vary with upstream model-service
+  changes, a sub-7/7 result is a **release-qualification finding to investigate**,
+  not a frozen CI failure; the result is ratified as a recorded empirical
+  qualification carrying its full pinned environment, never as a deterministic
+  automated pass. **Manual evidence is separate:** a documented manual transcript
+  may *supplement* the recorded qualification but is recorded distinctly.
+  *Acceptance:* the `@pytest.mark.integration` check (run on demand at
+  qualification time) enumerates the seven phrases, records the model id,
+  configuration, invocation protocol, activation oracle, retry policy, and Claude
+  Code CLI version, and reports the activation count (target 7/7) as a recorded
+  release qualification.
 
 ### FR-7 — Skill registry generalization (no regression)
 
@@ -566,8 +630,12 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
 `schemas/status.json` is a committed JSON Schema (Draft 2020-12) and the stable
 machine contract. It sets `additionalProperties: false` at the top level and on
 every nested object, so an unknown field is a validation failure, not silently
-accepted. All fields below are **required** unless marked nullable; a nullable
-field is always present and explicitly `null` when not applicable (never omitted).
+accepted. This strictness is scoped to the **current** `schema_version`: it
+describes exactly what the current Gauntlet emits, and the consumer-side rule that
+keeps additive growth non-breaking (validate against the matching-or-newer schema,
+never a private frozen copy) is defined in §6.5. All fields below are **required**
+unless marked nullable; a nullable field is always present and explicitly `null`
+when not applicable (never omitted).
 
 | Field | Type | Null? | Constraint |
 |-------|------|-------|------------|
@@ -595,6 +663,10 @@ field is always present and explicitly `null` when not applicable (never omitted
 | `steps[].iteration` | integer\|null | yes | iteration index for a cycle step, else `null`. |
 | `steps[].status` | string | no | step enum: `pending`\|`running`\|`done`\|`failed`\|`interrupted`\|`parked`\|`halted`\|`skipped`. |
 | `next_actions` | array | no | always present, possibly empty (e.g. a `done` run); each entry per FR-4.2. |
+| `reconciliation` | object\|null | yes | non-`null` **iff** read-only `status` detects a surviving `.recovery-intent.json` for the selected run instance (FR-5.6). It is **report-only** — `status` never reconciles or mutates — so it surfaces the pending reconciliation that a `recover` / run-startup will finalize. `null` when no intent survives. |
+| `reconciliation.intent_step_id` | string | no | the `step_id` recorded in the surviving intent. |
+| `reconciliation.nonce_matches_lock` | boolean | no | `true` when the intent's `lock_nonce` matches the current lock **or** the lock is absent (reconciliation would *finalize*, the live branch); `false` when the lock is present with a different nonce (reconciliation would *discard* it as stale). |
+| `reconciliation.recommended_command` | string | no | human-display command that finalizes the intent, e.g. `gauntlet recover <slug>`; for display only, never executed (mirrors FR-4.2's `command`). |
 
 `next_actions[]` entries are the structured-action objects defined in FR-4.2:
 `{ label: string, kind: "observe"|"decide"|"control"|"recover", argv: string[]
@@ -613,6 +685,7 @@ field is always present and explicitly `null` when not applicable (never omitted
   "driver": { "state": "none", "pid": null, "since": null, "host": null },
   "parked": { "step_id": "impl-cycle.0", "type": "human_gate", "reason": null },
   "failure": null,
+  "reconciliation": null,
   "steps": [
     { "id": "prd-cycle", "iteration": null, "status": "done" },
     { "id": "impl-cycle", "iteration": 0, "status": "parked" }
@@ -666,7 +739,55 @@ parked/failure descriptor — under this **precedence**:
 
 This table is the canonical taxonomy that G1, FR-1, FR-2.3 and FR-4 all reference;
 the human footer (FR-1) and `--json` (FR-4) are two renderings of this one
-computation (§4.2).
+computation (§4.2). The `descriptor` column above is resolved by the **descriptor
+selection and validity rules in §6.3a**; any combination §6.3a marks invalid maps
+to `state: unknown` (P4), making the function total.
+
+When the read-only `status` additionally detects a surviving `.recovery-intent.json`
+(FR-5.6), the composite `state`/`next_actions` are still computed exactly as above
+(reconciliation is a mutating operation `status` does not perform); the pending
+reconciliation is reported alongside as the report-only `reconciliation` notice
+(§6.1) and an accompanying `recover` recommendation, never by changing the
+composite `state`.
+
+### §6.3a Descriptor validity & selection (normative)
+
+The `descriptor` input is not free-form: for `run_status ∈ {parked, failed}` it is
+**selected** from the manifest's steps by a deterministic rule, and only specific
+descriptor shapes are valid. Any selection ambiguity or invalid shape is a
+contradiction and maps to `state: unknown` → read-only inspection only (the P4
+clause, here made concrete). For `run_status ∈ {running, done, aborted}` there is
+no descriptor (the `—` rows above); a non-empty parked/failure descriptor under
+those statuses is itself contradictory → `unknown`.
+
+**Parked-descriptor selection.** Under `run_status == parked`, the authoritative
+parked step is the **unique** step with `status == parked`. Its `(type, reason)`
+then classifies the state:
+
+| `type` | `reason` | classification |
+|--------|----------|----------------|
+| `human_gate` | `null` | `parked_gate` |
+| (any) | `upstream_conflict` \| `cycle_escalation` | `parked_for_response` (the *reason* defines the required response, independent of `type`) |
+| `agent_task` \| `adversarial_cycle` | `null` | **invalid → `unknown`** (a non-gate step parked with no reason has no defined operator response) |
+| (any) | any value ∉ {`null`, `upstream_conflict`, `cycle_escalation`} | **invalid → `unknown`** |
+
+Contradictions that map to `unknown`: **zero** steps with `status == parked`, or
+**more than one** such step, under `run_status == parked`; a parked descriptor
+present under a non-`parked` `run_status`.
+
+**Failure-descriptor selection.** Under `run_status == failed`, the authoritative
+failing step is selected deterministically — **by manifest step order (not
+directory order), the last step (and, for an iterated step, its highest iteration)
+whose `status ∈ {failed, halted, interrupted}`**. Multiple such steps are therefore
+*not* ambiguous; the rule picks one. `failure.status` is that step's status, which
+maps `failed→failed`, `halted→halted`, `interrupted→interrupted`. Contradiction
+that maps to `unknown`: **no** step with `status ∈ {failed, halted, interrupted}`
+exists under `run_status == failed` (a failed run with no terminal failure step).
+
+**Precedence note.** `run_status` partitions the descriptor space — a `parked` run
+uses only the parked descriptor, a `failed` run only the failure descriptor — so
+the two selections never compete. Both selections read the **manifest step order**
+as authoritative (never `steps[]` directory/mtime order), consistent with FR-3.1a.
 
 ### §6.4 Recovery-event record (`recovery` append-only list in the manifest)
 
@@ -736,13 +857,33 @@ instance, only during an in-flight or interrupted `recover`.
 
 ### §6.5 Schema compatibility policy
 
-`schemas/status.json` is a committed contract. `schema_version` starts at `1`.
-Changes are **additive-only within a major version** (new optional fields with
-`null`/empty defaults, new enum members appended); any field removal, type
-change, or required-field addition is a **breaking** change that bumps
-`schema_version`. Consumers must tolerate unknown enum members defensively (a
-new `state`/`kind` value is not a parse error). This is the concrete realisation
-of the §10 schema-churn mitigation.
+`schemas/status.json` is a committed contract. `schema_version` starts at `1` and
+identifies the **major** version. The committed schema is the single living source
+for that major version: it is updated additively **in place** and always describes
+exactly what the current Gauntlet emits, so its `additionalProperties: false` and
+closed enums apply to *that current* schema. Because a strict schema enumerates
+current fields and enum members, compatibility cannot mean "new output still
+validates against an old frozen schema" — it would not — so it is defined in terms
+of *which* schema a consumer validates against:
+
+- **Producer side.** Within a major version, changes are **additive-only** — new
+  optional fields (always present, defaulting to `null`/empty) and appended enum
+  members. Additive changes update the committed schema in place and do **not**
+  bump `schema_version`. Any field removal, type change, or required-field addition
+  is a **breaking** change that bumps `schema_version`.
+- **Consumer side.** A consumer that strict-validates **must validate against the
+  committed schema at the payload's `schema_version` or newer — never against a
+  private frozen copy**, since an additive field/enum would (correctly) be rejected
+  by an older snapshot under `additionalProperties: false`. A consumer that cannot
+  track the committed schema **must instead tolerate unknown object properties and
+  unknown enum members defensively** (a new `state`/`kind`/field is not a parse or
+  validation failure). Strict validation is only guaranteed against a schema at
+  least as new as the data.
+
+This keeps the strict producer schema and the additive policy consistent — strict
+validation is defined against the matching-or-newer schema, while additive growth
+stays non-breaking for any consumer that follows the rule above. It is the concrete
+realisation of the §10 schema-churn mitigation.
 
 **Drive-lock input (existing `<run_root>/.driving.lock`, read-only here):**
 `{ nonce, slug, run_id, pid, pgid, started_at, host, proc_identity }`. Liveness
@@ -833,9 +974,13 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
 - **G5 safety:** `recover` performs **0** kills across the unverifiable/foreign/
   dead/wrong-slug cases (refuses), and successfully terminates + marks
   `INTERRUPTED` + leaves-resumable in the verified-alive case.
-- **G6 discovery:** the operator skill triggers on **100%** of its documented
-  trigger phrases on the pinned Claude Code version (recorded FR-6.6 test), and
-  the prd-author golden-file test stays byte-identical (FR-7.2 — zero regression).
+- **G6 discovery:** the operator skill triggers on its **seven** documented
+  trigger phrases as a recorded **empirical release qualification** (FR-6.6) —
+  target **7/7**, pinned and recorded with the model id, configuration, invocation
+  protocol, activation oracle, retry policy, and Claude Code CLI version, and
+  explicitly **not** a deterministic CI gate (skill activation depends on an
+  external model service); and the prd-author golden-file test stays byte-identical
+  (FR-7.2 — zero regression).
 
 ---
 
@@ -845,7 +990,7 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
 |------|------------|
 | An alive-but-wedged driver reports `alive` and looks healthy, so the operator waits forever. | Liveness honestly reports `alive`; the per-step timeout/budget guard (`HALTED`) is the existing backstop, and `recover` (FR-5) lets the operator act on judgment. A true progress signal needs streamed output and is deferred to the `live-run-observability` PRD (§11 OQ-1); it is explicitly *not* a v1 gate (Non-Goal §2.2). |
 | `--json` schema churn breaks agent/script consumers. | `schemas/status.json` is a committed JSON Schema with a `schema_version` field and an explicit compatibility policy (§6.5): additive-only within a major, breaking changes bump the version, consumers tolerate unknown enum members. |
-| The operator skill fails to trigger reliably (same empirical risk as prd-author OQ-2). | Recorded FR-6.6 integration test; and the self-describing `status`/`--json` is the backstop — it works with no skill at all. |
+| The operator skill fails to trigger reliably (same empirical risk as prd-author OQ-2). | Recorded FR-6.6 **release-qualification** check (empirical, not a deterministic CI gate, since activation depends on an external model service); and the self-describing `status`/`--json` is the backstop — it works with no skill at all. |
 | `recover` kills the wrong process. | `procident` exact-identity gate + fail-closed refuse on any unverifiable target (FR-5.1/5.4); signals only the recorded process group. |
 | Generalizing `skill.py` regresses prd-author provenance/refresh. | FR-7.2 golden-file + the existing prd-author test suite must pass unmodified; registry change is mechanical, behavior-preserving. |
 | Cross-platform liveness gaps (Windows). | Documented Non-Goal; `procident` already fail-closed (`None` → unverifiable); `recover` refuses, `status` reports non-`alive`. |
@@ -879,10 +1024,11 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
    is designed to leave room for it.)
 5. **Operator trigger-phrase set — RESOLVED.** The `description` phrase list is
    now fixed normatively as the seven-phrase corpus in FR-6.2, which sets the
-   FR-6.6 acceptance denominator (7/7 on the pinned Claude Code version). It is no
-   longer open: changes are an explicit PRD revision. (Empirical *reliability* of
-   triggering is still proven, not assumed, by the recorded FR-6.6 integration
-   test — but the corpus and the deterministic pass criterion are ratified.)
+   FR-6.6 acceptance denominator (target 7/7). It is no longer open: changes are an
+   explicit PRD revision. (Empirical *reliability* of triggering is proven, not
+   assumed, by the recorded FR-6.6 **release-qualification** check — an empirical,
+   non-deterministic check against an external model service, not a CI gate; the
+   corpus and the recorded 7/7-target pass criterion are ratified.)
 
 ---
 
