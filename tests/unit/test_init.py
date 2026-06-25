@@ -287,7 +287,7 @@ def test_init_creates_skill_with_provenance_and_adopter_playbook_path(tmp_path):
     assert "`.gauntlet/prompts/prd-author.md`" in text
     assert S.PLAYBOOK_PLACEHOLDER not in text
     assert S.validate_skill_frontmatter(text) == []
-    assert S.classify_skill(text, ".gauntlet") == "generated"
+    assert S.classify_skill(text) == "generated"
 
 
 def test_init_skill_install_is_idempotent(tmp_path):
@@ -332,20 +332,44 @@ def test_init_refreshes_unmodified_generated_skill(tmp_path, monkeypatch):
     assert "template v2 line" in skill_file.read_text()
 
 
-def test_init_warns_on_stale_provenance_bearing_skill(tmp_path, monkeypatch):
-    # A generated skill whose asset_root later changed no longer matches the
-    # re-render (fail safe → customization), but it carries provenance and a
-    # drifted playbook path → init WARNS (naming the drift) and never modifies it.
+def test_init_refreshes_unmodified_generated_skill_on_asset_root_change(tmp_path):
+    # F-001: an *unmodified* generated skill whose resolved playbook path moved
+    # because the repo's asset_root changed is still a generated file and MUST be
+    # refreshed to the current configuration — not frozen as a customization and
+    # left stale. (Previously this case was misclassified and only WARNED.)
     init_repo(tmp_path)
     skill_file = tmp_path / S.SKILL_REL
     before = skill_file.read_text()  # references .gauntlet/prompts/prd-author.md
-    # Flip the repo's asset_root to "." so the rendered ref would now differ.
+    assert "`.gauntlet/prompts/prd-author.md`" in before
+    # Flip the repo's asset_root to "." so the rendered ref now differs.
+    cfg = tmp_path / ".gauntlet/config.yaml"
+    cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
+    result = init_repo(tmp_path)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == REFRESHED
+    after = skill_file.read_text()
+    assert "`prompts/prd-author.md`" in after
+    assert "`.gauntlet/prompts/prd-author.md`" not in after
+
+
+def test_init_warns_on_stale_provenance_bearing_customization(tmp_path):
+    # A *customized* (edited-body) skill that still carries provenance and whose
+    # playbook ref drifted after an asset_root change → init WARNS (naming the
+    # drift) and never modifies it. This is the genuine stale case; an unmodified
+    # generated file is refreshed instead (see the test above, F-001).
+    init_repo(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    # Edit the body so the file is a customization (no longer a clean rendering),
+    # while keeping the provenance frontmatter and the .gauntlet playbook ref.
+    custom = skill_file.read_text() + "\n<!-- hand-tuned by the maintainer -->\n"
+    skill_file.write_text(custom)
+    # Flip asset_root to "." so the customization's playbook ref is now stale.
     cfg = tmp_path / ".gauntlet/config.yaml"
     cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
     result = init_repo(tmp_path)
     actions = {a.path: a.action for a in result.actions}
     assert actions[S.SKILL_REL] == WARNED
-    assert skill_file.read_text() == before  # never modified
+    assert skill_file.read_text() == custom  # never modified
 
 
 def test_init_fails_closed_on_malformed_skill_state(tmp_path):

@@ -77,18 +77,25 @@ def test_parse_frontmatter_none_on_unfenced_or_nonmapping():
 
 def test_rendered_template_classifies_as_generated_for_its_asset_root():
     tmpl = S.current_template_path().read_text()
-    assert S.classify_skill(S.render_skill(tmpl, "."), ".") == "generated"
-    assert S.classify_skill(S.render_skill(tmpl, ".gauntlet"), ".gauntlet") == "generated"
+    assert S.classify_skill(S.render_skill(tmpl, ".")) == "generated"
+    assert S.classify_skill(S.render_skill(tmpl, ".gauntlet")) == "generated"
 
 
 def test_edited_or_provenance_stripped_skill_is_a_customization():
     tmpl = S.current_template_path().read_text()
     rendered = S.render_skill(tmpl, ".")
     # an edited body no longer byte-matches the re-render → customization
-    assert S.classify_skill(rendered + "\nmy custom note\n", ".") == "customization"
+    assert S.classify_skill(rendered + "\nmy custom note\n") == "customization"
     # provenance stripped → customization (fail safe to never-clobber)
     no_prov = rendered.replace("x-gauntlet-generated: true\n", "")
-    assert S.classify_skill(no_prov, ".") == "customization"
+    assert S.classify_skill(no_prov) == "customization"
+    # an edited *playbook ref* (no longer a value playbook_ref could produce) is a
+    # customization even though the rest of the body matches the template (F-001).
+    tampered = rendered.replace(
+        "`prompts/prd-author.md`", "`/etc/passwd`"
+    )
+    assert tampered != rendered
+    assert S.classify_skill(tampered) == "customization"
 
 
 def test_unknown_version_is_a_customization():
@@ -97,15 +104,21 @@ def test_unknown_version_is_a_customization():
         "x-gauntlet-template-version: 1", "x-gauntlet-template-version: 999"
     )
     assert S.version_template_path(999) is None
-    assert S.classify_skill(bumped, ".") == "customization"
+    assert S.classify_skill(bumped) == "customization"
 
 
-def test_generated_file_for_other_asset_root_is_a_customization_here():
-    # A skill generated for an adopter (.gauntlet) is NOT an unmodified generated
-    # file when re-rendered under asset_root "." — the playbook path differs.
+def test_generated_file_for_other_asset_root_is_recognized_generated():
+    # F-001: a skill generated for one asset_root is still an *unmodified
+    # generated* file when classified in a repo whose asset_root has since changed
+    # — recognition is independent of the current asset_root, so the file stays
+    # refreshable instead of being frozen as a customization.
     tmpl = S.current_template_path().read_text()
-    adopter = S.render_skill(tmpl, ".gauntlet")
-    assert S.classify_skill(adopter, ".") == "customization"
+    adopter = S.render_skill(tmpl, ".gauntlet")  # generated under asset_root .gauntlet
+    own = S.render_skill(tmpl, ".")              # generated under asset_root "."
+    # Either rendering classifies as generated regardless of the asset_root the
+    # current repo now uses.
+    assert S.classify_skill(adopter) == "generated"
+    assert S.classify_skill(own) == "generated"
 
 
 def test_skill_looks_stale_only_for_provenance_bearing_drift():
@@ -163,7 +176,7 @@ def test_own_committed_skill_matches_render_for_repo_asset_root():
     own = (REPO / S.SKILL_REL).read_text()
     expected = S.render_skill(S.current_template_path().read_text(), ".")
     assert own == expected
-    assert S.classify_skill(own, ".") == "generated"
+    assert S.classify_skill(own) == "generated"
     assert S.validate_skill_frontmatter(own) == []
 
 

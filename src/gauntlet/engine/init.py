@@ -346,7 +346,7 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
         # F-004): the same version-keyed re-render-and-compare predicate decides.
         if not target.exists():
             result.add(rel, MISSING)
-        elif S.classify_skill(target.read_text(), asset_root) == "customization":
+        elif S.classify_skill(target.read_text()) == "customization":
             result.add(rel, CUSTOMIZED, "committed skill is customized; left to the team")
         else:
             result.add(rel, PRESENT, "committed generated skill")
@@ -361,7 +361,7 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
         return
 
     existing = target.read_text()
-    if S.classify_skill(existing, asset_root) == "generated":
+    if S.classify_skill(existing) == "generated":
         # Unmodified generated file: refresh it when the current template or the
         # resolved playbook path has moved on (§4.5 — the only overwrite init does).
         if existing != rendered:

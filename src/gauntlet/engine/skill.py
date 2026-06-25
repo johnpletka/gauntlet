@@ -14,12 +14,15 @@ and later ``doctor`` (P3) build on:
   :func:`render_skill` substitutes the repository-relative playbook reference for
   the repo's ``asset_root`` so the committed file works after a clone/copy to any
   absolute location (FR-1.3).
-* **Provenance / refresh classification (§4.5, review F-004)** — recognition is a
-  *version-keyed re-render-and-compare*, not a flat checksum list, because the
+* **Provenance / refresh classification (§4.5, review F-004, F-001)** — recognition
+  is a *version-keyed re-render-and-compare*, not a flat checksum list, because the
   rendered playbook path is configuration-dependent. An installed file claiming
-  ``x-gauntlet-template-version: N`` is re-rendered from version N's template
-  under *this* repo's ``asset_root`` and compared byte-for-byte. Match → an
-  unmodified generated file (refreshable); any mismatch / missing provenance /
+  ``x-gauntlet-template-version: N`` is recognized as generated when it equals
+  version N's template rendered under *any* ``asset_root``; recognition is
+  deliberately independent of *this* repo's current ``asset_root`` so a file
+  generated under a prior ``asset_root`` stays an (unmodified, refreshable)
+  generated file rather than being frozen as a customization (review F-001). Match
+  → refreshable to the current configuration; any mismatch / missing provenance /
   unknown version → a customization (never clobbered). This fails safe toward
   never-clobber.
 * **Normative frontmatter schema (§6, OQ-2)** — :data:`SKILL_FRONTMATTER_SCHEMA`
@@ -198,15 +201,68 @@ def validate_skill_frontmatter(text: str) -> list[str]:
     ]
 
 
-def classify_skill(text: str, asset_root: str) -> str:
+def _asset_root_of_playbook_ref(ref: str) -> str | None:
+    """The ``asset_root`` a rendered playbook ``ref`` came from, or ``None`` if it
+    is not a canonical rendering. ``"prompts/prd-author.md"`` → ``"."``;
+    ``".gauntlet/prompts/prd-author.md"`` → ``".gauntlet"``. Used to confirm a
+    candidate substitution is a value :func:`playbook_ref` could actually produce,
+    not arbitrary edited text occupying the placeholder slot.
+    """
+    if ref == PLAYBOOK_REL:
+        return "."
+    tail = "/" + PLAYBOOK_REL
+    return ref[: -len(tail)] if ref.endswith(tail) else None
+
+
+def _is_generated_rendering(text: str, template_text: str) -> bool:
+    """True if ``text`` is an unmodified rendering of ``template_text`` under
+    *some* ``asset_root`` (review F-001).
+
+    Recognition is independent of *this* repo's current ``asset_root``: a file
+    generated under a previous ``asset_root`` (so it carries the old resolved
+    playbook path) is still an unmodified generated file and must stay
+    refreshable, not be misclassified as a customization. ``text`` qualifies iff
+    it equals ``template_text`` with every ``{{PLAYBOOK_PATH}}`` replaced by one
+    consistent value :func:`playbook_ref` could have produced.
+    """
+    segments = template_text.split(PLAYBOOK_PLACEHOLDER)
+    if len(segments) == 1:
+        return text == template_text  # template carries no placeholder
+    prefix, after = segments[0], segments[1]
+    if not text.startswith(prefix):
+        return False
+    rest = text[len(prefix):]
+    # The substituted value runs up to the literal segment following the first
+    # placeholder (or, if that segment is empty, up to the template's suffix).
+    if after:
+        idx = rest.find(after)
+        if idx == -1:
+            return False
+        value = rest[:idx]
+    else:
+        suffix = segments[-1]
+        if not rest.endswith(suffix):
+            return False
+        value = rest[: len(rest) - len(suffix)]
+    ar = _asset_root_of_playbook_ref(value)
+    if ar is None or playbook_ref(ar) != value:
+        return False
+    # Full reconstruction confirms the single consistent value across every
+    # placeholder occurrence (and that nothing else in the body was touched).
+    return text == template_text.replace(PLAYBOOK_PLACEHOLDER, value)
+
+
+def classify_skill(text: str) -> str:
     """Classify an installed SKILL.md as ``"generated"`` or ``"customization"``.
 
-    Version-keyed re-render-and-compare (§4.5, review F-004): a file claiming
+    Version-keyed re-render-and-compare (§4.5, review F-004), with recognition
+    *independent of the current ``asset_root``* (review F-001): a file claiming
     ``x-gauntlet-generated: true`` and a *known* ``x-gauntlet-template-version``
-    is re-rendered from that version's template under *this* repo's ``asset_root``
-    and compared byte-for-byte. Exact match → an unmodified generated file
-    (refreshable). Any mismatch, missing provenance, or unknown version →
-    a customization (never clobbered) — failing safe toward never-clobber.
+    is an unmodified generated file when it equals that version's template
+    rendered under *any* ``asset_root`` — so a file generated under a prior
+    ``asset_root`` stays refreshable rather than being frozen as a customization.
+    Any mismatch, missing provenance, or unknown version → a customization
+    (never clobbered) — failing safe toward never-clobber.
     """
     meta = parse_frontmatter(text)
     if not meta or meta.get("x-gauntlet-generated") is not True:
@@ -214,7 +270,7 @@ def classify_skill(text: str, asset_root: str) -> str:
     tmpl_path = version_template_path(meta.get("x-gauntlet-template-version"))
     if tmpl_path is None:
         return "customization"
-    return "generated" if text == render_skill(tmpl_path.read_text(), asset_root) else "customization"
+    return "generated" if _is_generated_rendering(text, tmpl_path.read_text()) else "customization"
 
 
 def skill_looks_stale(text: str, asset_root: str) -> bool:
