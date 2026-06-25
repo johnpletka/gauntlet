@@ -4,6 +4,52 @@ All notable changes to Gauntlet are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added — PRD-authoring aids (the repo teaches its own PRD conventions)
+
+Two committable aids make a fresh session — human or Claude — start PRD authoring
+from the right shape instead of from tribal knowledge. Both propagate via
+`gauntlet init` like every other asset, so a teammate who clones the repo
+inherits them (FR-1.2).
+
+- **PRD-authoring skill.** `gauntlet init` installs a project-level Claude Code
+  skill at `.claude/skills/gauntlet-prd-author/SKILL.md`. It triggers on
+  natural-language PRD intent ("write/draft/author a PRD", "start a Gauntlet
+  run") and routes the session to this repo's playbook and conventions. It is a
+  **thin pointer** to `prompts/prd-author.md` (resolved under the repo's
+  `asset_root`) — never a copy — so the single instruction source can't drift.
+  The playbook reference is repository-relative, so the committed skill keeps
+  resolving after a clone or copy to a different absolute path.
+- **Structured `gauntlet new` stub.** The PRD stub is now one committable
+  template (`<asset_root>/prd-stub.md`) carrying the playbook's full section
+  skeleton plus one-line guidance per section. Both `gauntlet new` and the
+  `gauntlet run` entry-contract gate resolve the *same* template (repo copy if
+  present, else the packaged default), so they can never disagree about what an
+  unfilled stub is.
+- **The human-author gate is unchanged and hardened.** The richer stub keeps the
+  FR-10.1 marker, and a deterministic authored-content predicate rejects every
+  trivial edit (whitespace-, comment-, or heading-only). Because the stub
+  template is now a gate input, both consumers validate it against template
+  invariants (exactly one marker, every mandatory section, required metadata
+  labels) and **fail closed** — a malformed customization can't silently disable
+  the gate.
+- **Idempotent, never-clobber propagation.** A re-run creates whichever aid is
+  missing, refreshes an *unmodified generated* file to the current template after
+  a version bump, and never overwrites a customization. `gauntlet init
+  --from-repo` reports each aid as present / missing / customized without
+  writing. Malformed pre-existing state (a non-regular or symlinked destination)
+  fails the run closed before any write.
+- **Committability + `doctor` check.** `init` warns (without editing the rule) if
+  a foreign ignore source — repo/parent `.gitignore`, `.git/info/exclude`, or the
+  global `core.excludesFile` — would exclude the skill from git. `gauntlet doctor`
+  gains a **warn-only** skill check (the skill gates nothing, so it never FAILs):
+  it warns when the skill is missing, malformed against the pinned frontmatter
+  schema, or its provenance looks stale.
+- **`gauntlet new` pointer (OQ-4).** `gauntlet new` now prints a CLI-agnostic
+  pointer to the playbook and skill, reinforcing the convention outside a
+  skill-aware Claude session.
+
 ## [0.2.0] — 2026-06-19
 
 A significant feature release. The headline is the **Gauntlet Console** — a

@@ -11,10 +11,18 @@
 # test_pipeline_contract / test_judge_live all green); the flag observations
 # below still hold. The historical "2.1.172" references in the prose notes
 # are left as the original audit record of when each behavior was first seen.
-verified_date: "2026-06-14"
+#
+# 2026-06-24: claude CLI re-pinned 2.1.177 -> 2.1.190 after another local
+# auto-update, surfaced by the prd-authoring-aids review (finding F-001):
+# FR-1.6 must be validated on the *pinned* version, and the FR-1.6 trigger was
+# observed PASS on 2.1.190 (BOOTSTRAP-NOTES #47/#49). The integration contract
+# suite was re-run on 2.1.190; result recorded in BOOTSTRAP-NOTES #51. The flag
+# observations below are carried forward from 2.1.177 (no flag-surface change
+# observed); re-record if a flag's behavior shifts.
+verified_date: "2026-06-24"
 clis:
   claude:
-    version: "2.1.177"
+    version: "2.1.190"
     verified_flags:
       - flag: "-p --output-format json (prompt via stdin)"
         verified: >-

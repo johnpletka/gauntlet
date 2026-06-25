@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +79,9 @@ SKIPPED = "skipped"      # asset already present; left untouched (idempotent)
 WIRED = "wired"          # hook wiring / gitignore guidance added
 PRESENT = "present"      # wiring already in place; nothing to do
 MISSING = "missing"      # --from-repo: a required committed asset is absent
+REFRESHED = "refreshed"  # an unmodified generated file updated to the current template (§4.5)
+WARNED = "warned"        # advisory: a customization that looks stale; left untouched
+CUSTOMIZED = "customized"  # --from-repo: a committed aid the team has customized (present, not generated)
 
 
 @dataclass(frozen=True)
@@ -113,9 +117,105 @@ def _asset_pairs() -> list[tuple[Path, str]]:
     return pairs
 
 
+def _guard_regular_destination(repo_root: Path, rel: str) -> None:
+    """Fail closed if a generated destination is unsafe to write (review F-001).
+
+    ``Path.exists()``/``is_file()`` dereference symlinks, so a dangling
+    ``<asset_root>/prd-stub.md`` symlink reads as *absent*, reaches
+    ``shutil.copyfile``, and writes *through* the link — outside the repository;
+    a symlink pointing at a regular file would likewise be accepted as valid
+    state. Checking only the destination leaf is insufficient: a symlinked
+    *parent* directory (e.g. ``.gauntlet`` → an external dir) leaves the leaf a
+    non-symlink, yet ``mkdir``/``write_text``/``copyfile`` still follow the parent
+    link and mutate paths outside the repo. We therefore:
+
+    1. reject a symlink at any existing path component between ``repo_root`` and
+       the destination via :meth:`Path.is_symlink` (which does not dereference) —
+       ``repo_root`` itself is excluded, since a repo legitimately rooted on a
+       symlinked path (e.g. a macOS worktree under ``/var``) is not our concern;
+    2. reject a non-regular leaf (directory, FIFO, …) once symlinks are ruled out;
+    3. verify the resolved destination remains contained within the resolved
+       repository root (defense in depth).
+    """
+    target = repo_root / rel
+    current = repo_root
+    for part in Path(rel).parts[:-1]:  # parent components only; leaf handled below
+        current = current / part
+        if current.is_symlink():
+            raise InitError(
+                f"{rel} has a symlinked parent directory "
+                f"({current.relative_to(repo_root).as_posix()}); refusing to "
+                "write through it (it may resolve outside the repository). Move "
+                "it aside and re-run `gauntlet init`."
+            )
+    if target.is_symlink():
+        raise InitError(
+            f"{rel} is a symlink; refusing to write through it (it may resolve "
+            "outside the repository). Move it aside and re-run `gauntlet init`."
+        )
+    if target.exists() and not target.is_file():
+        raise InitError(
+            f"{rel} exists but is not a regular file; refusing to clobber "
+            "unexpected state. Move it aside and re-run `gauntlet init`."
+        )
+    # With no symlinked component, ``target`` resolves inside the repo; assert it
+    # so any path that still escapes (e.g. ``..`` traversal in a future caller)
+    # fails closed rather than writing outside the tree.
+    repo_resolved = repo_root.resolve()
+    resolved = target.resolve()
+    if resolved != repo_resolved and repo_resolved not in resolved.parents:
+        raise InitError(
+            f"{rel} resolves outside the repository ({resolved}); refusing to "
+            "write. Move it aside and re-run `gauntlet init`."
+        )
+
+
+def _effective_asset_root(repo_root: Path, *, from_repo: bool) -> str:
+    """The ``asset_root`` that will be in force when the skill/stub install.
+
+    On an existing repo (or any ``--from-repo`` run) it is the configured value;
+    on a fresh scaffold it is the ``asset_root`` of the config ``init`` is about
+    to write (the scaffold default), since the skill/stub land *after* that write.
+    Used by the preflight so it guards the destinations init will actually touch.
+    """
+    cfg = repo_root / ".gauntlet" / "config.yaml"
+    if from_repo or cfg.exists():
+        return _resolve_asset_root(repo_root)
+    try:
+        from gauntlet.engine.config import RunConfig
+
+        return RunConfig.load(SCAFFOLD_DIR / "config.yaml").asset_root
+    except Exception:
+        return "."
+
+
+def _preflight_destinations(repo_root: Path, *, from_repo: bool) -> None:
+    """Reject every malformed generated destination BEFORE any write (review F-005).
+
+    A non-regular or symlinked target must abort ``init`` *without* mutating the
+    repo — otherwise a fresh repo with a pre-existing malformed stub destination
+    gets numerous files written and only then raises. The skill and stub are
+    checked in both modes (an adopter repo may already carry them); the asset
+    files only on a fresh scaffold, since ``--from-repo`` never writes them.
+    """
+    from gauntlet.engine import prd_stub as PS
+    from gauntlet.engine import skill as S
+
+    asset_root = _effective_asset_root(repo_root, from_repo=from_repo)
+    rels = [S.SKILL_REL, PS.stub_rel(asset_root)]
+    if not from_repo:
+        rels = [dst for _src, dst in _asset_pairs()] + rels
+    for rel in rels:
+        _guard_regular_destination(repo_root, rel)
+
+
 def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
     """Scaffold (or verify) the Gauntlet assets and wiring in ``repo_root``."""
     result = InitResult()
+
+    # Fail closed on malformed pre-existing state BEFORE any write (review F-005):
+    # a symlinked/non-regular destination aborts init without mutating the repo.
+    _preflight_destinations(repo_root, from_repo=from_repo)
 
     for src, dst_rel in _asset_pairs():
         target = repo_root / dst_rel
@@ -133,9 +233,15 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
         shutil.copyfile(src, target)
         result.add(dst_rel, CREATED)
 
+    # The skill resolves its playbook reference under the repo's asset_root, so
+    # install it after the config (which carries asset_root) has been written.
+    _scaffold_skill(repo_root, result, from_repo=from_repo)
+    # The structured stub template installs under the same asset_root (§4.3).
+    _scaffold_stub(repo_root, result, from_repo=from_repo)
     _wire_claude_hook(repo_root, result)
     _wire_codex_hook(repo_root, result, from_repo=from_repo)
     _ensure_gitignore_guidance(repo_root, result)
+    _warn_if_skill_ignored(repo_root, result)
     return result
 
 
@@ -192,6 +298,144 @@ def _scaffold_config(
         )
     target.write_text(new_text)
     result.add(dst_rel, CREATED, detection.note)
+
+
+def _resolve_asset_root(repo_root: Path) -> str:
+    """The repo's configured ``asset_root`` (default ``"."``).
+
+    The skill's playbook reference is rendered under this root (FR-1.3). On a
+    fresh ``init`` the scaffolded ``.gauntlet/config.yaml`` already carries the
+    adopter default (``.gauntlet``); Gauntlet's own repo pins ``"."``. An absent
+    or unreadable config falls back to ``"."`` — the engine's own default — so a
+    transient config fault never aborts skill install (the skill gates nothing).
+    """
+    cfg = repo_root / ".gauntlet" / "config.yaml"
+    if cfg.exists():
+        try:
+            from gauntlet.engine.config import RunConfig
+
+            return RunConfig.load(cfg).asset_root
+        except Exception:
+            pass
+    return "."
+
+
+def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
+    """Install the committable ``gauntlet-prd-author`` skill (FR-1.1, §4.5).
+
+    Posture mirrors the judge-hook wiring: create-if-absent, idempotent,
+    never-clobber a customization, fail-closed on malformed pre-existing state.
+    Recognition of a prior-generated file is the version-keyed
+    re-render-and-compare in :mod:`gauntlet.engine.skill` (review F-004), so an
+    *unmodified* generated file may be refreshed to the current template/path
+    (§4.5) while a customization is only ever warned about, never modified.
+    """
+    from gauntlet.engine import skill as S
+
+    rel = S.SKILL_REL
+    target = repo_root / rel
+    asset_root = _resolve_asset_root(repo_root)
+    # Malformed pre-existing state (a symlink or non-regular node at the skill
+    # path) is rejected in _preflight_destinations before any write (FR-3.2 /
+    # review F-001, F-005), so the destination here is absent or a regular file.
+
+    if from_repo:
+        # The committed skill is authoritative; never write it. Report
+        # present/missing/customized so `--from-repo`'s classification cannot
+        # disagree with what a write-mode re-run would refresh (FR-3.1, review
+        # F-004): the same version-keyed re-render-and-compare predicate decides.
+        if not target.exists():
+            result.add(rel, MISSING)
+        elif S.classify_skill(target.read_text()) == "customization":
+            result.add(rel, CUSTOMIZED, "committed skill is customized; left to the team")
+        else:
+            result.add(rel, PRESENT, "committed generated skill")
+        return
+
+    rendered = S.render_skill(S.current_template_path().read_text(), asset_root)
+
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered)
+        result.add(rel, CREATED, "PRD-authoring skill (thin pointer)")
+        return
+
+    existing = target.read_text()
+    if S.classify_skill(existing) == "generated":
+        # Unmodified generated file: refresh it when the current template or the
+        # resolved playbook path has moved on (§4.5 — the only overwrite init does).
+        if existing != rendered:
+            target.write_text(rendered)
+            result.add(rel, REFRESHED, "updated unmodified generated skill to current template")
+        else:
+            result.add(rel, SKIPPED, "generated skill up to date")
+        return
+
+    # A customization: never overwrite. Warn (only) when it looks stale (§4.5).
+    if S.skill_looks_stale(existing, asset_root):
+        result.add(
+            rel, WARNED,
+            f"customized skill looks stale: playbook ref {S.playbook_ref(asset_root)!r} "
+            "not found; review it (re-run does not modify a customization)",
+        )
+    else:
+        result.add(rel, SKIPPED, "customized; left unchanged")
+
+
+def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
+    """Install the structured PRD stub template to ``<asset_root>/prd-stub.md`` (§4.3).
+
+    Posture mirrors the skill installer: create-if-absent, idempotent, never-clobber
+    a customization, fail-closed via :class:`InitError` on malformed pre-existing
+    state (rejected in :func:`_preflight_destinations` before any write — FR-3.2 /
+    review F-005). Recognition of a prior-generated stub is the version-keyed
+    compare in :func:`prd_stub.classify_stub` (review F-004), so an *unmodified*
+    generated stub may be refreshed to the current template on a version bump (§4.5)
+    while a customization is left byte-for-byte intact. ``--from-repo`` reports
+    present/missing/customized via the same predicate (FR-3.1).
+    """
+    from gauntlet.engine import prd_stub as PS
+
+    asset_root = _resolve_asset_root(repo_root)
+    rel = PS.stub_rel(asset_root)
+    target = repo_root / rel
+    # Malformed pre-existing state (a symlink or non-regular node at the stub
+    # path) is rejected in _preflight_destinations before any write (FR-3.2 /
+    # review F-001, F-005), so the destination here is absent or a regular file.
+
+    if from_repo:
+        # The committed stub is authoritative; never write it — report
+        # present/missing/customized via the same predicate a write-mode re-run
+        # would use, so the two can never disagree (FR-3.1, review F-004).
+        if not target.exists():
+            result.add(rel, MISSING)
+        elif PS.classify_stub(target.read_text()) == "customization":
+            result.add(rel, CUSTOMIZED, "committed stub is customized; left to the team")
+        else:
+            result.add(rel, PRESENT, "committed generated stub")
+        return
+
+    current = PS.packaged_stub_path().read_text()
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(current)
+        result.add(rel, CREATED, "structured PRD stub template")
+        return
+
+    existing = target.read_text()
+    if PS.classify_stub(existing) == "generated":
+        # Unmodified generated stub: refresh it when the current template has moved
+        # on (a version bump), and never otherwise (§4.5 — the only overwrite init
+        # performs). The stub has no asset_root-dependent path, so unlike the skill
+        # there is no stale-warning case for a customization — it is simply kept.
+        if existing != current:
+            target.write_text(current)
+            result.add(rel, REFRESHED, "updated unmodified generated stub to current template")
+        else:
+            result.add(rel, SKIPPED, "generated stub up to date")
+        return
+
+    result.add(rel, SKIPPED, "customized; left unchanged")
 
 
 def _hook_entry() -> dict:
@@ -271,6 +515,44 @@ def _wire_codex_hook(repo_root: Path, result: InitResult, *, from_repo: bool) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(SCAFFOLD_DIR / "codex-hooks.json", path)
     result.add(rel, WIRED if from_repo else CREATED, "inert on pinned codex; forward-looking")
+
+
+def _warn_if_skill_ignored(repo_root: Path, result: InitResult) -> None:
+    """Warn (never edit) if a foreign ignore rule would exclude the skill (FR-1.4).
+
+    ``init``'s own ``.gitignore`` guidance never excludes ``.claude/skills/``, but a
+    repo ``.gitignore``, a parent-directory ``.gitignore``, ``.git/info/exclude``,
+    or the global ``core.excludesFile`` might — and a silently-ignored skill never
+    reaches a teammate's clone (defeating G4/FR-1.2). We ask git itself
+    (``git check-ignore -v``, which consults *every* effective ignore source) and,
+    when a rule matches, emit a WARNING naming the rule's source plus the
+    remediation. We do **not** edit a maintainer's foreign rule — that is their
+    call. When git is unavailable or this is not a work tree there is nothing to
+    check (and the skill gates nothing), so we stay silent.
+    """
+    from gauntlet.engine import skill as S
+
+    rel = S.SKILL_REL
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "-v", rel],
+            cwd=repo_root, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    # git check-ignore: 0 = a rule matches (ignored); 1 = committable (the good
+    # case); 128 = not a work tree / fatal. Only an actual match is worth warning.
+    if proc.returncode != 0:
+        return
+    first = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
+    # `-v` format is "<source>:<linenum>:<pattern>\t<pathname>"; the source is the
+    # ignore file the maintainer owns (or the global core.excludesFile path).
+    source = first.split(":", 1)[0] if first else "an effective .gitignore rule"
+    result.add(
+        rel, WARNED,
+        f"would be excluded by {source}; the committable skill must reach git — "
+        "commit it with `git add -f` or amend that ignore rule (init left it intact)",
+    )
 
 
 def _ensure_gitignore_guidance(repo_root: Path, result: InitResult) -> None:

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from gauntlet.engine import skill as S
 from gauntlet.engine.doctor import (
     FAIL,
     OK,
@@ -411,3 +412,123 @@ def test_version_check_surfaces_gauntlet_version(tmp_path):
     ver = _by_name(results)["gauntlet"]
     assert ver.status == OK
     assert "version" in ver.detail
+
+
+# ---- P3: doctor warn-only PRD-authoring skill check (FR-1.5, OQ-3) ----------
+
+def test_skill_check_ok_when_well_formed(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert _by_name(results)["prd-skill"].status == OK
+
+
+def test_skill_check_warns_and_never_fails_when_missing(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / S.SKILL_REL).unlink()
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN  # the skill gates nothing — never a blocker
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_on_malformed_frontmatter(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / S.SKILL_REL).write_text("no frontmatter at all\n")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_on_stale_provenance(tmp_path):
+    # A *customized* skill (edited body) that carries provenance and whose playbook
+    # ref drifted after an asset_root change → classify=customization + looks_stale
+    # → WARN (§4.5). An unmodified generated file is recognized as generated and is
+    # refreshable instead of stale (F-001); see the test below.
+    repo = _healthy_repo(tmp_path)
+    skill_file = repo / S.SKILL_REL
+    skill_file.write_text(skill_file.read_text() + "\n<!-- maintainer note -->\n")
+    cfg = repo / ".gauntlet/config.yaml"
+    cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert "stale" in skill.detail.lower()
+
+
+def test_skill_check_ok_for_unmodified_generated_after_asset_root_change(tmp_path):
+    # F-001: an unmodified generated skill whose asset_root later changed is still
+    # a generated file (refreshable by `gauntlet init`), so doctor does not flag it
+    # as a stale customization — it is not misclassified as a customization.
+    repo = _healthy_repo(tmp_path)
+    cfg = repo / ".gauntlet/config.yaml"
+    cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status != FAIL
+    assert "stale" not in skill.detail.lower()
+
+
+def test_skill_check_warns_and_never_fails_on_non_utf8(tmp_path):
+    # F-002: a non-UTF-8 SKILL.md must not crash the warn-only check (FR-1.5).
+    repo = _healthy_repo(tmp_path)
+    (repo / S.SKILL_REL).write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_and_never_fails_on_unreadable(tmp_path):
+    # F-002: an unreadable SKILL.md (PermissionError) must WARN, not hard-fail.
+    import os
+
+    if os.geteuid() == 0:
+        import pytest
+
+        pytest.skip("root can read any file regardless of mode")
+    repo = _healthy_repo(tmp_path)
+    skill_file = repo / S.SKILL_REL
+    skill_file.chmod(0o000)
+    try:
+        results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    finally:
+        skill_file.chmod(0o644)  # restore so tmp cleanup can proceed
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_and_does_not_dereference_symlinked_leaf(tmp_path):
+    # F-003: a symlinked skill path must not be dereferenced — doctor WARNs without
+    # reading the (possibly external) target, so its contents never reach output.
+    repo = _healthy_repo(tmp_path)
+    skill_file = repo / S.SKILL_REL
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret outside the repo\n")
+    skill_file.unlink()
+    skill_file.symlink_to(outside)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+    assert "symlink" in skill.detail.lower()
+    assert "secret" not in skill.detail
+
+
+def test_skill_check_warns_and_does_not_dereference_symlinked_parent(tmp_path):
+    # F-003: a symlinked *parent* directory must also abort dereferencing — the
+    # leaf is a regular file but reading it would follow the parent link out.
+    repo = _healthy_repo(tmp_path)
+    skills_dir = repo / ".claude/skills"
+    outside_dir = tmp_path / "outside_skills"
+    # Move the real skill tree outside and point .claude/skills at it via symlink.
+    import shutil
+
+    shutil.move(str(skills_dir), str(outside_dir))
+    skills_dir.symlink_to(outside_dir)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+    assert "symlink" in skill.detail.lower()

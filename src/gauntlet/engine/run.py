@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import gitops, manifest as M, prd_stub
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.execution import run_bookkeeping_excludes
 from gauntlet.engine.identity import resolve_operator_identity
@@ -51,20 +51,11 @@ RESERVATION_FILENAME = "reservation"
 _LOCK_ACQUIRE_RETRIES = 50
 
 # Marker written into a scaffolded PRD; the entry contract refuses to run while
-# it is still present (FR-10.1 / review OQ-1: existence + non-stub-ness).
-PRD_STUB_MARKER = "<!-- GAUNTLET-PRD-STUB: replace this file with a real PRD -->"
-
-_PRD_STUB = f"""{PRD_STUB_MARKER}
-# PRD: <title>
-
-> Gauntlet does not author PRDs (FR-10.1). Replace this stub with a real,
-> human-authored PRD, then run `gauntlet run <slug>`. The run refuses to start
-> while this marker is present.
-
-## Problem statement
-
-## Requirements
-"""
+# it is still present (FR-10.1 / review OQ-1: existence + non-stub-ness). The
+# marker, the single committable stub template, the §6 manifest parser, and the
+# fail-closed gate now all live in :mod:`gauntlet.engine.prd_stub` (P2); it is
+# re-exported here so existing importers keep working.
+PRD_STUB_MARKER = prd_stub.PRD_STUB_MARKER
 
 
 class EntryContractError(RuntimeError):
@@ -186,14 +177,6 @@ _TERMINAL_RUN_STATES = frozenset({M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED})
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-
-
-def _strip_marker(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if PRD_STUB_MARKER not in line)
-
-
-def _normalize(text: str) -> str:
-    return "\n".join(line.strip() for line in text.strip().splitlines() if line.strip())
 
 
 @dataclass
@@ -326,7 +309,15 @@ class RunManager:
         layout = self.layout(slug)
         layout.slug_dir.mkdir(parents=True, exist_ok=True)
         if not layout.prd_path.exists():
-            layout.prd_path.write_text(_PRD_STUB)
+            # Source the stub from the single resolved template (§4.3) and refuse
+            # to scaffold from a malformed one (FR-2.1/§4.4/FR-3.3): a broken
+            # gate-input template must never seed a new PRD.
+            template, src = prd_stub.resolve_stub_template(
+                self.repo_root, self.config.asset_root
+            )
+            manifest = prd_stub.resolve_manifest(self.repo_root, self.config.asset_root)
+            prd_stub.validate_template(template, manifest, source=src)
+            layout.prd_path.write_text(template)
         return layout.prd_path
 
     # ---- entry contract (FR-10.1) -------------------------------------------
@@ -337,19 +328,29 @@ class RunManager:
                 f"{layout.prd_path} does not exist; `gauntlet new {slug}` scaffolds "
                 "a stub for a human to author (FR-10.1)"
             )
+        # Resolve the SAME stub template `new` would write (§4.3) and validate it
+        # against the §4.4 invariants first (FR-3.3): a malformed gate-input
+        # template is treated as "cannot prove human-authored", never "authored".
+        template, src = prd_stub.resolve_stub_template(
+            self.repo_root, self.config.asset_root
+        )
+        manifest = prd_stub.resolve_manifest(self.repo_root, self.config.asset_root)
+        prd_stub.validate_template(template, manifest, source=src)
+
         content = layout.prd_path.read_text()
         if PRD_STUB_MARKER in content:
             raise EntryContractError(
                 f"{layout.prd_path} is still the scaffolded stub; a human must "
                 "author the PRD before a run can start (FR-10.1)"
             )
-        # Deleting only the marker line leaves the rest of the scaffold intact —
-        # still not a human-authored PRD. Compare the whole body, marker-stripped
-        # and whitespace-normalized, against the stub (review F-007).
-        if _normalize(content) == _normalize(_strip_marker(_PRD_STUB)):
+        # FR-2.4 authored-content predicate: deleting only the marker (or editing
+        # only comments / headings / whitespace) leaves the scaffold un-authored.
+        if not prd_stub.has_authored_content(content, template):
             raise EntryContractError(
-                f"{layout.prd_path} is the scaffolded stub with only the marker "
-                "removed; a human must author a real PRD before a run (FR-10.1)"
+                f"{layout.prd_path} is the scaffolded stub with no authored "
+                "content (only the marker removed and/or trivial comment/heading/"
+                "whitespace edits); a human must author a real PRD before a run "
+                "(FR-10.1)"
             )
 
     def _resolve_base_branch(self) -> str:
