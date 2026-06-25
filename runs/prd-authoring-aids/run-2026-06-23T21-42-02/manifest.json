@@ -349,7 +349,16 @@
       "attempts": 1,
       "base_sha": "b78d8f94768a245c1d11359c22b45c56b582332b",
       "parked_reason": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "impl-cycle-resp-1",
+          "response_text": "F-003 ruling — DECLINE (not_applicable for the automated cycle). The integration suite (`uv run pytest -m integration`) is a MANUAL pre-handoff gate the operator runs locally (CLAUDE.md §3); CI and the automated review cycle run `pytest -m 'not integration'` only (PRD §8). An automated fix-round commit is therefore NOT required to persist an integration-suite result, and the round-1 fix commit (51995ed8) stands: the unit suite passed (tests.1 green) and the integration gate is the operator's responsibility at handoff, recorded out-of-band. Do not treat F-003 as blocking — classify it not_applicable/reject and converge. If you surface genuinely NEW blocking code defects in the P2 diff, raise those normally.",
+          "timestamp": "2026-06-25T04:46:48.484399+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 921842,
         "output_tokens": 73697,
