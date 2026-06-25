@@ -76,11 +76,22 @@ def test_entry_contract_refuses_marker_only_removed(fixture_repo):
 
 # --- P2: structured stub is the §6 manifest skeleton (FR-2.1, FR-2.2) --------
 
+def _guidance_comment_after(content: str, heading: str) -> str:
+    """The first non-blank line after ``heading`` (its one-line guidance comment)."""
+    lines = content.splitlines()
+    idx = lines.index(heading)
+    for ln in lines[idx + 1:]:
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
 def test_new_scaffolds_full_section_skeleton(fixture_repo):
-    # FR-2.1 / review F-003: a freshly scaffolded prd.md contains EVERY §6
+    # FR-2.1 / review F-003, F-006: a freshly scaffolded prd.md contains EVERY §6
     # manifest header — both mandatory AND scale-with-size — each with a one-line
     # guidance comment, and exactly one marker. Asserting only the mandatory
-    # subset would let an implementation drop every scale-with-size section.
+    # subset would let an implementation drop every scale-with-size section, and
+    # asserting only section names would let it drop the guidance comments.
     from gauntlet.engine import prd_stub as PS
     from gauntlet.engine.run import PRD_STUB_MARKER
 
@@ -93,6 +104,20 @@ def test_new_scaffolds_full_section_skeleton(fixture_repo):
     assert PS.stub_section_names(content) == [e.name for e in manifest]
     # both classes are represented (not mandatory-only)
     assert {e.cls for e in manifest} == {PS.MANDATORY, PS.SCALE}
+    # F-006: EVERY '##' section heading is immediately followed by a one-line
+    # HTML guidance comment (not just present in the marker count).
+    h2_headings = [ln for ln in content.splitlines() if ln.startswith("## ")]
+    assert len(h2_headings) >= 1
+    for heading in h2_headings:
+        guidance = _guidance_comment_after(content, heading)
+        assert guidance.startswith("<!--") and guidance.endswith("-->"), (
+            f"section {heading!r} lacks its one-line guidance comment; got {guidance!r}"
+        )
+    # the header-block (not a heading) also carries a guidance comment of its own
+    assert any(
+        ln.strip().startswith("<!--") and "Header block" in ln
+        for ln in content.splitlines()
+    ), "header block lacks its one-line guidance comment"
 
 
 def test_scaffold_and_entry_contract_read_the_same_resolved_source(fixture_repo):
@@ -107,9 +132,9 @@ def test_scaffold_and_entry_contract_read_the_same_resolved_source(fixture_repo)
 
 
 def test_drift_guard_trips_when_playbook_section_changes(fixture_repo):
-    # FR-2.2: the drift test is driven off the PARSED playbook, so adding,
-    # renaming, or removing a heading of EITHER class (mandatory or scale-with-
-    # size) in the playbook trips it (the stub no longer mirrors the manifest).
+    # FR-2.2 / review F-006: the drift test is driven off the PARSED playbook, so
+    # adding, renaming, OR removing a heading of EITHER class (mandatory or scale-
+    # with-size) trips it — all six class/mutation combinations, not a subset.
     from gauntlet.engine import prd_stub as PS
 
     mgr = _prepare(fixture_repo)
@@ -118,15 +143,35 @@ def test_drift_guard_trips_when_playbook_section_changes(fixture_repo):
     base = PS.parse_manifest(playbook)
     assert PS.stub_section_names(stub) == [e.name for e in base]  # aligned today
 
-    # add (mandatory), rename (scale-with-size), remove (mandatory) — each breaks
-    add = playbook.replace(
-        "**§11 Open Questions**", "**§11.5 Brand New** *(mandatory)*\n\n**§11 Open Questions**"
-    )
-    rename = playbook.replace("**§3 Users and Personas**", "**§3 Stakeholders**")
-    remove = playbook.replace("**§9 Success Metrics** *(mandatory)*", "removed line")
-    for mutated in (add, rename, remove):
+    mutations = {
+        # add — for each class
+        "add-mandatory": playbook.replace(
+            "**§11 Open Questions**",
+            "**§11.5 Brand New** *(mandatory)*\n\n**§11 Open Questions**",
+        ),
+        "add-scale": playbook.replace(
+            "**§11 Open Questions**",
+            "**§11.6 Extra Notes** *(scale-with-size)*\n\n**§11 Open Questions**",
+        ),
+        # rename — for each class
+        "rename-mandatory": playbook.replace(
+            "**§5 Functional Requirements**", "**§5 Core Requirements**"
+        ),
+        "rename-scale": playbook.replace(
+            "**§3 Users and Personas**", "**§3 Stakeholders**"
+        ),
+        # remove — for each class (drop the whole bold-paragraph entry)
+        "remove-mandatory": playbook.replace(
+            "**§9 Success Metrics** *(mandatory)*", "removed line"
+        ),
+        "remove-scale": playbook.replace(
+            "**§10 Risks & Mitigations** *(scale-with-size)*", "removed line"
+        ),
+    }
+    for label, mutated in mutations.items():
+        assert mutated != playbook, f"{label}: mutation did not change the playbook"
         mutated_manifest = PS.parse_manifest(mutated)
-        assert PS.stub_section_names(stub) != [e.name for e in mutated_manifest]
+        assert PS.stub_section_names(stub) != [e.name for e in mutated_manifest], label
 
 
 # --- P2: §4.4 header-block invariant (review F-006) --------------------------

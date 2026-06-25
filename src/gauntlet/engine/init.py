@@ -115,9 +115,75 @@ def _asset_pairs() -> list[tuple[Path, str]]:
     return pairs
 
 
+def _guard_regular_destination(target: Path, rel: str) -> None:
+    """Fail closed if a generated destination is a symlink or a non-regular node.
+
+    ``Path.exists()``/``is_file()`` dereference symlinks (review F-001), so a
+    dangling ``<asset_root>/prd-stub.md`` symlink reads as *absent*, reaches
+    ``shutil.copyfile``, and writes *through* the link — outside the repository;
+    a symlink pointing at a regular file would likewise be accepted as valid
+    state. We therefore reject every symlink via :meth:`Path.is_symlink` (which
+    does not dereference) *before* the ``exists()``/``is_file()`` check that rules
+    out directories, FIFOs, and other non-regular nodes.
+    """
+    if target.is_symlink():
+        raise InitError(
+            f"{rel} is a symlink; refusing to write through it (it may resolve "
+            "outside the repository). Move it aside and re-run `gauntlet init`."
+        )
+    if target.exists() and not target.is_file():
+        raise InitError(
+            f"{rel} exists but is not a regular file; refusing to clobber "
+            "unexpected state. Move it aside and re-run `gauntlet init`."
+        )
+
+
+def _effective_asset_root(repo_root: Path, *, from_repo: bool) -> str:
+    """The ``asset_root`` that will be in force when the skill/stub install.
+
+    On an existing repo (or any ``--from-repo`` run) it is the configured value;
+    on a fresh scaffold it is the ``asset_root`` of the config ``init`` is about
+    to write (the scaffold default), since the skill/stub land *after* that write.
+    Used by the preflight so it guards the destinations init will actually touch.
+    """
+    cfg = repo_root / ".gauntlet" / "config.yaml"
+    if from_repo or cfg.exists():
+        return _resolve_asset_root(repo_root)
+    try:
+        from gauntlet.engine.config import RunConfig
+
+        return RunConfig.load(SCAFFOLD_DIR / "config.yaml").asset_root
+    except Exception:
+        return "."
+
+
+def _preflight_destinations(repo_root: Path, *, from_repo: bool) -> None:
+    """Reject every malformed generated destination BEFORE any write (review F-005).
+
+    A non-regular or symlinked target must abort ``init`` *without* mutating the
+    repo — otherwise a fresh repo with a pre-existing malformed stub destination
+    gets numerous files written and only then raises. The skill and stub are
+    checked in both modes (an adopter repo may already carry them); the asset
+    files only on a fresh scaffold, since ``--from-repo`` never writes them.
+    """
+    from gauntlet.engine import prd_stub as PS
+    from gauntlet.engine import skill as S
+
+    asset_root = _effective_asset_root(repo_root, from_repo=from_repo)
+    rels = [S.SKILL_REL, PS.stub_rel(asset_root)]
+    if not from_repo:
+        rels = [dst for _src, dst in _asset_pairs()] + rels
+    for rel in rels:
+        _guard_regular_destination(repo_root / rel, rel)
+
+
 def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
     """Scaffold (or verify) the Gauntlet assets and wiring in ``repo_root``."""
     result = InitResult()
+
+    # Fail closed on malformed pre-existing state BEFORE any write (review F-005):
+    # a symlinked/non-regular destination aborts init without mutating the repo.
+    _preflight_destinations(repo_root, from_repo=from_repo)
 
     for src, dst_rel in _asset_pairs():
         target = repo_root / dst_rel
@@ -235,13 +301,9 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
 
     rel = S.SKILL_REL
     target = repo_root / rel
-    # Fail closed on malformed pre-existing state (FR-3.2): a non-regular node at
-    # the skill path must never be silently clobbered, mirroring _wire_claude_hook.
-    if target.exists() and not target.is_file():
-        raise InitError(
-            f"{rel} exists but is not a regular file; refusing to clobber "
-            "unexpected state. Move it aside and re-run `gauntlet init`."
-        )
+    # Malformed pre-existing state (a symlink or non-regular node at the skill
+    # path) is rejected in _preflight_destinations before any write (FR-3.2 /
+    # review F-001, F-005), so the destination here is absent or a regular file.
 
     if from_repo:
         # The committed skill is authoritative; never write it (full
@@ -295,13 +357,9 @@ def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> N
     asset_root = _resolve_asset_root(repo_root)
     rel = PS.stub_rel(asset_root)
     target = repo_root / rel
-    # Fail closed on malformed pre-existing state (FR-3.2): a non-regular node at
-    # the stub path must never be silently clobbered, mirroring the skill guard.
-    if target.exists() and not target.is_file():
-        raise InitError(
-            f"{rel} exists but is not a regular file; refusing to clobber "
-            "unexpected state. Move it aside and re-run `gauntlet init`."
-        )
+    # Malformed pre-existing state (a symlink or non-regular node at the stub
+    # path) is rejected in _preflight_destinations before any write (FR-3.2 /
+    # review F-001, F-005), so the destination here is absent or a regular file.
 
     if from_repo:
         # The committed stub is authoritative; never write it (full

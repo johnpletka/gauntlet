@@ -83,11 +83,23 @@ def _norm(text: str) -> str:
 #
 # Class rule (deterministic): an entry is MANDATORY iff the first word inside the
 # parenthetical marker is exactly ``mandatory`` (so §11's "mandatory if any
-# exist" → mandatory); every other marker → SCALE. This binary rule reproduces
-# the PRD §6 prose manifest exactly, including §6/§7 whose playbook marker reads
-# "*(present whenever …)*" but which §6's prose lists as scale-with-size. The
-# marker may wrap to the next line (§6/§7 do), so we only need its leading word.
+# exist" → mandatory); every other allowed marker → SCALE. This binary rule
+# reproduces the PRD §6 prose manifest exactly, including §6/§7 whose playbook
+# marker reads "*(present whenever …)*" but which §6's prose lists as
+# scale-with-size. The marker may wrap to the next line (§6/§7 do), so we only
+# need its leading word.
 _ENTRY_RE = re.compile(r"^\*\*(?P<name>.+?)\*\*\s+\*\((?P<marker>[a-z][a-z-]*)")
+
+# A line that *opens* a top-level bold paragraph — i.e. a catalogue-entry
+# candidate. Within §2 every such line is a classified entry, so one that does
+# not also satisfy :data:`_ENTRY_RE` (a missing/garbled ``*(<class>)*`` marker)
+# is malformed and must fail closed rather than be silently skipped (review
+# F-002 — a marker typo would otherwise demote a mandatory section).
+_ENTRY_CANDIDATE_RE = re.compile(r"^\*\*.+?\*\*")
+
+# The only leading marker words §6 defines. Any other leading word is ambiguous
+# and cannot be classified deterministically → fail closed (review F-002).
+_ALLOWED_MARKERS = frozenset({MANDATORY, SCALE, "present"})
 
 
 def _structure_section(playbook_text: str) -> str:
@@ -110,14 +122,59 @@ def parse_manifest(playbook_text: str) -> list[ManifestEntry]:
     Returns the catalogue entries in document order. Driven entirely off the
     parsed playbook, so adding, renaming, or removing a §2 bold-paragraph entry
     changes the manifest (the property the drift guard, FR-2.2, relies on).
+
+    Fails closed (review F-002): a missing §2 section, a bold-paragraph entry with
+    no recognizable ``*(<class>)*`` marker, an unrecognized marker word, a
+    duplicate entry, an empty manifest, or a manifest missing the required
+    header-block anchor all raise :class:`StubTemplateError` rather than silently
+    producing an empty or weakened manifest that would let the gate fail open.
     """
+    section = _structure_section(playbook_text)
+    if not section.strip():
+        raise StubTemplateError(
+            "playbook §2 'PRD structure' section not found; cannot derive the "
+            "§6 mandatory-section manifest (fail closed, FR-3.3)"
+        )
+
     entries: list[ManifestEntry] = []
-    for line in _structure_section(playbook_text).splitlines():
-        m = _ENTRY_RE.match(line.strip())
+    seen: set[str] = set()
+    for raw in section.splitlines():
+        line = raw.strip()
+        if not _ENTRY_CANDIDATE_RE.match(line):
+            continue  # not a top-level bold catalogue entry
+        m = _ENTRY_RE.match(line)
         if not m:
-            continue
-        cls = MANDATORY if m.group("marker") == MANDATORY else SCALE
-        entries.append(ManifestEntry(name=_norm(m.group("name")), cls=cls))
+            raise StubTemplateError(
+                f"playbook §2 catalogue entry has no recognizable *(<class>)* "
+                f"marker: {line!r}"
+            )
+        marker = m.group("marker")
+        if marker not in _ALLOWED_MARKERS:
+            raise StubTemplateError(
+                f"playbook §2 entry has an unrecognized class marker {marker!r} "
+                f"(allowed: {sorted(_ALLOWED_MARKERS)}); refusing to guess its "
+                f"class: {line!r}"
+            )
+        name = _norm(m.group("name"))
+        if name in seen:
+            raise StubTemplateError(
+                f"playbook §2 has a duplicate catalogue entry {name!r}; the §6 "
+                "manifest must be unambiguous"
+            )
+        seen.add(name)
+        cls = MANDATORY if marker == MANDATORY else SCALE
+        entries.append(ManifestEntry(name=name, cls=cls))
+
+    if not entries:
+        raise StubTemplateError(
+            "playbook §2 yielded no catalogue entries; the §6 manifest cannot be "
+            "empty (fail closed, FR-3.3)"
+        )
+    if HEADER_BLOCK not in seen:
+        raise StubTemplateError(
+            f"playbook §2 manifest is missing the required {HEADER_BLOCK!r} entry "
+            "(the header-block invariant anchor)"
+        )
     return entries
 
 
@@ -172,6 +229,14 @@ def validate_template(
     template must never be usable, so both consumers call this before use.
     """
     src = str(source)
+    if not manifest:
+        # An empty manifest would enforce no mandatory headers at all — a fail-open
+        # gate input. The parser already fails closed on this, but a directly
+        # supplied empty manifest is rejected here too (review F-002).
+        raise StubTemplateError(
+            f"{src}: refusing to validate against an empty §6 manifest "
+            "(no mandatory sections could be enforced)"
+        )
     if not text.strip():
         raise StubTemplateError(f"{src}: stub template is empty after normalization")
 

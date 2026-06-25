@@ -57,6 +57,63 @@ def test_parser_classifies_present_whenever_markers_as_scale():
     assert by_name["§7 security & privacy"] == PS.SCALE
 
 
+# ---- F-002: the parser fails closed on a malformed/ambiguous playbook -------
+
+def _mini_playbook(body: str) -> str:
+    """A minimal §2-bounded playbook wrapping ``body`` (the catalogue entries)."""
+    return f"## 2. The PRD structure\n\n{body}\n\n## 3. How to grill me\n"
+
+
+def test_parse_manifest_raises_when_structure_section_absent():
+    # No §2 boundary at all → cannot derive the manifest; refuse (no silent empty).
+    text = "## 1. intro\n\n**Header block** *(mandatory)*\n\n## 3. next\n"
+    with pytest.raises(PS.StubTemplateError, match="§2"):
+        PS.parse_manifest(text)
+
+
+def test_parse_manifest_raises_on_marker_typo_instead_of_demoting():
+    # A typo on a MANDATORY marker must not be silently classified scale-with-size
+    # (the fail-open the binary rule used to allow); reject the ambiguous marker.
+    text = _mini_playbook("**Header block** *(mandtory)*")
+    with pytest.raises(PS.StubTemplateError, match="unrecognized class marker"):
+        PS.parse_manifest(text)
+
+
+def test_parse_manifest_raises_on_entry_without_a_class_marker():
+    # A bold-paragraph catalogue entry with no *(<class>)* marker is malformed;
+    # silently skipping it would drop a (possibly mandatory) section.
+    text = _mini_playbook("**Header block** *(mandatory)*\n\n**§5 Functional Requirements**")
+    with pytest.raises(PS.StubTemplateError, match="no recognizable"):
+        PS.parse_manifest(text)
+
+
+def test_parse_manifest_raises_on_duplicate_entry():
+    text = _mini_playbook("**Header block** *(mandatory)*\n\n**Header block** *(mandatory)*")
+    with pytest.raises(PS.StubTemplateError, match="duplicate"):
+        PS.parse_manifest(text)
+
+
+def test_parse_manifest_raises_on_empty_manifest():
+    text = _mini_playbook("(no catalogue entries here, just prose)")
+    with pytest.raises(PS.StubTemplateError, match="empty"):
+        PS.parse_manifest(text)
+
+
+def test_parse_manifest_raises_when_header_block_anchor_missing():
+    text = _mini_playbook(
+        "**§1 Overview** *(mandatory)*\n\n**§3 Users and Personas** *(scale-with-size)*"
+    )
+    with pytest.raises(PS.StubTemplateError, match="header block"):
+        PS.parse_manifest(text)
+
+
+def test_validate_template_rejects_empty_manifest():
+    # An empty manifest would enforce no mandatory headers at all (fail open).
+    stub = PS.packaged_stub_path().read_text()
+    with pytest.raises(PS.StubTemplateError, match="empty §6 manifest"):
+        PS.validate_template(stub, [])
+
+
 def test_scaffold_playbook_twin_is_byte_identical_to_canonical():
     # The manifest may be parsed from either copy (§4.3 fallback); they must agree.
     assert (REPO / "prompts" / "prd-author.md").read_bytes() == (

@@ -408,6 +408,54 @@ def test_init_fails_closed_on_malformed_stub_state(tmp_path):
     assert stub_path.is_dir()  # left intact, not clobbered
 
 
+def _tree(root: Path) -> set:
+    """Every path under ``root`` (relative), for asserting init wrote nothing."""
+    return {p.relative_to(root) for p in root.rglob("*")}
+
+
+def test_malformed_stub_on_fresh_repo_aborts_without_mutation(tmp_path):
+    # review F-005: on an OTHERWISE FRESH repo, a pre-existing non-regular stub
+    # destination must abort init in preflight — before any asset/skill/config is
+    # written. The earlier test inits successfully first, so it cannot catch a
+    # partial fresh-init write; this one asserts the whole tree is unchanged.
+    # A fresh init writes config asset_root .gauntlet, so the stub lands there.
+    stub_dir = tmp_path / ".gauntlet" / "prd-stub.md"
+    stub_dir.mkdir(parents=True)  # a directory where the stub file should be
+    before = _tree(tmp_path)
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+    assert _tree(tmp_path) == before  # nothing created, nothing clobbered
+
+
+def test_init_refuses_dangling_symlink_stub_and_does_not_write_through_it(tmp_path):
+    # review F-001: exists()/is_file() follow symlinks, so a DANGLING symlink at
+    # the stub destination would read as absent and reach shutil.copyfile, which
+    # writes THROUGH the link — outside the repo. Reject the symlink; never write.
+    escape = tmp_path.parent / f"escape-{tmp_path.name}.md"
+    assert not escape.exists()
+    stub_link = tmp_path / ".gauntlet" / "prd-stub.md"
+    stub_link.parent.mkdir(parents=True)
+    stub_link.symlink_to(escape)  # dangling: target does not exist
+    before = _tree(tmp_path)
+    with pytest.raises(InitError, match="symlink"):
+        init_repo(tmp_path)
+    assert not escape.exists()        # the link target was never written through
+    assert _tree(tmp_path) == before  # and the repo itself is untouched
+
+
+def test_init_refuses_symlink_stub_pointing_at_a_regular_file(tmp_path):
+    # review F-001: a symlink to an existing regular file must NOT be accepted as
+    # valid state — every symlink at a generated destination is refused.
+    real = tmp_path / "real-stub.md"
+    real.write_text("not the gauntlet stub\n")
+    stub_link = tmp_path / ".gauntlet" / "prd-stub.md"
+    stub_link.parent.mkdir(parents=True)
+    stub_link.symlink_to(real)
+    with pytest.raises(InitError, match="symlink"):
+        init_repo(tmp_path)
+    assert real.read_text() == "not the gauntlet stub\n"  # untouched
+
+
 def test_from_repo_reports_stub_present_or_missing(tmp_path):
     # --from-repo never writes the stub; it reports present/missing (full
     # customized classification is P3).
