@@ -341,11 +341,11 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "failed",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-06-25T03:33:48.876240+00:00",
-      "ended": "2026-06-25T03:54:23.936739+00:00",
+      "ended": "2026-06-25T04:53:24.546134+00:00",
       "attempts": 1,
       "base_sha": "b78d8f94768a245c1d11359c22b45c56b582332b",
       "parked_reason": null,
@@ -356,28 +356,29 @@
           "timestamp": "2026-06-25T04:46:48.484399+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 921842,
-        "output_tokens": 73697,
-        "cached_input_tokens": 4885123,
-        "cost_usd": 6.3937244999999985
+        "input_tokens": 1308880,
+        "output_tokens": 90804,
+        "cached_input_tokens": 5792872,
+        "cost_usd": 7.389330249999999
       },
-      "notes": "fixer made no changes in round 2 despite 1 accepted finding(s); failing closed",
+      "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "1",
       "metrics": {
-        "rounds": 2,
-        "findings_total": 7,
-        "accepted_total": 7,
-        "accepted_resolved_total": 4,
+        "rounds": 1,
+        "findings_total": 3,
+        "accepted_total": 2,
+        "accepted_resolved_total": 2,
         "verdict_counts": {
-          "legitimate": 7
+          "legitimate": 2,
+          "not_applicable": 1
         },
         "confirm_counts": {
-          "resolved": 4,
-          "unresolved": 2
+          "resolved": 2,
+          "unresolved": 1
         }
       }
     }
@@ -412,32 +413,37 @@
       "step_id": "impl-cycle",
       "phase": "P2.1",
       "sha": "51995ed8e6a0c178fbb6f364eead468ab23bdd7b"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P2.1",
+      "sha": "50ecaf47b904dbffaa296bc6818e7118adba1607"
     }
   ],
   "totals": {
-    "input_tokens": 1554621,
-    "output_tokens": 337406,
-    "cached_input_tokens": 22092762,
-    "cost_usd": 31.892705349999996
+    "input_tokens": 1941659,
+    "output_tokens": 354513,
+    "cached_input_tokens": 23000511,
+    "cost_usd": 32.888311099999996
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 1299531,
-      "output_tokens": 20396,
-      "cached_input_tokens": 967424,
+      "input_tokens": 1675144,
+      "output_tokens": 25785,
+      "cached_input_tokens": 1264384,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 73587,
-      "output_tokens": 19242,
+      "input_tokens": 79995,
+      "output_tokens": 20702,
       "cached_input_tokens": 0,
-      "cost_usd": 0.05688075
+      "cost_usd": 0.06140275
     },
     "builder": {
-      "input_tokens": 39765,
-      "output_tokens": 271742,
-      "cached_input_tokens": 21125338,
-      "cost_usd": 31.6961151
+      "input_tokens": 42637,
+      "output_tokens": 281248,
+      "cached_input_tokens": 21736127,
+      "cost_usd": 32.6769976
     },
     "judge_llm": {
       "input_tokens": 128987,
@@ -446,10 +452,10 @@
       "cost_usd": 0.07378274999999997
     },
     "escalation": {
-      "input_tokens": 12751,
-      "output_tokens": 5258,
+      "input_tokens": 14896,
+      "output_tokens": 6010,
       "cached_input_tokens": 0,
-      "cost_usd": 0.06592675
+      "cost_usd": 0.076128
     }
   }
 }

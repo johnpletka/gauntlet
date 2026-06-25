@@ -3,7 +3,7 @@
 - branch: `gauntlet/prd-authoring-aids` (base `main`)
 - pipeline: `standard` v1 (`sha256:0aab2da881fc…`)
 - status: **running** (at `impl-cycle`)
-- totals: 1554621in/337406out $31.8927
+- totals: 1941659in/354513out $32.8883
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -19,7 +19,7 @@
 | [implement.1](steps/implement.1/transcript.md) | agent_task | done | 1734s | 4011in/69251out $6.8624 | agent 'builder' completed |
 | [tests.1](steps/tests.1/) | shell | done | 68s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.1 | commit | done | 14s | 5768in/1347out $0.0041 | committed b78d8f9476 |
-| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | failed | 1235s | 921842in/73697out $6.3937 | fixer made no changes in round 2 despite 1 accepted finding(s); failing closed |
+| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 4776s | 1308880in/90804out $7.3893 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
 
 ## Commits
 
@@ -29,3 +29,4 @@
 - `24c75ae164` P1 (step `phase-commit`)
 - `b78d8f9476` P2 (step `phase-commit`)
 - `51995ed8e6` P2.1 (step `impl-cycle`)
+- `50ecaf47b9` P2.1 (step `impl-cycle`)
