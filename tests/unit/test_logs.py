@@ -248,6 +248,126 @@ def test_explicit_sub_leaf_missing_dir_errors(tmp_path, monkeypatch):
     assert "unknown step" in result.output
 
 
+def test_explicit_sub_leaf_finding_id_three_segments(tmp_path, monkeypatch):
+    # The documented deepest leaf: <cycle>/r1-triage/<finding-id> (3 segments).
+    inst = _instance(tmp_path)
+    _manifest(inst, [
+        _step("cyc", type="adversarial_cycle", iteration="0", status="failed",
+              metrics={"rounds": 1}),
+    ])
+    triage = inst / "steps" / "cyc.0" / "r1-triage" / "F-001"
+    triage.mkdir(parents=True)
+    (triage / "transcript.md").write_text("FINDING ONE TRIAGE\n")
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo", "--step", "cyc.0/r1-triage/F-001"])
+    assert result.exit_code == 0, result.output
+    assert "FINDING ONE TRIAGE" in result.output
+
+
+# --- F-003: nested selectors bounded to the composite leaf grammar -----------
+def test_nested_selector_under_non_composite_rejected(tmp_path, monkeypatch):
+    # An atomic step has no addressable sub-leaves; a nested selector is unknown
+    # even when the directory happens to exist on disk.
+    inst = _instance(tmp_path)
+    _manifest(inst, [_step("impl", status="failed")])
+    (inst / "steps" / "impl" / "sub").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo", "--step", "impl/sub"])
+    assert result.exit_code == 1
+    assert "unknown step" in result.output
+
+
+def test_nested_selector_too_deep_rejected(tmp_path, monkeypatch):
+    # A composite leaf bounds at role + one child (3 segments); a fourth segment
+    # is unknown even when the directory exists.
+    inst = _instance(tmp_path)
+    _manifest(inst, [
+        _step("cyc", type="adversarial_cycle", iteration="0", status="failed",
+              metrics={"rounds": 1}),
+    ])
+    deep = inst / "steps" / "cyc.0" / "r1-triage" / "F-001" / "extra"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["logs", "demo", "--step", "cyc.0/r1-triage/F-001/extra"]
+    )
+    assert result.exit_code == 1
+    assert "unknown step" in result.output
+
+
+# --- F-001: composite-leaf enumeration is contained before any read ----------
+def test_unknown_step_does_not_enumerate_symlinked_composite_dir(tmp_path, monkeypatch):
+    # A composite step dir that is a symlink escaping the run tree must never be
+    # enumerated for the available-steps message — no out-of-tree names leak.
+    inst = _instance(tmp_path)
+    _manifest(inst, [
+        _step("cyc", type="adversarial_cycle", iteration="0", status="failed",
+              metrics={"rounds": 1}),
+    ])
+    outside = tmp_path / "outside"
+    (outside / "r1-secret").mkdir(parents=True)
+    steps = inst / "steps"
+    steps.mkdir()
+    (steps / "cyc.0").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo", "--step", "does-not-exist"])
+    assert result.exit_code == 1
+    out = result.output
+    assert "unknown step" in out
+    assert "cyc.0" in out  # the top-level id itself is fine to name
+    assert "r1-secret" not in out  # the out-of-tree contents are never listed
+
+
+def test_unknown_step_does_not_follow_symlinked_role_dir(tmp_path, monkeypatch):
+    # A symlinked role inside a contained composite dir must not be followed:
+    # neither the role nor its children appear in the available-steps message.
+    inst = _instance(tmp_path)
+    _manifest(inst, [
+        _step("cyc", type="adversarial_cycle", iteration="0", status="failed",
+              metrics={"rounds": 1}),
+    ])
+    cyc = inst / "steps" / "cyc.0"
+    (cyc / "r1-review").mkdir(parents=True)  # a legit, contained role
+    outside = tmp_path / "outside"
+    (outside / "secret-finding").mkdir(parents=True)
+    (cyc / "r1-escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo", "--step", "does-not-exist"])
+    assert result.exit_code == 1
+    out = result.output
+    assert "cyc.0/r1-review" in out  # the real role is listed
+    assert "r1-escape" not in out  # the symlinked role is not followed
+    assert "secret-finding" not in out  # its out-of-tree children never enumerated
+
+
+# --- F-002: missing / malformed manifest → controlled LogsError, exit 1 ------
+def test_missing_manifest_errors(tmp_path, monkeypatch):
+    inst = _instance(tmp_path)  # instance dir + active-run.txt, but no manifest.json
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo"])
+    assert result.exit_code == 1
+    assert "cannot load manifest" in result.output
+
+
+def test_invalid_json_manifest_errors(tmp_path, monkeypatch):
+    inst = _instance(tmp_path)
+    (inst / "manifest.json").write_text("{not valid json")
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo"])
+    assert result.exit_code == 1
+    assert "cannot load manifest" in result.output
+
+
+def test_schema_invalid_manifest_errors(tmp_path, monkeypatch):
+    inst = _instance(tmp_path)
+    # Well-formed JSON, but missing the manifest's required fields.
+    (inst / "manifest.json").write_text(json.dumps({"slug": "demo"}))
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["logs", "demo"])
+    assert result.exit_code == 1
+    assert "cannot load manifest" in result.output
+
+
 # --- active-run.txt naming a missing instance → error listing instances ------
 def test_active_pointer_to_missing_instance_errors(tmp_path, monkeypatch):
     slug_dir = tmp_path / "runs" / "demo"

@@ -397,9 +397,14 @@ def step_dir_for(run_instance_dir: Path, rec: StepRecord) -> Path:
 
 
 def _subdirs(path: Path) -> list[Path]:
-    if not path.is_dir():
+    """Immediate real sub-directories of ``path``, never following symlinks.
+
+    A symlinked child is excluded so evidence-dir resolution and the
+    available-steps enumeration can never recurse out of the run tree (FR-3.3).
+    """
+    if not path.is_dir() or path.is_symlink():
         return []
-    return [c for c in path.iterdir() if c.is_dir()]
+    return [c for c in path.iterdir() if c.is_dir() and not c.is_symlink()]
 
 
 def _round_count(rec: StepRecord, step_dir: Path) -> int | None:
@@ -699,13 +704,35 @@ def _resolve_under(component: Path, ancestor_real: Path, *, label: str) -> Path:
     return real
 
 
-def _addressable_leaves(man: Manifest, run_instance_dir: Path) -> list[str]:
+def _contained(path: Path, ancestor_real: Path) -> bool:
+    """True iff ``path`` is a non-symlink directory resolving under ``ancestor_real``.
+
+    Fail-closed (FR-3.3): a symlink, an unresolvable path, or one escaping the
+    run tree is treated as not contained — so the enumeration below never reads
+    or lists directories out of the run tree.
+    """
+    if path.is_symlink():
+        return False
+    try:
+        real = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return _within(real, ancestor_real)
+
+
+def _addressable_leaves(
+    man: Manifest, run_instance_dir: Path, ancestor_real: Path
+) -> list[str]:
     """Every selectable ``--step`` leaf: top-level rendered ids + composite sub-leaves.
 
     For a composite step (cycle/retro) the role sub-dirs (and their immediate
     children, e.g. ``r1-triage/<finding-id>``) are addressable transcripts, so
     they are listed too — bounded to two levels, never following into a symlink
-    loop. Sorted for a deterministic error message (FR-3.2).
+    loop. Each composite step dir is contained under the run tree *before* it is
+    enumerated, and ``_subdirs`` never follows symlinks, so a symlinked composite
+    step or role can never cause out-of-tree enumeration or leak names through
+    the available-steps message (FR-3.3). Sorted for a deterministic error
+    message (FR-3.2).
     """
     leaves: list[str] = []
     for rec in man.steps:
@@ -713,6 +740,8 @@ def _addressable_leaves(man: Manifest, run_instance_dir: Path) -> list[str]:
         leaves.append(rid)
         if rec.type in _COMPOSITE_STEP_TYPES:
             sd = step_dir_for(run_instance_dir, rec)
+            if not _contained(sd, ancestor_real):
+                continue  # escaping/symlinked composite: never enumerate it
             for role in sorted(_subdirs(sd)):
                 leaves.append(f"{rid}/{role.name}")
                 for child in sorted(_subdirs(role)):
@@ -721,15 +750,20 @@ def _addressable_leaves(man: Manifest, run_instance_dir: Path) -> list[str]:
 
 
 def _select_logs_step(
-    man: Manifest, run_instance_dir: Path, step: str | None
+    man: Manifest, run_instance_dir: Path, step: str | None, ancestor_real: Path
 ) -> tuple[StepRecord, Path]:
     """Resolve ``(top-level record, transcript-leaf dir)`` for `logs` (FR-3.1a/3.2).
 
     ``step=None`` → the FR-3.1a default step + its resolved transcript leaf. An
     explicit ``step`` is either a top-level rendered id (``<id>`` / ``<id>.<it>``)
     or a composite role sub-leaf path (``<leaf>/r2-fix``,
-    ``<leaf>/r1-triage/<finding-id>``); an unknown id, or a sub-leaf dir that does
-    not exist, raises :class:`LogsError` listing the real leaves.
+    ``<leaf>/r1-triage/<finding-id>``). Nested selectors are valid **only** under
+    a composite step and bounded to the documented leaf grammar — a role
+    (``<leaf>/<role>``) or a role plus one child (``<leaf>/<role>/<finding-id>``),
+    i.e. two or three total segments. An unknown id, a nested selector under a
+    non-composite step or beyond that depth, or a sub-leaf dir that does not
+    exist raises :class:`LogsError` listing the real leaves. ``ancestor_real`` is
+    the resolved run dir, used to contain the available-steps enumeration.
     """
     if step is None:
         rec = select_default_step(man)
@@ -746,24 +780,29 @@ def _select_logs_step(
     except UnsafeRunSegment as exc:
         raise LogsError(str(exc)) from exc
 
+    def _unknown() -> LogsError:
+        leaves = _addressable_leaves(man, run_instance_dir, ancestor_real)
+        return LogsError(
+            f"unknown step {step!r}; available steps: {leaves or '(none)'}"
+        )
+
     head = segments[0]
     by_id = {render_step_id(r): r for r in man.steps}
     rec = by_id.get(head)
     if rec is None:
-        leaves = _addressable_leaves(man, run_instance_dir)
-        raise LogsError(
-            f"unknown step {step!r}; available steps: {leaves or '(none)'}"
-        )
+        raise _unknown()
     if len(segments) == 1:
         return rec, resolve_transcript_dir(run_instance_dir, rec)
-    # A nested role sub-leaf: address it directly. A non-existent sub-dir is an
-    # unknown leaf (exit 1), distinct from an existing dir with no transcript.
+    # A nested role sub-leaf is addressable only under a composite step and only
+    # to the documented depth (role, or role + finding-id); anything else is an
+    # unknown leaf, never an arbitrary nested directory walk (FR-3.2).
+    if rec.type not in _COMPOSITE_STEP_TYPES or len(segments) > 3:
+        raise _unknown()
+    # A non-existent sub-dir is an unknown leaf (exit 1), distinct from an
+    # existing dir with no transcript.
     sub = step_dir_for(run_instance_dir, rec).joinpath(*segments[1:])
     if not sub.is_dir():
-        leaves = _addressable_leaves(man, run_instance_dir)
-        raise LogsError(
-            f"unknown step {step!r}; available steps: {leaves or '(none)'}"
-        )
+        raise _unknown()
     return rec, sub
 
 
@@ -814,8 +853,20 @@ def resolve_logs(
     run_instance_dir = resolve_run_instance(slug_dir)
     _resolve_under(run_instance_dir, slug_dir_real, label="run instance")
 
-    man = Manifest.load(run_instance_dir / "manifest.json")
-    rec, transcript_dir = _select_logs_step(man, run_instance_dir, step)
+    # A missing, unreadable, non-JSON, or schema-invalid manifest is the
+    # command's controlled error path, not an unhandled crash (FR-3.3, fail
+    # closed). `read_text` raises OSError; `model_validate_json` raises pydantic
+    # ValidationError (a ValueError) for both JSON-decode and schema failures.
+    manifest_path = run_instance_dir / "manifest.json"
+    try:
+        man = Manifest.load(manifest_path)
+    except (OSError, ValueError) as exc:
+        raise LogsError(
+            f"cannot load manifest {manifest_path}: {exc}"
+        ) from exc
+    rec, transcript_dir = _select_logs_step(
+        man, run_instance_dir, step, slug_dir_real
+    )
 
     # Containment check 2: every leaf path stays under the run dir.
     _resolve_under(step_dir_for(run_instance_dir, rec), slug_dir_real, label="step dir")
