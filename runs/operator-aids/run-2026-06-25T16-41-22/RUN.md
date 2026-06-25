@@ -3,13 +3,14 @@
 - branch: `gauntlet/operator-aids` (base `feat/operator-aids`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
 - status: **running** (at `prd-cycle`)
-- totals: 182016in/73480out $4.4780
+- totals: 279358in/122600out $7.7290
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
-| [prd-cycle](steps/prd-cycle/) | adversarial_cycle | parked | 1199s | 149729in/69064out $4.4611 | escalation (FR-10.5): max_rounds=2 exhausted with open blocking(s): F-003, NEW, NEW; a human must resolve |
+| [prd-cycle](steps/prd-cycle/) | adversarial_cycle | done | 3453s | 247071in/118184out $7.7121 | converged in round 1 (blocking policy): no open blocking; 9 fixed, 0 non-blocking item(s) surfaced for the gate |
 
 ## Commits
 
 - `0a8572ddd5` PRD.1 (step `prd-cycle`)
 - `96ef382e81` PRD.2 (step `prd-cycle`)
+- `7b2fb27c2a` PRD.1 (step `prd-cycle`)

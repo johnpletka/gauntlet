@@ -29,14 +29,14 @@
     {
       "id": "prd-cycle",
       "type": "adversarial_cycle",
-      "status": "parked",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-06-25T16:41:24.031621+00:00",
-      "ended": "2026-06-25T17:01:22.644620+00:00",
+      "ended": "2026-06-25T17:38:56.972932+00:00",
       "attempts": 0,
       "base_sha": "d2cf44594d554d9594ef54a75ad15d36fdb08d16",
-      "parked_reason": "cycle_escalation",
+      "parked_reason": null,
       "human_responses": [
         {
           "response_id": "prd-cycle-resp-1",
@@ -44,28 +44,28 @@
           "timestamp": "2026-06-25T17:25:17.042749+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 149729,
-        "output_tokens": 69064,
-        "cached_input_tokens": 3154340,
-        "cost_usd": 4.4611107500000005
+        "input_tokens": 247071,
+        "output_tokens": 118184,
+        "cached_input_tokens": 5870817,
+        "cost_usd": 7.71205615
       },
-      "notes": "escalation (FR-10.5): max_rounds=2 exhausted with open blocking(s): F-003, NEW, NEW; a human must resolve",
+      "notes": "converged in round 1 (blocking policy): no open blocking; 9 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": null,
       "metrics": {
-        "rounds": 2,
-        "findings_total": 11,
-        "accepted_total": 11,
-        "accepted_resolved_total": 6,
+        "rounds": 1,
+        "findings_total": 9,
+        "accepted_total": 9,
+        "accepted_resolved_total": 8,
         "verdict_counts": {
-          "legitimate": 11
+          "legitimate": 9
         },
         "confirm_counts": {
-          "resolved": 6,
-          "partially_resolved": 5
+          "resolved": 8,
+          "partially_resolved": 1
         }
       }
     }
@@ -80,38 +80,43 @@
       "step_id": "prd-cycle",
       "phase": "PRD.2",
       "sha": "96ef382e81e7fe2f73fe918d9aca3bc3d8499117"
+    },
+    {
+      "step_id": "prd-cycle",
+      "phase": "PRD.1",
+      "sha": "7b2fb27c2a65de1d4162a67f4b91832b6f19d736"
     }
   ],
   "totals": {
-    "input_tokens": 182016,
-    "output_tokens": 73480,
-    "cached_input_tokens": 3154340,
-    "cost_usd": 4.4780145000000005
+    "input_tokens": 279358,
+    "output_tokens": 122600,
+    "cached_input_tokens": 5870817,
+    "cost_usd": 7.7289599
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 112260,
-      "output_tokens": 6508,
-      "cached_input_tokens": 9728,
+      "input_tokens": 177024,
+      "output_tokens": 11244,
+      "cached_input_tokens": 38144,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 20167,
-      "output_tokens": 4465,
+      "input_tokens": 42183,
+      "output_tokens": 8687,
       "cached_input_tokens": 0,
-      "cost_usd": 0.013971749999999998
+      "cost_usd": 0.024694149999999998
     },
     "escalation": {
-      "input_tokens": 7384,
-      "output_tokens": 2428,
+      "input_tokens": 14778,
+      "output_tokens": 5477,
       "cached_input_tokens": 0,
-      "cost_usd": 0.032214
+      "cost_usd": 0.0679145
     },
     "builder": {
-      "input_tokens": 9918,
-      "output_tokens": 55663,
-      "cached_input_tokens": 3144612,
-      "cost_usd": 4.414925
+      "input_tokens": 13086,
+      "output_tokens": 92776,
+      "cached_input_tokens": 5832673,
+      "cost_usd": 7.6194475
     },
     "judge_llm": {
       "input_tokens": 32287,
