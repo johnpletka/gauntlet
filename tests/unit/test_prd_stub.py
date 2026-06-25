@@ -107,6 +107,16 @@ def test_parse_manifest_raises_when_header_block_anchor_missing():
         PS.parse_manifest(text)
 
 
+def test_parse_manifest_raises_when_header_block_demoted():
+    # F-002: validate_template runs the header-block's Status/Author checks only
+    # for a MANDATORY entry. A playbook that classifies the header-block as
+    # scale-with-size would slip past that gate, letting a stub omit its required
+    # metadata (FR-3.3 fail-open). The anchor must be mandatory, not merely present.
+    text = _mini_playbook("**Header block** *(scale-with-size)*")
+    with pytest.raises(PS.StubTemplateError, match="must be mandatory"):
+        PS.parse_manifest(text)
+
+
 def test_validate_template_rejects_empty_manifest():
     # An empty manifest would enforce no mandatory headers at all (fail open).
     stub = PS.packaged_stub_path().read_text()

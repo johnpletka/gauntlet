@@ -456,6 +456,24 @@ def test_init_refuses_symlink_stub_pointing_at_a_regular_file(tmp_path):
     assert real.read_text() == "not the gauntlet stub\n"  # untouched
 
 
+def test_init_refuses_symlinked_parent_directory_and_does_not_write_through_it(tmp_path):
+    # review F-001: the leaf guard alone is not enough — if a PARENT directory
+    # (e.g. .gauntlet) is a symlink to an external dir, the leaf targets are not
+    # themselves symlinks, so they pass and mkdir/write_text/copyfile follow the
+    # parent link, mutating paths outside the repo. Reject the symlinked parent.
+    external = tmp_path.parent / f"external-{tmp_path.name}"
+    external.mkdir()
+    before_external = {p.relative_to(external) for p in external.rglob("*")}
+    gauntlet_link = tmp_path / ".gauntlet"
+    gauntlet_link.symlink_to(external, target_is_directory=True)
+    before = _tree(tmp_path)
+    with pytest.raises(InitError, match="symlink"):
+        init_repo(tmp_path)
+    # nothing was written through the parent link, and the repo is untouched
+    assert {p.relative_to(external) for p in external.rglob("*")} == before_external
+    assert _tree(tmp_path) == before
+
+
 def test_from_repo_reports_stub_present_or_missing(tmp_path):
     # --from-repo never writes the stub; it reports present/missing (full
     # customized classification is P3).

@@ -115,17 +115,37 @@ def _asset_pairs() -> list[tuple[Path, str]]:
     return pairs
 
 
-def _guard_regular_destination(target: Path, rel: str) -> None:
-    """Fail closed if a generated destination is a symlink or a non-regular node.
+def _guard_regular_destination(repo_root: Path, rel: str) -> None:
+    """Fail closed if a generated destination is unsafe to write (review F-001).
 
-    ``Path.exists()``/``is_file()`` dereference symlinks (review F-001), so a
-    dangling ``<asset_root>/prd-stub.md`` symlink reads as *absent*, reaches
+    ``Path.exists()``/``is_file()`` dereference symlinks, so a dangling
+    ``<asset_root>/prd-stub.md`` symlink reads as *absent*, reaches
     ``shutil.copyfile``, and writes *through* the link — outside the repository;
     a symlink pointing at a regular file would likewise be accepted as valid
-    state. We therefore reject every symlink via :meth:`Path.is_symlink` (which
-    does not dereference) *before* the ``exists()``/``is_file()`` check that rules
-    out directories, FIFOs, and other non-regular nodes.
+    state. Checking only the destination leaf is insufficient: a symlinked
+    *parent* directory (e.g. ``.gauntlet`` → an external dir) leaves the leaf a
+    non-symlink, yet ``mkdir``/``write_text``/``copyfile`` still follow the parent
+    link and mutate paths outside the repo. We therefore:
+
+    1. reject a symlink at any existing path component between ``repo_root`` and
+       the destination via :meth:`Path.is_symlink` (which does not dereference) —
+       ``repo_root`` itself is excluded, since a repo legitimately rooted on a
+       symlinked path (e.g. a macOS worktree under ``/var``) is not our concern;
+    2. reject a non-regular leaf (directory, FIFO, …) once symlinks are ruled out;
+    3. verify the resolved destination remains contained within the resolved
+       repository root (defense in depth).
     """
+    target = repo_root / rel
+    current = repo_root
+    for part in Path(rel).parts[:-1]:  # parent components only; leaf handled below
+        current = current / part
+        if current.is_symlink():
+            raise InitError(
+                f"{rel} has a symlinked parent directory "
+                f"({current.relative_to(repo_root).as_posix()}); refusing to "
+                "write through it (it may resolve outside the repository). Move "
+                "it aside and re-run `gauntlet init`."
+            )
     if target.is_symlink():
         raise InitError(
             f"{rel} is a symlink; refusing to write through it (it may resolve "
@@ -135,6 +155,16 @@ def _guard_regular_destination(target: Path, rel: str) -> None:
         raise InitError(
             f"{rel} exists but is not a regular file; refusing to clobber "
             "unexpected state. Move it aside and re-run `gauntlet init`."
+        )
+    # With no symlinked component, ``target`` resolves inside the repo; assert it
+    # so any path that still escapes (e.g. ``..`` traversal in a future caller)
+    # fails closed rather than writing outside the tree.
+    repo_resolved = repo_root.resolve()
+    resolved = target.resolve()
+    if resolved != repo_resolved and repo_resolved not in resolved.parents:
+        raise InitError(
+            f"{rel} resolves outside the repository ({resolved}); refusing to "
+            "write. Move it aside and re-run `gauntlet init`."
         )
 
 
@@ -174,7 +204,7 @@ def _preflight_destinations(repo_root: Path, *, from_repo: bool) -> None:
     if not from_repo:
         rels = [dst for _src, dst in _asset_pairs()] + rels
     for rel in rels:
-        _guard_regular_destination(repo_root / rel, rel)
+        _guard_regular_destination(repo_root, rel)
 
 
 def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:

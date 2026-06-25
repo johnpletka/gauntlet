@@ -170,10 +170,22 @@ def parse_manifest(playbook_text: str) -> list[ManifestEntry]:
             "playbook §2 yielded no catalogue entries; the §6 manifest cannot be "
             "empty (fail closed, FR-3.3)"
         )
-    if HEADER_BLOCK not in seen:
+    header_block = next((e for e in entries if e.name == HEADER_BLOCK), None)
+    if header_block is None:
         raise StubTemplateError(
             f"playbook §2 manifest is missing the required {HEADER_BLOCK!r} entry "
             "(the header-block invariant anchor)"
+        )
+    if header_block.cls != MANDATORY:
+        # validate_template runs the §4.4 metadata checks (Status/Author) only for
+        # MANDATORY entries, so a header-block parsed as scale-with-size would let
+        # a stub omit its required metadata — the FR-3.3 fail-open this guards
+        # against (review F-002). The header-block invariant is mandatory by
+        # definition; refuse any playbook that demotes it.
+        raise StubTemplateError(
+            f"playbook §2 classifies the {HEADER_BLOCK!r} entry as "
+            f"{header_block.cls!r}; it must be mandatory (its metadata validation "
+            "runs only for a mandatory entry)"
         )
     return entries
 
