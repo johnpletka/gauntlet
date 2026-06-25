@@ -11,6 +11,9 @@ the PID-reuse-safe process identity (`procident.py`), the transcript logger
 (`logging/transcript.py`), the committable-skill installer and provenance engine
 (`engine/skill.py`, `engine/init.py`), and `doctor` (`engine/doctor.py`). It
 extends the CLI surface and adds a second skill alongside `gauntlet-prd-author`.
+A follow-on PRD, `live-run-observability` (live/streamed step output), is
+sequenced **after** this one and builds *on* its `logs` and `--json` surfaces;
+this PRD does not depend on it.
 
 ---
 
@@ -104,9 +107,12 @@ before any mutating verb depends on it.
   may later feed the console, but that is not built here.
 - **No detection of an alive-but-*semantically*-stuck agent.** Liveness proves a
   process is our process and running; it does not judge whether a running agent
-  is making progress. A staleness heuristic (no transcript activity for N
-  minutes) is at most advisory and its threshold is an Open Question (§11),
-  not a gate.
+  is making *progress* — and v1 has no mid-step freshness artifact to judge from:
+  agent output is buffered until step end (`run_with_timeout` → `communicate()`),
+  so neither the transcript nor the orchestrator log grows during a step. A real
+  progress signal needs the streamed-output work in the follow-on
+  `live-run-observability` PRD; until then the wedged case is handled by `recover`
+  (FR-5) on operator judgment, not by an automatic signal.
 - **`recover` does not auto-resume.** It terminates + marks `INTERRUPTED` and
   stops. Resuming is a separate, explicit operator step (separation of concerns).
 - **No new safety bypass.** `recover` is an operator action, never an in-pipeline
@@ -453,7 +459,7 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
 
 | Risk | Mitigation |
 |------|------------|
-| An alive-but-wedged driver reports `alive` and looks healthy, so the operator waits forever. | Liveness honestly reports `alive`; the per-step timeout/budget guard (`HALTED`) is the existing backstop, and `recover` lets the operator act on judgment. An advisory staleness signal is an Open Question (§11), explicitly *not* a gate (Non-Goal). |
+| An alive-but-wedged driver reports `alive` and looks healthy, so the operator waits forever. | Liveness honestly reports `alive`; the per-step timeout/budget guard (`HALTED`) is the existing backstop, and `recover` (FR-5) lets the operator act on judgment. A true progress signal needs streamed output and is deferred to the `live-run-observability` PRD (§11 OQ-1); it is explicitly *not* a v1 gate (Non-Goal §2.2). |
 | `--json` schema churn breaks agent/script consumers. | Treat `schemas/status.json` as a committed contract; version it; additive-only changes by default. |
 | The operator skill fails to trigger reliably (same empirical risk as prd-author OQ-2). | Recorded FR-6.6 integration test; and the self-describing `status`/`--json` is the backstop — it works with no skill at all. |
 | `recover` kills the wrong process. | `procident` exact-identity gate + fail-closed refuse on any unverifiable target (FR-5.1/5.4); signals only the recorded process group. |
@@ -464,19 +470,29 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
 
 ## §11 Open Questions
 
-1. **Staleness heuristic.** Should `status` show an advisory "driver alive but no
-   transcript activity for N minutes" signal, and if so what is N? Leaning:
-   advisory-only, threshold deferred — liveness alone is the v1 contract. *(Record
-   and move on; judgment call, cheap to defer.)*
+1. **Alive-but-wedged freshness — deferred to streaming.** A truthful "is the live
+   step actually *progressing*?" signal is **not buildable in v1**: the agent
+   subprocess output is buffered until the step exits (`run_with_timeout` →
+   `communicate()`), so neither `transcript.md`/`events.jsonl` nor the orchestrator
+   log grows mid-step — there is no freshness artifact to read. (The proxies that
+   *do* move are too weak to surface: process CPU is noisy — a healthy agent
+   waiting on the model API is ~0% CPU — and worktree churn appears only for steps
+   that write files.) v1's contract is therefore **binary liveness (FR-2) +
+   `recover` (FR-5)** on operator judgment. The real progress signal — a live
+   last-event timestamp — requires streaming agent output to disk, which is the
+   follow-on `live-run-observability` PRD; the staleness threshold (N) is *its*
+   open question, not this one.
 2. **`gauntlet next` verb.** Is the one-line "what do I do" surface a separate
    `gauntlet next <slug>` verb, or just the `status` footer + `--json
    next_actions`? Leaning: footer + `--json` only in v1; `next` is optional sugar.
 3. **`recover` → resume coupling.** Confirmed leaning: `recover` does **not**
    auto-resume (Non-Goal §2.2 / design §4.2). Open only if review argues the
    two-step flow is error-prone enough to fuse behind a flag.
-4. **`logs` ergonomics.** Does v1 need `--follow`/`--tail N`/`events` flags, or is
-   "dump the failing step's transcript tail + name the dir" enough? Leaning:
-   minimal in v1; flags are additive later.
+4. **`logs` ergonomics.** Does v1 need `--tail N`/`events` flags, or is "dump the
+   failing step's transcript tail + name the dir" enough? Leaning: minimal in v1;
+   flags are additive later. (`--follow` is **not** in scope here — a live tail
+   needs streamed output and belongs to the `live-run-observability` PRD; `logs`
+   is designed to leave room for it.)
 5. **Operator trigger-phrase set (empirical).** The exact `description` phrase
    list that reliably triggers `gauntlet-operator` on the pinned Claude Code
    version — to be ratified against FR-6.6, mirroring prd-author's OQ-2.
@@ -485,6 +501,7 @@ accept the playbook briefly referencing not-yet-shipped verbs. Default: last.
 
 *Handoff: this is **Draft v0.1**. The riskiest assumption is §1.3 (truthful,
 cheap liveness from lock + procident), attacked first and read-only in P1. Open
-Questions 1, 2, 4, 5 remain live. Next step is `gauntlet run operator-aids`,
+Questions 2, 4, 5 remain live (OQ-1 is now deferred to the follow-on
+`live-run-observability` PRD). Next step is `gauntlet run operator-aids`,
 which begins with **adversarial review** — not implementation. I ratify; the
 pipeline executes.*
