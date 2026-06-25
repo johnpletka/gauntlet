@@ -193,13 +193,25 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
 
 
 @app.command()
-def status(slug: str) -> None:
+def status(
+    slug: str,
+    json_output: bool = typer.Option(
+        False, "--json",
+        help="Emit the run state as a single JSON object conforming to "
+        "schemas/status.json (FR-4) — the stable machine contract for an agent "
+        "or script. Stdout is only the JSON; exits non-zero only on an actual "
+        "error (a parked/failed run is a valid state, exit 0).",
+    ),
+) -> None:
     """Show the current run status for <slug> with driver liveness + next action.
 
     Read-only (FR-1/FR-2): reports the computed driver liveness and the concrete
     next action for the run's composite state. It never writes — a surviving
-    recovery intent is *reported*, never finalized (FR-5.6).
+    recovery intent is *reported*, never finalized (FR-5.6). With ``--json`` it
+    emits the same computed state as a lone, schema-stable JSON object (FR-4).
     """
+    import json
+
     from gauntlet.engine import operator
     from gauntlet.engine.manifest import Manifest
     from gauntlet.engine.operator import RunResolutionError
@@ -228,16 +240,38 @@ def status(slug: str) -> None:
         )
         raise typer.Exit(1) from exc
 
-    man = Manifest.load(run_instance_dir / "manifest.json")
-    typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
-    for rec in man.steps:
-        it = f"[{rec.iteration}]" if rec.iteration is not None else ""
-        typer.echo(f"  {rec.id}{it}: {rec.status}")
+    # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
+    # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
+    # empty on error), never an interleaved traceback.
+    try:
+        man = Manifest.load(run_instance_dir / "manifest.json")
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"error: cannot load manifest for {slug!r}: {exc}", err=True
+        )
+        raise typer.Exit(1) from exc
 
     run_root = mgr.repo_root / mgr.config.run_root
     driver = operator.driver_info(run_root, slug)
     rstate = operator.compute_run_state(man, driver.state)
     recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
+
+    if json_output:
+        # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
+        # malformed surviving intent is a human-footer anomaly only, so `recon`
+        # is None there and `reconciliation` is null — never a fabricated object.
+        payload = operator.status_payload(
+            man, driver, rstate, recon,
+            run_root=run_root, run_instance_dir=run_instance_dir,
+        )
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
+    for rec in man.steps:
+        it = f"[{rec.iteration}]" if rec.iteration is not None else ""
+        typer.echo(f"  {rec.id}{it}: {rec.status}")
+
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly
     ):

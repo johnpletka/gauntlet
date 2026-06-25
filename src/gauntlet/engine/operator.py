@@ -652,6 +652,114 @@ def read_recovery_intent(
     )
 
 
+# --- machine-readable status payload (P3, FR-4 / §6.1) -----------------------
+SCHEMA_VERSION = 1  # §6.1/§6.5 — the major version of the status.json contract
+
+
+def _iteration_for_json(rec: StepRecord) -> int | None:
+    """Render a step's iteration as the §6.1 ``integer|null``.
+
+    The engine stores ``iteration`` as ``str(idx)`` (a stringified non-negative
+    foreach/cycle index — see ``orchestrator._run_stage``), while the §6.1
+    contract is ``integer|null``; a numeric string converts losslessly. A
+    non-numeric iteration (never produced by the engine) renders ``null`` rather
+    than crashing the read-only emitter or emitting a contract-violating string
+    (fail closed).
+    """
+    if rec.iteration is None:
+        return None
+    try:
+        return int(rec.iteration)
+    except (TypeError, ValueError):
+        return None
+
+
+def _evidence_path(
+    run_root: Path, run_instance_dir: Path, failure: FailureDescriptor
+) -> str:
+    """The §6.1 ``failure.evidence_path``: the failing step's dir, POSIX-relative
+    under ``run_root`` (no leading ``/``, no ``..``).
+
+    The dir is ``<run_instance_dir>/steps/<rendered-leaf>`` (mirrors
+    :func:`step_dir_for`); the rendered leaf is exactly ``failure.step_id``.
+    ``run_instance_dir`` is always a descendant of ``run_root``, so the
+    ``relative_to`` succeeds; the fallback keeps the path relative and ``..``-free
+    if a caller ever passes an unrelated root.
+    """
+    step_dir = run_instance_dir / "steps" / failure.step_id
+    try:
+        return step_dir.relative_to(run_root).as_posix()
+    except ValueError:
+        return Path("steps", failure.step_id).as_posix()
+
+
+def status_payload(
+    man: Manifest,
+    driver: DriverInfo,
+    rstate: RunState,
+    reconciliation: Reconciliation | None,
+    *,
+    run_root: Path,
+    run_instance_dir: Path,
+) -> dict:
+    """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
+
+    Pure: it serializes the already-computed ``driver`` / ``rstate`` /
+    ``reconciliation`` plus manifest fields, doing no I/O and no recomputation,
+    so the JSON contract and the human footer can never diverge (FR-4.1/§4.2).
+    Nullable fields are always present and explicitly ``null`` when not
+    applicable (§6.1). A malformed/unreadable surviving intent surfaces as a
+    human-footer anomaly, never here — the caller passes ``reconciliation=None``
+    in that case, so ``--json`` never fabricates an ``intent_step_id``.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "slug": man.slug,
+        "run_id": man.run_id,
+        "run_status": man.status,
+        "state": rstate.state,
+        "current_step": rstate.current_step,
+        "driver": {
+            "state": driver.state,
+            "pid": driver.pid,
+            "since": driver.since,
+            "host": driver.host,
+        },
+        "parked": (
+            {
+                "step_id": rstate.parked.step_id,
+                "type": rstate.parked.type,
+                "reason": rstate.parked.reason,
+            }
+            if rstate.parked is not None
+            else None
+        ),
+        "failure": (
+            {
+                "step_id": rstate.failure.step_id,
+                "status": rstate.failure.status,
+                "evidence_path": _evidence_path(
+                    run_root, run_instance_dir, rstate.failure
+                ),
+            }
+            if rstate.failure is not None
+            else None
+        ),
+        "reconciliation": (
+            reconciliation.to_dict() if reconciliation is not None else None
+        ),
+        "steps": [
+            {
+                "id": rec.id,
+                "iteration": _iteration_for_json(rec),
+                "status": rec.status,
+            }
+            for rec in man.steps
+        ],
+        "next_actions": [a.to_dict() for a in rstate.next_actions],
+    }
+
+
 # --- read-only evidence access (`gauntlet logs`, FR-3) -----------------------
 TRANSCRIPT_TAIL_LINES = 200  # FR-3.1b — normative default tail for v1
 _TRANSCRIPT_NAME = "transcript.md"
