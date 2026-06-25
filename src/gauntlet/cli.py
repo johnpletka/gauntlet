@@ -216,18 +216,21 @@ def resume(
     slug: str,
     response: str = typer.Option(
         None, "--response",
-        help='Human decision for a step parked on an UPSTREAM CONFLICT '
-             '(FR-10.4): re-runs the builder with this context injected instead '
-             'of re-surfacing the conflict. Required to resume a conflict park; '
-             'passed verbatim, no parsing.',
+        help='Human decision for a step parked awaiting one (FR-10.4): a builder '
+             'UPSTREAM CONFLICT (agent_task) re-runs with this injected; a '
+             'reviewer-surfaced cycle escalation (adversarial_cycle) re-drives '
+             'with it injected into the reviewer/triager so they re-evaluate the '
+             'parked finding. Required to resume either; passed verbatim, no '
+             'parsing.',
     ),
     no_judge: bool = typer.Option(False, "--no-judge"),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
-    For a step parked on an UPSTREAM CONFLICT, supply
-    `--response "<decision>"` to record your decision (audited in the manifest)
-    and re-run the builder with it. Other parks resume as before.
+    For a step parked awaiting a human decision — a builder UPSTREAM CONFLICT or
+    an adversarial_cycle escalation its own loop cannot resolve (FR-10.4/10.5) —
+    supply `--response "<decision>"` to record it (audited in the manifest) and
+    re-drive with it injected. Other parks resume as before.
     """
     typer.echo(
         "run status: "

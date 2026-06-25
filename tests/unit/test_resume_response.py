@@ -332,7 +332,8 @@ def test_conflict_park_without_response_errors(tmp_path):
         mgr.resume("demo", use_judge=False)
     assert (
         "step 'implement' parked on an upstream conflict; resume it with "
-        '--response "<decision>" (see `gauntlet resume --help`)'
+        '--response "<decision>" (see `gauntlet resume --help`). '
+        "Re-running without a decision would only re-surface it."
     ) == str(exc.value)
 
 
@@ -350,7 +351,8 @@ def test_not_parked_with_response_errors(tmp_path):
     with pytest.raises(ValueError) as exc:
         mgr.resume("demo", response="too late", use_judge=False)
     assert str(exc.value) == (
-        f"run '{man.run_id}' is not parked; cannot resume with --response"
+        f"run '{man.run_id}' is done, neither parked nor failed; "
+        "cannot resume with --response"
     )
 
 
@@ -373,7 +375,7 @@ stages:
         mgr.resume("demo", response="decide", use_judge=False)
     assert str(exc.value) == (
         "use `gauntlet approve` or `gauntlet reject` for human_gate steps; "
-        "--response is for agent_task steps"
+        "--response is for agent_task and adversarial_cycle steps"
     )
 
 
