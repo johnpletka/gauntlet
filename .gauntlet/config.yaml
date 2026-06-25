@@ -8,7 +8,7 @@
 # `gauntlet init` will scaffold this file in P6; it is hand-authored for the
 # bootstrap so the P3 engine has profiles to resolve.
 
-base_branch: main
+base_branch: current
 branch_prefix: "gauntlet/"
 # This is Gauntlet's OWN source repo: its assets (pipelines/, prompts/, schemas/,
 # policy.yaml) live at the repo ROOT as first-class source, not under a dotfile
