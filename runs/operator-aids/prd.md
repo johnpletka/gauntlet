@@ -423,25 +423,70 @@ Two reader-roles touch this; both are "the operator," differing only in surface:
      now: abort **without signalling** and report "run completed/relaunched
      concurrently; re-run `gauntlet status`." This is the race against a normally
      completing driver, closed.
-  4. **Signal** the recorded process group (FR-5.2: SIGTERM, then SIGKILL after a
+  4. **Persist the recovery intent durably *before* any signal.** Atomically
+     write `<run_instance_dir>/.recovery-intent.json` (write-temp-then-`rename`)
+     capturing the just-verified, now-frozen facts: the lock `nonce`, `pid`,
+     `pgid`, `proc_identity`, `host`, the target `step_id`, the `prior_step_status`
+     / `prior_run_status`, and the invoking `actor`/`actor_source`/`ts` (schema in
+     §6.4). This intent is the durable record that "a kill of *this* verified
+     process is in progress," written while the gate's identity proof is still
+     valid — i.e. before the PID can become dead. Every crash from here on is
+     finalizable from the intent alone, without re-running the FR-5.1 liveness
+     gate (which would now fail precisely *because* the kill succeeded).
+  5. **Signal** the recorded process group (FR-5.2: SIGTERM, then SIGKILL after a
      bounded grace).
-  5. **Atomic manifest update:** mark the step `INTERRUPTED` and append the
-     recovery record (§6.4) in a single write-temp-then-`rename` so a crash
-     leaves either the old manifest or the fully-updated one — never a torn write.
-  6. **Release the lock** only if it still carries the recorded `nonce`
+  6. **Atomic manifest update:** mark the step `INTERRUPTED` and append the
+     recovery record (§6.4), built from the intent plus the observed
+     `signal_outcome`, in a single write-temp-then-`rename` so a crash leaves
+     either the old manifest or the fully-updated one — never a torn write.
+  7. **Clear the intent:** unlink `.recovery-intent.json` only after step 6's
+     rename is durable — its content is now folded into the persisted recovery
+     record, so a surviving intent always means "manifest not yet finalized."
+  8. **Release the lock** only if it still carries the recorded `nonce`
      (ownership release, mirroring the engine's existing nonce-guarded release —
      never unlink a new owner's lock).
 
-  **Crash reconciliation (deterministic restart):** if `recover` dies between any
-  two steps, re-running `recover` (or `status`) recomputes state from lock +
-  procident and converges safely — a process already killed but not yet marked
-  re-presents as `orphaned` → `resume` (the same recovery path), and a half-marked
-  manifest is completed by the atomic step (5) on the next run. No interrupted
-  state is contradictory or unrecoverable. *Acceptance:* tests assert (a) a lock
-  whose `nonce` changed between capture and signal causes a no-signal abort; (b) a
-  step that is no longer `running` causes a no-mutation abort; (c) `recover` run
-  twice over the same interrupted run converges (no torn manifest, no double-kill
-  of a reused PID) — i.e. the operation is idempotent.
+  **Crash reconciliation (deterministic restart).** On *every* `recover` (and the
+  read-only `status`) invocation, before anything else, reconcile any surviving
+  `.recovery-intent.json` for the selected run instance. Its presence means a
+  prior `recover` reached step 4 but did not durably complete step 6 — including
+  the otherwise-unreconcilable window where the process group was already killed
+  (step 5 done) but the manifest is still `running` with no recovery record. The
+  reconciliation is keyed on the intent, **not** on a fresh liveness gate, so a
+  now-dead target does not strand the run:
+  - **Stale intent (superseded run):** if the lock is gone or its `nonce` ≠ the
+    intent's `nonce`, the run was relaunched since the intent was written; the
+    intent is stale. Discard it (unlink) **without signalling and without mutating
+    the manifest**, and report "stale recovery intent discarded; run
+    relaunched — re-run `gauntlet status`."
+  - **Live intent (finalize the interrupted recovery):** otherwise (lock absent or
+    its `nonce` still matches, and the target step is still `running`), finalize
+    idempotently. The target PID being dead is the **expected** post-signal
+    outcome, not a gate failure, so finalization trusts the intent's frozen
+    identity rather than re-verifying liveness. It (re-)signals the recorded group
+    only if it is still alive — a no-op SIGKILL when already dead, safe because the
+    intent's identity still pins the group — then performs steps 6–8: writes the
+    `INTERRUPTED` transition + the §6.4 recovery record (`signal_outcome:
+    already_dead` when the group was already gone), clears the intent, and releases
+    the lock under the nonce guard. The FR-5.3 audit record is therefore **always**
+    written for any recovery that passed step 4; `resume` is never relied on to
+    create it.
+
+  A crash *before* step 4 leaves no intent and no signal, so a fresh `recover`
+  simply re-runs the full FR-5.1 gate (the PID is still live) — no special path
+  needed. Every boundary is thus either a clean fresh start or a finalizable
+  intent; no interrupted state is contradictory or unrecoverable. *Acceptance:*
+  tests assert (a) a lock whose `nonce` changed between capture and signal causes
+  a no-signal abort; (b) a step that is no longer `running` causes a no-mutation
+  abort; (c) `recover` run twice over the same interrupted run converges (no torn
+  manifest, no double-kill of a reused PID) — i.e. the operation is idempotent;
+  **(d) crash injected between step 5 (signal sent, group dead) and step 6
+  (manifest write) — intent persisted, manifest still `running`, no recovery
+  record — is reconciled by the next `recover`/`status` into an `INTERRUPTED` step
+  + a §6.4 recovery record (`signal_outcome: already_dead`) + cleared intent +
+  released lock, with the manifest never left stranded `running` and the audit
+  record present; (e) an intent whose lock `nonce` no longer matches (relaunched
+  run) is discarded with no signal and no manifest mutation.**
 
 ### FR-6 — Operator skill + playbook
 
@@ -658,6 +703,36 @@ computation (§4.2).
   exited during the grace window).
 - `prior_*` / `resulting_*` — the step/run statuses before and after, so the
   audit trail records the exact transition.
+
+**Recovery-intent file (`<run_instance_dir>/.recovery-intent.json`, transient).**
+The durable pre-signal companion to the recovery record (FR-5.6 step 4). It is
+written atomically *before* `recover` signals the process group and unlinked only
+after the recovery record is durably appended (FR-5.6 step 7), so its presence on
+a later invocation means exactly "a kill of this verified process began but the
+manifest was not finalized" — the signal it gives crash reconciliation:
+
+```json
+{
+  "ts": "2026-06-25T16-44-03",
+  "actor": "jdoe",
+  "actor_source": "os_user",
+  "lock_nonce": "a1b2…",
+  "pid": 48213,
+  "pgid": 48213,
+  "proc_identity": { "platform": "darwin", "value": 1750000000, "unit": "epoch_seconds" },
+  "host": "hostname",
+  "step_id": "implement.1",
+  "prior_step_status": "running",
+  "prior_run_status": "running"
+}
+```
+
+It carries the FR-5.1-verified identity datums (so finalization trusts them
+instead of re-running a liveness gate against a now-dead PID) and the prior
+states needed to compose the §6.4 record. Reconciliation matches its `lock_nonce`
+against the current lock: equal (or absent lock) ⇒ finalize; differing ⇒ stale,
+discard. It is never appended to and never long-lived — at most one exists per run
+instance, only during an in-flight or interrupted `recover`.
 
 ### §6.5 Schema compatibility policy
 
