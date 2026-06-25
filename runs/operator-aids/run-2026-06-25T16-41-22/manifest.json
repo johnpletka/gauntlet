@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-approve",
+  "current_step": "implement",
   "warnings": [],
   "steps": [
     {
@@ -189,6 +189,128 @@
       "notes": "approved: Plan approved. plan-cycle converged clean (round 1, 7 findings resolved, 0 residuals); plan-lint validated P1-P5; all FRs covered. Begin phased implementation.",
       "iteration": null,
       "metrics": {}
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "aca12e89-38c1-4055-b8d8-08e9291a1883",
+      "started": "2026-06-25T18:36:36.114401+00:00",
+      "ended": "2026-06-25T18:50:02.415376+00:00",
+      "attempts": 0,
+      "base_sha": "b84da7f51d586718152a6eb207be16610d0f4c3b",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 6803,
+        "output_tokens": 54051,
+        "cached_input_tokens": 3289742,
+        "cost_usd": 4.622578000000001
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T18:50:02.419642+00:00",
+      "ended": "2026-06-25T18:51:14.733266+00:00",
+      "attempts": 0,
+      "base_sha": "b84da7f51d586718152a6eb207be16610d0f4c3b",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T18:51:14.735455+00:00",
+      "ended": "2026-06-25T18:51:26.426939+00:00",
+      "attempts": 0,
+      "base_sha": "b84da7f51d586718152a6eb207be16610d0f4c3b",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 658,
+        "output_tokens": 1275,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.0027145
+      },
+      "notes": "committed 1650e7955f",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T18:51:26.429631+00:00",
+      "ended": "2026-06-25T19:06:59.231687+00:00",
+      "attempts": 0,
+      "base_sha": "1650e7955f3862a0546567090758706b06cdcb95",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 772101,
+        "output_tokens": 48292,
+        "cached_input_tokens": 5180185,
+        "cost_usd": 4.8141225
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 5 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": "0",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 5,
+        "accepted_total": 5,
+        "accepted_resolved_total": 4,
+        "verdict_counts": {
+          "legitimate": 5
+        },
+        "confirm_counts": {
+          "resolved": 4,
+          "partially_resolved": 1
+        }
+      }
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "failed",
+      "agent": "builder",
+      "session_id": null,
+      "started": "2026-06-25T19:06:59.235145+00:00",
+      "ended": "2026-06-25T19:08:50.588100+00:00",
+      "attempts": 1,
+      "base_sha": "c0ac52787034e06caff9c2ed39c22388a6c0ded6",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "handler error: claude reported failure: exit code 1; stderr: ",
+      "iteration": "1",
+      "metrics": {}
     }
   ],
   "commits": [
@@ -216,44 +338,54 @@
       "step_id": "plan-cycle",
       "phase": "PLAN.1",
       "sha": "f9be0a755384de8396dbbb0826ecb846620b8b06"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P1",
+      "sha": "1650e7955f3862a0546567090758706b06cdcb95"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P1.1",
+      "sha": "c0ac52787034e06caff9c2ed39c22388a6c0ded6"
     }
   ],
   "totals": {
-    "input_tokens": 924075,
-    "output_tokens": 196574,
-    "cached_input_tokens": 11031023,
-    "cost_usd": 14.192079900000003
+    "input_tokens": 1765297,
+    "output_tokens": 310043,
+    "cached_input_tokens": 19500950,
+    "cost_usd": 23.666611900000003
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 748448,
-      "output_tokens": 18275,
-      "cached_input_tokens": 523008,
+      "input_tokens": 1505845,
+      "output_tokens": 26664,
+      "cached_input_tokens": 1162368,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 54966,
-      "output_tokens": 11558,
+      "input_tokens": 64741,
+      "output_tokens": 14726,
       "cached_input_tokens": 0,
-      "cost_usd": 0.0336319
+      "cost_usd": 0.04241165
     },
     "escalation": {
-      "input_tokens": 16630,
-      "output_tokens": 5959,
+      "input_tokens": 18485,
+      "output_tokens": 6607,
       "cached_input_tokens": 0,
-      "cost_usd": 0.0750495
+      "cost_usd": 0.08384825000000001
     },
     "builder": {
-      "input_tokens": 22851,
-      "output_tokens": 147505,
-      "cached_input_tokens": 10508015,
-      "cost_usd": 14.036549500000001
+      "input_tokens": 33386,
+      "output_tokens": 238918,
+      "cached_input_tokens": 18338582,
+      "cost_usd": 23.458386000000004
     },
     "judge_llm": {
-      "input_tokens": 81180,
-      "output_tokens": 13277,
+      "input_tokens": 142840,
+      "output_tokens": 23128,
       "cached_input_tokens": 0,
-      "cost_usd": 0.04684900000000001
+      "cost_usd": 0.08196599999999996
     }
   }
 }
