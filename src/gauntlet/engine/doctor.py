@@ -342,6 +342,52 @@ def _check_codex_hook(repo_root: Path, pins: PinFile | None) -> CheckResult:
     return CheckResult("codex-hook", OK, note)
 
 
+def _check_skill(repo_root: Path, asset_root: str = ".") -> CheckResult:
+    """FR-1.5 / OQ-3: warn-only presence + format check for the PRD-authoring skill.
+
+    The ``gauntlet-prd-author`` skill gates nothing (it only routes a session to the
+    playbook), so a problem here is **never** a FAIL — at worst a WARN. We surface a
+    missing skill, a frontmatter block that does not parse against the normative
+    schema (FR-1.5 / §6), or provenance that looks stale (a customized,
+    provenance-bearing skill whose rendered playbook path no longer matches this
+    repo's ``asset_root`` — §4.5). A well-formed skill is OK.
+    """
+    from gauntlet.engine import skill as S
+
+    rel = S.SKILL_REL
+    path = repo_root / rel
+    remedy = "run `gauntlet init` to (re)install the PRD-authoring skill"
+    if not path.exists():
+        return CheckResult(
+            "prd-skill", WARN, f"{rel} missing (PRD-authoring skill not installed)",
+            remedy=remedy,
+        )
+    if not path.is_file():
+        return CheckResult(
+            "prd-skill", WARN, f"{rel} is not a regular file", remedy=remedy,
+        )
+    text = path.read_text()
+    violations = S.validate_skill_frontmatter(text)
+    if violations:
+        return CheckResult(
+            "prd-skill", WARN,
+            f"{rel} frontmatter does not match the pinned schema: {violations[0]}",
+            remedy=remedy,
+        )
+    if (
+        S.classify_skill(text, asset_root) == "customization"
+        and S.skill_looks_stale(text, asset_root)
+    ):
+        return CheckResult(
+            "prd-skill", WARN,
+            f"{rel} provenance looks stale: playbook ref "
+            f"{S.playbook_ref(asset_root)!r} not found (asset_root may have changed)",
+            remedy="re-render the skill (`gauntlet init`) or update its playbook "
+            "reference; init never modifies a customized skill",
+        )
+    return CheckResult("prd-skill", OK, f"{rel} present and well-formed")
+
+
 def _check_judge(repo_root: Path, asset_root: str = ".") -> CheckResult:
     policy = repo_root / asset_root / "policy.yaml"
     if not policy.exists():
@@ -600,6 +646,7 @@ def run_doctor(
 
     results.append(_check_claude_hook(repo_root, probes))
     results.append(_check_codex_hook(repo_root, pins))
+    results.append(_check_skill(repo_root, asset_root))
     results.append(_check_judge(repo_root, asset_root))
     results.append(_check_repo_secrets(repo_root, asset_root))
 

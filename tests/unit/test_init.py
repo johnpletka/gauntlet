@@ -9,14 +9,18 @@ repo's canonical ones.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from gauntlet.engine import prd_stub as PS
 from gauntlet.engine import skill as S
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.init import (
     CREATED,
+    CUSTOMIZED,
     MISSING,
     PRESENT,
     REFRESHED,
@@ -484,3 +488,139 @@ def test_from_repo_reports_stub_present_or_missing(tmp_path):
     rel = _stub_rel(tmp_path)
     present = init_repo(tmp_path, from_repo=True)
     assert {a.path: a.action for a in present.actions}[rel] == PRESENT
+
+
+# ---- P3: three-mode propagation of BOTH aids (FR-3.1, §4.5) -----------------
+
+def test_init_refreshes_unmodified_generated_stub(tmp_path, monkeypatch):
+    # §4.5: an unmodified generated stub is refreshed when the current template
+    # moves on (a version bump), and never otherwise — the stub analogue of the
+    # skill refresh. Simulate a v2 template while resolving the installed v1 stub
+    # to its original template so it is still recognized as generated.
+    init_repo(tmp_path)
+    rel = _stub_rel(tmp_path)
+    stub_file = tmp_path / rel
+    original = PS.packaged_stub_path().read_text()
+
+    new_tmpl = tmp_path / "new_stub.md"
+    new_tmpl.write_text(original + "\n<!-- stub template v2 line -->\n")
+    orig_tmpl = tmp_path / "orig_stub.md"
+    orig_tmpl.write_text(original)
+    monkeypatch.setattr(PS, "packaged_stub_path", lambda: new_tmpl)
+    monkeypatch.setattr(PS, "stub_version_template_path", lambda v: orig_tmpl if v == 1 else None)
+
+    result = init_repo(tmp_path)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[rel] == REFRESHED
+    assert "stub template v2 line" in stub_file.read_text()
+
+
+def test_init_does_not_clobber_customized_stub(tmp_path):
+    # A customized stub (provenance present but body edited → no byte match) is
+    # never overwritten on re-run; it is reported skipped (never-clobber, FR-3.1).
+    init_repo(tmp_path)
+    rel = _stub_rel(tmp_path)
+    stub_file = tmp_path / rel
+    custom = stub_file.read_text() + "\n<!-- hand-tuned by the maintainer -->\n"
+    stub_file.write_text(custom)
+    result = init_repo(tmp_path)
+    assert stub_file.read_text() == custom  # byte-for-byte intact
+    assert {a.path: a.action for a in result.actions}[rel] == SKIPPED
+
+
+def test_from_repo_reports_customized_for_both_aids(tmp_path):
+    # FR-3.1: --from-repo reports present/missing/customized for BOTH aids via the
+    # same predicate a write-mode re-run uses, so the report cannot disagree with
+    # what a re-run would refresh.
+    init_repo(tmp_path)
+    rel = _stub_rel(tmp_path)
+    skill_file = tmp_path / S.SKILL_REL
+    skill_file.write_text(skill_file.read_text() + "\n<!-- custom -->\n")
+    stub_file = tmp_path / rel
+    stub_file.write_text(stub_file.read_text() + "\n<!-- custom -->\n")
+    result = init_repo(tmp_path, from_repo=True)
+    actions = {a.path: a.action for a in result.actions}
+    assert actions[S.SKILL_REL] == CUSTOMIZED
+    assert actions[rel] == CUSTOMIZED
+    # a customized committed aid is never written, even in --from-repo mode
+    assert skill_file.read_text().endswith("<!-- custom -->\n")
+
+
+def test_combined_rerun_fail_closed_on_malformed_skill_without_mutating_stub(tmp_path):
+    # review F-005: a malformed pre-existing state at EITHER generated path during a
+    # both-aids re-run still raises InitError without mutation — the per-aid guards
+    # (skill in P1, stub in P2) are not bypassed when both are installed together.
+    init_repo(tmp_path)  # both aids present
+    rel = _stub_rel(tmp_path)
+    before_stub = (tmp_path / rel).read_text()
+    skill_file = tmp_path / S.SKILL_REL
+    skill_file.unlink()
+    skill_file.mkdir()  # a non-regular node where the SKILL.md belongs
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+    assert (tmp_path / rel).read_text() == before_stub  # stub not mutated
+
+
+def test_second_repo_adopter_lands_both_aids_at_adopter_paths(tmp_path):
+    # A distinct adopter repo (fresh init → asset_root .gauntlet) gets both aids at
+    # the adopter paths, the skill carrying the adopter-relative playbook reference.
+    init_repo(tmp_path)
+    assert RunConfig.load(tmp_path / ".gauntlet/config.yaml").asset_root == ".gauntlet"
+    assert (tmp_path / S.SKILL_REL).exists()
+    assert (tmp_path / ".gauntlet/prd-stub.md").exists()
+    assert "`.gauntlet/prompts/prd-author.md`" in (tmp_path / S.SKILL_REL).read_text()
+
+
+# ---- P3: clone-to-different-path portability (FR-1.3 acceptance (b)) ---------
+
+def test_committed_skill_reference_survives_relocation(tmp_path):
+    repo_a = tmp_path / "a"
+    repo_a.mkdir()
+    init_repo(repo_a)
+    asset_root = RunConfig.load(repo_a / ".gauntlet/config.yaml").asset_root
+    skill_text = (repo_a / S.SKILL_REL).read_text()
+    ref = S.playbook_ref(asset_root)  # repository-relative, never absolute
+    assert f"`{ref}`" in skill_text
+    for absolute in ("/Users/", "/home/", "/private/", "/tmp/", str(repo_a)):
+        assert absolute not in skill_text, absolute
+
+    # Relocate the whole repo to a different absolute path: the committed skill's
+    # repo-relative reference must still resolve to the playbook there (proves no
+    # embedded source-machine path).
+    repo_b = tmp_path / "b"
+    shutil.copytree(repo_a, repo_b)
+    assert (repo_b / ref).is_file()
+    assert (repo_b / S.SKILL_REL).read_text() == skill_text  # byte-identical
+
+
+# ---- P3: .gitignore committability + foreign-ignore-rule warning (FR-1.4) ----
+
+def _git_init(repo: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=repo, capture_output=True, check=True)
+
+
+def test_skill_committable_no_warning_when_not_ignored(tmp_path):
+    # init's own .gitignore guidance does not exclude .claude/skills/, so a fresh
+    # git repo leaves the skill committable: no foreign-ignore warning is emitted.
+    _git_init(tmp_path)
+    result = init_repo(tmp_path)
+    warned = [a for a in result.actions if a.path == S.SKILL_REL and a.action == WARNED]
+    assert warned == []
+    # and git agrees the installed skill is not ignored
+    check = subprocess.run(
+        ["git", "check-ignore", S.SKILL_REL], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert check.returncode == 1  # no rule matches → committable
+
+
+def test_skill_committable_warns_on_foreign_ignore_rule_without_editing_it(tmp_path):
+    # FR-1.4: a pre-existing info/exclude rule that matches .claude/skills/ makes
+    # init WARN (naming the source) and proceed — it never edits the foreign rule.
+    _git_init(tmp_path)
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    exclude.write_text(".claude/skills/\n")
+    result = init_repo(tmp_path)
+    warned = [a for a in result.actions if a.path == S.SKILL_REL and a.action == WARNED]
+    assert warned, "expected a foreign-ignore warning for the skill"
+    assert "exclude" in warned[0].detail.lower()  # names the ignoring source
+    assert exclude.read_text() == ".claude/skills/\n"  # foreign rule left intact

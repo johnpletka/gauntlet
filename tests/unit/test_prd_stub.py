@@ -185,3 +185,37 @@ def test_playbook_resolution_falls_back_to_package(tmp_path):
     pb.parent.mkdir(parents=True)
     pb.write_text("## 2. structure\n\n**Header block** *(mandatory)*\n\n## 3. next\n")
     assert PS.resolve_playbook_text(tmp_path, ".gauntlet") == pb.read_text()
+
+
+# ---- §4.5 stub provenance / refresh classification (P3, review F-004) -------
+
+def test_packaged_stub_classifies_as_generated():
+    assert PS.classify_stub(PS.packaged_stub_path().read_text()) == "generated"
+
+
+def test_edited_or_provenance_stripped_stub_is_a_customization():
+    packaged = PS.packaged_stub_path().read_text()
+    # an edited body no longer byte-matches the version template → customization
+    assert PS.classify_stub(packaged + "\nmy custom note\n") == "customization"
+    # provenance comment stripped → no recognizable claim → customization
+    stripped = PS.classify_stub(packaged.replace("gauntlet-template-version: 1", ""))
+    assert stripped == "customization"
+
+
+def test_unknown_stub_version_is_a_customization():
+    packaged = PS.packaged_stub_path().read_text()
+    bumped = packaged.replace(
+        "gauntlet-template-version: 1", "gauntlet-template-version: 999"
+    )
+    assert PS.stub_version_template_path(999) is None
+    assert PS.classify_stub(bumped) == "customization"
+
+
+def test_stub_version_registry_is_append_only_and_consistent():
+    assert PS.stub_version_template_path(PS.CURRENT_STUB_VERSION) == PS.packaged_stub_path()
+    # every superseded version (< current) must stay recognizable (never retired)
+    for v in range(1, PS.CURRENT_STUB_VERSION):
+        assert PS.stub_version_template_path(v) is not None, v
+    # a non-integer / bool version is not a recognizable version
+    assert PS.stub_version_template_path(True) is None
+    assert PS.stub_version_template_path("1") is None

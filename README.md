@@ -25,6 +25,7 @@ is [`runs/gauntlet/plan.md`](runs/gauntlet/plan.md).
   - [Windows](#windows)
 - [Configure credentials](#configure-credentials)
 - [Quick start (≤ 3 commands)](#quick-start--3-commands)
+- [Authoring a PRD (the repo teaches you how)](#authoring-a-prd-the-repo-teaches-you-how)
 - [The run lifecycle](#the-run-lifecycle)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
@@ -210,6 +211,37 @@ gauntlet init --from-repo
 `gauntlet doctor` reports actionable, per-check status — installed CLI versions
 vs. the verified pin file (`.gauntlet/pins.yaml`), authentication, hook wiring,
 judge startability, and ApiAdapter keys — and exits non-zero on any blocker.
+
+---
+
+## Authoring a PRD (the repo teaches you how)
+
+A Gauntlet run starts from a human-authored PRD. `gauntlet init` installs two
+committable aids so you don't have to carry the conventions in your head — and a
+teammate who clones the repo inherits both automatically:
+
+- **A Claude Code skill** at `.claude/skills/gauntlet-prd-author/SKILL.md`. In a
+  Claude session, a natural-language request like *"help me write a PRD"* or
+  *"start a Gauntlet run"* triggers it; it routes you to this repo's authoring
+  playbook (`prompts/prd-author.md`, under your `asset_root`) and the conventions
+  for where the PRD lives and how to scaffold and launch it. It's a thin pointer
+  to the playbook, not a copy, so there's one source of truth.
+- **A structured stub.** `gauntlet new <slug>` writes a PRD stub with the
+  playbook's full section skeleton and a one-line hint per section, so you start
+  from the right shape. The stub is the committable template
+  `<asset_root>/prd-stub.md` — edit it to change the house style for every future
+  PRD.
+
+The skill *teaches and routes*; it never authors the PRD for you. A human writes
+and ratifies it (FR-10.1): `gauntlet run` refuses to start while the file is
+still the stub (marker present, or no substantive content added), so an unfilled
+skeleton can't become a runnable non-PRD.
+
+Both aids are idempotent and never-clobber: re-running `gauntlet init` leaves any
+customization byte-for-byte intact (only an *unmodified* generated file is ever
+refreshed, and only after a template version bump). `gauntlet doctor` includes a
+warn-only check that the skill is installed and well-formed — it never blocks a
+run, since the skill gates nothing.
 
 ---
 

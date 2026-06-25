@@ -38,6 +38,17 @@ PRD_STUB_MARKER = "<!-- GAUNTLET-PRD-STUB: replace this file with a real PRD -->
 STUB_REL = "prd-stub.md"
 PLAYBOOK_REL = "prompts/prd-author.md"
 
+# §4.5 provenance for the *generated* stub. A PRD carries no YAML frontmatter (the
+# skill's provenance vehicle), so the stub's provenance rides in an HTML comment.
+# ``CURRENT_STUB_VERSION`` is the current generated-template version; bumping it
+# first COPIES the outgoing template into the append-only version registry under
+# ``scaffold/_stub-versions/<N>/`` so every stub gauntlet has ever generated stays
+# recognizable (mirrors :mod:`gauntlet.engine.skill`'s version registry).
+CURRENT_STUB_VERSION = 1
+_STUB_PROVENANCE_RE = re.compile(
+    r"<!--\s*gauntlet-generated:\s*true;\s*gauntlet-template-version:\s*(?P<version>\d+)\s*-->"
+)
+
 # Manifest entry classes (§6).
 MANDATORY = "mandatory"
 SCALE = "scale-with-size"
@@ -366,3 +377,54 @@ def resolve_playbook_text(repo_root: Path, asset_root: str) -> str:
 def resolve_manifest(repo_root: Path, asset_root: str) -> list[ManifestEntry]:
     """Parse the §6 manifest from the resolved playbook for this repo."""
     return parse_manifest(resolve_playbook_text(repo_root, asset_root))
+
+
+# --- §4.5 provenance / refresh classification (the stub analogue of skill.py) -
+
+def stub_version_template_path(version: object) -> Path | None:
+    """Template path for a recognized stub version, or ``None`` if unknown (§4.5).
+
+    The *current* version lives at the packaged path; superseded versions live
+    under ``_stub-versions/<N>/prd-stub.md`` (append-only — never retired, so any
+    stub gauntlet has ever generated stays recognizable). An out-of-range or
+    non-integer version is unknown → ``None`` → the caller fails safe to
+    "customization" (never clobber). Mirrors :func:`skill.version_template_path`.
+    """
+    if not isinstance(version, int) or isinstance(version, bool):
+        return None
+    if version == CURRENT_STUB_VERSION:
+        return packaged_stub_path()
+    superseded = SCAFFOLD_DIR / "_stub-versions" / str(version) / STUB_REL
+    return superseded if superseded.is_file() else None
+
+
+def stub_provenance_version(text: str) -> int | None:
+    """The template version a stub claims in its provenance comment, or ``None``.
+
+    ``None`` when the file carries no ``gauntlet-generated: true`` provenance
+    comment, so a hand-authored stub (or one with the line stripped) makes no
+    recognizable provenance claim and is treated as a customization downstream
+    (fail safe toward never-clobber).
+    """
+    m = _STUB_PROVENANCE_RE.search(text)
+    return int(m.group("version")) if m else None
+
+
+def classify_stub(text: str) -> str:
+    """Classify an installed stub as ``"generated"`` or ``"customization"`` (§4.5).
+
+    The stub analogue of :func:`skill.classify_skill`, using the same version-keyed
+    compare (review F-004): a file whose provenance claims a *known* version and is
+    byte-for-byte that version's template is an unmodified generated file
+    (refreshable); any byte mismatch, missing provenance, or unknown version is a
+    customization (never clobbered) — failing safe toward never-clobber. The stub
+    carries no ``asset_root``-dependent rendered path, so "re-render" is the
+    identity here and the compare is a plain byte equality.
+    """
+    version = stub_provenance_version(text)
+    if version is None:
+        return "customization"
+    tmpl_path = stub_version_template_path(version)
+    if tmpl_path is None:
+        return "customization"
+    return "generated" if text == tmpl_path.read_text() else "customization"

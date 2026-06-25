@@ -97,8 +97,20 @@ def _default_policy_path() -> Path:
 @app.command()
 def new(slug: str) -> None:
     """Scaffold the run dir (run_root/<slug>/, default .gauntlet/runs/) with a human-authored PRD stub (FR-8.1, FR-10.1)."""
-    path = _manager().new(slug)
+    manager = _manager()
+    path = manager.new(slug)
     typer.echo(f"scaffolded {path}; author the PRD, then `gauntlet run {slug}`")
+    # OQ-4 (decided "yes" in P3): a cheap, CLI-agnostic pointer to the authoring
+    # aids, so the convention is reinforced on the `gauntlet new` path even outside
+    # a skill-aware Claude session. It shapes no gate and no required acceptance
+    # test; it is pure reinforcement of G1 (the playbook is otherwise inert).
+    from gauntlet.engine import skill as S
+
+    playbook = S.playbook_ref(manager.config.asset_root)
+    typer.echo(
+        f"  authoring help: open {playbook} for the playbook; in a Claude session "
+        "the `gauntlet-prd-author` skill routes you there automatically."
+    )
 
 
 @app.command()

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from gauntlet.engine import skill as S
 from gauntlet.engine.doctor import (
     FAIL,
     OK,
@@ -411,3 +412,41 @@ def test_version_check_surfaces_gauntlet_version(tmp_path):
     ver = _by_name(results)["gauntlet"]
     assert ver.status == OK
     assert "version" in ver.detail
+
+
+# ---- P3: doctor warn-only PRD-authoring skill check (FR-1.5, OQ-3) ----------
+
+def test_skill_check_ok_when_well_formed(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert _by_name(results)["prd-skill"].status == OK
+
+
+def test_skill_check_warns_and_never_fails_when_missing(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / S.SKILL_REL).unlink()
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN  # the skill gates nothing — never a blocker
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_on_malformed_frontmatter(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / S.SKILL_REL).write_text("no frontmatter at all\n")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+
+
+def test_skill_check_warns_on_stale_provenance(tmp_path):
+    # A generated skill whose asset_root later changed carries provenance but a
+    # drifted playbook ref → classify=customization + looks_stale → WARN (§4.5).
+    repo = _healthy_repo(tmp_path)
+    cfg = repo / ".gauntlet/config.yaml"
+    cfg.write_text(cfg.read_text().replace("asset_root: .gauntlet", 'asset_root: "."'))
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert "stale" in skill.detail.lower()

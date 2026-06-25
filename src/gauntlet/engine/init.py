@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -80,6 +81,7 @@ PRESENT = "present"      # wiring already in place; nothing to do
 MISSING = "missing"      # --from-repo: a required committed asset is absent
 REFRESHED = "refreshed"  # an unmodified generated file updated to the current template (§4.5)
 WARNED = "warned"        # advisory: a customization that looks stale; left untouched
+CUSTOMIZED = "customized"  # --from-repo: a committed aid the team has customized (present, not generated)
 
 
 @dataclass(frozen=True)
@@ -239,6 +241,7 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
     _wire_claude_hook(repo_root, result)
     _wire_codex_hook(repo_root, result, from_repo=from_repo)
     _ensure_gitignore_guidance(repo_root, result)
+    _warn_if_skill_ignored(repo_root, result)
     return result
 
 
@@ -331,17 +334,24 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
 
     rel = S.SKILL_REL
     target = repo_root / rel
+    asset_root = _resolve_asset_root(repo_root)
     # Malformed pre-existing state (a symlink or non-regular node at the skill
     # path) is rejected in _preflight_destinations before any write (FR-3.2 /
     # review F-001, F-005), so the destination here is absent or a regular file.
 
     if from_repo:
-        # The committed skill is authoritative; never write it (full
-        # present/missing/customized classification is P3).
-        result.add(rel, PRESENT if target.exists() else MISSING)
+        # The committed skill is authoritative; never write it. Report
+        # present/missing/customized so `--from-repo`'s classification cannot
+        # disagree with what a write-mode re-run would refresh (FR-3.1, review
+        # F-004): the same version-keyed re-render-and-compare predicate decides.
+        if not target.exists():
+            result.add(rel, MISSING)
+        elif S.classify_skill(target.read_text(), asset_root) == "customization":
+            result.add(rel, CUSTOMIZED, "committed skill is customized; left to the team")
+        else:
+            result.add(rel, PRESENT, "committed generated skill")
         return
 
-    asset_root = _resolve_asset_root(repo_root)
     rendered = S.render_skill(S.current_template_path().read_text(), asset_root)
 
     if not target.exists():
@@ -375,12 +385,14 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
 def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
     """Install the structured PRD stub template to ``<asset_root>/prd-stub.md`` (§4.3).
 
-    P2 posture: create-if-absent, idempotent (skip when present), and fail-closed
-    via :class:`InitError` on malformed pre-existing state (a non-regular node at
-    the destination), mirroring the skill installer (FR-3.2 / review F-005). The
-    §4.5 refresh-vs-preserve and ``--from-repo`` customized classification of the
-    stub land in P3 (the both-aids propagation matrix); here ``--from-repo`` only
-    reports present/missing, the same as the skill installer does in P1.
+    Posture mirrors the skill installer: create-if-absent, idempotent, never-clobber
+    a customization, fail-closed via :class:`InitError` on malformed pre-existing
+    state (rejected in :func:`_preflight_destinations` before any write — FR-3.2 /
+    review F-005). Recognition of a prior-generated stub is the version-keyed
+    compare in :func:`prd_stub.classify_stub` (review F-004), so an *unmodified*
+    generated stub may be refreshed to the current template on a version bump (§4.5)
+    while a customization is left byte-for-byte intact. ``--from-repo`` reports
+    present/missing/customized via the same predicate (FR-3.1).
     """
     from gauntlet.engine import prd_stub as PS
 
@@ -392,18 +404,38 @@ def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> N
     # review F-001, F-005), so the destination here is absent or a regular file.
 
     if from_repo:
-        # The committed stub is authoritative; never write it (full
-        # present/missing/customized classification is P3).
-        result.add(rel, PRESENT if target.exists() else MISSING)
+        # The committed stub is authoritative; never write it — report
+        # present/missing/customized via the same predicate a write-mode re-run
+        # would use, so the two can never disagree (FR-3.1, review F-004).
+        if not target.exists():
+            result.add(rel, MISSING)
+        elif PS.classify_stub(target.read_text()) == "customization":
+            result.add(rel, CUSTOMIZED, "committed stub is customized; left to the team")
+        else:
+            result.add(rel, PRESENT, "committed generated stub")
         return
 
-    if target.exists():
-        result.add(rel, SKIPPED, "exists; left unchanged")
+    current = PS.packaged_stub_path().read_text()
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(current)
+        result.add(rel, CREATED, "structured PRD stub template")
         return
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(PS.packaged_stub_path(), target)
-    result.add(rel, CREATED, "structured PRD stub template")
+    existing = target.read_text()
+    if PS.classify_stub(existing) == "generated":
+        # Unmodified generated stub: refresh it when the current template has moved
+        # on (a version bump), and never otherwise (§4.5 — the only overwrite init
+        # performs). The stub has no asset_root-dependent path, so unlike the skill
+        # there is no stale-warning case for a customization — it is simply kept.
+        if existing != current:
+            target.write_text(current)
+            result.add(rel, REFRESHED, "updated unmodified generated stub to current template")
+        else:
+            result.add(rel, SKIPPED, "generated stub up to date")
+        return
+
+    result.add(rel, SKIPPED, "customized; left unchanged")
 
 
 def _hook_entry() -> dict:
@@ -483,6 +515,44 @@ def _wire_codex_hook(repo_root: Path, result: InitResult, *, from_repo: bool) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(SCAFFOLD_DIR / "codex-hooks.json", path)
     result.add(rel, WIRED if from_repo else CREATED, "inert on pinned codex; forward-looking")
+
+
+def _warn_if_skill_ignored(repo_root: Path, result: InitResult) -> None:
+    """Warn (never edit) if a foreign ignore rule would exclude the skill (FR-1.4).
+
+    ``init``'s own ``.gitignore`` guidance never excludes ``.claude/skills/``, but a
+    repo ``.gitignore``, a parent-directory ``.gitignore``, ``.git/info/exclude``,
+    or the global ``core.excludesFile`` might — and a silently-ignored skill never
+    reaches a teammate's clone (defeating G4/FR-1.2). We ask git itself
+    (``git check-ignore -v``, which consults *every* effective ignore source) and,
+    when a rule matches, emit a WARNING naming the rule's source plus the
+    remediation. We do **not** edit a maintainer's foreign rule — that is their
+    call. When git is unavailable or this is not a work tree there is nothing to
+    check (and the skill gates nothing), so we stay silent.
+    """
+    from gauntlet.engine import skill as S
+
+    rel = S.SKILL_REL
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "-v", rel],
+            cwd=repo_root, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    # git check-ignore: 0 = a rule matches (ignored); 1 = committable (the good
+    # case); 128 = not a work tree / fatal. Only an actual match is worth warning.
+    if proc.returncode != 0:
+        return
+    first = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
+    # `-v` format is "<source>:<linenum>:<pattern>\t<pathname>"; the source is the
+    # ignore file the maintainer owns (or the global core.excludesFile path).
+    source = first.split(":", 1)[0] if first else "an effective .gitignore rule"
+    result.add(
+        rel, WARNED,
+        f"would be excluded by {source}; the committable skill must reach git — "
+        "commit it with `git add -f` or amend that ignore rule (init left it intact)",
+    )
 
 
 def _ensure_gitignore_guidance(repo_root: Path, result: InitResult) -> None:
