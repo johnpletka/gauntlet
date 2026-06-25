@@ -352,48 +352,63 @@ class Orchestrator:
         self.manifest.current_step = step.id
         if spec.step_touches_worktree(step) and rec.base_sha is None:
             rec.base_sha = self._head_sha()
-        # Per-step judge attribution: child agent hooks read GAUNTLET_STEP_ID
-        # (only under an active judge run; unit tests leave judge_env empty).
-        if self.judge_env:
-            os.environ["GAUNTLET_STEP_ID"] = step.id
+        # Per-step agent attribution: EVERY in-run child agent must see
+        # GAUNTLET_STEP_ID (FR-5.5) — it is both the per-step marker the judge's
+        # `pipeline_step_only` rules key on AND the operator-only boundary that
+        # makes an in-pipeline `gauntlet recover` refuse fail-closed. It is
+        # therefore exported for every step INDEPENDENT of whether a judge is
+        # configured: under `--no-judge` (judge_env empty) the guard must still
+        # fire, so that path is not exempt (review F-001). Captured and restored
+        # around the step so the marker never leaks past it into the parent
+        # session — the judge's env snapshot then sees it already restored.
+        prior_step_id = os.environ.get("GAUNTLET_STEP_ID")
+        os.environ["GAUNTLET_STEP_ID"] = step.id
         self._persist()  # WRITE-AHEAD: before any side effect
 
-        ctx = self._make_context(step, rec, iteration, item)
         try:
-            result = spec.handler(step, ctx)
-        except AgentTimeoutError as exc:
-            result = StepResult(
-                status=HALTED,
-                usage=exc.partial.usage if exc.partial else None,
-                session_id=exc.partial.session_id if exc.partial else None,
-                notes=f"timeout halt (FR-3.3): {exc}",
-            )
-        except Exception as exc:  # fail closed: a handler fault halts the step
-            result = StepResult(status=FAILED, notes=f"handler error: {exc}")
+            ctx = self._make_context(step, rec, iteration, item)
+            try:
+                result = spec.handler(step, ctx)
+            except AgentTimeoutError as exc:
+                result = StepResult(
+                    status=HALTED,
+                    usage=exc.partial.usage if exc.partial else None,
+                    session_id=exc.partial.session_id if exc.partial else None,
+                    notes=f"timeout halt (FR-3.3): {exc}",
+                )
+            except Exception as exc:  # fail closed: a handler fault halts the step
+                result = StepResult(status=FAILED, notes=f"handler error: {exc}")
 
-        result = self._apply_budget_guard(step, rec, result)
-        # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
-        # whether signalled by the textual UPSTREAM CONFLICT marker (first
-        # conflict) or a re-park disposition (amendment_required/new_conflict) —
-        # hands control to a human, so the worktree MUST be clean. The builder
-        # runs with repo-write access; if it wrote implementation edits and THEN
-        # signalled a conflict, those edits are still uncommitted. Restore the
-        # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
-        # `--response` resume never re-runs over — and commits — stale edits.
-        result = self._restore_clean_after_conflict_park(step, spec, rec, result)
-        consumed = self._finalize(rec, result)
-        self._persist()  # WRITE-AHEAD: after the side effect, terminal state
-        # The consume flip, the FAILED attempt-increment, and the status all
-        # landed in the single `_persist` above — one atomic on-disk transaction
-        # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
-        # the `consumed` checkpoint, so a crash here leaves the entry already
-        # `consumed` on disk and recovery merely flushes this commit, never
-        # re-executing or double-counting.
-        if consumed is not None:
-            self._commit_manifest_checkpoint(
-                f"gauntlet: response {consumed.response_id} consumed"
-            )
-        return result
+            result = self._apply_budget_guard(step, rec, result)
+            # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
+            # whether signalled by the textual UPSTREAM CONFLICT marker (first
+            # conflict) or a re-park disposition (amendment_required/new_conflict) —
+            # hands control to a human, so the worktree MUST be clean. The builder
+            # runs with repo-write access; if it wrote implementation edits and THEN
+            # signalled a conflict, those edits are still uncommitted. Restore the
+            # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
+            # `--response` resume never re-runs over — and commits — stale edits.
+            result = self._restore_clean_after_conflict_park(step, spec, rec, result)
+            consumed = self._finalize(rec, result)
+            self._persist()  # WRITE-AHEAD: after the side effect, terminal state
+            # The consume flip, the FAILED attempt-increment, and the status all
+            # landed in the single `_persist` above — one atomic on-disk transaction
+            # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
+            # the `consumed` checkpoint, so a crash here leaves the entry already
+            # `consumed` on disk and recovery merely flushes this commit, never
+            # re-executing or double-counting.
+            if consumed is not None:
+                self._commit_manifest_checkpoint(
+                    f"gauntlet: response {consumed.response_id} consumed"
+                )
+            return result
+        finally:
+            # Scoped restoration (FR-5.5): never leak this step's id into the next
+            # step or the parent session.
+            if prior_step_id is None:
+                os.environ.pop("GAUNTLET_STEP_ID", None)
+            else:
+                os.environ["GAUNTLET_STEP_ID"] = prior_step_id
 
     def _resume_disposition(
         self, step: Step, spec, rec: StepRecord

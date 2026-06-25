@@ -109,6 +109,17 @@ class RecoverConcurrent(RecoverError):
     """
 
 
+class RecoverSignalError(RecoverError):
+    """`recover` could not deliver the kill to a verified-but-unsignalable driver.
+
+    The target's identity was proven but the OS refused the signal (``EPERM`` —
+    e.g. the process changed credentials). The driver is **still alive** and was
+    NOT terminated, so the step is never marked ``INTERRUPTED``; the caller clears
+    the durable intent so reconciliation never retries the un-killable signal
+    forever (review F-005). The message names manual termination as the safe path.
+    """
+
+
 class UnsafeRunSegment(ValueError):
     """A slug or run-id that is not a single, traversal-free path segment.
 
@@ -503,7 +514,35 @@ def _signal_process_group(
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         return M.SIGNAL_TERMINATED_SIGTERM  # exited right at the boundary
+    except PermissionError as exc:
+        # Identity was proven (it IS our driver) yet the OS refuses the signal —
+        # the process is still alive and CANNOT be terminated by us. Marking a
+        # live driver INTERRUPTED would be a lie, so fail closed with explicit
+        # guidance; the caller clears the durable intent so reconciliation does
+        # not retry this un-killable signal on every later entry point (F-005).
+        raise RecoverSignalError(
+            f"refusing to finalize recovery: permission denied signalling the "
+            f"verified driver's process group {pgid} ({exc}). The driver is "
+            "STILL ALIVE and was not terminated; no step was marked interrupted. "
+            f"Terminate it manually with sufficient privileges (e.g. `sudo kill "
+            f"-KILL -{pgid}`), then run `gauntlet resume`."
+        ) from exc
     return M.SIGNAL_TERMINATED_SIGKILL
+
+
+def _path_within(child: Path, ancestor: Path) -> bool:
+    """True iff ``child`` (already resolved) is at or under ``ancestor`` (resolved).
+
+    The write/control-path mirror of ``operator._within`` (FR-10.1 / PRD §7
+    containment): a path built from external bytes (the active-run pointer, a
+    ``.recovery-intent.json`` symlink) must be proven inside the run tree before
+    any read or write drives signalling or a manifest mutation.
+    """
+    try:
+        child.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -532,7 +571,28 @@ class RunLayout:
             raise FileNotFoundError(
                 f"no active run for {self.slug!r}; has `gauntlet run` been started?"
             )
-        return self.slug_dir / self.active_pointer.read_text().strip()
+        run_id = self.active_pointer.read_text().strip()
+        # Containment (FR-10.1 / PRD §7): the pointer's bytes flow straight into a
+        # path that the mutating verbs (recover/resume) then read AND write —
+        # manifest, recovery intent, lock. An unvalidated segment could carry a
+        # traversal or absolute path that redirects those mutations outside the run
+        # tree. Reject an unsafe segment, then require the resolved dir to remain
+        # beneath the slug dir (catching a run-dir symlink that escapes), before
+        # any caller reads or writes through it (review F-003).
+        safe_run_segment(run_id, kind="run-id")
+        candidate = self.slug_dir / run_id
+        try:
+            if not _path_within(candidate.resolve(), self.slug_dir.resolve()):
+                raise UnsafeRunSegment(
+                    f"active run dir for {self.slug!r} escapes the slug tree: "
+                    f"{run_id!r}"
+                )
+        except (OSError, RuntimeError) as exc:
+            raise UnsafeRunSegment(
+                f"active run dir for {self.slug!r} is unresolvable ({exc}): "
+                f"{run_id!r}"
+            ) from exc
+        return candidate
 
 
 class RunManager:
@@ -1320,7 +1380,10 @@ class RunManager:
         # a clean slate.
         self._reconcile_recovery_intent(run_dir)
 
-        man = Manifest.load(run_dir / "manifest.json")
+        # Containment (review F-003): refuse a symlinked/escaping manifest before
+        # any recover read or write; reuse the proven path for every load below.
+        manifest_path = self._guard_run_file(run_dir, "manifest.json")
+        man = Manifest.load(manifest_path)
 
         # FR-5.6 step 1: capture the lock once and run the full FR-5.1 gate.
         captured = self._read_lock()
@@ -1360,16 +1423,52 @@ class RunManager:
             prior_step_status=target.status,
             prior_run_status=man.status,
         )
-        _atomic_write_durable(run_dir / RECOVERY_INTENT_NAME, intent.to_json())
+        intent_path = run_dir / RECOVERY_INTENT_NAME
+        _atomic_write_durable(intent_path, intent.to_json())
+
+        # FR-5.6 step 4.5 (review F-004): close the TOCTOU window between the
+        # step-3 nonce check and the durable intent write. The driver can complete
+        # NORMALLY in that window — finishing the step, transitioning the run, and
+        # releasing the lock — after which finalizing the stale in-memory manifest
+        # would overwrite a completed step/run with INTERRUPTED/RUN_FAILED. Re-read
+        # the lock AND reload the manifest fresh from disk immediately after the
+        # write: if the nonce vanished/changed or the target is no longer
+        # `running`, the driver finished or relaunched → discard the just-written
+        # intent and abort WITHOUT signalling or mutating the manifest.
+        recheck = self._read_lock()
+        fresh_man = Manifest.load(manifest_path)
+        fresh_target = self._find_step_by_rendered_id(fresh_man, intent.step_id)
+        if (
+            recheck is None
+            or recheck.nonce != verified.nonce
+            or fresh_target is None
+            or fresh_target.status != M.RUNNING
+        ):
+            _unlink_durable(intent_path)
+            raise RecoverConcurrent(
+                f"run {man.run_id!r} completed or relaunched concurrently "
+                "(the driver finished after the recovery intent was written); no "
+                f"signal sent, no state changed — re-run `gauntlet status {slug}`."
+            )
 
         # FR-5.6 step 5: re-verify identity against the frozen intent, then signal
         # (closes the TOCTOU window where the PID/PGID is reused across 2–4).
-        outcome = self._signal_recover_target(intent)
+        try:
+            outcome = self._signal_recover_target(intent)
+        except RecoverSignalError:
+            # Verified but unsignalable (EPERM): the driver is still alive and was
+            # NOT killed. Clear the intent we just wrote so reconciliation never
+            # retries the un-killable signal forever, then surface the fail-closed
+            # refusal — the manifest is untouched (review F-005).
+            _unlink_durable(intent_path)
+            raise
 
         # FR-5.6 steps 6–8: atomic INTERRUPTED + append record, clear intent,
-        # release the lock under the recorded-nonce guard.
-        self._finalize_recovery(run_dir, man, intent, outcome)
-        return man.status
+        # release the lock under the recorded-nonce guard. `_finalize_recovery`
+        # reloads the manifest fresh and re-checks the running guard, so it never
+        # overwrites a concurrently-completed run.
+        self._finalize_recovery(run_dir, intent, outcome)
+        return Manifest.load(manifest_path).status
 
     @staticmethod
     def _recover_actor() -> tuple[str, str]:
@@ -1514,6 +1613,26 @@ class RunManager:
             _unlink_durable(self._lock_path())
 
     @staticmethod
+    def _guard_run_file(run_dir: Path, name: str) -> Path:
+        """Return ``run_dir/name`` after proving it is contained and not a symlink.
+
+        The mutating recover/reconcile paths read and write the manifest (and the
+        recovery intent) from bytes ultimately seeded by the active-run pointer.
+        Even with the pointer validated, a symlinked or run-dir-escaping target
+        file could still redirect a read or write outside the run tree, so refuse
+        one fail-closed before any I/O (FR-10.1 / PRD §7 containment, review F-003).
+        """
+        path = run_dir / name
+        if path.is_symlink():
+            raise UnsafeRunSegment(f"refusing symlinked run file: {path}")
+        try:
+            if not _path_within(path.resolve(), run_dir.resolve()):
+                raise UnsafeRunSegment(f"run file escapes the run dir: {path}")
+        except (OSError, RuntimeError) as exc:
+            raise UnsafeRunSegment(f"unresolvable run file {path}: {exc}") from exc
+        return path
+
+    @staticmethod
     def _find_step_by_rendered_id(man: Manifest, rendered_id: str):
         """The StepRecord whose rendered id equals ``rendered_id`` (or ``None``).
 
@@ -1533,29 +1652,45 @@ class RunManager:
     def _finalize_recovery(
         self,
         run_dir: Path,
-        man: Manifest,
         intent: "_RecoveryIntent",
         outcome: str,
-    ) -> None:
+    ) -> bool:
         """FR-5.6 steps 6–8: persist the transition, clear the intent, release the lock.
+
+        Reloads the manifest **fresh from disk** (never a caller's stale in-memory
+        copy) and applies the FR-5.6 running-step guard before any write, so a run
+        that completed normally in a concurrent window is never overwritten as
+        failed/interrupted (review F-002/F-004).
 
         Idempotent: if a §6.4 record for *this* intent (same ``lock_nonce`` +
         ``prior_step_id``) is already present, step 6 ran on a prior (crashed)
         attempt — skip the manifest write (never a torn or duplicated record) and
         only complete the still-pending steps 7–8. The recovery record is
         therefore written exactly once per recovery, always by whoever finalizes.
+
+        Returns ``True`` when finalized (or already finalized); ``False`` when it
+        refuses because the target step is no longer ``running`` — leaving the
+        manifest, lock, and intent untouched for the operator to inspect.
         """
+        manifest_path = self._guard_run_file(run_dir, "manifest.json")  # F-003
+        man = Manifest.load(manifest_path)
         already = any(
             r.lock_nonce == intent.lock_nonce and r.prior_step_id == intent.step_id
             for r in man.recoveries
         )
         if not already:
+            rec = self._find_step_by_rendered_id(man, intent.step_id)
+            # FR-5.6 running-step guard (review F-002/F-004): only finalize when the
+            # target step is STILL running. If it is absent or already terminal the
+            # driver completed or the run otherwise transitioned after the intent
+            # was written — overwriting it with INTERRUPTED/RUN_FAILED would corrupt
+            # a completed run. Refuse WITHOUT touching the manifest, lock, or intent.
+            if rec is None or rec.status != M.RUNNING:
+                return False
             # Step 6: atomic manifest update — mark the step INTERRUPTED and
             # append the §6.4 record, built from the frozen intent + the observed
             # signal outcome, in a single durable write-temp→fsync→rename→fsync-dir.
-            rec = self._find_step_by_rendered_id(man, intent.step_id)
-            if rec is not None:
-                rec.status = M.INTERRUPTED
+            rec.status = M.INTERRUPTED
             man.status = M.RUN_FAILED
             man.recoveries.append(
                 M.RecoveryRecord(
@@ -1576,7 +1711,7 @@ class RunManager:
                     resulting_run_status=M.RUN_FAILED,
                 )
             )
-            man.write_atomic(run_dir / "manifest.json")
+            man.write_atomic(manifest_path)
             _fsync_dir(run_dir)
         # Step 7: clear the intent only after step 6 is durable — its content is
         # now folded into the persisted record, so a surviving intent always means
@@ -1584,6 +1719,7 @@ class RunManager:
         _unlink_durable(run_dir / RECOVERY_INTENT_NAME)
         # Step 8: release the lock under the recorded-nonce guard.
         self._release_lock_if_nonce(intent.lock_nonce)
+        return True
 
     def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
         """Finalize or discard a surviving recovery intent (FR-5.6, mutating).
@@ -1609,8 +1745,25 @@ class RunManager:
         closed: no trustworthy facts to act on) and surfaced for the operator.
         """
         intent_path = run_dir / RECOVERY_INTENT_NAME
+        # Containment (review F-003): the intent drives process signalling and a
+        # manifest mutation, so — like the read-only parser — refuse a symlinked or
+        # run-dir-escaping path with NO read. In this mutating context we leave it
+        # untouched for the operator rather than act on attacker-redirected bytes.
+        if intent_path.is_symlink():
+            return (
+                "symlinked recovery intent present; left in place for inspection "
+                "(refusing to follow it out of the run dir)."
+            )
         if not intent_path.exists():
             return None
+        try:
+            if not _path_within(intent_path.resolve(), run_dir.resolve()):
+                return (
+                    "recovery intent path escapes the run dir; left in place for "
+                    "inspection."
+                )
+        except (OSError, RuntimeError):
+            return "unresolvable recovery intent present; left in place for inspection"
         try:
             text = intent_path.read_text()
         except OSError:
@@ -1629,11 +1782,44 @@ class RunManager:
                 "`gauntlet status`."
             )
 
-        # Live branch: finalize. Compute the (re-)signal outcome against the
-        # frozen intent — already_dead is the expected case post-crash.
-        man = Manifest.load(run_dir / "manifest.json")
-        outcome = self._signal_recover_target(intent)
-        self._finalize_recovery(run_dir, man, intent, outcome)
+        # Live branch: finalize — but only when the target step is still `running`
+        # (review F-002). A non-running target means the driver completed or the run
+        # otherwise transitioned after the intent was written: refuse WITHOUT
+        # signalling, mutating the manifest, or deleting the intent. The exception
+        # is an already-recorded recovery (step 6 ran on a prior crashed attempt,
+        # so the step is already INTERRUPTED): there only steps 7–8 remain, which
+        # `_finalize_recovery` completes idempotently.
+        man = Manifest.load(self._guard_run_file(run_dir, "manifest.json"))  # F-003
+        already = any(
+            r.lock_nonce == intent.lock_nonce and r.prior_step_id == intent.step_id
+            for r in man.recoveries
+        )
+        if not already:
+            target = self._find_step_by_rendered_id(man, intent.step_id)
+            if target is None or target.status != M.RUNNING:
+                return (
+                    "recovery intent present but its target step is no longer "
+                    "running (the run transitioned concurrently); left in place for "
+                    "inspection — re-run `gauntlet status`."
+                )
+        # Compute the (re-)signal outcome against the frozen intent — already_dead
+        # is the expected case post-crash. A verified-but-unsignalable driver
+        # (EPERM) is still alive: clear the intent so reconciliation does not retry
+        # the un-killable signal on every later entry point, leave the manifest
+        # running for manual intervention, and surface the note (review F-005).
+        try:
+            outcome = self._signal_recover_target(intent)
+        except RecoverSignalError as exc:
+            _unlink_durable(intent_path)
+            return f"could not finalize recovery: {exc} (intent cleared)."
+        if not self._finalize_recovery(run_dir, intent, outcome):
+            # The target transitioned out of `running` between the pre-check and
+            # the finalize reload (a tight race); finalize refused without mutating.
+            return (
+                "recovery intent present but its target step is no longer running "
+                "(the run transitioned concurrently); left in place for inspection "
+                "— re-run `gauntlet status`."
+            )
         return "finalized an interrupted recovery from its surviving intent."
 
     # ---- clean (run-branch tidy) --------------------------------------------

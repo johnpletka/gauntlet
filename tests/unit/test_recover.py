@@ -34,10 +34,13 @@ from gauntlet.engine.run import (
     RECOVERY_INTENT_NAME,
     RecoverConcurrent,
     RecoverRefused,
+    RecoverSignalError,
     RunManager,
+    UnsafeRunSegment,
     WorktreeLockError,
     _LockRecord,
     _RecoveryIntent,
+    _signal_process_group,
 )
 from gauntlet.procident import read_process_identity
 
@@ -622,3 +625,176 @@ def test_reason_preserved_through_reconcile(tmp_path):
     assert Manifest.load(run_dir / "manifest.json").recoveries[0].reason == (
         "kept across the crash"
     )
+
+
+# ---- F-002: reconciliation never overwrites a transitioned run --------------
+
+
+def test_reconcile_refuses_when_target_step_no_longer_running(tmp_path):
+    # (F-002) A surviving live-branch intent (lock ABSENT) whose target step has
+    # since completed normally must NOT be finalized — doing so would overwrite the
+    # completed step/run as INTERRUPTED/RUN_FAILED. Refuse without signalling,
+    # mutating the manifest, or deleting the intent; leave it for the operator.
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path, step_status=M.DONE, run_status=M.RUN_DONE)
+    _write_intent(run_dir, pid=DEAD_PID, identity=_ident(os.getpid()), lock_nonce="n-x")
+
+    note = mgr._reconcile_recovery_intent(run_dir)
+    assert "no longer" in note and "left in place" in note
+
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.status == M.RUN_DONE  # not overwritten
+    assert man.record("implement").status == M.DONE
+    assert man.recoveries == []
+    assert (run_dir / RECOVERY_INTENT_NAME).exists()  # intent left for inspection
+
+
+# ---- F-003: recover's mutable paths stay inside the run root -----------------
+
+
+def test_active_run_dir_rejects_traversal_pointer(tmp_path):
+    # (F-003) The active-run pointer flows straight into the mutable manifest/intent
+    # paths recover reads AND writes; a traversal segment must be refused before any
+    # path is built (so external bytes can never redirect a mutation out of tree).
+    mgr = _mgr(tmp_path)
+    layout = mgr.layout("demo")
+    layout.slug_dir.mkdir(parents=True, exist_ok=True)
+    layout.active_pointer.write_text("../../etc")
+    with pytest.raises(UnsafeRunSegment):
+        layout.active_run_dir()
+
+
+def test_active_run_dir_rejects_absolute_pointer(tmp_path):
+    # (F-003) An absolute path in the pointer (contains a separator) is refused too.
+    mgr = _mgr(tmp_path)
+    layout = mgr.layout("demo")
+    layout.slug_dir.mkdir(parents=True, exist_ok=True)
+    layout.active_pointer.write_text("/etc")
+    with pytest.raises(UnsafeRunSegment):
+        layout.active_run_dir()
+
+
+def test_reconcile_refuses_symlinked_intent_no_read(tmp_path):
+    # (F-003) A symlinked .recovery-intent.json could redirect the read that drives
+    # signalling + manifest mutation outside the run tree. Refuse with NO read,
+    # leave it in place, and do not touch the manifest — mirroring the read-only
+    # parser's containment check on the mutating reconcile path.
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path)
+    outside = tmp_path / "evil-intent.json"
+    _write_intent(run_dir, pid=DEAD_PID, identity=_ident(os.getpid()), lock_nonce="n-x")
+    (run_dir / RECOVERY_INTENT_NAME).rename(outside)  # move the real intent outside
+    (run_dir / RECOVERY_INTENT_NAME).symlink_to(outside)  # ...and point at it
+
+    note = mgr._reconcile_recovery_intent(run_dir)
+    assert "symlink" in note.lower()
+
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.status == M.RUN_RUNNING  # untouched
+    assert man.record("implement").status == M.RUNNING
+    assert man.recoveries == []
+
+
+# ---- F-004: a normal completion during the intent-write window is not clobbered
+
+
+def test_recover_aborts_if_driver_completes_during_intent_write(tmp_path, procs, monkeypatch):
+    # (F-004) The driver can complete NORMALLY between the step-3 nonce re-read and
+    # the durable intent write. recover must reload the lock + manifest immediately
+    # after the write and abort WITHOUT signalling or overwriting the now-completed
+    # manifest — and clean up the intent it just wrote.
+    import gauntlet.engine.run as run_mod
+
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path)
+    proc = procs()
+    _write_lock(tmp_path, pid=proc.pid, identity=_ident(proc.pid), nonce="nonce-1")
+
+    real_write = run_mod._atomic_write_durable
+
+    def write_then_complete(path, text):
+        real_write(path, text)
+        # Simulate the driver finishing normally inside the window: step DONE, run
+        # RUN_DONE, and the lock released — exactly what a clean exit leaves behind.
+        man = Manifest.load(run_dir / "manifest.json")
+        man.record("implement").status = M.DONE
+        man.status = M.RUN_DONE
+        man.write_atomic(run_dir / "manifest.json")
+        _lock_path(tmp_path).unlink()
+
+    monkeypatch.setattr(run_mod, "_atomic_write_durable", write_then_complete)
+
+    with pytest.raises(RecoverConcurrent, match="completed or relaunched"):
+        mgr.recover("demo")
+
+    assert proc.poll() is None  # never signalled
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.status == M.RUN_DONE  # the completed manifest is intact
+    assert man.record("implement").status == M.DONE
+    assert man.recoveries == []
+    assert not (run_dir / RECOVERY_INTENT_NAME).exists()  # the written intent cleaned up
+
+
+# ---- F-005: a verified-but-unsignalable driver fails closed, no retry wedge --
+
+
+def test_signal_process_group_raises_on_permission_denied(monkeypatch):
+    # (F-005) When the OS refuses the SIGKILL (EPERM) the helper raises a typed
+    # RecoverError instead of letting an unhandled OSError escape.
+    import gauntlet.engine.run as run_mod
+
+    monkeypatch.setattr(
+        run_mod.os, "killpg",
+        lambda pgid, sig: (_ for _ in ()).throw(PermissionError("not permitted")),
+    )
+    with pytest.raises(RecoverSignalError, match="permission denied"):
+        _signal_process_group(2_000_000_001, grace_s=0.05)
+
+
+def test_recover_cleans_up_intent_when_signal_permission_denied(tmp_path, procs, monkeypatch):
+    # (F-005) recover converts the unsignalable case into a fail-closed refusal:
+    # the still-alive driver is not marked INTERRUPTED, the manifest is untouched,
+    # the lock is left in place — and the durable intent is removed so reconciliation
+    # does not retry the un-killable signal forever.
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path)
+    proc = procs()
+    _write_lock(tmp_path, pid=proc.pid, identity=_ident(proc.pid), nonce="nonce-1")
+
+    def boom(intent):
+        raise RecoverSignalError("permission denied signalling the driver")
+
+    monkeypatch.setattr(mgr, "_signal_recover_target", boom)
+
+    with pytest.raises(RecoverSignalError, match="permission denied"):
+        mgr.recover("demo")
+
+    assert proc.poll() is None  # still alive — we could not kill it
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.status == M.RUN_RUNNING  # untouched
+    assert man.record("implement").status == M.RUNNING
+    assert man.recoveries == []
+    assert not (run_dir / RECOVERY_INTENT_NAME).exists()  # cleaned up, no retry wedge
+    assert _lock_path(tmp_path).exists()  # lock not released (driver still holds it)
+
+
+def test_reconcile_cleans_up_intent_when_signal_permission_denied(tmp_path, monkeypatch):
+    # (F-005) Reconciliation hitting the same EPERM clears the intent (so it is not
+    # retried on every later entry point) and leaves the manifest running for manual
+    # intervention, rather than wedging or raising an unhandled error.
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path)
+    _write_intent(run_dir, pid=DEAD_PID, identity=_ident(os.getpid()), lock_nonce="n-x")
+
+    def boom(intent):
+        raise RecoverSignalError("permission denied signalling the driver")
+
+    monkeypatch.setattr(mgr, "_signal_recover_target", boom)
+
+    note = mgr._reconcile_recovery_intent(run_dir)
+    assert "could not finalize" in note
+
+    assert not (run_dir / RECOVERY_INTENT_NAME).exists()  # cleared, no retry wedge
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.status == M.RUN_RUNNING  # not mutated
+    assert man.recoveries == []

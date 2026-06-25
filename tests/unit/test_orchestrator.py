@@ -666,3 +666,48 @@ stages:
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
     assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+
+
+AGENT_STEP = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, output: out.txt, prompt_text: go}
+"""
+
+
+def test_step_id_exported_to_agent_even_without_judge(fixture_repo):
+    # FR-5.5 / review F-001: GAUNTLET_STEP_ID must reach EVERY in-run agent
+    # INDEPENDENT of judge configuration. The prior code set it only when a judge
+    # was configured, so under `--no-judge` an in-pipeline agent that shelled out to
+    # `gauntlet recover` would NOT be blocked by the operator-only guard. This is an
+    # end-to-end proof of propagation: the orchestrator runs with judge_env empty
+    # (the no-judge path), and the agent — the FakeAdapter standing in for an
+    # in-pipeline agent — actually invokes `RunManager.recover` mid-step and is
+    # refused by the operator-only boundary. It also proves the marker is scoped
+    # (restored after the step, never leaked into the parent session).
+    import os
+
+    from gauntlet.engine.run import RecoverRefused, RunManager
+
+    os.environ.pop("GAUNTLET_STEP_ID", None)
+    seen: dict[str, str | None] = {}
+
+    def on_run(adapter, prompt, cwd):
+        seen["step_id"] = os.environ.get("GAUNTLET_STEP_ID")
+        mgr = RunManager(fixture_repo, config=RunConfig.model_validate(BUILDER_CFG))
+        try:
+            mgr.recover("demo")  # the guard fires before any run-dir resolution
+        except RecoverRefused as exc:
+            seen["recover_refused"] = str(exc)
+
+    adapter = FakeAdapter(text="done", on_run=on_run)
+    orch = _build(fixture_repo, AGENT_STEP, adapters={"builder": adapter})
+    assert orch.judge_env == {}  # the no-judge path
+    orch.drive()
+
+    assert seen["step_id"] == "implement"  # propagated under --no-judge
+    assert "operator-only" in seen.get("recover_refused", "")  # agent cannot recover
+    assert os.environ.get("GAUNTLET_STEP_ID") is None  # scoped — no leak past the step
