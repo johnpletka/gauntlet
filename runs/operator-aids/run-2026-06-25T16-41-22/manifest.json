@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "prd-cycle",
+  "current_step": "prd-approve",
   "warnings": [],
   "steps": [
     {
@@ -68,6 +68,28 @@
           "partially_resolved": 1
         }
       }
+    },
+    {
+      "id": "prd-approve",
+      "type": "human_gate",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T17:38:57.056184+00:00",
+      "ended": "2026-06-25T17:56:01.985071+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "approved: PRD approved. FR-5.6 escalation fully resolved (Fix A: missing-lock disambiguation; Fix B: FR-5.1 identity re-gate before re-signal closes reused-PGID hole). Accepted residual F-007 (major, partially_resolved): the section 6.5 summary sentence overclaims forward-validation, but the Consumer-side bullet already carries the correct tolerant rule, so the implementation is unaffected. Tighten the summary via a PRD revision if it becomes load-bearing.",
+      "iteration": null,
+      "metrics": {}
     }
   ],
   "commits": [
@@ -88,10 +110,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 279358,
-    "output_tokens": 122600,
+    "input_tokens": 296811,
+    "output_tokens": 125432,
     "cached_input_tokens": 5870817,
-    "cost_usd": 7.7289599
+    "cost_usd": 7.738987150000001
   },
   "agent_usage": {
     "reviewer": {
@@ -119,10 +141,10 @@
       "cost_usd": 7.6194475
     },
     "judge_llm": {
-      "input_tokens": 32287,
-      "output_tokens": 4416,
+      "input_tokens": 49740,
+      "output_tokens": 7248,
       "cached_input_tokens": 0,
-      "cost_usd": 0.016903750000000002
+      "cost_usd": 0.026931000000000004
     }
   }
 }
