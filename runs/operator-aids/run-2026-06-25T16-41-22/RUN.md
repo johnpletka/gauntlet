@@ -3,7 +3,7 @@
 - branch: `gauntlet/operator-aids` (base `feat/operator-aids`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
 - status: **running** (at `implement`)
-- totals: 1765297in/310043out $23.6666
+- totals: 1922607in/370780out $29.1104
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -17,7 +17,11 @@
 | [tests.0](steps/tests.0/) | shell | done | 72s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.0 | commit | done | 12s | 658in/1275out $0.0027 | committed 1650e7955f |
 | [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 933s | 772101in/48292out $4.8141 | converged in round 1 (blocking policy): no open blocking; 5 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.1](steps/implement.1/) | agent_task | failed | 111s | 0in/0out (tokens only) | handler error: claude reported failure: exit code 1; stderr:  |
+| [implement.1](steps/implement.1/transcript.md) | agent_task | done | 738s | 3162in/30658out $3.8248 | agent 'builder' completed |
+| [tests.1](steps/tests.1/) | shell | done | 64s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.1 | commit | done | 15s | 3120in/1210out $0.0032 | committed 3716c3f358 |
+| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 433s | 111061in/23146out $1.5943 | converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.2](steps/implement.2/) | agent_task | failed | 306s | 0in/0out (tokens only) | handler error: claude reported failure: exit code 1; stderr:  |
 
 ## Commits
 
@@ -28,3 +32,5 @@
 - `f9be0a7553` PLAN.1 (step `plan-cycle`)
 - `1650e7955f` P1 (step `phase-commit`)
 - `c0ac527870` P1.1 (step `impl-cycle`)
+- `3716c3f358` P2 (step `phase-commit`)
+- `4fdf359a69` P2.1 (step `impl-cycle`)
