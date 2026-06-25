@@ -14,6 +14,10 @@ executes against, so it must be concrete and assumption-validating.
   strictly sequential (FR-10.3): a later phase may not depend on work a phase
   before it has not yet delivered.
 - Names explicit deferrals rather than smuggling later work into an early phase.
+- Specifies the **simplest design that satisfies each phase** — no speculative
+  abstraction or flexibility for needs the PRD does not yet require; record
+  anticipated-but-unneeded extensions as deferrals, do not build them ahead of
+  need.
 
 ## Required: the machine-readable phase list
 
