@@ -44,8 +44,34 @@ SCAFFOLD_DIR = Path(__file__).resolve().parent.parent / "scaffold"
 class InitError(RuntimeError):
     """`gauntlet init` cannot proceed without risking existing state (fail closed)."""
 
-# The hook command both CLIs invoke (the console script from FR-1.1).
+# The console script both CLIs ultimately invoke (the entry point from FR-1.1).
+# Kept as the bare binary name: `gauntlet doctor` probes PATH for it, and this
+# substring is the stable marker that recognises a judge-wired PreToolUse entry.
 HOOK_COMMAND = "gauntlet-judge-hook"
+
+# The string actually wired into a CLI's PreToolUse `command` hook. It is an
+# install-tolerant POSIX launcher around HOOK_COMMAND, not the bare binary, so a
+# teammate who has NOT installed Gauntlet sees ZERO hook errors: the bare command
+# would exit 127 ("command not found") on every tool call, which the CLI surfaces
+# as a (non-blocking) per-call hook-error notice. The launcher instead:
+#   * when the hook IS installed: ``exec``s it, so the real hook's stdout and exit
+#     code — including the exit-2 DENY and its own GAUNTLET_RUN_ID gating — pass
+#     through unchanged (behaviour is byte-identical to the bare wiring); else
+#   * inside an active gauntlet run (GAUNTLET_RUN_ID set) with the hook missing:
+#     FAILS CLOSED (exit 2), so a broken install can never let a run proceed
+#     silently ungated (CLAUDE.md §2 "fail closed"); else
+#   * outside a run with the hook missing: stands aside silently (exit 0, no
+#     output) — the zero-notice case for a non-installer.
+# Shell form (no ``args``): Claude Code / Codex run this under POSIX sh on the
+# project's supported platforms (macOS, Linux, WSL2 — native-Windows users follow
+# the README's WSL2 path). ``command -v`` avoids a subshell; ``exec`` is what makes
+# the deny exit code survive. Validated branch-by-branch in tests/unit/test_hook_launcher.py.
+HOOK_WIRED_COMMAND = (
+    'command -v gauntlet-judge-hook >/dev/null 2>&1 && exec gauntlet-judge-hook '
+    '|| { if [ -n "${GAUNTLET_RUN_ID:-}" ]; then '
+    'echo "gauntlet-judge-hook not on PATH during an active gauntlet run; '
+    'failing closed" >&2; exit 2; fi; exit 0; }'
+)
 
 # Marker bounding the FR-4.5 guidance block in .gitignore, so re-runs detect it.
 GITIGNORE_MARKER = "# --- Gauntlet (added by `gauntlet init`"
@@ -441,33 +467,38 @@ def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> N
 def _hook_entry() -> dict:
     return {
         "matcher": "*",
-        "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 15}],
+        "hooks": [{"type": "command", "command": HOOK_WIRED_COMMAND, "timeout": 15}],
     }
 
 
-def _pretooluse_has_hook(settings: dict) -> bool:
-    """True if a PreToolUse entry already routes to the gauntlet hook command."""
+def _iter_pretooluse_hooks(settings: dict):
+    """Yield each ``(entry, hook)`` dict under PreToolUse, skipping odd shapes."""
     for entry in settings.get("hooks", {}).get("PreToolUse", []) or []:
+        if not isinstance(entry, dict):
+            continue
         for hook in entry.get("hooks", []) or []:
-            if hook.get("command") == HOOK_COMMAND:
-                return True
-    return False
+            if isinstance(hook, dict):
+                yield entry, hook
 
 
 def _wire_claude_hook(repo_root: Path, result: InitResult) -> None:
     """Merge the PreToolUse → judge hook into .claude/settings.json (FR-7.3).
 
-    Merge, not overwrite: any other settings the repo carries survive, and a
-    re-run is a no-op once the gauntlet hook is present.
+    Merge, not overwrite: any other settings the repo carries survive. The wired
+    command is the install-tolerant launcher (see HOOK_WIRED_COMMAND) so a teammate
+    who never installed Gauntlet sees no per-call hook-error notice. A re-run is
+    idempotent; a legacy bare-command entry written by an older gauntlet is upgraded
+    in place to the tolerant launcher — the only command rewrite init performs, and
+    safe because such an entry is unambiguously gauntlet-generated.
     """
     rel = ".claude/settings.json"
     path = repo_root / rel
     if not path.exists():
-        # Ship the scaffolded default verbatim — it carries the wired hook plus
+        # Ship the scaffolded default verbatim — it carries the wired launcher plus
         # the explanatory _comment a teammate reads.
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(SCAFFOLD_DIR / "claude-settings.json", path)
-        result.add(rel, CREATED, "PreToolUse → gauntlet-judge-hook")
+        result.add(rel, CREATED, "PreToolUse → install-tolerant judge launcher")
         return
 
     # Fail closed on malformed external state (CLAUDE.md §2): a parse error or a
@@ -489,14 +520,31 @@ def _wire_claude_hook(repo_root: Path, result: InitResult) -> None:
             "`gauntlet init`."
         )
 
-    if _pretooluse_has_hook(settings):
-        result.add(rel, PRESENT, "PreToolUse already wired to the judge")
+    # Recognise an existing gauntlet wiring; upgrade only an exact legacy bare
+    # command (unambiguously generated) to the tolerant launcher. A hand-rolled
+    # wrapping that still calls the hook is treated as a customization and left be.
+    present = False
+    upgraded = False
+    for _entry, hook in _iter_pretooluse_hooks(settings):
+        cmd = hook.get("command") or ""
+        if cmd == HOOK_COMMAND:
+            hook["command"] = HOOK_WIRED_COMMAND
+            present = upgraded = True
+        elif HOOK_COMMAND in cmd:
+            present = True
+
+    if present:
+        if upgraded:
+            path.write_text(json.dumps(settings, indent=2) + "\n")
+            result.add(rel, WIRED, "upgraded judge hook to the install-tolerant launcher")
+        else:
+            result.add(rel, PRESENT, "PreToolUse already wired to the judge")
         return
 
     hooks = settings.setdefault("hooks", {})
     hooks.setdefault("PreToolUse", []).append(_hook_entry())
     path.write_text(json.dumps(settings, indent=2) + "\n")
-    result.add(rel, WIRED, "PreToolUse → gauntlet-judge-hook")
+    result.add(rel, WIRED, "PreToolUse → install-tolerant judge launcher")
 
 
 def _wire_codex_hook(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:

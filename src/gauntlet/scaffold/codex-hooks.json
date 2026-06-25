@@ -1,5 +1,5 @@
 {
-  "_comment": "Gauntlet safety wiring for Codex (FR-1.2, FR-7.3). The PreToolUse hook routes Codex Bash tool calls through the same localhost judge as Claude Code, via the gauntlet-judge-hook console script (installed on PATH by `uv tool install` / `pipx install`, FR-1.1). NOTE (BOOTSTRAP-NOTES #10, ratified 2026-06-11): `codex exec` does NOT fire PreToolUse hooks on the pinned build (codex-cli 0.139.0) — the hook runtime is app-server/TUI-only. Codex's headless pre-execution control is therefore its SANDBOX (read-only for review steps, workspace-write for build steps), which `.gauntlet/config.yaml` sets per profile. This file is committable and forward-looking: it activates automatically if a future codex build fires exec hooks, at which point `gauntlet doctor` reports the firing change. The exact codex hooks schema is unverified on the pinned build (the hook never fires to exercise it); it mirrors the shared stdin-JSON / exit-code-2 / permissionDecision contract the hook client speaks.",
+  "_comment": "Gauntlet safety wiring for Codex (FR-1.2, FR-7.3). The PreToolUse `command` is the same install-tolerant POSIX launcher around the gauntlet-judge-hook console script as Claude Code uses (see .claude/settings.json): it execs the real hook when installed, stays silent (exit 0) for a teammate who never set up Gauntlet, and fails closed (exit 2) only when the hook is missing during an active gauntlet run (GAUNTLET_RUN_ID set). NOTE (BOOTSTRAP-NOTES #10, ratified 2026-06-11): `codex exec` does NOT fire PreToolUse hooks on the pinned build (codex-cli 0.139.0) — the hook runtime is app-server/TUI-only. Codex's headless pre-execution control is therefore its SANDBOX (read-only for review steps, workspace-write for build steps), which `.gauntlet/config.yaml` sets per profile. This file is committable and forward-looking: it activates automatically if a future codex build fires exec hooks, at which point `gauntlet doctor` reports the firing change. The exact codex hooks schema is unverified on the pinned build (the hook never fires to exercise it); it mirrors the shared stdin-JSON / exit-code-2 / permissionDecision contract the hook client speaks.",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "gauntlet-judge-hook",
+            "command": "command -v gauntlet-judge-hook >/dev/null 2>&1 && exec gauntlet-judge-hook || { if [ -n \"${GAUNTLET_RUN_ID:-}\" ]; then echo \"gauntlet-judge-hook not on PATH during an active gauntlet run; failing closed\" >&2; exit 2; fi; exit 0; }",
             "timeout": 15
           }
         ]

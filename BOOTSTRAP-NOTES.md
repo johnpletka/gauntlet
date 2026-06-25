@@ -883,3 +883,31 @@ process, and what it suggests for Gauntlet's design.
     resume-response (or the cycle escalation) to cover reviewer-surfaced FR-10.4
     cycle parks — otherwise the harness can deadlock any run whose reviewer (not
     builder) catches an upstream-invalidating finding.
+
+## 2026-06-25 — install-tolerant judge-hook launcher (zero notices for non-adopters)
+
+52. **`gauntlet init` now wires the PreToolUse hook as an install-tolerant POSIX
+    launcher, not the bare `gauntlet-judge-hook` console script** (branch
+    `fix/judge-hook-tolerant-launcher`). *Motivation:* in a repo where not everyone
+    uses Gauntlet, a teammate who never installed it had the bare command fire on
+    every tool call and exit 127 — a non-blocking but noisy `command not found`
+    hook-error notice per call. The launcher (`command -v … && exec … || { run-aware
+    fail-closed/defer }`, see `HOOK_WIRED_COMMAND` in `init.py`) execs the real hook
+    when present (so the exit-2 deny and `GAUNTLET_RUN_ID` gating are byte-identical
+    to before), stays **silent** (exit 0) for a non-installer *outside* a run, and
+    **fails closed** (exit 2) if the hook is missing *during* a run. That last branch
+    is what keeps CLAUDE.md §2 "fail closed" intact: the naive `… || exit 0` would
+    make a broken install run silently ungated — a safety regression a reviewer would
+    (rightly) block. `exec` is load-bearing: it replaces the shell so the deny exit
+    code can't be masked by the `|| …` tail. All four branches are exercised against
+    real `/bin/sh` in `tests/unit/test_hook_launcher.py`; a re-run upgrades a legacy
+    bare-command entry in place; `doctor` matches the hook by substring.
+    - **Tradeoff recorded:** perfect cross-platform silence is unachievable with one
+      shared `command` string. There is no runtime guaranteed present for a
+      *non-installer* across macOS + Linux + native Windows: PowerShell can't parse
+      the POSIX launcher, and the bare console-script name is the only
+      Windows-resolvable form (which is exactly what we can't make tolerant without a
+      shell). We optimize for the supported/POSIX path (macOS, Linux, WSL2 — the
+      README already routes Windows to WSL2) and document the limit. On
+      native-Windows-without-WSL2 the launcher is no better than today's bare command
+      at worst; it is not a regression for the supported configurations.

@@ -1,5 +1,5 @@
 {
-  "_comment": "Gauntlet safety wiring (FR-7.3, plan P2). The PreToolUse hook routes every tool call through the localhost judge via the gauntlet-judge-hook console script (installed on PATH by `uv tool install` / `pipx install`, FR-1.1; `gauntlet init` writes this file, FR-1.2). The hook is safe-by-default: it gates ONLY gauntlet-run sessions, keyed on GAUNTLET_RUN_ID (engine-injected for the run's lifetime, cleared on stop). Outside a run — i.e. any plain interactive session, even one with a GAUNTLET_JUDGE_TOKEN exported globally in ~/.zshenv — it emits no permission decision and defers to the CLI's normal permission handling, so the hook behaves as if absent: never bricked, never force-prompted, regardless of whether a judge is reachable. Under an active gauntlet run the engine sets GAUNTLET_RUN_ID/JUDGE_TOKEN/URL/MODE; unattended runs fail closed on a dead judge, interactive runs fall back to a prompt (review F-004).",
+  "_comment": "Gauntlet safety wiring (FR-7.3, plan P2). The PreToolUse `command` is an install-tolerant POSIX launcher around the gauntlet-judge-hook console script (installed on PATH by `uv tool install` / `pipx install`, FR-1.1; `gauntlet init` writes this file, FR-1.2). When the hook IS installed the launcher execs it, so the real hook's permission decision and exit code pass through unchanged. The hook is safe-by-default: it gates ONLY gauntlet-run sessions, keyed on GAUNTLET_RUN_ID (engine-injected for the run's lifetime, cleared on stop); outside a run it emits no permission decision and defers to the CLI's normal permission handling — behaving as if absent, never bricked, never force-prompted, regardless of whether a judge is reachable. When the hook is NOT installed (a teammate who never set up Gauntlet) the launcher stays SILENT (exit 0, no per-call 'command not found' notice) unless a gauntlet run is active (GAUNTLET_RUN_ID set), in which case it fails closed (exit 2) so a broken install can never let a run proceed ungated. Shell form runs under POSIX sh — macOS/Linux/WSL2, the project's supported platforms (native-Windows users follow the README's WSL2 path). Under an active gauntlet run the engine sets GAUNTLET_RUN_ID/JUDGE_TOKEN/URL/MODE; unattended runs fail closed on a dead judge, interactive runs fall back to a prompt (review F-004).",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "gauntlet-judge-hook",
+            "command": "command -v gauntlet-judge-hook >/dev/null 2>&1 && exec gauntlet-judge-hook || { if [ -n \"${GAUNTLET_RUN_ID:-}\" ]; then echo \"gauntlet-judge-hook not on PATH during an active gauntlet run; failing closed\" >&2; exit 2; fi; exit 0; }",
             "timeout": 15
           }
         ]

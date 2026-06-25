@@ -240,13 +240,18 @@ def _parse_json(path: Path) -> tuple[object | None, str | None]:
 
 
 def _gauntlet_pretooluse_entries(settings: dict) -> list[dict]:
-    """PreToolUse entries that route to the gauntlet judge hook."""
+    """PreToolUse entries that route to the gauntlet judge hook.
+
+    Matches on HOOK_COMMAND as a substring, not equality, so it recognises both
+    the bare console script and the install-tolerant launcher that `gauntlet init`
+    now wires (which calls the script via `command -v … && exec …`).
+    """
     entries = []
     for entry in settings.get("hooks", {}).get("PreToolUse", []) or []:
         if not isinstance(entry, dict):
             continue
         for hook in entry.get("hooks", []) or []:
-            if isinstance(hook, dict) and hook.get("command") == HOOK_COMMAND:
+            if isinstance(hook, dict) and HOOK_COMMAND in (hook.get("command") or ""):
                 entries.append((entry, hook))
                 break
     return entries

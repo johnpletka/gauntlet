@@ -6,6 +6,27 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed — the wired judge hook tolerates a missing install
+
+`gauntlet init` now wires the PreToolUse judge hook as an **install-tolerant
+launcher** instead of the bare `gauntlet-judge-hook` console script, so a repo can
+mix Gauntlet and non-Gauntlet developers without the latter seeing hook errors. The
+launcher:
+
+- **execs the real hook when it's installed** — the permission decision and exit
+  code (including the exit-2 deny) and the `GAUNTLET_RUN_ID` gating pass through
+  unchanged, so gating is byte-identical to before;
+- **stays silent (exit 0) for a teammate who never installed Gauntlet**, instead of
+  emitting a per-tool-call `command not found` hook-error notice on every call; and
+- **fails closed (exit 2) only when the hook is missing during an active run**
+  (`GAUNTLET_RUN_ID` set), so a broken install can never let a run proceed ungated.
+
+A re-run upgrades an existing bare-command wiring in place (idempotent; a
+hand-customized wrapping is left untouched), and `gauntlet doctor` recognizes both
+forms while still FAILing when the console script is absent on a Gauntlet user's
+PATH. The launcher is POSIX sh (macOS/Linux/WSL2 — native-Windows users follow the
+README's WSL2 path).
+
 ### Added — PRD-authoring aids (the repo teaches its own PRD conventions)
 
 Two committable aids make a fresh session — human or Claude — start PRD authoring
