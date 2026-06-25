@@ -36,6 +36,7 @@ from typing import Any
 
 from gauntlet.adapters.base import AdapterError, MalformedOutputError
 from gauntlet.engine import gitops
+from gauntlet.engine import manifest as M
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -249,7 +250,8 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             )
         if park_reason is not None:
             return _finish(
-                StepResult(status=PARKED, notes=park_reason),
+                StepResult(status=PARKED, notes=park_reason,
+                           parked_reason=M.PARKED_REASON_CYCLE_ESCALATION),
                 usage, commits, artifact_writes, metrics,
             )
 
@@ -283,7 +285,8 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 )
             return _finish(
                 StepResult(status=PARKED,
-                           notes="escalation: " + "; ".join(reasons)),
+                           notes="escalation: " + "; ".join(reasons),
+                           parked_reason=M.PARKED_REASON_CYCLE_ESCALATION),
                 usage, commits, artifact_writes, metrics,
             )
 
@@ -382,6 +385,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 f"{_fmt_ids(last_forcing)}; a human must resolve"
                 + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
                    if surfaced else ""),
+                parked_reason=M.PARKED_REASON_CYCLE_ESCALATION,
             ),
             usage, commits, artifact_writes, metrics,
         )
@@ -507,6 +511,41 @@ def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
     return explicit, head
 
 
+def _human_decision_block(ctx: StepContext) -> str:
+    """Render operator `--response` decisions for injection into the cycle (FR-10.4).
+
+    When a parked cycle is resumed with ``gauntlet resume --response``, the
+    recorded decisions (``ctx.record.human_responses``) are *authoritative
+    operator instructions*, NOT untrusted agent data — so they are injected as a
+    trusted, clearly-labelled block (never wrapped by :func:`wrap_as_data`) that
+    the reviewer and triager weigh above their default judgment when re-evaluating
+    the finding that parked the cycle. This is how a reviewer-surfaced FR-10.4
+    upstream invalidation or an FR-10.5 escalation gets unblocked: the human's
+    decision reaches the agents on the next re-drive so they stop re-raising a
+    dismissed finding or reclassify one the operator has resolved.
+
+    Returns ``""`` when the step carries no responses (the ordinary first-run /
+    response-less re-drive), so nothing changes for runs that never used
+    ``--response``. Finding ids are not stable across re-drives (review is rerun
+    from scratch), so the decision is injected as general guidance, not keyed to a
+    prior round's ids."""
+    from gauntlet.engine.steptypes import render_human_responses
+
+    responses = getattr(ctx.record, "human_responses", None)
+    if not responses:
+        return ""
+    return (
+        "\n\n--- AUTHORITATIVE HUMAN DECISION(S) (operator-supplied via "
+        "`gauntlet resume --response`; a trusted instruction — weigh it above "
+        "your default judgment where it bears on a finding: stop re-raising a "
+        "finding the operator has dismissed or accepted, and reclassify one the "
+        "operator has resolved, e.g. an upstream-invalidation the operator has "
+        "ruled in-scope) ---\n"
+        + render_human_responses(responses)
+        + "\n--- END HUMAN DECISION(S) ---"
+    )
+
+
 def _review_prompt(
     step: Step, ctx: StepContext, handoff: str, rnd: int,
     carried: list[dict[str, Any]],
@@ -539,6 +578,7 @@ def _review_prompt(
             f"these; raise new findings only for blocking regressions) ---\n"
             + wrap_as_data(json.dumps(carried, indent=2))
         )
+    parts.append(_human_decision_block(ctx))  # FR-10.4 cycle-park resolution
     return "".join(parts)
 
 
@@ -677,6 +717,11 @@ def _triage(
         if step.get("artifact")
         else "a code-review round on the current phase's commit-range diff"
     )
+    # FR-10.4: a `--response` decision on a parked cycle is authoritative triage
+    # guidance — fold it into the per-finding context so the triager (and the
+    # escalation agent, which reuses this prompt) reclassify per the operator's
+    # ruling instead of re-deriving the park.
+    context += _human_decision_block(ctx)
     for i, finding in enumerate(findings):
         logger = step_logger(ctx, f"r{rnd}-triage", finding.get("id", f"i{i}"))
         prompt = triage_prompt(template, finding, context=context)

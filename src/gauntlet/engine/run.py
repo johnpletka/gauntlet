@@ -857,46 +857,60 @@ class RunManager:
 
         # No pending entry.
         if response is None:
-            # FR-1.1: a conflict park REQUIRES --response; every other park keeps
-            # its existing response-less re-run behavior unchanged.
+            # FR-1.1 / FR-10.4: a response-resolvable park REQUIRES --response —
+            # the builder's UPSTREAM CONFLICT (agent_task) AND a reviewer-surfaced
+            # cycle escalation (adversarial_cycle). Re-driving either without a
+            # decision just re-runs into the same wall, which is the deadlock this
+            # path exists to prevent. Every other park keeps its existing
+            # response-less re-run behavior unchanged.
             parked = self._parked_step(man)
             if (
                 parked is not None
-                and parked.type == "agent_task"
-                and parked.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+                and parked.parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
             ):
+                what = (
+                    "an upstream conflict"
+                    if parked.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+                    else "a cycle escalation its own loop cannot resolve"
+                )
                 raise ValueError(
-                    f"step '{parked.id}' parked on an upstream conflict; resume "
-                    'it with --response "<decision>" '
-                    "(see `gauntlet resume --help`)"
+                    f"step '{parked.id}' parked on {what}; resume it with "
+                    '--response "<decision>" (see `gauntlet resume --help`). '
+                    "Re-running without a decision would only re-surface it."
                 )
             return ResponseAction(kind="none")
 
-        # FR-1/FR-8: a new --response was supplied; it requires a parked
-        # agent_task. Resolve identity LAST so a fail-closed identity error
-        # (FR-9) leaves the manifest untouched (no entry appended).
-        if man.status != M.RUN_PARKED:
+        # FR-1/FR-8/FR-10.5: a new --response targets the run's STUCK respondable
+        # step — a PARKED step (a builder conflict or a cycle escalation) OR a
+        # FAILED one (a cycle/agent_task whose execution failed, e.g. a cycle
+        # whose fixer made no changes). Both are "blocked cycles" a human decision
+        # can unblock: the decision is injected on the re-drive. Resolve identity
+        # LAST so a fail-closed identity error (FR-9) leaves the manifest
+        # untouched (no entry appended).
+        if man.status not in (M.RUN_PARKED, M.RUN_FAILED):
             raise ValueError(
-                f"run '{man.run_id}' is not parked; cannot resume with --response"
+                f"run '{man.run_id}' is {man.status}, neither parked nor failed; "
+                "cannot resume with --response"
             )
-        parked = self._parked_step(man)
-        if parked is None:
+        stuck = self._parked_step(man) or self._failed_step(man)
+        if stuck is None:
             raise ValueError(
-                f"run '{man.run_id}' is not parked; cannot resume with --response"
+                f"run '{man.run_id}' has no parked or failed step to resume with "
+                "--response"
             )
-        if parked.type == "human_gate":
+        if stuck.type == "human_gate":
             raise ValueError(
                 "use `gauntlet approve` or `gauntlet reject` for human_gate "
-                "steps; --response is for agent_task steps"
+                "steps; --response is for agent_task and adversarial_cycle steps"
             )
-        if parked.type != "agent_task":
+        if stuck.type not in M.RESPONDABLE_STEP_TYPES:
             raise ValueError(
-                f"step '{parked.id}' is a {parked.type}; --response only applies "
-                "to agent_task steps"
+                f"step '{stuck.id}' is a {stuck.type}; --response only applies "
+                f"to {' / '.join(sorted(M.RESPONDABLE_STEP_TYPES))} steps"
             )
         user = resolve_operator_identity(self.repo_root)
         return ResponseAction(
-            kind="append", step_id=parked.id, iteration=parked.iteration,
+            kind="append", step_id=stuck.id, iteration=stuck.iteration,
             text=response, user=user,
         )
 
@@ -920,6 +934,20 @@ class RunManager:
         """The single parked StepRecord (the run parks one step at a time)."""
         for rec in man.steps:
             if rec.status == M.PARKED:
+                return rec
+        return None
+
+    @staticmethod
+    def _failed_step(man: Manifest):
+        """The last FAILED StepRecord, for a `--response` resume of a failed run.
+
+        A failed run halts at the step that failed, so the last FAILED record is
+        that step. Resuming it with `--response` appends a fresh `pending` entry,
+        which clears the consumed-terminal-failure guard (FR-7.1) so the step
+        re-runs with the decision injected (e.g. a cycle whose fixer made no
+        changes, re-driven after a human reclassifies the offending finding)."""
+        for rec in reversed(man.steps):
+            if rec.status == M.FAILED:
                 return rec
         return None
 

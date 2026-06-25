@@ -25,6 +25,28 @@ from pydantic import BaseModel, Field
 # parked step is a conflict park; it carries no conflict content (the rich
 # conflict metadata is deferred, PRD §7). v1 has exactly one value.
 PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"
+# A parked ``adversarial_cycle`` whose own loop cannot resolve a finding without
+# a human: an FR-10.4 upstream invalidation, an FR-10.5 max_rounds exhaustion
+# with open blockers, or a triage escalation no configured agent could settle.
+# Unlike the builder's UPSTREAM CONFLICT (an ``agent_task`` park), this is
+# surfaced by the reviewer/triager, so it gets its own discriminator — and like
+# the conflict park it is human-decision-resolvable via ``gauntlet resume
+# --response`` (the decision is injected into the cycle's reviewer/triager on the
+# next re-drive). It is current-state, not a latch, cleared like every other
+# parked_reason on any non-cycle-escalation finalization.
+PARKED_REASON_CYCLE_ESCALATION = "cycle_escalation"
+
+# Park reasons a human resolves by supplying a `gauntlet resume --response`
+# decision (FR-1.1 / FR-10.4): resuming such a park WITHOUT `--response` errors
+# and asks for one, instead of silently re-running into the same wall.
+RESPONSE_RESOLVABLE_PARK_REASONS = frozenset(
+    {PARKED_REASON_UPSTREAM_CONFLICT, PARKED_REASON_CYCLE_ESCALATION}
+)
+# Step types that accept a `--response` decision when parked. An `agent_task`
+# (the builder halting on UPSTREAM CONFLICT) re-runs with the decision injected
+# into its prompt; an `adversarial_cycle` re-drives with it injected into the
+# reviewer/triager so they re-evaluate the parked finding.
+RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle"})
 
 # --- human-response lifecycle states (FR-2, FR-7.1) --------------------------
 # A `--response` entry is born ``pending`` (appended before the agent launches)
