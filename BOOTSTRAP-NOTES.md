@@ -861,3 +861,25 @@ process, and what it suggests for Gauntlet's design.
     `failed`→`parked` with the audit trail preserved (implement-resp-1 and the
     attempts history kept), then re-resumed with a fresh response so the builder
     re-evaluates against the fixed schema.
+
+51. **Coverage gap: `--response` does not reach an `adversarial_cycle` FR-10.4
+    park.** After the builder finished P1 (`24c75ae`, tests green, committed), the
+    P1 code-review cycle parked on an FR-10.4 upstream invalidation — finding
+    **F-008** got a `target_artifact = plan.md` (`defer`), so `cycle.py:268,287`
+    hard-stopped before the fix pass. The resume-response feature was built to
+    unstick this very dogfood, but `gauntlet resume --response` only attaches to a
+    parked `agent_task` with `parked_reason == "upstream_conflict"`
+    (`run.py:_plan_response_action`): `ValueError: step 'impl-cycle' is a
+    adversarial_cycle; --response only applies to agent_task steps`. The
+    conflict here was surfaced by the **reviewer/triage**, not the builder, so the
+    feature's whole flow (and its appendix worked-example, which assumes
+    `builder → UPSTREAM CONFLICT`) does not apply. **There is no engine path to
+    (a) inject a human decision into a parked cycle's triage, or (b) re-gate a
+    plan amendment against a parked cycle.** Unblocked manually: the operator
+    force-concluded `impl-cycle.0` (status→`done`) per
+    `runs/prd-authoring-aids/OPERATOR-OVERRIDE-impl-cycle-0.md`; F-008 accepted
+    in-scope, and the legitimate-but-unapplied findings (F-002 symlink-escape
+    [security], F-001 pin, F-009 handoff) deferred. **Follow-up:** extend
+    resume-response (or the cycle escalation) to cover reviewer-surfaced FR-10.4
+    cycle parks — otherwise the harness can deadlock any run whose reviewer (not
+    builder) catches an upstream-invalidating finding.
