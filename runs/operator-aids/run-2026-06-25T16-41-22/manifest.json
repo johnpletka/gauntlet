@@ -1,0 +1,123 @@
+{
+  "run_id": "run-2026-06-25T16-41-22",
+  "slug": "operator-aids",
+  "branch": "gauntlet/operator-aids",
+  "base_branch": "feat/operator-aids",
+  "pipeline": {
+    "name": "standard",
+    "version": 1,
+    "hash": "sha256:12f8ab6fc08dfb3aa384a00d33cc9e503869d8bb5bb090a5df3c5b65c36342f9"
+  },
+  "prompt_hashes": {
+    "policy.yaml": "sha256:7ab9abcf116138881ac19d6c9a4e1581a06d4294e0b25db591d345027851e113",
+    "prompts/review-document.md": "sha256:567770fdab66d52942954cb307465c5bc9c856a14edf1abe37fe292550e0460f",
+    "prompts/cycle-rereview.md": "sha256:de009fdee060edbdb6c90fdbe4ccfaffa037ca64befa9dabc6894045ed2c3a28",
+    "prompts/triage.md": "sha256:4d3722e71d8af633c0cbd2e2ab360eeeecc81e00e396275dfc6003b94e6e65fa",
+    "prompts/cycle-fix.md": "sha256:e2f15cb235d3add44586275bbb6e9d339e7de16b3dcba8aae64a03141df530ed",
+    "prompts/cycle-confirm.md": "sha256:27a412fc8f65fe5150df0c002b918d5aa3808050c5b7510389e9b5d7d917b02d",
+    "prompts/plan-author.md": "sha256:2667fe38d6ed210eca57e13a5ff876bbf2b9c82301731c3d8b2b44bad25abfa9",
+    "prompts/implement-phase.md": "sha256:9b69856e2e59411f49dc9213e0471c481bb74a3634500f25aa16e339fe6dc800",
+    "prompts/commit-message.md": "sha256:d40d9856ebc0b6422df7bbe69a9e62ffed8baf7ce2f6000406590d30d78ad251",
+    "prompts/review-code.md": "sha256:aaad8d5ef5b6350a77eca0a5431ddf0f88ef2b041d0466c3f8fdb5616124ed8d",
+    "prompts/retro.md": "sha256:7707598e9fd89bb06de0aabd842cd8f03e159900b7daa3773542d6cf93de3406",
+    "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
+  },
+  "status": "running",
+  "current_step": "prd-cycle",
+  "warnings": [],
+  "steps": [
+    {
+      "id": "prd-cycle",
+      "type": "adversarial_cycle",
+      "status": "parked",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T16:41:24.031621+00:00",
+      "ended": "2026-06-25T17:01:22.644620+00:00",
+      "attempts": 0,
+      "base_sha": "d2cf44594d554d9594ef54a75ad15d36fdb08d16",
+      "parked_reason": "cycle_escalation",
+      "human_responses": [
+        {
+          "response_id": "prd-cycle-resp-1",
+          "response_text": "HUMAN RESOLUTION of the FR-10.5 escalation on FR-5.6 (Crash reconciliation). Both open blocking findings are ACCEPTED as legitimate; the durable pre-signal recovery-intent mechanism is correct and stays. Apply two surgical fixes to FR-5.6's 'Crash reconciliation' bullets and acceptance tests so reconciliation becomes deterministic and reuse-safe:\n\nFIX A (disambiguate missing-lock semantics — resolves the contradiction that an absent lock is classified as both stale and live): A surviving intent is STALE only when the lock is PRESENT and its nonce != the intent's nonce (a relaunched driver holds a fresh lock); in that case discard the intent with no signal and no manifest mutation. In ALL other cases the intent is LIVE: lock absent, OR lock present with matching nonce. An absent lock therefore means the verified target was already killed and nothing relaunched, so finalize (do NOT discard). Rewrite the 'Stale intent' and 'Live intent' bullets so each state maps to exactly one branch — 'lock absent' must appear in the Live branch only.\n\nFIX B (close the reused-PGID double-kill hole): finalization must NOT re-signal based on bare liveness of a possibly-reused process group. Before any optional re-signal, re-run the FR-5.1 IDENTITY gate against the frozen intent — freshly-read proc_identity EXACT-match AND os.getpgid(pid)==recorded pgid. Only on an exact identity match may finalization (re-)signal (a no-op SIGKILL of the still-present same target). On identity mismatch (PID/PGID reused) OR target absent, send NO signal and record signal_outcome: already_dead, then finalize anyway (write INTERRUPTED + the 6.4 recovery record, clear the intent, release the lock under the nonce guard). This preserves the no-double-kill-of-a-reused-PID guarantee.\n\nACCEPTANCE: update tests (c)/(d)/(e) accordingly and add a reused-PGID injection case: target dead + a DIFFERENT process now occupying the recorded pgid -> finalization sends no signal, records already_dead, and never strands the manifest as running. These fixes are ratified by the operator; do not re-raise them as out-of-scope.",
+          "timestamp": "2026-06-25T17:25:17.042749+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
+      "usage": {
+        "input_tokens": 149729,
+        "output_tokens": 69064,
+        "cached_input_tokens": 3154340,
+        "cost_usd": 4.4611107500000005
+      },
+      "notes": "escalation (FR-10.5): max_rounds=2 exhausted with open blocking(s): F-003, NEW, NEW; a human must resolve",
+      "iteration": null,
+      "metrics": {
+        "rounds": 2,
+        "findings_total": 11,
+        "accepted_total": 11,
+        "accepted_resolved_total": 6,
+        "verdict_counts": {
+          "legitimate": 11
+        },
+        "confirm_counts": {
+          "resolved": 6,
+          "partially_resolved": 5
+        }
+      }
+    }
+  ],
+  "commits": [
+    {
+      "step_id": "prd-cycle",
+      "phase": "PRD.1",
+      "sha": "0a8572ddd53e0b702fcd2429bb111b691e5eb9bb"
+    },
+    {
+      "step_id": "prd-cycle",
+      "phase": "PRD.2",
+      "sha": "96ef382e81e7fe2f73fe918d9aca3bc3d8499117"
+    }
+  ],
+  "totals": {
+    "input_tokens": 182016,
+    "output_tokens": 73480,
+    "cached_input_tokens": 3154340,
+    "cost_usd": 4.4780145000000005
+  },
+  "agent_usage": {
+    "reviewer": {
+      "input_tokens": 112260,
+      "output_tokens": 6508,
+      "cached_input_tokens": 9728,
+      "cost_usd": null
+    },
+    "triage": {
+      "input_tokens": 20167,
+      "output_tokens": 4465,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.013971749999999998
+    },
+    "escalation": {
+      "input_tokens": 7384,
+      "output_tokens": 2428,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.032214
+    },
+    "builder": {
+      "input_tokens": 9918,
+      "output_tokens": 55663,
+      "cached_input_tokens": 3144612,
+      "cost_usd": 4.414925
+    },
+    "judge_llm": {
+      "input_tokens": 32287,
+      "output_tokens": 4416,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.016903750000000002
+    }
+  }
+}
