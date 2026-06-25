@@ -361,3 +361,60 @@ def test_from_repo_reports_skill_present_or_missing(tmp_path):
     init_repo(tmp_path)  # now scaffold it
     present = init_repo(tmp_path, from_repo=True)
     assert {a.path: a.action for a in present.actions}[S.SKILL_REL] == PRESENT
+
+
+# ---- structured PRD stub template install (P2: FR-2.1 §4.3, FR-3.2) ---------
+
+def _stub_rel(tmp_path: Path) -> str:
+    from gauntlet.engine import prd_stub as PS
+
+    return PS.stub_rel(RunConfig.load(tmp_path / ".gauntlet/config.yaml").asset_root)
+
+
+def test_init_creates_stub_template_under_asset_root(tmp_path):
+    from gauntlet.engine import prd_stub as PS
+
+    result = init_repo(tmp_path)
+    rel = _stub_rel(tmp_path)
+    assert rel == ".gauntlet/prd-stub.md"  # fresh init scaffolds asset_root .gauntlet
+    assert (tmp_path / rel).exists()
+    assert {a.path: a.action for a in result.actions}[rel] == CREATED
+    # the installed template is a valid gate input against the playbook manifest
+    text = (tmp_path / rel).read_text()
+    manifest = PS.parse_manifest((SCAFFOLD_DIR / "prompts" / "prd-author.md").read_text())
+    PS.validate_template(text, manifest)
+
+
+def test_init_stub_install_is_idempotent(tmp_path):
+    init_repo(tmp_path)
+    rel = _stub_rel(tmp_path)
+    before = (tmp_path / rel).read_text()
+    result = init_repo(tmp_path)
+    assert {a.path: a.action for a in result.actions}[rel] == SKIPPED
+    assert (tmp_path / rel).read_text() == before  # untouched
+
+
+def test_init_fails_closed_on_malformed_stub_state(tmp_path):
+    # FR-3.2 / review F-005: a non-regular node where the stub template belongs
+    # is malformed pre-existing state — refuse rather than clobber, and mutate
+    # nothing, mirroring the skill-path guard.
+    init_repo(tmp_path)  # writes config so asset_root resolves to .gauntlet
+    rel = _stub_rel(tmp_path)
+    stub_path = tmp_path / rel
+    stub_path.unlink()
+    stub_path.mkdir()  # a directory where the stub file should be
+    with pytest.raises(InitError):
+        init_repo(tmp_path)
+    assert stub_path.is_dir()  # left intact, not clobbered
+
+
+def test_from_repo_reports_stub_present_or_missing(tmp_path):
+    # --from-repo never writes the stub; it reports present/missing (full
+    # customized classification is P3).
+    missing = init_repo(tmp_path, from_repo=True)
+    # asset_root defaults to "." when no config exists yet → prd-stub.md at root
+    assert {a.path: a.action for a in missing.actions}["prd-stub.md"] == MISSING
+    init_repo(tmp_path)  # now scaffold it (writes config: asset_root .gauntlet)
+    rel = _stub_rel(tmp_path)
+    present = init_repo(tmp_path, from_repo=True)
+    assert {a.path: a.action for a in present.actions}[rel] == PRESENT

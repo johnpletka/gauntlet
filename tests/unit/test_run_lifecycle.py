@@ -74,6 +74,176 @@ def test_entry_contract_refuses_marker_only_removed(fixture_repo):
         mgr.check_entry_contract("demo")
 
 
+# --- P2: structured stub is the §6 manifest skeleton (FR-2.1, FR-2.2) --------
+
+def test_new_scaffolds_full_section_skeleton(fixture_repo):
+    # FR-2.1 / review F-003: a freshly scaffolded prd.md contains EVERY §6
+    # manifest header — both mandatory AND scale-with-size — each with a one-line
+    # guidance comment, and exactly one marker. Asserting only the mandatory
+    # subset would let an implementation drop every scale-with-size section.
+    from gauntlet.engine import prd_stub as PS
+    from gauntlet.engine.run import PRD_STUB_MARKER
+
+    mgr = _prepare(fixture_repo)
+    prd = mgr.new("demo")
+    content = prd.read_text()
+    assert content.count(PRD_STUB_MARKER) == 1
+    manifest = PS.resolve_manifest(fixture_repo, ".")
+    # the scaffolded structure equals the full parsed manifest, in order
+    assert PS.stub_section_names(content) == [e.name for e in manifest]
+    # both classes are represented (not mandatory-only)
+    assert {e.cls for e in manifest} == {PS.MANDATORY, PS.SCALE}
+
+
+def test_scaffold_and_entry_contract_read_the_same_resolved_source(fixture_repo):
+    # FR-2.2: `new` (which writes the scaffold) and `check_entry_contract` (which
+    # decides "still a stub") resolve the SAME template bytes — no second copy.
+    from gauntlet.engine import prd_stub as PS
+
+    mgr = _prepare(fixture_repo)
+    written = mgr.new("demo").read_text()
+    template, _ = PS.resolve_stub_template(fixture_repo, ".")
+    assert written == template
+
+
+def test_drift_guard_trips_when_playbook_section_changes(fixture_repo):
+    # FR-2.2: the drift test is driven off the PARSED playbook, so adding,
+    # renaming, or removing a heading of EITHER class (mandatory or scale-with-
+    # size) in the playbook trips it (the stub no longer mirrors the manifest).
+    from gauntlet.engine import prd_stub as PS
+
+    mgr = _prepare(fixture_repo)
+    stub = mgr.new("demo").read_text()
+    playbook = PS.resolve_playbook_text(fixture_repo, ".")
+    base = PS.parse_manifest(playbook)
+    assert PS.stub_section_names(stub) == [e.name for e in base]  # aligned today
+
+    # add (mandatory), rename (scale-with-size), remove (mandatory) — each breaks
+    add = playbook.replace(
+        "**§11 Open Questions**", "**§11.5 Brand New** *(mandatory)*\n\n**§11 Open Questions**"
+    )
+    rename = playbook.replace("**§3 Users and Personas**", "**§3 Stakeholders**")
+    remove = playbook.replace("**§9 Success Metrics** *(mandatory)*", "removed line")
+    for mutated in (add, rename, remove):
+        mutated_manifest = PS.parse_manifest(mutated)
+        assert PS.stub_section_names(stub) != [e.name for e in mutated_manifest]
+
+
+# --- P2: §4.4 header-block invariant (review F-006) --------------------------
+
+def test_header_block_invariant_requires_each_label_exactly_once(fixture_repo):
+    # review F-006: the synthetic header-block entry is validated by metadata
+    # labels, not a heading. A stub MISSING a required label, or with a
+    # DUPLICATED label, fails §4.4 even when every section header is present.
+    from gauntlet.engine import prd_stub as PS
+
+    template, _ = PS.resolve_stub_template(fixture_repo, ".")
+    manifest = PS.resolve_manifest(fixture_repo, ".")
+    PS.validate_template(template, manifest)  # the shipped template is valid
+
+    missing = template.replace("**Author:** <you>\n", "")
+    with pytest.raises(PS.StubTemplateError, match="Author"):
+        PS.validate_template(missing, manifest)
+
+    duplicated = template.replace(
+        "**Status:** Draft v0.1\n", "**Status:** Draft v0.1\n**Status:** again\n"
+    )
+    with pytest.raises(PS.StubTemplateError, match="Status"):
+        PS.validate_template(duplicated, manifest)
+
+
+# --- P2: FR-2.4 deterministic authored-content predicate ---------------------
+
+def _fresh_authored(fixture_repo, mgr):
+    """A scaffolded prd.md path plus its template, for the FR-2.4 matrix."""
+    from gauntlet.engine import prd_stub as PS
+
+    prd = mgr.new("demo")
+    template, _ = PS.resolve_stub_template(fixture_repo, ".")
+    return prd, template
+
+
+def test_authored_content_matrix(fixture_repo):
+    # FR-2.4 acceptance matrix: whitespace-/comment-/heading-only edits and a
+    # present/duplicated marker all reject; substantive body prose accepts.
+    from gauntlet.engine import prd_stub as PS
+    from gauntlet.engine.run import PRD_STUB_MARKER
+
+    mgr = _prepare(fixture_repo)
+    _, template = _fresh_authored(fixture_repo, mgr)
+    no_marker = template.replace(PRD_STUB_MARKER, "", 1)
+
+    # whitespace-only change → reject
+    assert not PS.has_authored_content(no_marker + "\n\n   \n", template)
+    # comment-only edit (add a guidance comment) → reject
+    assert not PS.has_authored_content(no_marker + "\n<!-- a new note -->\n", template)
+    # heading-only edit (add/rename a heading, no body) → reject
+    assert not PS.has_authored_content(no_marker + "\n## §12 Extra\n", template)
+    # marker present → reject
+    assert not PS.has_authored_content(template, template)
+    # marker DUPLICATED → reject (marker still present)
+    assert not PS.has_authored_content(template + "\n" + PRD_STUB_MARKER + "\n", template)
+    # substantive body prose, marker removed → accept
+    authored = no_marker + "\nFR-1: the step halts on timeout. Acceptance: a test asserts it.\n"
+    assert PS.has_authored_content(authored, template)
+
+
+def test_entry_contract_accepts_authored_and_rejects_trivial_edits(fixture_repo):
+    # End-to-end through check_entry_contract for the boundary FR-2.4 cases.
+    from gauntlet.engine.run import PRD_STUB_MARKER
+
+    mgr = _prepare(fixture_repo)
+    prd = mgr.new("demo")
+    template = prd.read_text()
+
+    # heading-only edit (marker removed) → still refused
+    prd.write_text(template.replace(PRD_STUB_MARKER, "", 1) + "\n## §12 Extra\n")
+    with pytest.raises(EntryContractError, match="no authored content"):
+        mgr.check_entry_contract("demo")
+
+    # substantive body authored → passes
+    prd.write_text(
+        template.replace(PRD_STUB_MARKER, "", 1)
+        + "\nFR-1: the run halts on a backbone failure. Acceptance: covered by a test.\n"
+    )
+    mgr.check_entry_contract("demo")  # no raise
+
+
+# --- P2: FR-3.3 fail-closed on a malformed installed stub template -----------
+
+def test_fail_closed_on_malformed_installed_stub(fixture_repo):
+    # FR-3.3: an installed <asset_root>/prd-stub.md whose marker is deleted,
+    # duplicated, or that drops a mandatory header makes BOTH `gauntlet new` and
+    # `check_entry_contract` raise — a broken gate-input template cannot disable
+    # the FR-10.1 human-author gate.
+    from gauntlet.engine import prd_stub as PS
+    from gauntlet.engine.run import PRD_STUB_MARKER
+
+    mgr = _prepare(fixture_repo)
+    template, _ = PS.resolve_stub_template(fixture_repo, ".")
+    repo_stub = fixture_repo / "prd-stub.md"  # asset_root "." → repo root
+
+    cases = {
+        "marker deleted": template.replace(PRD_STUB_MARKER + "\n", "", 1),
+        "marker duplicated": template + "\n" + PRD_STUB_MARKER + "\n",
+        "mandatory header removed": "\n".join(
+            l for l in template.splitlines() if not l.startswith("## §5 ")
+        ),
+    }
+    for i, (label, broken) in enumerate(cases.items()):
+        repo_stub.write_text(broken)
+        slug = f"broken{i}"
+        with pytest.raises(PS.StubTemplateError):
+            mgr.new(slug)  # refuses to scaffold from a broken template
+        # author a real prd.md, then prove the gate still fails closed on the
+        # malformed *template* even though the candidate would otherwise pass.
+        layout = mgr.layout(slug)
+        layout.slug_dir.mkdir(parents=True, exist_ok=True)
+        layout.prd_path.write_text("# Real\n\nGenuine authored content here.\n")
+        with pytest.raises(PS.StubTemplateError):
+            mgr.check_entry_contract(slug)
+
+
 GATED_REFUSE = """
 name: p
 version: 1

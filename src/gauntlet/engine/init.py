@@ -138,6 +138,8 @@ def init_repo(repo_root: Path, *, from_repo: bool = False) -> InitResult:
     # The skill resolves its playbook reference under the repo's asset_root, so
     # install it after the config (which carries asset_root) has been written.
     _scaffold_skill(repo_root, result, from_repo=from_repo)
+    # The structured stub template installs under the same asset_root (§4.3).
+    _scaffold_stub(repo_root, result, from_repo=from_repo)
     _wire_claude_hook(repo_root, result)
     _wire_codex_hook(repo_root, result, from_repo=from_repo)
     _ensure_gitignore_guidance(repo_root, result)
@@ -276,6 +278,44 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
         )
     else:
         result.add(rel, SKIPPED, "customized; left unchanged")
+
+
+def _scaffold_stub(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
+    """Install the structured PRD stub template to ``<asset_root>/prd-stub.md`` (§4.3).
+
+    P2 posture: create-if-absent, idempotent (skip when present), and fail-closed
+    via :class:`InitError` on malformed pre-existing state (a non-regular node at
+    the destination), mirroring the skill installer (FR-3.2 / review F-005). The
+    §4.5 refresh-vs-preserve and ``--from-repo`` customized classification of the
+    stub land in P3 (the both-aids propagation matrix); here ``--from-repo`` only
+    reports present/missing, the same as the skill installer does in P1.
+    """
+    from gauntlet.engine import prd_stub as PS
+
+    asset_root = _resolve_asset_root(repo_root)
+    rel = PS.stub_rel(asset_root)
+    target = repo_root / rel
+    # Fail closed on malformed pre-existing state (FR-3.2): a non-regular node at
+    # the stub path must never be silently clobbered, mirroring the skill guard.
+    if target.exists() and not target.is_file():
+        raise InitError(
+            f"{rel} exists but is not a regular file; refusing to clobber "
+            "unexpected state. Move it aside and re-run `gauntlet init`."
+        )
+
+    if from_repo:
+        # The committed stub is authoritative; never write it (full
+        # present/missing/customized classification is P3).
+        result.add(rel, PRESENT if target.exists() else MISSING)
+        return
+
+    if target.exists():
+        result.add(rel, SKIPPED, "exists; left unchanged")
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(PS.packaged_stub_path(), target)
+    result.add(rel, CREATED, "structured PRD stub template")
 
 
 def _hook_entry() -> dict:
