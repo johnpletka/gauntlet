@@ -245,6 +245,52 @@ def status(slug: str) -> None:
 
 
 @app.command()
+def logs(
+    slug: str,
+    step: str = typer.Option(
+        None, "--step",
+        help="Step to show (default: the deterministically-selected last "
+        "non-done step). A top-level rendered id (`<id>` or `<id>.<iteration>`), "
+        "or a composite role sub-leaf path (`<cycle-leaf>/r2-fix`, "
+        "`<cycle-leaf>/r1-triage/<finding-id>`).",
+    ),
+) -> None:
+    """Surface a step's evidence: its dir + transcript tail (read-only, FR-3).
+
+    Resolves the run-instance and step deterministically from run metadata
+    (never mtime), prints the resolved dirs, the last 200 lines of the step's
+    transcript, and names the `events.jsonl` path (never parsed). It writes
+    nothing and reads only within the run tree; a missing/unreadable transcript
+    is a notice, not an error (exit 0).
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine.operator import LogsError, RunResolutionError
+    from gauntlet.engine.run import UnsafeRunSegment
+
+    mgr = _manager()
+    layout = mgr.layout(slug)
+    run_root = mgr.repo_root / mgr.config.run_root
+    try:
+        result = operator.resolve_logs(run_root, layout.slug_dir, slug, step=step)
+    except (UnsafeRunSegment, RunResolutionError, LogsError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"run instance: {result.run_instance_dir}")
+    typer.echo(f"step: {result.step_id} ({result.step_status})")
+    typer.echo(f"step dir: {result.transcript_dir}")
+    typer.echo(f"events: {result.events_path}")
+    if result.transcript_lines is None:
+        typer.echo(result.notice)
+        return
+    suffix = f" (last {operator.TRANSCRIPT_TAIL_LINES} lines)" if result.truncated else ""
+    typer.echo(f"transcript: {result.transcript_path}{suffix}")
+    typer.echo("--- transcript ---")
+    for line in result.transcript_lines:
+        typer.echo(line)
+
+
+@app.command()
 def approve(
     slug: str,
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),

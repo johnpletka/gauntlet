@@ -647,6 +647,203 @@ def read_recovery_intent(
     )
 
 
+# --- read-only evidence access (`gauntlet logs`, FR-3) -----------------------
+TRANSCRIPT_TAIL_LINES = 200  # FR-3.1b — normative default tail for v1
+_TRANSCRIPT_NAME = "transcript.md"
+_EVENTS_NAME = "events.jsonl"
+
+
+class LogsError(RuntimeError):
+    """`gauntlet logs` could not resolve a step, or a path escaped the run tree.
+
+    A *step-id* / *containment* problem — exit 1. Distinct from an absent or
+    unreadable transcript for a *known* step, which is a non-error notice + exit
+    0 (FR-3.1c).
+    """
+
+
+@dataclass
+class LogsResult:
+    """The resolved, read-only evidence view for one step (FR-3).
+
+    ``transcript_lines`` is ``None`` (with ``notice`` set) when the transcript is
+    absent or unreadable — the FR-3.1c exit-0 case; otherwise it is the (possibly
+    tail-truncated) lines and ``truncated`` says whether the tail was applied.
+    """
+
+    run_instance_dir: Path
+    step_id: str  # rendered id of the selected top-level step
+    step_status: str  # that step's manifest status (for the FR-3.1c notice)
+    transcript_dir: Path  # the resolved transcript leaf dir
+    transcript_path: Path
+    events_path: Path
+    transcript_lines: list[str] | None
+    truncated: bool
+    notice: str | None
+
+
+def _resolve_under(component: Path, ancestor_real: Path, *, label: str) -> Path:
+    """``realpath``-resolve ``component`` and assert it stays under ``ancestor_real``.
+
+    Fail-closed (FR-3.3): a symlink escaping the run tree, or a path that cannot
+    be resolved, is refused with a :class:`LogsError` *before* any read.
+    """
+    try:
+        real = component.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise LogsError(f"cannot resolve {label} {component}: {exc}") from exc
+    if not _within(real, ancestor_real):
+        raise LogsError(
+            f"{label} {component} escapes the run tree; refusing to read it"
+        )
+    return real
+
+
+def _addressable_leaves(man: Manifest, run_instance_dir: Path) -> list[str]:
+    """Every selectable ``--step`` leaf: top-level rendered ids + composite sub-leaves.
+
+    For a composite step (cycle/retro) the role sub-dirs (and their immediate
+    children, e.g. ``r1-triage/<finding-id>``) are addressable transcripts, so
+    they are listed too — bounded to two levels, never following into a symlink
+    loop. Sorted for a deterministic error message (FR-3.2).
+    """
+    leaves: list[str] = []
+    for rec in man.steps:
+        rid = render_step_id(rec)
+        leaves.append(rid)
+        if rec.type in _COMPOSITE_STEP_TYPES:
+            sd = step_dir_for(run_instance_dir, rec)
+            for role in sorted(_subdirs(sd)):
+                leaves.append(f"{rid}/{role.name}")
+                for child in sorted(_subdirs(role)):
+                    leaves.append(f"{rid}/{role.name}/{child.name}")
+    return leaves
+
+
+def _select_logs_step(
+    man: Manifest, run_instance_dir: Path, step: str | None
+) -> tuple[StepRecord, Path]:
+    """Resolve ``(top-level record, transcript-leaf dir)`` for `logs` (FR-3.1a/3.2).
+
+    ``step=None`` → the FR-3.1a default step + its resolved transcript leaf. An
+    explicit ``step`` is either a top-level rendered id (``<id>`` / ``<id>.<it>``)
+    or a composite role sub-leaf path (``<leaf>/r2-fix``,
+    ``<leaf>/r1-triage/<finding-id>``); an unknown id, or a sub-leaf dir that does
+    not exist, raises :class:`LogsError` listing the real leaves.
+    """
+    if step is None:
+        rec = select_default_step(man)
+        if rec is None:
+            raise LogsError(f"no steps recorded in {run_instance_dir}")
+        return rec, resolve_transcript_dir(run_instance_dir, rec)
+
+    # Split the (possibly nested) selector and validate every segment against
+    # traversal — `safe_run_segment` rejects empty / `.` / `..` / NUL.
+    segments = step.split("/")
+    try:
+        for seg in segments:
+            safe_run_segment(seg, kind="step")
+    except UnsafeRunSegment as exc:
+        raise LogsError(str(exc)) from exc
+
+    head = segments[0]
+    by_id = {render_step_id(r): r for r in man.steps}
+    rec = by_id.get(head)
+    if rec is None:
+        leaves = _addressable_leaves(man, run_instance_dir)
+        raise LogsError(
+            f"unknown step {step!r}; available steps: {leaves or '(none)'}"
+        )
+    if len(segments) == 1:
+        return rec, resolve_transcript_dir(run_instance_dir, rec)
+    # A nested role sub-leaf: address it directly. A non-existent sub-dir is an
+    # unknown leaf (exit 1), distinct from an existing dir with no transcript.
+    sub = step_dir_for(run_instance_dir, rec).joinpath(*segments[1:])
+    if not sub.is_dir():
+        leaves = _addressable_leaves(man, run_instance_dir)
+        raise LogsError(
+            f"unknown step {step!r}; available steps: {leaves or '(none)'}"
+        )
+    return rec, sub
+
+
+def _read_transcript_tail(
+    path: Path, tail: int
+) -> tuple[list[str] | None, bool]:
+    """Read the last ``tail`` lines of ``path`` → ``(lines | None, truncated)``.
+
+    ``None`` lines means the file is absent or unreadable (FR-3.1c); the full
+    file is returned (``truncated=False``) when it has ``≤ tail`` lines.
+    """
+    try:
+        text = path.read_text()
+    except (OSError, ValueError):
+        return None, False
+    lines = text.splitlines()
+    if len(lines) <= tail:
+        return lines, False
+    return lines[-tail:], True
+
+
+def resolve_logs(
+    run_root: Path,
+    slug_dir: Path,
+    slug: str,
+    *,
+    step: str | None = None,
+    tail: int = TRANSCRIPT_TAIL_LINES,
+) -> LogsResult:
+    """Resolve read-only evidence for `gauntlet logs <slug>` (FR-3).
+
+    Strictly read-only and contained (FR-3.3): two directional ``realpath``
+    checks — the run dir (``slug_dir``) under ``run_root``, and the run-instance
+    dir, step dir, transcript leaf, and ``events.jsonl`` each under the run dir —
+    so a symlink escaping the run tree, or a traversal in the slug/``--step``, is
+    refused before any read. Never writes.
+    """
+    try:
+        safe_run_segment(slug, kind="slug")
+    except UnsafeRunSegment as exc:
+        raise LogsError(str(exc)) from exc
+
+    # Containment check 1: the run dir is a descendant of (or equal to) run_root.
+    run_root_real = run_root.resolve()
+    slug_dir_real = _resolve_under(slug_dir, run_root_real, label="run dir")
+
+    # Resolve the instance (validates active-run.txt), then contain it.
+    run_instance_dir = resolve_run_instance(slug_dir)
+    _resolve_under(run_instance_dir, slug_dir_real, label="run instance")
+
+    man = Manifest.load(run_instance_dir / "manifest.json")
+    rec, transcript_dir = _select_logs_step(man, run_instance_dir, step)
+
+    # Containment check 2: every leaf path stays under the run dir.
+    _resolve_under(step_dir_for(run_instance_dir, rec), slug_dir_real, label="step dir")
+    _resolve_under(transcript_dir, slug_dir_real, label="transcript dir")
+    transcript_path = transcript_dir / _TRANSCRIPT_NAME
+    events_path = transcript_dir / _EVENTS_NAME
+    _resolve_under(transcript_path, slug_dir_real, label="transcript")
+    _resolve_under(events_path, slug_dir_real, label="events")
+
+    lines, truncated = _read_transcript_tail(transcript_path, tail)
+    notice = None
+    if lines is None:
+        notice = (
+            f"transcript absent/unreadable (step status: {rec.status})"
+        )
+    return LogsResult(
+        run_instance_dir=run_instance_dir,
+        step_id=render_step_id(rec),
+        step_status=rec.status,
+        transcript_dir=transcript_dir,
+        transcript_path=transcript_path,
+        events_path=events_path,
+        transcript_lines=lines,
+        truncated=truncated,
+        notice=notice,
+    )
+
+
 # --- human footer rendering (FR-1.1/FR-1.2) ----------------------------------
 def render_footer(
     driver: DriverInfo,
