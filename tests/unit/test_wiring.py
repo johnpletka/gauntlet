@@ -20,6 +20,9 @@ def test_pretooluse_wires_judge_hook():
         for h in group["hooks"]
         if h.get("type") == "command"
     ]
-    assert "gauntlet-judge-hook" in commands, commands
+    # The wired command is the install-tolerant launcher, which *calls* the
+    # console script (so a non-installer sees no notice) rather than being the
+    # bare name — assert the script is referenced, not equal.
+    assert any("gauntlet-judge-hook" in c for c in commands), commands
     # matches all tools (the judge gates every tool call, FR-7.3)
     assert any(group.get("matcher") == "*" for group in groups)

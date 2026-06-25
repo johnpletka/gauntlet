@@ -406,10 +406,18 @@ contract suite, which requires authenticated CLIs and API keys.
   `uv tool install gauntlet`. Run `uv tool uninstall gauntlet`, then reinstall
   the correct package: `uv tool install gauntlet-spec` (add `--python 3.10` if
   your default interpreter is older).
-- **`gauntlet-judge-hook: command not found`** during a run — the hook console
-  script isn't on the PATH the agent CLI sees. Re-run `gauntlet init` (or
-  `gauntlet init --from-repo`) and confirm `uv tool`'s bin directory is on your
-  PATH (`uv tool update-shell`, then open a new terminal).
+- **A teammate who hasn't installed Gauntlet** sees no hook errors. The wired
+  PreToolUse `command` is an install-tolerant launcher: when `gauntlet-judge-hook`
+  isn't on PATH it stands aside silently (exit 0) rather than emitting a per-call
+  `command not found` notice — *unless* a gauntlet run is active. A shared repo can
+  mix Gauntlet and non-Gauntlet developers freely.
+- **A run halts with `gauntlet-judge-hook not on PATH during an active gauntlet
+  run; failing closed`** — the hook console script isn't on the PATH the agent CLI
+  sees *inside a run*, so the launcher fails closed (exit 2) rather than letting the
+  run proceed ungated. Re-run `gauntlet init` (or `gauntlet init --from-repo`) and
+  confirm `uv tool`'s bin directory is on your PATH (`uv tool update-shell`, then
+  open a new terminal). On native Windows, run inside WSL2 — the launcher is POSIX
+  sh (see the install note above).
 - **`doctor` reports a stale CLI version** — your installed `claude` / `codex`
   differs from `.gauntlet/pins.yaml`. Re-verify with the integration suite, or
   update the pin file if the new version is intended.

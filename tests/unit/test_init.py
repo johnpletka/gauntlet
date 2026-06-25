@@ -114,6 +114,8 @@ def test_init_refuses_non_object_claude_settings(tmp_path):
 
 
 def test_claude_hook_wired_with_judge_command(tmp_path):
+    from gauntlet.engine.init import HOOK_WIRED_COMMAND
+
     init_repo(tmp_path)
     settings = json.loads((tmp_path / ".claude/settings.json").read_text())
     commands = [
@@ -121,7 +123,10 @@ def test_claude_hook_wired_with_judge_command(tmp_path):
         for entry in settings["hooks"]["PreToolUse"]
         for h in entry["hooks"]
     ]
-    assert "gauntlet-judge-hook" in commands
+    # The install-tolerant launcher is wired (it *calls* the console script), so a
+    # teammate without Gauntlet installed gets no per-call hook-error notice.
+    assert HOOK_WIRED_COMMAND in commands
+    assert all("gauntlet-judge-hook" in c for c in commands)
 
 
 def test_init_is_idempotent(tmp_path):
@@ -160,7 +165,7 @@ def test_init_merges_into_existing_claude_settings(tmp_path):
         for entry in settings["hooks"]["PreToolUse"]
         for h in entry["hooks"]
     ]
-    assert commands.count("gauntlet-judge-hook") == 1
+    assert len(commands) == 1 and "gauntlet-judge-hook" in commands[0]
     # a second run must not duplicate the hook
     init_repo(tmp_path)
     settings = json.loads((claude / "settings.json").read_text())
@@ -169,7 +174,62 @@ def test_init_merges_into_existing_claude_settings(tmp_path):
         for entry in settings["hooks"]["PreToolUse"]
         for h in entry["hooks"]
     ]
-    assert commands.count("gauntlet-judge-hook") == 1
+    assert len(commands) == 1 and "gauntlet-judge-hook" in commands[0]
+
+
+def test_init_upgrades_legacy_bare_hook_to_tolerant_launcher(tmp_path):
+    # A repo wired by an older gauntlet (the bare `gauntlet-judge-hook` command) is
+    # upgraded in place to the install-tolerant launcher on re-run, so existing
+    # adopters stop emitting per-call hook errors for teammates without gauntlet.
+    from gauntlet.engine.init import HOOK_COMMAND, HOOK_WIRED_COMMAND
+
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    legacy = {
+        "model": "opus",
+        "hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": HOOK_COMMAND, "timeout": 15}]}]},
+    }
+    (claude / "settings.json").write_text(json.dumps(legacy))
+
+    actions = {a.path: a.action for a in init_repo(tmp_path).actions}
+    assert actions[".claude/settings.json"] == WIRED  # upgraded, not left untouched
+
+    settings = json.loads((claude / "settings.json").read_text())
+    assert settings["model"] == "opus"  # unrelated settings preserved
+    hooks = settings["hooks"]["PreToolUse"]
+    assert len(hooks) == 1 and len(hooks[0]["hooks"]) == 1  # no duplicate appended
+    assert hooks[0]["hooks"][0]["command"] == HOOK_WIRED_COMMAND
+
+    # Re-running is idempotent: the tolerant launcher is recognized as present.
+    second = {a.path: a.action for a in init_repo(tmp_path).actions}
+    assert second[".claude/settings.json"] == PRESENT
+    again = json.loads((claude / "settings.json").read_text())
+    assert again["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == HOOK_WIRED_COMMAND
+
+
+def test_init_leaves_customized_hook_wrapping_untouched(tmp_path):
+    # A hand-rolled wrapping that still calls the hook is a customization: init
+    # recognizes it as already wired (no duplicate) and never rewrites it. Only an
+    # exact legacy bare command is auto-upgraded.
+    from gauntlet.engine.init import HOOK_WIRED_COMMAND
+
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    custom_cmd = "nice -n 5 gauntlet-judge-hook"
+    (claude / "settings.json").write_text(json.dumps(
+        {"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": custom_cmd, "timeout": 20}]}]}}))
+
+    actions = {a.path: a.action for a in init_repo(tmp_path).actions}
+    assert actions[".claude/settings.json"] == PRESENT
+
+    cmd = json.loads((claude / "settings.json").read_text())[
+        "hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert cmd == custom_cmd  # untouched: not upgraded, not duplicated
+    assert cmd != HOOK_WIRED_COMMAND
 
 
 def test_gitignore_guidance_appended_once(tmp_path):
