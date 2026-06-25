@@ -261,3 +261,123 @@ def test_json_error_exits_nonzero_without_partial_object(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["status", "nonexistent", "--json"])
     assert result.exit_code != 0
+
+
+# --- F-001: a non-canonical iteration can never desync current_step / steps[] -
+@pytest.mark.parametrize("bad_iteration", ["01", "00", "+1", "-1", " 1", "1 ", "bad", "1.0", ""])
+def test_noncanonical_iteration_fails_closed(bad_iteration):
+    # A leading-zero form ("01") rendered "step.01" as current_step but "step.1"
+    # in steps[] (int 1); a non-numeric value rendered "step.bad" vs a null
+    # iteration ("step"). Both surfaces now route through one canonical
+    # representation and fail closed on a non-canonical value rather than emit a
+    # contradictory object.
+    man = _manifest(
+        M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING, iteration=bad_iteration)]
+    )
+    with pytest.raises(op.StatusContractError):
+        _payload(man, op.LIVENESS_ALIVE)
+
+
+@pytest.mark.parametrize("good_iteration, expected", [("0", 0), ("1", 1), ("12", 12)])
+def test_canonical_iteration_current_step_matches_steps(good_iteration, expected):
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED,
+               reason=M.PARKED_REASON_UPSTREAM_CONFLICT, iteration=good_iteration)],
+    )
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["steps"][0]["iteration"] == expected
+    assert payload["current_step"] == f"impl.{expected}"
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+# --- F-002: a step id with traversal can never escape run_root via evidence_path
+@pytest.mark.parametrize("bad_id", ["../../outside", "..", "a/b", "/abs", "x\x00y"])
+def test_traversal_step_id_in_failure_fails_closed(bad_id):
+    # failure.evidence_path is `steps/<rendered-id>`; relative_to() is lexical and
+    # would not strip a traversal/absolute/separator id. The id is validated as a
+    # single safe path segment first, so a corrupt manifest fails closed instead
+    # of emitting a `..`/absolute evidence_path that violates schemas/status.json.
+    man = _manifest(M.RUN_FAILED, [_step(bad_id, "agent_task", M.FAILED)])
+    with pytest.raises(op.StatusContractError):
+        _payload(man, op.LIVENESS_NONE)
+
+
+def test_safe_failure_step_id_yields_contained_evidence_path():
+    man = _manifest(M.RUN_FAILED, [_step("impl", "agent_task", M.FAILED)])
+    payload = _payload(man, op.LIVENESS_NONE, run_root=Path("/runs"))
+    ev = payload["failure"]["evidence_path"]
+    assert ev == "demo/run-x/steps/impl"
+    assert not ev.startswith("/") and ".." not in ev
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+# --- F-003: an out-of-enum persisted value can never reach a consumer ---------
+def test_out_of_enum_step_status_fails_closed():
+    # StepRecord.status accepts arbitrary strings, but steps[].status is a closed
+    # enum. The completed payload is validated before emission, so a malformed
+    # status fails closed rather than printing schema-invalid JSON.
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", "weird-status")])
+    with pytest.raises(op.StatusContractError):
+        _payload(man, op.LIVENESS_ALIVE)
+
+
+def test_malformed_driver_since_fails_closed():
+    # A driver.since that is not the §6.1 timestamp format (e.g. an ISO offset)
+    # fails schema validation at emission rather than leaking a non-conforming
+    # value into the contract (F-003/F-004).
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    bad_driver = op.DriverInfo(op.LIVENESS_ALIVE, 42, "host", "2026-06-25T16:41:22+00:00")
+    with pytest.raises(op.StatusContractError):
+        _payload(man, op.LIVENESS_ALIVE, driver=bad_driver)
+
+
+def test_embedded_schema_matches_committed_file():
+    # operator validates against an EMBEDDED copy of the schema (the committed
+    # file is not packaged in the wheel); guard the two against drift (F-003).
+    assert op.STATUS_SCHEMA == STATUS_SCHEMA
+
+
+# --- F-004: the schema enforces the normative §6.1 timestamp for driver.since -
+@pytest.mark.parametrize("since", [
+    "2026-06-25T16:41:22",        # colon-delimited time
+    "2026-06-25T16-41-22+00:00",  # trailing offset
+    "2026-06-25T16-41-22Z",       # zulu suffix
+    "2026-06-25 16-41-22",        # space instead of T
+    "garbage",
+])
+def test_schema_rejects_nonconforming_driver_since(since):
+    payload = _payload(
+        _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)]),
+        op.LIVENESS_ALIVE,
+    )
+    payload["driver"]["since"] = since
+    with pytest.raises(ValueError):
+        validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_schema_accepts_conforming_driver_since():
+    payload = _payload(
+        _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)]),
+        op.LIVENESS_ALIVE,
+    )
+    payload["driver"]["since"] = "2026-06-25T16-41-22"
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+# --- the CLI turns a contract violation into a non-zero exit, empty stdout ----
+@pytest.mark.parametrize("run_status, steps", [
+    ("running", [{"id": "s", "type": "agent_task", "status": "running",
+                  "iteration": "01"}]),                                    # F-001
+    ("failed", [{"id": "../../x", "type": "agent_task", "status": "failed"}]),  # F-002
+    ("running", [{"id": "s", "type": "agent_task", "status": "weird"}]),   # F-003
+])
+def test_cli_json_contract_violation_exits_nonzero_empty_stdout(
+    tmp_path, monkeypatch, run_status, steps
+):
+    _setup_repo(tmp_path, status=run_status, steps=steps)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status", "demo", "--json"])
+    assert result.exit_code != 0
+    assert result.stdout.strip() == ""  # no half-formed object on stdout
+    assert "error:" in result.stderr

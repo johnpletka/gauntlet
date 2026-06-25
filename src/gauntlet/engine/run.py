@@ -218,15 +218,36 @@ class _LockRecord:
     def from_json(cls, text: str) -> "_LockRecord | None":
         try:
             data = json.loads(text)
+            if not isinstance(data, dict):
+                return None
+            nonce = data["nonce"]
+            slug = data["slug"]
+            run_id = data.get("run_id")
+            started_at = data.get("started_at", "")
+            host = data.get("host", "")
+            proc_identity = data.get("proc_identity")
+            # Type-check the string-typed fields so a malformed lock (a non-string
+            # started_at/host/nonce/slug, or a non-dict proc_identity) is treated
+            # as malformed → indeterminate driver, never propagated into the
+            # status payload as a contract-violating since/host (operator F-003).
+            # `bool` is an int subclass but is not a str, so it is rejected here.
+            if not all(
+                isinstance(v, str) for v in (nonce, slug, started_at, host)
+            ):
+                return None
+            if run_id is not None and not isinstance(run_id, str):
+                return None
+            if proc_identity is not None and not isinstance(proc_identity, dict):
+                return None
             return cls(
-                nonce=data["nonce"],
-                slug=data["slug"],
-                run_id=data.get("run_id"),
+                nonce=nonce,
+                slug=slug,
+                run_id=run_id,
                 pid=int(data["pid"]),
                 pgid=int(data.get("pgid", data["pid"])),
-                started_at=data.get("started_at", ""),
-                host=data.get("host", ""),
-                proc_identity=data.get("proc_identity"),
+                started_at=started_at,
+                host=host,
+                proc_identity=proc_identity,
             )
         except (ValueError, KeyError, TypeError):
             return None

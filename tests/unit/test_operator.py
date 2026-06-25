@@ -179,6 +179,26 @@ def test_row_g_missing_field_is_indeterminate(tmp_path):
     assert op.driver_liveness(tmp_path, "demo") == op.LIVENESS_INDETERMINATE
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [("started_at", 12345), ("host", {"x": 1}), ("nonce", 7), ("slug", ["demo"])],
+)
+def test_row_g_nonstring_lock_field_is_malformed(tmp_path, field, value):
+    # F-003: a non-string nonce/slug/started_at/host is malformed → indeterminate
+    # with NULL driver fields, so a non-string `since`/`host` can never leak into
+    # the status payload (which would violate schemas/status.json).
+    rec = {
+        "nonce": "n", "slug": "demo", "run_id": "run-x", "pid": 4242,
+        "pgid": 4242, "started_at": "2026-06-25T16-41-22", "host": THIS_HOST,
+        "proc_identity": _identity(),
+    }
+    rec[field] = value
+    _write_lock(tmp_path, raw=json.dumps(rec))
+    info = op.driver_info(tmp_path, "demo")
+    assert info.state == op.LIVENESS_INDETERMINATE
+    assert info.since is None and info.host is None
+
+
 def test_row_h_foreign_host_is_indeterminate(tmp_path, host, probe, identity_read):
     # Identities equal but host differs → indeterminate, never alive/orphaned.
     probe("alive")

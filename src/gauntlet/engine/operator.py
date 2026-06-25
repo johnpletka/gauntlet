@@ -101,6 +101,20 @@ class RunResolutionError(RuntimeError):
     """Run-instance/step selection could not resolve deterministically (FR-3.1a)."""
 
 
+class StatusContractError(RuntimeError):
+    """A persisted manifest/lock value cannot be rendered as a §6.1 status
+    payload, so we fail closed (FR-4.3) rather than emit a contract-violating
+    object.
+
+    Raised for: a non-canonical step ``iteration`` (so ``current_step`` and
+    ``steps[].iteration`` can never disagree — F-001); a step ``id`` that is not
+    a single safe path segment (so ``failure.evidence_path`` can never escape
+    ``run_root`` — F-002); and a completed payload that fails validation against
+    the committed ``schemas/status.json`` (so an unconstrained persisted value —
+    e.g. an out-of-enum step status or a non-string lock field — can never reach
+    a consumer as schema-invalid JSON — F-003)."""
+
+
 # --- structured action + state records --------------------------------------
 @dataclass
 class Action:
@@ -334,9 +348,44 @@ def _actions_for(state: str, slug: str) -> list[Action]:
 
 
 # --- step / run-instance resolution (FR-3.1a) --------------------------------
+# A canonical non-negative decimal: "0", or a non-zero leading digit followed by
+# more digits — no leading zero, sign, or surrounding whitespace. The engine
+# always writes ``iteration`` as ``str(idx)`` for a non-negative index
+# (orchestrator._run_stage), so a real manifest always matches; anything else is
+# a corrupt manifest (F-001).
+_CANONICAL_ITERATION_RE = re.compile(r"0|[1-9][0-9]*")
+
+
+def _canonical_iteration(iteration: str | None) -> int | None:
+    """Parse a step iteration into the §6.1 canonical ``integer|null``.
+
+    ``None`` stays ``None``; a canonical non-negative decimal string converts to
+    its int. Any other value (a leading-zero form like ``"01"``, a sign,
+    whitespace, or a non-numeric string) is a manifest-contract violation →
+    :class:`StatusContractError` (fail closed). This single canonical
+    representation feeds BOTH :func:`render_step_id` (which renders
+    ``current_step`` and every parked/failure descriptor) and
+    :func:`_iteration_for_json` (``steps[].iteration``), so the rendered id and
+    the serialized iteration can never disagree (F-001).
+    """
+    if iteration is None:
+        return None
+    if not _CANONICAL_ITERATION_RE.fullmatch(iteration):
+        raise StatusContractError(
+            f"non-canonical step iteration {iteration!r}: expected a canonical "
+            "non-negative decimal string (e.g. '0', '1', '12')"
+        )
+    return int(iteration)
+
+
 def render_step_id(rec: StepRecord) -> str:
-    """The rendered step id used everywhere a leaf is named (``id`` / ``id.it``)."""
-    return rec.id if rec.iteration is None else f"{rec.id}.{rec.iteration}"
+    """The rendered step id used everywhere a leaf is named (``id`` / ``id.it``).
+
+    The iteration is rendered through :func:`_canonical_iteration`, the same
+    canonical integer the JSON serializer uses, so a rendered ``current_step``
+    always matches its ``steps[]`` entry exactly (F-001)."""
+    it = _canonical_iteration(rec.iteration)
+    return rec.id if it is None else f"{rec.id}.{it}"
 
 
 def select_default_step(man: Manifest) -> StepRecord | None:
@@ -655,23 +704,293 @@ def read_recovery_intent(
 # --- machine-readable status payload (P3, FR-4 / §6.1) -----------------------
 SCHEMA_VERSION = 1  # §6.1/§6.5 — the major version of the status.json contract
 
+# The §6.1 contract, embedded so emission-time validation works in any repo
+# (the committed ``schemas/status.json`` lives at the run root and is NOT packaged
+# in the wheel). This is a byte-equivalent mirror of that committed file —
+# drift-guarded by tests/unit/test_status_json.py — mirroring the
+# ``skill.SKILL_FRONTMATTER_SCHEMA`` pattern (F-003).
+_STATUS_SCHEMA_JSON = r'''{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gauntlet/schemas/status.json",
+  "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
+  "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
+  "$comment": "Compatibility policy (§6.5): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "slug",
+    "run_id",
+    "run_status",
+    "state",
+    "current_step",
+    "driver",
+    "parked",
+    "failure",
+    "reconciliation",
+    "steps",
+    "next_actions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Major schema version. 1 for v1; see §6.5 compatibility policy."
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "The run slug; matches the slug-validation pattern."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "The selected run-instance id."
+    },
+    "run_status": {
+      "type": "string",
+      "description": "Raw manifest run_status (running|parked|done|aborted|failed). Left an unconstrained string deliberately: an unrecognized value does not fail the schema, it maps to composite state `unknown` (§6.3)."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "orphaned",
+        "indeterminate",
+        "parked_gate",
+        "parked_for_response",
+        "failed",
+        "halted",
+        "interrupted",
+        "done",
+        "aborted",
+        "unknown"
+      ],
+      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor)."
+    },
+    "current_step": {
+      "type": ["string", "null"],
+      "description": "Rendered id of the active/most-recent non-terminal step, or null. When non-null it MUST equal the rendered id of exactly one steps[] entry (`<id>` or `<id>.<iteration>`). Derived convenience; steps[] is authoritative."
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "pid", "since", "host"],
+      "description": "The computed driver-liveness view (FR-2.4). Always present.",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["alive", "orphaned", "indeterminate", "none"],
+          "description": "Liveness value (FR-2.4)."
+        },
+        "pid": {
+          "type": ["integer", "null"],
+          "description": "Recorded pid, or null when liveness is `none`."
+        },
+        "since": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}$",
+          "description": "The lock's started_at verbatim (%Y-%m-%dT%H-%M-%S UTC, hyphen-delimited, no offset); opaque, never reformatted; null when `none`. The anchored pattern enforces exactly the §6.1 format (rejecting an ISO offset, colon-delimited time, or any other string); it constrains only the string form, so null still passes."
+        },
+        "host": {
+          "type": ["string", "null"],
+          "description": "The lock's recorded host, or null when `none`."
+        }
+      }
+    },
+    "parked": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["step_id", "type", "reason"],
+      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "description": "The parked step's rendered id."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["human_gate", "agent_task", "adversarial_cycle"],
+          "description": "The parked step's type."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": ["upstream_conflict", "cycle_escalation", null],
+          "description": "Park reason; null for a plain human_gate."
+        }
+      }
+    },
+    "failure": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["step_id", "status", "evidence_path"],
+      "description": "Present (object) iff state in {failed, halted, interrupted}, else null (enforced by the state-coupling allOf below).",
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "description": "The failing step's rendered id."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["failed", "halted", "interrupted"],
+          "description": "The failing step's status."
+        },
+        "evidence_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*\\.\\.).+$",
+          "description": "POSIX-relative path under run_root (no leading slash, no `..`): the failing step's dir."
+        }
+      }
+    },
+    "reconciliation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["intent_step_id", "nonce_matches_lock", "recommended_command"],
+      "description": "Non-null iff read-only `status` detects a surviving .recovery-intent.json for the selected run instance (FR-5.6). Report-only — `status` never reconciles; null when no intent survives (or it is malformed/unreadable, which is a human-footer anomaly note only).",
+      "properties": {
+        "intent_step_id": {
+          "type": "string",
+          "description": "The step_id recorded in the surviving intent."
+        },
+        "nonce_matches_lock": {
+          "type": "boolean",
+          "description": "true when the intent's lock_nonce matches the current lock OR the lock is absent (reconciliation would FINALIZE — the live branch); false when the lock is present with a different nonce (reconciliation would DISCARD it as stale)."
+        },
+        "recommended_command": {
+          "type": "string",
+          "description": "Human-display command that finalizes the intent (e.g. `gauntlet recover <slug>`); for display only, never executed."
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "description": "Authoritative ordered step list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "iteration", "status"],
+        "properties": {
+          "id": {"type": "string", "description": "Step id."},
+          "iteration": {
+            "type": ["integer", "null"],
+            "description": "Iteration index for a cycle/foreach step, else null."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "done",
+              "failed",
+              "interrupted",
+              "parked",
+              "halted",
+              "skipped"
+            ],
+            "description": "Step status."
+          }
+        }
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "description": "Structured next action(s); always present, possibly empty (e.g. a done run). Each entry per FR-4.2.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "kind",
+          "argv",
+          "required_inputs",
+          "executable",
+          "command"
+        ],
+        "properties": {
+          "label": {"type": "string", "description": "Short action label."},
+          "kind": {
+            "type": "string",
+            "enum": ["observe", "decide", "control", "recover"],
+            "description": "Action class."
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "description": "Already-split, fully-resolved argument tokens — no shell quoting, no interpolation. Executed only when `executable` is true."
+          },
+          "required_inputs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Named operator-supplied inputs the action needs before it is runnable (empty when none)."
+          },
+          "executable": {
+            "type": "boolean",
+            "description": "true only when required_inputs is empty and argv is complete and safe to run as-is."
+          },
+          "command": {
+            "type": "string",
+            "description": "Rendered string for HUMAN DISPLAY ONLY, never for execution (may contain placeholder text)."
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "parked is an object iff the composite state is a parked class, else null.",
+      "if": {
+        "properties": {
+          "state": {"enum": ["parked_gate", "parked_for_response"]}
+        }
+      },
+      "then": {"properties": {"parked": {"type": "object"}}},
+      "else": {"properties": {"parked": {"type": "null"}}}
+    },
+    {
+      "description": "failure is an object iff the composite state is a failure class, else null.",
+      "if": {
+        "properties": {
+          "state": {"enum": ["failed", "halted", "interrupted"]}
+        }
+      },
+      "then": {"properties": {"failure": {"type": "object"}}},
+      "else": {"properties": {"failure": {"type": "null"}}}
+    }
+  ]
+}'''
+
+STATUS_SCHEMA: dict = json.loads(_STATUS_SCHEMA_JSON)
+
+
+def _validate_status_payload(payload: dict) -> None:
+    """Validate a completed payload against the embedded §6.1 schema (F-003).
+
+    Fail-closed before emission: unconstrained persisted inputs (an out-of-enum
+    ``StepRecord.status``, a non-string lock field, etc.) flow into the payload
+    via the existing models, and the CLI would otherwise print them verbatim —
+    schema-invalid JSON that breaks a strict consumer. A violation raises
+    :class:`StatusContractError`, which the CLI turns into a non-zero exit with
+    empty stdout, never a half-formed object."""
+    import jsonschema
+
+    try:
+        jsonschema.validate(instance=payload, schema=STATUS_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        raise StatusContractError(
+            f"status payload violates schemas/status.json: {exc.message}"
+        ) from exc
+
 
 def _iteration_for_json(rec: StepRecord) -> int | None:
     """Render a step's iteration as the §6.1 ``integer|null``.
 
-    The engine stores ``iteration`` as ``str(idx)`` (a stringified non-negative
-    foreach/cycle index — see ``orchestrator._run_stage``), while the §6.1
-    contract is ``integer|null``; a numeric string converts losslessly. A
-    non-numeric iteration (never produced by the engine) renders ``null`` rather
-    than crashing the read-only emitter or emitting a contract-violating string
-    (fail closed).
+    Goes through :func:`_canonical_iteration`, the *same* canonical
+    representation :func:`render_step_id` uses, so ``steps[].iteration`` and the
+    rendered ``current_step`` can never diverge — a non-canonical value fails
+    closed in both places rather than rendering as ``step.01`` here but
+    ``step.1`` there (F-001).
     """
-    if rec.iteration is None:
-        return None
-    try:
-        return int(rec.iteration)
-    except (TypeError, ValueError):
-        return None
+    return _canonical_iteration(rec.iteration)
 
 
 def _evidence_path(
@@ -681,16 +1000,33 @@ def _evidence_path(
     under ``run_root`` (no leading ``/``, no ``..``).
 
     The dir is ``<run_instance_dir>/steps/<rendered-leaf>`` (mirrors
-    :func:`step_dir_for`); the rendered leaf is exactly ``failure.step_id``.
-    ``run_instance_dir`` is always a descendant of ``run_root``, so the
-    ``relative_to`` succeeds; the fallback keeps the path relative and ``..``-free
-    if a caller ever passes an unrelated root.
+    :func:`step_dir_for`); the rendered leaf is exactly ``failure.step_id``. That
+    leaf becomes a single path component, so it is validated as a single safe
+    path segment first — a step id carrying a separator, ``.``/``..``, or NUL
+    (``relative_to`` is lexical and would NOT strip it) is a corrupt manifest and
+    fails closed rather than emitting a traversal/absolute path that violates
+    ``schemas/status.json`` and §6.1 (F-002). ``run_instance_dir`` is always a
+    descendant of ``run_root``; a root that is unrelated, or a result that is
+    somehow not contained, is likewise a contract violation, not a silent
+    fallback.
     """
+    try:
+        safe_run_segment(failure.step_id, kind="step id")
+    except UnsafeRunSegment as exc:
+        raise StatusContractError(str(exc)) from exc
     step_dir = run_instance_dir / "steps" / failure.step_id
     try:
-        return step_dir.relative_to(run_root).as_posix()
-    except ValueError:
-        return Path("steps", failure.step_id).as_posix()
+        rel = step_dir.relative_to(run_root)
+    except ValueError as exc:
+        raise StatusContractError(
+            f"evidence dir {step_dir} is not under run_root {run_root}"
+        ) from exc
+    posix = rel.as_posix()
+    if posix.startswith("/") or ".." in rel.parts:
+        raise StatusContractError(
+            f"evidence_path {posix!r} is not a contained relative path"
+        )
+    return posix
 
 
 def status_payload(
@@ -711,8 +1047,15 @@ def status_payload(
     applicable (§6.1). A malformed/unreadable surviving intent surfaces as a
     human-footer anomaly, never here — the caller passes ``reconciliation=None``
     in that case, so ``--json`` never fabricates an ``intent_step_id``.
+
+    The completed object is validated against the committed §6.1 schema before it
+    is returned (F-003): unconstrained persisted inputs (e.g. an out-of-enum
+    ``StepRecord.status`` or a non-string lock field) can otherwise reach a
+    consumer as schema-invalid JSON. A violation raises
+    :class:`StatusContractError`, so emission fails closed rather than printing a
+    contract-breaking object.
     """
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "slug": man.slug,
         "run_id": man.run_id,
@@ -758,6 +1101,8 @@ def status_payload(
         ],
         "next_actions": [a.to_dict() for a in rstate.next_actions],
     }
+    _validate_status_payload(payload)
+    return payload
 
 
 # --- read-only evidence access (`gauntlet logs`, FR-3) -----------------------

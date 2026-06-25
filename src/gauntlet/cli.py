@@ -214,7 +214,7 @@ def status(
 
     from gauntlet.engine import operator
     from gauntlet.engine.manifest import Manifest
-    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.operator import RunResolutionError, StatusContractError
     from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
 
     mgr = _manager()
@@ -253,19 +253,27 @@ def status(
 
     run_root = mgr.repo_root / mgr.config.run_root
     driver = operator.driver_info(run_root, slug)
-    rstate = operator.compute_run_state(man, driver.state)
-    recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
+    # A persisted-state contract violation (a non-canonical iteration, an unsafe
+    # step id, or a payload that fails schema validation) is an actual error
+    # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty
+    # rather than a contract-breaking object (operator F-001/F-002/F-003).
+    try:
+        rstate = operator.compute_run_state(man, driver.state)
+        recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
-    if json_output:
-        # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
-        # malformed surviving intent is a human-footer anomaly only, so `recon`
-        # is None there and `reconciliation` is null — never a fabricated object.
-        payload = operator.status_payload(
-            man, driver, rstate, recon,
-            run_root=run_root, run_instance_dir=run_instance_dir,
-        )
-        typer.echo(json.dumps(payload, indent=2))
-        return
+        if json_output:
+            # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
+            # malformed surviving intent is a human-footer anomaly only, so `recon`
+            # is None there and `reconciliation` is null — never a fabricated object.
+            payload = operator.status_payload(
+                man, driver, rstate, recon,
+                run_root=run_root, run_instance_dir=run_instance_dir,
+            )
+            typer.echo(json.dumps(payload, indent=2))
+            return
+    except StatusContractError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
     typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
     for rec in man.steps:
@@ -298,7 +306,11 @@ def logs(
     is a notice, not an error (exit 0).
     """
     from gauntlet.engine import operator
-    from gauntlet.engine.operator import LogsError, RunResolutionError
+    from gauntlet.engine.operator import (
+        LogsError,
+        RunResolutionError,
+        StatusContractError,
+    )
     from gauntlet.engine.run import UnsafeRunSegment
 
     mgr = _manager()
@@ -306,7 +318,7 @@ def logs(
     run_root = mgr.repo_root / mgr.config.run_root
     try:
         result = operator.resolve_logs(run_root, layout.slug_dir, slug, step=step)
-    except (UnsafeRunSegment, RunResolutionError, LogsError) as exc:
+    except (UnsafeRunSegment, RunResolutionError, LogsError, StatusContractError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
