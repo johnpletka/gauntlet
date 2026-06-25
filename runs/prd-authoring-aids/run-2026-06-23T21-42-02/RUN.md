@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/prd-authoring-aids` (base `main`)
 - pipeline: `standard` v1 (`sha256:0aab2da881fc…`)
-- status: **running** (impl-cycle.0 force-concluded by operator; next: P2 `implement.1`)
-- totals: 559442in/182852out $18.5960
+- status: **running**
+- totals: 563552in/183732out $18.5988
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -15,7 +15,7 @@
 | [implement.0](steps/implement.0/transcript.md) | agent_task | done | 71324s | 15102in/79074out $13.2319 | agent 'builder' completed |
 | [tests.0](steps/tests.0/) | shell | done | 74s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.0 | commit | done | 29s | 5843in/2483out $0.0064 | committed 24c75ae164 |
-| [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 200s | 268128in/11772out $0.0423 | **operator override (force-concluded)**: FR-10.4 park on F-008 accepted in-scope; `--response` does not cover adversarial_cycle parks (BOOTSTRAP-NOTES #51); F-001/F-002/F-009 deferred unapplied — see OPERATOR-OVERRIDE-impl-cycle-0.md |
+| [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 200s | 268128in/11772out $0.0423 | operator override (force-concluded): FR-10.4 cycle park on F-008 resolved by accepting P1 scope; --response does not cover adversarial_cycle parks (BOOTSTRAP-NOTES #51). Accepted findings F-001/F-002/F-009 deferred unapplied; see OPERATOR-OVERRIDE-impl-cycle-0.md |
 
 ## Commits
 
