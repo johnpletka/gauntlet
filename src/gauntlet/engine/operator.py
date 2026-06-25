@@ -37,6 +37,7 @@ from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
+    RECOVERY_INTENT_NAME,
     UnsafeRunSegment,
     _LockRecord,
     safe_run_segment,
@@ -624,7 +625,9 @@ def composite_state(man: Manifest, liveness: str) -> str:
 
 
 # --- read-only recovery-intent parser (FR-5.6 report half) -------------------
-_RECOVERY_INTENT_NAME = ".recovery-intent.json"
+# The single source of the intent filename is `run.RECOVERY_INTENT_NAME`; the P4
+# writer and this read-only parser must agree, so it is imported, not re-literal'd.
+_RECOVERY_INTENT_NAME = RECOVERY_INTENT_NAME
 
 
 def _within(child: Path, ancestor: Path) -> bool:

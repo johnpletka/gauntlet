@@ -153,6 +153,42 @@ class CommitRecord(BaseModel):
     sha: str
 
 
+# --- recovery audit (operator-aids P4, FR-5.3 / §6.4) ------------------------
+# `gauntlet recover` terminates a verified wedged driver. Which signal ended the
+# recorded process group — or that it was already gone by the time we signalled.
+SIGNAL_TERMINATED_SIGTERM = "terminated_sigterm"
+SIGNAL_TERMINATED_SIGKILL = "terminated_sigkill"
+SIGNAL_ALREADY_DEAD = "already_dead"
+
+
+class RecoveryRecord(BaseModel):
+    """One `gauntlet recover` event, APPENDED to ``Manifest.recoveries`` (§6.4).
+
+    Append-only: a prior record is never overwritten, so repeated recoveries (a
+    run re-wedged after a resume) accumulate a complete audit trail. The
+    ``lock_nonce``/``pid``/``pgid``/``proc_identity``/``host`` are the verified
+    prior-lock identity datums (the FR-5.1 gate inputs), so the record proves
+    *which* process was killed; ``prior_*``/``resulting_*`` record the exact
+    step/run transition the recovery effected.
+    """
+
+    ts: str
+    actor: str
+    actor_source: str
+    reason: str | None = None
+    lock_nonce: str
+    pid: int
+    pgid: int
+    proc_identity: dict | None = None
+    host: str
+    signal_outcome: str  # terminated_sigterm | terminated_sigkill | already_dead
+    prior_step_id: str
+    prior_step_status: str
+    prior_run_status: str
+    resulting_step_status: str
+    resulting_run_status: str
+
+
 class Manifest(BaseModel):
     """The persisted run state (§7)."""
 
@@ -177,6 +213,11 @@ class Manifest(BaseModel):
     # reviewer, triager, fixer, and escalation profiles, so step-level totals
     # alone cannot answer "is triage < 5% of run cost?" (FR-3 acceptance).
     agent_usage: dict[str, UsageTotals] = Field(default_factory=dict)
+    # Append-only `gauntlet recover` audit (operator-aids P4, FR-5.3/§6.4). One
+    # record per recovery; never overwritten, so a run re-wedged after a resume
+    # accumulates the full history. Defaults empty, so older manifests load
+    # unchanged (additive — the field is absent on pre-P4 runs).
+    recoveries: list[RecoveryRecord] = Field(default_factory=list)
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

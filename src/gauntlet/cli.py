@@ -391,6 +391,36 @@ def abort(slug: str) -> None:
 
 
 @app.command()
+def recover(
+    slug: str,
+    reason: str = typer.Option(
+        None, "--reason",
+        help="Optional operator note recorded verbatim in the recovery audit "
+        "record (§6.4); omitted ⇒ recorded as null.",
+    ),
+) -> None:
+    """Terminate a verified, wedged live driver and mark its step INTERRUPTED (FR-5).
+
+    Operator-only and fail-closed: signals only a process it can prove via
+    process identity is the same driver it launched — on this host, still in the
+    recorded process group — never a recycled, foreign-host, or unverifiable PID.
+    Fills the gap `resume` cannot (a *live* lock is never reclaimed). It does
+    **not** auto-resume: run `gauntlet resume <slug>` afterwards. Refuses inside a
+    pipeline-agent context.
+    """
+    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.run import RecoverError, UnsafeRunSegment
+
+    mgr = _manager()
+    try:
+        status = mgr.recover(slug, reason=reason)
+    except (RecoverError, UnsafeRunSegment, RunResolutionError, FileNotFoundError) as exc:
+        typer.echo(f"recover refused: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"run status: {status}")
+
+
+@app.command()
 def clean(
     slug: str,
     force: bool = typer.Option(

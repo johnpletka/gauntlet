@@ -9,12 +9,15 @@ review F-010).
 from __future__ import annotations
 
 import atexit
+import getpass
 import hmac
 import json
 import os
 import secrets
 import shutil
+import signal
 import socket
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +40,19 @@ from gauntlet.procident import (
 # The worktree-scoped active-run lockfile name (FR-10.5). One per repo/worktree,
 # at the resolved run root, gitignored.
 DRIVING_LOCK_NAME = ".driving.lock"
+
+# The transient pre-signal recovery intent (operator-aids P4, FR-5.6 / §6.4).
+# Lives in the run-instance dir; written durably *before* `recover` signals and
+# unlinked only after the manifest recovery record is durably appended, so its
+# presence on a later mutating invocation means "a verified kill began but the
+# manifest was not finalized" — the signal crash reconciliation keys on.
+RECOVERY_INTENT_NAME = ".recovery-intent.json"
+
+# `recover` bounded SIGTERM→SIGKILL grace (FR-5.2), mirroring the timeout-kill
+# path but TERM-first so a driver can flush. The poll interval bounds how often
+# we re-check the group between the TERM and the escalation to KILL.
+_RECOVER_SIGTERM_GRACE_S = 10.0
+_RECOVER_POLL_INTERVAL_S = 0.1
 
 # Console sidecar layout (also imported by web.jobproc so the two agree). The
 # engine needs these to honour the run-id reservation handshake (FR-6.1a,
@@ -68,6 +84,29 @@ class RollbackGuardError(RuntimeError):
 
 class AbortGuardError(RuntimeError):
     """`abort()` refused because the target run is terminal (review F-002)."""
+
+
+class RecoverError(RuntimeError):
+    """Base for `gauntlet recover` outcomes that are not a successful recovery."""
+
+
+class RecoverRefused(RecoverError):
+    """`recover` refused fail-closed (FR-5.1/FR-5.4/FR-5.5): no signal was sent.
+
+    The target could not be fully verified (absent/foreign/dead/recycled/
+    regrouped lock, or an unobtainable datum), OR `recover` was invoked inside a
+    pipeline-agent context (``GAUNTLET_STEP_ID`` set — the operator-only
+    boundary). The message names the reason and the safe alternatives.
+    """
+
+
+class RecoverConcurrent(RecoverError):
+    """`recover` aborted a race with a concurrently-finishing/relaunching driver.
+
+    No signal was sent and the manifest was not mutated (FR-5.6 steps 2–3): the
+    in-flight step transitioned out of ``running`` between capture and action, or
+    the lock's ``nonce`` changed/vanished immediately before signalling.
+    """
 
 
 class UnsafeRunSegment(ValueError):
@@ -259,6 +298,212 @@ class _LockHandle:
 
     path: Path
     nonce: str
+
+
+@dataclass
+class _RecoveryIntent:
+    """The transient ``.recovery-intent.json`` content (FR-5.6 / §6.4).
+
+    The durable pre-signal companion to the §6.4 recovery record: it freezes the
+    FR-5.1-verified identity datums (so a crash-reconciled finalize trusts them
+    instead of re-running a liveness gate against a now-dead PID) plus the prior
+    states needed to compose the record and the operator ``reason``. ``step_id``
+    is the *rendered* step id (``<id>`` / ``<id>.<iteration>``), matched back to a
+    record by re-rendering — never by parsing — so a dotted id is unambiguous.
+    """
+
+    ts: str
+    actor: str
+    actor_source: str
+    reason: str | None
+    lock_nonce: str
+    pid: int
+    pgid: int
+    proc_identity: dict | None
+    host: str
+    step_id: str
+    prior_step_status: str
+    prior_run_status: str
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "ts": self.ts,
+                "actor": self.actor,
+                "actor_source": self.actor_source,
+                "reason": self.reason,
+                "lock_nonce": self.lock_nonce,
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "proc_identity": self.proc_identity,
+                "host": self.host,
+                "step_id": self.step_id,
+                "prior_step_status": self.prior_step_status,
+                "prior_run_status": self.prior_run_status,
+            },
+            indent=2,
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "_RecoveryIntent | None":
+        """Parse the intent, or ``None`` if malformed/incomplete (fail closed).
+
+        A malformed intent carries no trustworthy facts, so reconciliation must
+        not signal or finalize from it — it stays untouched for the operator.
+        """
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                return None
+            lock_nonce = data["lock_nonce"]
+            step_id = data["step_id"]
+            host = data.get("host", "")
+            actor = data.get("actor", "")
+            actor_source = data.get("actor_source", "")
+            ts = data.get("ts", "")
+            reason = data.get("reason")
+            proc_identity = data.get("proc_identity")
+            prior_step_status = data["prior_step_status"]
+            prior_run_status = data["prior_run_status"]
+            if not all(
+                isinstance(v, str) and v
+                for v in (lock_nonce, step_id, prior_step_status, prior_run_status)
+            ):
+                return None
+            if not all(isinstance(v, str) for v in (host, actor, actor_source, ts)):
+                return None
+            if reason is not None and not isinstance(reason, str):
+                return None
+            if proc_identity is not None and not isinstance(proc_identity, dict):
+                return None
+            return cls(
+                ts=ts,
+                actor=actor,
+                actor_source=actor_source,
+                reason=reason,
+                lock_nonce=lock_nonce,
+                pid=int(data["pid"]),
+                pgid=int(data.get("pgid", data["pid"])),
+                proc_identity=proc_identity,
+                host=host,
+                step_id=step_id,
+                prior_step_status=prior_step_status,
+                prior_run_status=prior_run_status,
+            )
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+def _fsync_dir(path: Path) -> None:
+    """``fsync`` a directory so a rename/unlink within it survives power loss.
+
+    Best-effort: some platforms refuse a directory ``fsync`` (``EINVAL``/
+    ``EISDIR``) — the atomic ``rename`` is still crash-consistent there, only the
+    extra power-loss durability is unavailable, so a failure is swallowed.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_durable(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` durably and atomically (FR-5.6).
+
+    temp → write → ``flush`` → ``fsync`` → ``rename`` → ``fsync`` the containing
+    dir, so a crash or power loss leaves either no file or the complete one —
+    atomic ``rename`` alone is not durable across power loss.
+    """
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _unlink_durable(path: Path) -> None:
+    """Unlink ``path`` and ``fsync`` its dir so the deletion itself is durable."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    _fsync_dir(path.parent)
+
+
+def _pid_is_live(pid: int) -> bool:
+    """``os.kill(pid, 0)`` liveness probe; fail-closed (unknown errors → live).
+
+    ``ProcessLookupError`` is the only *proof* of absence; a permission error
+    means the pid exists (owned by another user); any other ``OSError`` cannot
+    prove it gone, so it is treated as live (the identity check decides).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _group_alive(pgid: int) -> bool:
+    """True unless the process group is *proven* empty (``ProcessLookupError``)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _signal_process_group(
+    pgid: int, *, grace_s: float = _RECOVER_SIGTERM_GRACE_S
+) -> str:
+    """SIGTERM the group, wait a bounded grace, then SIGKILL if still alive (FR-5.2).
+
+    Mirrors the timeout-kill path (``adapters/process.py``) but TERM-first so a
+    driver gets a chance to flush. Returns the §6.4 ``signal_outcome``:
+    ``terminated_sigterm`` (gone within the grace), ``terminated_sigkill`` (only
+    after the escalation), or ``already_dead`` (the group was gone before TERM).
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return M.SIGNAL_ALREADY_DEAD
+    except PermissionError:
+        # Owned by another user — we proved identity, so escalate to KILL below.
+        pass
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not _group_alive(pgid):
+            return M.SIGNAL_TERMINATED_SIGTERM
+        time.sleep(_RECOVER_POLL_INTERVAL_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return M.SIGNAL_TERMINATED_SIGTERM  # exited right at the boundary
+    return M.SIGNAL_TERMINATED_SIGKILL
 
 
 @dataclass
@@ -794,6 +1039,13 @@ class RunManager:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
+        # FR-5.6 crash reconciliation runs on this mutating entry point BEFORE the
+        # lock is touched: finalization compares a surviving intent's nonce against
+        # the lock the wedged driver left, and acquiring the lock first (which
+        # reclaims a stale dead-driver lock under a *fresh* nonce) would destroy
+        # that comparison and mislabel a finalize-able intent as stale. Reload the
+        # manifest after, so a finalized recovery's INTERRUPTED step is what drives.
+        self._reconcile_recovery_intent(run_dir)
         man = Manifest.load(run_dir / "manifest.json")
         # Resume is a driving verb (FR-10.5): take the worktree lock FIRST,
         # before the branch checkout / drive. The lock record carries this run's
@@ -1027,6 +1279,362 @@ class RunManager:
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
         return man.status
+
+    # ---- recover (operator-aids P4, FR-5) -----------------------------------
+    def recover(self, slug: str, *, reason: str | None = None) -> str:
+        """Terminate a verified, wedged *live* driver and mark its step INTERRUPTED.
+
+        The only mutating operator verb here (FR-5). It fills the gap ``resume``
+        cannot: ``resume`` reclaims a *stale* (dead/orphaned) lock, but never a
+        *live* one, so an alive-but-wedged driver's lock would block every verb
+        forever. ``recover`` signals only a process it can *prove* via process
+        identity is the same driver it launched — on this host, still in the
+        recorded process group — marks the in-flight step ``INTERRUPTED``, appends
+        an append-only §6.4 audit record, releases the lock, and stops. It does
+        **not** auto-resume (separation of concerns, Non-Goal §2.2).
+
+        Crash-consistent and idempotent via the FR-5.6 nonce-/state-guarded
+        sequence; safe to interrupt at every boundary and safe to re-run.
+        """
+        safe_run_segment(slug, kind="slug")
+        # FR-5.5 operator-only boundary (mechanism 2, authoritative for ad-hoc
+        # invocation): refuse — before any reconcile, signal, or mutation — when
+        # running inside a pipeline-agent context. `GAUNTLET_STEP_ID` is the
+        # per-step marker the orchestrator exports to every in-run agent (the same
+        # signal the judge's pipeline_step_only rules key on), so an in-pipeline
+        # agent that shells out to `gauntlet recover` is refused by `recover`
+        # itself, keeping the §2.2 "policy.yaml unchanged" promise true.
+        if os.environ.get("GAUNTLET_STEP_ID"):
+            raise RecoverRefused(
+                "refusing `gauntlet recover` inside a pipeline-agent context "
+                "(GAUNTLET_STEP_ID is set): recover is an operator-only action, "
+                "never an in-pipeline step (FR-5.5). No signal sent. Run it from "
+                "an operator session instead."
+            )
+        layout = self.layout(slug)
+        run_dir = layout.active_run_dir()
+
+        # FR-5.6 step 0: reconcile any surviving intent from a prior interrupted
+        # `recover` FIRST (this is a mutating context). A finalize-able intent is
+        # finalized here; a stale one discarded — so the fresh recovery below sees
+        # a clean slate.
+        self._reconcile_recovery_intent(run_dir)
+
+        man = Manifest.load(run_dir / "manifest.json")
+
+        # FR-5.6 step 1: capture the lock once and run the full FR-5.1 gate.
+        captured = self._read_lock()
+        verified = self._verify_recover_target(captured, slug)
+
+        # FR-5.6 step 2: state guard — the in-flight step must still be `running`.
+        target = self._recover_target_step(man)
+
+        # FR-5.6 step 3: re-read the lock immediately before persisting/signalling.
+        # A changed/absent nonce means the driver finished or relaunched between
+        # step 1 and now → abort WITHOUT signalling (the race against a normally
+        # completing driver, closed).
+        current = self._read_lock()
+        if current is None or current.nonce != verified.nonce:
+            raise RecoverConcurrent(
+                f"run {man.run_id!r} completed or relaunched concurrently "
+                "(the drive lock changed before signalling); no action taken — "
+                f"re-run `gauntlet status {slug}`."
+            )
+
+        # FR-5.6 step 4: persist the durable intent BEFORE any signal — while the
+        # gate's identity proof is still valid (before the PID can become dead).
+        from gauntlet.engine import operator
+
+        actor, actor_source = self._recover_actor()
+        intent = _RecoveryIntent(
+            ts=_utc_stamp(),
+            actor=actor,
+            actor_source=actor_source,
+            reason=reason,
+            lock_nonce=verified.nonce,
+            pid=verified.pid,
+            pgid=verified.pgid,
+            proc_identity=verified.proc_identity,
+            host=verified.host,
+            step_id=operator.render_step_id(target),
+            prior_step_status=target.status,
+            prior_run_status=man.status,
+        )
+        _atomic_write_durable(run_dir / RECOVERY_INTENT_NAME, intent.to_json())
+
+        # FR-5.6 step 5: re-verify identity against the frozen intent, then signal
+        # (closes the TOCTOU window where the PID/PGID is reused across 2–4).
+        outcome = self._signal_recover_target(intent)
+
+        # FR-5.6 steps 6–8: atomic INTERRUPTED + append record, clear intent,
+        # release the lock under the recorded-nonce guard.
+        self._finalize_recovery(run_dir, man, intent, outcome)
+        return man.status
+
+    @staticmethod
+    def _recover_actor() -> tuple[str, str]:
+        """The invoking OS user for the §6.4 audit (``getpass.getuser``).
+
+        Tagged ``os_user`` so the identity provenance is explicit. Audit-only —
+        an unresolvable username never blocks a recovery (it is not a safety
+        datum), so it falls back to ``"unknown"`` rather than failing closed.
+        """
+        try:
+            return getpass.getuser(), "os_user"
+        except Exception:  # pragma: no cover - getuser rarely fails
+            return "unknown", "os_user"
+
+    def _verify_recover_target(
+        self, rec: "_LockRecord | None", slug: str
+    ) -> "_LockRecord":
+        """The full FR-5.1 identity gate (all ANDed); return the verified record.
+
+        Every condition must hold; any failed or unobtainable datum is a
+        fail-closed refusal with **no signal sent** (FR-5.1/FR-5.4). The PID-live
+        + exact-identity-match + host-equality trio is computed by P1's
+        :func:`operator.driver_liveness` (so ``alive`` here is exactly liveness
+        ``alive``, never ``orphaned``/``indeterminate``); the PID-in-PGID check is
+        the extra immediate-pre-signal gate.
+        """
+        from gauntlet.engine import operator
+
+        safe = (
+            "Safe alternatives: wait for the driver to finish, or inspect with "
+            f"`gauntlet status {slug}` / `gauntlet logs {slug}`."
+        )
+        if rec is None:
+            raise RecoverRefused(
+                f"no drive lock is present for {slug!r}; there is no live driver "
+                f"to recover. {safe}"
+            )
+        if rec.slug != slug:
+            raise RecoverRefused(
+                f"the drive lock is owned by {rec.slug!r}, not {slug!r}; refusing "
+                f"to signal another run's driver. {safe}"
+            )
+        if rec.host != socket.gethostname():
+            raise RecoverRefused(
+                f"the drive lock was created on host {rec.host!r}, not this host "
+                f"({socket.gethostname()!r}); refusing to signal a foreign-host "
+                f"PID in a shared run root. {safe}"
+            )
+        liveness = operator.driver_liveness(self._run_root_dir(), slug)
+        if liveness != operator.LIVENESS_ALIVE:
+            why = {
+                operator.LIVENESS_ORPHANED: (
+                    "the recorded driver is gone or its PID was recycled "
+                    "(orphaned); use `gauntlet resume` to reclaim the stale lock"
+                ),
+                operator.LIVENESS_INDETERMINATE: (
+                    "the driver's process identity is unobtainable/unverifiable "
+                    "(indeterminate) — it cannot be proven the recorded process"
+                ),
+                operator.LIVENESS_NONE: "no live driver is present",
+            }.get(liveness, f"driver liveness is {liveness!r}, not alive")
+            raise RecoverRefused(
+                f"refusing to recover {slug!r}: {why}. {safe}"
+            )
+        # PID-in-PGID, immediately before signalling: never signal a PGID the
+        # proven-ours PID has since left (or that was never its group). An
+        # unobtainable getpgid is a fail-closed refusal.
+        try:
+            actual_pgid = os.getpgid(rec.pid)
+        except OSError as exc:
+            raise RecoverRefused(
+                f"refusing to recover {slug!r}: the recorded PID {rec.pid}'s "
+                f"process group is unobtainable ({exc}). {safe}"
+            ) from exc
+        if actual_pgid != rec.pgid:
+            raise RecoverRefused(
+                f"refusing to recover {slug!r}: PID {rec.pid} is no longer in the "
+                f"recorded process group {rec.pgid} (now {actual_pgid}); it has "
+                f"regrouped since the lock was taken. {safe}"
+            )
+        return rec
+
+    @staticmethod
+    def _recover_target_step(man: Manifest):
+        """The unique ``running`` in-flight step `recover` targets (FR-5.6 step 2).
+
+        Aborts (no mutation, no signal) when there is not exactly one — the step
+        transitioned concurrently (finished/failed/parked) or the manifest is in a
+        shape `recover` must not overwrite.
+        """
+        running = [s for s in man.steps if s.status == M.RUNNING]
+        if len(running) != 1:
+            raise RecoverConcurrent(
+                f"run {man.run_id!r} has {'no' if not running else 'multiple'} "
+                "single in-flight `running` step (the step transitioned "
+                "concurrently); no action taken — re-run `gauntlet status`."
+            )
+        return running[0]
+
+    @staticmethod
+    def _identity_still_matches(pid: int, recorded: dict | None) -> bool:
+        """True iff ``pid`` is live and its freshly-read identity equals ``recorded``.
+
+        The PID-reuse-safe re-check (FR-5.6 step 5 / reconciliation gate): a
+        ``None`` recorded identity, a ``None`` fresh read (dead/reused/unsupported
+        platform), or a mismatch all fail closed → not our process → no signal.
+        """
+        known = ProcessIdentity.from_dict(recorded)
+        if known is None:
+            return False
+        if not _pid_is_live(pid):
+            return False
+        return known.same_process(read_process_identity(pid))
+
+    def _signal_recover_target(self, intent: "_RecoveryIntent") -> str:
+        """Re-verify the frozen intent's identity, then signal the group (FR-5.6 step 5).
+
+        On an exact identity match AND PID-still-in-PGID, signal the recorded
+        process group (SIGTERM→SIGKILL). On a mismatch/absent/reused target send
+        no signal and report ``already_dead`` — the durable intent already pins
+        the verified target, so finalization proceeds without signalling.
+        """
+        if not self._identity_still_matches(intent.pid, intent.proc_identity):
+            return M.SIGNAL_ALREADY_DEAD
+        try:
+            if os.getpgid(intent.pid) != intent.pgid:
+                return M.SIGNAL_ALREADY_DEAD
+        except OSError:
+            return M.SIGNAL_ALREADY_DEAD
+        return _signal_process_group(intent.pgid)
+
+    def _release_lock_if_nonce(self, nonce: str) -> None:
+        """Release the drive lock only if it still carries ``nonce`` (FR-5.6 step 8).
+
+        Mirrors :meth:`_release_worktree_lock`'s nonce guard, but keyed on the
+        recovered nonce rather than a held handle — `recover` never *acquired* the
+        lock, it is releasing the wedged driver's. Never unlinks a new owner's
+        fresh lock.
+        """
+        current = self._read_lock()
+        if current is not None and current.nonce == nonce:
+            _unlink_durable(self._lock_path())
+
+    @staticmethod
+    def _find_step_by_rendered_id(man: Manifest, rendered_id: str):
+        """The StepRecord whose rendered id equals ``rendered_id`` (or ``None``).
+
+        Matches by re-rendering (id / id.iteration) rather than parsing, so a
+        dotted step id is unambiguous and the lookup agrees with everything else
+        that names a leaf (FR-3.1a)."""
+        from gauntlet.engine import operator
+
+        for rec in man.steps:
+            try:
+                if operator.render_step_id(rec) == rendered_id:
+                    return rec
+            except Exception:  # a corrupt iteration on some other record
+                continue
+        return None
+
+    def _finalize_recovery(
+        self,
+        run_dir: Path,
+        man: Manifest,
+        intent: "_RecoveryIntent",
+        outcome: str,
+    ) -> None:
+        """FR-5.6 steps 6–8: persist the transition, clear the intent, release the lock.
+
+        Idempotent: if a §6.4 record for *this* intent (same ``lock_nonce`` +
+        ``prior_step_id``) is already present, step 6 ran on a prior (crashed)
+        attempt — skip the manifest write (never a torn or duplicated record) and
+        only complete the still-pending steps 7–8. The recovery record is
+        therefore written exactly once per recovery, always by whoever finalizes.
+        """
+        already = any(
+            r.lock_nonce == intent.lock_nonce and r.prior_step_id == intent.step_id
+            for r in man.recoveries
+        )
+        if not already:
+            # Step 6: atomic manifest update — mark the step INTERRUPTED and
+            # append the §6.4 record, built from the frozen intent + the observed
+            # signal outcome, in a single durable write-temp→fsync→rename→fsync-dir.
+            rec = self._find_step_by_rendered_id(man, intent.step_id)
+            if rec is not None:
+                rec.status = M.INTERRUPTED
+            man.status = M.RUN_FAILED
+            man.recoveries.append(
+                M.RecoveryRecord(
+                    ts=intent.ts,
+                    actor=intent.actor,
+                    actor_source=intent.actor_source,
+                    reason=intent.reason,
+                    lock_nonce=intent.lock_nonce,
+                    pid=intent.pid,
+                    pgid=intent.pgid,
+                    proc_identity=intent.proc_identity,
+                    host=intent.host,
+                    signal_outcome=outcome,
+                    prior_step_id=intent.step_id,
+                    prior_step_status=intent.prior_step_status,
+                    prior_run_status=intent.prior_run_status,
+                    resulting_step_status=M.INTERRUPTED,
+                    resulting_run_status=M.RUN_FAILED,
+                )
+            )
+            man.write_atomic(run_dir / "manifest.json")
+            _fsync_dir(run_dir)
+        # Step 7: clear the intent only after step 6 is durable — its content is
+        # now folded into the persisted record, so a surviving intent always means
+        # "manifest not yet finalized".
+        _unlink_durable(run_dir / RECOVERY_INTENT_NAME)
+        # Step 8: release the lock under the recorded-nonce guard.
+        self._release_lock_if_nonce(intent.lock_nonce)
+
+    def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
+        """Finalize or discard a surviving recovery intent (FR-5.6, mutating).
+
+        Runs at the start of every `recover` and on the `resume` path (both
+        already mutating). Read-only `status` never calls this — it only
+        *detects and reports* via :func:`operator.read_recovery_intent`.
+
+        Keyed on the intent, **not** a fresh liveness gate (a now-dead target is
+        the *expected* post-signal outcome, not a failure):
+
+        * **Stale** — lock **present** with a **different** nonce (a relaunched
+          driver holds a fresh lock): discard the intent, no signal, no manifest
+          mutation.
+        * **Live** — lock **absent** (verified target already killed, nothing
+          relaunched) **or** present with a matching nonce: finalize idempotently.
+          Re-run the FR-5.1 identity gate against the frozen intent — only an
+          exact match may (re-)signal (a no-op SIGKILL); a mismatch/absent target
+          sends no signal and records ``already_dead`` — then perform steps 6–8.
+
+        Returns a short human note describing what was done, or ``None`` when no
+        intent survives. A malformed/unreadable intent is left untouched (fail
+        closed: no trustworthy facts to act on) and surfaced for the operator.
+        """
+        intent_path = run_dir / RECOVERY_INTENT_NAME
+        if not intent_path.exists():
+            return None
+        try:
+            text = intent_path.read_text()
+        except OSError:
+            return "unreadable recovery intent present; left in place for inspection"
+        intent = _RecoveryIntent.from_json(text)
+        if intent is None:
+            return "malformed recovery intent present; left in place for inspection"
+
+        current = self._read_lock()
+        if current is not None and current.nonce != intent.lock_nonce:
+            # Stale: a relaunched driver holds a fresh lock → discard, no signal,
+            # no manifest mutation.
+            _unlink_durable(intent_path)
+            return (
+                "stale recovery intent discarded; run relaunched — re-run "
+                "`gauntlet status`."
+            )
+
+        # Live branch: finalize. Compute the (re-)signal outcome against the
+        # frozen intent — already_dead is the expected case post-crash.
+        man = Manifest.load(run_dir / "manifest.json")
+        outcome = self._signal_recover_target(intent)
+        self._finalize_recovery(run_dir, man, intent, outcome)
+        return "finalized an interrupted recovery from its surviving intent."
 
     # ---- clean (run-branch tidy) --------------------------------------------
     def clean(self, slug: str, *, force: bool = False) -> str:
