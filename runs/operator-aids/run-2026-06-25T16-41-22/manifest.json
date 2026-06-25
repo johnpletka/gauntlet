@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "prd-approve",
+  "current_step": "plan-approve",
   "warnings": [],
   "steps": [
     {
@@ -90,6 +90,105 @@
       "notes": "approved: PRD approved. FR-5.6 escalation fully resolved (Fix A: missing-lock disambiguation; Fix B: FR-5.1 identity re-gate before re-signal closes reused-PGID hole). Accepted residual F-007 (major, partially_resolved): the section 6.5 summary sentence overclaims forward-validation, but the Consumer-side bullet already carries the correct tolerant rule, so the implementation is unaffected. Tighten the summary via a PRD revision if it becomes load-bearing.",
       "iteration": null,
       "metrics": {}
+    },
+    {
+      "id": "plan-author",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "278c4711-7f7b-40e6-8667-3039918cff9c",
+      "started": "2026-06-25T17:56:02.045894+00:00",
+      "ended": "2026-06-25T17:59:13.863810+00:00",
+      "attempts": 0,
+      "base_sha": "45cbcd741cedf1b9d6b21e42ac396f45a3cf73ad",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 6144,
+        "output_tokens": 13923,
+        "cached_input_tokens": 455647,
+        "cost_usd": 1.4087235
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T17:59:13.867148+00:00",
+      "ended": "2026-06-25T18:15:04.648776+00:00",
+      "attempts": 0,
+      "base_sha": "45cbcd741cedf1b9d6b21e42ac396f45a3cf73ad",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 589680,
+        "output_tokens": 51190,
+        "cached_input_tokens": 4704559,
+        "cost_usd": 5.024451250000001
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 7 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": null,
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 7,
+        "accepted_total": 7,
+        "accepted_resolved_total": 7,
+        "verdict_counts": {
+          "legitimate": 7
+        },
+        "confirm_counts": {
+          "resolved": 7
+        }
+      }
+    },
+    {
+      "id": "plan-lint",
+      "type": "phase_lint",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T18:15:04.652811+00:00",
+      "ended": "2026-06-25T18:15:04.655541+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "phase lint: 5 phase(s) valid (P1, P2, P3, P4, P5)",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-approve",
+      "type": "human_gate",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-25T18:15:04.657505+00:00",
+      "ended": "2026-06-25T18:36:36.059575+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "approved: Plan approved. plan-cycle converged clean (round 1, 7 findings resolved, 0 residuals); plan-lint validated P1-P5; all FRs covered. Begin phased implementation.",
+      "iteration": null,
+      "metrics": {}
     }
   ],
   "commits": [
@@ -107,44 +206,54 @@
       "step_id": "prd-cycle",
       "phase": "PRD.1",
       "sha": "7b2fb27c2a65de1d4162a67f4b91832b6f19d736"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN",
+      "sha": "6b3d570a32a53ec05c7b976c07ab3efdfc282597"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN.1",
+      "sha": "f9be0a755384de8396dbbb0826ecb846620b8b06"
     }
   ],
   "totals": {
-    "input_tokens": 296811,
-    "output_tokens": 125432,
-    "cached_input_tokens": 5870817,
-    "cost_usd": 7.738987150000001
+    "input_tokens": 924075,
+    "output_tokens": 196574,
+    "cached_input_tokens": 11031023,
+    "cost_usd": 14.192079900000003
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 177024,
-      "output_tokens": 11244,
-      "cached_input_tokens": 38144,
+      "input_tokens": 748448,
+      "output_tokens": 18275,
+      "cached_input_tokens": 523008,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 42183,
-      "output_tokens": 8687,
+      "input_tokens": 54966,
+      "output_tokens": 11558,
       "cached_input_tokens": 0,
-      "cost_usd": 0.024694149999999998
+      "cost_usd": 0.0336319
     },
     "escalation": {
-      "input_tokens": 14778,
-      "output_tokens": 5477,
+      "input_tokens": 16630,
+      "output_tokens": 5959,
       "cached_input_tokens": 0,
-      "cost_usd": 0.0679145
+      "cost_usd": 0.0750495
     },
     "builder": {
-      "input_tokens": 13086,
-      "output_tokens": 92776,
-      "cached_input_tokens": 5832673,
-      "cost_usd": 7.6194475
+      "input_tokens": 22851,
+      "output_tokens": 147505,
+      "cached_input_tokens": 10508015,
+      "cost_usd": 14.036549500000001
     },
     "judge_llm": {
-      "input_tokens": 49740,
-      "output_tokens": 7248,
+      "input_tokens": 81180,
+      "output_tokens": 13277,
       "cached_input_tokens": 0,
-      "cost_usd": 0.026931000000000004
+      "cost_usd": 0.04684900000000001
     }
   }
 }
