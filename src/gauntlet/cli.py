@@ -194,12 +194,30 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
 
 @app.command()
 def status(slug: str) -> None:
-    """Show the current run status for <slug> (FR-8.1)."""
-    man = _manager().status(slug)
+    """Show the current run status for <slug> with driver liveness + next action.
+
+    Read-only (FR-1/FR-2): reports the computed driver liveness and the concrete
+    next action for the run's composite state. It never writes — a surviving
+    recovery intent is *reported*, never finalized (FR-5.6).
+    """
+    from gauntlet.engine import operator
+
+    mgr = _manager()
+    man = mgr.status(slug)
     typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
     for rec in man.steps:
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
+
+    run_root = mgr.repo_root / mgr.config.run_root
+    driver = operator.driver_info(run_root, slug)
+    rstate = operator.compute_run_state(man, driver.state)
+    run_instance_dir = mgr.layout(slug).active_run_dir()
+    recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
+    for line in operator.render_footer(
+        driver, rstate, reconciliation=recon, anomaly=anomaly
+    ):
+        typer.echo(line)
 
 
 @app.command()
