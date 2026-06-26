@@ -516,6 +516,42 @@ def test_skill_check_warns_and_does_not_dereference_symlinked_leaf(tmp_path):
     assert "secret" not in skill.detail
 
 
+def test_skill_check_warns_on_name_mismatch_operator(tmp_path):
+    # F-003: an otherwise-valid SKILL.md whose frontmatter `name` does not match
+    # the spec installed at this path is a broken discovery surface. The schema
+    # only pins `name` to *some* kebab id, so this must be caught explicitly:
+    # WARN (never FAIL — the skill gates nothing), and never silently OK.
+    repo = _healthy_repo(tmp_path)
+    skill_file = repo / S.OPERATOR_SPEC.skill_rel
+    skill_file.write_text(
+        skill_file.read_text().replace(
+            "name: gauntlet-operator", "name: some-other-skill"
+        )
+    )
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["operator-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+    assert "some-other-skill" in skill.detail
+    assert "gauntlet-operator" in skill.detail
+
+
+def test_skill_check_warns_on_name_mismatch_prd_author(tmp_path):
+    # F-003: the same name-consistency check guards the prd-author skill too.
+    repo = _healthy_repo(tmp_path)
+    skill_file = repo / S.SKILL_REL
+    skill_file.write_text(
+        skill_file.read_text().replace(
+            "name: gauntlet-prd-author", "name: some-other-skill"
+        )
+    )
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    skill = _by_name(results)["prd-skill"]
+    assert skill.status == WARN
+    assert skill.status != FAIL
+    assert "some-other-skill" in skill.detail
+
+
 def test_skill_check_warns_and_does_not_dereference_symlinked_parent(tmp_path):
     # F-003: a symlinked *parent* directory must also abort dereferencing — the
     # leaf is a regular file but reading it would follow the parent link out.

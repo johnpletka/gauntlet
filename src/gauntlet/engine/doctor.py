@@ -427,6 +427,20 @@ def _check_skill(repo_root: Path, spec, asset_root: str = ".") -> CheckResult:
             f"{rel} frontmatter does not match the pinned schema: {violations[0]}",
             remedy=remedy,
         )
+    # F-003: the schema only pins `name` to *some* kebab-case id, so an otherwise
+    # valid SKILL.md whose frontmatter names a *different* skill would pass schema
+    # validation and (with its playbook ref intact) classify as a customization —
+    # leaving doctor reporting OK while the skill's discovery surface is broken.
+    # The installed file at this spec's path must declare this spec's name.
+    meta = S.parse_frontmatter(text)
+    declared = meta.get("name") if meta else None
+    if declared != spec.name:
+        return CheckResult(
+            name, WARN,
+            f"{rel} frontmatter name {declared!r} does not match expected "
+            f"{spec.name!r}",
+            remedy=remedy,
+        )
     if (
         spec.classify(text) == "customization"
         and spec.looks_stale(text, asset_root)

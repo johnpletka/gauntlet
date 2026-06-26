@@ -69,9 +69,12 @@ Work top-down; stop at the first branch that matches.
 4. **Does the manifest say running?** Then trust *liveness*, not the manifest:
    - `in_progress` → it is genuinely working; wait and observe.
    - `orphaned` → the driver is gone; `gauntlet resume <slug>` reclaims it.
-   - `indeterminate` → you cannot prove it is alive *or* dead. Inspect read-only.
-     If you have independent, out-of-band proof the process is wedged and alive,
-     `gauntlet recover <slug>` is the guarded path (§4) — but only then.
+   - `indeterminate` → you cannot prove it is alive *or* dead. Inspect
+     read-only (`logs`, `status --json`) and escalate; **never** a mutating verb
+     — not even with out-of-band proof. `recover` is reserved for a state the
+     tool itself can prove is the verified live target (§4); `indeterminate` is
+     by definition not that. When liveness cannot be proven, you look, you do
+     not touch.
 5. **Terminal?** `done` / `aborted` → nothing to do. `unknown` → inspect
    read-only and escalate; never apply a mutating verb to a state the tool itself
    could not classify.
