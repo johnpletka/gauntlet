@@ -34,12 +34,19 @@ DEFAULT_TIMEOUT_S = 600.0
 class CodexAdapter:
     name = "codex"
     # Live-streaming qualification (live-run-observability FR-2.7/FR-2.8). `codex
-    # exec --json` is always message-granular NDJSON — one whole JSON event per
-    # line — so a sensitive value lands wholly inside a single newline-framed
-    # line (the per-line redaction unit). Verified by the P2 containment test,
-    # not assumed; an adapter whose framing splits values must leave this False
-    # and use the buffered path (FR-2.8).
-    supports_line_streaming = True
+    # exec --json` is *expected* to be message-granular NDJSON — one whole JSON
+    # event per line — which would make a sensitive value land wholly inside a
+    # single newline-framed line (the per-line redaction unit). But the
+    # qualification gate is fail-closed: this flag may be flipped to True ONLY
+    # after a fixture-based containment test (FR-2.7) exercises this adapter's
+    # *real* `codex exec --json` framing — pinned captured raw streams from the
+    # verified CLI version — with a planted secret AND a split-secret negative
+    # case (FR-2.8). The current P2 suite proves only the synthetic streaming
+    # double, not the live CLI contract, so this adapter is NOT yet qualified and
+    # must stay False: streams_to_sink() returns False and the buffered path is
+    # used, closing the fail-open secret-splitting case the carryover redactor
+    # (deferred) would otherwise be needed to catch.
+    supports_line_streaming = False
     capabilities = AdapterCapabilities(
         repo_write=True, structured_output="native", resume=True
     )

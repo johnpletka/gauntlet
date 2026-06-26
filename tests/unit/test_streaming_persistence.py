@@ -257,7 +257,12 @@ def test_claude_adapter_streams_through_sink(monkeypatch):
         _streaming_run_double(CLAUDE_EVENTS),
     )
     received: list[str] = []
-    result = ClaudeCodeAdapter(output_format="stream-json").run("ping", sink=received.append)
+    adapter = ClaudeCodeAdapter(output_format="stream-json")
+    # Simulate a fixture-qualified adapter: the real default is False until the
+    # live-CLI containment fixture qualifies it (F-001); this test exercises the
+    # streaming *mechanism* given qualification, not the shipped default.
+    adapter.supports_line_streaming = True
+    result = adapter.run("ping", sink=received.append)
     assert result.text == "GAUNTLET_PONG"
     assert [json.loads(line)["type"] for line in received] == ["system", "assistant", "result"]
 
@@ -269,7 +274,10 @@ def test_codex_adapter_streams_through_sink(monkeypatch):
         _streaming_run_double(_codex_events()),
     )
     received: list[str] = []
-    result = CodexAdapter().run("ping", sink=received.append)
+    adapter = CodexAdapter()
+    # Simulate a fixture-qualified adapter (real default is False, F-001).
+    adapter.supports_line_streaming = True
+    result = adapter.run("ping", sink=received.append)
     assert result.text == "codex-pong"
     assert [json.loads(line)["type"] for line in received] == [
         "thread.started", "item.completed", "turn.completed"
@@ -288,6 +296,9 @@ def test_claude_buffered_format_never_streams(monkeypatch):
     monkeypatch.setattr("gauntlet.adapters.claude_code.run_with_timeout", wrap)
     received: list[str] = []
     adapter = ClaudeCodeAdapter(output_format="json")
+    # Even a (hypothetically) qualified adapter must not stream the legacy `json`
+    # format — prove the format gate blocks it independently of qualification.
+    adapter.supports_line_streaming = True
     assert adapter.streams_to_sink() is False
     adapter.run("ping", sink=received.append)
     assert captured["sink"] is None  # the adapter passed None to run_with_timeout
@@ -329,6 +340,44 @@ def test_unqualified_adapter_runs_buffered(monkeypatch, make_adapter):
     assert received == []
 
 
+@pytest.mark.parametrize(
+    "make_adapter",
+    [
+        lambda: ClaudeCodeAdapter(output_format="stream-json"),
+        lambda: CodexAdapter(),
+    ],
+    ids=["claude", "codex"],
+)
+def test_real_adapters_ship_unqualified_and_run_buffered(monkeypatch, make_adapter):
+    # FR-2.8 / F-001: the shipped real adapters are NOT yet qualified — no
+    # fixture exercises their live NDJSON framing with a planted + split secret —
+    # so supports_line_streaming defaults False, streams_to_sink() is False, and
+    # even with a sink and stream-json they pass None and run buffered. Flipping
+    # the class default back to True without that fixture is a fail-open
+    # regression for the secret-splitting case the carryover redactor would catch.
+    adapter = make_adapter()
+    assert adapter.supports_line_streaming is False
+    assert adapter.streams_to_sink() is False
+
+    module = (
+        "gauntlet.adapters.claude_code"
+        if isinstance(adapter, ClaudeCodeAdapter)
+        else "gauntlet.adapters.codex"
+    )
+    events = CLAUDE_EVENTS if isinstance(adapter, ClaudeCodeAdapter) else _codex_events()
+    captured: dict = {}
+
+    def wrap(argv, **kw):
+        captured["sink"] = kw.get("sink")
+        return _streaming_run_double(events)(argv, **kw)
+
+    monkeypatch.setattr(f"{module}.run_with_timeout", wrap)
+    received: list[str] = []
+    adapter.run("ping", sink=received.append)
+    assert captured["sink"] is None  # buffered path: no sink threaded
+    assert received == []
+
+
 @pytest.mark.parametrize("cli", ["claude", "codex"])
 def test_secret_value_contained_in_single_event_line(monkeypatch, tmp_path, cli):
     # FR-2.7: a known secret in the agent's streamed output appears within a
@@ -353,6 +402,9 @@ def test_secret_value_contained_in_single_event_line(monkeypatch, tmp_path, cli)
         )
         adapter = CodexAdapter()
 
+    # Simulate a fixture-qualified adapter (real default is False, F-001); this
+    # exercises the containment mechanism given qualification.
+    adapter.supports_line_streaming = True
     redactor = Redactor(env={"K_API_KEY": secret})
     logger = StepLogger(RedactingWriter(redactor), tmp_path / "s")
     stream = logger.open_stream()
@@ -388,6 +440,7 @@ def test_agent_result_parity_buffered_vs_streamed(monkeypatch, cli):
             _streaming_run_double(events),
         )
         adapter = ClaudeCodeAdapter(output_format="stream-json")
+        adapter.supports_line_streaming = True  # qualify (real default False, F-001)
         buffered = adapter.run("ping", schema=schema)
         streamed = adapter.run("ping", schema=schema, sink=lambda _l: None)
     else:
@@ -399,6 +452,7 @@ def test_agent_result_parity_buffered_vs_streamed(monkeypatch, cli):
             _streaming_run_double(events),
         )
         adapter = CodexAdapter()
+        adapter.supports_line_streaming = True  # qualify (real default False, F-001)
         buffered = adapter.run("ping", schema=schema)
         streamed = adapter.run("ping", schema=schema, sink=lambda _l: None)
 
@@ -418,6 +472,7 @@ def test_events_jsonl_final_render_identical_across_modes(monkeypatch, tmp_path)
         _streaming_run_double(CLAUDE_EVENTS),
     )
     adapter = ClaudeCodeAdapter(output_format="stream-json")
+    adapter.supports_line_streaming = True  # qualify (real default False, F-001)
 
     buf_logger = StepLogger(RedactingWriter(), tmp_path / "buffered")
     buf_logger.log_result(adapter.run("ping"))
