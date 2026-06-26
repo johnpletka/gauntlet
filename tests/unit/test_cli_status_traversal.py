@@ -88,3 +88,26 @@ def test_status_refuses_symlinked_instance_escaping_run_tree(tmp_path, monkeypat
     assert result.exit_code == 1
     assert "escapes the run tree" in result.output
     assert "LEAKED" not in result.output  # the out-of-tree intent was not read
+
+
+def test_status_refuses_symlinked_slug_dir_escaping_run_root(tmp_path, monkeypatch):
+    # F-002: the slug dir ITSELF is a symlink out of the configured run_root. The
+    # instance then resolves under the (escaped) slug dir, so a child-of-slug check
+    # alone passes vacuously — the slug dir must be proven under run_root first.
+    (tmp_path / ".gauntlet").mkdir()
+    (tmp_path / ".gauntlet" / "config.yaml").write_text("{}\n")
+    (tmp_path / "runs").mkdir()
+    outside_slug = tmp_path / "outside_slug"
+    _write_manifest(outside_slug / "run-1")
+    (outside_slug / "run-1" / ".recovery-intent.json").write_text(
+        json.dumps({"step_id": "LEAKED", "lock_nonce": "n"})
+    )
+    (outside_slug / "active-run.txt").write_text("run-1\n")
+    # runs/demo -> /outside_slug: a safe-looking slug whose dir escapes run_root.
+    (tmp_path / "runs" / "demo").symlink_to(outside_slug, target_is_directory=True)
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status", "demo"])
+    assert result.exit_code == 1
+    assert "escapes the run tree" in result.output
+    assert "LEAKED" not in result.output  # the out-of-tree intent was not read

@@ -9,6 +9,7 @@ on the console script being on PATH.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import socket
@@ -17,6 +18,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gauntlet.judge.hook_client import (
@@ -27,9 +30,14 @@ from gauntlet.judge.hook_client import (
     URL_ENV_VAR,
 )
 from gauntlet.judge.service import TOKEN_ENV_VAR
+from gauntlet.procident import read_process_identity
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+# The run-dir sidecar recording the per-run judge's endpoint + reap identity
+# (FR-5, §6.2). Gitignored (the run dir self-ignores `*`), mode 0600.
+JUDGE_RECORD_NAME = "judge.json"
 
 # Every GAUNTLET_* var the run touches — snapshotted at start, restored at stop
 # so nothing (incl. the per-step GAUNTLET_STEP_ID set by the orchestrator) leaks
@@ -58,6 +66,154 @@ def classifier_disabled_warning() -> str:
     )
 
 
+@dataclass(frozen=True)
+class JudgeRecord:
+    """The on-disk content of ``<run_dir>/judge.json`` (§6.2).
+
+    Two distinct concerns share the record:
+
+    - ``pid``/``pgid``/``proc_identity``/``host`` are the FR-6 reap-identity
+      datums — PID-reuse-safe, so cleanup verbs can prove a judge is *ours on
+      this host* before signalling it (P2). ``proc_identity`` is ``None`` on an
+      unsupported platform → never reaped (procident's fail-closed contract).
+    - ``port``/``url``/``token``/``run_id`` are what the monitor (§6.3) needs to
+      wire itself to *this run's* judge. ``token`` is the **per-run judge token**
+      (the value the judge accepts on ``GAUNTLET_JUDGE_TOKEN``) — never the
+      console ``serve`` token; the two credentials are distinct (§6.2).
+    """
+
+    pid: int
+    pgid: int
+    proc_identity: dict | None
+    host: str
+    port: int
+    url: str
+    token: str
+    run_id: str
+    started_at: str
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "proc_identity": self.proc_identity,
+                "host": self.host,
+                "port": self.port,
+                "url": self.url,
+                "token": self.token,
+                "run_id": self.run_id,
+                "started_at": self.started_at,
+            },
+            indent=2,
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "JudgeRecord | None":
+        """Rehydrate a record, or ``None`` if missing/malformed (fail-closed).
+
+        A corrupt or partial sidecar round-trips to ``None`` so every reader
+        (reap gate, monitor wiring) treats it as *absent* rather than acting on
+        half a record (§6.4 fail-closed; data over inference)."""
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            pid = int(data["pid"])
+            pgid = int(data["pgid"])
+            port = int(data["port"])
+            url = data["url"]
+            token = data["token"]
+            run_id = data["run_id"]
+            host = data["host"]
+            started_at = data["started_at"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        # The string-typed fields must be strings; `bool` is an int subclass but
+        # not a str, so it is rejected here (mirrors _LockRecord.from_json).
+        if not all(isinstance(v, str) for v in (url, token, run_id, host, started_at)):
+            return None
+        proc_identity = data.get("proc_identity")
+        if proc_identity is not None and not isinstance(proc_identity, dict):
+            return None
+        return cls(
+            pid=pid,
+            pgid=pgid,
+            proc_identity=proc_identity,
+            host=host,
+            port=port,
+            url=url,
+            token=token,
+            run_id=run_id,
+            started_at=started_at,
+        )
+
+
+def read_judge_record(run_dir: Path) -> JudgeRecord | None:
+    """Read ``<run_dir>/judge.json``, or ``None`` if absent/unreadable/malformed.
+
+    The single reader the monitor launchers (P3/P4) and the reap gate (P2)
+    consume. A missing or corrupt file is ``None`` — treated as *no live judge*,
+    which fails closed everywhere it is used (a normal prompted session, or no
+    reap signal)."""
+    try:
+        text = (run_dir / JUDGE_RECORD_NAME).read_text()
+    except (OSError, FileNotFoundError):
+        return None
+    return JudgeRecord.from_json(text)
+
+
+def operator_session_env(record: JudgeRecord) -> dict[str, str]:
+    """The operator-session env for a monitor wired to a live judge (§6.3).
+
+    Returns **exactly** ``GAUNTLET_RUN_ID`` + the judge ``URL``/``TOKEN`` and
+    **deliberately omits** ``GAUNTLET_STEP_ID`` — its *absence* is what marks the
+    operator's own session (validating §1.3): the judge classifies a
+    ``step_id``-absent caller as the operator (broad auto-allow), a
+    ``step_id``-present caller as an in-run agent (push/PR denied), purely on
+    ``step_id`` presence (FR-10). Consumers that hit the degraded (no-live-judge)
+    path set **none** of these — never partial."""
+    return {
+        RUN_ID_ENV_VAR: record.run_id,
+        URL_ENV_VAR: record.url,
+        TOKEN_ENV_VAR: record.token,
+    }
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _write_judge_record_best_effort(path: Path, record: JudgeRecord) -> None:
+    """Write ``judge.json`` atomically with mode ``0600``; never raise (FR-5.2).
+
+    Best-effort: a write failure is logged to stderr and the run proceeds — the
+    judge is up in-process regardless, so its absence on disk degrades the
+    monitor/reap helpers (which fail closed) but never blocks the run."""
+    try:
+        tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(record.to_json())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError as exc:
+        print(
+            f"gauntlet: WARNING — could not write {path} ({exc}); the judge is "
+            "up in-process but its endpoint/reap record is unavailable on disk.",
+            file=sys.stderr,
+        )
+
+
 class ManagedJudge:
     def __init__(
         self,
@@ -71,6 +227,7 @@ class ManagedJudge:
         mode: str = "unattended",
         startup_timeout_s: float = 15.0,
         repo_root: Path | None = None,
+        run_dir: Path | None = None,
     ) -> None:
         self.policy_path = policy_path
         self.audit_path = audit_path
@@ -81,6 +238,7 @@ class ManagedJudge:
         self.mode = mode
         self.startup_timeout_s = startup_timeout_s
         self.repo_root = repo_root
+        self.run_dir = run_dir
         self.token = secrets.token_urlsafe(32)
         self._proc: subprocess.Popen | None = None
         self._env_snapshot: dict[str, str | None] = {}
@@ -156,6 +314,11 @@ class ManagedJudge:
             self.host,
             "--port",
             str(self.port),
+            # Bind the judge to THIS run (FR-10.2): /decide rejects any request
+            # whose run_id does not match, so a valid-token caller for a different
+            # (or absent) run is never classified+allowed as if it were ours.
+            "--run-id",
+            self.run_id,
         ]
         if self.judge_model:
             argv += ["--judge-model", self.judge_model]
@@ -165,13 +328,66 @@ class ManagedJudge:
             # hook subprocess (which it didn't, on claude — #29). The env var
             # stays as belt-and-suspenders for the hook fallback.
             argv += ["--repo-root", str(self.repo_root)]
-        self._proc = subprocess.Popen(argv, env=child_env)
+        # Isolate the judge in its own session/process group (F-001): without
+        # this the judge inherits the driver/console process group, so the
+        # recorded ``pgid`` (``os.getpgid(pid)``) would name the driver's group
+        # and the FR-6 reaper's group-wide SIGTERM/SIGKILL could kill unrelated
+        # sibling processes. A new session makes ``pgid == pid``, so cleanup only
+        # ever signals the judge's own group (FR-6.3).
+        self._proc = subprocess.Popen(argv, env=child_env, start_new_session=True)
         self._await_healthy()
+        # The judge answered healthz: record its endpoint + reap identity for the
+        # monitor (§6.3) and the cleanup verbs (FR-6). Best-effort (FR-5.2): a
+        # write failure never blocks the run — the judge is up in-process.
+        self._write_record()
         # Snapshot prior values of every managed var so stop() restores exactly.
         self._env_snapshot = {v: os.environ.get(v) for v in _MANAGED_ENV_VARS}
         env = self.env()
         os.environ.update(env)  # the bootstrap session + child agents see it
         return env
+
+    def _record_path(self) -> Path | None:
+        return None if self.run_dir is None else self.run_dir / JUDGE_RECORD_NAME
+
+    def _write_record(self) -> None:
+        """Persist ``judge.json`` (§6.2) for the judge subprocess (FR-5.1)."""
+        path = self._record_path()
+        if path is None or self._proc is None:
+            return  # no run dir (e.g. a standalone judge) → no sidecar
+        pid = self._proc.pid
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            pgid = pid  # fall back to the pid; a non-positive pgid is fail-closed in P2
+        identity = read_process_identity(pid)
+        record = JudgeRecord(
+            pid=pid,
+            pgid=pgid,
+            proc_identity=identity.to_dict() if identity is not None else None,
+            host=socket.gethostname(),
+            port=self.port,
+            url=self.url,
+            token=self.token,
+            run_id=self.run_id,
+            started_at=_utc_stamp(),
+        )
+        _write_judge_record_best_effort(path, record)
+
+    def _remove_record(self) -> None:
+        """Remove ``judge.json`` on a clean stop (FR-5.1). Best-effort."""
+        path = self._record_path()
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(
+                f"gauntlet: WARNING — could not remove {path} ({exc}); a stale "
+                "judge record may remain for an already-stopped judge.",
+                file=sys.stderr,
+            )
 
     @staticmethod
     def _port_is_free(host: str, port: int) -> bool:
@@ -225,6 +441,10 @@ class ManagedJudge:
             self._proc.kill()
             self._proc.wait(timeout=5.0)
         self._proc = None
+        # Clean stop: the judge is down, so its sidecar must not outlive it (FR-5.1).
+        # An orphaned judge (a killed/crashed driver that never reaches stop())
+        # deliberately leaves the record behind for FR-6 reaping.
+        self._remove_record()
 
     def __enter__(self) -> ManagedJudge:
         self.start()

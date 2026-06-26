@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from typer.core import TyperCommand
 
 from gauntlet import __version__
 
@@ -18,6 +19,46 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Adversarial multi-agent development harness.",
 )
+
+# Bare `--interactive` selects this monitor agent (FR-7.1). Mirrors
+# interactive.DEFAULT_MONITOR_AGENT; a drift guard test pins them equal so the
+# normalization default below never diverges from the launcher's validator.
+_BARE_INTERACTIVE_VALUE = "claude"
+
+
+def _normalize_interactive_argv(args: list[str]) -> list[str]:
+    """Rewrite a bare ``--interactive`` token to ``--interactive=<default>``.
+
+    `--interactive[=claude|codex]` is an optional-value flag (FR-7.1): bare →
+    claude, ``--interactive=codex`` → codex. typer 0.26's vendored parser has no
+    optional-value support (a value-bearing option always demands an argument),
+    so we normalize the bare form here before the parser runs. Only an exact bare
+    ``--interactive`` token before any ``--`` separator is rewritten;
+    ``--interactive=<v>`` and tokens after ``--`` are left untouched.
+    """
+    out: list[str] = []
+    after_separator = False
+    for arg in args:
+        if not after_separator and arg == "--":
+            after_separator = True
+        elif not after_separator and arg == "--interactive":
+            out.append(f"--interactive={_BARE_INTERACTIVE_VALUE}")
+            continue
+        out.append(arg)
+    return out
+
+
+class _InteractiveCommand(TyperCommand):
+    """A typer command whose ``--interactive`` is an optional-value flag (FR-7.1).
+
+    typer 0.26's parser cannot express an option that is bare-or-valued, so this
+    subclass normalizes a bare ``--interactive`` to ``--interactive=<default>``
+    in :meth:`parse_args` before delegating to the normal parser. Everything else
+    about the command is unchanged.
+    """
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        return super().parse_args(ctx, _normalize_interactive_argv(args))
 
 judge_app = typer.Typer(no_args_is_help=True, help="Safety judge service (FR-7).")
 app.add_typer(judge_app, name="judge")
@@ -81,6 +122,49 @@ def _manager() -> "object":
     return RunManager(Path.cwd())
 
 
+def _resolve_run_instance_dir(mgr, slug: str) -> Path:
+    """Resolve <slug>'s run instance through the safe resolver (review F-002).
+
+    Validates the slug, resolves the instance via the deterministic operator
+    selection (``active-run.txt`` else lexically-greatest ``run-*``), and confirms
+    it stays under the slug dir before any caller reads or attaches to it. Raises
+    ``typer.Exit(1)`` on an unsafe slug/pointer, an unresolvable run, or an
+    instance that escapes the run tree. Shared by ``status`` and ``status
+    --interactive`` so both inherit the same FR-10.1 containment (the resolution
+    never flows through the unchecked ``active_run_dir()``).
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+
+    layout = mgr.layout(slug)
+    try:
+        safe_run_segment(slug, kind="slug")
+        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
+    except (UnsafeRunSegment, RunResolutionError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    # Containment is a two-link chain (F-002): resolving the run instance against
+    # the slug dir alone is not enough — a `runs/<slug>` symlink pointing outside
+    # the configured run_root resolves both the slug dir AND the instance to the
+    # same escaped location, so the child-of-slug check passes vacuously. Prove
+    # the slug dir is itself under the resolved run_root FIRST, then the instance
+    # under the resolved slug dir, so neither link can escape the run tree.
+    run_root = (mgr.repo_root / mgr.config.run_root).resolve()
+    slug_dir = layout.slug_dir.resolve()
+    try:
+        slug_dir.relative_to(run_root)
+        run_instance_dir.resolve().relative_to(slug_dir)
+    except ValueError as exc:
+        typer.echo(
+            f"error: resolved run instance {run_instance_dir} escapes the run "
+            f"tree for {slug!r}; refusing to read it",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+    return run_instance_dir
+
+
 def _default_policy_path() -> Path:
     """`<asset_root>/policy.yaml` from the repo config (review F-005): a fresh
     adopter keeps the policy under `.gauntlet/`, so the bare `policy.yaml` default
@@ -113,7 +197,7 @@ def new(slug: str) -> None:
     )
 
 
-@app.command()
+@app.command(cls=_InteractiveCommand)
 def run(
     slug: str,
     pipeline: str = typer.Option("standard", help="Pipeline name under pipelines/."),
@@ -140,6 +224,14 @@ def run(
         "(boot/reuse it) and print its URL before running in the foreground "
         "(FR-12.1).",
     ),
+    interactive: str = typer.Option(
+        None, "--interactive",
+        help="Launch the run DETACHED and hand the terminal to an interactive "
+        "monitor agent (bare → claude; --interactive=codex for codex). The "
+        "monitor is wired to the run's judge as the operator's own session when "
+        "the judge is live and the driver is alive, else a normal prompted "
+        "session (FR-7). Composes with --watch.",
+    ),
     console_host: str = typer.Option(
         "127.0.0.1", "--console-host", help="Console bind host for --watch.",
     ),
@@ -149,6 +241,29 @@ def run(
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
+    if interactive is not None:
+        # --interactive launches the run detached + foregrounds the monitor; the
+        # pre-allocation/handshake is owned by the launch path, so the manual
+        # --run-id/--reservation-token and --pipeline-file knobs do not apply.
+        if run_id is not None or reservation_token is not None:
+            typer.echo(
+                "error: --run-id/--reservation-token are managed automatically by "
+                "--interactive (it pre-allocates the run-id + reservation token)",
+                err=True,
+            )
+            raise typer.Exit(2)
+        if pipeline_file is not None:
+            typer.echo(
+                "error: --pipeline-file is not supported with --interactive; use "
+                "--pipeline <name>",
+                err=True,
+            )
+            raise typer.Exit(2)
+        _run_interactive(
+            mgr, slug, agent=interactive, pipeline=pipeline, no_judge=no_judge,
+            watch=watch, console_host=console_host, console_port=console_port,
+        )
+        return
     if watch:
         _ensure_watch_console(mgr, host=console_host, port=console_port)
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
@@ -157,6 +272,55 @@ def run(
         reservation_token=reservation_token,
     )
     typer.echo(f"run status: {status}")
+
+
+def _run_interactive(
+    mgr, slug: str, *, agent: str, pipeline: str, no_judge: bool, watch: bool,
+    console_host: str, console_port: int,
+) -> None:
+    """`gauntlet run <slug> --interactive`: detached run + foreground monitor (FR-7).
+
+    Validates the monitor agent BEFORE any launch (FR-7.1), optionally boots the
+    --watch console (composes), pre-allocates a run-id + single-use reservation
+    token and launches the run DETACHED via the sanctioned RunProcess handshake
+    (FR-7.2, reusing the console supervisor's launch path), then foregrounds the
+    shared monitor on that run's dir (FR-7.3). The monitor exec replaces this
+    process; the detached run keeps running.
+    """
+    from gauntlet import interactive as interactive_mod
+    from gauntlet.web.supervisor import JobSupervisor
+
+    # Unknown agent errors before any launch, naming the valid choices (FR-7.1).
+    try:
+        interactive_mod.validate_monitor_agent(agent)
+    except interactive_mod.MonitorAgentError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    if watch:
+        _ensure_watch_console(mgr, host=console_host, port=console_port)
+
+    # Pre-allocate run-id + reservation token and launch DETACHED via RunProcess
+    # (FR-7.2) — the same FR-6.1a handshake the console supervisor uses.
+    supervisor = JobSupervisor(mgr.repo_root, mgr.config)
+    rp = supervisor.launch_run(slug, pipeline=pipeline, no_judge=no_judge)
+    typer.echo(
+        f"run launched detached: {slug}/{rp.run_id} (log: {rp.log_path})"
+    )
+
+    # Foreground the operator monitor on the just-launched run (FR-7.3). This
+    # execs and replaces the process; the detached run keeps running.
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    interactive_mod.launch_monitor(
+        repo_root=repo_root,
+        run_root=run_root,
+        slug=slug,
+        run_dir=rp.run_dir,
+        agent=agent,
+        use_judge=not no_judge,
+        asset_root=mgr.config.asset_root,
+    )
 
 
 def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
@@ -192,7 +356,7 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
             typer.echo(f"GAUNTLET_WEB_TOKEN={handle.token}", err=True)
 
 
-@app.command()
+@app.command(cls=_InteractiveCommand)
 def status(
     slug: str,
     json_output: bool = typer.Option(
@@ -202,6 +366,14 @@ def status(
         "or script. Stdout is only the JSON; exits non-zero only on an actual "
         "error (a parked/failed run is a valid state, exit 0).",
     ),
+    interactive: str = typer.Option(
+        None, "--interactive",
+        help="Attach an interactive monitor agent to the EXISTING run (bare → "
+        "claude; --interactive=codex for codex). Starts no new run; foregrounds "
+        "the same monitor as `run --interactive`, wired to the run's judge as the "
+        "operator's own session when the driver is alive, else a normal prompted "
+        "session for diagnosis (FR-8).",
+    ),
 ) -> None:
     """Show the current run status for <slug> with driver liveness + next action.
 
@@ -209,36 +381,36 @@ def status(
     next action for the run's composite state. It never writes — a surviving
     recovery intent is *reported*, never finalized (FR-5.6). With ``--json`` it
     emits the same computed state as a lone, schema-stable JSON object (FR-4).
+    With ``--interactive`` it foregrounds a monitor agent attached to the run
+    instead of rendering status (FR-8); the two output modes are exclusive.
     """
     import json
 
     from gauntlet.engine import operator
     from gauntlet.engine.manifest import Manifest
-    from gauntlet.engine.operator import RunResolutionError, StatusContractError
-    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+    from gauntlet.engine.operator import StatusContractError
 
     mgr = _manager()
-    # FR-10.1 containment: the slug and the active-run pointer both flow into
-    # filesystem paths, so validate the slug, resolve the instance through the
-    # safe resolver (which validates active-run.txt), and confirm the resolved
-    # instance stays under the slug dir BEFORE reading the manifest or a
-    # recovery intent — never via the unchecked `active_run_dir()` (F-002).
-    layout = mgr.layout(slug)
-    try:
-        safe_run_segment(slug, kind="slug")
-        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
-    except (UnsafeRunSegment, RunResolutionError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    try:
-        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
-    except ValueError as exc:
-        typer.echo(
-            f"error: resolved run instance {run_instance_dir} escapes the run "
-            f"tree for {slug!r}; refusing to read it",
-            err=True,
-        )
-        raise typer.Exit(1) from exc
+    if interactive is not None:
+        # `--interactive` attaches a foreground monitor (FR-8) instead of
+        # rendering status; combining it with the `--json` machine contract is
+        # nonsensical, so reject the pair rather than silently picking one.
+        if json_output:
+            typer.echo(
+                "error: --interactive and --json are mutually exclusive; "
+                "--interactive foregrounds a monitor agent, --json emits the "
+                "machine status contract",
+                err=True,
+            )
+            raise typer.Exit(2)
+        _status_interactive(mgr, slug, agent=interactive)
+        return
+
+    # FR-10.1 containment: validate the slug, resolve the instance through the
+    # safe resolver, and confirm it stays under the slug dir BEFORE reading the
+    # manifest or a recovery intent — never via the unchecked `active_run_dir()`
+    # (F-002). Shared with `status --interactive` via `_resolve_run_instance_dir`.
+    run_instance_dir = _resolve_run_instance_dir(mgr, slug)
 
     # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
     # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
@@ -296,6 +468,75 @@ def status(
         current_step_freshness=freshness,
     ):
         typer.echo(line)
+
+
+def _status_interactive(mgr, slug: str, *, agent: str) -> None:
+    """`gauntlet status <slug> --interactive`: attach the monitor to an EXISTING run (FR-8).
+
+    Resolves the run instance with the same deterministic selection operator-aids
+    uses (``active-run.txt`` else lexically-greatest ``run-*``, via the shared safe
+    resolver); an unknown/absent run errors. Starts **no** ``RunProcess`` — the
+    run already exists — and only foregrounds the shared P3 monitor, reusing
+    ``build_monitor_command`` unchanged so the attach path inherits the exact same
+    argv/env/prompt launch contract (review F-002). Judge wiring follows
+    ``driver_liveness`` inside ``launch_monitor`` (FR-8.2): the operator-session
+    env (§6.3) only when the driver is alive **and** ``judge.json`` is readable,
+    else a normal prompted session for diagnosis (the agent can still read
+    ``status``/``logs`` and ``resume``).
+    """
+    from gauntlet import interactive as interactive_mod
+
+    # An unknown agent value errors BEFORE any resolution/launch, naming the valid
+    # choices (FR-7.1) — never half-attach to a run.
+    try:
+        interactive_mod.validate_monitor_agent(agent)
+    except interactive_mod.MonitorAgentError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    run_instance_dir = _resolve_run_instance_dir(mgr, slug)
+
+    # The resolver proves containment but not that the directory is a real run
+    # (F-001): a stale reservation or a hand-made `runs/<slug>/run-*` with no
+    # manifest would otherwise launch a monitor against a non-run, violating the
+    # FR-8.1 unknown/absent-run error contract. Load and validate the manifest
+    # with the same handling as the normal `status` path BEFORE foregrounding the
+    # agent, and confirm it is the manifest for this slug + this instance.
+    from gauntlet.engine.manifest import Manifest
+
+    try:
+        man = Manifest.load(run_instance_dir / "manifest.json")
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"error: cannot load manifest for {slug!r}: {exc}", err=True
+        )
+        raise typer.Exit(1) from exc
+    if man.slug != slug or man.run_id != run_instance_dir.name:
+        typer.echo(
+            f"error: manifest in {run_instance_dir} does not match run "
+            f"{slug}/{run_instance_dir.name} (got {man.slug}/{man.run_id}); "
+            "refusing to attach",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    # No RunProcess: the run already exists (FR-8.1). `judge_wait_s=0` — unlike
+    # `run --interactive`'s detached launch, there is no startup race to wait
+    # through: an already-running run's judge has long since written `judge.json`,
+    # so a missing record means the driver is not serving a live judge and we
+    # degrade to a prompted session at once rather than blocking the operator.
+    interactive_mod.launch_monitor(
+        repo_root=repo_root,
+        run_root=run_root,
+        slug=slug,
+        run_dir=run_instance_dir,
+        agent=agent,
+        use_judge=True,
+        asset_root=mgr.config.asset_root,
+        judge_wait_s=0.0,
+    )
 
 
 @app.command()
@@ -649,6 +890,10 @@ def judge_serve(
         None, help="Authoritative repo boundary for path checks (#31); "
         "the engine passes this so checks never depend on the agent's cwd."
     ),
+    run_id: str = typer.Option(
+        None, help="Bind the judge to this run id (FR-10.2); /decide rejects "
+        "requests whose run_id does not match. Omit for a run-agnostic dev judge."
+    ),
 ) -> None:
     """Run the localhost judge service (dev command; engine-managed in P3)."""
     from gauntlet.judge.runner import serve
@@ -662,4 +907,5 @@ def judge_serve(
         host=host,
         port=port,
         repo_root=repo_root,
+        run_id=run_id,
     )
