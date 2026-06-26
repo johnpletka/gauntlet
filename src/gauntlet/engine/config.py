@@ -142,6 +142,15 @@ class RunConfig(BaseModel):
     # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
 
+    # Live run observability (live-run-observability PRD, FR-6.1): stream each
+    # CLI agent's NDJSON stdout to events.jsonl incrementally as it arrives,
+    # instead of one buffered write at step end. Default OFF for all of v1 — the
+    # buffered path is the proven fail-closed fallback; flipping the default is a
+    # separate post-v1 decision after a soak (PRD OQ-5), never an acceptance
+    # criterion of any phase here. An omitted field deserializes to False and the
+    # flag round-trips through the same load/dump path as the gates above.
+    stream_step_output: bool = False
+
     # Cycle convergence policy (FR-10.5; ratified 2026-06-12, BOOTSTRAP-NOTES
     # #30). What forces another review round:
     #   "blocking" (default) — only open BLOCKING findings loop (to max_rounds,

@@ -1,0 +1,718 @@
+{
+  "run_id": "run-2026-06-26T03-33-24",
+  "slug": "live-run-observability",
+  "branch": "gauntlet/live-run-observability",
+  "base_branch": "main",
+  "pipeline": {
+    "name": "standard",
+    "version": 1,
+    "hash": "sha256:12f8ab6fc08dfb3aa384a00d33cc9e503869d8bb5bb090a5df3c5b65c36342f9"
+  },
+  "prompt_hashes": {
+    "policy.yaml": "sha256:7ab9abcf116138881ac19d6c9a4e1581a06d4294e0b25db591d345027851e113",
+    "prompts/review-document.md": "sha256:567770fdab66d52942954cb307465c5bc9c856a14edf1abe37fe292550e0460f",
+    "prompts/cycle-rereview.md": "sha256:de009fdee060edbdb6c90fdbe4ccfaffa037ca64befa9dabc6894045ed2c3a28",
+    "prompts/triage.md": "sha256:4d3722e71d8af633c0cbd2e2ab360eeeecc81e00e396275dfc6003b94e6e65fa",
+    "prompts/cycle-fix.md": "sha256:e2f15cb235d3add44586275bbb6e9d339e7de16b3dcba8aae64a03141df530ed",
+    "prompts/cycle-confirm.md": "sha256:27a412fc8f65fe5150df0c002b918d5aa3808050c5b7510389e9b5d7d917b02d",
+    "prompts/plan-author.md": "sha256:2667fe38d6ed210eca57e13a5ff876bbf2b9c82301731c3d8b2b44bad25abfa9",
+    "prompts/implement-phase.md": "sha256:9b69856e2e59411f49dc9213e0471c481bb74a3634500f25aa16e339fe6dc800",
+    "prompts/commit-message.md": "sha256:d40d9856ebc0b6422df7bbe69a9e62ffed8baf7ce2f6000406590d30d78ad251",
+    "prompts/review-code.md": "sha256:aaad8d5ef5b6350a77eca0a5431ddf0f88ef2b041d0466c3f8fdb5616124ed8d",
+    "prompts/retro.md": "sha256:7707598e9fd89bb06de0aabd842cd8f03e159900b7daa3773542d6cf93de3406",
+    "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
+  },
+  "status": "done",
+  "current_step": null,
+  "warnings": [],
+  "steps": [
+    {
+      "id": "prd-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T03:33:25.649792+00:00",
+      "ended": "2026-06-26T03:40:51.899354+00:00",
+      "attempts": 0,
+      "base_sha": "b71a257c46c524e2fda6c22eee3fe216fc79859b",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 69608,
+        "output_tokens": 27403,
+        "cached_input_tokens": 607984,
+        "cost_usd": 1.3567072500000004
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 6 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": null,
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 6,
+        "accepted_total": 6,
+        "accepted_resolved_total": 6,
+        "verdict_counts": {
+          "legitimate": 6
+        },
+        "confirm_counts": {
+          "resolved": 6
+        }
+      }
+    },
+    {
+      "id": "prd-approve",
+      "type": "human_gate",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T03:40:51.904261+00:00",
+      "ended": "2026-06-26T03:49:33.280784+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "approved",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-author",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "b72b1b05-8978-489f-98e8-763a246dc851",
+      "started": "2026-06-26T03:49:33.288300+00:00",
+      "ended": "2026-06-26T03:52:30.581463+00:00",
+      "attempts": 0,
+      "base_sha": "fa4552d82de922e7334bc59c83db8b54c5e4d5d9",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3010,
+        "output_tokens": 12648,
+        "cached_input_tokens": 480643,
+        "cost_usd": 1.2880924999999999
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T03:52:30.584121+00:00",
+      "ended": "2026-06-26T03:58:50.749423+00:00",
+      "attempts": 0,
+      "base_sha": "fa4552d82de922e7334bc59c83db8b54c5e4d5d9",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 67606,
+        "output_tokens": 19038,
+        "cached_input_tokens": 853492,
+        "cost_usd": 1.1454085
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 6 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": null,
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 6,
+        "accepted_total": 6,
+        "accepted_resolved_total": 6,
+        "verdict_counts": {
+          "legitimate": 6
+        },
+        "confirm_counts": {
+          "resolved": 6
+        }
+      }
+    },
+    {
+      "id": "plan-lint",
+      "type": "phase_lint",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T03:58:50.754125+00:00",
+      "ended": "2026-06-26T03:58:50.756865+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "phase lint: 4 phase(s) valid (P1, P2, P3, P4)",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-approve",
+      "type": "human_gate",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T03:58:50.758809+00:00",
+      "ended": "2026-06-26T04:04:29.728721+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "approved",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "bd3e4d91-e36d-4542-986b-37620842db7a",
+      "started": "2026-06-26T04:04:29.732925+00:00",
+      "ended": "2026-06-26T04:13:56.894754+00:00",
+      "attempts": 0,
+      "base_sha": "5553de2eaa0d3f289b371ab66d65070e5ea47a9d",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 2892,
+        "output_tokens": 36054,
+        "cached_input_tokens": 874983,
+        "cost_usd": 2.1157194999999995
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:13:56.899197+00:00",
+      "ended": "2026-06-26T04:15:16.574167+00:00",
+      "attempts": 0,
+      "base_sha": "5553de2eaa0d3f289b371ab66d65070e5ea47a9d",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:15:16.576273+00:00",
+      "ended": "2026-06-26T04:15:35.083241+00:00",
+      "attempts": 0,
+      "base_sha": "5553de2eaa0d3f289b371ab66d65070e5ea47a9d",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3418,
+        "output_tokens": 1709,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.0042725
+      },
+      "notes": "committed 6246867793",
+      "iteration": "0",
+      "metrics": {}
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:15:35.086096+00:00",
+      "ended": "2026-06-26T04:24:12.838533+00:00",
+      "attempts": 0,
+      "base_sha": "6246867793fec37893eebfc61e702d4efa3fb9d6",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 488983,
+        "output_tokens": 27468,
+        "cached_input_tokens": 801981,
+        "cost_usd": 1.1612557500000003
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": "0",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 2,
+        "accepted_total": 2,
+        "accepted_resolved_total": 2,
+        "verdict_counts": {
+          "legitimate": 2
+        },
+        "confirm_counts": {
+          "resolved": 2
+        }
+      }
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "c14aad46-9712-4c67-b351-16f6fd59d5af",
+      "started": "2026-06-26T04:24:12.841126+00:00",
+      "ended": "2026-06-26T04:40:29.276050+00:00",
+      "attempts": 0,
+      "base_sha": "cf21dfd1a1d5bd6a82ebb48568a112c06be2f5ae",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 12004,
+        "output_tokens": 65202,
+        "cached_input_tokens": 7467116,
+        "cost_usd": 9.338067000000002
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "1",
+      "metrics": {}
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:40:29.280675+00:00",
+      "ended": "2026-06-26T04:41:50.290582+00:00",
+      "attempts": 0,
+      "base_sha": "cf21dfd1a1d5bd6a82ebb48568a112c06be2f5ae",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "1",
+      "metrics": {}
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:41:50.293103+00:00",
+      "ended": "2026-06-26T04:42:10.363789+00:00",
+      "attempts": 0,
+      "base_sha": "cf21dfd1a1d5bd6a82ebb48568a112c06be2f5ae",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 5378,
+        "output_tokens": 1902,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.005148499999999999
+      },
+      "notes": "committed 79751c4bdf",
+      "iteration": "1",
+      "metrics": {}
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T04:42:10.367188+00:00",
+      "ended": "2026-06-26T13:31:59.531247+00:00",
+      "attempts": 1,
+      "base_sha": "79751c4bdf3728c73cfdefbb12de4e05c787ad5b",
+      "parked_reason": null,
+      "human_responses": [
+        {
+          "response_id": "impl-cycle-resp-1",
+          "response_text": "The previous review attempt failed before producing any findings due to a transient Codex CLI usage-limit crash — infrastructure, not a review outcome. There is no prior finding or human reclassification to apply. Run the P2 (impl-cycle) code review normally and from scratch.",
+          "timestamp": "2026-06-26T13:24:49.342002+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "consumed"
+        }
+      ],
+      "usage": {
+        "input_tokens": 602988,
+        "output_tokens": 17918,
+        "cached_input_tokens": 1389214,
+        "cost_usd": 1.2524365
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": "1",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 1,
+        "accepted_total": 1,
+        "accepted_resolved_total": 1,
+        "verdict_counts": {
+          "legitimate": 1
+        },
+        "confirm_counts": {
+          "resolved": 1
+        }
+      }
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "5ab17d8d-79cc-47fe-9be3-a9876f3e44e8",
+      "started": "2026-06-26T13:31:59.616550+00:00",
+      "ended": "2026-06-26T13:43:02.442363+00:00",
+      "attempts": 0,
+      "base_sha": "e04c0cb592092d8e201e57c94b30167768782767",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 4390,
+        "output_tokens": 38352,
+        "cached_input_tokens": 2158245,
+        "cost_usd": 3.0388234999999995
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "2",
+      "metrics": {}
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T13:43:02.447821+00:00",
+      "ended": "2026-06-26T13:44:27.407665+00:00",
+      "attempts": 0,
+      "base_sha": "e04c0cb592092d8e201e57c94b30167768782767",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "2",
+      "metrics": {}
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T13:44:27.410095+00:00",
+      "ended": "2026-06-26T13:44:47.084622+00:00",
+      "attempts": 0,
+      "base_sha": "e04c0cb592092d8e201e57c94b30167768782767",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3192,
+        "output_tokens": 1717,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.004232
+      },
+      "notes": "committed 417e4b5fdb",
+      "iteration": "2",
+      "metrics": {}
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T13:44:47.087465+00:00",
+      "ended": "2026-06-26T14:01:56.766073+00:00",
+      "attempts": 0,
+      "base_sha": "417e4b5fdbaa651fd6a9928a97dc51386d3c8b6c",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 1268413,
+        "output_tokens": 46456,
+        "cached_input_tokens": 2470409,
+        "cost_usd": 2.4807444999999997
+      },
+      "notes": "converged in round 2 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": "2",
+      "metrics": {
+        "rounds": 2,
+        "findings_total": 3,
+        "accepted_total": 3,
+        "accepted_resolved_total": 2,
+        "verdict_counts": {
+          "legitimate": 3
+        },
+        "confirm_counts": {
+          "partially_resolved": 1,
+          "resolved": 2
+        }
+      }
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "cd3897e4-7a60-471a-b71c-82a39d48135d",
+      "started": "2026-06-26T14:01:56.774647+00:00",
+      "ended": "2026-06-26T14:12:00.560104+00:00",
+      "attempts": 0,
+      "base_sha": "595e4043a1ab1832ae515c4fda377b768f235ffd",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3442,
+        "output_tokens": 35617,
+        "cached_input_tokens": 3350261,
+        "cost_usd": 4.196074499999999
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "3",
+      "metrics": {}
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T14:12:00.565854+00:00",
+      "ended": "2026-06-26T14:13:22.829665+00:00",
+      "attempts": 0,
+      "base_sha": "595e4043a1ab1832ae515c4fda377b768f235ffd",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "3",
+      "metrics": {}
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T14:13:22.832320+00:00",
+      "ended": "2026-06-26T14:13:38.313126+00:00",
+      "attempts": 0,
+      "base_sha": "595e4043a1ab1832ae515c4fda377b768f235ffd",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3171,
+        "output_tokens": 1309,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.0034107499999999997
+      },
+      "notes": "committed b89d478aed",
+      "iteration": "3",
+      "metrics": {}
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T14:13:38.315612+00:00",
+      "ended": "2026-06-26T14:32:26.671911+00:00",
+      "attempts": 0,
+      "base_sha": "b89d478aed9a390fd076c6acff2e187faffbd2cc",
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 1182996,
+        "output_tokens": 59235,
+        "cached_input_tokens": 3649685,
+        "cost_usd": 3.470451
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 1 non-blocking item(s) surfaced for the gate: NEW",
+      "iteration": "3",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 2,
+        "accepted_total": 2,
+        "accepted_resolved_total": 1,
+        "verdict_counts": {
+          "legitimate": 2
+        },
+        "confirm_counts": {
+          "resolved": 1,
+          "partially_resolved": 1
+        }
+      }
+    },
+    {
+      "id": "retrospective",
+      "type": "retrospective",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-26T14:32:26.682763+00:00",
+      "ended": "2026-06-26T14:34:26.699646+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 49034,
+        "output_tokens": 7733,
+        "cached_input_tokens": 21181,
+        "cost_usd": 0.2175805
+      },
+      "notes": "retrospective: 2 self-critique(s); 3 proposal(s) generated, 0 applyable",
+      "iteration": null,
+      "metrics": {
+        "retro_agents": 2,
+        "proposals_generated": 3,
+        "proposals_valid": 0
+      }
+    }
+  ],
+  "commits": [
+    {
+      "step_id": "prd-cycle",
+      "phase": "PRD.1",
+      "sha": "fa4552d82de922e7334bc59c83db8b54c5e4d5d9"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN",
+      "sha": "dab3217ec277a36a9fa5a65db5907190ebf13ec0"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN.1",
+      "sha": "5553de2eaa0d3f289b371ab66d65070e5ea47a9d"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P1",
+      "sha": "6246867793fec37893eebfc61e702d4efa3fb9d6"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P1.1",
+      "sha": "cf21dfd1a1d5bd6a82ebb48568a112c06be2f5ae"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P2",
+      "sha": "79751c4bdf3728c73cfdefbb12de4e05c787ad5b"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P2.1",
+      "sha": "84933069f3980a69b8acc13ab3d8bc49f8b4ab83"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P3",
+      "sha": "417e4b5fdbaa651fd6a9928a97dc51386d3c8b6c"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P3.1",
+      "sha": "f0b66160e0048294b5de98ddafd8cf39c67c027c"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P3.2",
+      "sha": "595e4043a1ab1832ae515c4fda377b768f235ffd"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P4",
+      "sha": "b89d478aed9a390fd076c6acff2e187faffbd2cc"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P4.1",
+      "sha": "c103a495f772d15bd60b2f4a5cc6784e59017d68"
+    }
+  ],
+  "totals": {
+    "input_tokens": 3961679,
+    "output_tokens": 434402,
+    "cached_input_tokens": 24125194,
+    "cost_usd": 31.195495250000004
+  },
+  "agent_usage": {
+    "reviewer": {
+      "input_tokens": 3627989,
+      "output_tokens": 37942,
+      "cached_input_tokens": 2932992,
+      "cost_usd": null
+    },
+    "triage": {
+      "input_tokens": 78531,
+      "output_tokens": 18460,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.05655275
+    },
+    "escalation": {
+      "input_tokens": 13916,
+      "output_tokens": 5675,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.07011300000000001
+    },
+    "builder": {
+      "input_tokens": 50089,
+      "output_tokens": 337684,
+      "cached_input_tokens": 21192202,
+      "cost_usd": 30.951759
+    },
+    "judge_llm": {
+      "input_tokens": 191154,
+      "output_tokens": 34641,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.1170705
+    }
+  },
+  "recoveries": []
+}

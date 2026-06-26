@@ -433,6 +433,8 @@ def _run_sub(
     failure — so the reviewer-mutation guard can never be skipped by an error
     path or hand a dirty tree to a retry.
     """
+    from gauntlet.engine.steptypes import open_step_stream
+
     adapter = ctx.build_adapter(agent_name)
     timeout = None
     if agent_name in ctx.config.agents:
@@ -443,8 +445,17 @@ def _run_sub(
     attempt_prompt = prompt
     last_exc: MalformedOutputError | None = None
     for attempt in range(1, 2 + max_retries):
+        # Live-observability streaming (live-run-observability FR-2): open a
+        # fresh stream per attempt (open_stream truncates), so events.jsonl
+        # reflects the current attempt; a failed attempt's authoritative evidence
+        # is kept separately by _log_partial (suffixed). sink is threaded ONLY
+        # when streaming — the buffered call shape is untouched (FR-6.1).
+        stream = open_step_stream(ctx, adapter, logger)
+        run_kwargs: dict = {"schema": schema, "cwd": ctx.repo_root}
+        if stream is not None:
+            run_kwargs["sink"] = stream.append_line
         try:
-            result = adapter.run(attempt_prompt, schema=schema, cwd=ctx.repo_root)
+            result = adapter.run(attempt_prompt, **run_kwargs)
         except MalformedOutputError as exc:
             _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
@@ -463,6 +474,11 @@ def _run_sub(
             if after_attempt is not None:
                 after_attempt()
             raise
+        finally:
+            # Close the per-attempt stream regardless of outcome (a StreamSinkError
+            # propagating here still fails the step closed via the orchestrator).
+            if stream is not None:
+                stream.close()
         logger.log_result(result, structured_name=structured_name)
         usage.add(result.usage, agent=agent_name)  # per-profile split (FR-3.2)
         if after_attempt is not None:

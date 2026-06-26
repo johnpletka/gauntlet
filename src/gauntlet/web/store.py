@@ -778,22 +778,21 @@ def _read_chunk(path: Path, name: str, offset: int, max_bytes: int) -> LogChunk:
     Bytes before ``offset`` are never returned, so a client re-requesting with
     ``from=<prior end>`` sees only appended bytes. If ``offset`` is past EOF
     (rotation/truncation) ``start`` resets to 0 so the client re-syncs.
+
+    Delegates the offset framing to :func:`operator.read_log_chunk` so the
+    console SSE tail and ``gauntlet logs --follow`` read identically (plan P3,
+    "so CLI and console agree"). Lazy-imported to avoid any import-time coupling.
     """
-    size = path.stat().st_size
-    start = max(0, offset)
-    if start > size:  # the file shrank under us → resync from the top
-        start = 0
-    with path.open("rb") as fh:
-        fh.seek(start)
-        raw = fh.read(max_bytes)
-    end = start + len(raw)
+    from gauntlet.engine.operator import read_log_chunk
+
+    chunk = read_log_chunk(path, offset, max_bytes)
     return LogChunk(
         name=name,
-        start=start,
-        end=end,
-        size=size,
-        eof=end >= size,
-        text=raw.decode("utf-8", errors="replace"),
+        start=chunk.start,
+        end=chunk.end,
+        size=chunk.size,
+        eof=chunk.end >= chunk.size,
+        text=chunk.text,
     )
 
 

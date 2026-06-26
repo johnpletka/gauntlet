@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,20 @@ DEFAULT_TIMEOUT_S = 600.0
 
 class CodexAdapter:
     name = "codex"
+    # Live-streaming qualification (live-run-observability FR-2.7/FR-2.8). `codex
+    # exec --json` is *expected* to be message-granular NDJSON — one whole JSON
+    # event per line — which would make a sensitive value land wholly inside a
+    # single newline-framed line (the per-line redaction unit). But the
+    # qualification gate is fail-closed: this flag may be flipped to True ONLY
+    # after a fixture-based containment test (FR-2.7) exercises this adapter's
+    # *real* `codex exec --json` framing — pinned captured raw streams from the
+    # verified CLI version — with a planted secret AND a split-secret negative
+    # case (FR-2.8). The current P2 suite proves only the synthetic streaming
+    # double, not the live CLI contract, so this adapter is NOT yet qualified and
+    # must stay False: streams_to_sink() returns False and the buffered path is
+    # used, closing the fail-open secret-splitting case the carryover redactor
+    # (deferred) would otherwise be needed to catch.
+    supports_line_streaming = False
     capabilities = AdapterCapabilities(
         repo_write=True, structured_output="native", resume=True
     )
@@ -56,6 +71,14 @@ class CodexAdapter:
         self.base_flags = list(base_flags or [])
         lint_flags(self._build_argv(session=None, schema_path=None, output_path=None))
 
+    def streams_to_sink(self) -> bool:
+        """Whether a provided line ``sink`` is used (live-run-observability
+        FR-2.7/FR-2.8). `codex exec --json` is always message-granular NDJSON, so
+        the only gate is :attr:`supports_line_streaming` — an unqualified adapter
+        falls back to the buffered path rather than risk a value split across
+        events (FR-2.8)."""
+        return self.supports_line_streaming
+
     def run(
         self,
         prompt: str,
@@ -64,6 +87,7 @@ class CodexAdapter:
         schema: dict | None = None,
         cwd: Path | None = None,
         extra_flags: list[str] | None = None,
+        sink: Callable[[str], None] | None = None,
     ) -> AgentResult:
         with tempfile.TemporaryDirectory(prefix="gauntlet-codex-") as tmp:
             schema_path: Path | None = None
@@ -77,8 +101,14 @@ class CodexAdapter:
             argv += extra_flags or []
             argv.append("-")  # prompt on stdin
             lint_flags(argv)
+            # Stream only when a sink is provided AND this adapter is qualified
+            # (FR-2.7/FR-2.8); otherwise pass None and the buffered path runs.
+            effective_sink = (
+                sink if (sink is not None and self.streams_to_sink()) else None
+            )
             out = run_with_timeout(
-                argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd
+                argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
+                sink=effective_sink,
             )
             last_message = (
                 output_path.read_text() if output_path.exists() else None

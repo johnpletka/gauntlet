@@ -30,6 +30,8 @@ import json
 import os
 import re
 import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +44,7 @@ from gauntlet.engine.run import (
     _LockRecord,
     safe_run_segment,
 )
+from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
 from gauntlet.procident import ProcessIdentity, read_process_identity
 
 # --- liveness values (FR-2.4) ------------------------------------------------
@@ -731,6 +734,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "parked",
     "failure",
     "reconciliation",
+    "current_step_freshness",
     "steps",
     "next_actions"
   ],
@@ -861,6 +865,18 @@ _STATUS_SCHEMA_JSON = r'''{
         "recommended_command": {
           "type": "string",
           "description": "Human-display command that finalizes the intent (e.g. `gauntlet recover <slug>`); for display only, never executed."
+        }
+      }
+    },
+    "current_step_freshness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["last_event_age_s"],
+      "description": "Advisory freshness for a running, streamed step (live-run-observability FR-5): the age in seconds of the newest streamed event (now - mtime of the step's events.jsonl). The OBJECT is the nullable unit: null for a non-streamed/not-applicable step or the pre-first-event window (events.jsonl absent or empty); when present, last_event_age_s is ALWAYS a number, never null. There is no top-level last_event_age_s. Drives no gate and no automatic action (FR-5.2).",
+      "properties": {
+        "last_event_age_s": {
+          "type": "number",
+          "description": "Age in seconds of the newest streamed event (now - mtime of the current step's events.jsonl). Always a number when the object is present."
         }
       }
     },
@@ -1040,6 +1056,7 @@ def status_payload(
     *,
     run_root: Path,
     run_instance_dir: Path,
+    current_step_freshness: float | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -1050,6 +1067,15 @@ def status_payload(
     applicable (§6.1). A malformed/unreadable surviving intent surfaces as a
     human-footer anomaly, never here — the caller passes ``reconciliation=None``
     in that case, so ``--json`` never fabricates an ``intent_step_id``.
+
+    ``current_step_freshness`` is the advisory age (seconds) of the newest
+    streamed event for a running, streamed step (live-run-observability FR-5),
+    computed by the I/O-bearing :func:`compute_current_step_freshness` in the
+    caller and threaded in here so this serializer stays pure. ``None`` (a
+    non-streamed / not-applicable step, or the pre-first-event window) renders as
+    ``current_step_freshness: null``; a number renders as the nested object
+    ``{ "last_event_age_s": <number> }`` — the **object** is the nullable unit,
+    never a top-level ``last_event_age_s`` (§6.1).
 
     The completed object is validated against the committed §6.1 schema before it
     is returned (F-003): unconstrained persisted inputs (e.g. an out-of-enum
@@ -1094,6 +1120,11 @@ def status_payload(
         "reconciliation": (
             reconciliation.to_dict() if reconciliation is not None else None
         ),
+        "current_step_freshness": (
+            {"last_event_age_s": current_step_freshness}
+            if current_step_freshness is not None
+            else None
+        ),
         "steps": [
             {
                 "id": rec.id,
@@ -1112,6 +1143,101 @@ def status_payload(
 TRANSCRIPT_TAIL_LINES = 200  # FR-3.1b — normative default tail for v1
 _TRANSCRIPT_NAME = "transcript.md"
 _EVENTS_NAME = "events.jsonl"
+
+
+# --- advisory freshness signal (live-run-observability FR-5) -----------------
+def compute_current_step_freshness(
+    man: Manifest,
+    run_instance_dir: Path,
+    *,
+    streaming: bool,
+    now: float | None = None,
+) -> float | None:
+    """Age (seconds) of the newest streamed event for a running, streamed step.
+
+    The single I/O point behind the §6.1 ``current_step_freshness`` field
+    (FR-5.1). It lives in the status-computation path (not in the pure
+    :func:`status_payload`) and its result is threaded into that serializer. The
+    value is ``now − mtime`` of the current step's ``events.jsonl`` — the live
+    file's last-append time — requiring **no** event-body parse (matching the §6
+    note that a freshness read must never block persistence).
+
+    Returns ``None`` (→ ``current_step_freshness: null``) unless **all** hold:
+
+    * the run is streaming (``streaming`` — the ``stream_step_output`` flag); a
+      non-streamed run is always ``null``;
+    * the manifest ``run_status`` is ``running`` (the only "running step" window;
+      a parked/failed/done run has no streaming step);
+    * a default (running) step resolves, and its rendered id is a single safe
+      path segment that resolves to an ``events.jsonl`` **contained under the run
+      instance** — a corrupt manifest id (separator / ``..`` / absolute / NUL) or
+      a symlinked leaf that would escape the run tree raises
+      :class:`StatusContractError` (fail closed, F-001), never a silent ``null``
+      or an uncaught ``ValueError``;
+    * a per-line stream is **open** for that step now — its live-stream sidecar
+      marker (written by :meth:`StepLogger.open_stream`, removed by
+      :meth:`StepStream.close`) is present. A non-empty ``events.jsonl`` from a
+      *buffered* adapter (no stream opened) or a *prior/killed* attempt has no
+      open marker and stays ``null`` — never misreported as current progress
+      (F-002);
+    * that step's ``events.jsonl`` **exists and is non-empty** — a single
+      ``stat`` does both checks. The pre-first-event window (file absent, i.e.
+      ``FileNotFoundError`` / any ``OSError``, or zero bytes) is ``null`` — never
+      ``0``, never a surfaced stat error, never an age off the file's
+      create/open time. Only once ≥1 line has been appended does a number land.
+
+    A negative result from clock skew (mtime slightly ahead of ``now``) is
+    clamped to ``0.0`` so the advisory value is never a nonsensical negative.
+    Freshness drives no gate and no automatic action (FR-5.2)."""
+    if not streaming or man.status != M.RUN_RUNNING:
+        return None
+    rec = select_default_step(man)
+    if rec is None:
+        return None
+    # FR-10.1 containment (F-001): the step id flows straight into a filesystem
+    # path (``steps/<leaf>/...``); a corrupt manifest whose id carries a
+    # separator, ``.``/``..``, an absolute path, or a NUL must fail CLOSED before
+    # any stat — never stat an out-of-tree ``events.jsonl``, and never raise an
+    # uncaught ``ValueError`` (a NUL byte makes ``Path.stat`` raise ``ValueError``,
+    # which the ``except OSError`` below would NOT catch). Mirrors the same guard
+    # in :func:`_evidence_path`.
+    try:
+        safe_run_segment(render_step_id(rec), kind="step id")
+    except UnsafeRunSegment as exc:
+        raise StatusContractError(str(exc)) from exc
+    # Resolve the active transcript leaf the same way `logs`/`--follow` and the
+    # console tail do (metadata-driven, never mtime), so the freshness signal is
+    # the age of exactly the file those surfaces stream.
+    events_path = resolve_transcript_dir(run_instance_dir, rec) / _EVENTS_NAME
+    # Defense in depth (F-001): the fully-resolved events path must stay
+    # contained under the selected run instance. ``resolve_transcript_dir`` only
+    # appends internally-derived leaves, but a symlinked leaf or any other escape
+    # is a contract violation — fail closed rather than stat outside the tree.
+    try:
+        events_path.resolve().relative_to(run_instance_dir.resolve())
+    except ValueError as exc:
+        raise StatusContractError(
+            f"freshness events path {events_path} escapes run instance "
+            f"{run_instance_dir}"
+        ) from exc
+    # A per-line stream must be OPEN for this step right now (F-002):
+    # ``StepLogger.open_stream`` writes this sidecar marker next to the live file
+    # and ``close()`` removes it. Requiring it keeps a non-empty ``events.jsonl``
+    # left by a *buffered* adapter (no stream opened this invocation) or by a
+    # *prior/killed* attempt from being misreported as current streamed progress
+    # — freshness stays ``null`` until the CURRENT stream has appended a line.
+    marker_path = events_path.parent / (events_path.name + STREAM_MARKER_SUFFIX)
+    if not marker_path.exists():
+        return None  # no live stream open for this step → not current progress
+    try:
+        st = events_path.stat()
+    except OSError:
+        return None  # absent / unreadable → pre-first-event window, fail to null
+    if st.st_size <= 0:
+        return None  # established but empty → no event yet
+    if now is None:
+        now = time.time()
+    return max(0.0, now - st.st_mtime)
 
 
 class LogsError(RuntimeError):
@@ -1351,6 +1477,206 @@ def resolve_logs(
     )
 
 
+# --- `gauntlet logs --follow`: offset-tail the live step (FR-3) --------------
+DEFAULT_FOLLOW_INTERVAL_S = 1.0  # poll cadence; mirrors the console SSE tail
+# Cap a single read so one poll never pulls an unbounded log into memory; the
+# poll loop drains repeatedly to EOF, so this is a window size, not a ceiling.
+# Matches the console's ``store.DEFAULT_LOG_MAX_BYTES`` so CLI and console agree.
+FOLLOW_MAX_BYTES = 256 * 1024
+
+
+@dataclass
+class LogChunkBytes:
+    """A byte-offset slice of a log file — the shared offset-tail unit.
+
+    ``text`` is the bytes in ``[start, end)`` decoded ``utf-8``/``replace``.
+    ``end >= size`` means the read reached EOF. The console SSE tail
+    (``store._read_chunk``) and ``gauntlet logs --follow`` both read through
+    :func:`read_log_chunk`, so the two surfaces frame identically (plan P3).
+    """
+
+    text: str
+    start: int
+    end: int
+    size: int
+
+
+def read_log_chunk(path: Path, offset: int, max_bytes: int) -> LogChunkBytes:
+    """Read the bytes of ``path`` after ``offset`` (up to ``max_bytes``).
+
+    Bytes before ``offset`` are never returned, so a caller re-reading with
+    ``offset=<prior end>`` sees only appended bytes. If ``offset`` is past EOF
+    (rotation/truncation) ``start`` resets to ``0`` so the reader re-syncs rather
+    than reading garbage — identical semantics to the console's
+    ``store._read_chunk``. The file must exist; ``--follow`` guards the
+    not-yet-created window itself before calling.
+
+    Containment and read operate on a *single* opened object (F-001): the file
+    is opened once with ``O_NOFOLLOW`` and then ``fstat``/``read`` go through that
+    one descriptor. A caller validates the path's containment (e.g. ``--follow``
+    via :func:`_resolve_under`) and then calls here; opening on the same path with
+    a separate ``stat``/``open`` would leave a symlink-swap TOCTOU window — a leaf
+    swapped to an escaping symlink between the check and the open could redirect
+    the tail out of the run tree. ``O_NOFOLLOW`` refuses a symlink leaf at open
+    (``OSError``/``ELOOP``, fail-closed; FR-3.3), and ``fstat`` reads the same
+    inode the open returned, so there is no second path lookup to race.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        start = max(0, offset)
+        if start > size:  # the file shrank under us → resync from the top
+            start = 0
+        fh.seek(start)
+        raw = fh.read(max_bytes)
+    end = start + len(raw)
+    return LogChunkBytes(
+        text=raw.decode("utf-8", errors="replace"), start=start, end=end, size=size
+    )
+
+
+@dataclass
+class FollowResult:
+    """Outcome of a ``gauntlet logs --follow`` session (read-only, FR-3)."""
+
+    step_id: str  # rendered id of the followed step
+    final_status: str  # the step's last-observed manifest status
+    followed: bool  # True iff the live poll loop ran (step was `running`)
+    interrupted: bool  # True iff stopped by SIGINT (KeyboardInterrupt)
+
+
+def _reload_step_status(manifest_path: Path, step_id: str) -> str | None:
+    """Re-read the manifest and return the rendered ``step_id``'s status.
+
+    Raises :class:`LogsError` if the manifest is absent/unreadable/invalid. The
+    manifest is published atomically (``os.replace``), so a reader never sees a
+    torn write — a failed load is a genuine integrity problem, not a transient
+    race. Mapping such a failure to ``running`` would let ``--follow`` poll a
+    corrupt manifest forever and never observe the step end; instead we fail
+    closed and surface the error (fail-closed principle; FR-3.1). Returns
+    ``None`` only when the manifest loads cleanly but the step id is gone — a
+    distinct case the caller may ride out as a transient miss.
+    """
+    try:
+        man = Manifest.load(manifest_path)
+    except (OSError, ValueError) as exc:
+        raise LogsError(f"cannot reload manifest {manifest_path}: {exc}") from exc
+    for rec in man.steps:
+        if render_step_id(rec) == step_id:
+            return rec.status
+    return None
+
+
+def follow_logs(
+    run_root: Path,
+    slug_dir: Path,
+    slug: str,
+    *,
+    step: str | None = None,
+    emit: Callable[[str], None],
+    sleep: Callable[[float], None] = time.sleep,
+    interval: float = DEFAULT_FOLLOW_INTERVAL_S,
+    max_bytes: int = FOLLOW_MAX_BYTES,
+    max_polls: int | None = None,
+) -> FollowResult:
+    """Tail the current step's ``events.jsonl`` until it ends (FR-3.1/3.2/3.3).
+
+    Resolves the step through the same read-only, contained
+    :func:`resolve_logs` path (so traversal in ``slug``/``--step`` is refused and
+    only redacted on-disk bytes are ever read — never the raw pipe), then:
+
+    - while the step's manifest status is ``running``, polls ``events.jsonl`` and
+      ``emit``s appended bytes every ``interval`` seconds;
+    - **reads the status before draining each tick and only stops *after* the
+      drain** — so the iteration in which terminal status is first observed still
+      drains to EOF, capturing bytes flushed in the window the status flipped
+      (no dropped tail; the step's sink is closed before its status goes
+      terminal, so every byte is on disk by then);
+    - if the step is **not** ``running`` at entry (already finished, or not yet
+      started), this degrades to a single one-shot dump + exit — no hang
+      (FR-3.2);
+    - on SIGINT (``KeyboardInterrupt``) it stops cleanly with
+      ``interrupted=True``.
+
+    ``sleep``/``max_polls`` are injectable so a test can drive the loop to a
+    deterministic end. ``emit`` receives raw appended text (it already carries
+    the per-event newlines); the caller writes it without adding any.
+    """
+    # Resolve once for containment + the events path + the step identity; the
+    # transcript tail it also reads is unused here (cheap, one-time).
+    resolved = resolve_logs(run_root, slug_dir, slug, step=step)
+    events_path = resolved.events_path
+    step_id = resolved.step_id
+    manifest_path = resolved.run_instance_dir / "manifest.json"
+    # The resolved run dir — the containment ancestor `events_path` must stay
+    # under (matches the `label="events"` check in `resolve_logs`). Revalidated
+    # before every read below, not just at resolve.
+    run_dir_real = _resolve_under(slug_dir, run_root.resolve(), label="run dir")
+
+    def _drain_to_eof(offset: int) -> int:
+        """Emit every byte from ``offset`` to current EOF; return the new offset.
+
+        Loops so a large backlog (or a one-shot dump of a finished step) is
+        flushed in full, not one window per poll. An absent file (a `running`
+        step that has not written its first line yet) is a no-op — the live tail
+        simply has nothing to show until the producer creates it (§P4 baseline).
+
+        Containment is re-checked immediately before each read: the live file
+        can be created or replaced between polls, so a one-time resolve is a
+        TOCTOU hole — a symlink swapped in after resolve would redirect the tail
+        out of the run tree. `_resolve_under` follows the leaf symlink and fails
+        closed (:class:`LogsError`) if the target escapes; a not-yet-created
+        file resolves to its in-tree path and passes (FR-3.3). The remaining
+        window between that check and the open is closed inside
+        :func:`read_log_chunk`, which opens with `O_NOFOLLOW` and stats/reads the
+        same descriptor — so a leaf swapped to an escaping symlink *after*
+        `_resolve_under` passes but *before* the open is refused at open (its
+        `OSError` is caught here as a no-op; the next poll's `_resolve_under`
+        then surfaces it as a `LogsError`). Either way the out-of-tree target is
+        never read (F-001).
+        """
+        while True:
+            _resolve_under(events_path, run_dir_real, label="events")
+            try:
+                chunk = read_log_chunk(events_path, offset, max_bytes)
+            except (FileNotFoundError, OSError):
+                return offset
+            if chunk.text:
+                emit(chunk.text)
+            offset = chunk.end
+            if chunk.end >= chunk.size:
+                return offset
+
+    offset = 0
+    followed = False
+    interrupted = False
+    status = _reload_step_status(manifest_path, step_id) or resolved.step_status
+    polls = 0
+    try:
+        first = True
+        while max_polls is None or polls < max_polls:
+            polls += 1
+            if not first:
+                sleep(interval)
+                status = _reload_step_status(manifest_path, step_id) or M.RUNNING
+            first = False
+            # Read status *before* draining, stop *after*: the terminal-status
+            # iteration still drains to EOF (final drain — no dropped tail).
+            offset = _drain_to_eof(offset)
+            if status != M.RUNNING:
+                break
+            followed = True
+    except KeyboardInterrupt:  # SIGINT → clean stop (FR-3.1)
+        interrupted = True
+
+    return FollowResult(
+        step_id=step_id,
+        final_status=status,
+        followed=followed,
+        interrupted=interrupted,
+    )
+
+
 # --- human footer rendering (FR-1.1/FR-1.2) ----------------------------------
 def render_footer(
     driver: DriverInfo,
@@ -1358,11 +1684,17 @@ def render_footer(
     *,
     reconciliation: Reconciliation | None = None,
     anomaly: str | None = None,
+    current_step_freshness: float | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
     Each action renders as ``  $ <command>`` so the footer's commands are
     exactly the ``command`` fields of ``rstate.next_actions`` (FR-1.2 lockstep).
+
+    When ``current_step_freshness`` is a number (a running, streamed step with
+    ≥1 streamed event), a single advisory line reports the age of the newest
+    event (live-run-observability FR-5). ``None`` (a non-streamed/not-applicable
+    step) adds no line, so the footer is unchanged for every existing run.
     """
     lines: list[str] = []
     if driver.state == LIVENESS_NONE:
@@ -1379,6 +1711,12 @@ def render_footer(
         lines.append(f"driver: {driver.state}{suffix}")
 
     lines.append(f"state: {rstate.state} — {_MEANING.get(rstate.state, '')}")
+
+    if current_step_freshness is not None:
+        lines.append(
+            f"freshness: last streamed event {current_step_freshness:.1f}s ago "
+            "(advisory — drives no action)"
+        )
 
     # A lingering lock under a terminal/parked run is harmless residue (§6.3 P2).
     if (
