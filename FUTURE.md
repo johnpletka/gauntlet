@@ -10,7 +10,7 @@ so a partial fix accepted at a gate is tracked, not forgotten.
 - **F-002 [latent, deferred] — `on_fail` on a response-consuming step can strip
   the disposition gate / drop the route.** A `--response` failure is finalized
   FAILED *and* the pending response is flipped to `consumed` in the same atomic
-  transaction; `_is_consumed_terminal_failure` then makes that record terminal on
+  transaction; `_is_terminal_failure` then makes that record terminal on
   recovery (the P3-era F-002 fix, to avoid double-counting). Two interactions
   follow IF a response-consuming `agent_task` *also* carries `on_fail`: (a) an
   in-invocation retry re-runs with the response already consumed, so

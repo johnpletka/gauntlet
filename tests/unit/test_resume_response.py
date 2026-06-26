@@ -552,6 +552,47 @@ def test_consumed_failure_is_not_reexecuted_on_resume(tmp_path):
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
 
 
+def test_responseless_terminal_failure_not_reexecuted_on_resume(tmp_path):
+    # FR-9.3 / review F-002: a step with NO on_fail policy and NO pending
+    # --response that FAILED is terminal — there is no re-entry path. A plain
+    # (response-less) resume must surface the failure and reconcile bookkeeping
+    # only, NEVER re-invoke the adapter. Re-running it would double-count the
+    # failure (FR-6) and rewrite the terminal `failed` state — with its `ended`
+    # timestamp still set — back to `running`, leaving a dirty/contradictory
+    # manifest at the reviewer handoff (the clean-committed-worktree invariant).
+    # This is the response-less analogue of the consumed-failure guard above, and
+    # the exact shape an `adversarial_cycle` (no on_fail) takes when its fixer
+    # makes no changes and it fails closed.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    fail = ScriptedAdapter("fail")
+    status = mgr.start(
+        "demo", repo / "pipelines" / "respond.yaml",
+        use_judge=False, adapter_factory=lambda n: fail, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.attempts == 1
+    assert rec.ended is not None
+    assert rec.human_responses == []  # no human decision in play
+    ended_before = rec.ended
+
+    # A plain resume over the terminal failure: adapter never re-invoked, status
+    # stays FAILED (never rewritten to `running`), and neither the failure counter
+    # nor the terminal `ended` timestamp moves.
+    resume_adapter = ScriptedAdapter("proceed")  # would WRITE + succeed if re-run
+    status = mgr.resume(
+        "demo", use_judge=False,
+        adapter_factory=lambda n: resume_adapter, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED  # surfaced, not silently driven to done
+    assert resume_adapter.prompts == []  # adapter never invoked
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED  # terminal state NOT rewritten to `running`
+    assert rec.attempts == 1  # not double-counted
+    assert rec.ended == ended_before  # terminal timestamp preserved
+
+
 # --- FR-7.1: idempotent crash recovery --------------------------------------
 def _seed_pending(mgr: RunManager, text: str = "the human decision") -> str:
     """Simulate a crash AFTER the atomic pending append but BEFORE its checkpoint
