@@ -30,6 +30,8 @@ import json
 import os
 import re
 import socket
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1348,6 +1350,172 @@ def resolve_logs(
         transcript_lines=lines,
         truncated=truncated,
         notice=notice,
+    )
+
+
+# --- `gauntlet logs --follow`: offset-tail the live step (FR-3) --------------
+DEFAULT_FOLLOW_INTERVAL_S = 1.0  # poll cadence; mirrors the console SSE tail
+# Cap a single read so one poll never pulls an unbounded log into memory; the
+# poll loop drains repeatedly to EOF, so this is a window size, not a ceiling.
+# Matches the console's ``store.DEFAULT_LOG_MAX_BYTES`` so CLI and console agree.
+FOLLOW_MAX_BYTES = 256 * 1024
+
+
+@dataclass
+class LogChunkBytes:
+    """A byte-offset slice of a log file — the shared offset-tail unit.
+
+    ``text`` is the bytes in ``[start, end)`` decoded ``utf-8``/``replace``.
+    ``end >= size`` means the read reached EOF. The console SSE tail
+    (``store._read_chunk``) and ``gauntlet logs --follow`` both read through
+    :func:`read_log_chunk`, so the two surfaces frame identically (plan P3).
+    """
+
+    text: str
+    start: int
+    end: int
+    size: int
+
+
+def read_log_chunk(path: Path, offset: int, max_bytes: int) -> LogChunkBytes:
+    """Read the bytes of ``path`` after ``offset`` (up to ``max_bytes``).
+
+    Bytes before ``offset`` are never returned, so a caller re-reading with
+    ``offset=<prior end>`` sees only appended bytes. If ``offset`` is past EOF
+    (rotation/truncation) ``start`` resets to ``0`` so the reader re-syncs rather
+    than reading garbage — identical semantics to the console's
+    ``store._read_chunk``. The file must exist; ``--follow`` guards the
+    not-yet-created window itself before calling.
+    """
+    size = path.stat().st_size
+    start = max(0, offset)
+    if start > size:  # the file shrank under us → resync from the top
+        start = 0
+    with path.open("rb") as fh:
+        fh.seek(start)
+        raw = fh.read(max_bytes)
+    end = start + len(raw)
+    return LogChunkBytes(
+        text=raw.decode("utf-8", errors="replace"), start=start, end=end, size=size
+    )
+
+
+@dataclass
+class FollowResult:
+    """Outcome of a ``gauntlet logs --follow`` session (read-only, FR-3)."""
+
+    step_id: str  # rendered id of the followed step
+    final_status: str  # the step's last-observed manifest status
+    followed: bool  # True iff the live poll loop ran (step was `running`)
+    interrupted: bool  # True iff stopped by SIGINT (KeyboardInterrupt)
+
+
+def _reload_step_status(manifest_path: Path, step_id: str) -> str | None:
+    """Re-read the manifest and return the rendered ``step_id``'s status.
+
+    Returns ``None`` if the manifest is absent/unreadable/invalid or the step is
+    gone — the caller keeps following on a transient miss rather than dropping a
+    live tail on one bad read (fail-soft for an advisory observability path; the
+    step's own driver, not this reader, owns correctness).
+    """
+    try:
+        man = Manifest.load(manifest_path)
+    except (OSError, ValueError):
+        return None
+    for rec in man.steps:
+        if render_step_id(rec) == step_id:
+            return rec.status
+    return None
+
+
+def follow_logs(
+    run_root: Path,
+    slug_dir: Path,
+    slug: str,
+    *,
+    step: str | None = None,
+    emit: Callable[[str], None],
+    sleep: Callable[[float], None] = time.sleep,
+    interval: float = DEFAULT_FOLLOW_INTERVAL_S,
+    max_bytes: int = FOLLOW_MAX_BYTES,
+    max_polls: int | None = None,
+) -> FollowResult:
+    """Tail the current step's ``events.jsonl`` until it ends (FR-3.1/3.2/3.3).
+
+    Resolves the step through the same read-only, contained
+    :func:`resolve_logs` path (so traversal in ``slug``/``--step`` is refused and
+    only redacted on-disk bytes are ever read — never the raw pipe), then:
+
+    - while the step's manifest status is ``running``, polls ``events.jsonl`` and
+      ``emit``s appended bytes every ``interval`` seconds;
+    - **reads the status before draining each tick and only stops *after* the
+      drain** — so the iteration in which terminal status is first observed still
+      drains to EOF, capturing bytes flushed in the window the status flipped
+      (no dropped tail; the step's sink is closed before its status goes
+      terminal, so every byte is on disk by then);
+    - if the step is **not** ``running`` at entry (already finished, or not yet
+      started), this degrades to a single one-shot dump + exit — no hang
+      (FR-3.2);
+    - on SIGINT (``KeyboardInterrupt``) it stops cleanly with
+      ``interrupted=True``.
+
+    ``sleep``/``max_polls`` are injectable so a test can drive the loop to a
+    deterministic end. ``emit`` receives raw appended text (it already carries
+    the per-event newlines); the caller writes it without adding any.
+    """
+    # Resolve once for containment + the events path + the step identity; the
+    # transcript tail it also reads is unused here (cheap, one-time).
+    resolved = resolve_logs(run_root, slug_dir, slug, step=step)
+    events_path = resolved.events_path
+    step_id = resolved.step_id
+    manifest_path = resolved.run_instance_dir / "manifest.json"
+
+    def _drain_to_eof(offset: int) -> int:
+        """Emit every byte from ``offset`` to current EOF; return the new offset.
+
+        Loops so a large backlog (or a one-shot dump of a finished step) is
+        flushed in full, not one window per poll. An absent file (a `running`
+        step that has not written its first line yet) is a no-op — the live tail
+        simply has nothing to show until the producer creates it (§P4 baseline).
+        """
+        while True:
+            try:
+                chunk = read_log_chunk(events_path, offset, max_bytes)
+            except (FileNotFoundError, OSError):
+                return offset
+            if chunk.text:
+                emit(chunk.text)
+            offset = chunk.end
+            if chunk.end >= chunk.size:
+                return offset
+
+    offset = 0
+    followed = False
+    interrupted = False
+    status = _reload_step_status(manifest_path, step_id) or resolved.step_status
+    polls = 0
+    try:
+        first = True
+        while max_polls is None or polls < max_polls:
+            polls += 1
+            if not first:
+                sleep(interval)
+                status = _reload_step_status(manifest_path, step_id) or M.RUNNING
+            first = False
+            # Read status *before* draining, stop *after*: the terminal-status
+            # iteration still drains to EOF (final drain — no dropped tail).
+            offset = _drain_to_eof(offset)
+            if status != M.RUNNING:
+                break
+            followed = True
+    except KeyboardInterrupt:  # SIGINT → clean stop (FR-3.1)
+        interrupted = True
+
+    return FollowResult(
+        step_id=step_id,
+        final_status=status,
+        followed=followed,
+        interrupted=interrupted,
     )
 
 

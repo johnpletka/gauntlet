@@ -296,6 +296,12 @@ def logs(
         "or a composite role sub-leaf path (`<cycle-leaf>/r2-fix`, "
         "`<cycle-leaf>/r1-triage/<finding-id>`).",
     ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f",
+        help="Tail the step's events.jsonl live, printing appended events as "
+        "they arrive and exiting when the step ends or on Ctrl-C. A finished "
+        "step degrades to a one-shot dump (no hang).",
+    ),
 ) -> None:
     """Surface a step's evidence: its dir + transcript tail (read-only, FR-3).
 
@@ -304,6 +310,10 @@ def logs(
     transcript, and names the `events.jsonl` path (never parsed). It writes
     nothing and reads only within the run tree; a missing/unreadable transcript
     is a notice, not an error (exit 0).
+
+    With `--follow`, instead of the transcript tail it streams the step's
+    `events.jsonl` live (the per-line redacted on-disk file, never the raw pipe),
+    exiting cleanly when the step ends or on SIGINT (live-run-observability FR-3).
     """
     from gauntlet.engine import operator
     from gauntlet.engine.operator import (
@@ -316,6 +326,22 @@ def logs(
     mgr = _manager()
     layout = mgr.layout(slug)
     run_root = mgr.repo_root / mgr.config.run_root
+
+    if follow:
+        try:
+            fr = operator.follow_logs(
+                run_root, layout.slug_dir, slug, step=step,
+                emit=lambda text: typer.echo(text, nl=False),
+            )
+        except (
+            UnsafeRunSegment, RunResolutionError, LogsError, StatusContractError
+        ) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        if fr.interrupted:
+            typer.echo("")  # finish the partial line SIGINT cut off
+        return
+
     try:
         result = operator.resolve_logs(run_root, layout.slug_dir, slug, step=step)
     except (UnsafeRunSegment, RunResolutionError, LogsError, StatusContractError) as exc:
