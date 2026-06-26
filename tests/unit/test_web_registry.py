@@ -221,6 +221,19 @@ def test_select_console_port_rejects_non_loopback_host():
         select_console_port("0.0.0.0", 8765)
 
 
+@pytest.mark.parametrize("port", [0, -1, 70000])
+def test_select_console_port_clamps_out_of_range_request(port):
+    # Regression (PR #41 review): the scan only clamped its upper bound, so a
+    # `port=0` request returned 0 (the "any port" sentinel, useless in a URL)
+    # and a negative request raised an uncaught OverflowError from bind()
+    # instead of failing closed. The docstring promises clamping to the valid
+    # range; assert every out-of-range request yields a real bindable port in
+    # [1, 65535] and never 0 / never raises.
+    chosen = select_console_port("127.0.0.1", port)
+    assert isinstance(chosen, int)
+    assert 1 <= chosen <= 65535
+
+
 # --- F-003: single loopback source of truth (no drift) -----------------------
 
 

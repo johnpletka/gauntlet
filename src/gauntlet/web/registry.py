@@ -294,15 +294,23 @@ def select_console_port(host: str, port: int) -> int:
     :class:`ConsoleBootError` only if even the ephemeral fallback cannot bind.
     """
     assert_loopback(host)
-    last = min(port + AUTO_PORT_WINDOW, 65535)
-    for candidate in range(port, last + 1):
+    # Clamp the scan to the valid bindable range [1, 65535] — the docstring's
+    # stated contract. A bare lower bound let `port=0` return 0 (the "any port"
+    # sentinel, meaningless once it reaches URL/record construction) and let a
+    # negative `port` raise an uncaught OverflowError from `bind()` instead of
+    # failing closed. Port 0 is never a real requested console port (the CLI
+    # default is 8765); clamping it to 1 makes the scan skip the privileged
+    # range and fall through to the OS-ephemeral bind.
+    start = max(1, min(port, 65535))
+    last = min(start + AUTO_PORT_WINDOW, 65535)
+    for candidate in range(start, last + 1):
         if port_is_free(host, candidate):
             return candidate
     ephemeral = _ephemeral_port(host)
     if ephemeral is not None:
         return ephemeral
     raise ConsoleBootError(
-        f"cannot start console: no free port from {port} through {last} on "
+        f"cannot start console: no free port from {start} through {last} on "
         f"{host} and the OS-ephemeral fallback bind failed (FR-3.1, fail-closed)"
     )
 
