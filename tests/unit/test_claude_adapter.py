@@ -116,6 +116,17 @@ def test_tools_disabled_argv():
     assert argv[idx + 1] == ""
 
 
+def test_effort_argv():
+    argv = ClaudeCodeAdapter(effort="high")._build_argv("x", session=None, schema=None)
+    idx = argv.index("--effort")
+    assert argv[idx + 1] == "high"
+
+
+def test_no_effort_argv():
+    argv = ClaudeCodeAdapter()._build_argv("x", session=None, schema=None)
+    assert "--effort" not in argv
+
+
 def test_malformed_output_raises_with_partial(monkeypatch):
     patch_run(
         monkeypatch,

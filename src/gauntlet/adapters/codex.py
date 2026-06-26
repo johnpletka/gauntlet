@@ -40,6 +40,7 @@ class CodexAdapter:
         self,
         *,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         sandbox: str = "read-only",
         skip_git_repo_check: bool = False,
         executable: str = "codex",
@@ -47,6 +48,7 @@ class CodexAdapter:
         base_flags: list[str] | None = None,
     ) -> None:
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.sandbox = sandbox
         self.skip_git_repo_check = skip_git_repo_check
         self.executable = executable
@@ -103,6 +105,8 @@ class CodexAdapter:
         argv.append("--json")
         if self.model:
             argv += ["--model", self.model]
+        if self.reasoning_effort:
+            argv += ["-c", f"model_reasoning_effort={self.reasoning_effort!r}"]
         if session:
             # `exec resume` accepts no --sandbox flag (verified on 0.139.0);
             # the config-override spelling keeps the sandbox pinned on resume.
