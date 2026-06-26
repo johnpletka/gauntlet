@@ -1413,15 +1413,19 @@ class FollowResult:
 def _reload_step_status(manifest_path: Path, step_id: str) -> str | None:
     """Re-read the manifest and return the rendered ``step_id``'s status.
 
-    Returns ``None`` if the manifest is absent/unreadable/invalid or the step is
-    gone — the caller keeps following on a transient miss rather than dropping a
-    live tail on one bad read (fail-soft for an advisory observability path; the
-    step's own driver, not this reader, owns correctness).
+    Raises :class:`LogsError` if the manifest is absent/unreadable/invalid. The
+    manifest is published atomically (``os.replace``), so a reader never sees a
+    torn write — a failed load is a genuine integrity problem, not a transient
+    race. Mapping such a failure to ``running`` would let ``--follow`` poll a
+    corrupt manifest forever and never observe the step end; instead we fail
+    closed and surface the error (fail-closed principle; FR-3.1). Returns
+    ``None`` only when the manifest loads cleanly but the step id is gone — a
+    distinct case the caller may ride out as a transient miss.
     """
     try:
         man = Manifest.load(manifest_path)
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        raise LogsError(f"cannot reload manifest {manifest_path}: {exc}") from exc
     for rec in man.steps:
         if render_step_id(rec) == step_id:
             return rec.status
@@ -1469,6 +1473,10 @@ def follow_logs(
     events_path = resolved.events_path
     step_id = resolved.step_id
     manifest_path = resolved.run_instance_dir / "manifest.json"
+    # The resolved run dir — the containment ancestor `events_path` must stay
+    # under (matches the `label="events"` check in `resolve_logs`). Revalidated
+    # before every read below, not just at resolve.
+    run_dir_real = _resolve_under(slug_dir, run_root.resolve(), label="run dir")
 
     def _drain_to_eof(offset: int) -> int:
         """Emit every byte from ``offset`` to current EOF; return the new offset.
@@ -1477,8 +1485,16 @@ def follow_logs(
         flushed in full, not one window per poll. An absent file (a `running`
         step that has not written its first line yet) is a no-op — the live tail
         simply has nothing to show until the producer creates it (§P4 baseline).
+
+        Containment is re-checked immediately before each read: the live file
+        can be created or replaced between polls, so a one-time resolve is a
+        TOCTOU hole — a symlink swapped in after resolve would redirect the tail
+        out of the run tree. `_resolve_under` follows the leaf symlink and fails
+        closed (:class:`LogsError`) if the target escapes; a not-yet-created
+        file resolves to its in-tree path and passes (FR-3.3).
         """
         while True:
+            _resolve_under(events_path, run_dir_real, label="events")
             try:
                 chunk = read_log_chunk(events_path, offset, max_bytes)
             except (FileNotFoundError, OSError):

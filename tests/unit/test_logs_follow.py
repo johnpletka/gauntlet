@@ -226,6 +226,84 @@ def test_traversal_step_is_rejected(tmp_path):
         )
 
 
+def test_events_replaced_with_escaping_symlink_mid_follow_is_refused(tmp_path):
+    """TOCTOU (F-001): containment is checked once at resolve, but the live file
+    can be created/replaced between polls. If `events.jsonl` is swapped for a
+    symlink escaping the run tree after follow starts, the next read must fail
+    closed — never tail the out-of-tree target (FR-3.3)."""
+    inst = _instance(tmp_path)
+    _write_manifest(inst, [_step("impl", status="running")])
+    ev = _events_path(inst)
+    ev.write_text('{"e":1}\n')
+    # A target outside the run tree the swapped-in symlink will point at.
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"secret":"sk-leak"}\n')
+
+    def fake_sleep(_interval):
+        ev.unlink()
+        ev.symlink_to(outside)
+
+    out: list[str] = []
+    with pytest.raises(op.LogsError):
+        op.follow_logs(
+            tmp_path / "runs",
+            tmp_path / "runs" / "demo",
+            "demo",
+            emit=out.append,
+            sleep=fake_sleep,
+            max_polls=10,
+        )
+    # Poll 1 flushed the legit in-tree byte; the out-of-tree content was never read.
+    assert "".join(out) == '{"e":1}\n'
+    assert "sk-leak" not in "".join(out)
+
+
+def test_corrupt_manifest_mid_follow_fails_closed(tmp_path):
+    """F-002: a manifest that turns invalid after follow starts must fail closed
+    (LogsError), not be mapped to `running` and polled forever (fail-closed)."""
+    inst = _instance(tmp_path)
+    _write_manifest(inst, [_step("impl", status="running")])
+    ev = _events_path(inst)
+    ev.write_text('{"e":1}\n')
+
+    def fake_sleep(_interval):
+        (inst / "manifest.json").write_text("{not valid json")  # invalid → ValueError
+
+    out: list[str] = []
+    with pytest.raises(op.LogsError):
+        op.follow_logs(
+            tmp_path / "runs",
+            tmp_path / "runs" / "demo",
+            "demo",
+            emit=out.append,
+            sleep=fake_sleep,
+            max_polls=10,
+        )
+    assert "".join(out) == '{"e":1}\n'  # the pre-corruption tail still flushed
+
+
+def test_removed_manifest_mid_follow_fails_closed(tmp_path):
+    """F-002 (OSError branch): a manifest removed after follow starts is an
+    integrity failure, not a still-running step — fail closed rather than hang."""
+    inst = _instance(tmp_path)
+    _write_manifest(inst, [_step("impl", status="running")])
+    ev = _events_path(inst)
+    ev.write_text('{"e":1}\n')
+
+    def fake_sleep(_interval):
+        (inst / "manifest.json").unlink()  # gone → OSError on reload
+
+    with pytest.raises(op.LogsError):
+        op.follow_logs(
+            tmp_path / "runs",
+            tmp_path / "runs" / "demo",
+            "demo",
+            emit=lambda _t: None,
+            sleep=fake_sleep,
+            max_polls=10,
+        )
+
+
 # --- CLI surface: `--follow` wires through and exits 0 -----------------------
 def test_cli_follow_streams_and_exits_zero(tmp_path, monkeypatch):
     inst = _instance(tmp_path)
