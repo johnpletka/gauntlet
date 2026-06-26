@@ -1386,12 +1386,23 @@ def read_log_chunk(path: Path, offset: int, max_bytes: int) -> LogChunkBytes:
     than reading garbage — identical semantics to the console's
     ``store._read_chunk``. The file must exist; ``--follow`` guards the
     not-yet-created window itself before calling.
+
+    Containment and read operate on a *single* opened object (F-001): the file
+    is opened once with ``O_NOFOLLOW`` and then ``fstat``/``read`` go through that
+    one descriptor. A caller validates the path's containment (e.g. ``--follow``
+    via :func:`_resolve_under`) and then calls here; opening on the same path with
+    a separate ``stat``/``open`` would leave a symlink-swap TOCTOU window — a leaf
+    swapped to an escaping symlink between the check and the open could redirect
+    the tail out of the run tree. ``O_NOFOLLOW`` refuses a symlink leaf at open
+    (``OSError``/``ELOOP``, fail-closed; FR-3.3), and ``fstat`` reads the same
+    inode the open returned, so there is no second path lookup to race.
     """
-    size = path.stat().st_size
-    start = max(0, offset)
-    if start > size:  # the file shrank under us → resync from the top
-        start = 0
-    with path.open("rb") as fh:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        start = max(0, offset)
+        if start > size:  # the file shrank under us → resync from the top
+            start = 0
         fh.seek(start)
         raw = fh.read(max_bytes)
     end = start + len(raw)
@@ -1491,7 +1502,14 @@ def follow_logs(
         TOCTOU hole — a symlink swapped in after resolve would redirect the tail
         out of the run tree. `_resolve_under` follows the leaf symlink and fails
         closed (:class:`LogsError`) if the target escapes; a not-yet-created
-        file resolves to its in-tree path and passes (FR-3.3).
+        file resolves to its in-tree path and passes (FR-3.3). The remaining
+        window between that check and the open is closed inside
+        :func:`read_log_chunk`, which opens with `O_NOFOLLOW` and stats/reads the
+        same descriptor — so a leaf swapped to an escaping symlink *after*
+        `_resolve_under` passes but *before* the open is refused at open (its
+        `OSError` is caught here as a no-op; the next poll's `_resolve_under`
+        then surfaces it as a `LogsError`). Either way the out-of-tree target is
+        never read (F-001).
         """
         while True:
             _resolve_under(events_path, run_dir_real, label="events")

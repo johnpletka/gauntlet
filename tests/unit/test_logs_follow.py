@@ -258,6 +258,66 @@ def test_events_replaced_with_escaping_symlink_mid_follow_is_refused(tmp_path):
     assert "sk-leak" not in "".join(out)
 
 
+def test_read_log_chunk_refuses_a_symlink_leaf(tmp_path):
+    """F-001: the read must be atomic — opening with `O_NOFOLLOW` and stat/read on
+    the *same* descriptor — so a leaf symlinked to an out-of-tree target is refused
+    at open and its content is never read, with no separate path stat/open to race."""
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"secret":"sk-leak"}\n')
+    link = tmp_path / "events.jsonl"
+    link.symlink_to(outside)
+
+    with pytest.raises(OSError):
+        op.read_log_chunk(link, 0, op.FOLLOW_MAX_BYTES)
+
+
+def test_events_swapped_between_containment_check_and_open_is_refused(
+    tmp_path, monkeypatch
+):
+    """TOCTOU (F-001 confirm): the prior fix re-checked containment per poll but
+    then reopened the original path, leaving a window *between* the check and the
+    open. Simulate the swap landing exactly in that window — after the drain loop's
+    `_resolve_under` validates the still-legit file but before `read_log_chunk`
+    opens it. The atomic `O_NOFOLLOW` open must refuse the symlink leaf, so the
+    out-of-tree target is never tailed (FR-3.3)."""
+    inst = _instance(tmp_path)
+    _write_manifest(inst, [_step("impl", status="running")])
+    ev = _events_path(inst)
+    ev.write_text('{"e":1}\n')
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"secret":"sk-leak"}\n')
+
+    real_resolve = op._resolve_under
+    events_calls = {"n": 0}
+
+    def resolve_then_swap(component, ancestor_real, *, label):
+        # Validate against the still-legit file, then swap it for an escaping
+        # symlink before returning — reproducing the check-then-reopen window.
+        result = real_resolve(component, ancestor_real, label=label)
+        if label == "events":
+            events_calls["n"] += 1
+            # Call 1 is `resolve_logs`'s initial validation; call 2 is the drain
+            # loop's per-poll check immediately before `read_log_chunk` opens.
+            if events_calls["n"] == 2:
+                ev.unlink()
+                ev.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(op, "_resolve_under", resolve_then_swap)
+
+    out: list[str] = []
+    with pytest.raises(op.LogsError):
+        op.follow_logs(
+            tmp_path / "runs",
+            tmp_path / "runs" / "demo",
+            "demo",
+            emit=out.append,
+            sleep=lambda _i: None,
+            max_polls=10,
+        )
+    assert "sk-leak" not in "".join(out)  # the out-of-tree target was never read
+
+
 def test_corrupt_manifest_mid_follow_fails_closed(tmp_path):
     """F-002: a manifest that turns invalid after follow starts must fail closed
     (LogsError), not be mapped to `running` and polled forever (fail-closed)."""

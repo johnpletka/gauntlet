@@ -1,10 +1,11 @@
 """ClaudeCodeAdapter: drives `claude -p` headlessly (PRD §4.1).
 
 Verified against claude 2.1.172 (see the doctor pin file): `--output-format
-json|stream-json`, `--resume <session>`, `--model`, `--append-system-prompt`,
-`--allowedTools`/`--disallowedTools`, `--tools` (empty string disables all
-tools), `--permission-mode`, and native structured output via `--json-schema`.
-Permission-bypass flags are rejected by the §8 lint, never merely avoided.
+json|stream-json`, `--resume <session>`, `--model`, `--effort`,
+`--append-system-prompt`, `--allowedTools`/`--disallowedTools`, `--tools`
+(empty string disables all tools), `--permission-mode`, and native structured
+output via `--json-schema`. Permission-bypass flags are rejected by the §8
+lint, never merely avoided.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ class ClaudeCodeAdapter:
         self,
         *,
         model: str | None = None,
+        effort: str | None = None,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
@@ -71,6 +73,7 @@ class ClaudeCodeAdapter:
         if output_format not in ("json", "stream-json"):
             raise ValueError(f"unsupported output_format {output_format!r}")
         self.model = model
+        self.effort = effort
         self.permission_mode = permission_mode
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
@@ -130,6 +133,8 @@ class ClaudeCodeAdapter:
             argv.append("--verbose")  # required by claude for stream-json in -p mode
         if self.model:
             argv += ["--model", self.model]
+        if self.effort:
+            argv += ["--effort", self.effort]
         if self.permission_mode:
             argv += ["--permission-mode", self.permission_mode]
         if self.allowed_tools is not None:
