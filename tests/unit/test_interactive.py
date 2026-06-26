@@ -55,6 +55,25 @@ def _clean_judge_env(monkeypatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+# Every engine-managed GAUNTLET_* var the run may have set in the parent env
+# (matches judgeproc._MANAGED_ENV_VARS), used to seed a *stale* parent env and
+# prove the launcher scrubs it before exec (review F-001).
+_STALE_PARENT_JUDGE_ENV = {
+    "GAUNTLET_RUN_ID": "stale-run",
+    "GAUNTLET_JUDGE_URL": "http://stale:1234",
+    "GAUNTLET_JUDGE_TOKEN": "stale-token",
+    "GAUNTLET_JUDGE_MODE": "unattended",
+    "GAUNTLET_STEP_ID": "stale-step",
+    "GAUNTLET_REPO_ROOT": "/stale/repo",
+}
+
+
+def _seed_stale_judge_env(monkeypatch) -> None:
+    """Seed the parent process with stale managed judge vars (review F-001)."""
+    for var, value in _STALE_PARENT_JUDGE_ENV.items():
+        monkeypatch.setenv(var, value)
+
+
 def _write_judge_json(
     run_dir: Path, *, url: str = "http://127.0.0.1:8787", token: str = "jtok",
     run_id: str = "run-1",
@@ -231,6 +250,34 @@ def test_launch_monitor_degraded_under_no_judge_even_with_record(tmp_path, monke
     env = captured["env"]
     for var in JUDGE_ENV_VARS:
         assert var not in env
+
+
+def test_launch_monitor_degraded_scrubs_stale_parent_judge_env(tmp_path, monkeypatch):
+    # Review F-001: a degraded session must carry NO judge env even when the parent
+    # process (a driver shell, a stale operator env) already has managed vars set.
+    # The empty overlay does not remove them — the launcher must scrub them first.
+    _seed_stale_judge_env(monkeypatch)
+    captured = _run_launch_monitor(tmp_path, with_judge_json=True, liveness="orphaned")
+    env = captured["env"]
+    for var in _STALE_PARENT_JUDGE_ENV:
+        assert var not in env, f"stale parent {var} leaked into a degraded monitor"
+
+
+def test_launch_monitor_gated_overrides_stale_and_omits_step_id(tmp_path, monkeypatch):
+    # Review F-001: on the gated path a stale parent GAUNTLET_STEP_ID must NOT
+    # survive — its presence would make the judge classify the operator's own
+    # session as an in-run agent (FR-7.3 / FR-10). The other managed vars take the
+    # overlay's authoritative values, not the parent's stale ones.
+    _seed_stale_judge_env(monkeypatch)
+    captured = _run_launch_monitor(tmp_path, with_judge_json=True, liveness="alive")
+    env = captured["env"]
+    assert "GAUNTLET_STEP_ID" not in env  # operator session — stale value scrubbed
+    assert env["GAUNTLET_RUN_ID"] == "run-1"  # overlay value, not the stale parent's
+    assert env["GAUNTLET_JUDGE_URL"] == "http://127.0.0.1:9000"
+    assert env["GAUNTLET_JUDGE_TOKEN"] == "jtok"
+    # Managed vars not in the operator overlay are scrubbed, never inherited stale.
+    assert "GAUNTLET_JUDGE_MODE" not in env
+    assert "GAUNTLET_REPO_ROOT" not in env
 
 
 # --- `gauntlet run --interactive` CLI wiring (FR-7.1, FR-7.2) ----------------

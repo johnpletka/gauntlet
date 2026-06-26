@@ -33,7 +33,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from gauntlet.engine.judgeproc import JudgeRecord, operator_session_env, read_judge_record
+from gauntlet.engine.judgeproc import (
+    _MANAGED_ENV_VARS,
+    JudgeRecord,
+    operator_session_env,
+    read_judge_record,
+)
 
 # The two supported monitor agents. `claude` is the default and primary path;
 # `codex` is wired the same way (the OQ-2 spike confirmed `codex [PROMPT]` takes
@@ -292,7 +297,16 @@ def launch_monitor(
     command = build_monitor_command(
         agent, prompt=prompt, repo_root=repo_root, judge_env=judge_env
     )
-    env = {**os.environ, **command.env_overlay}
+    # Scrub every engine-managed GAUNTLET_* var from the parent env BEFORE layering
+    # the overlay (review F-001). The parent process (a `gauntlet run` driver or an
+    # operator shell with stale judge vars) may carry GAUNTLET_RUN_ID / JUDGE_URL /
+    # JUDGE_TOKEN / STEP_ID / MODE / REPO_ROOT; merging the overlay on top does not
+    # remove them. Without scrubbing, the degraded path (empty overlay) would still
+    # carry judge env — violating §6.3's "no judge env in degraded mode" — and the
+    # gated path would inherit a parent GAUNTLET_STEP_ID, causing the judge to
+    # classify the operator's own session as an in-run agent (FR-7.3 / FR-10).
+    env = {k: v for k, v in os.environ.items() if k not in _MANAGED_ENV_VARS}
+    env.update(command.env_overlay)
     # Run the agent from the repo root (the operator's own cwd) so the sanctioned
     # `gauntlet` verbs it runs resolve `.gauntlet/config.yaml` (plan F-002).
     chdir_fn(command.cwd)
