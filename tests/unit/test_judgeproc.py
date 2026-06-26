@@ -15,11 +15,16 @@ import pytest
 from gauntlet.engine import judgeproc
 from gauntlet.engine.judgeproc import (
     _MANAGED_ENV_VARS,
+    JUDGE_RECORD_NAME,
+    JudgeRecord,
     ManagedJudge,
     classifier_disabled_warning,
+    operator_session_env,
+    read_judge_record,
 )
-from gauntlet.judge.hook_client import STEP_ID_ENV_VAR
+from gauntlet.judge.hook_client import RUN_ID_ENV_VAR, STEP_ID_ENV_VAR, URL_ENV_VAR
 from gauntlet.judge.service import TOKEN_ENV_VAR
+from gauntlet.procident import ProcessIdentity
 
 
 def test_classifier_disabled_warning_is_actionable():
@@ -196,3 +201,150 @@ def test_spawn_mints_token_when_port_free_but_no_global_token(monkeypatch, clean
         mj._proc = None
         for v in _MANAGED_ENV_VARS:
             os.environ.pop(v, None)
+
+
+# --- judge.json lifecycle (FR-5, §6.2) -------------------------------------------
+class _LiveProc:
+    """A stand-in subprocess whose pid is THIS test process — so getpgid and
+    read_process_identity resolve a real, live identity for the record."""
+
+    returncode = 0
+
+    def __init__(self):
+        self.pid = os.getpid()
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def _spawn_live(monkeypatch, run_dir):
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", lambda argv, env=None: _LiveProc())
+    # Stub the identity read so the record write does not shell out to `ps`
+    # (which the patched Popen would otherwise intercept). A real platform-tagged
+    # identity is returned so proc_identity serialises like production.
+    monkeypatch.setattr(
+        judgeproc,
+        "read_process_identity",
+        lambda pid: ProcessIdentity(platform="darwin", value=1750000000, unit="epoch_seconds"),
+    )
+    return ManagedJudge(
+        policy_path=Path("p.yaml"),
+        audit_path=Path("a.jsonl"),
+        run_id="run-2026-06-25T16-41-22",
+        run_dir=run_dir,
+    )
+
+
+def test_judge_record_written_on_start_removed_on_clean_stop(
+    monkeypatch, clean_managed_env, tmp_path
+):
+    # FR-5.1: judge.json exists with the recorded identity/endpoint fields while
+    # the judge runs and is absent after a clean stop().
+    mj = _spawn_live(monkeypatch, tmp_path)
+    mj.start()
+    try:
+        rec = read_judge_record(tmp_path)
+        assert rec is not None
+        assert rec.pid == os.getpid()
+        assert rec.pgid == os.getpgid(os.getpid())
+        assert rec.proc_identity is not None  # darwin/linux test host
+        assert rec.host  # the machine hostname (FR-6 host-match datum)
+        assert rec.port == judgeproc.DEFAULT_PORT
+        assert rec.url == mj.url
+        assert rec.token == mj.token
+        assert rec.run_id == "run-2026-06-25T16-41-22"
+        assert rec.started_at
+    finally:
+        mj.stop()
+    # Clean stop removes the sidecar — it must not outlive the judge (FR-5.1).
+    assert not (tmp_path / JUDGE_RECORD_NAME).exists()
+    assert read_judge_record(tmp_path) is None
+
+
+def test_judge_record_mode_is_0600(monkeypatch, clean_managed_env, tmp_path):
+    # FR-5.1: the per-run judge token at rest is 0600 (§7 token-at-rest).
+    mj = _spawn_live(monkeypatch, tmp_path)
+    mj.start()
+    try:
+        mode = (tmp_path / JUDGE_RECORD_NAME).stat().st_mode & 0o777
+        assert mode == 0o600
+    finally:
+        mj._proc = None  # skip the fake-proc teardown signalling
+
+
+def test_judge_record_write_failure_does_not_abort_run(
+    monkeypatch, clean_managed_env, tmp_path
+):
+    # FR-5.2: a judge.json write failure is best-effort — the run proceeds and
+    # the judge stays healthy (it is up in-process regardless). Point the run
+    # dir at a *file* so opening run_dir/judge.json raises NotADirectoryError.
+    not_a_dir = tmp_path / "notadir"
+    not_a_dir.write_text("x")
+    mj = _spawn_live(monkeypatch, not_a_dir)
+    try:
+        env = mj.start()  # must not raise
+        assert mj._proc is not None  # judge is up
+        assert env[RUN_ID_ENV_VAR] == "run-2026-06-25T16-41-22"
+        assert not (not_a_dir / JUDGE_RECORD_NAME).exists()
+    finally:
+        mj._proc = None
+
+
+def test_no_record_written_without_run_dir(monkeypatch, clean_managed_env, tmp_path):
+    # A standalone judge (no run_dir) writes no sidecar and does not blow up.
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", lambda argv, env=None: _LiveProc())
+    mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
+    try:
+        mj.start()  # run_dir is None → no record path, no write
+    finally:
+        mj._proc = None
+
+
+# --- operator-session env contract (§6.3) ----------------------------------------
+def _record() -> JudgeRecord:
+    return JudgeRecord(
+        pid=123,
+        pgid=123,
+        proc_identity={"platform": "darwin", "value": 1, "unit": "epoch_seconds"},
+        host="h",
+        port=8787,
+        url="http://127.0.0.1:8787",
+        token="per-run-judge-token",
+        run_id="run-x",
+        started_at="2026-06-25T16-41-22",
+    )
+
+
+def test_operator_session_env_omits_step_id():
+    # §6.3 / §1.3: the operator session sets EXACTLY RUN_ID + judge URL/TOKEN and
+    # deliberately omits GAUNTLET_STEP_ID — its absence is what marks the call as
+    # the operator's own session (the load-bearing classification, FR-10).
+    env = operator_session_env(_record())
+    assert env == {
+        RUN_ID_ENV_VAR: "run-x",
+        URL_ENV_VAR: "http://127.0.0.1:8787",
+        TOKEN_ENV_VAR: "per-run-judge-token",
+    }
+    assert STEP_ID_ENV_VAR not in env
+
+
+def test_judge_record_round_trips_and_rejects_malformed(tmp_path):
+    rec = _record()
+    assert JudgeRecord.from_json(rec.to_json()) == rec
+    # A missing field, a non-dict proc_identity, and non-JSON each fail closed.
+    assert JudgeRecord.from_json('{"pid": 1}') is None
+    assert JudgeRecord.from_json("not json") is None
+    assert read_judge_record(tmp_path) is None  # no file → None (degraded path)

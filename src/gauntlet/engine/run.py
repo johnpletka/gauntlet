@@ -2247,6 +2247,7 @@ class RunManager:
             run_id=man.run_id,
             judge_model=judge_model,
             repo_root=self.repo_root,  # the fixed path boundary (notes #29)
+            run_dir=run_dir,  # where judge.json lands (§6.2) — gitignored
         )
         env = judge.start()
         try:
