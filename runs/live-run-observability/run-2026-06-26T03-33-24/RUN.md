@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/live-run-observability` (base `main`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
-- status: **running** (at `impl-cycle`)
-- totals: 1333866in/221906out $17.7117
+- status: **done**
+- totals: 3848504in/412325out $31.1230
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -21,6 +21,15 @@
 | [tests.1](steps/tests.1/) | shell | done | 81s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.1 | commit | done | 20s | 5378in/1902out $0.0051 | committed 79751c4bdf |
 | [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 31789s | 602988in/17918out $1.2524 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.2](steps/implement.2/transcript.md) | agent_task | done | 663s | 4390in/38352out $3.0388 | agent 'builder' completed |
+| [tests.2](steps/tests.2/) | shell | done | 85s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.2 | commit | done | 20s | 3192in/1717out $0.0042 | committed 417e4b5fdb |
+| [impl-cycle.2](steps/impl-cycle.2/) | adversarial_cycle | done | 1030s | 1268413in/46456out $2.4807 | converged in round 2 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.3](steps/implement.3/transcript.md) | agent_task | done | 604s | 3442in/35617out $4.1961 | agent 'builder' completed |
+| [tests.3](steps/tests.3/) | shell | done | 82s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.3 | commit | done | 15s | 3171in/1309out $0.0034 | committed b89d478aed |
+| [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 1128s | 1182996in/59235out $3.4705 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 1 non-blocking item(s) surfaced for the gate: NEW |
+| [retrospective](steps/retrospective/) | retrospective | done | 120s | 49034in/7733out $0.2176 | retrospective: 2 self-critique(s); 3 proposal(s) generated, 0 applyable |
 
 ## Commits
 
@@ -31,3 +40,8 @@
 - `cf21dfd1a1` P1.1 (step `impl-cycle`)
 - `79751c4bdf` P2 (step `phase-commit`)
 - `84933069f3` P2.1 (step `impl-cycle`)
+- `417e4b5fdb` P3 (step `phase-commit`)
+- `f0b66160e0` P3.1 (step `impl-cycle`)
+- `595e4043a1` P3.2 (step `impl-cycle`)
+- `b89d478aed` P4 (step `phase-commit`)
+- `c103a495f7` P4.1 (step `impl-cycle`)
