@@ -166,6 +166,41 @@ def test_timeout_kills_whole_process_group_streaming():
     assert not alive, f"grandchild {grandchild_pid} survived the group kill"
 
 
+def test_timeout_enforced_after_stdout_stderr_eof():
+    # The child closes fd 1 and fd 2, then hangs. Pipe EOF must NOT end the run
+    # early: the hard wall-clock timeout has to still fire on the still-running
+    # child (F-001). Otherwise the final proc.wait() would block forever on a
+    # child that closed its pipes and then slept — a fail-open regression.
+    script = (
+        "import os, time\n"
+        "os.write(1, str(os.getpid()).encode() + b'\\n')\n"
+        "os.close(1)\n"  # stdout EOF
+        "os.close(2)\n"  # stderr EOF
+        "time.sleep(60)\n"  # ...but the process stays alive
+    )
+    lines: list[str] = []
+    start = time.monotonic()
+    out = run_with_timeout(_child(script), timeout_s=1.5, sink=lines.append)
+    elapsed = time.monotonic() - start
+
+    assert out.timed_out  # timeout fired despite the early pipe EOF
+    assert out.exit_code != 0  # killed, not a clean exit
+    assert elapsed < 15  # did not hang on the final wait
+
+    child_pid = int(lines[0].strip())
+    # The hung child's process group was killed during teardown.
+    deadline = time.monotonic() + 5
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.1)
+    assert not alive, f"child {child_pid} survived the EOF-then-hang timeout"
+
+
 # --------------------------------------------------------------------------
 # FR-1.4 — field-for-field ProcessOutput parity
 # --------------------------------------------------------------------------
@@ -307,6 +342,58 @@ def test_sink_fault_kills_group_and_raises():
             break
         time.sleep(0.1)
     assert not alive, f"child {child_pid} survived the sink-fault teardown"
+
+
+def test_sink_fault_during_timeout_final_drain_still_cleans_up():
+    # A sink fault that lands on the *final drain* (after the timeout kill),
+    # not the main loop, must still kill/drain/reap before re-raising (F-002).
+    #
+    # The setup forces the faulting line to be emitted only during the drain:
+    # the child writes its pid + an "ok" line, then 0.3s later a "BOOM" line,
+    # then sleeps. A slow sink (0.4s/line) spends ~0.8s emitting the first two
+    # lines in the main loop — past the 0.7s timeout — so the loop breaks with
+    # "BOOM" still buffered, unread, in the pipe. After the killpg, the final
+    # drain reads "BOOM" and the sink raises there. Cleanup must still run.
+    script = (
+        "import os, sys, time\n"
+        "sys.stdout.write(str(os.getpid()) + '\\n')\n"
+        "sys.stdout.write('ok\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.3)\n"
+        "sys.stdout.write('BOOM\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+    received: list[str] = []
+
+    def boom(line: str) -> None:
+        received.append(line)
+        if line == "BOOM\n":
+            raise RuntimeError("disk full")
+        time.sleep(0.4)  # lag the main loop so the timeout fires before BOOM
+
+    start = time.monotonic()
+    with pytest.raises(StreamSinkError) as excinfo:
+        run_with_timeout(_child(script), timeout_s=0.7, sink=boom)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 15  # no hang on the cleanup path
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    # The fault landed on the drain-emitted line, after the two main-loop lines.
+    assert received[1:] == ["ok\n", "BOOM\n"]
+    child_pid = int(received[0].strip())
+
+    # Cleanup ran despite the drain-path fault: the process group was killed.
+    deadline = time.monotonic() + 5
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.1)
+    assert not alive, f"child {child_pid} survived the drain-fault teardown"
 
 
 # --------------------------------------------------------------------------

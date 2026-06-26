@@ -290,6 +290,18 @@ def _run_streaming(
                     _feed_stdin()
                 else:
                     _on_read(key, emit=True)
+        # stdout/stderr are at EOF, but the child may still be alive — it can
+        # close fd 1 and fd 2 and then hang. The hard timeout has to cover
+        # process liveness, not just pipe liveness (FR-3.3, F-001), so wait for
+        # exit under whatever wall-clock budget remains. On expiry, fall through
+        # to the same killpg/drain/reap teardown as the in-loop timeout instead
+        # of blocking forever on the final ``proc.wait()``.
+        if not timed_out:
+            remaining = timeout_s - (time.monotonic() - start)
+            try:
+                proc.wait(timeout=max(remaining, 0.0))
+            except subprocess.TimeoutExpired:
+                timed_out = True
     except BaseException as exc:  # sink fault or unexpected reader error
         pending_exc = exc
 
@@ -302,7 +314,10 @@ def _run_streaming(
 
     # On the sink-fault path the sink already failed — drain into the raw
     # buffers only (emit=False). On the timeout path, emit the complete lines
-    # received before the kill so they are retained (FR-1.3).
+    # received before the kill so they are retained (FR-1.3). A sink fault
+    # *during* this drain must not skip the cleanup below: record it, stop
+    # emitting, and keep draining so the kill/drain/reap contract still
+    # completes before we re-raise (FR-6.2, F-002).
     emit_during_drain = pending_exc is None
     drain_deadline = time.monotonic() + _FINAL_DRAIN_S
     while open_tags and time.monotonic() < drain_deadline:
@@ -316,7 +331,12 @@ def _run_streaming(
             if key.data == "stdin":
                 _close_stdin()
                 continue
-            _on_read(key, emit=emit_during_drain)
+            try:
+                _on_read(key, emit=emit_during_drain)
+            except StreamSinkError as exc:
+                if pending_exc is None:
+                    pending_exc = exc
+                emit_during_drain = False
 
     _close_stdin()
     proc.wait()
