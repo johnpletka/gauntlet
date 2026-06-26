@@ -212,13 +212,20 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
     logger.log_prompt(prompt)  # before the call: the prompt survives a crash
+    # Live-observability streaming (live-run-observability FR-2): when enabled and
+    # the adapter is line-streamable, thread a per-line sink so events.jsonl grows
+    # during the step. sink is passed ONLY when streaming — the buffered path's
+    # call shape (and existing fakes) stay untouched (FR-6.1).
+    stream = open_step_stream(ctx, adapter, logger)
+    run_kwargs: dict = {
+        "session": ctx.record.session_id,
+        "schema": schema,
+        "cwd": ctx.repo_root,
+    }
+    if stream is not None:
+        run_kwargs["sink"] = stream.append_line
     try:
-        result = adapter.run(
-            prompt,
-            session=ctx.record.session_id,
-            schema=schema,
-            cwd=ctx.repo_root,
-        )
+        result = adapter.run(prompt, **run_kwargs)
     except AdapterError as exc:
         # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
         # partial evidence the adapter salvaged before the orchestrator
@@ -227,6 +234,13 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             logger.log_result(exc.partial, suffix="-failed")
         logger.log_text("failure.txt", str(exc))
         raise
+    finally:
+        # A streaming sink fault surfaces as a StreamSinkError (not an
+        # AdapterError) that propagates past the except above; the orchestrator
+        # records the step FAILED (fail closed, FR-6.2). Close the stream either
+        # way so it is never left half-open.
+        if stream is not None:
+            stream.close()
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     usage_by_agent = {agent_name: result.usage} if result.usage else {}
 
@@ -919,6 +933,26 @@ def step_log_dir(ctx: StepContext) -> Path:
 def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
     """FR-4 logger for this step (or a sub-step, e.g. a cycle round's review)."""
     return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
+
+
+def open_step_stream(ctx: StepContext, adapter, logger: StepLogger):
+    """Open a live ``events.jsonl`` stream, or return ``None`` for the buffered
+    path (live-run-observability FR-2/FR-6.1).
+
+    Returns a :class:`StepStream` (whose ``append_line`` is threaded into
+    ``adapter.run`` as the per-line sink) only when **both** the run-level flag
+    is on **and** the bound adapter declares itself line-streamable for its
+    current output mode (``streams_to_sink``). Gating on the adapter's own
+    qualification honors FR-2.8: a non-qualified adapter (or the API adapter,
+    which has no such method) never opens a stream at all — no file is created
+    and no sink is passed, so the buffered path runs exactly as today (FR-6.1).
+    """
+    if not getattr(ctx.config, "stream_step_output", False):
+        return None
+    streams = getattr(adapter, "streams_to_sink", None)
+    if not callable(streams) or not streams():
+        return None
+    return logger.open_stream()
 
 
 def _write_step_log(ctx: StepContext, name: str, text: str) -> None:

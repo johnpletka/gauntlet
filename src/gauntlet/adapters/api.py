@@ -10,6 +10,7 @@ depending on per-provider response_format support.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,11 @@ class ApiAdapter:
         schema: dict | None = None,
         cwd: Path | None = None,  # accepted for interface parity; unused
         extra_flags: list[str] | None = None,  # meaningless for an API call
+        # accepted for interface parity; unused. Live streaming is a durable
+        # Non-Goal for the API adapter: it is an in-process call (no subprocess
+        # reader) and streams token deltas — a secret can span chunks, which
+        # breaks the per-line redaction unit (live-run-observability §2.2).
+        sink: Callable[[str], None] | None = None,
     ) -> AgentResult:
         if session is not None:
             raise UnsupportedFeatureError(

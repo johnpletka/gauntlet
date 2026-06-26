@@ -10,6 +10,7 @@ Permission-bypass flags are rejected by the §8 lint, never merely avoided.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,14 @@ DEFAULT_TIMEOUT_S = 600.0
 
 class ClaudeCodeAdapter:
     name = "claude-code"
+    # Live-streaming qualification (live-run-observability FR-2.7/FR-2.8). claude
+    # `--output-format stream-json` emits one whole JSON event per line — it is
+    # message-granular, so any sensitive value lands wholly inside a single
+    # newline-framed line (the per-line redaction unit). Verified by the P2
+    # containment test, NOT assumed. True qualifies this adapter for per-line
+    # streaming; an adapter whose framing cannot be shown to contain whole values
+    # must leave this False and fall back to the buffered path (FR-2.8).
+    supports_line_streaming = True
     capabilities = AdapterCapabilities(
         repo_write=True,
         # claude 2.1.172 grew a native --json-schema flag; the PRD assumed
@@ -67,6 +76,15 @@ class ClaudeCodeAdapter:
         self.base_flags = list(base_flags or [])
         lint_flags(self._build_argv("", session=None, schema=None))
 
+    def streams_to_sink(self) -> bool:
+        """Whether a provided line ``sink`` is used (live-run-observability
+        FR-2.7/FR-2.8). Only ``stream-json`` is message-granular NDJSON; the
+        legacy ``json`` mode emits one large object, not lines, so it is never
+        streamed. Gated on :attr:`supports_line_streaming` so an unqualified
+        adapter falls back to the buffered path rather than risk a value split
+        across events (FR-2.8)."""
+        return self.output_format == "stream-json" and self.supports_line_streaming
+
     def run(
         self,
         prompt: str,
@@ -75,12 +93,18 @@ class ClaudeCodeAdapter:
         schema: dict | None = None,
         cwd: Path | None = None,
         extra_flags: list[str] | None = None,
+        sink: Callable[[str], None] | None = None,
     ) -> AgentResult:
         argv = self._build_argv(prompt, session=session, schema=schema)
         argv += extra_flags or []
         lint_flags(argv)
+        # Stream only when a sink is provided AND this adapter is qualified for
+        # per-line streaming in its current output mode (FR-2.7/FR-2.8);
+        # otherwise pass None and the buffered communicate() path runs unchanged.
+        effective_sink = sink if (sink is not None and self.streams_to_sink()) else None
         out = run_with_timeout(
-            argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd
+            argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
+            sink=effective_sink,
         )
         if out.timed_out:
             raise AgentTimeoutError(

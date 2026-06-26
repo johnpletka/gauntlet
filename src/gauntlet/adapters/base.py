@@ -6,6 +6,7 @@ raw_events, exit_code.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -59,7 +60,18 @@ class AgentAdapter(Protocol):
         schema: dict | None = None,
         cwd: Path | None = None,
         extra_flags: list[str] | None = None,
-    ) -> AgentResult: ...
+        sink: Callable[[str], None] | None = None,
+    ) -> AgentResult:
+        """Run the agent and return its result.
+
+        ``sink`` (live-run-observability FR-2/FR-7): an optional callable that
+        receives each complete NDJSON stdout line as it arrives, for live
+        persistence. Only the subprocess/NDJSON CLI adapters honor it, and only
+        when their output mode is message-granular and qualified
+        (:meth:`streams_to_sink`); the in-process API adapter accepts it for
+        interface parity and ignores it (a durable Non-Goal — token-delta stream
+        breaks the per-line redaction unit). ``None`` ⇒ the buffered path."""
+        ...
 
 
 class AdapterError(Exception):
