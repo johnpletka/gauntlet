@@ -449,10 +449,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 1581969,
-    "output_tokens": 290560,
+    "input_tokens": 1583303,
+    "output_tokens": 290778,
     "cached_input_tokens": 22513053,
-    "cost_usd": 29.267367000000007
+    "cost_usd": 29.268136500000008
   },
   "agent_usage": {
     "reviewer": {
@@ -474,10 +474,10 @@
       "cost_usd": 29.143490500000002
     },
     "judge_llm": {
-      "input_tokens": 138996,
-      "output_tokens": 26710,
+      "input_tokens": 140330,
+      "output_tokens": 26928,
       "cached_input_tokens": 0,
-      "cost_usd": 0.08816899999999998
+      "cost_usd": 0.08893849999999999
     },
     "escalation": {
       "input_tokens": 2016,
