@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/operator-aids` (base `feat/operator-aids`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
-- status: **running** (at `impl-cycle`)
-- totals: 4387592in/748309out $64.2222
+- status: **done**
+- totals: 4964793in/797167out $67.2126
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -32,7 +32,8 @@
 | [implement.4](steps/implement.4/transcript.md) | agent_task | done | 9066s | 10893in/68446out $8.6058 | agent 'builder' completed |
 | [tests.4](steps/tests.4/) | shell | done | 68s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.4 | commit | done | 31s | 15679in/3062out $0.0100 | committed f7af47dbbd |
-| [impl-cycle.4](steps/impl-cycle.4/) | adversarial_cycle | failed | 744s | 1093916in/29697out $1.9672 | fixer made no changes in round 2 despite 1 accepted finding(s); failing closed |
+| [impl-cycle.4](steps/impl-cycle.4/) | adversarial_cycle | done | 3761s | 1619883in/70384out $4.7080 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [retrospective](steps/retrospective/) | retrospective | done | 109s | 51234in/8171out $0.2497 | retrospective: 2 self-critique(s); 2 proposal(s) generated, 0 applyable |
 
 ## Commits
 
@@ -51,3 +52,4 @@
 - `94cf3f2657` P4.1 (step `impl-cycle`)
 - `f7af47dbbd` P5 (step `phase-commit`)
 - `18fcdbab62` P5.1 (step `impl-cycle`)
+- `04cb60e983` P5.1 (step `impl-cycle`)
