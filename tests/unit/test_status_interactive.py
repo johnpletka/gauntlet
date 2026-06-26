@@ -183,6 +183,81 @@ def test_status_interactive_absent_run_errors(tmp_path, monkeypatch):
     assert calls == {}
 
 
+def test_status_interactive_run_dir_without_manifest_errors(tmp_path, monkeypatch):
+    # F-001: a resolvable `runs/<slug>/run-*` (a stale reservation or a hand-made
+    # dir) with NO manifest must error per the FR-8.1 absent-run contract, not
+    # launch a monitor against a non-run.
+    (tmp_path / ".gauntlet").mkdir()
+    (tmp_path / ".gauntlet" / "config.yaml").write_text("{}\n")
+    slug_dir = tmp_path / "runs" / "demo"
+    (slug_dir / "run-1").mkdir(parents=True)  # resolvable dir, but no manifest.json
+    (slug_dir / "active-run.txt").write_text("run-1\n")
+    monkeypatch.chdir(tmp_path)
+    started = _no_runprocess(monkeypatch)
+    calls: dict = {}
+    monkeypatch.setattr(
+        "gauntlet.interactive.launch_monitor", lambda **kw: calls.update(kw)
+    )
+
+    result = runner.invoke(app, ["status", "demo", "--interactive"])
+    assert result.exit_code == 1
+    assert "cannot load manifest" in result.output
+    assert calls == {}  # launcher never invoked
+    assert started == []
+
+
+def test_status_interactive_mismatched_manifest_errors(tmp_path, monkeypatch):
+    # F-001: a manifest whose slug/run_id does not match the resolved instance is
+    # not this run; refuse to attach rather than launch against a foreign manifest.
+    run_dir = _setup_repo(tmp_path)
+    man = json.loads((run_dir / "manifest.json").read_text())
+    man["slug"] = "other"  # mismatched slug
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    monkeypatch.chdir(tmp_path)
+    calls: dict = {}
+    monkeypatch.setattr(
+        "gauntlet.interactive.launch_monitor", lambda **kw: calls.update(kw)
+    )
+
+    result = runner.invoke(app, ["status", "demo", "--interactive"])
+    assert result.exit_code == 1
+    assert "does not match run" in result.output
+    assert calls == {}  # launcher never invoked
+
+
+def test_status_interactive_refuses_symlinked_slug_dir_escaping_run_root(tmp_path, monkeypatch):
+    # F-002: the attach path shares the safe resolver, so a slug dir that is a
+    # symlink out of the configured run_root must error before any launch — the
+    # child-of-slug containment check must not pass vacuously on an escaped slug.
+    (tmp_path / ".gauntlet").mkdir()
+    (tmp_path / ".gauntlet" / "config.yaml").write_text("{}\n")
+    (tmp_path / "runs").mkdir()
+    outside_slug = tmp_path / "outside_slug"
+    run_dir = outside_slug / "run-1"
+    run_dir.mkdir(parents=True)
+    man = {
+        "run_id": "run-1", "slug": "demo", "branch": "gauntlet/demo",
+        "base_branch": "main", "pipeline": {"name": "p", "version": 1, "hash": "h"},
+        "status": "running", "steps": [],
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (outside_slug / "active-run.txt").write_text("run-1\n")
+    (tmp_path / "runs" / "demo").symlink_to(outside_slug, target_is_directory=True)
+
+    monkeypatch.chdir(tmp_path)
+    started = _no_runprocess(monkeypatch)
+    calls: dict = {}
+    monkeypatch.setattr(
+        "gauntlet.interactive.launch_monitor", lambda **kw: calls.update(kw)
+    )
+
+    result = runner.invoke(app, ["status", "demo", "--interactive"])
+    assert result.exit_code == 1
+    assert "escapes the run tree" in result.output
+    assert calls == {}  # launcher never invoked
+    assert started == []
+
+
 # --- FR-8.2: judge wiring follows driver liveness ----------------------------
 
 def test_status_interactive_gated_when_alive_and_judge_json(tmp_path, monkeypatch):

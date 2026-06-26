@@ -144,8 +144,17 @@ def _resolve_run_instance_dir(mgr, slug: str) -> Path:
     except (UnsafeRunSegment, RunResolutionError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc
+    # Containment is a two-link chain (F-002): resolving the run instance against
+    # the slug dir alone is not enough — a `runs/<slug>` symlink pointing outside
+    # the configured run_root resolves both the slug dir AND the instance to the
+    # same escaped location, so the child-of-slug check passes vacuously. Prove
+    # the slug dir is itself under the resolved run_root FIRST, then the instance
+    # under the resolved slug dir, so neither link can escape the run tree.
+    run_root = (mgr.repo_root / mgr.config.run_root).resolve()
+    slug_dir = layout.slug_dir.resolve()
     try:
-        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
+        slug_dir.relative_to(run_root)
+        run_instance_dir.resolve().relative_to(slug_dir)
     except ValueError as exc:
         typer.echo(
             f"error: resolved run instance {run_instance_dir} escapes the run "
@@ -486,6 +495,30 @@ def _status_interactive(mgr, slug: str, *, agent: str) -> None:
         raise typer.Exit(2) from exc
 
     run_instance_dir = _resolve_run_instance_dir(mgr, slug)
+
+    # The resolver proves containment but not that the directory is a real run
+    # (F-001): a stale reservation or a hand-made `runs/<slug>/run-*` with no
+    # manifest would otherwise launch a monitor against a non-run, violating the
+    # FR-8.1 unknown/absent-run error contract. Load and validate the manifest
+    # with the same handling as the normal `status` path BEFORE foregrounding the
+    # agent, and confirm it is the manifest for this slug + this instance.
+    from gauntlet.engine.manifest import Manifest
+
+    try:
+        man = Manifest.load(run_instance_dir / "manifest.json")
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"error: cannot load manifest for {slug!r}: {exc}", err=True
+        )
+        raise typer.Exit(1) from exc
+    if man.slug != slug or man.run_id != run_instance_dir.name:
+        typer.echo(
+            f"error: manifest in {run_instance_dir} does not match run "
+            f"{slug}/{run_instance_dir.name} (got {man.slug}/{man.run_id}); "
+            "refusing to attach",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     repo_root = mgr.repo_root.resolve()
     run_root = repo_root / mgr.config.run_root
