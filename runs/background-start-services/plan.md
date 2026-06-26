@@ -121,14 +121,20 @@ Reuses P1's `judge.json` and the existing `procident` identity gate
 
 - A `reap_orphaned_judge(run_root, slug)` helper (in `engine/run.py` or a small
   sibling): read `judge.json`; verify the judge's **own** identity
-  (`process_is_alive(pid, identity)` + host match via `procident`); read the
+  (`process_is_alive(pid, identity)` + host match via `procident`); **confirm the
+  recorded `pgid` still belongs to that verified PID** (review F-001) — compute
+  `os.getpgid(pid)` for the live, identity-verified judge and require it to be a
+  positive value equal to the recorded `pgid`, so a stale or corrupted record
+  can never steer a group signal at an unrelated process group; read the
   owning-driver liveness through the **single sanctioned primitive**
   `engine/operator.driver_liveness(run_root, slug)` (§6.4). Reap **iff** the
-  judge identity verifies **and** the driver is `orphaned` or `none`: signal the
-  recorded `pgid` SIGTERM, then SIGKILL after a bounded grace, then remove
-  `judge.json`. Fail closed on every other case — absent/mismatched/unverifiable
-  identity datum, or driver `alive`/`indeterminate` → **no signal**, file left
-  intact, condition noted.
+  judge identity verifies, **the live PGID matches the recorded `pgid`**, **and**
+  the driver is `orphaned` or `none`: signal that re-confirmed process group
+  SIGTERM, then SIGKILL after a bounded grace, then remove `judge.json`. Fail
+  closed on every other case — absent/mismatched/unverifiable identity datum, a
+  non-positive or mismatched `pgid` (`os.getpgid(pid)` disagrees with the record,
+  or the call raises), or driver `alive`/`indeterminate` → **no signal**, file
+  left intact, condition noted.
 - Wire the helper into `abort`, `finish`, and `clean` in `engine/run.py`.
 - These verbs **never** touch `web/registry.ConsoleRecord` / the console process
   — only the per-run judge is a reap target (FR-6.3).
@@ -142,6 +148,12 @@ Reuses P1's `judge.json` and the existing `procident` identity gate
   `judge.json` intact.
 - **fail-closed identity:** dead PID, mismatched `proc_identity`, and `null`
   identity each assert **no** signal (no foreign / PID-reused kill).
+- **fail-closed pgid (review F-001):** a `judge.json` whose `pid` identity
+  verifies but whose recorded `pgid` is non-positive, absent, or does not equal
+  `os.getpgid(pid)` (stale / corrupted record) asserts **no** signal and the file
+  left intact — the reaper never signals a group it has not re-confirmed belongs
+  to the verified judge, with the driver forced to `orphaned`/`none` so only the
+  pgid gate can hold the kill back.
 - **console survival:** a registered live console survives `abort`/`finish`/`clean`
   with its registry entry intact.
 
@@ -173,6 +185,19 @@ so no unseeded-codex option ever ships. `claude` is the default and primary path
   Build the FR-9.1 starter prompt and `exec` the **bare interactive** `claude` /
   `codex` CLI in the foreground — explicitly **not** the one-shot
   `ClaudeCodeAdapter`/`CodexAdapter` (which drive `-p`/`exec` non-interactively).
+- **Monitor command builder (review F-002):** factor the launch vector out of the
+  `exec` so the contract is testable without running an agent — a pure
+  `build_monitor_command(agent, *, prompt, run_dir, judge_env) -> MonitorCommand`
+  returning the **executable**, **`argv`**, **`cwd` (the run dir)**, the **env
+  overlay** to apply (the operator-session env, or none when degraded), and the
+  **prompt-delivery mechanism** (claude: the composed prompt as the interactive
+  positional argument; codex: per the OQ-2 spike outcome). The builder is the
+  single source of truth for the launch contract; `launch_monitor` and `exec`
+  merely consume it. It emits the **bare interactive** invocation and a guard
+  **rejects any one-shot adapter flag** (`-p`, `--print`, the `exec` subcommand,
+  `--output-schema`). P4's attach launcher reuses this **same** builder, so the
+  argv/env/prompt contract is proven once and shared across both entry points
+  (FR-7/FR-8).
 - `cli.py` `run` gains `--interactive[=claude|codex]` (bare → `claude`; unknown
   value errors **before any launch**, naming the valid choices). On
   `--interactive`, pre-allocate a run-id + single-use reservation token, launch
@@ -201,6 +226,14 @@ so no unseeded-codex option ever ships. `claude` is the default and primary path
   prompted** session (none of the judge env) when `judge.json` present **but**
   driver not alive (`none`/`orphaned`), and when `judge.json` is absent after the
   bounded wait (FR-7.3).
+- the command builder (review F-002) produces, for `claude`, the expected
+  **executable** + **`argv`** with the composed prompt delivered as the
+  interactive positional argument, the **run dir as `cwd`**, and the
+  operator-session **env overlay** (and an empty overlay on the degraded path) —
+  and its argv contains **none** of the one-shot adapter flags (`-p`, `--print`,
+  the `exec` subcommand, `--output-schema`); the guard rejects an attempt to add
+  one. This builder contract is asserted directly (not inferred from a stubbed
+  `exec`) and the same builder is re-exercised by the P4 attach test.
 - bare `--interactive` selects claude; `--interactive=bogus` exits non-zero naming
   the choices; `--interactive=codex` **either** launches codex with the composed
   prompt delivered **or** exits non-zero with the unsupported-codex message —
@@ -229,7 +262,9 @@ deterministic run-instance selection.
 - `cli.py` `status` gains `--interactive[=claude|codex]`: resolve the run instance
   with the same deterministic selection operator-aids uses (`active-run.txt` else
   lexically-greatest `run-*`); an unknown/absent run errors. It starts **no**
-  `RunProcess` — it only invokes `launch_monitor` (P3) for the resolved run dir.
+  `RunProcess` — it only invokes `launch_monitor` (P3) for the resolved run dir,
+  reusing P3's `build_monitor_command` unchanged so the attach path inherits the
+  exact same argv/env/prompt launch contract (review F-002).
 - Judge wiring follows `driver_liveness`: `alive` **and** readable `judge.json` →
   operator-session env (§6.3); any other liveness or unreadable `judge.json` → a
   normal prompted session for diagnosis (the agent can still read `status`/`logs`
@@ -243,6 +278,9 @@ deterministic run-instance selection.
   **no** `RunProcess` is started (FR-8.1).
 - live driver + `judge.json` → operator-session env; a parked / `none`-liveness
   run → a normal session (no judge env) and the command still succeeds (FR-8.2).
+- the attach launch reuses P3's `build_monitor_command` (review F-002): the
+  asserted executable / `argv` / `cwd` / env-overlay contract for the attach path
+  is **identical** to the `run --interactive` path, with no one-shot adapter flags.
 - `status <slug>` with no flag does **not** exec an agent; the existing /
   operator-aids `status` and `--json` tests pass unchanged (FR-8.3).
 
@@ -270,9 +308,18 @@ could move earlier with no code dependency forcing the order).
   and cookie. The `_make_auth_dependency` `check` gains a `Response` parameter:
   on the first query-authenticated hit with no valid existing cookie it **mints a
   session + CSRF and sets the httpOnly `SameSite=Strict` cookie** exactly as
-  `POST /login` does; a **page GET** is then **303-redirected to the same path
-  with `p` stripped** (other query params preserved), so the token never lingers
-  in the address bar or history. A **pre-existing valid cookie short-circuits**
+  `POST /login` does. Whether that hit is then **redirected** is decided by route
+  class, not guessed from `Accept` (review F-003): a **page GET** — a top-level
+  HTML-document route that renders the console shell, an explicitly declared set
+  — is **303-redirected to the same path with `p` stripped** (other query params
+  preserved), so the token never lingers in the address bar or history. A
+  **non-page GET** — JSON/API endpoints, the SSE/log stream, and static assets —
+  is **not** redirected (a 303 would break `fetch`/`EventSource`/asset clients):
+  it serves its **normal response** directly, carrying the same bootstrap
+  `Set-Cookie` so every subsequent request is cookie-authed. Token non-lingering
+  still holds for non-page GETs because such URLs are fetched, never address-bar
+  navigations, and the follow-up traffic uses the minted cookie rather than `?p=`.
+  A **pre-existing valid cookie short-circuits**
   the query check (no per-request session minting). All console responses carry
   **`Referrer-Policy: no-referrer`**. A query-authenticated state-changing request
   is treated like a header one for CSRF (not ambient). Loopback bind,
@@ -286,6 +333,12 @@ could move earlier with no code dependency forcing the order).
   fall back to a single OS-ephemeral bind (port `0`). Every candidate passes the
   existing loopback guard so the bind surface never widens beyond `127.0.0.1`.
   `ConsoleHandle` surfaces the token on **reuse** too (rebuilt from the record).
+  **Stale-record interaction (review F-004):** reuse applies only to a record
+  whose console process is still **live**; a **stale** record naming the
+  requested port whose process is gone is **not** reused and is **not** treated
+  as a fail-closed collision even when an unrelated live listener now owns that
+  port — the auto-port scan runs, a new console is started on another free
+  loopback port, and the registry record is **updated** to the new port.
   **Migration (normative §6.1):** a legacy tokenless live record is **reused**
   (no new process/port) and surfaces the **`/login`** URL — it is **not**
   rewritten on reuse, and never reclaimed as stale solely for lacking a token.
@@ -315,13 +368,22 @@ could move earlier with no code dependency forcing the order).
   → 200; invalid `?p=` → 401 / login redirect; pre-existing cookie + `?p=` →
   session count does not grow; page GET to `/?p=<valid>` → 303 to the same path
   **without** `p` (bootstrap cookie on the redirect; redirected request → 200);
+  a **non-page** authenticated GET with `?p=<valid>` — covering at least one
+  JSON/API endpoint and the SSE/log stream — returns its **normal 200 response,
+  not a 303**, while still emitting the bootstrap `Set-Cookie`, and a cookie-only
+  follow-up to it succeeds (review F-003); a static-asset GET behaves the same;
   served page links/forms carry **no** `p`/token; `Referrer-Policy: no-referrer`
   present; existing CSRF/same-origin tests pass unchanged.
 - FR-3: a dummy listener on the default port → console comes up on a different
   port reflected in registry + URL; the full `[requested, requested+50]` window
   occupied → OS-ephemeral fallback (outside the scan window); a non-loopback
   `--host` still rejected with no port scan; a registered live console on the
-  requested port still reused (no new process/port).
+  requested port still reused (no new process/port); a **stale registry record**
+  naming the requested port whose process is gone **while an unrelated live
+  listener now owns that port** → the dead record is **not** reused and **not**
+  fail-closed; `ensure_console` auto-selects another free loopback port, starts a
+  new console there, and **updates the registry** to the new port/record
+  (review F-004).
 - FR-4: live registered console → no new process, browser opened; none → detached
   boot (healthz passes) + browser opened + command returns; non-answering boot →
   non-zero exit naming the log path; plain `serve` tests pass unchanged.
