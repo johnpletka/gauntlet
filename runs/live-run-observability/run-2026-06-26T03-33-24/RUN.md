@@ -3,7 +3,7 @@
 - branch: `gauntlet/live-run-observability` (base `main`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
 - status: **running** (at `impl-cycle`)
-- totals: 730878in/203988out $16.4593
+- totals: 1333866in/221906out $17.7117
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -20,7 +20,7 @@
 | [implement.1](steps/implement.1/transcript.md) | agent_task | done | 976s | 12004in/65202out $9.3381 | agent 'builder' completed |
 | [tests.1](steps/tests.1/) | shell | done | 81s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.1 | commit | done | 20s | 5378in/1902out $0.0051 | committed 79751c4bdf |
-| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | failed | 4s | 0in/0out (tokens only) | handler error: codex reported failure: exit code 1; stderr:  |
+| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 31789s | 602988in/17918out $1.2524 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
 
 ## Commits
 
@@ -30,3 +30,4 @@
 - `6246867793` P1 (step `phase-commit`)
 - `cf21dfd1a1` P1.1 (step `impl-cycle`)
 - `79751c4bdf` P2 (step `phase-commit`)
+- `84933069f3` P2.1 (step `impl-cycle`)

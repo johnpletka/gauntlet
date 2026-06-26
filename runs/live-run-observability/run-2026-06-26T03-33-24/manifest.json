@@ -348,11 +348,11 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "failed",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-06-26T04:42:10.367188+00:00",
-      "ended": "2026-06-26T04:42:14.199902+00:00",
+      "ended": "2026-06-26T13:31:59.531247+00:00",
       "attempts": 1,
       "base_sha": "79751c4bdf3728c73cfdefbb12de4e05c787ad5b",
       "parked_reason": null,
@@ -363,18 +363,29 @@
           "timestamp": "2026-06-26T13:24:49.342002+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_input_tokens": 0,
-        "cost_usd": null
+        "input_tokens": 602988,
+        "output_tokens": 17918,
+        "cached_input_tokens": 1389214,
+        "cost_usd": 1.2524365
       },
-      "notes": "handler error: codex reported failure: exit code 1; stderr: ",
+      "notes": "converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "1",
-      "metrics": {}
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 1,
+        "accepted_total": 1,
+        "accepted_resolved_total": 1,
+        "verdict_counts": {
+          "legitimate": 1
+        },
+        "confirm_counts": {
+          "resolved": 1
+        }
+      }
     }
   ],
   "commits": [
@@ -407,38 +418,43 @@
       "step_id": "phase-commit",
       "phase": "P2",
       "sha": "79751c4bdf3728c73cfdefbb12de4e05c787ad5b"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P2.1",
+      "sha": "84933069f3980a69b8acc13ab3d8bc49f8b4ab83"
     }
   ],
   "totals": {
-    "input_tokens": 730878,
-    "output_tokens": 203988,
-    "cached_input_tokens": 11086199,
-    "cost_usd": 16.459294250000006
+    "input_tokens": 1333866,
+    "output_tokens": 221906,
+    "cached_input_tokens": 12475413,
+    "cost_usd": 17.711730750000008
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 585143,
-      "output_tokens": 11956,
-      "cached_input_tokens": 381952,
+      "input_tokens": 1180600,
+      "output_tokens": 16881,
+      "cached_input_tokens": 855424,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 35161,
-      "output_tokens": 8986,
+      "input_tokens": 37412,
+      "output_tokens": 9421,
       "cached_input_tokens": 0,
-      "cost_usd": 0.02676225
+      "cost_usd": 0.028195
     },
     "escalation": {
-      "input_tokens": 5747,
-      "output_tokens": 2633,
+      "input_tokens": 7998,
+      "output_tokens": 3587,
       "cached_input_tokens": 0,
-      "cost_usd": 0.03092175
+      "cost_usd": 0.0432755
     },
     "builder": {
-      "input_tokens": 26848,
-      "output_tokens": 167849,
-      "cached_input_tokens": 10704247,
-      "cost_usd": 16.356987500000002
+      "input_tokens": 29877,
+      "output_tokens": 179453,
+      "cached_input_tokens": 11619989,
+      "cost_usd": 17.595637500000002
     },
     "judge_llm": {
       "input_tokens": 77979,
