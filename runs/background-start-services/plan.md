@@ -188,7 +188,10 @@ so no unseeded-codex option ever ships. `claude` is the default and primary path
 - **Monitor command builder (review F-002):** factor the launch vector out of the
   `exec` so the contract is testable without running an agent — a pure
   `build_monitor_command(agent, *, prompt, run_dir, judge_env) -> MonitorCommand`
-  returning the **executable**, **`argv`**, **`cwd` (the run dir)**, the **env
+  returning the **executable**, **`argv`**, **`cwd` (the repo root)** — the
+  operator's own cwd, where the sanctioned `gauntlet` verbs resolve
+  `.gauntlet/config.yaml`; the run dir is conveyed to the agent via the FR-9.1
+  starter prompt, not as cwd — the **env
   overlay** to apply (the operator-session env, or none when degraded), and the
   **prompt-delivery mechanism** (claude: the composed prompt as the interactive
   positional argument; codex: per the OQ-2 spike outcome). The builder is the
@@ -228,7 +231,7 @@ so no unseeded-codex option ever ships. `claude` is the default and primary path
   bounded wait (FR-7.3).
 - the command builder (review F-002) produces, for `claude`, the expected
   **executable** + **`argv`** with the composed prompt delivered as the
-  interactive positional argument, the **run dir as `cwd`**, and the
+  interactive positional argument, the **repo root as `cwd`**, and the
   operator-session **env overlay** (and an empty overlay on the degraded path) —
   and its argv contains **none** of the one-shot adapter flags (`-p`, `--print`,
   the `exec` subcommand, `--output-schema`); the guard rejects an attempt to add
