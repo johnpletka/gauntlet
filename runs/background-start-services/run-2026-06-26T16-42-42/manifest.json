@@ -386,7 +386,7 @@
       "agent": "builder",
       "session_id": "2fe848bb-ec53-41dc-83d2-889e9764d834",
       "started": "2026-06-26T17:56:08.350462+00:00",
-      "ended": "2026-06-26T18:10:21.915505+00:00",
+      "ended": "2026-06-26T18:18:12.072734+00:00",
       "attempts": 0,
       "base_sha": "99360d875d3b177103283a9fe632b68101c6dd7b",
       "parked_reason": "upstream_conflict",
@@ -397,16 +397,16 @@
           "timestamp": "2026-06-26T18:13:15.721193+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 4759,
-        "output_tokens": 57263,
-        "cached_input_tokens": 5306229,
-        "cost_usd": 7.7359085
+        "input_tokens": 4892,
+        "output_tokens": 78485,
+        "cached_input_tokens": 5547037,
+        "cost_usd": 10.985777500000001
       },
-      "notes": "agent signalled 'UPSTREAM CONFLICT' (FR-10.4 upstream conflict / halt); parked for a human instead of marking the step done (#32)\nconflict park left an uncommitted worktree; backed up to refs/gauntlet/backup/run-2026-06-26T16-42-42/implement-conflict-2026-06-26T18-10-21.813201+00-00 and restored the clean tree before handoff (F-001)",
+      "notes": "resume disposition: amendment_required (FR-3/FR-5/FR-10)",
       "iteration": "2",
       "metrics": {}
     }
@@ -449,10 +449,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 1581836,
-    "output_tokens": 269338,
-    "cached_input_tokens": 22272245,
-    "cost_usd": 26.017498000000007
+    "input_tokens": 1581969,
+    "output_tokens": 290560,
+    "cached_input_tokens": 22513053,
+    "cost_usd": 29.267367000000007
   },
   "agent_usage": {
     "reviewer": {
@@ -468,10 +468,10 @@
       "cost_usd": 0.024827500000000002
     },
     "builder": {
-      "input_tokens": 46166,
-      "output_tokens": 214934,
-      "cached_input_tokens": 21275637,
-      "cost_usd": 25.893621500000002
+      "input_tokens": 46299,
+      "output_tokens": 236156,
+      "cached_input_tokens": 21516445,
+      "cost_usd": 29.143490500000002
     },
     "judge_llm": {
       "input_tokens": 138996,
