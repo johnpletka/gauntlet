@@ -43,6 +43,30 @@ from gauntlet.web.auth import token_fingerprint
 CONSOLE_REGISTRY_NAME = ".console.json"
 CONSOLE_LOG_NAME = ".console.log"
 
+# The set of loopback hosts the console is permitted to bind (FR-10.4, §2.2).
+# Defined here (not in `runner`) so the auto-port scan (FR-3.2) can assert
+# loopback on every candidate without importing `runner` (which imports *this*
+# module — a cycle); `runner` re-exports these for backward compatibility.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# The bounded auto-port scan window (FR-3.1): the requested port through 50 ports
+# above it (51 candidates), then a single OS-ephemeral bind. A named bound keeps
+# the bind surface deterministic and the boundary test exact.
+AUTO_PORT_WINDOW = 50
+
+
+class NonLoopbackHostError(ValueError):
+    """The console refuses to bind a non-loopback host (FR-10.4)."""
+
+
+def assert_loopback(host: str) -> None:
+    """Fail closed unless ``host`` is a loopback address (FR-10.4, §2.2)."""
+    if host not in LOOPBACK_HOSTS:
+        raise NonLoopbackHostError(
+            f"console refuses to bind non-loopback host {host!r} "
+            "(FR-10.4: localhost only, like the judge)"
+        )
+
 
 class ConsoleBootError(RuntimeError):
     """The console could not be booted/reused (port conflict, no healthz)."""
@@ -65,6 +89,14 @@ class ConsoleRecord:
     token_fingerprint: str
     started_at: str
     log_path: str
+    # The serve token in clear (§6.1, P5): persisted so a reusing process can
+    # rebuild the authenticated `?p=` URL without knowing the running console's
+    # in-memory token. Loopback-scoped, gitignored, local-only (the §7
+    # relaxation). `token_fingerprint` is retained for the existing mismatch
+    # check. **Optional for backward compatibility**: a legacy record written
+    # before P5 has no `token` (→ None), and such a record surfaces `/login` on
+    # reuse rather than an authenticated URL (FR-1.2 migration).
+    token: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2)
@@ -83,6 +115,8 @@ class ConsoleRecord:
                 token_fingerprint=data.get("token_fingerprint", ""),
                 started_at=data.get("started_at", ""),
                 log_path=data.get("log_path", ""),
+                # Absent on a legacy (pre-P5) record → None; never raises.
+                token=data.get("token"),
             )
         except (ValueError, KeyError, TypeError):
             return None
