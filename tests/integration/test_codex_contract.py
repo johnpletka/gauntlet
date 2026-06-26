@@ -105,6 +105,20 @@ def test_help_surface_matches_pin_file():
     assert "--sandbox" not in resume_help  # resume re-pins via -c sandbox_mode
 
 
+def test_reasoning_effort_config_key(fixture_repo):
+    # model_reasoning_effort is a -c config key, not a named CLI flag; it will
+    # not appear in `codex exec --help`. Verify the installed CLI accepts it
+    # without error before treating it as pinned behavior.
+    adapter = CodexAdapter(
+        sandbox="read-only", reasoning_effort="low", timeout_s=TIMEOUT_S
+    )
+    result = adapter.run(
+        "Reply with exactly: GAUNTLET_PONG", cwd=fixture_repo
+    )
+    assert result.exit_code == 0
+    assert "GAUNTLET_PONG" in result.text
+
+
 def test_workspace_write_in_disposable_fixture_repo(fixture_repo):
     # The write-mode sandbox flag is itself under test (plan F-002 carve-out).
     adapter = CodexAdapter(sandbox="workspace-write", timeout_s=TIMEOUT_S)

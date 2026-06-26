@@ -77,6 +77,25 @@ def test_stream_json_capture(tmp_path):
     assert len(result.raw_events) >= 2  # init/assistant events plus result
 
 
+def test_effort_flag(tmp_path):
+    # --effort is a new surface added by this adapter; verify the installed
+    # CLI accepts it without error before treating it as pinned behavior.
+    result = toolless_adapter(effort="low").run(
+        "Reply with exactly: GAUNTLET_PONG", cwd=tmp_path
+    )
+    assert result.exit_code == 0
+    assert "GAUNTLET_PONG" in result.text
+
+
+def test_help_surface_effort_flag():
+    import subprocess
+
+    help_out = subprocess.run(
+        ["claude", "--help"], capture_output=True, text=True, timeout=30
+    ).stdout
+    assert "--effort" in help_out, "--effort absent from claude --help"
+
+
 def test_write_flag_in_disposable_fixture_repo(fixture_repo):
     # The write-mode flag is itself under test here (plan F-002 carve-out):
     # acceptEdits + Write tool, in a throwaway repo under tmp, never this repo.

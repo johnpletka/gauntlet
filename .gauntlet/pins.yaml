@@ -57,6 +57,11 @@ clis:
         verified: >-
           Write tool ran unprompted in a disposable fixture repo; file
           created with expected content.
+      - flag: "--effort low"
+        verified: >-
+          Flag accepted by claude -p; model completes normally with the effort
+          level applied. Present in `claude --help` (confirmed 2.1.190).
+          Live-verified via test_claude_contract::test_effort_flag.
       - flag: "PreToolUse hook via .claude/settings.json (--setting-sources project)"
         verified: >-
           P2: fires in `claude -p` for Bash tool calls. Payload carries
@@ -133,6 +138,12 @@ clis:
         Bypass flags observed in --help (--dangerously-bypass-approvals-and-sandbox,
         --dangerously-bypass-hook-trust, -s danger-full-access) are rejected
         by the config lint.
+      - >-
+        `-c model_reasoning_effort=<level>` is a config-key override (not a
+        named CLI flag; not listed in `codex exec --help`). Accepted values
+        documented by codex: minimal/low/medium/high/xhigh. Live-verified via
+        test_codex_contract::test_reasoning_effort_config_key (exit 0, valid
+        response).
       - >-
         P2 HOOK FINDING (deviation, ratified by John 2026-06-11): `codex exec`
         does NOT fire PreToolUse hooks on 0.139.0 — verified against project

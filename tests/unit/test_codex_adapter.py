@@ -206,7 +206,7 @@ def test_reasoning_effort_argv(monkeypatch):
     CodexAdapter(reasoning_effort="xhigh").run("x")
     argv, _ = calls[0]
     idx = argv.index("-c")
-    assert argv[idx + 1] == "model_reasoning_effort='xhigh'"
+    assert argv[idx + 1] == 'model_reasoning_effort="xhigh"'
 
 
 def test_no_reasoning_effort_argv(monkeypatch):
