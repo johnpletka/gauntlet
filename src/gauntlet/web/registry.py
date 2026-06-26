@@ -237,6 +237,11 @@ def build_record(
         token_fingerprint=token_fingerprint(token),
         started_at=_utc_now_iso(),
         log_path=str(log_path),
+        # Persist the serve token in clear (§6.1) so a reusing process can
+        # reconstruct the authenticated URL / surface the console token instead
+        # of seeing `token: null`. `token_fingerprint` is kept for the mismatch
+        # check; the clear token is loopback-scoped, gitignored, local-only.
+        token=token,
     )
 
 
@@ -265,6 +270,41 @@ def port_is_free(host: str, port: int) -> bool:
         return False
     finally:
         sock.close()
+
+
+def _ephemeral_port(host: str) -> int | None:
+    """Ask the OS for any free port on ``host`` (the auto-port fallback)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def select_console_port(host: str, port: int) -> int:
+    """Pick a bindable loopback port for the console boot (FR-3.1/3.2).
+
+    Validates ``host`` is loopback (fail-closed, like every bind), then tries
+    the requested ``port`` through ``port + AUTO_PORT_WINDOW`` (51 candidates,
+    clamped to the valid port range), and finally one OS-ephemeral bind. Raises
+    :class:`ConsoleBootError` only if even the ephemeral fallback cannot bind.
+    """
+    assert_loopback(host)
+    last = min(port + AUTO_PORT_WINDOW, 65535)
+    for candidate in range(port, last + 1):
+        if port_is_free(host, candidate):
+            return candidate
+    ephemeral = _ephemeral_port(host)
+    if ephemeral is not None:
+        return ephemeral
+    raise ConsoleBootError(
+        f"cannot start console: no free port from {port} through {last} on "
+        f"{host} and the OS-ephemeral fallback bind failed (FR-3.1, fail-closed)"
+    )
 
 
 def is_reusable(record: ConsoleRecord | None) -> bool:
@@ -298,14 +338,14 @@ def ensure_console(
 ) -> ConsoleHandle:
     """Reuse the live console, else boot a detached one (FR-12.1/12.4).
 
-    Returns a :class:`ConsoleHandle`. On reuse, ``token`` is ``None`` (the
-    running console keeps its own token, which we do not know — only its
-    fingerprint) and we surface that console's existing login URL. On boot, we
-    mint/inherit the serve token, launch ``gauntlet serve`` **detached** so it
-    outlives the foreground run (FR-12.2), wait for ``/healthz``, and return its
-    URL + token. A port already held by an **unrelated** process (the registry is
-    not reusable yet the port is bound) fails closed (FR-12.4) — we never
-    silently pick a different port the printed URL would then mismatch.
+    Returns a :class:`ConsoleHandle`. On reuse, ``token`` is the running
+    console's **persisted** serve token (or ``None`` for a legacy pre-P5 record
+    that never persisted one) and we surface that console's existing login URL.
+    On boot, we mint/inherit the serve token, pick a bindable port within the
+    bounded auto-port window (FR-3.1) — the requested port through
+    ``requested + AUTO_PORT_WINDOW``, then a single OS-ephemeral fallback —
+    launch ``gauntlet serve`` **detached** so it outlives the foreground run
+    (FR-12.2), wait for ``/healthz``, and return its URL + token.
     """
     supplied = token or os.environ.get("GAUNTLET_WEB_TOKEN")
     existing = read_registry(run_root)
@@ -324,18 +364,19 @@ def ensure_console(
             port=existing.port,
             url=existing.url,
             reused=True,
+            # Surface the running console's persisted serve token (None on a
+            # legacy pre-P5 record) so the caller can rebuild the authenticated
+            # URL without knowing the live console's in-memory token.
+            token=existing.token,
             token_mismatch=mismatch,
         )
 
     # Not reusable: the recorded console (if any) is stale and will be
-    # overwritten by the booting child's own registry write. Before launching,
-    # make sure the port is ours to take.
-    if not port_is_free(host, port):
-        raise ConsoleBootError(
-            f"cannot start console: {host}:{port} is in use by an unrelated "
-            "process and no live gauntlet console is registered there; free the "
-            "port or pass a different --port (FR-12.4, fail-closed)"
-        )
+    # overwritten by the booting child's own registry write. Pick a bindable
+    # port within the bounded auto-port window (FR-3.1) instead of failing
+    # closed on the exact requested port, so an occupied port no longer wedges
+    # console boot.
+    port = select_console_port(host, port)
 
     # Mint a token when neither an explicit token nor GAUNTLET_WEB_TOKEN exists,
     # so the detached child uses *our* token (not one it generates privately) and
@@ -397,8 +438,12 @@ __all__ = [
     "ConsoleRecord",
     "ConsoleHandle",
     "ConsoleBootError",
+    "NonLoopbackHostError",
+    "LOOPBACK_HOSTS",
+    "AUTO_PORT_WINDOW",
     "CONSOLE_REGISTRY_NAME",
     "CONSOLE_LOG_NAME",
+    "assert_loopback",
     "registry_path",
     "console_log_path",
     "read_registry",
@@ -407,6 +452,7 @@ __all__ = [
     "build_record",
     "healthz_ok",
     "port_is_free",
+    "select_console_port",
     "is_reusable",
     "wait_for_healthz",
     "ensure_console",

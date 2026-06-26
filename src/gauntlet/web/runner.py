@@ -23,6 +23,9 @@ from pathlib import Path
 
 from gauntlet.engine import gitops
 from gauntlet.web.registry import (
+    LOOPBACK_HOSTS,
+    NonLoopbackHostError,
+    assert_loopback,
     build_record,
     console_log_path,
     is_reusable,
@@ -36,20 +39,12 @@ from gauntlet.web.supervisor import JobSupervisor
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-
-class NonLoopbackHostError(ValueError):
-    """The console refuses to bind a non-loopback host (FR-10.4)."""
-
-
-def assert_loopback(host: str) -> None:
-    """Fail closed unless ``host`` is a loopback address (FR-10.4, §2.2)."""
-    if host not in LOOPBACK_HOSTS:
-        raise NonLoopbackHostError(
-            f"console refuses to bind non-loopback host {host!r} "
-            "(FR-10.4: localhost only, like the judge)"
-        )
+# `LOOPBACK_HOSTS`, `NonLoopbackHostError`, and `assert_loopback` are the single
+# source of truth in `registry` (defined there so the auto-port scan can assert
+# loopback without importing `runner` — a cycle). They are re-exported here for
+# backward compatibility, so callers that catch/import the runner symbols still
+# cover `serve()` and there is no second allowlist/exception class to drift.
 
 
 def generate_token() -> str:
@@ -188,5 +183,6 @@ __all__ = [
     "serve",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "LOOPBACK_HOSTS",
     "NonLoopbackHostError",
 ]

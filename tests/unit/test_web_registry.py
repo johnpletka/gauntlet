@@ -23,13 +23,16 @@ import pytest
 
 from gauntlet.procident import ProcessIdentity, read_process_identity
 from gauntlet.web.registry import (
+    AUTO_PORT_WINDOW,
     ConsoleRecord,
+    NonLoopbackHostError,
     build_record,
     ensure_console,
     is_reusable,
     port_is_free,
     read_registry,
     remove_registry,
+    select_console_port,
     write_registry,
 )
 
@@ -144,12 +147,92 @@ def test_build_record_is_for_current_process():
     assert rec.pid == os.getpid()
     assert rec.is_live() is True  # us, identity matches
     assert "sekret" not in rec.token_fingerprint  # non-reversible
+    # F-001: the clear serve token is persisted (not left null) so a reusing
+    # process can reconstruct the authenticated URL; it survives a JSON round-trip.
+    assert rec.token == "sekret"
+    back = ConsoleRecord.from_json(rec.to_json())
+    assert back is not None and back.token == "sekret"
+
+
+def test_build_record_token_survives_roundtrip_and_reuse_propagates(tmp_path, monkeypatch):
+    # F-001: the persisted token must flow through the reuse path, not just the
+    # record. A live, reusable console hands its persisted token back so the
+    # caller can rebuild the authenticated URL without the in-memory token.
+    from gauntlet.web import registry
+
+    rec = build_record(
+        host="127.0.0.1", port=4321, token="persisted-tok", log_path=tmp_logpath()
+    )
+    monkeypatch.setattr(registry, "read_registry", lambda _run_root: rec)
+    monkeypatch.setattr(registry, "is_reusable", lambda _record: True)
+    handle = ensure_console(
+        tmp_path, tmp_path, host="127.0.0.1", port=4321, token="persisted-tok"
+    )
+    assert handle.reused is True
+    assert handle.token == "persisted-tok"
+    assert handle.token_mismatch is False
 
 
 def tmp_logpath():
     from pathlib import Path
 
     return Path("/tmp/console.log")
+
+
+# --- F-002: bounded auto-port scan -------------------------------------------
+
+
+def test_select_console_port_returns_requested_when_free():
+    port = _free_port()
+    assert select_console_port("127.0.0.1", port) == port
+
+
+def test_select_console_port_skips_taken_requested_port():
+    # Conflict case: the requested port is held, so the scan steps to the next
+    # free candidate inside the window rather than failing.
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen()
+    taken = holder.getsockname()[1]
+    try:
+        chosen = select_console_port("127.0.0.1", taken)
+        assert chosen != taken
+        assert taken < chosen <= taken + AUTO_PORT_WINDOW
+        assert port_is_free("127.0.0.1", chosen) is True
+    finally:
+        holder.close()
+
+
+def test_select_console_port_falls_back_to_ephemeral_when_window_exhausted(monkeypatch):
+    # Boundary case: every candidate in the window is occupied, so the helper
+    # falls back to one OS-ephemeral bind and returns whatever the OS gives.
+    from gauntlet.web import registry
+
+    monkeypatch.setattr(registry, "port_is_free", lambda _h, _p: False)
+    chosen = select_console_port("127.0.0.1", 9000)
+    assert chosen > 0
+    # The ephemeral port is outside the exhausted window.
+    assert not (9000 <= chosen <= 9000 + AUTO_PORT_WINDOW)
+
+
+def test_select_console_port_rejects_non_loopback_host():
+    with pytest.raises(NonLoopbackHostError):
+        select_console_port("0.0.0.0", 8765)
+
+
+# --- F-003: single loopback source of truth (no drift) -----------------------
+
+
+def test_runner_reexports_registry_loopback_symbols():
+    # The loopback allowlist + guard live in `registry`; `runner` must re-export
+    # the SAME objects so callers catching/importing the runner symbols cover
+    # `serve()` and no second allowlist can silently drift.
+    from gauntlet.web import registry, runner
+
+    assert runner.LOOPBACK_HOSTS is registry.LOOPBACK_HOSTS
+    assert runner.NonLoopbackHostError is registry.NonLoopbackHostError
+    assert runner.assert_loopback is registry.assert_loopback
 
 
 # --- subprocess lifecycle: boot / reuse / reclaim ----------------------------
