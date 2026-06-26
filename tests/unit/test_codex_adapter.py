@@ -201,6 +201,22 @@ def test_resume_argv(monkeypatch):
     assert argv[idx + 1] == 'sandbox_mode="read-only"'
 
 
+def test_reasoning_effort_argv(monkeypatch):
+    calls = patch_run(monkeypatch, fake_output(make_events()))
+    CodexAdapter(reasoning_effort="xhigh").run("x")
+    argv, _ = calls[0]
+    idx = argv.index("-c")
+    assert argv[idx + 1] == 'model_reasoning_effort="xhigh"'
+
+
+def test_no_reasoning_effort_argv(monkeypatch):
+    calls = patch_run(monkeypatch, fake_output(make_events()))
+    CodexAdapter().run("x")
+    argv, _ = calls[0]
+    c_args = [argv[i + 1] for i, v in enumerate(argv[:-1]) if v == "-c"]
+    assert not any("model_reasoning_effort" in a for a in c_args)
+
+
 def test_timeout_raises_checkpointable(monkeypatch):
     partial_events = make_events("partial answer")[:3]  # no turn.completed
     patch_run(
