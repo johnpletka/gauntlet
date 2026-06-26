@@ -1,6 +1,6 @@
 """ClaudeCodeAdapter: drives `claude -p` headlessly (PRD §4.1).
 
-Verified against claude 2.1.172 (see the doctor pin file): `--output-format
+Verified against claude 2.1.190 (see the doctor pin file): `--output-format
 json|stream-json`, `--resume <session>`, `--model`, `--effort`,
 `--append-system-prompt`, `--allowedTools`/`--disallowedTools`, `--tools`
 (empty string disables all tools), `--permission-mode`, and native structured
