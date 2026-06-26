@@ -261,6 +261,16 @@ def status(
         rstate = operator.compute_run_state(man, driver.state)
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
+        # Advisory freshness (live-run-observability FR-5): the single I/O point
+        # (a stat of the running step's events.jsonl), gated on the streaming
+        # flag, computed here and threaded into the pure renderers below so both
+        # the JSON contract and the human footer report the same value. None for
+        # a non-streamed / not-applicable step (→ `current_step_freshness: null`).
+        freshness = operator.compute_current_step_freshness(
+            man, run_instance_dir,
+            streaming=bool(getattr(mgr.config, "stream_step_output", False)),
+        )
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -268,6 +278,7 @@ def status(
             payload = operator.status_payload(
                 man, driver, rstate, recon,
                 run_root=run_root, run_instance_dir=run_instance_dir,
+                current_step_freshness=freshness,
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -281,7 +292,8 @@ def status(
         typer.echo(f"  {rec.id}{it}: {rec.status}")
 
     for line in operator.render_footer(
-        driver, rstate, reconciliation=recon, anomaly=anomaly
+        driver, rstate, reconciliation=recon, anomaly=anomaly,
+        current_step_freshness=freshness,
     ):
         typer.echo(line)
 

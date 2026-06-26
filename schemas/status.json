@@ -17,6 +17,7 @@
     "parked",
     "failure",
     "reconciliation",
+    "current_step_freshness",
     "steps",
     "next_actions"
   ],
@@ -147,6 +148,18 @@
         "recommended_command": {
           "type": "string",
           "description": "Human-display command that finalizes the intent (e.g. `gauntlet recover <slug>`); for display only, never executed."
+        }
+      }
+    },
+    "current_step_freshness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["last_event_age_s"],
+      "description": "Advisory freshness for a running, streamed step (live-run-observability FR-5): the age in seconds of the newest streamed event (now - mtime of the step's events.jsonl). The OBJECT is the nullable unit: null for a non-streamed/not-applicable step or the pre-first-event window (events.jsonl absent or empty); when present, last_event_age_s is ALWAYS a number, never null. There is no top-level last_event_age_s. Drives no gate and no automatic action (FR-5.2).",
+      "properties": {
+        "last_event_age_s": {
+          "type": "number",
+          "description": "Age in seconds of the newest streamed event (now - mtime of the current step's events.jsonl). Always a number when the object is present."
         }
       }
     },

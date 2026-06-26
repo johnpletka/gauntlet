@@ -733,6 +733,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "parked",
     "failure",
     "reconciliation",
+    "current_step_freshness",
     "steps",
     "next_actions"
   ],
@@ -863,6 +864,18 @@ _STATUS_SCHEMA_JSON = r'''{
         "recommended_command": {
           "type": "string",
           "description": "Human-display command that finalizes the intent (e.g. `gauntlet recover <slug>`); for display only, never executed."
+        }
+      }
+    },
+    "current_step_freshness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["last_event_age_s"],
+      "description": "Advisory freshness for a running, streamed step (live-run-observability FR-5): the age in seconds of the newest streamed event (now - mtime of the step's events.jsonl). The OBJECT is the nullable unit: null for a non-streamed/not-applicable step or the pre-first-event window (events.jsonl absent or empty); when present, last_event_age_s is ALWAYS a number, never null. There is no top-level last_event_age_s. Drives no gate and no automatic action (FR-5.2).",
+      "properties": {
+        "last_event_age_s": {
+          "type": "number",
+          "description": "Age in seconds of the newest streamed event (now - mtime of the current step's events.jsonl). Always a number when the object is present."
         }
       }
     },
@@ -1042,6 +1055,7 @@ def status_payload(
     *,
     run_root: Path,
     run_instance_dir: Path,
+    current_step_freshness: float | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -1052,6 +1066,15 @@ def status_payload(
     applicable (§6.1). A malformed/unreadable surviving intent surfaces as a
     human-footer anomaly, never here — the caller passes ``reconciliation=None``
     in that case, so ``--json`` never fabricates an ``intent_step_id``.
+
+    ``current_step_freshness`` is the advisory age (seconds) of the newest
+    streamed event for a running, streamed step (live-run-observability FR-5),
+    computed by the I/O-bearing :func:`compute_current_step_freshness` in the
+    caller and threaded in here so this serializer stays pure. ``None`` (a
+    non-streamed / not-applicable step, or the pre-first-event window) renders as
+    ``current_step_freshness: null``; a number renders as the nested object
+    ``{ "last_event_age_s": <number> }`` — the **object** is the nullable unit,
+    never a top-level ``last_event_age_s`` (§6.1).
 
     The completed object is validated against the committed §6.1 schema before it
     is returned (F-003): unconstrained persisted inputs (e.g. an out-of-enum
@@ -1096,6 +1119,11 @@ def status_payload(
         "reconciliation": (
             reconciliation.to_dict() if reconciliation is not None else None
         ),
+        "current_step_freshness": (
+            {"last_event_age_s": current_step_freshness}
+            if current_step_freshness is not None
+            else None
+        ),
         "steps": [
             {
                 "id": rec.id,
@@ -1114,6 +1142,59 @@ def status_payload(
 TRANSCRIPT_TAIL_LINES = 200  # FR-3.1b — normative default tail for v1
 _TRANSCRIPT_NAME = "transcript.md"
 _EVENTS_NAME = "events.jsonl"
+
+
+# --- advisory freshness signal (live-run-observability FR-5) -----------------
+def compute_current_step_freshness(
+    man: Manifest,
+    run_instance_dir: Path,
+    *,
+    streaming: bool,
+    now: float | None = None,
+) -> float | None:
+    """Age (seconds) of the newest streamed event for a running, streamed step.
+
+    The single I/O point behind the §6.1 ``current_step_freshness`` field
+    (FR-5.1). It lives in the status-computation path (not in the pure
+    :func:`status_payload`) and its result is threaded into that serializer. The
+    value is ``now − mtime`` of the current step's ``events.jsonl`` — the live
+    file's last-append time — requiring **no** event-body parse (matching the §6
+    note that a freshness read must never block persistence).
+
+    Returns ``None`` (→ ``current_step_freshness: null``) unless **all** hold:
+
+    * the run is streaming (``streaming`` — the ``stream_step_output`` flag); a
+      non-streamed run is always ``null``;
+    * the manifest ``run_status`` is ``running`` (the only "running step" window;
+      a parked/failed/done run has no streaming step);
+    * a default (running) step resolves;
+    * that step's ``events.jsonl`` **exists and is non-empty** — a single
+      ``stat`` does both checks. The pre-first-event window (file absent, i.e.
+      ``FileNotFoundError`` / any ``OSError``, or zero bytes) is ``null`` — never
+      ``0``, never a surfaced stat error, never an age off the file's
+      create/open time. Only once ≥1 line has been appended does a number land.
+
+    A negative result from clock skew (mtime slightly ahead of ``now``) is
+    clamped to ``0.0`` so the advisory value is never a nonsensical negative.
+    Freshness drives no gate and no automatic action (FR-5.2)."""
+    if not streaming or man.status != M.RUN_RUNNING:
+        return None
+    rec = select_default_step(man)
+    if rec is None:
+        return None
+    # Resolve the active transcript leaf the same way `logs`/`--follow` and the
+    # console tail do (metadata-driven, never mtime), so the freshness signal is
+    # the age of exactly the file those surfaces stream.
+    events_path = resolve_transcript_dir(run_instance_dir, rec) / _EVENTS_NAME
+    try:
+        st = events_path.stat()
+    except OSError:
+        return None  # absent / unreadable → pre-first-event window, fail to null
+    if st.st_size <= 0:
+        return None  # established but empty → no event yet
+    if now is None:
+        now = time.time()
+    return max(0.0, now - st.st_mtime)
 
 
 class LogsError(RuntimeError):
@@ -1560,11 +1641,17 @@ def render_footer(
     *,
     reconciliation: Reconciliation | None = None,
     anomaly: str | None = None,
+    current_step_freshness: float | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
     Each action renders as ``  $ <command>`` so the footer's commands are
     exactly the ``command`` fields of ``rstate.next_actions`` (FR-1.2 lockstep).
+
+    When ``current_step_freshness`` is a number (a running, streamed step with
+    ≥1 streamed event), a single advisory line reports the age of the newest
+    event (live-run-observability FR-5). ``None`` (a non-streamed/not-applicable
+    step) adds no line, so the footer is unchanged for every existing run.
     """
     lines: list[str] = []
     if driver.state == LIVENESS_NONE:
@@ -1581,6 +1668,12 @@ def render_footer(
         lines.append(f"driver: {driver.state}{suffix}")
 
     lines.append(f"state: {rstate.state} — {_MEANING.get(rstate.state, '')}")
+
+    if current_step_freshness is not None:
+        lines.append(
+            f"freshness: last streamed event {current_step_freshness:.1f}s ago "
+            "(advisory — drives no action)"
+        )
 
     # A lingering lock under a terminal/parked run is harmless residue (§6.3 P2).
     if (

@@ -197,6 +197,7 @@ def test_section_6_2_example_validates():
         "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": None},
         "failure": None,
         "reconciliation": None,
+        "current_step_freshness": None,
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done"},
             {"id": "impl-cycle", "iteration": 0, "status": "parked"},
