@@ -159,8 +159,8 @@ One role, two surfaces (mirroring operator-aids §3):
   `open_authenticated(handle, *, no_browser)` builds the loopback `?p=<token>`
   URL and calls `webbrowser.open` **only** on a TTY with `--no-browser` unset and
   a known token; otherwise it prints the URL (and falls back to `/login` when the
-  token is unknown). One place, so `run --watch` and `serve --resume` behave
-  identically.
+  token is unknown or **absent on a legacy tokenless record**, §6.1). One place, so
+  `run --watch` and `serve --resume` behave identically.
 - `src/gauntlet/interactive.py` — the monitor launcher, shared by both entry
   points: resolves the run's judge endpoint (from `judge.json`) and driver
   liveness (operator-aids primitive), composes the **operator-session env** (§6.3),
@@ -205,8 +205,8 @@ One role, two surfaces (mirroring operator-aids §3):
 | Fail-closed monitor authz | Operator-gated only when the run's driver is verified **alive** and `judge.json` is readable; otherwise a **normal prompted** session. | Never run ungated while implying gated; an unverifiable judge is treated as absent. *Fail closed.* |
 | `judge.json` as endpoint + reap record | `ManagedJudge` writes it (gitignored, `0600`) on start, removes on clean stop; mirrors `.console.json` / `.serve/job.json`. | Gives cleanup verbs and the monitor a single, identity-bearing source of truth for the per-run judge. *Data over inference.* |
 | Reuse before kill | Console reuse is the existing PID-reuse-safe + healthz check; judge reaping is the same `procident` identity gate operator-aids' `recover` uses. | No new liveness logic; never SIGKILL a recycled/foreign PID. *Fail closed.* |
-| `?p=` sets the cookie, then steps aside | A valid `?p=` authenticates *and* sets the httpOnly session cookie on first hit; page links stay token-free. | Bounds token exposure to the initial URL; everything after rides the cookie, preserving the rest of the gauntlet-ui posture. |
-| Auto-port is loopback-only | Port scan/ephemeral-bind reuses the judge's pattern and keeps `assert_loopback`. | Convenience must not silently widen the bind surface. *Fail closed.* |
+| `?p=` sets the cookie, then steps aside | A valid `?p=` authenticates *and* sets the httpOnly session cookie on first hit; a page GET is then **303-redirected to the same path without `p`** (FR-2.5) and all responses carry `Referrer-Policy: no-referrer` (FR-2.6); page links stay token-free. | Bounds token exposure to the very first request — the redirect clears it from the address bar/history and `no-referrer` keeps it out of `Referer` headers; everything after rides the cookie, preserving the rest of the gauntlet-ui posture. |
+| Auto-port is loopback-only | Port scan/ephemeral-bind reuses the judge's pattern and keeps `assert_loopback`; the scan window is the fixed bound `[requested, requested+50]` then one OS-ephemeral bind (FR-3.1). | Convenience must not silently widen the bind surface, and a named bound keeps behavior/tests deterministic. *Fail closed.* |
 
 ---
 
@@ -222,9 +222,16 @@ One role, two surfaces (mirroring operator-aids §3):
   loopback URL carrying the serve token; with `--no-browser` (or no TTY) it is
   **not** called and the URL is still printed.
 - **FR-1.2** Browser-open is **fail-soft**: a `webbrowser.open` failure, or an
-  unknown token on console *reuse*, never aborts the run — it prints the
-  `/login` URL and continues. *Acceptance:* a test where `webbrowser.open` raises
-  asserts the run proceeds and the `/login` URL is printed.
+  **unknown token on console *reuse*** — including reuse of a **legacy tokenless
+  `.console.json` record** (one written before this feature, with no `token`
+  field; see §6.1 migration) — never aborts the run. In every such case it falls
+  back to printing/opening the **`/login`** URL and continues; a tokenless live
+  record is still **reused** (no new process, same port) and is **not** rewritten
+  on reuse. *Acceptance:* a test where `webbrowser.open` raises asserts the run
+  proceeds and the `/login` URL is printed; a second test seeds a **legacy
+  tokenless** live console record and asserts the console is **reused** (no new
+  process/port) and the **`/login`** URL is surfaced (not an authenticated `?p=`
+  URL), and the record is left unrewritten.
 - **FR-1.3** Console boot/reuse remains exactly the existing behavior otherwise
   (a second `--watch` reuses the live console; a stale registry entry is
   reclaimed). *Acceptance:* the existing `run --watch` reuse test passes unchanged.
@@ -253,16 +260,36 @@ One role, two surfaces (mirroring operator-aids §3):
   treated like a header one for CSRF purposes (not ambient). *Acceptance:* the
   existing CSRF/same-origin tests pass unchanged; a cookie POST still requires a
   valid CSRF token.
+- **FR-2.5** A **page GET** (an HTML navigation, not an asset/API request)
+  authenticated by `?p=` with no prior session cookie, after setting the cookie
+  (FR-2.2), responds with a **redirect (303) to the same loopback path with the
+  `p` parameter stripped**, so the token does not persist in the address bar or
+  browser history and the rendered page is served by the token-free follow-up
+  request. The redirect target preserves any other query parameters. *Acceptance:*
+  a test issues a page GET to `/?p=<valid>` and asserts a 303 whose `Location` is
+  the same path **without** `p`, that the `Set-Cookie` bootstrap header is on the
+  redirect response, and that the redirected (cookie-only) request returns 200;
+  a second test asserts the served page's links/forms contain **no** `p`/token.
+- **FR-2.6** Console responses carry **`Referrer-Policy: no-referrer`** so the
+  initial `?p=` URL is never emitted as a `Referer` header on sub-resource loads or
+  outbound links during the brief pre-redirect window. *Acceptance:* a test asserts
+  the `Referrer-Policy: no-referrer` header is present on console responses
+  (including the `?p=` page response).
 
 ### FR-3 — Console auto-port selection
 
 - **FR-3.1** When the requested console port is held by an **unrelated** process
   (no reusable gauntlet console registered there), `ensure_console` selects a free
-  **loopback** port instead of failing closed: it scans a bounded range upward
-  from the requested port, then falls back to an OS-ephemeral bind. The chosen
-  port is recorded in the registry and reflected in the printed/opened URL.
-  *Acceptance:* a test occupies the default port with a dummy listener and asserts
-  the console comes up on a different port and its registry/URL reflect it.
+  **loopback** port instead of failing closed: it scans the **bounded window
+  `[requested_port, requested_port + 50]` inclusive** (the requested port through
+  50 ports above it, 51 candidates total), binding the first free loopback port in
+  that window; if every port in the window is taken it falls back to a single
+  **OS-ephemeral bind** (port `0`). The chosen port is recorded in the registry and
+  reflected in the printed/opened URL. *Acceptance:* a test occupies the default
+  port with a dummy listener and asserts the console comes up on a different port
+  and its registry/URL reflect it; a boundary test occupies the full
+  `[requested, requested+50]` window and asserts the console falls back to an
+  OS-ephemeral port (outside the scan window) rather than failing.
 - **FR-3.2** Auto-port never binds a non-loopback host (`assert_loopback` is
   applied to every candidate). *Acceptance:* a test asserts a non-loopback
   `--host` is still rejected and no port scan widens the bind surface.
@@ -302,12 +329,21 @@ One role, two surfaces (mirroring operator-aids §3):
 ### FR-6 — Orphaned-judge reaping on cleanup verbs
 
 - **FR-6.1** `gauntlet abort`, `finish`, and `clean` reap an **orphaned** judge:
-  if `judge.json` records a process that is **verified alive and identity-matched**
-  (`procident`, the same gate operator-aids' `recover` uses) but its owning run
-  driver is gone, signal its process group (SIGTERM then SIGKILL after a bounded
-  grace) and remove `judge.json`. *Acceptance:* a test spawns a dummy process as a
-  stand-in judge, records it in `judge.json`, kills the "driver," and asserts the
-  verb terminates the recorded group and removes the file.
+  the judge is reaped **iff both** (a) `judge.json` records a process that is
+  **verified alive and identity-matched** (`procident`, the same gate operator-aids'
+  `recover` uses), **and** (b) its **owning run driver is gone** — defined
+  normatively in §6.4 as `engine/operator.driver_liveness(run_root, slug)` being
+  `orphaned` or `none`. When both hold, signal the recorded judge's process group
+  (SIGTERM then SIGKILL after a bounded grace) and remove `judge.json`. If the
+  driver is `alive` (running) **or** `indeterminate` (liveness unprovable), the
+  judge is **not** signalled (fail closed, §6.4). *Acceptance:* a **gone-driver/kill**
+  test spawns a dummy process as a stand-in judge, records it in `judge.json`,
+  removes the drive lock (driver `none`) or marks it dead (driver `orphaned`), and
+  asserts the verb terminates the recorded group and removes the file; an
+  **alive-driver/no-kill** test holds an alive drive lock for the run and asserts
+  the recorded judge is **not** signalled and `judge.json` is left intact; an
+  **indeterminate-driver/no-kill** test (driver liveness unprovable) likewise
+  asserts no signal.
 - **FR-6.2** Reaping is fail-closed: any absent/mismatched/unverifiable identity
   datum → no signal sent (the judge is left alone and the condition noted), never
   a foreign or PID-reused kill. *Acceptance:* tests with a dead PID, a mismatched
@@ -321,9 +357,24 @@ One role, two surfaces (mirroring operator-aids §3):
 
 - **FR-7.1** `gauntlet run <slug> --interactive` accepts an optional value
   (`claude` default, or `codex`); an unknown value errors before any launch.
-  *Acceptance:* a test asserts `--interactive=codex` selects Codex, bare
-  `--interactive` selects Claude, and `--interactive=bogus` exits non-zero with a
-  message naming the valid choices.
+  `--interactive=codex` is **gated on the P3 starter-prompt feasibility spike**
+  (OQ-2, §8 P3): the monitor must come up **seeded** with the FR-9.1 starter prompt
+  (a monitor with no starter prompt is unsafe — it would not be routed to the
+  operator playbook). The spike resolves, before `codex` is accepted, exactly one
+  of two outcomes — (a) the pinned `codex` CLI accepts an initial prompt in
+  interactive mode (analogous to `claude "<prompt>"`), in which case `codex` is
+  wired the same way as `claude`; or (b) it does not, in which case P3 implements
+  the **defined fallback delivery** (the starter prompt is passed via the codex
+  CLI's supported initial-input channel — stdin/prompt-file — confirmed by the
+  spike) **or**, if no such channel exists, `--interactive=codex` **fails closed**
+  before any launch with a clear message that codex prompt-seeding is unsupported
+  by the pinned version (and `--interactive=claude` is the supported path). Codex is
+  **never** launched unseeded. *Acceptance:* a test asserts bare `--interactive`
+  selects Claude and `--interactive=bogus` exits non-zero naming the valid choices;
+  and a test asserts that `--interactive=codex` **either** launches codex with the
+  composed starter prompt delivered (the spike-confirmed channel) **or** exits
+  non-zero with the unsupported-codex message — never launching codex without the
+  starter prompt.
 - **FR-7.2** It pre-allocates a run-id + single-use reservation token and launches
   the run **detached** via `RunProcess` (the existing FR-6.1a handshake), then
   foregrounds the monitor on that run. It composes with `--watch` (console also
@@ -331,12 +382,20 @@ One role, two surfaces (mirroring operator-aids §3):
   pre-allocated run-id with the reservation token, and that the monitor launcher
   is invoked with that run's dir.
 - **FR-7.3** The monitor is execed in the foreground with the operator-session env
-  (§6.3) once the run's `judge.json` appears (bounded wait); if it does not appear
-  within the timeout (or under `--no-judge`), the monitor launches as a **normal
-  prompted** session with a note. *Acceptance:* a test (judge exec stubbed)
-  asserts the env carries `GAUNTLET_RUN_ID` + judge `URL`/`TOKEN` and **no**
-  `GAUNTLET_STEP_ID` when `judge.json` is present, and carries none of them when
-  it is absent after the timeout.
+  (§6.3) **only when both** conditions hold: the run's `judge.json` has appeared
+  (bounded wait) **and** the run's driver is verified **alive** by the operator-aids
+  liveness primitive (`engine/operator.driver_liveness(run_root, slug) == "alive"`,
+  §6.4). If `judge.json` does not appear within the timeout, **or** the driver is
+  not verified alive (liveness `none`/`orphaned`/`indeterminate` — e.g. the detached
+  driver died immediately after launch, orphaning the judge), **or** under
+  `--no-judge`, the monitor launches as a **normal prompted** session with an
+  explicit degraded note (and never sets any judge env). *Acceptance:* a test
+  (judge exec stubbed) asserts the env carries `GAUNTLET_RUN_ID` + judge
+  `URL`/`TOKEN` and **no** `GAUNTLET_STEP_ID` when `judge.json` is present **and**
+  the driver is alive; a test with `judge.json` present **but the driver not alive**
+  (liveness `none`/`orphaned`) asserts a **normal prompted** session with **none**
+  of the judge env set; and a test with `judge.json` absent after the timeout
+  likewise asserts none of them are set.
 
 ### FR-8 — `status --interactive`: attach the monitor to an existing run
 
@@ -346,10 +405,12 @@ One role, two surfaces (mirroring operator-aids §3):
   starting a new run; an unknown/absent run errors. *Acceptance:* a test over a
   fixture run dir asserts the monitor launcher is invoked for the resolved run-id
   and that no `RunProcess` is started.
-- **FR-8.2** Judge wiring follows driver liveness (operator-aids `Liveness`): when
-  the driver is `alive` and `judge.json` is readable → operator-session env (§6.3);
-  otherwise → a normal prompted session for diagnosis (the agent can still read
-  `status`/`logs` and `resume`). *Acceptance:* a test with a live driver +
+- **FR-8.2** Judge wiring follows driver liveness (the §6.4 primitive,
+  `engine/operator.driver_liveness`): when the driver is `alive` **and** `judge.json`
+  is readable → operator-session env (§6.3); for any other liveness
+  (`orphaned`/`none`/`indeterminate`) or an unreadable `judge.json` → a normal
+  prompted session for diagnosis (the agent can still read `status`/`logs` and
+  `resume`). *Acceptance:* a test with a live driver +
   `judge.json` asserts operator-session env; a test with a parked/`none`-liveness
   run asserts a normal session (no judge env) and that the command still succeeds.
 - **FR-8.3** `--interactive` is additive to `status` — the default `status` output
@@ -368,6 +429,49 @@ One role, two surfaces (mirroring operator-aids §3):
   slug, the run dir, and a reference resolving to the operator playbook, and names
   no autonomous push/merge action.
 
+### FR-10 — Operator-vs-in-run judge classification proof (validates §1.3; P1)
+
+This is the behavioral proof of the load-bearing §1.3 assumption. It asserts the
+judge's *decisions*, not merely the presence of env vars. `policy.yaml` is
+**unchanged** (§2.2); these are the verdicts the *existing* deny-first policy
+already produces, keyed on whether the decide request carries a `step_id`. The
+`GAUNTLET_RUN_ID`/`GAUNTLET_STEP_ID` env (§6.3) is what the judge hook translates
+into the decide request's `run_id`/`step_id` fields, so "operator session" ≙
+`step_id` **absent** and "in-run agent" ≙ `step_id` **present** (both with a valid
+per-run `run_id` + token).
+
+- **FR-10.1** Against a live per-run judge, an **operator-session** decide request
+  (`run_id` set, `step_id` **absent**) returns the verdicts below; an **in-run**
+  decide request (same `run_id`, a non-empty `step_id`) returns the contrasting
+  verdicts. Verdicts use the existing fast-path outcome set (`allow` / `deny` /
+  `ask`; anything unmatched escalates to the LLM classifier — for this proof use
+  inputs that resolve on the fast path so the assertions are deterministic):
+
+  | Representative tool call | Operator (`step_id` absent) | In-run agent (`step_id` present) | Policy rule exercised |
+  |--------------------------|------------------------------|----------------------------------|-----------------------|
+  | `git push` (feature branch) | **allow** | **deny** | `git-push` (allow) vs `push-or-pr-open-in-pipeline-step` (deny, `pipeline_step_only`) |
+  | `gh pr create …` | **allow** | **deny** | `gh-pr-propose-and-read` (allow) vs `push-or-pr-open-in-pipeline-step` (deny) |
+  | `git status` / `uv run pytest` | **allow** | **allow** | `git-readonly` / `test-and-build-runners` — unaffected by step scope |
+  | `gh pr merge …` | **deny** | **deny** | `gh-pr-merge` — denied in **every** context (proves operator is *not* a blanket allow) |
+  | `git push --force …` | **deny** | **deny** | `force-push` — denied in every context |
+
+  *Acceptance:* a test stands up a real (or in-process) judge with the unchanged
+  `policy.yaml`, issues each request above with a valid per-run token under both
+  env combinations, and asserts every cell of the table. The `git push` and
+  `gh pr create` rows are the load-bearing ones: they must **flip** between
+  operator-`allow` and in-run-`deny` purely on `step_id` presence.
+
+- **FR-10.2** Authorization is still per-run: an operator-session request bearing a
+  **wrong or missing per-run token**, or a `run_id` that does not match the judge,
+  is **rejected by the judge** regardless of `step_id`, so the classification never
+  admits a non-operator caller. *Acceptance:* a test issues an operator-shaped
+  request (`step_id` absent) with an invalid token and asserts it is rejected, not
+  auto-allowed.
+
+P1 acceptance (§8) **depends on FR-10**: P1 is not complete until the FR-10.1
+table and FR-10.2 assertions pass, not merely until `judge.json` is written and the
+env is shaped (FR-5 / §6.3).
+
 ---
 
 ## §6 Data & Schemas (normative)
@@ -379,7 +483,19 @@ the file stays gitignored:
 
 | Field | Type | Note |
 |-------|------|------|
-| `token` | string | the serve token in clear, so reuse can rebuild the `?p=` URL. **New.** Loopback-scoped, gitignored, local-only (consistent with the §7 relaxation). `token_fingerprint` is retained for the existing mismatch check. |
+| `token` | string \| absent | the serve token in clear, so reuse can rebuild the `?p=` URL. **New.** Loopback-scoped, gitignored, local-only (consistent with the §7 relaxation). `token_fingerprint` is retained for the existing mismatch check. The field is **optional for backward compatibility** — see the migration rule below. |
+
+**Migration / tokenless records (normative).** A pre-existing `.console.json`
+written before this feature has no `token` field. When `ensure_console` discovers
+such a record and healthz proves the console is **live**, it **reuses** the console
+(no new process, no port change) but, because it cannot reconstruct an
+authenticated `?p=` URL, it surfaces the **`/login`** URL instead of an
+already-authenticated one (FR-1.2). The stale tokenless record is **not** rewritten
+on reuse (the running console's in-memory token is unknown to the reusing process);
+the record gains a `token` only when a console is **freshly booted** by this code,
+which writes the field. A tokenless record is therefore reusable, never reclaimed as
+stale solely for lacking a token, and never silently skips the fail-soft `/login`
+path.
 
 ### §6.2 `judge.json` (in the run dir, gitignored, mode `0600`)
 
@@ -391,7 +507,7 @@ the file stays gitignored:
   "host": "hostname",
   "port": 8787,
   "url": "http://127.0.0.1:8787",
-  "token": "…serve-token…",
+  "token": "…per-run-judge-token…",
   "run_id": "run-2026-06-25T16-41-22",
   "started_at": "2026-06-25T16-41-22"
 }
@@ -401,6 +517,11 @@ the file stays gitignored:
   safe; `proc_identity` may be `null` on an unsupported platform → never reaped).
 - `port`/`url`/`token`/`run_id` — what the monitor (§6.3) needs to wire itself to
   this run's judge. `started_at` is the lock-style UTC stamp.
+- `token` is the **per-run judge token** (the value the judge accepts on
+  `GAUNTLET_JUDGE_TOKEN`), **not** the console `serve` token recorded in
+  `.console.json` (§6.1). The two credentials are distinct and are never
+  interchanged; conflating them would let a console credential reach the judge or
+  vice-versa.
 
 ### §6.3 Operator-session environment contract (the monitor)
 
@@ -417,20 +538,45 @@ is **deliberately absent** (its presence is what marks an in-run agent):
 In the degraded (no-live-judge) case **none** of these are set — the session uses
 Claude Code's normal permission handling.
 
+### §6.4 Owning-driver identity & liveness (normative)
+
+A judge process is *owned* by the run driver recorded in **`<run_root>/.driving.lock`**
+— the single drive-lock read path operator-aids already uses. Cleanup verbs (FR-6)
+and the monitor launchers (FR-7.3, FR-8.2) **must** determine driver liveness
+through exactly one primitive, **`engine/operator.driver_liveness(run_root, slug)`**,
+which reads that lock plus the `procident` OS identity primitives and returns one of:
+
+| Liveness | Meaning (per `engine/operator.py`) | Counts as "owner gone" for reaping? |
+|----------|------------------------------------|-------------------------------------|
+| `alive` | lock present, PID alive, identity matches on this host | **No** — driver is running; never reap. |
+| `orphaned` | lock present but the driver is **proven dead** (or its PID was reused) | **Yes** — owner gone; reap if the judge's own identity also verifies (FR-6.1). |
+| `none` | no drive lock (or a foreign-host lock that is not ours) | **Yes** — owner gone; reap if the judge's own identity also verifies (FR-6.1). |
+| `indeterminate` | the driver's liveness **cannot be proven** either way | **No** — fail closed; leave the judge untouched and note the condition. |
+
+This is the *only* sanctioned source for the "is the owning driver gone?" decision;
+implementations must not infer it from any other artifact. The judge's **own**
+process identity is verified separately against `judge.json` (`pid`/`pgid`/
+`proc_identity`/`host`) via `procident` before any signal — a gone driver authorizes
+reaping only of a judge whose identity still matches (FR-6.1/FR-6.2).
+
 ---
 
 ## §7 Security & Privacy
 
 - **The `?p=` relaxation (superseding gauntlet-ui FR-10.4/10.6, narrowly).** A
   reusable serve token may now ride in the `?p=` query parameter. The accepted
-  exposure is the token appearing in the initial URL, browser history, and any
-  proxy/server access log of *that first request*. The mitigations that make this
-  acceptable for a localhost developer console: the bind is **loopback-only**
-  (an attacker needs local access — the same boundary the whole console already
-  rests on); the token is **per-serve** (a console restart invalidates it); and
-  the `?p=` hit **immediately sets the httpOnly cookie** so all subsequent
-  navigation is token-free (page links carry no token — the rest of the
-  gauntlet-ui posture is preserved). Everything else — constant-time compare,
+  exposure is the token appearing in the URL/access log of *that single first
+  request*. The mitigations that make this acceptable for a localhost developer
+  console: the bind is **loopback-only** (an attacker needs local access — the same
+  boundary the whole console already rests on); the token is **per-serve** (a
+  console restart invalidates it); the `?p=` hit **immediately sets the httpOnly
+  cookie and a page GET is then 303-redirected to the same path with `p` stripped**
+  (FR-2.5), so the reusable token does **not** linger in the address bar or browser
+  history past the first request; responses carry **`Referrer-Policy: no-referrer`**
+  (FR-2.6) so the token never leaks via a `Referer` header to a sub-resource or
+  outbound link; and all subsequent navigation is token-free (page links carry no
+  token — the rest of the gauntlet-ui posture is preserved). Everything else —
+  constant-time compare,
   loopback bind, httpOnly+SameSite=Strict cookie, session-bound CSRF, same-origin
   on cookie POSTs — is **unchanged**. This trade-off is ratified by the human
   through this PRD's review + gate; see OQ-1 for the stronger one-time-bootstrap
@@ -463,9 +609,9 @@ ends in passing tests and a commit.
 
 | Phase | Deliverable | Assumption it validates |
 |-------|-------------|--------------------------|
-| **P1** | `judge.json` lifecycle (FR-5) **+** the operator-session env contract (§6.3) proven against the judge: a `RUN_ID`-set / `STEP_ID`-unset caller is allowed-as-operator while a `STEP_ID`-set caller keeps in-run denials. (FR-5; §1.3) | **The load-bearing one (§1.3):** the monitor can find a run's judge and be correctly classified as the operator, both directions, *before* any launcher depends on it. |
+| **P1** | `judge.json` lifecycle (FR-5) **+** the operator-session env contract (§6.3) **+** the classification proof (FR-10): the FR-10.1 verdict table and FR-10.2 per-run-token rejection pass against the unchanged `policy.yaml` — `git push`/`gh pr create` flip operator-`allow`↔in-run-`deny` on `step_id` presence, with `gh pr merge` denied in both. (FR-5; FR-10; §1.3) | **The load-bearing one (§1.3):** the monitor can find a run's judge and be correctly classified as the operator, both directions, *before* any launcher depends on it. P1 acceptance is the FR-10 judge-level assertions, not env-shape checks alone. |
 | **P2** | Orphaned-judge reaping on `abort`/`finish`/`clean`; console never killed. (FR-6) | A wedged/orphaned judge can be terminated *safely* (identity-checked) and a shared console survives cleanup. Reuses P1's `judge.json` + the existing `procident` gate. |
-| **P3** | `run --interactive` — detached run + foreground operator monitor + starter prompt. (FR-7, FR-9) | The detach-run / foreground-agent handoff works and the monitor comes up wired (or honestly degraded). Depends on P1 (`judge.json` + classification) and the existing `RunProcess`. |
+| **P3** | `run --interactive` — detached run + foreground operator monitor + starter prompt. (FR-7, FR-9) Includes the **codex starter-prompt feasibility spike** (OQ-2, FR-7.1): determine whether the pinned `codex` CLI can be seeded with the FR-9.1 prompt and either wire it (direct or fallback channel) or make `--interactive=codex` fail closed with the unsupported message. | The detach-run / foreground-agent handoff works and the monitor comes up wired (or honestly degraded). `claude` is the default/primary path; the spike resolves codex feasibility so no unseeded-codex option ships. Depends on P1 (`judge.json` + classification) and the existing `RunProcess`. |
 | **P4** | `status --interactive` — attach the monitor to an existing run, gated-if-alive-else-normal. (FR-8, FR-9) | The same monitor attaches to a run started without it, choosing authz from liveness. Reuses P3's launcher + operator-aids liveness. |
 | **P5** | Frictionless access: `?p=` auth + cookie bootstrap (FR-2), registry token persistence + auto-port (FR-3, §6.1), `open_authenticated` + `run --watch` browser-open (FR-1), `serve --resume` (FR-4). | Zero-copy-paste, port-collision-free console access. Lowest technical risk and independent of P1–P4 (web layer only); sequenced after the riskier judge/monitor work — it could move earlier if preferred (see §8 note). |
 
@@ -521,8 +667,11 @@ the access ergonomics before the monitor — no code dependency forces the order
    not the rest of the design.
 2. **Codex interactive invocation.** Does the pinned `codex` CLI accept an initial
    prompt while entering interactive mode (as `claude "<prompt>"` does), or must
-   the prompt be delivered another way (stdin/paste/file)? Verify in P3; affects
-   only `--interactive=codex`.
+   the prompt be delivered another way (stdin/paste/file)? **Resolution is now
+   gated, not open-ended (FR-7.1, §8 P3):** the P3 spike must land one of —
+   direct prompt, a confirmed fallback delivery channel, or `--interactive=codex`
+   failing closed with an unsupported-codex message. Codex never launches unseeded;
+   `--interactive=claude` is unaffected.
 3. **Does `run --interactive` imply `--watch`?** *Leaning: no — independent and
    composable* (`run --interactive --watch` for both). The monitor reads run state
    directly and does not require the console. Open if the reviewer/author prefers
