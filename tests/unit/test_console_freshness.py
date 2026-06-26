@@ -34,6 +34,7 @@ from gauntlet.engine import manifest as M
 from gauntlet.engine import operator as op
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
+from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
 from gauntlet.web.sse import log_tail_stream
 from gauntlet.web.store import RunStore
 
@@ -60,12 +61,26 @@ def _step(id: str, status: str, *, type: str = "agent_task") -> StepRecord:
     return StepRecord(id=id, type=type, status=status)
 
 
-def _events(run_instance_dir: Path, leaf: str, text: str) -> Path:
-    """Write a step's events.jsonl under ``steps/<leaf>/`` and return its path."""
+def _events(
+    run_instance_dir: Path, leaf: str, text: str, *, streaming: bool = True
+) -> Path:
+    """Write a step's events.jsonl under ``steps/<leaf>/`` and return its path.
+
+    ``streaming`` (default) also lays down the live-stream sidecar marker that
+    :meth:`StepLogger.open_stream` writes, i.e. simulates a step whose per-line
+    stream is currently OPEN. Pass ``streaming=False`` to model a non-empty
+    ``events.jsonl`` with NO open stream — a buffered adapter or a prior/killed
+    attempt — which freshness must report as ``null`` (F-002).
+    """
     step_dir = run_instance_dir / "steps" / leaf
     step_dir.mkdir(parents=True, exist_ok=True)
     path = step_dir / "events.jsonl"
     path.write_text(text)
+    marker = step_dir / ("events.jsonl" + STREAM_MARKER_SUFFIX)
+    if streaming:
+        marker.write_text("")
+    elif marker.exists():
+        marker.unlink()
     return path
 
 
@@ -189,6 +204,107 @@ def test_freshness_clamps_clock_skew_to_zero(tmp_path: Path):
     assert op.compute_current_step_freshness(
         man, tmp_path, streaming=True, now=1_999.0
     ) == 0.0
+
+
+# --- F-002: only the CURRENT open stream is current progress ------------------
+def test_freshness_null_without_open_stream_marker(tmp_path: Path):
+    """A non-empty events.jsonl with NO open-stream marker is never current.
+
+    Models the two ways a non-empty events.jsonl exists without a live stream
+    for *this* invocation: a buffered (non-streamable) adapter that wrote the
+    file at end-of-step, or a prior/killed attempt's leftover. Both must read as
+    null until the current stream opens and appends, per the P4 contract (F-002).
+    """
+    man = _manifest(M.RUN_RUNNING, [_step("s", M.RUNNING)])
+    # Non-empty events, but the producer has not opened a live stream (no marker).
+    path = _events(tmp_path, "s", '{"t":"stale"}\n', streaming=False)
+    assert path.stat().st_size > 0
+    assert op.compute_current_step_freshness(man, tmp_path, streaming=True) is None
+
+    # The current stream opens (open_stream truncates the file + writes marker),
+    # so the leftover content is gone and freshness stays null until a new append.
+    marker = path.parent / ("events.jsonl" + STREAM_MARKER_SUFFIX)
+    marker.write_text("")
+    path.write_text("")  # open_stream's truncate
+    assert op.compute_current_step_freshness(man, tmp_path, streaming=True) is None
+
+    # Only once the current stream appends a line does a number land.
+    path.write_text('{"t":"fresh"}\n')
+    age = op.compute_current_step_freshness(man, tmp_path, streaming=True)
+    assert isinstance(age, float) and age >= 0.0
+
+
+def test_open_stream_marks_then_close_clears(tmp_path: Path):
+    """The producer half of F-002: open_stream writes the marker, close removes it.
+
+    A freshly opened stream over a *stale* non-empty events.jsonl truncates it
+    and marks the stream open, so freshness is null until the new append; once
+    the stream closes, the marker is gone and freshness reverts to null even
+    though the (now repopulated) file is non-empty.
+    """
+    from gauntlet.logging.redact import RedactingWriter
+    from gauntlet.logging.transcript import StepLogger
+
+    man = _manifest(M.RUN_RUNNING, [_step("s", M.RUNNING)])
+    # Plant a stale non-empty events.jsonl with no marker (prior attempt).
+    path = _events(tmp_path, "s", '{"t":"stale"}\n', streaming=False)
+    assert op.compute_current_step_freshness(man, tmp_path, streaming=True) is None
+
+    logger = StepLogger(RedactingWriter(), path.parent)
+    stream = logger.open_stream()
+    assert stream.marker_path is not None and stream.marker_path.exists()
+    assert path.read_text() == ""  # the open truncated the stale content
+    assert op.compute_current_step_freshness(man, tmp_path, streaming=True) is None
+
+    stream.append_line('{"t":"fresh"}\n')
+    age = op.compute_current_step_freshness(man, tmp_path, streaming=True)
+    assert isinstance(age, float) and age >= 0.0
+
+    stream.close()
+    assert not stream.marker_path.exists()  # marker cleared on close
+    assert path.stat().st_size > 0  # file still non-empty …
+    assert op.compute_current_step_freshness(man, tmp_path, streaming=True) is None
+    # … but no open stream ⇒ not current progress.
+
+
+# --- F-001: an unsafe / out-of-tree step id fails closed, never stats ---------
+@pytest.mark.parametrize(
+    "bad_id",
+    ["/tmp", "../../etc", "a/b", "..", ".", "a\x00b"],
+)
+def test_freshness_unsafe_step_id_raises_contract_error(tmp_path: Path, bad_id: str):
+    """A corrupt manifest step id must fail closed, not stat outside the tree.
+
+    Separators, ``.``/``..``, absolute paths, and a NUL byte are all rejected as
+    a :class:`StatusContractError` BEFORE any path is built or stat'd. The NUL
+    case in particular would raise an uncaught ``ValueError`` from ``stat`` under
+    the old code; here it is a contract error like the rest (F-001).
+    """
+    man = _manifest(M.RUN_RUNNING, [_step(bad_id, M.RUNNING)])
+    with pytest.raises(op.StatusContractError):
+        op.compute_current_step_freshness(man, tmp_path, streaming=True)
+
+
+def test_freshness_symlinked_leaf_escaping_tree_raises(tmp_path: Path):
+    """A safe-named step leaf that is a symlink out of the run tree fails closed.
+
+    The id itself is a single safe segment, so segment validation passes, but the
+    resolved events.jsonl escapes the run instance — the containment check turns
+    that into a :class:`StatusContractError` rather than stat'ing out-of-tree
+    (F-001 defense in depth).
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "events.jsonl").write_text('{"t":"x"}\n')
+    (outside / ("events.jsonl" + STREAM_MARKER_SUFFIX)).write_text("")
+
+    run_instance = tmp_path / "inst"
+    (run_instance / "steps").mkdir(parents=True)
+    (run_instance / "steps" / "leaf").symlink_to(outside, target_is_directory=True)
+
+    man = _manifest(M.RUN_RUNNING, [_step("leaf", M.RUNNING)])
+    with pytest.raises(op.StatusContractError):
+        op.compute_current_step_freshness(man, run_instance, streaming=True)
 
 
 # --- FR-5.1: the payload object is the nullable unit, schema-valid both ways ---

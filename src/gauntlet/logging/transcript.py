@@ -53,6 +53,15 @@ GITIGNORE_GUIDANCE = """\
 
 _SANDBOX_REFUSAL_MARKER = "operation not permitted"
 
+# Live-stream sidecar marker (live-run-observability FR-5, F-002). `open_stream`
+# writes ``events.jsonl`` + this empty sibling to mark that a per-line stream is
+# OPEN for the step *right now*; `StepStream.close()` removes it. The freshness
+# signal (operator.compute_current_step_freshness) requires the marker, so a
+# non-empty ``events.jsonl`` left by a *buffered* adapter (which never opens a
+# stream) or by a *prior/killed* attempt is never misreported as current
+# streamed progress. It is advisory state only — never read for correctness.
+STREAM_MARKER_SUFFIX = ".streaming"
+
 
 class StepStream:
     """Live, per-line-redacted append sink for a step's ``events.jsonl``.
@@ -70,9 +79,12 @@ class StepStream:
     rather than dropping or leaking output (FR-6.2).
     """
 
-    def __init__(self, writer: RedactingWriter, path: Path) -> None:
+    def __init__(
+        self, writer: RedactingWriter, path: Path, marker_path: Path | None = None
+    ) -> None:
         self.writer = writer
         self.path = path
+        self.marker_path = marker_path
         self._closed = False
 
     def append_line(self, text: str) -> None:
@@ -82,6 +94,15 @@ class StepStream:
 
     def close(self) -> None:
         self._closed = True
+        # Remove the live-stream marker so freshness stops treating this step's
+        # events.jsonl as in-flight the instant the stream closes (F-002).
+        # Best-effort: a missing marker or an unlink race is not an error — the
+        # close path must never fail the step over advisory cleanup.
+        if self.marker_path is not None:
+            try:
+                self.marker_path.unlink()
+            except OSError:
+                pass
 
 
 class StepLogger:
@@ -108,7 +129,12 @@ class StepLogger:
         land on disk, never *what* the final record is."""
         path = self.step_dir / f"events{suffix}.jsonl"
         self.writer.write_text(path, "")  # establish + truncate the live file
-        return StepStream(self.writer, path)
+        # Mark the stream OPEN (F-002), written AFTER the truncate so a present
+        # marker always accompanies a freshly-emptied live file — never a stale
+        # non-empty one from a prior/killed attempt. close() removes it.
+        marker_path = path.parent / (path.name + STREAM_MARKER_SUFFIX)
+        self.writer.write_text(marker_path, "")
+        return StepStream(self.writer, path, marker_path)
 
     def log_result(
         self,

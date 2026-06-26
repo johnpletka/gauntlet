@@ -44,6 +44,7 @@ from gauntlet.engine.run import (
     _LockRecord,
     safe_run_segment,
 )
+from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
 from gauntlet.procident import ProcessIdentity, read_process_identity
 
 # --- liveness values (FR-2.4) ------------------------------------------------
@@ -1167,7 +1168,18 @@ def compute_current_step_freshness(
       non-streamed run is always ``null``;
     * the manifest ``run_status`` is ``running`` (the only "running step" window;
       a parked/failed/done run has no streaming step);
-    * a default (running) step resolves;
+    * a default (running) step resolves, and its rendered id is a single safe
+      path segment that resolves to an ``events.jsonl`` **contained under the run
+      instance** — a corrupt manifest id (separator / ``..`` / absolute / NUL) or
+      a symlinked leaf that would escape the run tree raises
+      :class:`StatusContractError` (fail closed, F-001), never a silent ``null``
+      or an uncaught ``ValueError``;
+    * a per-line stream is **open** for that step now — its live-stream sidecar
+      marker (written by :meth:`StepLogger.open_stream`, removed by
+      :meth:`StepStream.close`) is present. A non-empty ``events.jsonl`` from a
+      *buffered* adapter (no stream opened) or a *prior/killed* attempt has no
+      open marker and stays ``null`` — never misreported as current progress
+      (F-002);
     * that step's ``events.jsonl`` **exists and is non-empty** — a single
       ``stat`` does both checks. The pre-first-event window (file absent, i.e.
       ``FileNotFoundError`` / any ``OSError``, or zero bytes) is ``null`` — never
@@ -1182,10 +1194,41 @@ def compute_current_step_freshness(
     rec = select_default_step(man)
     if rec is None:
         return None
+    # FR-10.1 containment (F-001): the step id flows straight into a filesystem
+    # path (``steps/<leaf>/...``); a corrupt manifest whose id carries a
+    # separator, ``.``/``..``, an absolute path, or a NUL must fail CLOSED before
+    # any stat — never stat an out-of-tree ``events.jsonl``, and never raise an
+    # uncaught ``ValueError`` (a NUL byte makes ``Path.stat`` raise ``ValueError``,
+    # which the ``except OSError`` below would NOT catch). Mirrors the same guard
+    # in :func:`_evidence_path`.
+    try:
+        safe_run_segment(render_step_id(rec), kind="step id")
+    except UnsafeRunSegment as exc:
+        raise StatusContractError(str(exc)) from exc
     # Resolve the active transcript leaf the same way `logs`/`--follow` and the
     # console tail do (metadata-driven, never mtime), so the freshness signal is
     # the age of exactly the file those surfaces stream.
     events_path = resolve_transcript_dir(run_instance_dir, rec) / _EVENTS_NAME
+    # Defense in depth (F-001): the fully-resolved events path must stay
+    # contained under the selected run instance. ``resolve_transcript_dir`` only
+    # appends internally-derived leaves, but a symlinked leaf or any other escape
+    # is a contract violation — fail closed rather than stat outside the tree.
+    try:
+        events_path.resolve().relative_to(run_instance_dir.resolve())
+    except ValueError as exc:
+        raise StatusContractError(
+            f"freshness events path {events_path} escapes run instance "
+            f"{run_instance_dir}"
+        ) from exc
+    # A per-line stream must be OPEN for this step right now (F-002):
+    # ``StepLogger.open_stream`` writes this sidecar marker next to the live file
+    # and ``close()`` removes it. Requiring it keeps a non-empty ``events.jsonl``
+    # left by a *buffered* adapter (no stream opened this invocation) or by a
+    # *prior/killed* attempt from being misreported as current streamed progress
+    # — freshness stays ``null`` until the CURRENT stream has appended a line.
+    marker_path = events_path.parent / (events_path.name + STREAM_MARKER_SUFFIX)
+    if not marker_path.exists():
+        return None  # no live stream open for this step → not current progress
     try:
         st = events_path.stat()
     except OSError:
