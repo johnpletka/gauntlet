@@ -363,40 +363,58 @@ def _has_symlinked_component(repo_root: Path, rel: str) -> bool:
     return False
 
 
-def _check_skill(repo_root: Path, asset_root: str = ".") -> CheckResult:
-    """FR-1.5 / OQ-3: warn-only presence + format check for the PRD-authoring skill.
+# Each registry skill maps to a stable doctor check name. prd-author keeps its
+# historical "prd-skill" name so existing diagnostics/tests are unchanged.
+_SKILL_CHECK_NAMES = {
+    "gauntlet-prd-author": "prd-skill",
+    "gauntlet-operator": "operator-skill",
+}
 
-    The ``gauntlet-prd-author`` skill gates nothing (it only routes a session to the
-    playbook), so a problem here is **never** a FAIL — at worst a WARN. We surface a
-    missing skill, a frontmatter block that does not parse against the normative
-    schema (FR-1.5 / §6), or provenance that looks stale (a customized,
-    provenance-bearing skill whose rendered playbook path no longer matches this
-    repo's ``asset_root`` — §4.5). A well-formed skill is OK. Malformed or
-    unreadable skill state never hard-fails doctor (FR-1.5).
+
+def _skill_check_name(spec) -> str:
+    return _SKILL_CHECK_NAMES.get(spec.name, f"{spec.name}-skill")
+
+
+def _playbook_check_name(spec) -> str:
+    return f"{_skill_check_name(spec)}-playbook"
+
+
+def _check_skill(repo_root: Path, spec, asset_root: str = ".") -> CheckResult:
+    """FR-1.5 / FR-6.5: warn-only presence + format check for a registry skill.
+
+    A committable skill gates nothing (it only routes a session to its playbook),
+    so a problem here is **never** a FAIL — at worst a WARN. We surface a missing
+    skill, a frontmatter block that does not parse against the normative schema
+    (FR-1.5 / §6), or provenance that looks stale (a customized, provenance-bearing
+    skill whose rendered playbook path no longer matches this repo's ``asset_root``
+    — §4.5). A well-formed skill is OK. Malformed or unreadable skill state never
+    hard-fails doctor (FR-1.5). Generalized over the skill registry so the operator
+    skill is validated at the same severity as prd-author (FR-6.5, FR-7.1).
     """
     from gauntlet.engine import skill as S
 
-    rel = S.SKILL_REL
+    name = _skill_check_name(spec)
+    rel = spec.skill_rel
     path = repo_root / rel
-    remedy = "run `gauntlet init` to (re)install the PRD-authoring skill"
+    remedy = f"run `gauntlet init` to (re)install the {spec.name} skill"
     # F-003: `Path.is_file()` / `read_text()` follow symlinks, so a skill path
     # pointed — directly or via a symlinked parent — at a file outside the repo
     # would be read and its contents surfaced in diagnostics. Refuse to
     # dereference; WARN without reading the target.
     if _has_symlinked_component(repo_root, rel):
         return CheckResult(
-            "prd-skill", WARN,
+            name, WARN,
             f"{rel} is a symlink (or has a symlinked parent); not dereferenced",
             remedy=remedy,
         )
     if not path.exists():
         return CheckResult(
-            "prd-skill", WARN, f"{rel} missing (PRD-authoring skill not installed)",
+            name, WARN, f"{rel} missing ({spec.name} skill not installed)",
             remedy=remedy,
         )
     if not path.is_file():
         return CheckResult(
-            "prd-skill", WARN, f"{rel} is not a regular file", remedy=remedy,
+            name, WARN, f"{rel} is not a regular file", remedy=remedy,
         )
     # F-002: an unreadable or non-UTF-8 SKILL.md must not crash the warn-only
     # check (FR-1.5). UnicodeDecodeError is a ValueError; PermissionError an
@@ -405,27 +423,66 @@ def _check_skill(repo_root: Path, asset_root: str = ".") -> CheckResult:
         text = path.read_text()
     except (OSError, ValueError) as exc:
         return CheckResult(
-            "prd-skill", WARN, f"{rel} could not be read: {exc}", remedy=remedy,
+            name, WARN, f"{rel} could not be read: {exc}", remedy=remedy,
         )
     violations = S.validate_skill_frontmatter(text)
     if violations:
         return CheckResult(
-            "prd-skill", WARN,
+            name, WARN,
             f"{rel} frontmatter does not match the pinned schema: {violations[0]}",
             remedy=remedy,
         )
+    # F-003: the schema only pins `name` to *some* kebab-case id, so an otherwise
+    # valid SKILL.md whose frontmatter names a *different* skill would pass schema
+    # validation and (with its playbook ref intact) classify as a customization —
+    # leaving doctor reporting OK while the skill's discovery surface is broken.
+    # The installed file at this spec's path must declare this spec's name.
+    meta = S.parse_frontmatter(text)
+    declared = meta.get("name") if meta else None
+    if declared != spec.name:
+        return CheckResult(
+            name, WARN,
+            f"{rel} frontmatter name {declared!r} does not match expected "
+            f"{spec.name!r}",
+            remedy=remedy,
+        )
     if (
-        S.classify_skill(text) == "customization"
-        and S.skill_looks_stale(text, asset_root)
+        spec.classify(text) == "customization"
+        and spec.looks_stale(text, asset_root)
     ):
         return CheckResult(
-            "prd-skill", WARN,
+            name, WARN,
             f"{rel} provenance looks stale: playbook ref "
-            f"{S.playbook_ref(asset_root)!r} not found (asset_root may have changed)",
+            f"{spec.playbook_ref(asset_root)!r} not found (asset_root may have changed)",
             remedy="re-render the skill (`gauntlet init`) or update its playbook "
             "reference; init never modifies a customized skill",
         )
-    return CheckResult("prd-skill", OK, f"{rel} present and well-formed")
+    return CheckResult(name, OK, f"{rel} present and well-formed")
+
+
+def _check_playbook(repo_root: Path, spec, asset_root: str = ".") -> CheckResult:
+    """FR-6.5: warn-only presence check for a skill's playbook (the file it points
+    at). A skill that resolves to an absent playbook routes a session to nothing,
+    so surface it — but, like the skill itself, it gates no run, so it is never a
+    FAIL. Symlinks are not dereferenced (F-003)."""
+    name = _playbook_check_name(spec)
+    rel = spec.playbook_ref(asset_root)
+    path = repo_root / rel
+    remedy = f"run `gauntlet init` to (re)install the {spec.name} playbook"
+    if _has_symlinked_component(repo_root, rel):
+        return CheckResult(
+            name, WARN,
+            f"{rel} is a symlink (or has a symlinked parent); not dereferenced",
+            remedy=remedy,
+        )
+    if not path.exists():
+        return CheckResult(
+            name, WARN, f"{rel} missing ({spec.name} playbook the skill points at)",
+            remedy=remedy,
+        )
+    if not path.is_file():
+        return CheckResult(name, WARN, f"{rel} is not a regular file", remedy=remedy)
+    return CheckResult(name, OK, f"{rel} present")
 
 
 def _check_judge(repo_root: Path, asset_root: str = ".") -> CheckResult:
@@ -686,7 +743,14 @@ def run_doctor(
 
     results.append(_check_claude_hook(repo_root, probes))
     results.append(_check_codex_hook(repo_root, pins))
-    results.append(_check_skill(repo_root, asset_root))
+    # Validate every committable skill (prd-author + operator) and its playbook at
+    # the same warn-only severity (FR-6.5, FR-7.1). Imported here to avoid a
+    # module-load cycle and to keep doctor's import surface lazy.
+    from gauntlet.engine import skill as S
+
+    for spec in S.SKILL_REGISTRY:
+        results.append(_check_skill(repo_root, spec, asset_root))
+        results.append(_check_playbook(repo_root, spec, asset_root))
     results.append(_check_judge(repo_root, asset_root))
     results.append(_check_repo_secrets(repo_root, asset_root))
 

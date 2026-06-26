@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gauntlet/schemas/status.json",
+  "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
+  "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
+  "$comment": "Compatibility policy (§6.5): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "slug",
+    "run_id",
+    "run_status",
+    "state",
+    "current_step",
+    "driver",
+    "parked",
+    "failure",
+    "reconciliation",
+    "steps",
+    "next_actions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Major schema version. 1 for v1; see §6.5 compatibility policy."
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "The run slug; matches the slug-validation pattern."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "The selected run-instance id."
+    },
+    "run_status": {
+      "type": "string",
+      "description": "Raw manifest run_status (running|parked|done|aborted|failed). Left an unconstrained string deliberately: an unrecognized value does not fail the schema, it maps to composite state `unknown` (§6.3)."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "in_progress",
+        "orphaned",
+        "indeterminate",
+        "parked_gate",
+        "parked_for_response",
+        "failed",
+        "halted",
+        "interrupted",
+        "done",
+        "aborted",
+        "unknown"
+      ],
+      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor)."
+    },
+    "current_step": {
+      "type": ["string", "null"],
+      "description": "Rendered id of the active/most-recent non-terminal step, or null. When non-null it MUST equal the rendered id of exactly one steps[] entry (`<id>` or `<id>.<iteration>`). Derived convenience; steps[] is authoritative."
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "pid", "since", "host"],
+      "description": "The computed driver-liveness view (FR-2.4). Always present.",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["alive", "orphaned", "indeterminate", "none"],
+          "description": "Liveness value (FR-2.4)."
+        },
+        "pid": {
+          "type": ["integer", "null"],
+          "description": "Recorded pid, or null when liveness is `none`."
+        },
+        "since": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}$",
+          "description": "The lock's started_at verbatim (%Y-%m-%dT%H-%M-%S UTC, hyphen-delimited, no offset); opaque, never reformatted; null when `none`. The anchored pattern enforces exactly the §6.1 format (rejecting an ISO offset, colon-delimited time, or any other string); it constrains only the string form, so null still passes."
+        },
+        "host": {
+          "type": ["string", "null"],
+          "description": "The lock's recorded host, or null when `none`."
+        }
+      }
+    },
+    "parked": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["step_id", "type", "reason"],
+      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "description": "The parked step's rendered id."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["human_gate", "agent_task", "adversarial_cycle"],
+          "description": "The parked step's type."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": ["upstream_conflict", "cycle_escalation", null],
+          "description": "Park reason; null for a plain human_gate."
+        }
+      }
+    },
+    "failure": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["step_id", "status", "evidence_path"],
+      "description": "Present (object) iff state in {failed, halted, interrupted}, else null (enforced by the state-coupling allOf below).",
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "description": "The failing step's rendered id."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["failed", "halted", "interrupted"],
+          "description": "The failing step's status."
+        },
+        "evidence_path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*\\.\\.).+$",
+          "description": "POSIX-relative path under run_root (no leading slash, no `..`): the failing step's dir."
+        }
+      }
+    },
+    "reconciliation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["intent_step_id", "nonce_matches_lock", "recommended_command"],
+      "description": "Non-null iff read-only `status` detects a surviving .recovery-intent.json for the selected run instance (FR-5.6). Report-only — `status` never reconciles; null when no intent survives (or it is malformed/unreadable, which is a human-footer anomaly note only).",
+      "properties": {
+        "intent_step_id": {
+          "type": "string",
+          "description": "The step_id recorded in the surviving intent."
+        },
+        "nonce_matches_lock": {
+          "type": "boolean",
+          "description": "true when the intent's lock_nonce matches the current lock OR the lock is absent (reconciliation would FINALIZE — the live branch); false when the lock is present with a different nonce (reconciliation would DISCARD it as stale)."
+        },
+        "recommended_command": {
+          "type": "string",
+          "description": "Human-display command that finalizes the intent (e.g. `gauntlet recover <slug>`); for display only, never executed."
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "description": "Authoritative ordered step list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "iteration", "status"],
+        "properties": {
+          "id": {"type": "string", "description": "Step id."},
+          "iteration": {
+            "type": ["integer", "null"],
+            "description": "Iteration index for a cycle/foreach step, else null."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "done",
+              "failed",
+              "interrupted",
+              "parked",
+              "halted",
+              "skipped"
+            ],
+            "description": "Step status."
+          }
+        }
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "description": "Structured next action(s); always present, possibly empty (e.g. a done run). Each entry per FR-4.2.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "kind",
+          "argv",
+          "required_inputs",
+          "executable",
+          "command"
+        ],
+        "properties": {
+          "label": {"type": "string", "description": "Short action label."},
+          "kind": {
+            "type": "string",
+            "enum": ["observe", "decide", "control", "recover"],
+            "description": "Action class."
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "description": "Already-split, fully-resolved argument tokens — no shell quoting, no interpolation. Executed only when `executable` is true."
+          },
+          "required_inputs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Named operator-supplied inputs the action needs before it is runnable (empty when none)."
+          },
+          "executable": {
+            "type": "boolean",
+            "description": "true only when required_inputs is empty and argv is complete and safe to run as-is."
+          },
+          "command": {
+            "type": "string",
+            "description": "Rendered string for HUMAN DISPLAY ONLY, never for execution (may contain placeholder text)."
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "parked is an object iff the composite state is a parked class, else null.",
+      "if": {
+        "properties": {
+          "state": {"enum": ["parked_gate", "parked_for_response"]}
+        }
+      },
+      "then": {"properties": {"parked": {"type": "object"}}},
+      "else": {"properties": {"parked": {"type": "null"}}}
+    },
+    {
+      "description": "failure is an object iff the composite state is a failure class, else null.",
+      "if": {
+        "properties": {
+          "state": {"enum": ["failed", "halted", "interrupted"]}
+        }
+      },
+      "then": {"properties": {"failure": {"type": "object"}}},
+      "else": {"properties": {"failure": {"type": "null"}}}
+    }
+  ]
+}

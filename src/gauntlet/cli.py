@@ -193,13 +193,147 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
 
 
 @app.command()
-def status(slug: str) -> None:
-    """Show the current run status for <slug> (FR-8.1)."""
-    man = _manager().status(slug)
+def status(
+    slug: str,
+    json_output: bool = typer.Option(
+        False, "--json",
+        help="Emit the run state as a single JSON object conforming to "
+        "schemas/status.json (FR-4) — the stable machine contract for an agent "
+        "or script. Stdout is only the JSON; exits non-zero only on an actual "
+        "error (a parked/failed run is a valid state, exit 0).",
+    ),
+) -> None:
+    """Show the current run status for <slug> with driver liveness + next action.
+
+    Read-only (FR-1/FR-2): reports the computed driver liveness and the concrete
+    next action for the run's composite state. It never writes — a surviving
+    recovery intent is *reported*, never finalized (FR-5.6). With ``--json`` it
+    emits the same computed state as a lone, schema-stable JSON object (FR-4).
+    """
+    import json
+
+    from gauntlet.engine import operator
+    from gauntlet.engine.manifest import Manifest
+    from gauntlet.engine.operator import RunResolutionError, StatusContractError
+    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+
+    mgr = _manager()
+    # FR-10.1 containment: the slug and the active-run pointer both flow into
+    # filesystem paths, so validate the slug, resolve the instance through the
+    # safe resolver (which validates active-run.txt), and confirm the resolved
+    # instance stays under the slug dir BEFORE reading the manifest or a
+    # recovery intent — never via the unchecked `active_run_dir()` (F-002).
+    layout = mgr.layout(slug)
+    try:
+        safe_run_segment(slug, kind="slug")
+        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
+    except (UnsafeRunSegment, RunResolutionError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
+    except ValueError as exc:
+        typer.echo(
+            f"error: resolved run instance {run_instance_dir} escapes the run "
+            f"tree for {slug!r}; refusing to read it",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+    # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
+    # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
+    # empty on error), never an interleaved traceback.
+    try:
+        man = Manifest.load(run_instance_dir / "manifest.json")
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"error: cannot load manifest for {slug!r}: {exc}", err=True
+        )
+        raise typer.Exit(1) from exc
+
+    run_root = mgr.repo_root / mgr.config.run_root
+    driver = operator.driver_info(run_root, slug)
+    # A persisted-state contract violation (a non-canonical iteration, an unsafe
+    # step id, or a payload that fails schema validation) is an actual error
+    # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty
+    # rather than a contract-breaking object (operator F-001/F-002/F-003).
+    try:
+        rstate = operator.compute_run_state(man, driver.state)
+        recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
+
+        if json_output:
+            # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
+            # malformed surviving intent is a human-footer anomaly only, so `recon`
+            # is None there and `reconciliation` is null — never a fabricated object.
+            payload = operator.status_payload(
+                man, driver, rstate, recon,
+                run_root=run_root, run_instance_dir=run_instance_dir,
+            )
+            typer.echo(json.dumps(payload, indent=2))
+            return
+    except StatusContractError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
     typer.echo(f"{man.slug}: {man.status} (current step: {man.current_step})")
     for rec in man.steps:
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
+
+    for line in operator.render_footer(
+        driver, rstate, reconciliation=recon, anomaly=anomaly
+    ):
+        typer.echo(line)
+
+
+@app.command()
+def logs(
+    slug: str,
+    step: str = typer.Option(
+        None, "--step",
+        help="Step to show (default: the deterministically-selected last "
+        "non-done step). A top-level rendered id (`<id>` or `<id>.<iteration>`), "
+        "or a composite role sub-leaf path (`<cycle-leaf>/r2-fix`, "
+        "`<cycle-leaf>/r1-triage/<finding-id>`).",
+    ),
+) -> None:
+    """Surface a step's evidence: its dir + transcript tail (read-only, FR-3).
+
+    Resolves the run-instance and step deterministically from run metadata
+    (never mtime), prints the resolved dirs, the last 200 lines of the step's
+    transcript, and names the `events.jsonl` path (never parsed). It writes
+    nothing and reads only within the run tree; a missing/unreadable transcript
+    is a notice, not an error (exit 0).
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine.operator import (
+        LogsError,
+        RunResolutionError,
+        StatusContractError,
+    )
+    from gauntlet.engine.run import UnsafeRunSegment
+
+    mgr = _manager()
+    layout = mgr.layout(slug)
+    run_root = mgr.repo_root / mgr.config.run_root
+    try:
+        result = operator.resolve_logs(run_root, layout.slug_dir, slug, step=step)
+    except (UnsafeRunSegment, RunResolutionError, LogsError, StatusContractError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"run instance: {result.run_instance_dir}")
+    typer.echo(f"step: {result.step_id} ({result.step_status})")
+    typer.echo(f"step dir: {result.transcript_dir}")
+    typer.echo(f"events: {result.events_path}")
+    if result.transcript_lines is None:
+        typer.echo(result.notice)
+        return
+    suffix = f" (last {operator.TRANSCRIPT_TAIL_LINES} lines)" if result.truncated else ""
+    typer.echo(f"transcript: {result.transcript_path}{suffix}")
+    typer.echo("--- transcript ---")
+    for line in result.transcript_lines:
+        typer.echo(line)
 
 
 @app.command()
@@ -254,6 +388,36 @@ def resume(
 def abort(slug: str) -> None:
     """Abort a run (FR-8.1)."""
     typer.echo(f"run status: {_manager().abort(slug)}")
+
+
+@app.command()
+def recover(
+    slug: str,
+    reason: str = typer.Option(
+        None, "--reason",
+        help="Optional operator note recorded verbatim in the recovery audit "
+        "record (§6.4); omitted ⇒ recorded as null.",
+    ),
+) -> None:
+    """Terminate a verified, wedged live driver and mark its step INTERRUPTED (FR-5).
+
+    Operator-only and fail-closed: signals only a process it can prove via
+    process identity is the same driver it launched — on this host, still in the
+    recorded process group — never a recycled, foreign-host, or unverifiable PID.
+    Fills the gap `resume` cannot (a *live* lock is never reclaimed). It does
+    **not** auto-resume: run `gauntlet resume <slug>` afterwards. Refuses inside a
+    pipeline-agent context.
+    """
+    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.run import RecoverError, UnsafeRunSegment
+
+    mgr = _manager()
+    try:
+        status = mgr.recover(slug, reason=reason)
+    except (RecoverError, UnsafeRunSegment, RunResolutionError, FileNotFoundError) as exc:
+        typer.echo(f"recover refused: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"run status: {status}")
 
 
 @app.command()

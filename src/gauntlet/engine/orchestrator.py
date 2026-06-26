@@ -246,13 +246,15 @@ class Orchestrator:
             if rec is not None and rec.status in (M.DONE, M.SKIPPED):
                 ptr += 1
                 continue
-            # A consumed-response terminal FAILURE is reconciled bookkeeping-only,
-            # never re-executed (FR-7.1, review F-002): the human's --response was
-            # processed and the step genuinely failed, persisted as FAILED with the
-            # response already CONSUMED (and its checkpoint flushed at drive start).
-            # Re-running it would re-invoke the adapter and double-count the failure
-            # on every later resume; surface the failure instead.
-            if self._is_consumed_terminal_failure(rec):
+            # A terminal FAILURE is reconciled bookkeeping-only, never re-executed
+            # (FR-7.1/FR-9.3, review F-002): re-running it would re-invoke the
+            # adapter, double-count the failure, and — for a step whose terminal
+            # `failed` carries an `ended` timestamp — rewrite that state back to
+            # `running` on every later resume, breaking the clean-committed-worktree
+            # handoff invariant. Surface the failure instead so control passes to a
+            # human. The companion predicate excludes failures that a pending
+            # --response or an on_fail retry budget legitimately re-arms.
+            if self._is_terminal_failure(step, rec):
                 return FAILED
             if not eval_when(step.when, self._context(item, iteration)):
                 self._mark_skipped(step.id, iteration)
@@ -283,19 +285,41 @@ class Orchestrator:
         return DONE
 
     @staticmethod
-    def _is_consumed_terminal_failure(rec: StepRecord | None) -> bool:
-        """True for a FAILED record whose latest `--response` is already consumed.
+    def _is_terminal_failure(step: Step, rec: StepRecord | None) -> bool:
+        """True for a FAILED record that must surface, never re-execute on resume.
 
-        Such a record is a terminal, already-reconciled outcome (FR-7.1): a prior
-        invocation launched the response, it failed, and the finalize flipped the
-        entry to ``consumed`` and counted the one failure. It must never re-run.
+        A FAILED step is re-runnable on a response-less resume ONLY when something
+        legitimately re-arms it; absent that, the failure is terminal and a resume
+        must reconcile bookkeeping only — re-executing it would re-invoke the
+        adapter, double-count the failure (FR-6), and rewrite the terminal
+        ``failed`` state (with its stale ``ended`` timestamp) back to ``running``,
+        violating the clean-committed-worktree handoff (FR-9.3, review F-002).
+
+        Re-arming cases (NOT terminal):
+
+        - The latest ``--response`` is still ``pending``: a human injected a
+          decision the resume re-runs the step to consume (FR-7.1).
+        - The step carries an ``on_fail`` retry policy: its budget governs
+          re-entry, so a response-less resume re-runs it for the retry/reroute
+          (asserted by ``test_retry_budget_does_not_reset_across_resume``).
+
+        Terminal cases (surface FAILED):
+
+        - The latest ``--response`` is already ``consumed``: a prior invocation
+          launched the human's decision, it failed, and finalize counted the one
+          failure (the original FR-7.1 / F-002 guard).
+        - No ``--response`` history AND no ``on_fail`` policy: the step has no
+          re-entry path (e.g. an ``adversarial_cycle`` whose fixer made no
+          changes), so re-running only repeats the same failure.
         """
-        return (
-            rec is not None
-            and rec.status == M.FAILED
-            and bool(rec.human_responses)
-            and rec.human_responses[-1].state == M.RESPONSE_CONSUMED
-        )
+        if rec is None or rec.status != M.FAILED:
+            return False
+        if rec.human_responses:
+            # Pending → a human decision re-arms it; consumed → terminal.
+            return rec.human_responses[-1].state != M.RESPONSE_PENDING
+        # No human decision: an on_fail step is re-entered under its retry budget;
+        # a step without one has nowhere to go but a repeated failure.
+        return step.on_fail is None
 
     def _run_step_foreach(self, step: Step) -> str:
         items = resolve_list(step.foreach, self._context())
@@ -352,48 +376,63 @@ class Orchestrator:
         self.manifest.current_step = step.id
         if spec.step_touches_worktree(step) and rec.base_sha is None:
             rec.base_sha = self._head_sha()
-        # Per-step judge attribution: child agent hooks read GAUNTLET_STEP_ID
-        # (only under an active judge run; unit tests leave judge_env empty).
-        if self.judge_env:
-            os.environ["GAUNTLET_STEP_ID"] = step.id
+        # Per-step agent attribution: EVERY in-run child agent must see
+        # GAUNTLET_STEP_ID (FR-5.5) — it is both the per-step marker the judge's
+        # `pipeline_step_only` rules key on AND the operator-only boundary that
+        # makes an in-pipeline `gauntlet recover` refuse fail-closed. It is
+        # therefore exported for every step INDEPENDENT of whether a judge is
+        # configured: under `--no-judge` (judge_env empty) the guard must still
+        # fire, so that path is not exempt (review F-001). Captured and restored
+        # around the step so the marker never leaks past it into the parent
+        # session — the judge's env snapshot then sees it already restored.
+        prior_step_id = os.environ.get("GAUNTLET_STEP_ID")
+        os.environ["GAUNTLET_STEP_ID"] = step.id
         self._persist()  # WRITE-AHEAD: before any side effect
 
-        ctx = self._make_context(step, rec, iteration, item)
         try:
-            result = spec.handler(step, ctx)
-        except AgentTimeoutError as exc:
-            result = StepResult(
-                status=HALTED,
-                usage=exc.partial.usage if exc.partial else None,
-                session_id=exc.partial.session_id if exc.partial else None,
-                notes=f"timeout halt (FR-3.3): {exc}",
-            )
-        except Exception as exc:  # fail closed: a handler fault halts the step
-            result = StepResult(status=FAILED, notes=f"handler error: {exc}")
+            ctx = self._make_context(step, rec, iteration, item)
+            try:
+                result = spec.handler(step, ctx)
+            except AgentTimeoutError as exc:
+                result = StepResult(
+                    status=HALTED,
+                    usage=exc.partial.usage if exc.partial else None,
+                    session_id=exc.partial.session_id if exc.partial else None,
+                    notes=f"timeout halt (FR-3.3): {exc}",
+                )
+            except Exception as exc:  # fail closed: a handler fault halts the step
+                result = StepResult(status=FAILED, notes=f"handler error: {exc}")
 
-        result = self._apply_budget_guard(step, rec, result)
-        # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
-        # whether signalled by the textual UPSTREAM CONFLICT marker (first
-        # conflict) or a re-park disposition (amendment_required/new_conflict) —
-        # hands control to a human, so the worktree MUST be clean. The builder
-        # runs with repo-write access; if it wrote implementation edits and THEN
-        # signalled a conflict, those edits are still uncommitted. Restore the
-        # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
-        # `--response` resume never re-runs over — and commits — stale edits.
-        result = self._restore_clean_after_conflict_park(step, spec, rec, result)
-        consumed = self._finalize(rec, result)
-        self._persist()  # WRITE-AHEAD: after the side effect, terminal state
-        # The consume flip, the FAILED attempt-increment, and the status all
-        # landed in the single `_persist` above — one atomic on-disk transaction
-        # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
-        # the `consumed` checkpoint, so a crash here leaves the entry already
-        # `consumed` on disk and recovery merely flushes this commit, never
-        # re-executing or double-counting.
-        if consumed is not None:
-            self._commit_manifest_checkpoint(
-                f"gauntlet: response {consumed.response_id} consumed"
-            )
-        return result
+            result = self._apply_budget_guard(step, rec, result)
+            # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
+            # whether signalled by the textual UPSTREAM CONFLICT marker (first
+            # conflict) or a re-park disposition (amendment_required/new_conflict) —
+            # hands control to a human, so the worktree MUST be clean. The builder
+            # runs with repo-write access; if it wrote implementation edits and THEN
+            # signalled a conflict, those edits are still uncommitted. Restore the
+            # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
+            # `--response` resume never re-runs over — and commits — stale edits.
+            result = self._restore_clean_after_conflict_park(step, spec, rec, result)
+            consumed = self._finalize(rec, result)
+            self._persist()  # WRITE-AHEAD: after the side effect, terminal state
+            # The consume flip, the FAILED attempt-increment, and the status all
+            # landed in the single `_persist` above — one atomic on-disk transaction
+            # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
+            # the `consumed` checkpoint, so a crash here leaves the entry already
+            # `consumed` on disk and recovery merely flushes this commit, never
+            # re-executing or double-counting.
+            if consumed is not None:
+                self._commit_manifest_checkpoint(
+                    f"gauntlet: response {consumed.response_id} consumed"
+                )
+            return result
+        finally:
+            # Scoped restoration (FR-5.5): never leak this step's id into the next
+            # step or the parent session.
+            if prior_step_id is None:
+                os.environ.pop("GAUNTLET_STEP_ID", None)
+            else:
+                os.environ["GAUNTLET_STEP_ID"] = prior_step_id
 
     def _resume_disposition(
         self, step: Step, spec, rec: StepRecord
