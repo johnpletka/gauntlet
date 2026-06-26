@@ -8,6 +8,8 @@ into the parent session on success or failure.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,7 +121,7 @@ def test_spawn_moves_off_taken_port(monkeypatch, clean_managed_env):
     monkeypatch.setattr(ManagedJudge, "_free_port", staticmethod(lambda h: 54321))
     monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
 
-    def _popen(argv, env=None):
+    def _popen(argv, env=None, **kwargs):
         captured["argv"] = argv
         return _Proc()
 
@@ -151,7 +153,7 @@ def _patch_spawn(monkeypatch, captured):
 
     monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
 
-    def _popen(argv, env=None):
+    def _popen(argv, env=None, **kwargs):
         captured["argv"] = argv
         captured["env"] = env
         return _Proc()
@@ -229,7 +231,9 @@ class _LiveProc:
 def _spawn_live(monkeypatch, run_dir):
     monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
     monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
-    monkeypatch.setattr(judgeproc.subprocess, "Popen", lambda argv, env=None: _LiveProc())
+    monkeypatch.setattr(
+        judgeproc.subprocess, "Popen", lambda argv, env=None, **kwargs: _LiveProc()
+    )
     # Stub the identity read so the record write does not shell out to `ps`
     # (which the patched Popen would otherwise intercept). A real platform-tagged
     # identity is returned so proc_identity serialises like production.
@@ -272,6 +276,55 @@ def test_judge_record_written_on_start_removed_on_clean_stop(
     assert read_judge_record(tmp_path) is None
 
 
+def test_judge_spawned_in_own_session_group(monkeypatch, clean_managed_env, tmp_path):
+    # F-001 regression: ManagedJudge must launch the judge in its OWN session/
+    # process group. Otherwise the judge inherits the driver/console group, the
+    # recorded pgid names that shared group, and the FR-6 reaper's group-wide
+    # SIGTERM/SIGKILL kills unrelated siblings (FR-6.3 violation). Drive the real
+    # subprocess.Popen (keeping production kwargs intact) but swap the judge argv
+    # for a harmless sleeper so no real judge service is needed.
+    real_popen = judgeproc.subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def spawn_benign(argv, env=None, **kwargs):
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            env=env,
+            **kwargs,  # carries the production start_new_session through verbatim
+        )
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", spawn_benign)
+    mj = ManagedJudge(
+        policy_path=Path("p.yaml"),
+        audit_path=Path("a.jsonl"),
+        run_id="run-2026-06-25T16-41-22",
+        run_dir=tmp_path,
+    )
+    try:
+        mj.start()
+        rec = read_judge_record(tmp_path)
+        assert rec is not None
+        # The judge leads its own session: pgid == pid, and — crucially — NOT the
+        # driver/test-process group the reaper would otherwise be steered to kill.
+        assert rec.pgid == rec.pid
+        assert rec.pgid != os.getpgid(os.getpid())
+    finally:
+        for proc in spawned:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        mj._proc = None
+
+
 def test_judge_record_mode_is_0600(monkeypatch, clean_managed_env, tmp_path):
     # FR-5.1: the per-run judge token at rest is 0600 (§7 token-at-rest).
     mj = _spawn_live(monkeypatch, tmp_path)
@@ -305,7 +358,9 @@ def test_no_record_written_without_run_dir(monkeypatch, clean_managed_env, tmp_p
     # A standalone judge (no run_dir) writes no sidecar and does not blow up.
     monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
     monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
-    monkeypatch.setattr(judgeproc.subprocess, "Popen", lambda argv, env=None: _LiveProc())
+    monkeypatch.setattr(
+        judgeproc.subprocess, "Popen", lambda argv, env=None, **kwargs: _LiveProc()
+    )
     mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
     try:
         mj.start()  # run_dir is None → no record path, no write

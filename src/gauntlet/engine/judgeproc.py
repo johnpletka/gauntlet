@@ -328,7 +328,13 @@ class ManagedJudge:
             # hook subprocess (which it didn't, on claude — #29). The env var
             # stays as belt-and-suspenders for the hook fallback.
             argv += ["--repo-root", str(self.repo_root)]
-        self._proc = subprocess.Popen(argv, env=child_env)
+        # Isolate the judge in its own session/process group (F-001): without
+        # this the judge inherits the driver/console process group, so the
+        # recorded ``pgid`` (``os.getpgid(pid)``) would name the driver's group
+        # and the FR-6 reaper's group-wide SIGTERM/SIGKILL could kill unrelated
+        # sibling processes. A new session makes ``pgid == pid``, so cleanup only
+        # ever signals the judge's own group (FR-6.3).
+        self._proc = subprocess.Popen(argv, env=child_env, start_new_session=True)
         self._await_healthy()
         # The judge answered healthz: record its endpoint + reap identity for the
         # monitor (§6.3) and the cleanup verbs (FR-6). Best-effort (FR-5.2): a
