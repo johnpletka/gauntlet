@@ -911,3 +911,34 @@ process, and what it suggests for Gauntlet's design.
       README already routes Windows to WSL2) and document the limit. On
       native-Windows-without-WSL2 the launcher is no better than today's bare command
       at worst; it is not a regression for the supported configurations.
+
+## 2026-06-26 — background-start-services P3 (codex starter-prompt feasibility spike, OQ-2)
+
+53. **The pinned `codex` CLI DOES accept an initial prompt in interactive mode —
+    spike outcome (a): wire codex exactly like claude (positional prompt).**
+    OQ-2 / FR-7.1 required the P3 spike to resolve, before `--interactive=codex`
+    is accepted, whether the pinned codex can be seeded with the FR-9.1 starter
+    prompt (a monitor with no starter prompt is unsafe). Verified against the
+    pinned `codex-cli 0.139.0` (matches `.gauntlet/pins.yaml`): `codex --help`
+    reports `Usage: codex [OPTIONS] [PROMPT]` with `[PROMPT] Optional user prompt
+    to start the session` — i.e. the bare interactive `codex` (NOT the `codex
+    exec` one-shot subcommand) takes a positional initial prompt, exactly
+    analogous to `claude [prompt]` (`claude --help`: `Usage: claude [options]
+    [command] [prompt]`, "starts an interactive session by default"). So the
+    monitor wires both agents identically: `interactive.build_monitor_command`
+    emits `[<agent>, <composed-prompt>]` with `prompt_delivery="positional"`. The
+    defined fallback channels (stdin/prompt-file) and the fail-closed
+    unsupported-codex branch (spike outcomes (b)/(c)) are therefore NOT built —
+    they were contingent on codex *not* taking a positional prompt, which it does.
+    Codex is never launched unseeded.
+    - **Pin note:** the spike host had `claude 2.1.193` (the pin records
+      `2.1.190`); the positional-`[prompt]` interactive contract is stable Claude
+      Code behavior across that range and unrelated to the `-p` headless flags the
+      `ClaudeCodeAdapter` pins. No pin bump is warranted by this spike; re-record
+      if a future codex/claude release changes the interactive positional-prompt
+      surface.
+    - **One-shot guard:** because both monitors are *bare interactive* sessions,
+      `interactive.assert_interactive_argv` rejects any one-shot adapter token
+      (`-p`, `--print`, `--output-schema`, the `exec` subcommand) from ever
+      reaching the monitor argv — a future edit can't silently turn the monitor
+      into the non-interactive adapter path (review F-002).

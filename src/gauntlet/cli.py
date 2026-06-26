@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
+from typer.core import TyperCommand
 
 from gauntlet import __version__
 
@@ -18,6 +19,46 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Adversarial multi-agent development harness.",
 )
+
+# Bare `--interactive` selects this monitor agent (FR-7.1). Mirrors
+# interactive.DEFAULT_MONITOR_AGENT; a drift guard test pins them equal so the
+# normalization default below never diverges from the launcher's validator.
+_BARE_INTERACTIVE_VALUE = "claude"
+
+
+def _normalize_interactive_argv(args: list[str]) -> list[str]:
+    """Rewrite a bare ``--interactive`` token to ``--interactive=<default>``.
+
+    `--interactive[=claude|codex]` is an optional-value flag (FR-7.1): bare →
+    claude, ``--interactive=codex`` → codex. typer 0.26's vendored parser has no
+    optional-value support (a value-bearing option always demands an argument),
+    so we normalize the bare form here before the parser runs. Only an exact bare
+    ``--interactive`` token before any ``--`` separator is rewritten;
+    ``--interactive=<v>`` and tokens after ``--`` are left untouched.
+    """
+    out: list[str] = []
+    after_separator = False
+    for arg in args:
+        if not after_separator and arg == "--":
+            after_separator = True
+        elif not after_separator and arg == "--interactive":
+            out.append(f"--interactive={_BARE_INTERACTIVE_VALUE}")
+            continue
+        out.append(arg)
+    return out
+
+
+class _InteractiveCommand(TyperCommand):
+    """A typer command whose ``--interactive`` is an optional-value flag (FR-7.1).
+
+    typer 0.26's parser cannot express an option that is bare-or-valued, so this
+    subclass normalizes a bare ``--interactive`` to ``--interactive=<default>``
+    in :meth:`parse_args` before delegating to the normal parser. Everything else
+    about the command is unchanged.
+    """
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        return super().parse_args(ctx, _normalize_interactive_argv(args))
 
 judge_app = typer.Typer(no_args_is_help=True, help="Safety judge service (FR-7).")
 app.add_typer(judge_app, name="judge")
@@ -113,7 +154,7 @@ def new(slug: str) -> None:
     )
 
 
-@app.command()
+@app.command(cls=_InteractiveCommand)
 def run(
     slug: str,
     pipeline: str = typer.Option("standard", help="Pipeline name under pipelines/."),
@@ -140,6 +181,14 @@ def run(
         "(boot/reuse it) and print its URL before running in the foreground "
         "(FR-12.1).",
     ),
+    interactive: str = typer.Option(
+        None, "--interactive",
+        help="Launch the run DETACHED and hand the terminal to an interactive "
+        "monitor agent (bare → claude; --interactive=codex for codex). The "
+        "monitor is wired to the run's judge as the operator's own session when "
+        "the judge is live and the driver is alive, else a normal prompted "
+        "session (FR-7). Composes with --watch.",
+    ),
     console_host: str = typer.Option(
         "127.0.0.1", "--console-host", help="Console bind host for --watch.",
     ),
@@ -149,6 +198,29 @@ def run(
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
+    if interactive is not None:
+        # --interactive launches the run detached + foregrounds the monitor; the
+        # pre-allocation/handshake is owned by the launch path, so the manual
+        # --run-id/--reservation-token and --pipeline-file knobs do not apply.
+        if run_id is not None or reservation_token is not None:
+            typer.echo(
+                "error: --run-id/--reservation-token are managed automatically by "
+                "--interactive (it pre-allocates the run-id + reservation token)",
+                err=True,
+            )
+            raise typer.Exit(2)
+        if pipeline_file is not None:
+            typer.echo(
+                "error: --pipeline-file is not supported with --interactive; use "
+                "--pipeline <name>",
+                err=True,
+            )
+            raise typer.Exit(2)
+        _run_interactive(
+            mgr, slug, agent=interactive, pipeline=pipeline, no_judge=no_judge,
+            watch=watch, console_host=console_host, console_port=console_port,
+        )
+        return
     if watch:
         _ensure_watch_console(mgr, host=console_host, port=console_port)
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
@@ -157,6 +229,55 @@ def run(
         reservation_token=reservation_token,
     )
     typer.echo(f"run status: {status}")
+
+
+def _run_interactive(
+    mgr, slug: str, *, agent: str, pipeline: str, no_judge: bool, watch: bool,
+    console_host: str, console_port: int,
+) -> None:
+    """`gauntlet run <slug> --interactive`: detached run + foreground monitor (FR-7).
+
+    Validates the monitor agent BEFORE any launch (FR-7.1), optionally boots the
+    --watch console (composes), pre-allocates a run-id + single-use reservation
+    token and launches the run DETACHED via the sanctioned RunProcess handshake
+    (FR-7.2, reusing the console supervisor's launch path), then foregrounds the
+    shared monitor on that run's dir (FR-7.3). The monitor exec replaces this
+    process; the detached run keeps running.
+    """
+    from gauntlet import interactive as interactive_mod
+    from gauntlet.web.supervisor import JobSupervisor
+
+    # Unknown agent errors before any launch, naming the valid choices (FR-7.1).
+    try:
+        interactive_mod.validate_monitor_agent(agent)
+    except interactive_mod.MonitorAgentError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    if watch:
+        _ensure_watch_console(mgr, host=console_host, port=console_port)
+
+    # Pre-allocate run-id + reservation token and launch DETACHED via RunProcess
+    # (FR-7.2) — the same FR-6.1a handshake the console supervisor uses.
+    supervisor = JobSupervisor(mgr.repo_root, mgr.config)
+    rp = supervisor.launch_run(slug, pipeline=pipeline, no_judge=no_judge)
+    typer.echo(
+        f"run launched detached: {slug}/{rp.run_id} (log: {rp.log_path})"
+    )
+
+    # Foreground the operator monitor on the just-launched run (FR-7.3). This
+    # execs and replaces the process; the detached run keeps running.
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    interactive_mod.launch_monitor(
+        repo_root=repo_root,
+        run_root=run_root,
+        slug=slug,
+        run_dir=rp.run_dir,
+        agent=agent,
+        use_judge=not no_judge,
+        asset_root=mgr.config.asset_root,
+    )
 
 
 def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
