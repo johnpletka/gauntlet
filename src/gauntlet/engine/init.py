@@ -202,7 +202,7 @@ def _preflight_destinations(repo_root: Path, *, from_repo: bool) -> None:
     from gauntlet.engine import skill as S
 
     asset_root = _effective_asset_root(repo_root, from_repo=from_repo)
-    rels = [S.SKILL_REL, PS.stub_rel(asset_root)]
+    rels = [spec.skill_rel for spec in S.SKILL_REGISTRY] + [PS.stub_rel(asset_root)]
     if not from_repo:
         rels = [dst for _src, dst in _asset_pairs()] + rels
     for rel in rels:
@@ -321,20 +321,34 @@ def _resolve_asset_root(repo_root: Path) -> str:
 
 
 def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> None:
-    """Install the committable ``gauntlet-prd-author`` skill (FR-1.1, §4.5).
+    """Install every committable skill in the registry (FR-1.1, §4.5, FR-7.3).
 
-    Posture mirrors the judge-hook wiring: create-if-absent, idempotent,
-    never-clobber a customization, fail-closed on malformed pre-existing state.
-    Recognition of a prior-generated file is the version-keyed
-    re-render-and-compare in :mod:`gauntlet.engine.skill` (review F-004), so an
-    *unmodified* generated file may be refreshed to the current template/path
-    (§4.5) while a customization is only ever warned about, never modified.
+    Iterates ``skill.SKILL_REGISTRY`` (the prd-author and operator skills), each
+    installed with the *same* posture: create-if-absent, idempotent, never-clobber
+    a customization, fail-closed on malformed pre-existing state. Recognition of a
+    prior-generated file is the version-keyed re-render-and-compare in
+    :mod:`gauntlet.engine.skill` (review F-004), so an *unmodified* generated file
+    may be refreshed to the current template/path (§4.5) while a customization is
+    only ever warned about, never modified.
     """
     from gauntlet.engine import skill as S
 
-    rel = S.SKILL_REL
-    target = repo_root / rel
     asset_root = _resolve_asset_root(repo_root)
+    for spec in S.SKILL_REGISTRY:
+        _scaffold_one_skill(repo_root, result, spec, asset_root, from_repo=from_repo)
+
+
+def _scaffold_one_skill(
+    repo_root: Path,
+    result: InitResult,
+    spec,
+    asset_root: str,
+    *,
+    from_repo: bool,
+) -> None:
+    """Install/verify a single registry skill (the per-spec body of FR-7.3)."""
+    rel = spec.skill_rel
+    target = repo_root / rel
     # Malformed pre-existing state (a symlink or non-regular node at the skill
     # path) is rejected in _preflight_destinations before any write (FR-3.2 /
     # review F-001, F-005), so the destination here is absent or a regular file.
@@ -346,22 +360,22 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
         # F-004): the same version-keyed re-render-and-compare predicate decides.
         if not target.exists():
             result.add(rel, MISSING)
-        elif S.classify_skill(target.read_text()) == "customization":
+        elif spec.classify(target.read_text()) == "customization":
             result.add(rel, CUSTOMIZED, "committed skill is customized; left to the team")
         else:
             result.add(rel, PRESENT, "committed generated skill")
         return
 
-    rendered = S.render_skill(S.current_template_path().read_text(), asset_root)
+    rendered = spec.render(spec.template_path().read_text(), asset_root)
 
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(rendered)
-        result.add(rel, CREATED, "PRD-authoring skill (thin pointer)")
+        result.add(rel, CREATED, f"{spec.name} skill (thin pointer)")
         return
 
     existing = target.read_text()
-    if S.classify_skill(existing) == "generated":
+    if spec.classify(existing) == "generated":
         # Unmodified generated file: refresh it when the current template or the
         # resolved playbook path has moved on (§4.5 — the only overwrite init does).
         if existing != rendered:
@@ -372,10 +386,10 @@ def _scaffold_skill(repo_root: Path, result: InitResult, *, from_repo: bool) -> 
         return
 
     # A customization: never overwrite. Warn (only) when it looks stale (§4.5).
-    if S.skill_looks_stale(existing, asset_root):
+    if spec.looks_stale(existing, asset_root):
         result.add(
             rel, WARNED,
-            f"customized skill looks stale: playbook ref {S.playbook_ref(asset_root)!r} "
+            f"customized skill looks stale: playbook ref {spec.playbook_ref(asset_root)!r} "
             "not found; review it (re-run does not modify a customization)",
         )
     else:
@@ -532,27 +546,28 @@ def _warn_if_skill_ignored(repo_root: Path, result: InitResult) -> None:
     """
     from gauntlet.engine import skill as S
 
-    rel = S.SKILL_REL
-    try:
-        proc = subprocess.run(
-            ["git", "check-ignore", "-v", rel],
-            cwd=repo_root, capture_output=True, text=True, timeout=10,
+    for spec in S.SKILL_REGISTRY:
+        rel = spec.skill_rel
+        try:
+            proc = subprocess.run(
+                ["git", "check-ignore", "-v", rel],
+                cwd=repo_root, capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        # git check-ignore: 0 = a rule matches (ignored); 1 = committable (the good
+        # case); 128 = not a work tree / fatal. Only an actual match is worth warning.
+        if proc.returncode != 0:
+            continue
+        first = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
+        # `-v` format is "<source>:<linenum>:<pattern>\t<pathname>"; the source is the
+        # ignore file the maintainer owns (or the global core.excludesFile path).
+        source = first.split(":", 1)[0] if first else "an effective .gitignore rule"
+        result.add(
+            rel, WARNED,
+            f"would be excluded by {source}; the committable skill must reach git — "
+            "commit it with `git add -f` or amend that ignore rule (init left it intact)",
         )
-    except (OSError, subprocess.SubprocessError):
-        return
-    # git check-ignore: 0 = a rule matches (ignored); 1 = committable (the good
-    # case); 128 = not a work tree / fatal. Only an actual match is worth warning.
-    if proc.returncode != 0:
-        return
-    first = next((ln for ln in proc.stdout.splitlines() if ln.strip()), "")
-    # `-v` format is "<source>:<linenum>:<pattern>\t<pathname>"; the source is the
-    # ignore file the maintainer owns (or the global core.excludesFile path).
-    source = first.split(":", 1)[0] if first else "an effective .gitignore rule"
-    result.add(
-        rel, WARNED,
-        f"would be excluded by {source}; the committable skill must reach git — "
-        "commit it with `git add -f` or amend that ignore rule (init left it intact)",
-    )
 
 
 def _ensure_gitignore_guidance(repo_root: Path, result: InitResult) -> None:
