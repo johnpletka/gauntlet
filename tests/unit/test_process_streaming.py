@@ -201,6 +201,48 @@ def test_timeout_enforced_after_stdout_stderr_eof():
     assert not alive, f"child {child_pid} survived the EOF-then-hang timeout"
 
 
+def test_clean_exit_at_deadline_not_falsely_timed_out(monkeypatch):
+    # Regression: when both pipes hit EOF with the wall-clock budget already
+    # spent, the post-EOF reap must NOT degenerate to ``proc.wait(timeout=0.0)``,
+    # which polls once and raises TimeoutExpired for a child that closed its
+    # pipes and is exiting cleanly but has not yet been reaped (EOF and reaping
+    # separated by scheduler latency). The small reap grace must absorb that and
+    # report the real clean exit (timed_out=False, exit_code 0) instead of
+    # killing a healthy process and discarding its result.
+    import gauntlet.adapters.process as proc_mod
+
+    timeout_s = 2.0
+    base = 1000.0
+    # Scripted clock: call 1 = start, call 2 = the single loop iteration (sees
+    # ~0 elapsed → remaining ≈ timeout_s, so no in-loop timeout). From the
+    # post-loop reap computation onward the budget reads as fully spent
+    # (remaining < 0) — the exact boundary that used to force wait(timeout=0.0).
+    calls = {"n": 0}
+
+    def fake_monotonic():
+        calls["n"] += 1
+        return base if calls["n"] <= 2 else base + timeout_s + 1.0
+
+    monkeypatch.setattr(proc_mod.time, "monotonic", fake_monotonic)
+
+    # Child closes both pipes up front (both EOFs ready in one select → a single
+    # loop pass), stays alive briefly (well within the reap grace), then exits 0.
+    # os._exit avoids interpreter-shutdown flush errors on the closed std fds.
+    script = (
+        "import os, time\n"
+        "os.close(1)\n"
+        "os.close(2)\n"
+        "time.sleep(0.2)\n"
+        "os._exit(0)\n"
+    )
+    out = run_with_timeout(
+        _child(script), timeout_s=timeout_s, sink=lambda _line: None
+    )
+
+    assert not out.timed_out  # clean exit at the deadline is not a timeout
+    assert out.exit_code == 0
+
+
 # --------------------------------------------------------------------------
 # FR-1.4 — field-for-field ProcessOutput parity
 # --------------------------------------------------------------------------

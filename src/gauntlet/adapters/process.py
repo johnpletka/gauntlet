@@ -43,6 +43,14 @@ _READ_CHUNK = 65536
 # grandchild holding a pipe open can never hang teardown.
 _FINAL_DRAIN_S = 5.0
 
+# Grace granted to reap a child whose pipes have already hit EOF when the
+# wall-clock budget is exhausted. Pipe EOF is strong evidence the child is
+# exiting, but EOF and reaping can be separated by scheduler latency; without a
+# grace, ``proc.wait(timeout=0.0)`` polls once and falsely reports a timeout for
+# a cleanly-completing child. Kept small so it never materially loosens the hard
+# timeout (FR-3.3) — a child that stays alive past it is a genuine post-EOF hang.
+_REAP_GRACE_S = 0.5
+
 
 @dataclass(frozen=True)
 class ProcessOutput:
@@ -62,8 +70,11 @@ class StreamSinkError(RuntimeError):
     Raised only after the child's process group has been killed and its pipes
     drained, so a sink fault never leaves a live child, an undrained pipe, or a
     skipped process-group cleanup. The original sink exception is the
-    ``__cause__``; the adapter records the step as failed (fail-closed) rather
-    than continuing with output silently dropped or un-redacted.
+    ``__cause__``. This is intentionally NOT an :class:`AdapterError`: it
+    propagates past the adapters' (and engine's) ``except AdapterError`` handlers
+    to the orchestrator's generic fail-closed handler, which records the step
+    FAILED (FR-6.2) rather than continuing with output silently dropped or
+    un-redacted. The streamed lines persisted before the fault stay on disk.
     """
 
 
@@ -298,8 +309,19 @@ def _run_streaming(
         # of blocking forever on the final ``proc.wait()``.
         if not timed_out:
             remaining = timeout_s - (time.monotonic() - start)
+            # Both pipes are at EOF, so the child has closed fd 1 and fd 2 and is
+            # almost certainly exiting. ``proc.wait(timeout=0.0)`` does NOT sleep —
+            # it polls once and raises ``TimeoutExpired`` if the child has not yet
+            # been reaped — so a bare ``max(remaining, 0.0)`` would falsely mark a
+            # cleanly-completing child as timed out whenever the budget is spent at
+            # the moment EOF lands (remaining ≤ 0) and EOF/reaping are separated by
+            # scheduler latency. Floor the reap budget at the small ``_REAP_GRACE_S``
+            # so a child that is genuinely finishing is reaped, while a child that
+            # stays alive past it is still surfaced as a real post-EOF hang (FR-3.3).
+            # A child exiting promptly returns immediately regardless of the ceiling,
+            # so this only extends the wait when the budget was already exhausted.
             try:
-                proc.wait(timeout=max(remaining, 0.0))
+                proc.wait(timeout=max(remaining, _REAP_GRACE_S))
             except subprocess.TimeoutExpired:
                 timed_out = True
     except BaseException as exc:  # sink fault or unexpected reader error
