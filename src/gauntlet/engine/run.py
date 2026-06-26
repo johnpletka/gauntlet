@@ -26,7 +26,11 @@ from gauntlet.engine import gitops, manifest as M, prd_stub
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.execution import run_bookkeeping_excludes
 from gauntlet.engine.identity import resolve_operator_identity
-from gauntlet.engine.judgeproc import ManagedJudge
+from gauntlet.engine.judgeproc import (
+    JUDGE_RECORD_NAME,
+    ManagedJudge,
+    read_judge_record,
+)
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator, ResponseAction
 from gauntlet.engine.pipeline import load_pipeline
@@ -34,6 +38,7 @@ from gauntlet.engine.validate import validate_pipeline
 from gauntlet.logging.redact import RedactingWriter, build_redactor
 from gauntlet.procident import (
     ProcessIdentity,
+    process_is_alive,
     read_process_identity,
 )
 
@@ -1323,6 +1328,88 @@ class RunManager:
         return orch.reject_gate(gate, notes)
 
     # ---- abort --------------------------------------------------------------
+    # ---- orphaned-judge reaping on cleanup verbs (FR-6) ---------------------
+    def _reap_orphaned_judge(self, run_dir: Path, slug: str) -> str | None:
+        """Reap the run's per-run judge iff it is *orphaned* and *ours* (FR-6).
+
+        Called by the cleanup verbs (`abort`/`finish`/`clean`). The judge is
+        signalled **iff all three** hold; any other case sends **no signal**,
+        leaves ``judge.json`` intact, and returns ``None`` (fail closed, §6.4):
+
+        (a) ``judge.json`` records a judge whose **own** identity verifies as
+            ours on **this host** — :func:`procident.process_is_alive` (PID live
+            + exact creation-time identity match) plus a host equality check
+            (FR-6.1/FR-6.2). An absent/mismatched/``null``/unsupported-platform
+            identity datum fails closed here, never a foreign or PID-reused kill.
+        (b) the recorded ``pgid`` still belongs to that verified PID — a
+            **positive** ``os.getpgid(pid)`` **equal** to the record (review
+            F-001), so a stale or corrupted record can never steer a group
+            signal at an unrelated process group.
+        (c) the **owning driver is gone** — :func:`operator.driver_liveness`
+            (the single sanctioned §6.4 primitive, never inferred from any other
+            artifact) is ``orphaned`` or ``none``. A driver that is ``alive``
+            (running) or ``indeterminate`` (liveness unprovable) → never reap.
+
+        On all three: SIGTERM→SIGKILL the re-confirmed group (bounded grace) and
+        remove ``judge.json``. Best-effort — it never raises into the calling
+        verb: a verified-but-unsignalable judge (EPERM) is left in place rather
+        than crashing the cleanup. It never touches the shared console (FR-6.3):
+        only the group recorded in ``judge.json`` is ever a target.
+        """
+        from gauntlet.engine import operator
+
+        record = read_judge_record(run_dir)
+        if record is None:
+            return None  # no / malformed judge.json → nothing to reap
+
+        # (a) the judge's own identity must verify as ours on this host.
+        if record.host != socket.gethostname():
+            return None  # foreign-host PID in a shared run root → never signal
+        identity = ProcessIdentity.from_dict(record.proc_identity)
+        if not process_is_alive(record.pid, identity):
+            # dead / PID-reused / null identity / unsupported platform → no kill
+            return None
+
+        # (b) the recorded pgid must still be the verified PID's group (F-001):
+        # re-confirm it so a stale/corrupted record can never steer the signal.
+        try:
+            actual_pgid = os.getpgid(record.pid)
+        except OSError:
+            return None
+        if actual_pgid <= 0 or actual_pgid != record.pgid:
+            return None  # non-positive or mismatched group → fail closed
+
+        # (c) the owning driver must be provably gone (orphaned/none) — §6.4.
+        liveness = operator.driver_liveness(self._run_root_dir(), slug)
+        if liveness not in (operator.LIVENESS_ORPHANED, operator.LIVENESS_NONE):
+            return None  # alive (running) or indeterminate → fail closed
+
+        # All three hold: signal the re-confirmed group, then drop the record.
+        try:
+            outcome = _signal_process_group(record.pgid)
+        except RecoverSignalError:
+            # EPERM: identity proven but the OS refuses the signal — the judge is
+            # still alive and unkillable by us. Leave judge.json so a privileged
+            # operator can still find it; never derail the cleanup verb.
+            return None
+        _unlink_durable(run_dir / JUDGE_RECORD_NAME)
+        return outcome
+
+    def _reap_orphaned_judge_safe(self, layout: "RunLayout") -> None:
+        """Resolve the active run dir and reap its orphaned judge, if any (FR-6).
+
+        Wraps :meth:`_reap_orphaned_judge` for a verb that may run after the
+        active-run pointer is gone (e.g. `clean` reclaiming a stale pointer): a
+        missing or unsafe pointer simply means there is no run dir to read
+        ``judge.json`` from, so there is nothing to reap — skip, never fail the
+        verb.
+        """
+        try:
+            run_dir = layout.active_run_dir()
+        except (FileNotFoundError, UnsafeRunSegment):
+            return
+        self._reap_orphaned_judge(run_dir, layout.slug)
+
     def abort(self, slug: str) -> str:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -1338,6 +1425,9 @@ class RunManager:
             )
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
+        # FR-6: an orphaned judge left by a dead/crashed driver is reaped here
+        # (identity-verified, driver-gone-only); a live run's judge is untouched.
+        self._reap_orphaned_judge(run_dir, slug)
         return man.status
 
     # ---- recover (operator-aids P4, FR-5) -----------------------------------
@@ -1833,6 +1923,11 @@ class RunManager:
         """
         layout = self.layout(slug)
         repo = self.repo_root
+        # FR-6: reap an orphaned judge while the active-run pointer still
+        # resolves the run dir (clean clears it below). Driver-gone-only +
+        # identity-verified; a live run's judge and the shared console are left
+        # untouched.
+        self._reap_orphaned_judge_safe(layout)
         branch = f"{self.config.branch_prefix}{slug}"
         if not gitops.branch_exists(repo, branch):
             cleared = self._clear_active_pointer(layout)
@@ -1895,6 +1990,9 @@ class RunManager:
         man = Manifest.load(run_dir / "manifest.json")
         repo = self.repo_root
         branch, base = man.branch, man.base_branch
+        # FR-6: a completed run's driver is gone, so reap its orphaned judge
+        # here (identity-verified, driver-gone-only); never the shared console.
+        self._reap_orphaned_judge(run_dir, slug)
 
         if man.status != M.RUN_DONE:
             raise FinishError(
