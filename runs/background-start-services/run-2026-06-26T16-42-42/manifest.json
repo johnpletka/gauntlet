@@ -382,14 +382,14 @@
     {
       "id": "implement",
       "type": "agent_task",
-      "status": "parked",
+      "status": "done",
       "agent": "builder",
       "session_id": "2fe848bb-ec53-41dc-83d2-889e9764d834",
       "started": "2026-06-26T17:56:08.350462+00:00",
-      "ended": "2026-06-26T18:18:12.072734+00:00",
+      "ended": "2026-06-26T20:43:24.757634+00:00",
       "attempts": 0,
       "base_sha": "99360d875d3b177103283a9fe632b68101c6dd7b",
-      "parked_reason": "upstream_conflict",
+      "parked_reason": null,
       "human_responses": [
         {
           "response_id": "implement-resp-1",
@@ -405,16 +405,16 @@
           "timestamp": "2026-06-26T20:33:58.625321+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 2,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 4892,
-        "output_tokens": 78485,
-        "cached_input_tokens": 5547037,
-        "cost_usd": 10.985777500000001
+        "input_tokens": 5182,
+        "output_tokens": 113490,
+        "cached_input_tokens": 10355299,
+        "cost_usd": 17.6213335
       },
-      "notes": "resume disposition: amendment_required (FR-3/FR-5/FR-10)",
+      "notes": "agent 'builder' completed",
       "iteration": "2",
       "metrics": {}
     }
@@ -457,10 +457,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 1583303,
-    "output_tokens": 290778,
-    "cached_input_tokens": 22513053,
-    "cost_usd": 29.268136500000008
+    "input_tokens": 1583593,
+    "output_tokens": 325783,
+    "cached_input_tokens": 27321315,
+    "cost_usd": 35.903692500000005
   },
   "agent_usage": {
     "reviewer": {
@@ -476,10 +476,10 @@
       "cost_usd": 0.024827500000000002
     },
     "builder": {
-      "input_tokens": 46299,
-      "output_tokens": 236156,
-      "cached_input_tokens": 21516445,
-      "cost_usd": 29.143490500000002
+      "input_tokens": 46589,
+      "output_tokens": 271161,
+      "cached_input_tokens": 26324707,
+      "cost_usd": 35.7790465
     },
     "judge_llm": {
       "input_tokens": 140330,

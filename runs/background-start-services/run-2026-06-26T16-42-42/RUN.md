@@ -3,7 +3,7 @@
 - branch: `gauntlet/background-start-services` (base `main`)
 - pipeline: `standard` v1 (`sha256:12f8ab6fc08d…`)
 - status: **running** (at `implement`)
-- totals: 1583303in/290778out $29.2681
+- totals: 1583593in/325783out $35.9037
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -21,7 +21,7 @@
 | [tests.1](steps/tests.1/) | shell | done | 93s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.1 | commit | done | 17s | 2063in/1325out $0.0032 | committed 05d17ba1de |
 | [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 548s | 499985in/19297out $1.9125 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.2](steps/implement.2/transcript.md) | agent_task | parked | 1324s | 4892in/78485out $10.9858 | resume disposition: amendment_required (FR-3/FR-5/FR-10) |
+| [implement.2](steps/implement.2/transcript.md) | agent_task | done | 10036s | 5182in/113490out $17.6213 | agent 'builder' completed |
 
 ## Commits
 
