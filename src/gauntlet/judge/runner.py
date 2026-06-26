@@ -109,6 +109,7 @@ def serve(
     port: int = DEFAULT_PORT,
     token: str | None = None,
     repo_root: Path | None = None,
+    run_id: str | None = None,
 ) -> None:  # pragma: no cover - exercised via the live contract suite
     import os
     import sys
@@ -125,7 +126,7 @@ def serve(
         policy_path=policy_path, audit_path=audit_path, judge_model=judge_model,
         repo_root=repo_root,
     )
-    app = create_app(core, token=resolved_token)
+    app = create_app(core, token=resolved_token, expected_run_id=run_id)
     print(f"gauntlet judge listening on http://{host}:{port}")
     print(f"{TOKEN_ENV_VAR}={resolved_token}")
     # Resolve the model the SAME way doctor does, so "enabled" is never printed

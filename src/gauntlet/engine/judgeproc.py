@@ -314,6 +314,11 @@ class ManagedJudge:
             self.host,
             "--port",
             str(self.port),
+            # Bind the judge to THIS run (FR-10.2): /decide rejects any request
+            # whose run_id does not match, so a valid-token caller for a different
+            # (or absent) run is never classified+allowed as if it were ours.
+            "--run-id",
+            self.run_id,
         ]
         if self.judge_model:
             argv += ["--judge-model", self.judge_model]

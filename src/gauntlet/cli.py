@@ -649,6 +649,10 @@ def judge_serve(
         None, help="Authoritative repo boundary for path checks (#31); "
         "the engine passes this so checks never depend on the agent's cwd."
     ),
+    run_id: str = typer.Option(
+        None, help="Bind the judge to this run id (FR-10.2); /decide rejects "
+        "requests whose run_id does not match. Omit for a run-agnostic dev judge."
+    ),
 ) -> None:
     """Run the localhost judge service (dev command; engine-managed in P3)."""
     from gauntlet.judge.runner import serve
@@ -662,4 +666,5 @@ def judge_serve(
         host=host,
         port=port,
         repo_root=repo_root,
+        run_id=run_id,
     )

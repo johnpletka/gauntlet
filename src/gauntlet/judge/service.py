@@ -37,13 +37,29 @@ class DecideResponse(BaseModel):
     matched_rule: str | None = None
 
 
-def create_app(core: JudgeCore, *, token: str) -> FastAPI:
+def create_app(
+    core: JudgeCore, *, token: str, expected_run_id: str | None = None
+) -> FastAPI:
     app = FastAPI(title="gauntlet-judge", docs_url=None, redoc_url=None)
 
     def _check_token(supplied: str | None) -> None:
         # constant-time compare; reject foreign callers (§8)
         if not supplied or not hmac.compare_digest(supplied, token):
             raise HTTPException(status_code=401, detail="bad or missing judge token")
+
+    def _check_run_id(supplied: str | None) -> None:
+        # FR-10.2: authorization is per-RUN, not merely per-token. A request that
+        # carries the right token but a missing or different run_id is for some
+        # other run (or none); reject it rather than classify+allow it as if it
+        # belonged here. When the judge is not bound to a run (standalone
+        # `gauntlet judge serve` with no --run-id) expected_run_id is None and
+        # this check stands aside.
+        if expected_run_id is None:
+            return
+        if not supplied or not hmac.compare_digest(supplied, expected_run_id):
+            raise HTTPException(
+                status_code=403, detail="run_id does not match this judge"
+            )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -57,6 +73,7 @@ def create_app(core: JudgeCore, *, token: str) -> FastAPI:
         x_gauntlet_token: str | None = Header(default=None, alias=TOKEN_HEADER),
     ) -> DecideResponse:
         _check_token(x_gauntlet_token)
+        _check_run_id(req.run_id)
         decision = core.decide(
             req.tool_name,
             req.tool_input,

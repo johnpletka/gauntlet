@@ -36,12 +36,20 @@ def client():
     return TestClient(create_app(core, token=TOKEN))
 
 
-def _decide(client, command, *, step_id, token=TOKEN):
+@pytest.fixture
+def bound_client():
+    # A judge bound to THIS run's id (as the engine starts it, FR-10.2): /decide
+    # must reject a valid-token request whose run_id is wrong or missing.
+    core = JudgeCore(PolicyEngine(Policy.load(POLICY)))
+    return TestClient(create_app(core, token=TOKEN, expected_run_id=RUN_ID))
+
+
+def _decide(client, command, *, step_id, token=TOKEN, run_id=RUN_ID):
     body = {
         "tool_name": "Bash",
         "tool_input": {"command": command},
         "repo_root": str(REPO_ROOT),
-        "run_id": RUN_ID,
+        "run_id": run_id,
     }
     if step_id is not None:
         body["step_id"] = step_id
@@ -112,3 +120,35 @@ def test_fr10_2_operator_shape_with_missing_token_is_rejected(client):
     }
     resp = client.post("/decide", json=body)  # no X-Gauntlet-Token header
     assert resp.status_code == 401
+
+
+def test_fr10_2_operator_shape_with_wrong_run_id_is_rejected(bound_client):
+    # FR-10.2: even with the CORRECT token, a request whose run_id does not match
+    # the judge is rejected (403), not classified+allowed as if it belonged to
+    # this run — the explicit PRD acceptance case (prd.md §FR-10.2).
+    resp = _decide(
+        bound_client, "git push origin feature-x", step_id=None,
+        run_id="run-some-other-run",
+    )
+    assert resp.status_code == 403
+
+
+def test_fr10_2_operator_shape_with_missing_run_id_is_rejected(bound_client):
+    # A bound judge also rejects a valid-token request that omits run_id entirely.
+    body = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push origin feature-x"},
+        "repo_root": str(REPO_ROOT),
+    }
+    resp = bound_client.post(
+        "/decide", headers={"X-Gauntlet-Token": TOKEN}, json=body
+    )
+    assert resp.status_code == 403
+
+
+def test_fr10_2_bound_judge_allows_matching_run_id(bound_client):
+    # The correct run_id + token still works against a bound judge — the new
+    # check rejects mismatches without breaking the legitimate operator caller.
+    resp = _decide(bound_client, "git status", step_id=None)
+    assert resp.status_code == 200
+    assert resp.json()["decision"] == "allow"
