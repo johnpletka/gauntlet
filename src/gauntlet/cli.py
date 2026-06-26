@@ -122,6 +122,40 @@ def _manager() -> "object":
     return RunManager(Path.cwd())
 
 
+def _resolve_run_instance_dir(mgr, slug: str) -> Path:
+    """Resolve <slug>'s run instance through the safe resolver (review F-002).
+
+    Validates the slug, resolves the instance via the deterministic operator
+    selection (``active-run.txt`` else lexically-greatest ``run-*``), and confirms
+    it stays under the slug dir before any caller reads or attaches to it. Raises
+    ``typer.Exit(1)`` on an unsafe slug/pointer, an unresolvable run, or an
+    instance that escapes the run tree. Shared by ``status`` and ``status
+    --interactive`` so both inherit the same FR-10.1 containment (the resolution
+    never flows through the unchecked ``active_run_dir()``).
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine.operator import RunResolutionError
+    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+
+    layout = mgr.layout(slug)
+    try:
+        safe_run_segment(slug, kind="slug")
+        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
+    except (UnsafeRunSegment, RunResolutionError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
+    except ValueError as exc:
+        typer.echo(
+            f"error: resolved run instance {run_instance_dir} escapes the run "
+            f"tree for {slug!r}; refusing to read it",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+    return run_instance_dir
+
+
 def _default_policy_path() -> Path:
     """`<asset_root>/policy.yaml` from the repo config (review F-005): a fresh
     adopter keeps the policy under `.gauntlet/`, so the bare `policy.yaml` default
@@ -313,7 +347,7 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
             typer.echo(f"GAUNTLET_WEB_TOKEN={handle.token}", err=True)
 
 
-@app.command()
+@app.command(cls=_InteractiveCommand)
 def status(
     slug: str,
     json_output: bool = typer.Option(
@@ -323,6 +357,14 @@ def status(
         "or script. Stdout is only the JSON; exits non-zero only on an actual "
         "error (a parked/failed run is a valid state, exit 0).",
     ),
+    interactive: str = typer.Option(
+        None, "--interactive",
+        help="Attach an interactive monitor agent to the EXISTING run (bare → "
+        "claude; --interactive=codex for codex). Starts no new run; foregrounds "
+        "the same monitor as `run --interactive`, wired to the run's judge as the "
+        "operator's own session when the driver is alive, else a normal prompted "
+        "session for diagnosis (FR-8).",
+    ),
 ) -> None:
     """Show the current run status for <slug> with driver liveness + next action.
 
@@ -330,36 +372,36 @@ def status(
     next action for the run's composite state. It never writes — a surviving
     recovery intent is *reported*, never finalized (FR-5.6). With ``--json`` it
     emits the same computed state as a lone, schema-stable JSON object (FR-4).
+    With ``--interactive`` it foregrounds a monitor agent attached to the run
+    instead of rendering status (FR-8); the two output modes are exclusive.
     """
     import json
 
     from gauntlet.engine import operator
     from gauntlet.engine.manifest import Manifest
-    from gauntlet.engine.operator import RunResolutionError, StatusContractError
-    from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
+    from gauntlet.engine.operator import StatusContractError
 
     mgr = _manager()
-    # FR-10.1 containment: the slug and the active-run pointer both flow into
-    # filesystem paths, so validate the slug, resolve the instance through the
-    # safe resolver (which validates active-run.txt), and confirm the resolved
-    # instance stays under the slug dir BEFORE reading the manifest or a
-    # recovery intent — never via the unchecked `active_run_dir()` (F-002).
-    layout = mgr.layout(slug)
-    try:
-        safe_run_segment(slug, kind="slug")
-        run_instance_dir = operator.resolve_run_instance(layout.slug_dir)
-    except (UnsafeRunSegment, RunResolutionError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    try:
-        run_instance_dir.resolve().relative_to(layout.slug_dir.resolve())
-    except ValueError as exc:
-        typer.echo(
-            f"error: resolved run instance {run_instance_dir} escapes the run "
-            f"tree for {slug!r}; refusing to read it",
-            err=True,
-        )
-        raise typer.Exit(1) from exc
+    if interactive is not None:
+        # `--interactive` attaches a foreground monitor (FR-8) instead of
+        # rendering status; combining it with the `--json` machine contract is
+        # nonsensical, so reject the pair rather than silently picking one.
+        if json_output:
+            typer.echo(
+                "error: --interactive and --json are mutually exclusive; "
+                "--interactive foregrounds a monitor agent, --json emits the "
+                "machine status contract",
+                err=True,
+            )
+            raise typer.Exit(2)
+        _status_interactive(mgr, slug, agent=interactive)
+        return
+
+    # FR-10.1 containment: validate the slug, resolve the instance through the
+    # safe resolver, and confirm it stays under the slug dir BEFORE reading the
+    # manifest or a recovery intent — never via the unchecked `active_run_dir()`
+    # (F-002). Shared with `status --interactive` via `_resolve_run_instance_dir`.
+    run_instance_dir = _resolve_run_instance_dir(mgr, slug)
 
     # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
     # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
@@ -417,6 +459,51 @@ def status(
         current_step_freshness=freshness,
     ):
         typer.echo(line)
+
+
+def _status_interactive(mgr, slug: str, *, agent: str) -> None:
+    """`gauntlet status <slug> --interactive`: attach the monitor to an EXISTING run (FR-8).
+
+    Resolves the run instance with the same deterministic selection operator-aids
+    uses (``active-run.txt`` else lexically-greatest ``run-*``, via the shared safe
+    resolver); an unknown/absent run errors. Starts **no** ``RunProcess`` — the
+    run already exists — and only foregrounds the shared P3 monitor, reusing
+    ``build_monitor_command`` unchanged so the attach path inherits the exact same
+    argv/env/prompt launch contract (review F-002). Judge wiring follows
+    ``driver_liveness`` inside ``launch_monitor`` (FR-8.2): the operator-session
+    env (§6.3) only when the driver is alive **and** ``judge.json`` is readable,
+    else a normal prompted session for diagnosis (the agent can still read
+    ``status``/``logs`` and ``resume``).
+    """
+    from gauntlet import interactive as interactive_mod
+
+    # An unknown agent value errors BEFORE any resolution/launch, naming the valid
+    # choices (FR-7.1) — never half-attach to a run.
+    try:
+        interactive_mod.validate_monitor_agent(agent)
+    except interactive_mod.MonitorAgentError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    run_instance_dir = _resolve_run_instance_dir(mgr, slug)
+
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    # No RunProcess: the run already exists (FR-8.1). `judge_wait_s=0` — unlike
+    # `run --interactive`'s detached launch, there is no startup race to wait
+    # through: an already-running run's judge has long since written `judge.json`,
+    # so a missing record means the driver is not serving a live judge and we
+    # degrade to a prompted session at once rather than blocking the operator.
+    interactive_mod.launch_monitor(
+        repo_root=repo_root,
+        run_root=run_root,
+        slug=slug,
+        run_dir=run_instance_dir,
+        agent=agent,
+        use_judge=True,
+        asset_root=mgr.config.asset_root,
+        judge_wait_s=0.0,
+    )
 
 
 @app.command()
