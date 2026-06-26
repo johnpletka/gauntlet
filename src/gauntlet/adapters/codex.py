@@ -106,7 +106,7 @@ class CodexAdapter:
         if self.model:
             argv += ["--model", self.model]
         if self.reasoning_effort:
-            argv += ["-c", f"model_reasoning_effort={self.reasoning_effort!r}"]
+            argv += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
         if session:
             # `exec resume` accepts no --sandbox flag (verified on 0.139.0);
             # the config-override spelling keeps the sandbox pinned on resume.
