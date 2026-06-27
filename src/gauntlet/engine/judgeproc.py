@@ -169,17 +169,30 @@ def read_judge_record(run_dir: Path) -> JudgeRecord | None:
 def operator_session_env(record: JudgeRecord) -> dict[str, str]:
     """The operator-session env for a monitor wired to a live judge (§6.3).
 
-    Returns **exactly** ``GAUNTLET_RUN_ID`` + the judge ``URL``/``TOKEN`` and
-    **deliberately omits** ``GAUNTLET_STEP_ID`` — its *absence* is what marks the
-    operator's own session (validating §1.3): the judge classifies a
-    ``step_id``-absent caller as the operator (broad auto-allow), a
-    ``step_id``-present caller as an in-run agent (push/PR denied), purely on
-    ``step_id`` presence (FR-10). Consumers that hit the degraded (no-live-judge)
-    path set **none** of these — never partial."""
+    Sets ``GAUNTLET_RUN_ID`` + the judge ``URL``/``TOKEN`` and
+    ``GAUNTLET_JUDGE_MODE=interactive``, and **deliberately omits**
+    ``GAUNTLET_STEP_ID`` — its *absence* is what marks the operator's own session
+    (validating §1.3): the judge classifies a ``step_id``-absent caller as the
+    operator (broad auto-allow), a ``step_id``-present caller as an in-run agent
+    (push/PR denied), purely on ``step_id`` presence (FR-10). Consumers that hit
+    the degraded (no-live-judge) path set **none** of these — never partial.
+
+    Mode is ``interactive`` because the monitor IS a human at the keyboard. The
+    run's judge is ephemeral — it dies the instant the run ends (cleanly or, as
+    seen live, on an early-step failure that reaps the judge ~seconds in). Under
+    the default ``unattended`` mode the hook would then fail closed on the
+    now-unreachable judge and deny EVERY operator tool call — even read-only
+    diagnostics like ``gauntlet status`` — bricking the supervisor session with a
+    misleading "judge unreachable" error. ``interactive`` degrades that liveness
+    failure to an ``ask`` prompt instead (review F-004): the operator becomes the
+    backstop and can still investigate why the run died. A judge *deny* (live
+    judge, refused action) still denies in both modes, so this never loosens
+    policy on a reachable judge."""
     return {
         RUN_ID_ENV_VAR: record.run_id,
         URL_ENV_VAR: record.url,
         TOKEN_ENV_VAR: record.token,
+        MODE_ENV_VAR: "interactive",
     }
 
 

@@ -189,6 +189,12 @@ allow:
       - '^\s*(make|just)\s'
       - '^\s*(cargo|go)\s+(test|build|vet|fmt|check)\b'
 
+  - name: gauntlet-cli
+    description: "Gauntlet's own CLI. The interactive operator/monitor session exists to drive a run with these verbs (status/logs/approve/reject/resume/abort/recover/report/doctor/…); with no fast-path match they escalated to the LLM classifier, which denied them as an 'untrusted external tool outside the repository' — bricking the operator at the very commands it exists to run. `gauntlet` is a bounded, first-party verb set that runs no arbitrary shell and reaches no non-local network; the destructive git/network primitives stay independently gated by the deny-first rules above in every context, so allowing the wrapper never widens the blast radius. NOTE: like every allow rule this is skipped on a chained/piped/redirected command (a benign prefix must not bless a dangerous trailing segment), so the operator must run gauntlet verbs as a single bare command — their output is already bounded (logs tails 200 lines, status --json is small), so piping is never needed."
+    applies_to_tools: [Bash]
+    command_patterns:
+      - '^\s*(uv\s+run\s+)?(python\s+-m\s+)?gauntlet\b'
+
 ask:
   - name: package-install
     description: "Installing packages can run arbitrary install scripts."

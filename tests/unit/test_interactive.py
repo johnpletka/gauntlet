@@ -204,6 +204,16 @@ def test_compose_starter_prompt_resolves_playbook_under_asset_root():
     assert ".gauntlet/prompts/operator.md" in prompt
 
 
+def test_compose_starter_prompt_steers_to_bare_gauntlet_commands():
+    # The judge fast-path allows `gauntlet` only as a standalone command; a piped
+    # command escalates and is denied. The prompt must steer the operator away
+    # from pipes/redirects so it doesn't brick itself on the chaining guard.
+    prompt = compose_starter_prompt("demo", Path("/repo/runs/demo/run-1"))
+    low = prompt.lower()
+    assert "single bare command" in low
+    assert "no pipes" in low
+
+
 # --- launch_monitor fail-closed wiring (FR-7.3) ------------------------------
 
 def _run_launch_monitor(tmp_path, *, with_judge_json, liveness, use_judge=True):
@@ -245,6 +255,9 @@ def test_launch_monitor_gated_when_judge_present_and_driver_alive(tmp_path, monk
     assert env["GAUNTLET_RUN_ID"] == "run-1"
     assert env["GAUNTLET_JUDGE_URL"] == "http://127.0.0.1:9000"
     assert env["GAUNTLET_JUDGE_TOKEN"] == "jtok"
+    # interactive mode so a run-ended (unreachable) judge degrades to an ask
+    # prompt rather than bricking the operator session (review F-004).
+    assert env["GAUNTLET_JUDGE_MODE"] == "interactive"
     assert "GAUNTLET_STEP_ID" not in env  # operator session — never set (§6.3)
     assert captured["executable"] == "claude"
     assert captured["argv"][0] == "claude"
@@ -302,8 +315,10 @@ def test_launch_monitor_gated_overrides_stale_and_omits_step_id(tmp_path, monkey
     assert env["GAUNTLET_RUN_ID"] == "run-1"  # overlay value, not the stale parent's
     assert env["GAUNTLET_JUDGE_URL"] == "http://127.0.0.1:9000"
     assert env["GAUNTLET_JUDGE_TOKEN"] == "jtok"
+    # MODE takes the overlay's interactive value, NOT the stale parent's unattended
+    # — proving the operator session can never inherit a fail-closed mode.
+    assert env["GAUNTLET_JUDGE_MODE"] == "interactive"
     # Managed vars not in the operator overlay are scrubbed, never inherited stale.
-    assert "GAUNTLET_JUDGE_MODE" not in env
     assert "GAUNTLET_REPO_ROOT" not in env
 
 

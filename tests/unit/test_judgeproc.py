@@ -24,7 +24,12 @@ from gauntlet.engine.judgeproc import (
     operator_session_env,
     read_judge_record,
 )
-from gauntlet.judge.hook_client import RUN_ID_ENV_VAR, STEP_ID_ENV_VAR, URL_ENV_VAR
+from gauntlet.judge.hook_client import (
+    MODE_ENV_VAR,
+    RUN_ID_ENV_VAR,
+    STEP_ID_ENV_VAR,
+    URL_ENV_VAR,
+)
 from gauntlet.judge.service import TOKEN_ENV_VAR
 from gauntlet.procident import ProcessIdentity
 
@@ -384,14 +389,18 @@ def _record() -> JudgeRecord:
 
 
 def test_operator_session_env_omits_step_id():
-    # §6.3 / §1.3: the operator session sets EXACTLY RUN_ID + judge URL/TOKEN and
-    # deliberately omits GAUNTLET_STEP_ID — its absence is what marks the call as
-    # the operator's own session (the load-bearing classification, FR-10).
+    # §6.3 / §1.3: the operator session sets EXACTLY RUN_ID + judge URL/TOKEN +
+    # interactive MODE, and deliberately omits GAUNTLET_STEP_ID — its absence is
+    # what marks the call as the operator's own session (the load-bearing
+    # classification, FR-10). MODE is interactive so an unreachable (run-ended)
+    # judge degrades to an ask-prompt instead of bricking the operator session
+    # with an unattended fail-closed deny (review F-004).
     env = operator_session_env(_record())
     assert env == {
         RUN_ID_ENV_VAR: "run-x",
         URL_ENV_VAR: "http://127.0.0.1:8787",
         TOKEN_ENV_VAR: "per-run-judge-token",
+        MODE_ENV_VAR: "interactive",
     }
     assert STEP_ID_ENV_VAR not in env
 
