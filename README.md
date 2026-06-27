@@ -291,7 +291,8 @@ and CLI primitives that expose the same state for headless/CI use.
 
 ```sh
 gauntlet serve                 # loopback-only, token-authenticated console
-gauntlet run myfeat --watch    # boot/reuse the console, print its URL, then run
+gauntlet serve --resume        # reuse/boot the console, open the browser, return
+gauntlet run myfeat --watch    # boot/reuse the console, open the browser, then run
 ```
 
 `gauntlet serve` starts a **loopback-only, token-authenticated** web console that
@@ -307,9 +308,10 @@ children and survive its own restart by re-attaching to live PIDs, and fire
 desktop / Slack / in-tab notifications on the four moments that need a human
 (gate reached, escalation parked, run failed, run completed).
 
-`gauntlet run --watch` ensures the console is up (booting or reusing it) and
-prints its URL before running in the foreground. `--console-host` /
-`--console-port` override the bind (default `127.0.0.1:8765`).
+`gauntlet run --watch` ensures the console is up (booting or reusing it), prints
+its URL, and **opens the authenticated console in your browser** before running
+in the foreground; pass `--no-browser` (on either command) to skip the launch.
+`--console-host` / `--console-port` override the bind (default `127.0.0.1:8765`). `gauntlet serve --resume` does the same boot-or-reuse-and-open without holding the foreground.
 
 ### CLI observability
 
