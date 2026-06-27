@@ -7,6 +7,11 @@ attacks the result, a cheap **triage** model sorts the findings, the builder
 fixes, and the reviewer confirms the fix against the diff. A localhost
 **judge** service gates every tool call the agents make, failing closed.
 
+A local-first, loopback-only **console** (`gauntlet serve`) makes every run
+visible, answerable, and recoverable from the browser, and the CLI exposes the
+same observability — live log tailing, machine-readable status, and guarded
+recovery — for headless use.
+
 The canonical spec is [`PRD-gauntlet.md`](PRD-gauntlet.md). The bootstrap plan
 is [`runs/gauntlet/plan.md`](runs/gauntlet/plan.md).
 
@@ -27,6 +32,7 @@ is [`runs/gauntlet/plan.md`](runs/gauntlet/plan.md).
 - [Quick start (≤ 3 commands)](#quick-start--3-commands)
 - [Authoring a PRD (the repo teaches you how)](#authoring-a-prd-the-repo-teaches-you-how)
 - [The run lifecycle](#the-run-lifecycle)
+- [Watching a run (console + observability)](#watching-a-run-console--observability)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Safety model](#safety-model)
@@ -275,6 +281,63 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
 
 ---
 
+## Watching a run (console + observability)
+
+A run advances on its own between gates, so the question is usually *"where is it
+now, and does it need me?"* Gauntlet answers that two ways — a browser console
+and CLI primitives that expose the same state for headless/CI use.
+
+### The console (`gauntlet serve`)
+
+```sh
+gauntlet serve                 # loopback-only, token-authenticated console
+gauntlet run myfeat --watch    # boot/reuse the console, print its URL, then run
+```
+
+`gauntlet serve` starts a **loopback-only, token-authenticated** web console that
+runs strictly *above* the orchestrator: every control action it offers launches
+the same sanctioned `gauntlet` CLI verb you would type, so it inherits every
+safety invariant rather than being able to weaken one. It lists every run across
+all slugs with live status / current step / cost, drills into each step's
+`prompt.md`, rendered `transcript.md`, and `events.jsonl` (with live tailing for
+running steps), assembles the evidence behind a parked gate and offers
+**Approve / Reject** in one place, and classifies a failed/parked run into the
+action that actually applies. It can also launch and abort runs as supervised
+children and survive its own restart by re-attaching to live PIDs, and fire
+desktop / Slack / in-tab notifications on the four moments that need a human
+(gate reached, escalation parked, run failed, run completed).
+
+`gauntlet run --watch` ensures the console is up (booting or reusing it) and
+prints its URL before running in the foreground. `--console-host` /
+`--console-port` override the bind (default `127.0.0.1:8765`).
+
+### CLI observability
+
+```sh
+gauntlet status myfeat              # driver liveness, run-state, next action
+gauntlet status myfeat --json       # the same state as one machine-readable object
+gauntlet logs myfeat                # a step's dir + transcript tail (read-only)
+gauntlet logs myfeat --follow       # tail a running step's events.jsonl live
+gauntlet recover myfeat             # terminate a verified-wedged driver (guarded)
+gauntlet run myfeat --interactive   # detach the run, foreground a monitor agent
+```
+
+- **`status`** reports driver liveness, the computed run-state, and the next
+  action / recovery hint; `--json` emits the same payload (schema
+  `schemas/status.json`) for scripts and CI.
+- **`logs`** is strictly read-only evidence-on-demand; `--follow` streams a
+  step's events as they're written (paired with opt-in live step streaming).
+- **`recover`** terminates a driver only after verifying it is genuinely wedged,
+  then marks its step `INTERRUPTED` so a plain `resume` re-enters cleanly — it
+  never kills a healthy run.
+- **`run --interactive[=claude|codex]`** launches the run detached and hands the
+  terminal to an interactive monitoring agent (wired to the run's judge as the
+  operator's own session); `status --interactive` attaches the same monitor to an
+  already-running run. An installed **`gauntlet-operator`** Claude Code skill
+  routes a supervising session to this repo's recovery playbook.
+
+---
+
 ## Resolving an upstream conflict
 
 When a builder finds that the approved PRD or plan is wrong or under-specified,
@@ -324,13 +387,18 @@ Notes:
 | `gauntlet init [--from-repo]` | Scaffold config/pipeline/prompts/policy + wire hooks (idempotent). |
 | `gauntlet doctor` | Validate environment: CLIs, auth, hooks, judge, keys. |
 | `gauntlet new <slug>` | Scaffold `.gauntlet/runs/<slug>/` with a PRD stub. |
-| `gauntlet run <slug> [--pipeline standard\|bootstrap] [--no-judge]` | Start a run on branch `gauntlet/<slug>`. |
-| `gauntlet status <slug>` | Show run status and each step's state. |
+| `gauntlet run <slug> [--pipeline standard\|bootstrap] [--no-judge] [--watch] [--interactive[=claude\|codex]]` | Start a run on branch `gauntlet/<slug>`. `--watch` boots/reuses the console; `--interactive` detaches the run and foregrounds a monitor agent. |
+| `gauntlet status <slug> [--json] [--interactive[=claude\|codex]]` | Show run status, driver liveness, and the next action; `--json` for a machine-readable payload; `--interactive` attaches a monitor. |
+| `gauntlet logs <slug> [--follow]` | Surface a step's dir + transcript (read-only); `--follow` tails its `events.jsonl` live. |
+| `gauntlet serve [--host …] [--port 8765]` | Run the loopback-only supervisory console (FR-11). |
 | `gauntlet approve <slug> [--gate ID] [--notes …]` | Approve a parked gate, continue the run. |
 | `gauntlet reject <slug> --notes … [--gate ID]` | Reject a parked gate. |
 | `gauntlet resume <slug>` | Resume an interrupted run at its last incomplete step. |
 | `gauntlet resume <slug> --response "…"` | Decide a step parked on an upstream conflict (FR-10.4); records the decision and re-runs the builder with it. Required for conflict parks. |
+| `gauntlet recover <slug>` | Terminate a verified-wedged live driver and mark its step `INTERRUPTED` (guarded; FR-5). |
 | `gauntlet abort <slug>` | Abort a run. |
+| `gauntlet finish <slug>` | Merge a completed run into its base, then delete the branch + pointer. |
+| `gauntlet clean <slug>` | Delete a merged run branch + clear its pointer; keep the run record. |
 | `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown. |
 | `gauntlet feedback <slug>` | Capture human feedback + triage corrections (FR-6.1). |
 | `gauntlet rollback <slug> --phase N` | Reset the branch + manifest to a phase boundary (guarded). |
@@ -365,6 +433,20 @@ To repoint a tier at a different provider, edit the agent profile's `adapter`
 and `model` in `.gauntlet/config.yaml` and set that provider's key in your
 environment (e.g. `ANTHROPIC_API_KEY` for an `anthropic/*` model). LiteLLM
 model naming applies to `api` adapter profiles.
+
+**Per-agent reasoning effort.** A `claude-code` profile accepts an optional
+`effort` (`low` / `medium` / `high` / `xhigh` / `max`, passed to `claude` as
+`--effort`), and a `codex` profile accepts `reasoning_effort` (passed as
+`-c model_reasoning_effort=…`). Both are optional and no-op when absent, so
+existing configs are unaffected. A natural use is a cheaper `fixer:` role for
+review-fix rounds while the initial `builder` runs at higher effort:
+
+```yaml
+agents:
+  builder:   { adapter: claude-code, model: opus,   effort: high }
+  impl_fixer:{ adapter: claude-code, model: sonnet, effort: medium }
+  reviewer:  { adapter: codex,       model: gpt-5.5, reasoning_effort: xhigh }
+```
 
 ---
 
