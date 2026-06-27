@@ -360,7 +360,7 @@ def test_status_interactive_starter_prompt_routes_to_operator(tmp_path, monkeypa
 
     result = runner.invoke(app, ["status", "demo", "--interactive"])
     assert result.exit_code == 0, result.output
-    prompt = captured["argv"][1]  # the positional starter prompt
+    prompt = captured["argv"][-1]  # the trailing positional starter prompt
     assert "demo" in prompt
     assert str(run_dir) in prompt
     assert "gauntlet-operator" in prompt
