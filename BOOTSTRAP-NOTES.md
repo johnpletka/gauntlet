@@ -942,3 +942,63 @@ process, and what it suggests for Gauntlet's design.
       (`-p`, `--print`, `--output-schema`, the `exec` subcommand) from ever
       reaching the monitor argv — a future edit can't silently turn the monitor
       into the non-interactive adapter path (review F-002).
+
+## 2026-06-27 — background-start-services P5 silently shipped a partial phase (process miss)
+
+54. **A whole tranche of an approved phase's deliverables (FR-1 browser-open,
+    FR-2 `?p=` auth, FR-4 `serve --resume`) was dropped during implementation,
+    survived the adversarial review and the gate, and merged to `main` — and the
+    gap only surfaced when an operator ran `gauntlet run … --watch` and no browser
+    opened.** Recovered on `fix/watch-browser-open` (this entry's commit) by
+    building the full dropped scope + its acceptance tests. The interesting part is
+    *how a partial phase passed as complete*, recorded here so the process can be
+    hardened.
+    - **What the plan said P5 was:** `runs/background-start-services/plan.md` §P5
+      bundled FR-1 (`web/launch.py` + `open_authenticated` + `--no-browser`, wired
+      into `run --watch`), FR-2 (loopback `?p=` query auth + cookie bootstrap +
+      `p`-stripping 303 + `Referrer-Policy`), FR-3 (auto-port window), FR-4
+      (`serve --resume`), plus §6.1/§7. Each FR carried an explicit *Acceptance:*
+      clause naming the test to write.
+    - **What commit `6ed0cf8` ("P5: enforce loopback, add port window and persist
+      console token") actually delivered:** FR-3 + loopback enforcement + the
+      token-persistence groundwork for FR-1.2 — a coherent, internally-correct
+      *subset*. FR-1, FR-2, FR-4 were never implemented and **never named as
+      deferrals.** `service.py` even still read "the `?token=` query path … is
+      gone," directly contradicting the FR-2 the same phase was supposed to add.
+    - **Why the guardrails didn't catch it:**
+      1. **Tests only guard what's built.** The builder wrote tests for what it
+         implemented; it wrote none of the FR-1/2/4 acceptance tests, so there was
+         no *failing* test to signal the absence. "The suite only grows" protects
+         against regressions, not against features that were never started.
+      2. **The review was diff-scoped, not plan-coverage-scoped.** The
+         `impl-cycle.4` reviewer checked that the produced diff was correct (it
+         was) and found nothing about a missing `web/launch.py`. CLAUDE.md §5 asks
+         "did the phase deliver what it *said*?" but in practice the reviewer
+         anchored on the diff in front of it, not on the plan's deliverable list.
+         A *completeness* miss (planned-but-absent) reads as nothing to review.
+      3. **The deferral note was a decoy.** The commit's "Deferred to P6: hardened
+         secret storage" pointed at a phase **that does not exist** (the plan ends
+         at P5). It created the *appearance* of deferral discipline while the
+         actually-dropped FRs weren't tracked anywhere and there was no P6 to
+         honor even the named one.
+      4. **The phase was oversized.** Four independent FRs in one phase let a
+         plausible subset look like a finished phase.
+    - **Cheapest high-value preventions (proposed; not yet built — would go through
+      the policy/retro process, not a unilateral edit):**
+      - **Acceptance-clause → test gate.** The plan already names an *Acceptance:*
+        test per FR. Make the phase gate require each acceptance clause for the
+        phase to map to a real test id and fail closed on any unmapped clause.
+        This converts "silently dropped FR" into a hard stop — every one of
+        FR-1.1/1.2/2.1–2.6/4.1–4.3 had an Acceptance clause and zero tests.
+      - **Completeness-critic review dimension.** A reviewer pass that *ignores the
+        diff* and instead enumerates the phase's planned artifacts (files, symbols,
+        flags, acceptance tests) and asks "what did the plan promise that I cannot
+        find in the tree?" — a near-zero-cost grep for plan-named identifiers
+        (`web/launch.py`, `open_authenticated`, `--no-browser`, `--resume`) absent
+        from the worktree would have flagged this immediately.
+      - **Deferral reconciliation.** Validate every "Deferred to PN" against the
+        plan's actual phase list at commit time (reject a deferral to a
+        non-existent phase) and carry open deferrals forward into later phases'
+        review context so they can't evaporate.
+      - **Bound FRs-per-phase.** Flag a phase bundling many independent FRs for a
+        split, so a partial delivery can't masquerade as a whole phase.

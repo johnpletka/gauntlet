@@ -238,6 +238,10 @@ def run(
     console_port: int = typer.Option(
         8765, "--console-port", help="Console bind port for --watch.",
     ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="With --watch, do not open a browser; just "
+        "print the console URL (FR-1). Also honored when not on a TTY.",
+    ),
 ) -> None:
     """Start a run on branch gauntlet/<slug> (FR-8.1)."""
     mgr = _manager()
@@ -262,10 +266,13 @@ def run(
         _run_interactive(
             mgr, slug, agent=interactive, pipeline=pipeline, no_judge=no_judge,
             watch=watch, console_host=console_host, console_port=console_port,
+            no_browser=no_browser,
         )
         return
     if watch:
-        _ensure_watch_console(mgr, host=console_host, port=console_port)
+        _ensure_watch_console(
+            mgr, host=console_host, port=console_port, no_browser=no_browser
+        )
     path = pipeline_file or (Path.cwd() / mgr.config.asset_root / "pipelines" / f"{pipeline}.yaml")
     status = mgr.start(
         slug, path, use_judge=not no_judge, run_id=run_id,
@@ -276,7 +283,7 @@ def run(
 
 def _run_interactive(
     mgr, slug: str, *, agent: str, pipeline: str, no_judge: bool, watch: bool,
-    console_host: str, console_port: int,
+    console_host: str, console_port: int, no_browser: bool = False,
 ) -> None:
     """`gauntlet run <slug> --interactive`: detached run + foreground monitor (FR-7).
 
@@ -298,7 +305,9 @@ def _run_interactive(
         raise typer.Exit(2) from exc
 
     if watch:
-        _ensure_watch_console(mgr, host=console_host, port=console_port)
+        _ensure_watch_console(
+            mgr, host=console_host, port=console_port, no_browser=no_browser
+        )
 
     # Pre-allocate run-id + reservation token and launch DETACHED via RunProcess
     # (FR-7.2) — the same FR-6.1a handshake the console supervisor uses.
@@ -323,14 +332,17 @@ def _run_interactive(
     )
 
 
-def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
-    """Boot/reuse the detached console for `run --watch` (FR-12.1/12.4).
+def _ensure_watch_console(mgr, *, host: str, port: int, no_browser: bool = False) -> None:
+    """Boot/reuse the detached console for `run --watch` and open it (FR-12.1/FR-1).
 
     Fail-soft: the console is a convenience surface, so a boot failure (e.g. an
     unrelated process on the port) is surfaced loudly but does **not** abort the
     run — the foreground pipeline still runs exactly as today. The booted console
-    is detached and persists after the foreground run returns (FR-12.2).
+    is detached and persists after the foreground run returns (FR-12.2). On a TTY
+    (unless ``--no-browser``) the operator's browser is opened to an already
+    authenticated ``?p=`` URL so there is no token to paste (FR-1, goal G1).
     """
+    from gauntlet.web.launch import open_authenticated
     from gauntlet.web.registry import ConsoleBootError, ensure_console
 
     repo_root = mgr.repo_root.resolve()
@@ -342,7 +354,7 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
         typer.echo("continuing without a --watch console.", err=True)
         return
     if handle.reused:
-        typer.echo(f"reusing console at {handle.login_url}")
+        typer.echo("reusing the running console")
         if handle.token_mismatch:
             typer.echo(
                 "note: the running console uses a different token than your "
@@ -351,9 +363,11 @@ def _ensure_watch_console(mgr, *, host: str, port: int) -> None:
                 err=True,
             )
     else:
-        typer.echo(f"console started at {handle.login_url}")
+        typer.echo("console started")
         if handle.token:
             typer.echo(f"GAUNTLET_WEB_TOKEN={handle.token}", err=True)
+    # Surface (and on a TTY open) the authenticated landing URL (FR-1); fail-soft.
+    open_authenticated(handle, no_browser=no_browser, echo=typer.echo)
 
 
 @app.command(cls=_InteractiveCommand)
@@ -852,6 +866,15 @@ def serve(
         "prompt — it spawns nothing and makes no model call. Overrides the "
         "`web.handoff` config key.",
     ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Reuse a live console (or boot one detached), open "
+        "the authenticated browser, and return immediately instead of binding in "
+        "the foreground (FR-4).",
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="With --resume, do not open a browser; just "
+        "print the console URL (FR-1).",
+    ),
 ) -> None:
     """Run the local supervisory console over loopback (FR-11.1).
 
@@ -859,7 +882,17 @@ def serve(
     CLI, validates it is inside a git repo (fail-closed), mints a per-serve token
     and prints it + the URL on startup. The console scopes to this one repo; all
     of its slugs and run history are browsable (FR-1.1/FR-2.4).
+
+    ``--resume`` is the non-blocking variant (FR-4): it reuses a live console or
+    boots one **detached**, opens the authenticated browser, and returns — for
+    re-attaching to a console after the launching terminal is gone. Plain
+    ``serve`` (no ``--resume``) is unchanged: it binds in the foreground and never
+    auto-opens a browser (FR-4.3).
     """
+    if resume:
+        _serve_resume(host=host, port=port, no_browser=no_browser)
+        return
+
     from gauntlet.web.runner import serve as serve_console
 
     # Only pass the flag through when explicitly set, so an unset CLI flag falls
@@ -870,6 +903,33 @@ def serve(
         port=port,
         enable_handoff=True if enable_handoff else None,
     )
+
+
+def _serve_resume(*, host: str, port: int, no_browser: bool) -> None:
+    """`gauntlet serve --resume`: reuse/boot detached, open browser, return (FR-4).
+
+    Reuses a live registered console if there is one (no new process); otherwise
+    boots one detached and waits for healthz. Either way it opens the
+    authenticated browser and returns rather than blocking. A boot that never
+    answers healthz fails closed naming the log path (FR-4.2) — unlike
+    ``run --watch``, where the console is a convenience and a boot failure is only
+    a warning, ``serve --resume``'s sole job is the console, so it exits non-zero.
+    """
+    from gauntlet.web.launch import open_authenticated
+    from gauntlet.web.registry import ConsoleBootError, ensure_console
+
+    mgr = _manager()
+    repo_root = mgr.repo_root.resolve()
+    run_root = repo_root / mgr.config.run_root
+    try:
+        handle = ensure_console(repo_root, run_root, host=host, port=port)
+    except ConsoleBootError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo("reusing the running console" if handle.reused else "console started")
+    if not handle.reused and handle.token:
+        typer.echo(f"GAUNTLET_WEB_TOKEN={handle.token}", err=True)
+    open_authenticated(handle, no_browser=no_browser, echo=typer.echo)
 
 
 @judge_app.command("serve")
