@@ -6,6 +6,66 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-27
+
+A run-observability and supervision release. It makes an in-flight run
+answerable — live log streaming, machine-readable status, a guarded recovery
+path, and a one-command bridge into the console — and adds per-agent reasoning
+effort control. Everything is additive; existing CLI workflows are unchanged.
+
+### Added — operator observability & supervision (`status` / `logs` / `recover`)
+
+- **`gauntlet status`** now reports **driver liveness**, the **computed
+  run-state**, and the **next action / recovery hint**, so a glance answers
+  "where is it, and does it need me?".
+- **`gauntlet status --json`** emits the same state as one machine-readable
+  object (schema `schemas/status.json`) for scripts and CI.
+- **`gauntlet logs <slug>`** is read-only evidence-on-demand — a step's dir plus
+  its transcript tail.
+- **`gauntlet recover <slug>`** terminates a driver **only after verifying it is
+  genuinely wedged** (identity-checked) and marks its step `INTERRUPTED` so a
+  plain `resume` re-enters cleanly — it never kills a healthy run.
+- **`gauntlet-operator` skill + playbook.** `gauntlet init` installs a
+  project-level Claude Code skill (`prompts/operator.md`) that routes a
+  supervising session to this repo's run-state triage and recovery playbook,
+  propagated like every other asset.
+- **Engine hardening.** A response-less terminal cycle failure now surfaces
+  instead of being silently re-executed/rewritten on `resume` (with a regression
+  test).
+
+### Added — live run observability (streamed step output)
+
+- **Streamed step output.** The CLI agents' line-delimited JSON events are now
+  written to disk incrementally as they arrive (replacing the buffered drain in
+  `run_with_timeout`), so an in-flight step has a live, redacted, tailable log.
+  Claude + Codex adapters; the API/LiteLLM adapter is a durable non-goal.
+  Streaming ships behind a **default-off** flag.
+- **`gauntlet logs --follow`** tails a running step's `events.jsonl` live.
+- **Advisory freshness signal.** `status` / `status --json` expose
+  `current_step_freshness.last_event_age_s` so a stalled step is visible.
+
+### Added — background service startup & the interactive run monitor
+
+- **`gauntlet run --watch`** ensures the supervisory console is running
+  (boot/reuse) and prints its URL before running in the foreground;
+  `--console-host` / `--console-port` override the bind.
+- **`gauntlet run --interactive[=claude|codex]`** launches the run **detached**
+  and hands the terminal to an interactive monitoring agent, wired to the run's
+  judge as the **operator's own session** (judge-gated without prompt spam);
+  **`gauntlet status --interactive`** attaches the same monitor to an
+  already-running run.
+- **Per-run `judge.json`** (gitignored — endpoint + process identity) lets
+  `abort` / `finish` / `clean` reap an **orphaned per-run judge** by verified
+  identity; the shared console is never killed.
+
+### Added — per-agent reasoning effort
+
+- **`claude-code`** profiles accept an optional `effort`
+  (`low`/`medium`/`high`/`xhigh`/`max`, passed as `--effort`), and **`codex`**
+  profiles accept `reasoning_effort` (passed as `-c model_reasoning_effort=…`).
+  Both are optional and no-op when absent — existing configs are unaffected — so
+  a cheaper `fixer:` role can run review-fix rounds while `builder` runs higher.
+
 ### Changed — the wired judge hook tolerates a missing install
 
 `gauntlet init` now wires the PreToolUse judge hook as an **install-tolerant
@@ -167,4 +227,5 @@ safety invariant rather than being able to weaken one.
   worktree active-run lock); everything else reads on-disk state or shells out to
   CLI verbs.
 
+[0.3.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.0
 [0.2.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.2.0
