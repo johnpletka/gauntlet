@@ -28,7 +28,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from gauntlet.engine.manifest import RUN_ABORTED, RUN_DONE, RUN_FAILED
-from gauntlet.web.auth import COOKIE_NAME, SessionStore, safe_next
+from gauntlet.web.auth import (
+    COOKIE_NAME,
+    SessionStore,
+    safe_next,
+    set_session_cookie,
+)
 from gauntlet.web.gate import GateResolver, NoPendingGate
 from gauntlet.web.intel import resume_intel
 from gauntlet.web.markdown import render_markdown
@@ -246,11 +251,9 @@ def register_views(
             )
         sid, _csrf_token = sessions.create_session()
         resp = RedirectResponse(nxt, status_code=303)
-        # HttpOnly (no JS access) + SameSite=Strict (defence-in-depth on top of
-        # the CSRF token) + host-only Path=/; Secure omitted for loopback http.
-        resp.set_cookie(
-            COOKIE_NAME, sid, httponly=True, samesite="strict", path="/"
-        )
+        # Identical cookie attributes as the ?p= bootstrap (FR-2.2), via the one
+        # shared setter: HttpOnly + SameSite=Strict + host-only Path=/.
+        set_session_cookie(resp, sid)
         return resp
 
     @app.post("/logout")

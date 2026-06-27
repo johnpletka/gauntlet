@@ -35,7 +35,9 @@ def test_watch_reuses_existing_console(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("gauntlet.web.registry.ensure_console", fake_ensure)
     cli._ensure_watch_console(_fake_manager(tmp_path), host="127.0.0.1", port=8765)
     out = capsys.readouterr().out
-    assert "reusing console" in out
+    assert "reusing the running console" in out
+    # A reused console with no persisted token (legacy record) surfaces /login,
+    # never an authenticated ?p= URL (FR-1.2).
     assert "/login" in out
     assert calls["run_root"] == tmp_path / "runs"
 

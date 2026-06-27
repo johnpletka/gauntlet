@@ -37,6 +37,11 @@ COOKIE_NAME = "gauntlet_web"
 CSRF_HEADER = "X-CSRF-Token"
 CSRF_FIELD = "_csrf"
 TOKEN_HEADER = "X-Gauntlet-Token"
+# The loopback `?p=<token>` query password (FR-2). This narrowly supersedes the
+# gauntlet-ui "token must never ride in a URL" clause for a loopback-only console
+# (§7): it is the one query param that authenticates, exists only long enough to
+# bootstrap a cookie, and is stripped from a page navigation's URL (FR-2.5).
+QUERY_TOKEN_PARAM = "p"
 
 # Default ports by scheme, so an Origin lacking an explicit port compares equal to
 # the same scheme on its default port (FR-10.6 same-origin tuple).
@@ -59,9 +64,11 @@ class LoginRequired(Exception):
         self.next_path = next_path
 
 
-# Auth source of a request, so the CSRF gate can exempt header callers (FR-10.6).
+# Auth source of a request, so the CSRF gate can exempt non-ambient callers
+# (header + loopback query token) and so the query path can bootstrap a cookie.
 AUTH_COOKIE = "cookie"
 AUTH_HEADER = "header"
+AUTH_QUERY = "query"
 
 
 class SessionStore:
@@ -144,12 +151,15 @@ def is_same_origin(origin: str | None, expected: str | None) -> bool:
 
 
 def authenticate(request, sessions: SessionStore) -> str:
-    """Classify a request's auth, or raise :class:`Unauthenticated` (FR-10.4).
+    """Classify a request's auth, or raise :class:`Unauthenticated` (FR-10.4/FR-2).
 
-    Returns :data:`AUTH_HEADER` for a valid ``X-Gauntlet-Token`` (API parity,
-    CSRF-exempt) or :data:`AUTH_COOKIE` for a valid login-session cookie. The
-    ``?token=`` query path of P1–P6 is **gone** — the token must never ride in a
-    URL (FR-10.4).
+    Returns, in precedence order: :data:`AUTH_HEADER` for a valid
+    ``X-Gauntlet-Token`` (API parity, CSRF-exempt); :data:`AUTH_COOKIE` for a
+    valid login-session cookie; :data:`AUTH_QUERY` for a valid loopback
+    ``?p=<token>`` query password (FR-2.1). A valid cookie **short-circuits** the
+    query check (FR-2.3) so reloading a ``?p=`` URL never mints a fresh session.
+    The general-purpose ``?token=`` query path of P1–P6 stays gone; only the
+    narrow, single-use ``?p=`` loopback password authenticates (§7).
     """
     header = request.headers.get(TOKEN_HEADER)
     if sessions.verify_token(header):
@@ -157,6 +167,9 @@ def authenticate(request, sessions: SessionStore) -> str:
     sid = request.cookies.get(COOKIE_NAME)
     if sessions.is_valid_session(sid):
         return AUTH_COOKIE
+    query_token = request.query_params.get(QUERY_TOKEN_PARAM)
+    if sessions.verify_token(query_token):
+        return AUTH_QUERY
     raise Unauthenticated()
 
 
@@ -177,6 +190,18 @@ def enforce_csrf(request, sessions: SessionStore) -> None:
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not is_same_origin(origin, str(request.base_url)):
         raise CsrfError("cross-origin POST rejected (FR-10.6 same-origin)")
+
+
+def set_session_cookie(response, sid: str) -> None:
+    """Set the HttpOnly login-session cookie on ``response`` (FR-10.4).
+
+    The one place the session cookie is minted onto a response, shared by the
+    ``POST /login`` exchange and the ``?p=`` query-token bootstrap (FR-2.2) so
+    both set identical attributes: HttpOnly (no JS access) + SameSite=Strict
+    (defence-in-depth atop CSRF) + host-only ``Path=/``; Secure is omitted for
+    loopback http. The cookie carries only the opaque session id, never the token.
+    """
+    response.set_cookie(COOKIE_NAME, sid, httponly=True, samesite="strict", path="/")
 
 
 def safe_next(path: str | None) -> str:
@@ -208,11 +233,14 @@ __all__ = [
     "enforce_csrf",
     "is_same_origin",
     "safe_next",
+    "set_session_cookie",
     "token_fingerprint",
     "COOKIE_NAME",
     "CSRF_HEADER",
     "CSRF_FIELD",
     "TOKEN_HEADER",
+    "QUERY_TOKEN_PARAM",
     "AUTH_COOKIE",
     "AUTH_HEADER",
+    "AUTH_QUERY",
 ]

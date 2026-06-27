@@ -18,7 +18,7 @@ import contextlib
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
@@ -26,12 +26,15 @@ from pydantic import BaseModel, field_validator
 from gauntlet.engine.run import UnsafeRunSegment, safe_run_segment
 from gauntlet.web.auth import (
     AUTH_COOKIE,
+    AUTH_QUERY,
+    QUERY_TOKEN_PARAM,
     CsrfError,
     LoginRequired,
     SessionStore,
     Unauthenticated,
     authenticate,
     enforce_csrf,
+    set_session_cookie,
 )
 from gauntlet.web.auth import TOKEN_HEADER as TOKEN_HEADER  # re-export (tests/API)
 from gauntlet.web.config import web_config_from
@@ -59,11 +62,28 @@ def _wants_login_redirect(request: Request) -> bool:
 
     An unauthenticated **page** navigation should land on the login form, not a
     bare 401; an unauthenticated API/SSE/partial call (always issued by code that
-    can read a status) gets 401 so it fails closed loudly.
+    can read a status) gets 401 so it fails closed loudly. The same classifier
+    decides which ``?p=``-authenticated requests get the p-stripping page
+    redirect (FR-2.5) vs. an in-place cookie bootstrap (FR-2.2).
     """
     if request.method not in ("GET", "HEAD"):
         return False
     return not request.url.path.startswith(_API_PREFIXES)
+
+
+class QueryAuthBootstrap(Exception):
+    """A ``?p=``-authenticated **page** GET → 303 to the p-stripped path (FR-2.5).
+
+    Carries the same-path redirect target (``p`` removed, other query params
+    preserved) and the freshly-minted session id so the handler can set the
+    bootstrap cookie on the redirect response — the token never reaches the
+    rendered page or the address bar.
+    """
+
+    def __init__(self, location: str, sid: str) -> None:
+        super().__init__("query-auth bootstrap redirect")
+        self.location = location
+        self.sid = sid
 
 
 def _make_auth_dependency(sessions: SessionStore):
@@ -77,7 +97,7 @@ def _make_auth_dependency(sessions: SessionStore):
     are CSRF-exempt (header auth is not ambient and cannot be forged cross-site).
     """
 
-    def check(request: Request) -> None:
+    def check(request: Request, response: Response) -> None:
         try:
             source = authenticate(request, sessions)
         except Unauthenticated as exc:
@@ -89,6 +109,26 @@ def _make_auth_dependency(sessions: SessionStore):
             raise HTTPException(
                 status_code=401, detail="bad or missing web token"
             ) from exc
+        # A valid loopback ?p= token bootstraps a cookie session (FR-2.2). Reached
+        # only when there was no valid cookie (authenticate short-circuits on the
+        # cookie first, FR-2.3), so we never mint a duplicate session on reload.
+        if source == AUTH_QUERY:
+            sid, _csrf = sessions.create_session()
+            if _wants_login_redirect(request):
+                # A page navigation: redirect to the same path with `p` stripped
+                # (other query params preserved) so the token leaves the address
+                # bar/history; the cookie rides on the redirect (FR-2.5).
+                stripped = request.url.remove_query_params(QUERY_TOKEN_PARAM)
+                location = stripped.path + (
+                    f"?{stripped.query}" if stripped.query else ""
+                )
+                raise QueryAuthBootstrap(location, sid)
+            # An API/asset/state-changing call: set the cookie in place and let it
+            # proceed (no redirect — the caller is code, not the address bar).
+            set_session_cookie(response, sid)
+        # CSRF is only required for the **ambient** cookie source; header and query
+        # auth are not ambient and cannot be forged cross-site, so they are exempt
+        # (FR-2.4 / FR-10.6).
         if request.method not in ("GET", "HEAD", "OPTIONS") and source == AUTH_COOKIE:
             try:
                 enforce_csrf(request, sessions)
@@ -216,6 +256,25 @@ def create_app(
         return RedirectResponse(
             f"/login?next={quote(exc.next_path, safe='')}", status_code=303
         )
+
+    # A ?p=-authenticated page GET → 303 to the same path with `p` stripped,
+    # carrying the bootstrap cookie so the token-free follow-up renders the page
+    # (FR-2.5). The cookie is set here (not in the dependency) because the redirect
+    # response is the one the browser keeps.
+    @app.exception_handler(QueryAuthBootstrap)
+    async def _query_bootstrap(_request: Request, exc: QueryAuthBootstrap) -> RedirectResponse:
+        resp = RedirectResponse(exc.location, status_code=303)
+        set_session_cookie(resp, exc.sid)
+        return resp
+
+    # Every console response carries Referrer-Policy: no-referrer (FR-2.6) so the
+    # brief pre-redirect ?p= URL is never leaked as a Referer on sub-resource loads
+    # or outbound links.
+    @app.middleware("http")
+    async def _no_referrer(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     # Fail-closed error mapping: a bad path segment is a 400 (the caller asked
     # for something unsafe), a missing run/slug/step is a 404.
