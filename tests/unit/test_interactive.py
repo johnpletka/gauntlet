@@ -30,6 +30,7 @@ from gauntlet import interactive
 from gauntlet.cli import app
 from gauntlet.engine.judgeproc import JudgeRecord
 from gauntlet.interactive import (
+    _CLAUDE_PROJECT_SCOPE_FLAGS,
     MonitorAgentError,
     MonitorContractError,
     assert_interactive_argv,
@@ -97,13 +98,39 @@ def test_build_monitor_command_claude_positional_prompt_repo_root_cwd():
         "claude", prompt="PROMPT-TEXT", repo_root=Path("/repo"), judge_env=env
     )
     assert cmd.executable == "claude"
-    assert cmd.argv == ["claude", "PROMPT-TEXT"]  # composed prompt is positional
+    # `--setting-sources project` loads this repo's `.claude/` config (the judge
+    # hook + the `gauntlet-operator` skill the starter prompt routes to); the
+    # composed prompt stays the trailing positional (fix/gauntlet-operator-scope).
+    assert cmd.argv == ["claude", "--setting-sources", "project", "PROMPT-TEXT"]
+    assert cmd.argv[-1] == "PROMPT-TEXT"  # prompt remains the positional arg
     assert cmd.cwd == Path("/repo")  # the repo root, NOT the run dir (plan F-002)
     assert cmd.env_overlay == env
     assert cmd.prompt_delivery == "positional"
     # None of the one-shot adapter flags ever reach a bare interactive argv.
     for tok in ("-p", "--print", "--output-schema", "exec"):
         assert tok not in cmd.argv
+
+
+def test_build_monitor_command_claude_scopes_project_for_skill_discovery():
+    # fix/gauntlet-operator-scope: without `--setting-sources project` the bare
+    # interactive claude session does not load the repo's `.claude/` config, so
+    # the `gauntlet-operator` skill is out of scope and the agent cannot run it.
+    cmd = build_monitor_command(
+        "claude", prompt="P", repo_root=Path("/repo"), judge_env={}
+    )
+    assert list(_CLAUDE_PROJECT_SCOPE_FLAGS) == ["--setting-sources", "project"]
+    # The flags appear contiguously, ahead of the trailing positional prompt.
+    assert cmd.argv == ["claude", "--setting-sources", "project", "P"]
+
+
+def test_build_monitor_command_codex_carries_no_setting_sources_flag():
+    # codex has no skills/settings-source concept (and fires no PreToolUse hooks),
+    # so the project scope flag is claude-only — codex stays a bare positional.
+    cmd = build_monitor_command(
+        "codex", prompt="P", repo_root=Path("/repo"), judge_env={}
+    )
+    assert cmd.argv == ["codex", "P"]
+    assert "--setting-sources" not in cmd.argv
 
 
 def test_build_monitor_command_degraded_has_empty_env_overlay():

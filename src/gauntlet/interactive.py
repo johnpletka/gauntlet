@@ -60,6 +60,19 @@ DEFAULT_POLL_INTERVAL_S = 0.25
 # adapter path and break the foreground hand-off.
 _ONE_SHOT_TOKENS = frozenset({"-p", "--print", "--output-schema", "exec"})
 
+# Claude loads a repo's project configuration — its `.claude/settings.json` (the
+# judge PreToolUse hook) and its `.claude/skills/` (the `gauntlet-operator` skill
+# the FR-9.1 starter prompt routes the monitor to) — only when the project
+# setting-source is explicitly selected. This mirrors the claude builder/reviewer
+# profiles' `base_flags` in `.gauntlet/config.yaml`, whose `--setting-sources
+# project` is what makes claude load the repo hook (pins.yaml: "without it claude
+# does not load the repo hook and the agent runs UNGATED"). The same mechanism
+# scopes the skill — so the bare interactive monitor must carry the flag too, or
+# the `gauntlet-operator` skill is out of scope and the session cannot run it
+# (fix/gauntlet-operator-scope). claude-only: codex has no skills/settings-source
+# concept and fires no PreToolUse hooks (BOOTSTRAP-NOTES #10).
+_CLAUDE_PROJECT_SCOPE_FLAGS = ("--setting-sources", "project")
+
 
 class MonitorAgentError(ValueError):
     """An unknown ``--interactive`` agent value (FR-7.1) — rejected before launch."""
@@ -146,8 +159,14 @@ def build_monitor_command(
     """
     validate_monitor_agent(agent)
     executable = agent  # "claude" / "codex" — the CLI name is the agent name
-    # Bare interactive invocation with the prompt as the positional argument.
-    argv = [executable, prompt]
+    # Bare interactive invocation with the prompt as the positional argument. For
+    # claude, prepend `--setting-sources project` so the session loads this repo's
+    # `.claude/` config — both the judge hook AND the `gauntlet-operator` skill the
+    # starter prompt routes to. Without it the skill is not scoped to the repo and
+    # the agent reports it cannot run it (fix/gauntlet-operator-scope). The prompt
+    # stays the trailing positional. codex carries no such flag.
+    scope_flags = list(_CLAUDE_PROJECT_SCOPE_FLAGS) if agent == "claude" else []
+    argv = [executable, *scope_flags, prompt]
     assert_interactive_argv(argv, prompt=prompt)
     return MonitorCommand(
         executable=executable,
