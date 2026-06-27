@@ -6,6 +6,43 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-27
+
+A patch release that fixes two ways the interactive operator/monitor session
+(`gauntlet run --interactive`) could be left unable to act. Both are bug fixes;
+existing workflows are unchanged.
+
+### Fixed
+
+- **The interactive operator session no longer bricks when its run ends.** The
+  monitor is wired to the run's judge, which is reaped the instant the run exits
+  — cleanly or, as seen live, on an early-step failure seconds in. The operator
+  session was wired in the judge's default `unattended` mode, so once the judge
+  was gone every operator tool call failed closed and was denied — even
+  read-only diagnostics like `gauntlet status` — with a misleading "judge
+  unreachable" error. `operator_session_env` now marks the session
+  `interactive`, so an unreachable judge degrades to a permission prompt (the
+  human operator is the backstop) instead of a total deny. A live judge's *deny*
+  still denies in both modes, so this never loosens policy on a reachable judge.
+- **The judge no longer denies the `gauntlet` CLI in the operator session.**
+  `policy.yaml` had no fast-path rule for `gauntlet`, so the operator's own
+  verbs (`status`/`logs`/`approve`/`reject`/`resume`/`abort`/`recover`/…)
+  escalated to the LLM classifier, which denied them as an "untrusted external
+  tool outside the repository" — blocking the operator at the commands it exists
+  to run. A new `gauntlet-cli` fast-path allow rule covers the first-party CLI;
+  the deny-first rules still gate the destructive git/network primitives in every
+  context. Because allow rules are skipped on chained/piped/redirected commands
+  (a benign prefix must not bless a dangerous trailing segment), the monitor's
+  starter prompt now steers the operator to run gauntlet verbs as a single bare
+  command — their output is already bounded (`logs` tails 200 lines,
+  `status --json` is small), so piping is never needed.
+
+### Notes
+
+- **Adopters:** the `gauntlet-cli` allow rule ships in the scaffolded
+  `.gauntlet/policy.yaml`; existing repos pick it up via `gauntlet upgrade` (or
+  by adding the rule to their `policy.yaml`).
+
 ## [0.3.1] — 2026-06-27
 
 A patch release that completes and hardens the run-supervision surface shipped
@@ -252,5 +289,7 @@ safety invariant rather than being able to weaken one.
   worktree active-run lock); everything else reads on-disk state or shells out to
   CLI verbs.
 
+[0.3.2]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.2
+[0.3.1]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.1
 [0.3.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.0
 [0.2.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.2.0

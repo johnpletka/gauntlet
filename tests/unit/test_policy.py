@@ -298,6 +298,40 @@ def test_plain_benign_still_allowed_after_chaining_guard(engine):
         assert d is not None and d.decision == "allow", cmd
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gauntlet status rules-engine-ui --json",
+        "gauntlet logs rules-engine-ui",
+        "gauntlet logs rules-engine-ui --step prd-cycle",
+        "gauntlet approve rules-engine-ui",
+        "gauntlet reject rules-engine-ui",
+        "gauntlet resume rules-engine-ui",
+        "gauntlet abort rules-engine-ui",
+        "gauntlet recover rules-engine-ui",
+        "uv run gauntlet status demo",
+        "python -m gauntlet status demo",
+    ],
+)
+def test_gauntlet_cli_allowed_for_operator(engine, cmd):
+    # The operator/monitor session drives the run with these verbs; a bare
+    # gauntlet command must fast-path ALLOW (no escalation to the classifier,
+    # which denied them as an untrusted external tool — the operator brick).
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT, step_id=None)
+    assert d is not None and d.decision == "allow", cmd
+    assert d.matched_rule == "gauntlet-cli"
+
+
+def test_gauntlet_cli_piped_escalates_not_allowed(engine):
+    # Documents the known limitation the starter prompt steers around: a PIPED
+    # gauntlet command hits the chaining guard, so the gauntlet-cli allow is
+    # skipped and the line escalates (None/ask) — never a terminal allow. The
+    # operator must run gauntlet verbs bare (compose_starter_prompt says so).
+    cmd = "gauntlet status rules-engine-ui --json 2>&1 | head -100"
+    d = engine.evaluate("Bash", {"command": cmd}, repo_root=REPO_ROOT, step_id=None)
+    assert d is None or d.decision != "allow"
+
+
 # --- F-004: network allowlist host-boundary bypass -------------------------
 @pytest.mark.parametrize(
     "cmd",
