@@ -6,6 +6,31 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-27
+
+A patch release that completes and hardens the run-supervision surface shipped
+in 0.3.0. Both changes are bug fixes; existing workflows are unchanged.
+
+### Fixed
+
+- **`gauntlet run --watch` now opens the console in your browser.** The
+  background-start-services phase (P5) had specified an authenticated
+  browser-open for `--watch` but shipped only a subset of its scope — the
+  browser-open (FR-1), `?p=` loopback query auth (FR-2), and `serve --resume`
+  (FR-4) were never implemented. This release builds the dropped scope: `--watch`
+  opens the authenticated loopback URL (degrading fail-soft to `/login`, never
+  aborting the run), `serve --resume` reuses or boots a console and opens the
+  browser without a foreground bind, and a new `--no-browser` flag opts out.
+  Loopback `?p=<token>` query auth bootstraps the HttpOnly session cookie and is
+  then stripped from the URL. (#43)
+- **The interactive monitor now loads this repo's operator skill.**
+  `run --interactive` / `status --interactive` launched a bare `claude` with no
+  flags, so the spawned session never loaded the repo's `.claude/` project
+  config and reported it could not run the `gauntlet-operator` skill. The
+  monitor command now passes `--setting-sources project` for the `claude` agent
+  (matching the builder/reviewer adapter profiles), bringing `.claude/skills/`
+  into scope. (#44)
+
 ## [0.3.0] — 2026-06-27
 
 A run-observability and supervision release. It makes an in-flight run
