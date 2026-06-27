@@ -3,10 +3,9 @@
 The console's whole ergonomic promise (PRD goal G1) is *zero manual paste*: from
 a TTY, ``--watch`` should land the operator on an **already-authenticated**
 console with no token to copy. This module builds the loopback ``?p=<token>`` URL
-(FR-2) and opens the default browser to it — but only on a TTY, only when a token
-is known, and always fail-soft (a browser that cannot open, or a console reuse
-with no recoverable token, degrades to surfacing the ``/login`` URL, never aborts
-the run — FR-1.2).
+(FR-2) and opens the default browser to it on a TTY, always fail-soft: a browser
+that cannot open, or a console reuse with no recoverable token, degrades to
+surfacing the ``/login`` URL, never aborting the run (FR-1.2).
 """
 
 from __future__ import annotations
