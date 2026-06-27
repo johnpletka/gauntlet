@@ -9,7 +9,7 @@
 # file (FR-1.4) — `gauntlet doctor` fails if a credential literal appears here.
 # This file references models, not credentials.
 
-base_branch: main
+base_branch: current
 branch_prefix: "gauntlet/"
 # Adopter layout: consolidate every gauntlet-owned file under .gauntlet/.
 # `asset_root` is where the engine resolves pipelines/prompts/schemas/policy;
