@@ -310,9 +310,8 @@ desktop / Slack / in-tab notifications on the four moments that need a human
 
 `gauntlet run --watch` ensures the console is up (booting or reusing it), prints
 its URL, and **opens the authenticated console in your browser** before running
-in the foreground; pass `--no-browser` to skip the launch. `--console-host` /
-`--console-port` override the bind (default `127.0.0.1:8765`). `gauntlet serve
---resume` does the same boot-or-reuse-and-open without holding the foreground.
+in the foreground; pass `--no-browser` (on either command) to skip the launch.
+`--console-host` / `--console-port` override the bind (default `127.0.0.1:8765`). `gauntlet serve --resume` does the same boot-or-reuse-and-open without holding the foreground.
 
 ### CLI observability
 
