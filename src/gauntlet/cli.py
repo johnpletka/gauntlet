@@ -645,9 +645,19 @@ def reject(
     slug: str,
     notes: str = typer.Option(..., help="Why the gate was rejected."),
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
+    no_judge: bool = typer.Option(False, "--no-judge"),
 ) -> None:
-    """Reject a parked human_gate (FR-8.1)."""
-    typer.echo(f"run status: {_manager().reject(slug, notes, gate)}")
+    """Reject a parked human_gate (FR-8.1).
+
+    A rejection is not a dead end: when the gate sits downstream of an
+    adversarial_cycle (the PRD/plan review loops), the note is injected into that
+    cycle as a new fix round and the run is re-driven, re-parking the gate for a
+    fresh decision. Re-drives agents, so it honors the judge like `approve`. Only
+    a gate with no upstream cycle to iterate ends the run (terminal reject).
+    """
+    typer.echo(
+        f"run status: {_manager().reject(slug, notes, gate, use_judge=not no_judge)}"
+    )
 
 
 @app.command()

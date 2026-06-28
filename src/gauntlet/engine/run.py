@@ -1347,16 +1347,41 @@ class RunManager:
         finally:
             self._release_worktree_lock(handle)
 
-    def reject(self, slug: str, notes: str, gate: str | None = None) -> str:
+    def reject(self, slug: str, notes: str, gate: str | None = None,
+               *, use_judge: bool = True, adapter_factory=None) -> str:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
         gate = gate or man.current_step
         if gate is None:
             raise ValueError("no gate to reject; run is not parked")
-        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-        orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={})
-        return orch.reject_gate(gate, notes)
+        # Reject now re-drives the upstream adversarial_cycle with the rejection
+        # note injected as a new round (FR-8.1 + operator playbook), so like
+        # `approve` it is a driving verb: take the worktree lock first and honor
+        # the judge. The rejection is attributed to the resolved operator identity.
+        user = resolve_operator_identity(self.repo_root)
+        handle = self._acquire_worktree_lock(slug, man.run_id)
+        try:
+            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+            if use_judge:
+                return self._with_judge(man, run_dir, lambda env: self._reject_drive(
+                    layout, run_dir, pipeline, man, gate, notes, user, env,
+                    adapter_factory))
+            orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
+                                      adapter_factory=adapter_factory)
+            status = orch.reject_gate(gate, notes, user)
+            self._maybe_draft_pr(layout, run_dir, man, status)
+            return status
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _reject_drive(self, layout, run_dir, pipeline, man, gate, notes, user, env,
+                      adapter_factory):
+        orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
+                                  adapter_factory=adapter_factory)
+        status = orch.reject_gate(gate, notes, user)
+        self._maybe_draft_pr(layout, run_dir, man, status)
+        return status
 
     # ---- abort --------------------------------------------------------------
     # ---- orphaned-judge reaping on cleanup verbs (FR-6) ---------------------

@@ -212,14 +212,63 @@ class Orchestrator:
         self._persist()
         return self.drive()
 
-    def reject_gate(self, step_id: str, notes: str) -> str:
+    def reject_gate(self, step_id: str, notes: str, user: str = "operator") -> str:
+        """Reject a parked gate (FR-8.1).
+
+        A rejection is actionable feedback, not a dead end: when the gate sits
+        downstream of an ``adversarial_cycle`` (the PRD/plan review loops), inject
+        the rejection note into that cycle as a new round and re-drive — the same
+        way ``resume --response`` re-drives a parked cycle escalation. This matches
+        the operator playbook ("reject with a reason the builder can act on") and
+        removes the trap where a rejected gate terminally failed the run while
+        ``status`` still recommended a `resume` that no-op'd.
+
+        Falls back to a terminal reject (the prior behavior) only when there is no
+        upstream cycle to iterate — a gate not preceded by an ``adversarial_cycle``
+        in its stage, or one inside a ``foreach`` fan-out (iteration re-arming is
+        out of scope) — so the verb is never silently a no-op.
+        """
         rec = self._find_parked_gate(step_id)
-        rec.status = M.FAILED
-        rec.ended = self.clock()
-        rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
-        rec.notes = f"rejected: {notes}"
-        self._persist()
-        return self._set_run_status(FAILED)
+        cycle_step, stage = self._upstream_cycle_for_gate(step_id)
+        if cycle_step is None:
+            rec.status = M.FAILED
+            rec.ended = self.clock()
+            rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
+            rec.notes = (
+                f"rejected (no upstream adversarial_cycle to iterate): {notes}"
+            )
+            self._persist()
+            return self._set_run_status(FAILED)
+        # Iterate: append the rejection note to the upstream cycle as a pending
+        # `--response` (audited + checkpoint-committed like any decision), then
+        # reset the cycle and everything after it in the stage — including this
+        # gate — so the stage walk re-runs the cycle (consuming the note as
+        # authoritative round guidance) and re-parks the gate for a fresh decision.
+        cyc_rec = self.manifest.record(cycle_step.id, None)
+        self._append_response(cyc_rec, notes, user)
+        self._reset_for_retry(stage, cycle_step.id, None)
+        return self.drive()
+
+    def _upstream_cycle_for_gate(self, gate_id: str):
+        """The ``adversarial_cycle`` step a gate ratifies, and its stage.
+
+        The cycle is the last ``adversarial_cycle`` before ``gate_id`` in the same
+        (non-``foreach``) stage — ``prd-cycle`` for ``prd-approve``, ``plan-cycle``
+        for ``plan-approve`` in ``standard.yaml``. Returns ``(None, None)`` when
+        there is none to iterate (so reject falls back to a terminal reject).
+        """
+        for stage in self.pipeline.stages:
+            ids = [s.id for s in stage.steps]
+            if gate_id not in ids:
+                continue
+            if stage.foreach is not None:
+                return None, None  # iteration re-arming is out of scope
+            gate_idx = ids.index(gate_id)
+            for step in reversed(stage.steps[:gate_idx]):
+                if step.type == "adversarial_cycle":
+                    return step, stage
+            return None, None
+        return None, None
 
     # ---- stage / step walk ---------------------------------------------------
     def _run_stage(self, stage: Stage) -> str:
