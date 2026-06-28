@@ -78,10 +78,10 @@ def _manifest(status: str, steps: list[StepRecord], *, slug: str = "demo") -> Ma
 
 
 def _step(id: str, type: str, status: str, *, reason=None, iteration=None,
-          metrics=None) -> StepRecord:
+          metrics=None, failure_kind=None) -> StepRecord:
     return StepRecord(
         id=id, type=type, status=status, parked_reason=reason,
-        iteration=iteration, metrics=metrics or {},
+        iteration=iteration, metrics=metrics or {}, failure_kind=failure_kind,
     )
 
 
@@ -268,8 +268,18 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
          [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_UPSTREAM_CONFLICT)],
          op.LIVENESS_NONE, op.STATE_PARKED_FOR_RESPONSE,
          ['gauntlet resume demo --response "<your decision>"']),
+        # A terminal failure cannot be re-run by a plain resume → recommend a
+        # `--response` decision (matches what `resume` itself now tells you).
         (M.RUN_FAILED, [_step("s", "agent_task", M.FAILED)], op.LIVENESS_NONE,
-         op.STATE_FAILED, ["gauntlet logs demo", "gauntlet resume demo"]),
+         op.STATE_FAILED,
+         ["gauntlet logs demo", 'gauntlet resume demo --response "<your decision>"']),
+        # A re-runnable clean-handoff PRECONDITION failure → plain resume (the
+        # operator commits/cleans the named paths, then re-runs the guard).
+        (M.RUN_FAILED,
+         [_step("cycle", "adversarial_cycle", M.FAILED,
+                failure_kind=M.FAILURE_KIND_CLEAN_HANDOFF)],
+         op.LIVENESS_NONE, op.STATE_FAILED,
+         ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_FAILED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_FAILED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,

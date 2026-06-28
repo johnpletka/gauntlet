@@ -52,6 +52,13 @@ class StepResult:
     # park on a *different* ``halt_on`` marker, a human_gate, or a budget halt).
     # ``_finalize`` copies this onto the record so the field stays current-state.
     parked_reason: str | None = None
+    # Failure-kind discriminator (current-state, like ``parked_reason``): set to a
+    # ``manifest.FAILURE_KIND_*`` value ONLY when this step failed a re-runnable
+    # PRECONDITION guard (no adapter invoked, no cost — e.g. the FR-9.3 round-1
+    # clean-handoff guard). ``None`` for every other outcome. ``_finalize`` copies
+    # it onto the record so ``_is_terminal_failure`` can let a plain ``resume``
+    # re-run such a step once the operator fixes the precondition.
+    failure_kind: str | None = None
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
     # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent

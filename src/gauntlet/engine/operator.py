@@ -159,6 +159,11 @@ class ParkedDescriptor:
 class FailureDescriptor:
     step_id: str
     status: str  # failed | halted | interrupted
+    # The FAILED step's ``failure_kind`` (current-state): a re-runnable
+    # PRECONDITION failure (e.g. FR-9.3 clean-handoff) takes plain `resume` once
+    # the operator fixes the precondition, while a terminal failure needs a
+    # `resume --response` decision — so the next-action recommendation differs.
+    failure_kind: str | None = None
 
 
 @dataclass
@@ -333,7 +338,9 @@ def _decide_resume_response(slug: str) -> Action:
                   f'gauntlet resume {slug} --response "<your decision>"')
 
 
-def _actions_for(state: str, slug: str) -> list[Action]:
+def _actions_for(
+    state: str, slug: str, failure: "FailureDescriptor | None" = None
+) -> list[Action]:
     """The §6.3 next-action column for a composite ``state`` (total)."""
     if state == STATE_IN_PROGRESS:
         return [_observe_logs(slug), _observe_status_json(slug)]
@@ -343,7 +350,16 @@ def _actions_for(state: str, slug: str) -> list[Action]:
         return [_decide_approve(slug), _decide_reject(slug)]
     if state == STATE_PARKED_FOR_RESPONSE:
         return [_decide_resume_response(slug)]
-    if state in (STATE_FAILED, STATE_HALTED, STATE_INTERRUPTED):
+    if state == STATE_FAILED:
+        # A re-runnable PRECONDITION failure (FR-9.3 clean-handoff): plain
+        # `resume` re-runs the guard once the operator fixes the named
+        # precondition. A terminal failure cannot be re-run by a plain resume
+        # (it would only repeat) — recommend a `--response` decision instead, so
+        # the hint matches what `resume` actually does (no more contradiction).
+        if failure is not None and failure.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
+            return [_observe_logs(slug), _control_resume(slug)]
+        return [_observe_logs(slug), _decide_resume_response(slug)]
+    if state in (STATE_HALTED, STATE_INTERRUPTED):
         return [_observe_logs(slug), _control_resume(slug)]
     if state in (STATE_DONE, STATE_ABORTED):
         return []
@@ -580,7 +596,9 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
         if not failure_steps:
             return STATE_UNKNOWN, None, None  # failed run with no failure step
         fs = failure_steps[-1]
-        return fs.status, None, FailureDescriptor(render_step_id(fs), fs.status)
+        return fs.status, None, FailureDescriptor(
+            render_step_id(fs), fs.status, fs.failure_kind
+        )
 
     # P4: any unrecognized run_status.
     return STATE_UNKNOWN, None, None
@@ -613,7 +631,7 @@ def compute_run_state(man: Manifest, liveness: str) -> RunState:
         current_step=_current_step(man, state, parked, failure),
         parked=parked,
         failure=failure,
-        next_actions=_actions_for(state, man.slug),
+        next_actions=_actions_for(state, man.slug, failure),
     )
 
 

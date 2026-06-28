@@ -671,10 +671,15 @@ def resume(
     supply `--response "<decision>"` to record it (audited in the manifest) and
     re-drive with it injected. Other parks resume as before.
     """
-    typer.echo(
-        "run status: "
-        f"{_manager().resume(slug, response=response, use_judge=not no_judge)}"
-    )
+    try:
+        status = _manager().resume(slug, response=response, use_judge=not no_judge)
+    except ValueError as exc:
+        # A terminal/parked run resume cannot proceed: surface WHY + the next
+        # verb on stderr and exit non-zero — never silently print a status and
+        # exit 0 (the contradiction `status` recommended `resume` papered over).
+        typer.echo(f"resume cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"run status: {status}")
 
 
 @app.command()

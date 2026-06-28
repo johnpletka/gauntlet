@@ -43,7 +43,17 @@ behind that output. Drive every decision off the reported state class:
   `UPSTREAM CONFLICT` or a review-cycle escalation its own loop could not settle.
   Action: `gauntlet resume <slug> --response "<decision>"`.
 - **`failed`** — a step failed. Action: read the evidence with `gauntlet logs
-  <slug>`, then `gauntlet resume <slug>` once the cause is understood.
+  <slug>` (and the failed step's `notes`), then recover by failure kind:
+  - **A re-runnable precondition failure** (e.g. the FR-9.3 clean-handoff guard:
+    "worktree dirty at round-1 review handoff") fired *before* any agent ran. The
+    step `notes` name the offending uncommitted paths. Commit or stash them, then
+    `gauntlet resume <slug>` re-runs the guard and continues. `status` recommends
+    exactly this.
+  - **A terminal failure** (a fixer that made no changes, a genuine agent error)
+    cannot be advanced by a plain `resume` — it would only repeat. If a human
+    decision can unblock it, inject one: `gauntlet resume <slug> --response
+    "<decision>"`; otherwise `gauntlet abort`. A plain `resume` here refuses with
+    that guidance instead of silently no-op'ing.
 - **`halted`** — the budget/timeout guard tripped. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.

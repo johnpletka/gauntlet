@@ -48,6 +48,24 @@ RESPONSE_RESOLVABLE_PARK_REASONS = frozenset(
 # reviewer/triager so they re-evaluate the parked finding.
 RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle"})
 
+# --- failure kinds (current-state discriminator on a FAILED step) ------------
+# Most FAILED steps are TERMINAL: re-running them only re-invokes the adapter and
+# repeats the same failure (`_is_terminal_failure`). A PRECONDITION failure is the
+# exception — it fired BEFORE any adapter call (no cost, `agent` null), because an
+# upstream invariant the step depends on was not satisfied. The canonical case is
+# the FR-9.3 round-1 clean-handoff guard: control may not pass to a reviewer on a
+# dirty worktree. Such a failure is safely re-runnable once the operator fixes the
+# precondition (commits/cleans the tree), so a plain `gauntlet resume` re-executes
+# the step's guard rather than no-op'ing as a terminal failure would. Like
+# `parked_reason`, this is CURRENT-STATE on the record: `_finalize` copies the
+# just-finished execution's `failure_kind`, so any non-precondition finalization
+# clears a stale value.
+FAILURE_KIND_CLEAN_HANDOFF = "clean_handoff_precondition"
+# Failure kinds a plain (response-less) `gauntlet resume` may safely re-execute
+# once the operator has fixed the named precondition — they cost nothing and
+# re-run the guard, not the adapter.
+RERUNNABLE_FAILURE_KINDS = frozenset({FAILURE_KIND_CLEAN_HANDOFF})
+
 # --- human-response lifecycle states (FR-2, FR-7.1) --------------------------
 # A `--response` entry is born ``pending`` (appended before the agent launches)
 # and flips to ``consumed`` once the resumed agent reaches a terminal outcome
@@ -133,6 +151,14 @@ class StepRecord(BaseModel):
     # execution halted on an UPSTREAM CONFLICT. A stale value therefore can never
     # cause a later generic park to be misclassified as a conflict park.
     parked_reason: str | None = None
+    # Failure-kind discriminator on a FAILED step (current-state, like
+    # ``parked_reason``): ``FAILURE_KIND_CLEAN_HANDOFF`` when this execution failed
+    # a re-runnable PRECONDITION guard (no adapter invoked, no cost) rather than
+    # in execution. ``_is_terminal_failure`` consults it so a plain ``resume``
+    # re-runs such a step once the precondition is fixed instead of treating it as
+    # terminal. ``None`` for every other outcome; cleared on any finalization that
+    # does not re-set it (so a stale value can never mislabel a later failure).
+    failure_kind: str | None = None
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)

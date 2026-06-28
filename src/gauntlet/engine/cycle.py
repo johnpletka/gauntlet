@@ -179,11 +179,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # FR-9.3: control passes to a reviewer only on a clean, committed tree.
         if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
             return _finish(
-                StepResult(
-                    status=FAILED,
-                    notes=f"worktree dirty at round-{rnd} review handoff; the "
-                    "clean-handoff invariant (FR-9.3) failed upstream",
-                ),
+                _clean_handoff_failure(ctx, rnd),
                 usage, commits, artifact_writes, metrics,
             )
 
@@ -913,6 +909,49 @@ def _fmt_ids(items: list[dict[str, Any]]) -> str:
 
 
 # --- artifact-mode baseline commit (FR-5.1 ↔ FR-9.3) -----------------------------
+def _clean_handoff_failure(ctx: StepContext, rnd: int) -> StepResult:
+    """Build the FR-9.3 round-N clean-handoff failure, with actionable diagnostics.
+
+    Names the offending uncommitted paths (review feedback: "the clean-handoff
+    invariant failed upstream" gives the operator nothing to act on) and, for the
+    round-1 case, marks the failure a re-runnable PRECONDITION (no adapter ran, no
+    cost) so a plain ``gauntlet resume`` re-runs the guard once the tree is clean —
+    instead of no-op'ing as a terminal failure. A dirty tree at round > 1 is
+    internal cycle residue (a fixer/reviewer mutation that escaped a commit), a
+    genuine defect, so it stays terminal — re-running the guard would not fix it.
+    """
+    status = gitops.status_porcelain(
+        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+    )
+    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
+    listed = ", ".join(paths) if paths else "(no paths reported)"
+    if rnd == 1:
+        # Upstream precondition: something before the cycle left the tree dirty
+        # (e.g. an out-of-band config edit, or a producer step whose output was
+        # never committed). Operator-fixable, then re-runnable.
+        slug = ctx.manifest.slug
+        return StepResult(
+            status=FAILED,
+            failure_kind=M.FAILURE_KIND_CLEAN_HANDOFF,
+            notes=(
+                f"worktree dirty at round-1 review handoff; the clean-handoff "
+                f"invariant (FR-9.3) requires a committed tree before control "
+                f"passes to a reviewer. Uncommitted paths: {listed}. "
+                f"Commit or stash them (e.g. `git add -A && git commit`, or "
+                f"`git stash`), then `gauntlet resume {slug}` re-runs this step."
+            ),
+        )
+    return StepResult(
+        status=FAILED,
+        notes=(
+            f"worktree dirty at round-{rnd} review handoff; the clean-handoff "
+            f"invariant (FR-9.3) failed mid-cycle — a fix/review round left "
+            f"uncommitted changes: {listed}. This is internal cycle residue, "
+            f"not an upstream precondition, so it is terminal."
+        ),
+    )
+
+
 def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
     """True iff the single uncommitted path is the artifact under review.
 

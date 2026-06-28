@@ -297,6 +297,9 @@ class Orchestrator:
 
         Re-arming cases (NOT terminal):
 
+        - The failure carries a re-runnable ``failure_kind`` (a PRECONDITION
+          guard such as FR-9.3's round-1 clean-handoff): nothing ran, so once the
+          operator fixes the precondition a plain resume re-runs the guard.
         - The latest ``--response`` is still ``pending``: a human injected a
           decision the resume re-runs the step to consume (FR-7.1).
         - The step carries an ``on_fail`` retry policy: its budget governs
@@ -313,6 +316,13 @@ class Orchestrator:
           changes), so re-running only repeats the same failure.
         """
         if rec is None or rec.status != M.FAILED:
+            return False
+        # A re-runnable PRECONDITION failure (FR-9.3 round-1 clean-handoff guard)
+        # is NOT terminal: it fired before any adapter call (no cost), so once the
+        # operator fixes the precondition a plain `resume` re-runs the guard. The
+        # rationale that bars re-executing terminal failures (re-invoking the
+        # adapter, double-counting the failure) does not apply — nothing ran.
+        if rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             return False
         if rec.human_responses:
             # Pending → a human decision re-arms it; consumed → terminal.
@@ -629,6 +639,10 @@ class Orchestrator:
         # CONFLICT, and None for every other outcome — so a conflict park later
         # resumed to done/failed/non-conflict-park clears the stale value here.
         rec.parked_reason = result.parked_reason
+        # Failure kind is CURRENT-STATE too (FR-9.3 recovery): copy the just-
+        # finished execution's value so a precondition failure is re-runnable on
+        # resume, and any later non-precondition finalization clears a stale value.
+        rec.failure_kind = result.failure_kind
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:
