@@ -368,9 +368,18 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
             status=FAILED,
             notes=f"producer-commit message invalid: {err.reason}",
         )
-    sha = gitops.commit_paths(
-        ctx.repo_root, message, [rel], identity=ctx.config.identity(agent_name),
-    )
+    # Fail closed with an actionable note (review): a git failure here (hook,
+    # identity, lock) must surface the cause + the offending path/phase, not
+    # bubble out as the orchestrator's generic "handler error: ...".
+    try:
+        sha = gitops.commit_paths(
+            ctx.repo_root, message, [rel], identity=ctx.config.identity(agent_name),
+        )
+    except gitops.GitError as exc:
+        return StepResult(
+            status=FAILED,
+            notes=f"producer-commit of {rel!r} (phase {phase}) failed: {exc}",
+        )
     return sha, phase
 
 

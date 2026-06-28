@@ -418,6 +418,23 @@ def test_commit_output_stages_only_the_artifact_not_unrelated_dirt(fixture_repo)
     assert "plan.md" not in dirty
 
 
+def test_commit_output_excludes_a_pre_staged_unrelated_file(fixture_repo):
+    """A file already STAGED in the index when the producer commits is not swept
+    into the producer commit (the index-level analogue of the dirt case — what a
+    pathspec-less commit would have included)."""
+    (fixture_repo / "unrelated.txt").write_text("operator's other work\n")
+    git(fixture_repo, "add", "unrelated.txt")  # pre-staged before the step runs
+    orch = _orch(fixture_repo, _COMMIT_OUTPUT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text="# Plan\n\nbody\n")})
+    assert orch.drive() == M.RUN_DONE
+    sha = orch.manifest.commits[0].sha
+    files = gitops._run(
+        fixture_repo, "show", "--name-only", "--format=", sha
+    ).split()
+    assert files == ["runs/demo/plan.md"]  # only the deliverable, not the pre-staged file
+    assert "A  unrelated.txt" in gitops.status_porcelain(fixture_repo)  # left staged
+
+
 def test_commit_output_without_phase_fails_closed(fixture_repo):
     pipeline = """
 name: demo

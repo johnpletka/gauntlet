@@ -645,7 +645,11 @@ def reject(
     slug: str,
     notes: str = typer.Option(..., help="Why the gate was rejected."),
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
-    no_judge: bool = typer.Option(False, "--no-judge"),
+    no_judge: bool = typer.Option(
+        False, "--no-judge",
+        help="Drive the re-driven cycle without the judge (testing/diagnosis only; "
+        "the judge is the safety layer).",
+    ),
 ) -> None:
     """Reject a parked human_gate (FR-8.1).
 

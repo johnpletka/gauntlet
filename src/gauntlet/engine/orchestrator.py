@@ -230,13 +230,27 @@ class Orchestrator:
         """
         rec = self._find_parked_gate(step_id)
         cycle_step, stage = self._upstream_cycle_for_gate(step_id)
-        if cycle_step is None:
+        cyc_rec = (
+            self.manifest.record(cycle_step.id, None)
+            if cycle_step is not None else None
+        )
+        # Iterate only when the upstream cycle actually ran to DONE. A missing
+        # record (defensive) or a non-DONE one — e.g. a `when:`-skipped cycle, the
+        # only path that leaves a SKIPPED record before the gate — has nothing to
+        # re-arm: re-driving would just re-skip it and orphan the injected note.
+        # Fall back to a terminal reject with a clear reason (never a crash, never
+        # a silent no-op).
+        if cyc_rec is None or cyc_rec.status != M.DONE:
             rec.status = M.FAILED
             rec.ended = self.clock()
             rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
-            rec.notes = (
-                f"rejected (no upstream adversarial_cycle to iterate): {notes}"
+            why = (
+                "no upstream adversarial_cycle to iterate"
+                if cycle_step is None
+                else f"upstream cycle {cycle_step.id!r} is not in a re-runnable "
+                f"state ({cyc_rec.status if cyc_rec else 'no record'})"
             )
+            rec.notes = f"rejected ({why}): {notes}"
             self._persist()
             return self._set_run_status(FAILED)
         # Iterate: append the rejection note to the upstream cycle as a pending
@@ -244,7 +258,6 @@ class Orchestrator:
         # reset the cycle and everything after it in the stage — including this
         # gate — so the stage walk re-runs the cycle (consuming the note as
         # authoritative round guidance) and re-parks the gate for a fresh decision.
-        cyc_rec = self.manifest.record(cycle_step.id, None)
         self._append_response(cyc_rec, notes, user)
         self._reset_for_retry(stage, cycle_step.id, None)
         return self.drive()
@@ -430,6 +443,17 @@ class Orchestrator:
         # only on a FAILED outcome — never on success, conflict park, halt,
         # interruption, or a `--response` continuation. Relocating it there is
         # what keeps conflict/response resumes from consuming the retry budget.
+        # Re-arm a re-runnable PRECONDITION failure (FR-9.3 clean-handoff): the
+        # operator fixed the precondition (e.g. committed the dirty tree) before
+        # this resume, so HEAD has advanced. The prior FAILED attempt recorded a
+        # base_sha pointing BEFORE that cleanup commit; reusing it would make a
+        # later interrupt's transaction-boundary check (`is_dirty_vs(base_sha)` /
+        # rewind) diff against — or rewind past — the operator's cleanup. Clear it
+        # so this fresh attempt re-stamps the boundary at the current HEAD below,
+        # and drop the now-superseded failure_kind (re-set by `_finalize`).
+        if rec.status == M.FAILED and rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
+            rec.base_sha = None
+            rec.failure_kind = None
         rec.status = M.RUNNING
         rec.started = rec.started or self.clock()
         self.manifest.current_step = step.id

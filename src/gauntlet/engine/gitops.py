@@ -229,12 +229,20 @@ def commit_paths(
     proposal apply (FR-6.4) commits precisely the allowlisted asset(s) it patched
     plus the CHANGELOG, so run bookkeeping can never be swept into the commit.
     The message is passed on stdin (``-F -``); no agent-authored text hits argv.
+
+    The commit is **pathspec-limited** (``commit … -- <paths>``): it commits ONLY
+    these paths even if other files were already staged in the index when this
+    runs. Without the pathspec a bare ``git commit`` snapshots the whole index, so
+    a pre-staged unrelated file would be swept in — silently breaking the
+    isolation both callers rely on (the producer commit's clean-handoff guarantee,
+    and the proposal apply's allowlist). Any such pre-staged file is left staged
+    and uncommitted, exactly as it was.
     """
     _run(repo, "add", "--", *paths)
     args = [
         "-c", f"user.name={identity.name}",
         "-c", f"user.email={identity.email}",
-        "commit", "-F", "-",
+        "commit", "-F", "-", "--", *paths,
     ]
     _run(repo, *args, stdin=message)
     return head_sha(repo)

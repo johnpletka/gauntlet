@@ -1231,7 +1231,7 @@ class RunManager:
                 if step is not None and Orchestrator._is_terminal_failure(step, failed):
                     detail = (failed.notes or "no further detail recorded").strip()
                     raise ValueError(
-                        f"run '{man.run_id}' failed terminally at step "
+                        f"run '{man.slug}' failed terminally at step "
                         f"'{failed.id}': {detail} A plain `gauntlet resume` cannot "
                         "re-run a terminal failure — it would only repeat it. If a "
                         "human decision can unblock it (e.g. reclassifying a "
