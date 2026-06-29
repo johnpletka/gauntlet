@@ -728,7 +728,64 @@ def test_dirty_worktree_at_handoff_fails(cycle_repo):
     adapters = {"reviewer": SeqAdapter(), "triage": SeqAdapter(), "builder": SeqAdapter()}
     status, man, _ = run_cycle(cycle_repo, adapters)
     assert status == M.RUN_FAILED
-    assert "FR-9.3" in man.record("cycle").notes
+    rec = man.record("cycle")
+    assert "FR-9.3" in rec.notes
+    # The round-1 failure is a re-runnable PRECONDITION (no adapter invoked), so a
+    # plain resume can re-run it once the operator cleans the tree (report #1).
+    assert rec.failure_kind == M.FAILURE_KIND_CLEAN_HANDOFF
+    # The note names the offending path + the recovery (report #4), not a bare
+    # "failed upstream" the operator cannot act on.
+    assert "dirty.txt" in rec.notes
+    assert "gauntlet resume demo" in rec.notes
+
+
+def test_clean_handoff_failure_is_rerunnable_after_cleanup(cycle_repo):
+    """report #1: once the dirty precondition is fixed, re-driving the SAME run
+    re-runs the cycle's guard and proceeds — it is not a terminal no-op."""
+    (cycle_repo / "dirty.txt").write_text("uncommitted\n")
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [cycle_step()]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+
+    def _drive(adapters):
+        orch = Orchestrator(
+            repo_root=cycle_repo, run_dir=run_dir, artifact_root=cycle_repo,
+            config=cfg, pipeline=pipeline, manifest=man,
+            adapter_factory=lambda n: adapters[n],
+        )
+        return orch.drive()
+
+    # First drive: dirty tree → terminal-looking FAILED, but tagged re-runnable.
+    status = _drive({"reviewer": SeqAdapter(), "triage": SeqAdapter(),
+                     "builder": SeqAdapter()})
+    assert status == M.RUN_FAILED
+    assert man.record("cycle").failure_kind == M.FAILURE_KIND_CLEAN_HANDOFF
+    stale_base = man.record("cycle").base_sha  # recorded before the cleanup commit
+
+    # Operator fixes the precondition: commit the stray file → clean tree.
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "clean it"],
+                   check=True)
+    cleanup_head = gitops.head_sha(cycle_repo)
+
+    # Re-driving the SAME manifest re-runs the cycle (not a no-op) and converges.
+    status = _drive({"reviewer": SeqAdapter(REVIEW()), "triage": SeqAdapter(),
+                     "builder": SeqAdapter()})
+    assert status == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    # current-state: the re-run cleared the stale failure_kind (FR-2.1 analogue).
+    assert rec.failure_kind is None
+    # F2: the re-run re-stamped the transaction boundary at the post-cleanup HEAD —
+    # NOT the stale pre-cleanup base_sha, which a later interrupt would diff/rewind
+    # against and rewind past the operator's cleanup commit.
+    assert rec.base_sha == cleanup_head
+    assert rec.base_sha != stale_base
 
 
 def test_missing_roles_fail(cycle_repo):

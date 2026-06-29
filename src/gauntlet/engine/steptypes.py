@@ -287,18 +287,100 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
 
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")
+    commit_sha = commit_phase = None
     if output:
         out_path = ctx.artifact_root / output
         ctx.writer.write_text(out_path, result.text)
         artifact_writes[output] = out_path
+        # Prevent-at-source (report #3): a producer that opts in commits its own
+        # declared deliverable as it finalizes, so HEAD advances at production
+        # time. The deliverable then survives a crash before the next step AND
+        # cannot be conflated with unrelated dirt at the downstream cycle's
+        # clean-handoff guard — which previously skipped its baseline commit when
+        # any second path was dirty and failed the next step with a misleading
+        # "failed upstream". Commits ONLY the output path; unrelated dirt is left
+        # for the handoff guard to surface (now with the offending paths named).
+        if step.get("commit_output"):
+            outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
+            if isinstance(outcome, StepResult):  # fail-closed format/commit error
+                return outcome
+            commit_sha, commit_phase = outcome
     return StepResult(
         status=DONE,
         session_id=result.session_id,
         usage=result.usage,
         usage_by_agent=usage_by_agent,
         artifact_writes=artifact_writes,
+        commit_sha=commit_sha,
+        commit_phase=commit_phase,
         notes=f"agent {agent_name!r} completed",
     )
+
+
+def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
+                            output: str, out_path: Path):
+    """Commit ONLY the producer's freshly written `output:` artifact.
+
+    Returns ``(sha, phase)`` on a commit, ``(None, None)`` when the artifact is
+    already current (nothing to commit — never an empty commit), or a terminal
+    ``StepResult`` on a missing-phase / format / git error (fail closed).
+
+    Stages exactly the one path (never ``git add -A``), so an unrelated dirty
+    file is neither swept into this commit nor able to defeat it — it stays
+    uncommitted for the downstream clean-handoff guard to name.
+    """
+    phase = step.get("phase")
+    if not phase:
+        return StepResult(
+            status=FAILED,
+            notes=f"step {step.get('id')!r} sets commit_output but no `phase:`; "
+            "the producer commit needs a phase prefix (e.g. PLAN) for the "
+            "enforced header format",
+        )
+    try:
+        rel = out_path.resolve().relative_to(ctx.repo_root.resolve()).as_posix()
+    except ValueError:
+        return StepResult(
+            status=FAILED,
+            notes=f"commit_output: artifact {output!r} resolves outside the repo",
+        )
+    dirty = {
+        ln[3:].strip()
+        for ln in gitops.status_porcelain(
+            ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+        ).splitlines()
+        if ln.strip()
+    }
+    if rel not in dirty:
+        return None, None  # identical to HEAD — nothing to commit, no empty commit
+    message = (
+        f"{phase}: Author {output} for adversarial review\n\n"
+        f"The {phase} artifact ({output}) was authored by the {agent_name} and is "
+        "committed here, by the producing step, as the clean reviewable baseline. "
+        "The clean-handoff invariant (FR-9.3) requires a committed worktree when "
+        "control passes to the reviewer; committing at production time also lets "
+        "the deliverable survive a crash before the review cycle. Engine-composed; "
+        "no agent call.\n"
+    )
+    err = validate_commit_message(message)
+    if err is not None:  # engine-composed; a violation here is a bug
+        return StepResult(
+            status=FAILED,
+            notes=f"producer-commit message invalid: {err.reason}",
+        )
+    # Fail closed with an actionable note (review): a git failure here (hook,
+    # identity, lock) must surface the cause + the offending path/phase, not
+    # bubble out as the orchestrator's generic "handler error: ...".
+    try:
+        sha = gitops.commit_paths(
+            ctx.repo_root, message, [rel], identity=ctx.config.identity(agent_name),
+        )
+    except gitops.GitError as exc:
+        return StepResult(
+            status=FAILED,
+            notes=f"producer-commit of {rel!r} (phase {phase}) failed: {exc}",
+        )
+    return sha, phase
 
 
 def _completion_signal(step: Step, text: str, *, check_halt: bool = True):

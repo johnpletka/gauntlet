@@ -42,9 +42,13 @@ stages:
       # false-positives and discards the authored plan.md. A genuinely broken
       # PRD is caught downstream at plan-cycle / plan-approve.
       - {id: plan-author, type: agent_task, agent: builder,
-         prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md}
-      # plan.md is freshly authored and uncommitted; the artifact-mode cycle
-      # commits it as the clean review baseline (PLAN: …) before reviewing.
+         prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md,
+         phase: PLAN, commit_output: true}
+      # plan-author commits its own deliverable (PLAN: …) as it finalizes, so HEAD
+      # advances at production time: the plan survives a crash before review, and
+      # an unrelated dirty file can no longer defeat the review baseline (the
+      # artifact-mode cycle's baseline commit remains a fallback for producers
+      # that do not set commit_output).
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
          phase: PLAN, reviewer: reviewer, triager: triage, fixer: builder,
          escalation_agent: escalation, max_rounds: 2,

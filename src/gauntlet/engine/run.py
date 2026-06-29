@@ -1157,7 +1157,7 @@ class RunManager:
             # FR-7.1 idempotent recovery). All validation and operator-identity
             # resolution happen HERE, before driving; the orchestrator only
             # applies an already-validated, fail-closed decision.
-            action = self._plan_response_action(man, response)
+            action = self._plan_response_action(man, response, pipeline)
             return self._drive(
                 layout, run_dir, pipeline, man,
                 use_judge=use_judge, adapter_factory=adapter_factory,
@@ -1168,7 +1168,7 @@ class RunManager:
             self._release_worktree_lock(handle)
 
     def _plan_response_action(
-        self, man: Manifest, response: str | None
+        self, man: Manifest, response: str | None, pipeline=None
     ) -> ResponseAction:
         """Validate `gauntlet resume [--response]` and decide the transition.
 
@@ -1216,6 +1216,29 @@ class RunManager:
                     '--response "<decision>" (see `gauntlet resume --help`). '
                     "Re-running without a decision would only re-surface it."
                 )
+            # Never silently no-op a terminally FAILED run (review feedback):
+            # `status` recommends `resume`, so a plain resume that declines to
+            # act must say WHY and what to do — not print `run status: failed`
+            # and exit 0. A re-runnable failure (a clean-handoff PRECONDITION the
+            # operator has since fixed, or an on_fail retry budget) falls through
+            # to re-drive; only a genuinely TERMINAL failure raises here.
+            if man.status == M.RUN_FAILED and pipeline is not None:
+                failed = self._failed_step(man)
+                step = (
+                    self._pipeline_step(pipeline, failed.id)
+                    if failed is not None else None
+                )
+                if step is not None and Orchestrator._is_terminal_failure(step, failed):
+                    detail = (failed.notes or "no further detail recorded").strip()
+                    raise ValueError(
+                        f"run '{man.slug}' failed terminally at step "
+                        f"'{failed.id}': {detail} A plain `gauntlet resume` cannot "
+                        "re-run a terminal failure — it would only repeat it. If a "
+                        "human decision can unblock it (e.g. reclassifying a "
+                        "finding the fixer could not act on), inject one: "
+                        f'`gauntlet resume {man.slug} --response "<decision>"`. '
+                        "Otherwise `gauntlet abort` the run."
+                    )
             return ResponseAction(kind="none")
 
         # FR-1/FR-8/FR-10.5: a new --response targets the run's STUCK respondable
@@ -1268,6 +1291,14 @@ class RunManager:
         return target
 
     @staticmethod
+    def _pipeline_step(pipeline, step_id: str):
+        """The pipeline ``Step`` matching ``step_id`` (for failure classification)."""
+        for step in pipeline.all_steps():
+            if step.id == step_id:
+                return step
+        return None
+
+    @staticmethod
     def _parked_step(man: Manifest):
         """The single parked StepRecord (the run parks one step at a time)."""
         for rec in man.steps:
@@ -1316,16 +1347,41 @@ class RunManager:
         finally:
             self._release_worktree_lock(handle)
 
-    def reject(self, slug: str, notes: str, gate: str | None = None) -> str:
+    def reject(self, slug: str, notes: str, gate: str | None = None,
+               *, use_judge: bool = True, adapter_factory=None) -> str:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
         gate = gate or man.current_step
         if gate is None:
             raise ValueError("no gate to reject; run is not parked")
-        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-        orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={})
-        return orch.reject_gate(gate, notes)
+        # Reject now re-drives the upstream adversarial_cycle with the rejection
+        # note injected as a new round (FR-8.1 + operator playbook), so like
+        # `approve` it is a driving verb: take the worktree lock first and honor
+        # the judge. The rejection is attributed to the resolved operator identity.
+        user = resolve_operator_identity(self.repo_root)
+        handle = self._acquire_worktree_lock(slug, man.run_id)
+        try:
+            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+            if use_judge:
+                return self._with_judge(man, run_dir, lambda env: self._reject_drive(
+                    layout, run_dir, pipeline, man, gate, notes, user, env,
+                    adapter_factory))
+            orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
+                                      adapter_factory=adapter_factory)
+            status = orch.reject_gate(gate, notes, user)
+            self._maybe_draft_pr(layout, run_dir, man, status)
+            return status
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _reject_drive(self, layout, run_dir, pipeline, man, gate, notes, user, env,
+                      adapter_factory):
+        orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
+                                  adapter_factory=adapter_factory)
+        status = orch.reject_gate(gate, notes, user)
+        self._maybe_draft_pr(layout, run_dir, man, status)
+        return status
 
     # ---- abort --------------------------------------------------------------
     # ---- orphaned-judge reaping on cleanup verbs (FR-6) ---------------------

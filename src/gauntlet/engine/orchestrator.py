@@ -212,14 +212,76 @@ class Orchestrator:
         self._persist()
         return self.drive()
 
-    def reject_gate(self, step_id: str, notes: str) -> str:
+    def reject_gate(self, step_id: str, notes: str, user: str = "operator") -> str:
+        """Reject a parked gate (FR-8.1).
+
+        A rejection is actionable feedback, not a dead end: when the gate sits
+        downstream of an ``adversarial_cycle`` (the PRD/plan review loops), inject
+        the rejection note into that cycle as a new round and re-drive — the same
+        way ``resume --response`` re-drives a parked cycle escalation. This matches
+        the operator playbook ("reject with a reason the builder can act on") and
+        removes the trap where a rejected gate terminally failed the run while
+        ``status`` still recommended a `resume` that no-op'd.
+
+        Falls back to a terminal reject (the prior behavior) only when there is no
+        upstream cycle to iterate — a gate not preceded by an ``adversarial_cycle``
+        in its stage, or one inside a ``foreach`` fan-out (iteration re-arming is
+        out of scope) — so the verb is never silently a no-op.
+        """
         rec = self._find_parked_gate(step_id)
-        rec.status = M.FAILED
-        rec.ended = self.clock()
-        rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
-        rec.notes = f"rejected: {notes}"
-        self._persist()
-        return self._set_run_status(FAILED)
+        cycle_step, stage = self._upstream_cycle_for_gate(step_id)
+        cyc_rec = (
+            self.manifest.record(cycle_step.id, None)
+            if cycle_step is not None else None
+        )
+        # Iterate only when the upstream cycle actually ran to DONE. A missing
+        # record (defensive) or a non-DONE one — e.g. a `when:`-skipped cycle, the
+        # only path that leaves a SKIPPED record before the gate — has nothing to
+        # re-arm: re-driving would just re-skip it and orphan the injected note.
+        # Fall back to a terminal reject with a clear reason (never a crash, never
+        # a silent no-op).
+        if cyc_rec is None or cyc_rec.status != M.DONE:
+            rec.status = M.FAILED
+            rec.ended = self.clock()
+            rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
+            why = (
+                "no upstream adversarial_cycle to iterate"
+                if cycle_step is None
+                else f"upstream cycle {cycle_step.id!r} is not in a re-runnable "
+                f"state ({cyc_rec.status if cyc_rec else 'no record'})"
+            )
+            rec.notes = f"rejected ({why}): {notes}"
+            self._persist()
+            return self._set_run_status(FAILED)
+        # Iterate: append the rejection note to the upstream cycle as a pending
+        # `--response` (audited + checkpoint-committed like any decision), then
+        # reset the cycle and everything after it in the stage — including this
+        # gate — so the stage walk re-runs the cycle (consuming the note as
+        # authoritative round guidance) and re-parks the gate for a fresh decision.
+        self._append_response(cyc_rec, notes, user)
+        self._reset_for_retry(stage, cycle_step.id, None)
+        return self.drive()
+
+    def _upstream_cycle_for_gate(self, gate_id: str):
+        """The ``adversarial_cycle`` step a gate ratifies, and its stage.
+
+        The cycle is the last ``adversarial_cycle`` before ``gate_id`` in the same
+        (non-``foreach``) stage — ``prd-cycle`` for ``prd-approve``, ``plan-cycle``
+        for ``plan-approve`` in ``standard.yaml``. Returns ``(None, None)`` when
+        there is none to iterate (so reject falls back to a terminal reject).
+        """
+        for stage in self.pipeline.stages:
+            ids = [s.id for s in stage.steps]
+            if gate_id not in ids:
+                continue
+            if stage.foreach is not None:
+                return None, None  # iteration re-arming is out of scope
+            gate_idx = ids.index(gate_id)
+            for step in reversed(stage.steps[:gate_idx]):
+                if step.type == "adversarial_cycle":
+                    return step, stage
+            return None, None
+        return None, None
 
     # ---- stage / step walk ---------------------------------------------------
     def _run_stage(self, stage: Stage) -> str:
@@ -297,6 +359,9 @@ class Orchestrator:
 
         Re-arming cases (NOT terminal):
 
+        - The failure carries a re-runnable ``failure_kind`` (a PRECONDITION
+          guard such as FR-9.3's round-1 clean-handoff): nothing ran, so once the
+          operator fixes the precondition a plain resume re-runs the guard.
         - The latest ``--response`` is still ``pending``: a human injected a
           decision the resume re-runs the step to consume (FR-7.1).
         - The step carries an ``on_fail`` retry policy: its budget governs
@@ -313,6 +378,13 @@ class Orchestrator:
           changes), so re-running only repeats the same failure.
         """
         if rec is None or rec.status != M.FAILED:
+            return False
+        # A re-runnable PRECONDITION failure (FR-9.3 round-1 clean-handoff guard)
+        # is NOT terminal: it fired before any adapter call (no cost), so once the
+        # operator fixes the precondition a plain `resume` re-runs the guard. The
+        # rationale that bars re-executing terminal failures (re-invoking the
+        # adapter, double-counting the failure) does not apply — nothing ran.
+        if rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             return False
         if rec.human_responses:
             # Pending → a human decision re-arms it; consumed → terminal.
@@ -371,6 +443,17 @@ class Orchestrator:
         # only on a FAILED outcome — never on success, conflict park, halt,
         # interruption, or a `--response` continuation. Relocating it there is
         # what keeps conflict/response resumes from consuming the retry budget.
+        # Re-arm a re-runnable PRECONDITION failure (FR-9.3 clean-handoff): the
+        # operator fixed the precondition (e.g. committed the dirty tree) before
+        # this resume, so HEAD has advanced. The prior FAILED attempt recorded a
+        # base_sha pointing BEFORE that cleanup commit; reusing it would make a
+        # later interrupt's transaction-boundary check (`is_dirty_vs(base_sha)` /
+        # rewind) diff against — or rewind past — the operator's cleanup. Clear it
+        # so this fresh attempt re-stamps the boundary at the current HEAD below,
+        # and drop the now-superseded failure_kind (re-set by `_finalize`).
+        if rec.status == M.FAILED and rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
+            rec.base_sha = None
+            rec.failure_kind = None
         rec.status = M.RUNNING
         rec.started = rec.started or self.clock()
         self.manifest.current_step = step.id
@@ -629,6 +712,10 @@ class Orchestrator:
         # CONFLICT, and None for every other outcome — so a conflict park later
         # resumed to done/failed/non-conflict-park clears the stale value here.
         rec.parked_reason = result.parked_reason
+        # Failure kind is CURRENT-STATE too (FR-9.3 recovery): copy the just-
+        # finished execution's value so a precondition failure is re-runnable on
+        # resume, and any later non-precondition finalization clears a stale value.
+        rec.failure_kind = result.failure_kind
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:

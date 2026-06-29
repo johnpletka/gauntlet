@@ -38,12 +38,23 @@ behind that output. Drive every decision off the reported state class:
   **read-only inspection only** (`logs`, `status --json`) — never a mutating verb.
   This is the deliberately safe verdict; treat it as "look, do not touch."
 - **`parked_gate`** — the run is awaiting a human decision at a `human_gate`.
-  Action: `gauntlet approve <slug>` or `gauntlet reject <slug> --notes "<reason>"`.
+  Action: `gauntlet approve <slug>` or `gauntlet reject <slug> --notes "<reason>"`
+  (reject feeds the note back into the upstream review cycle as a new round — see §3).
 - **`parked_for_response`** — the run is awaiting `resume --response`: a builder
   `UPSTREAM CONFLICT` or a review-cycle escalation its own loop could not settle.
   Action: `gauntlet resume <slug> --response "<decision>"`.
 - **`failed`** — a step failed. Action: read the evidence with `gauntlet logs
-  <slug>`, then `gauntlet resume <slug>` once the cause is understood.
+  <slug>` (and the failed step's `notes`), then recover by failure kind:
+  - **A re-runnable precondition failure** (e.g. the FR-9.3 clean-handoff guard:
+    "worktree dirty at round-1 review handoff") fired *before* any agent ran. The
+    step `notes` name the offending uncommitted paths. Commit or stash them, then
+    `gauntlet resume <slug>` re-runs the guard and continues. `status` recommends
+    exactly this.
+  - **A terminal failure** (a fixer that made no changes, a genuine agent error)
+    cannot be advanced by a plain `resume` — it would only repeat. If a human
+    decision can unblock it, inject one: `gauntlet resume <slug> --response
+    "<decision>"`; otherwise `gauntlet abort`. A plain `resume` here refuses with
+    that guidance instead of silently no-op'ing.
 - **`halted`** — the budget/timeout guard tripped. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
@@ -85,7 +96,12 @@ Work top-down; stop at the first branch that matches.
   is gating: `gauntlet approve <slug>`. Approval is a human ratification, not a
   formality — see the guardrails.
 - **Reject** with a reason the builder can act on: `gauntlet reject <slug>
-  --notes "<why>"`. The note is required; a bare rejection wastes a cycle.
+  --notes "<why>"`. The note is required and consequential: when the gate sits
+  downstream of an adversarial_cycle (the PRD/plan loops), reject injects your
+  note into that cycle as a new fix round and re-drives, then re-parks the gate
+  for a fresh decision — so a bare rejection wastes a cycle. (A gate with no
+  upstream cycle to iterate ends the run.) Reject re-drives agents, so it honors
+  the judge like `approve`.
 - **Respond** to a `parked_for_response` park with the human's decision:
   `gauntlet resume <slug> --response "<decision>"`. The text is passed verbatim
   to the agent that re-evaluates the conflict; be specific.

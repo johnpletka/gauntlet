@@ -81,6 +81,71 @@ def _drive_with_record(repo, adapters, cycle_record, *, step_extra=None):
     return orch.drive(), man
 
 
+# --- reject re-drives the upstream cycle with the note (report 2nd trigger) -----
+def test_reject_gate_redrives_upstream_cycle_with_note(cycle_repo):
+    """A rejected gate downstream of an adversarial_cycle injects the rejection
+    note into that cycle as a new round and re-parks the gate — it does NOT
+    terminally fail the run (matches the operator playbook)."""
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            cycle_step(),
+            {"id": "gate", "type": "human_gate"},
+        ]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(), REVIEW()),  # converge, then converge on re-drive
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("gate").status == M.PARKED
+    assert man.record("cycle").status == M.DONE
+
+    status = orch.reject_gate(
+        "gate", notes="tighten the threat-model section", user="op@example.com"
+    )
+    # Re-driven, not terminally failed: the gate re-parks for a fresh decision.
+    assert status == M.RUN_PARKED
+    assert man.record("gate").status == M.PARKED
+    cyc = man.record("cycle")
+    assert cyc.status == M.DONE  # cycle re-ran and re-converged
+    # The note is injected into the cycle as an audited, consumed decision.
+    assert len(cyc.human_responses) == 1
+    assert cyc.human_responses[0].response_text == "tighten the threat-model section"
+    assert cyc.human_responses[0].user == "op@example.com"
+    assert cyc.human_responses[0].state == M.RESPONSE_CONSUMED
+
+
+def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
+    """A gate with no upstream adversarial_cycle still fails terminally (no
+    iterate path) — reject is never a silent no-op."""
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [{"id": "gate", "type": "human_gate"}]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: {}[n],
+    )
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
+    assert man.record("gate").status == M.FAILED
+    assert "no upstream adversarial_cycle" in man.record("gate").notes
+
+
 # --- 1. parked_reason discriminator on cycle parks ------------------------------
 def test_upstream_invalidation_park_sets_cycle_escalation_reason(cycle_repo):
     """An FR-10.4 upstream-invalidation park is response-resolvable now."""

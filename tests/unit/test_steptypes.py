@@ -8,14 +8,14 @@ import pytest
 import yaml
 
 from gauntlet.adapters.base import AgentResult
-from gauntlet.engine import manifest as M
+from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
 from gauntlet.engine.steptypes import _marker_signalled, render_shell_command
 
-from conftest import FakeAdapter
+from conftest import FakeAdapter, git
 
 
 def _orch(repo, text, *, config=None, adapters=None, extra_context=None):
@@ -373,6 +373,82 @@ def test_halt_marker_as_block_parks_without_writing_output(fixture_repo):
                  adapters={"builder": FakeAdapter(text=conflict)})
     assert orch.drive() == M.RUN_PARKED
     assert not (fixture_repo / "runs" / "demo" / "plan.md").exists()
+
+
+# --- producer commit_output (report #3: commit the deliverable at the source) -
+_COMMIT_OUTPUT_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-author, type: agent_task, agent: builder, prompt_text: go,
+         output: plan.md, phase: PLAN, commit_output: true}
+"""
+
+
+def test_commit_output_commits_the_producers_deliverable(fixture_repo):
+    """report #3: a producer commits its own output as it finalizes, so HEAD
+    advances at production time (the plan survives a crash before review)."""
+    orch = _orch(fixture_repo, _COMMIT_OUTPUT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text="# Plan\n\nbody\n")})
+    assert orch.drive() == M.RUN_DONE
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    assert plan.read_text() == "# Plan\n\nbody\n"
+    # The deliverable is committed (not left dirty for a downstream cycle) and the
+    # manifest records the PLAN: commit attributed to the producing step.
+    assert gitops.is_clean(fixture_repo, exclude=["runs/demo/run-1"])
+    assert [c.phase for c in orch.manifest.commits] == ["PLAN"]
+    sha = orch.manifest.commits[0].sha
+    assert gitops.commit_subject(fixture_repo, sha) == "PLAN: Author plan.md for adversarial review"
+    assert orch.manifest.commits[0].step_id == "plan-author"
+
+
+def test_commit_output_stages_only_the_artifact_not_unrelated_dirt(fixture_repo):
+    """The producer commit stages ONLY its declared output — an unrelated dirty
+    file is neither swept in nor able to defeat the commit (report #3)."""
+    (fixture_repo / "policy.yaml").write_text("operator edit, uncommitted\n")
+    orch = _orch(fixture_repo, _COMMIT_OUTPUT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text="# Plan\n\nbody\n")})
+    assert orch.drive() == M.RUN_DONE
+    # plan.md committed; policy.yaml left exactly as the operator left it (dirty).
+    assert [c.phase for c in orch.manifest.commits] == ["PLAN"]
+    dirty = gitops.status_porcelain(fixture_repo, untracked_all=True)
+    assert "policy.yaml" in dirty
+    assert "plan.md" not in dirty
+
+
+def test_commit_output_excludes_a_pre_staged_unrelated_file(fixture_repo):
+    """A file already STAGED in the index when the producer commits is not swept
+    into the producer commit (the index-level analogue of the dirt case — what a
+    pathspec-less commit would have included)."""
+    (fixture_repo / "unrelated.txt").write_text("operator's other work\n")
+    git(fixture_repo, "add", "unrelated.txt")  # pre-staged before the step runs
+    orch = _orch(fixture_repo, _COMMIT_OUTPUT_PIPELINE,
+                 adapters={"builder": FakeAdapter(text="# Plan\n\nbody\n")})
+    assert orch.drive() == M.RUN_DONE
+    sha = orch.manifest.commits[0].sha
+    files = gitops._run(
+        fixture_repo, "show", "--name-only", "--format=", sha
+    ).split()
+    assert files == ["runs/demo/plan.md"]  # only the deliverable, not the pre-staged file
+    assert "A  unrelated.txt" in gitops.status_porcelain(fixture_repo)  # left staged
+
+
+def test_commit_output_without_phase_fails_closed(fixture_repo):
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-author, type: agent_task, agent: builder, prompt_text: go,
+         output: plan.md, commit_output: true}
+"""
+    orch = _orch(fixture_repo, pipeline,
+                 adapters={"builder": FakeAdapter(text="# Plan\n")})
+    assert orch.drive() == M.RUN_FAILED
+    assert "no `phase:`" in orch.manifest.record("plan-author").notes
 
 
 # --- phase_lint: deterministic plan-gate structural check --------------------

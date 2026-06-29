@@ -645,9 +645,23 @@ def reject(
     slug: str,
     notes: str = typer.Option(..., help="Why the gate was rejected."),
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
+    no_judge: bool = typer.Option(
+        False, "--no-judge",
+        help="Drive the re-driven cycle without the judge (testing/diagnosis only; "
+        "the judge is the safety layer).",
+    ),
 ) -> None:
-    """Reject a parked human_gate (FR-8.1)."""
-    typer.echo(f"run status: {_manager().reject(slug, notes, gate)}")
+    """Reject a parked human_gate (FR-8.1).
+
+    A rejection is not a dead end: when the gate sits downstream of an
+    adversarial_cycle (the PRD/plan review loops), the note is injected into that
+    cycle as a new fix round and the run is re-driven, re-parking the gate for a
+    fresh decision. Re-drives agents, so it honors the judge like `approve`. Only
+    a gate with no upstream cycle to iterate ends the run (terminal reject).
+    """
+    typer.echo(
+        f"run status: {_manager().reject(slug, notes, gate, use_judge=not no_judge)}"
+    )
 
 
 @app.command()
@@ -671,10 +685,15 @@ def resume(
     supply `--response "<decision>"` to record it (audited in the manifest) and
     re-drive with it injected. Other parks resume as before.
     """
-    typer.echo(
-        "run status: "
-        f"{_manager().resume(slug, response=response, use_judge=not no_judge)}"
-    )
+    try:
+        status = _manager().resume(slug, response=response, use_judge=not no_judge)
+    except ValueError as exc:
+        # A terminal/parked run resume cannot proceed: surface WHY + the next
+        # verb on stderr and exit non-zero — never silently print a status and
+        # exit 0 (the contradiction `status` recommended `resume` papered over).
+        typer.echo(f"resume cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"run status: {status}")
 
 
 @app.command()

@@ -36,6 +36,24 @@ def test_commit_all_uses_identity(fixture_repo):
     assert author == "Builder X <bx@g.local>"
 
 
+def test_commit_paths_excludes_pre_staged_files(fixture_repo):
+    """commit_paths is pathspec-limited: a file already staged in the index when
+    it runs is NOT swept into the commit (it stays staged, uncommitted)."""
+    (fixture_repo / "unrelated.txt").write_text("operator's other work\n")
+    gitops._run(fixture_repo, "add", "unrelated.txt")  # pre-staged, not ours
+    (fixture_repo / "artifact.txt").write_text("the deliverable\n")
+    sha = gitops.commit_paths(
+        fixture_repo, "PLAN: author artifact\n\nbody", ["artifact.txt"],
+        identity=Identity("Builder", "b@g.local"),
+    )
+    files = gitops._run(
+        fixture_repo, "show", "--name-only", "--format=", sha
+    ).split()
+    assert files == ["artifact.txt"]  # ONLY the named path, never the pre-staged file
+    # the pre-staged file is left exactly as it was — staged, uncommitted.
+    assert "A  unrelated.txt" in gitops.status_porcelain(fixture_repo)
+
+
 def test_is_dirty_vs_base(fixture_repo):
     base = gitops.head_sha(fixture_repo)
     assert not gitops.is_dirty_vs(fixture_repo, base)

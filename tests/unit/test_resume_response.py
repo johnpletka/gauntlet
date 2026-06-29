@@ -21,8 +21,9 @@ import pytest
 from gauntlet.adapters.base import AdapterCapabilities, AdapterError, AgentResult
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.identity import GAUNTLET_USER_EMAIL
-from gauntlet.engine.manifest import HumanResponse, Manifest
+from gauntlet.engine.manifest import HumanResponse, Manifest, PipelineRef, StepRecord
 from gauntlet.engine.orchestrator import ENGINE_IDENTITY
+from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.run import RunManager
 
 from conftest import git
@@ -539,14 +540,19 @@ def test_consumed_failure_is_not_reexecuted_on_resume(tmp_path):
     )
     assert status == M.RUN_FAILED
 
-    # A plain resume over that terminal failure must not re-run the agent.
+    # A plain resume over that terminal failure must not re-run the agent — and
+    # must NOT silently no-op (report #2): it now surfaces WHY + the next verb by
+    # raising, instead of returning RUN_FAILED and exiting 0 while `status` keeps
+    # recommending `resume`. The manifest stays untouched (the stronger invariant:
+    # we refuse before driving, so nothing is re-invoked or rewritten).
     adapter = ScriptedAdapter("proceed")  # would WRITE + succeed if re-executed
-    status = mgr.resume(
-        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
-    )
-    assert status == M.RUN_FAILED  # still failed; not silently driven to done
+    with pytest.raises(ValueError, match="failed terminally"):
+        mgr.resume(
+            "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+        )
     assert adapter.prompts == []  # adapter never invoked
     rec = mgr.status("demo").record("implement")
+    assert rec.status == M.FAILED  # still failed; never driven to done
     assert rec.attempts == 1  # exactly one failure, not double-counted
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
@@ -577,20 +583,54 @@ def test_responseless_terminal_failure_not_reexecuted_on_resume(tmp_path):
     assert rec.human_responses == []  # no human decision in play
     ended_before = rec.ended
 
-    # A plain resume over the terminal failure: adapter never re-invoked, status
-    # stays FAILED (never rewritten to `running`), and neither the failure counter
-    # nor the terminal `ended` timestamp moves.
+    # A plain resume over the terminal failure now SURFACES the dead end (report
+    # #2) rather than silently returning RUN_FAILED: it raises with the reason +
+    # the next verb. The adapter is never re-invoked, status stays FAILED (never
+    # rewritten to `running`), and neither the failure counter nor the terminal
+    # `ended` timestamp moves — we refuse before driving.
     resume_adapter = ScriptedAdapter("proceed")  # would WRITE + succeed if re-run
-    status = mgr.resume(
-        "demo", use_judge=False,
-        adapter_factory=lambda n: resume_adapter, clock=_clock(),
-    )
-    assert status == M.RUN_FAILED  # surfaced, not silently driven to done
+    with pytest.raises(ValueError, match="failed terminally"):
+        mgr.resume(
+            "demo", use_judge=False,
+            adapter_factory=lambda n: resume_adapter, clock=_clock(),
+        )
     assert resume_adapter.prompts == []  # adapter never invoked
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.FAILED  # terminal state NOT rewritten to `running`
     assert rec.attempts == 1  # not double-counted
     assert rec.ended == ended_before  # terminal timestamp preserved
+
+
+def test_plan_response_action_rerunnable_vs_terminal(tmp_path):
+    # report #1/#2: `_plan_response_action` for a plain (response-less) resume of
+    # a FAILED run distinguishes a re-runnable PRECONDITION failure (let it
+    # re-drive) from a terminal one (surface WHY, don't silently no-op).
+    repo, mgr = _build_repo(tmp_path / "repo")
+    pipeline, _ = load_pipeline(repo / "pipelines" / "respond.yaml")
+
+    def _man(failure_kind):
+        man = Manifest(
+            run_id="r", slug="demo", branch="b", base_branch="main",
+            pipeline=PipelineRef(name="respond", version=1, hash="h"),
+        )
+        man.status = M.RUN_FAILED
+        man.steps.append(StepRecord(
+            id="implement", type="agent_task", status=M.FAILED,
+            failure_kind=failure_kind,
+        ))
+        return man
+
+    # Re-runnable: the clean-handoff precondition the operator has since fixed →
+    # no raise, falls through to re-drive (kind="none").
+    action = mgr._plan_response_action(
+        _man(M.FAILURE_KIND_CLEAN_HANDOFF), None, pipeline
+    )
+    assert action.kind == "none"
+
+    # Terminal: no failure_kind, no on_fail, no pending response → must raise with
+    # the reason + the next verb, never silently no-op.
+    with pytest.raises(ValueError, match="failed terminally"):
+        mgr._plan_response_action(_man(None), None, pipeline)
 
 
 # --- FR-7.1: idempotent crash recovery --------------------------------------
