@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "prd-cycle",
+  "current_step": "prd-approve",
   "warnings": [],
   "steps": [
     {
@@ -72,11 +72,11 @@
     {
       "id": "prd-approve",
       "type": "human_gate",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-06-30T19:13:06.502503+00:00",
-      "ended": null,
+      "ended": "2026-06-30T20:22:50.875131+00:00",
       "attempts": 0,
       "base_sha": null,
       "parked_reason": null,
@@ -88,7 +88,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
-      "notes": "awaiting human decision; review: prd.md, findings.json, triage.json, confirm.json",
+      "notes": "approved",
       "iteration": null,
       "metrics": {}
     }
@@ -106,10 +106,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 192324,
-    "output_tokens": 71945,
+    "input_tokens": 217469,
+    "output_tokens": 75948,
     "cached_input_tokens": 5485939,
-    "cost_usd": 5.784176050000001
+    "cost_usd": 5.798468300000001
   },
   "agent_usage": {
     "reviewer": {
@@ -137,10 +137,10 @@
       "cost_usd": 5.720117500000001
     },
     "judge_llm": {
-      "input_tokens": 15470,
-      "output_tokens": 2616,
+      "input_tokens": 40615,
+      "output_tokens": 6619,
       "cached_input_tokens": 0,
-      "cost_usd": 0.009099499999999998
+      "cost_usd": 0.02339174999999999
     }
   },
   "recoveries": []
