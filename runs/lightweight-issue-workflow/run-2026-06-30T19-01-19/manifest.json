@@ -1,0 +1,142 @@
+{
+  "run_id": "run-2026-06-30T19-01-19",
+  "slug": "lightweight-issue-workflow",
+  "branch": "gauntlet/lightweight-issue-workflow",
+  "base_branch": "docs/lightweight-issue-workflow-prd",
+  "pipeline": {
+    "name": "standard",
+    "version": 1,
+    "hash": "sha256:9faabc476ba4872b7a54564219b6e93083858a59929cfac23b1e275515b9eede"
+  },
+  "prompt_hashes": {
+    "policy.yaml": "sha256:6a381a148e01543cc19e6b098be7168179ceb863e0e77fa4d30b41325b552a74",
+    "prompts/review-document.md": "sha256:567770fdab66d52942954cb307465c5bc9c856a14edf1abe37fe292550e0460f",
+    "prompts/cycle-rereview.md": "sha256:de009fdee060edbdb6c90fdbe4ccfaffa037ca64befa9dabc6894045ed2c3a28",
+    "prompts/triage.md": "sha256:4d3722e71d8af633c0cbd2e2ab360eeeecc81e00e396275dfc6003b94e6e65fa",
+    "prompts/cycle-fix.md": "sha256:e2f15cb235d3add44586275bbb6e9d339e7de16b3dcba8aae64a03141df530ed",
+    "prompts/cycle-confirm.md": "sha256:27a412fc8f65fe5150df0c002b918d5aa3808050c5b7510389e9b5d7d917b02d",
+    "prompts/plan-author.md": "sha256:2667fe38d6ed210eca57e13a5ff876bbf2b9c82301731c3d8b2b44bad25abfa9",
+    "prompts/implement-phase.md": "sha256:9b69856e2e59411f49dc9213e0471c481bb74a3634500f25aa16e339fe6dc800",
+    "prompts/commit-message.md": "sha256:d40d9856ebc0b6422df7bbe69a9e62ffed8baf7ce2f6000406590d30d78ad251",
+    "prompts/review-code.md": "sha256:aaad8d5ef5b6350a77eca0a5431ddf0f88ef2b041d0466c3f8fdb5616124ed8d",
+    "prompts/retro.md": "sha256:7707598e9fd89bb06de0aabd842cd8f03e159900b7daa3773542d6cf93de3406",
+    "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
+  },
+  "status": "parked",
+  "current_step": "prd-approve",
+  "warnings": [],
+  "steps": [
+    {
+      "id": "prd-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-30T19:01:21.305224+00:00",
+      "ended": "2026-06-30T19:13:06.497098+00:00",
+      "attempts": 0,
+      "base_sha": "e4239b7bd537c0e67e6f5fd7b658a5e8aa9edbc5",
+      "parked_reason": null,
+      "failure_kind": null,
+      "human_responses": [
+        {
+          "response_id": "prd-cycle-resp-1",
+          "response_text": "Pre-approval amendment — author-derived intent as a first-class mode. The change-author/session-derived intent path (-m) is currently framed in FR-2.1 only as a tolerated escape hatch from a circularity it warns against. Promote it to an explicitly supported intent-provenance spectrum, accepting the circularity as a deliberate ease-of-use trade:\n\n1. Provenance spectrum (amend FR-2.1). Recognize three intent sources by independence: (a) tracker-independent — ticket authored independently of the fix (strongest); (b) ticket-seeded + session-refined — a vague ticket ('this didn't work right') expanded during the bug-fix session into a concrete statement (common, supported); (c) author session-summary — no ticket, statement synthesized from the working session (supported, weakest). Note that the review still validates implementation-correctness, stated-acceptance coverage, regressions, and quality even when the 'is this the right problem?' axis is non-independent.\n\n2. Record provenance honestly (new FR / extend FR-2.4 + FR-8). intent.md and the run manifest must tag intent provenance and an independence flag (e.g. tracker | tracker+session | author-session-summary). The reviewer prompt is told the provenance so it calibrates how much weight to place on the problem-correctness axis (data over inference).\n\n3. Human-in-the-loop review of synthesized intent (the mitigation). When intent is author/session-derived rather than a clean independent ticket, the synthesized problem statement must be surfaced to the human to review/edit before the review run starts. A human ratifying the problem statement is what makes the accepted circularity tolerable. Specify where this hook lives (CLI confirmation vs. the calling skill).\n\n4. Scope decision — /gauntlet-review skill. A Claude Code skill that synthesizes intent from the active session and/or a vague linked ticket, presents it for in-session human review, invokes 'gauntlet review -m \"<approved statement>\"' with provenance, then hands off to /gauntlet-operator. Decide whether this skill is in-scope here or a follow-on; either way, ensure the CLI exposes what the skill needs (non-interactive -m plus a provenance argument).",
+          "timestamp": "2026-06-30T20:01:26.492869+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
+      "usage": {
+        "input_tokens": 84350,
+        "output_tokens": 30356,
+        "cached_input_tokens": 1809538,
+        "cost_usd": 2.1549292499999995
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 10 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": null,
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 10,
+        "accepted_total": 10,
+        "accepted_resolved_total": 10,
+        "verdict_counts": {
+          "legitimate": 10
+        },
+        "confirm_counts": {
+          "resolved": 10
+        }
+      }
+    },
+    {
+      "id": "prd-approve",
+      "type": "human_gate",
+      "status": "parked",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-30T19:13:06.502503+00:00",
+      "ended": "2026-06-30T19:13:06.503437+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "failure_kind": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "awaiting human decision; review: prd.md, findings.json, triage.json, confirm.json",
+      "iteration": null,
+      "metrics": {}
+    }
+  ],
+  "commits": [
+    {
+      "step_id": "prd-cycle",
+      "phase": "PRD.1",
+      "sha": "108b4b57504179a162796454be8be12f9622c4d0"
+    }
+  ],
+  "totals": {
+    "input_tokens": 99820,
+    "output_tokens": 32972,
+    "cached_input_tokens": 1809538,
+    "cost_usd": 2.1640287499999995
+  },
+  "agent_usage": {
+    "reviewer": {
+      "input_tokens": 57718,
+      "output_tokens": 4157,
+      "cached_input_tokens": 4864,
+      "cost_usd": null
+    },
+    "triage": {
+      "input_tokens": 19016,
+      "output_tokens": 4370,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.013493999999999999
+    },
+    "escalation": {
+      "input_tokens": 3929,
+      "output_tokens": 1287,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.01648525
+    },
+    "builder": {
+      "input_tokens": 3687,
+      "output_tokens": 20542,
+      "cached_input_tokens": 1804674,
+      "cost_usd": 2.1249499999999997
+    },
+    "judge_llm": {
+      "input_tokens": 15470,
+      "output_tokens": 2616,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.009099499999999998
+    }
+  },
+  "recoveries": []
+}
