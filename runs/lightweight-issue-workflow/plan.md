@@ -168,13 +168,10 @@ P1 attacks the external-API risk in isolation — testable with no review machin
 - id: P3
   title: Wire the cycle — review.yaml, intent-aware prompt, zero-gate execution
   goal: Add pipelines/review.yaml and prompts/review-code-intent.md and wire the P2 entrypoint through to executing the adversarial_cycle in code_review mode with injected review_base, intent.md, and provenance, zero gates, and the FR-3.4 terminal-severity contract (park on blocking, complete-with-residual-risk on non-blocking). Validates the core thesis — the cycle alone surfaces real correctness/spec-gap findings on a small diff at acceptable cost.
-- id: P4a
+- id: P4
   title: Policy-rule proposal + deterministic FR-7.4 preflight reader
   goal: Ship the deterministic preflight reader (loads policy.yaml, verifies pr_read_commands@v1 present + ratified + version v1, fails closed with the exact FR-7.4 message — no network, no agent) and author the exact pr_read_commands@v1 rule proposal artifact (with id/version/ratified fields) as input to the policy-change process. Buildable and testable without the rule being ratified; never edits policy.yaml. Breaks the circular dependency where a single PR phase would both require a ratified rule and own its proposal.
-- id: ratification-gate
-  title: Human ratification of pr_read_commands@v1 (out-of-band policy-change process)
-  goal: GATE, not a build phase. After P4a, the human ratifies the proposed pr_read_commands@v1 rule into policy.yaml through the policy-change process (Open Question 11.4) and the ratification is recorded in the run manifest. Humans ratify; agents propose (CLAUDE.md §2). P4b must not begin until this manifest record exists. No agent edits policy.yaml.
-- id: P4b
+-- id: P5
   title: GitHub PR mode on top of the ratified preflight
   goal: Add --pr mode (gh resolution + checkout contract with non-destructive divergence detection, base-from-PR, linked-ticket auto-derive with multi-ref handling, fork no-push case) plus gauntlet init scaffolding, gated at run time by the P4a preflight reader. Begins only after the manifest records pr_read_commands@v1 ratified. Validates that a PR can be reviewed against its base and linked ticket with fixes landed locally, without widening the judge boundary.
 ```
