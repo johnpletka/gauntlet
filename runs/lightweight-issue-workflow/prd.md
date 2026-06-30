@@ -67,8 +67,9 @@ PRD → plan → phase ceremony is removed.
 
 The riskiest belief: that the value of the heavyweight pipeline's review is
 **separable** from its ceremony — i.e., that running the `adversarial_cycle`
-alone, against an isolated small diff and an independently-sourced problem
-statement, produces correctness/spec-gap findings valuable enough to justify the
+alone, against an isolated small diff and a provenance-tagged problem statement
+(independent where a ticket exists, author/session-derived with human ratification
+otherwise — FR-2.1a/FR-2.5), produces correctness/spec-gap findings valuable enough to justify the
 flow over plain Claude Code, at low enough cost and friction that engineers
 actually use it for bug fixes. If a single-round review of a small fix surfaces
 few real findings, or costs/takes enough that engineers still skip it, the
@@ -87,7 +88,7 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 | G3 | The review leaves the repo working tree exactly as clean as plain Claude Code would — the review generates no committed or untracked artifact of its own; only fix commits land. (A pre-existing user-supplied in-repo `--intent` file is the user's own untracked dirt, not a review artifact, and is excluded from this guarantee per FR-2.4/FR-8.2.) | Bug intent is transient and must not pollute history or the worktree (contrast: `prd.md` is durable product understanding) |
 | G4 | Fixes land in place on the branch under review (or the PR's head branch); the harness never pushes | Honor the one-PR-per-change model and the no-autonomous-push invariant (FR-9.8) |
 | G5 | The issue tracker is a configurable, pluggable provider; v1 ships Linear, with the seam for GitHub Issues/Jira later | Different teams use different trackers; "tracker of choice" must not be a fork |
-| G6 | The flow runs with zero routine human gates, while still failing closed (parking) on an unresolved blocking finding | Lightweight means unattended-to-PR; safety still cannot be skipped |
+| G6 | The review *cycle* runs with zero routine human gates, while still failing closed (parking) on an unresolved blocking finding; the only human touch-point is a one-time pre-run ratification of a non-independent (author/session-derived) problem statement (FR-2.5), skipped entirely for an independent tracker ticket | Lightweight means unattended-to-PR; safety still cannot be skipped, and accepting author-derived intent is made tolerable by a single up-front human ratification |
 
 ### 2.2 Non-Goals (v1)
 
@@ -95,6 +96,14 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   *existing* change; it does not author the original fix from a ticket. (The
   autonomous "implement from a ticket" variant — a `review` run with a leading
   `agent_task` — is a deliberate follow-on, Open Question 11.1.)
+- **The `/gauntlet-review` Claude Code skill is a follow-on, not a v1
+  deliverable.** v1 ships the `gauntlet review` **CLI** with everything that skill
+  would need — non-interactive `-m`, `--intent-provenance`, and `--approved-intent`
+  (FR-1.1) plus the provenance/ratification recording (FR-2.6). The skill itself
+  (synthesize intent from the active session and/or a vague linked ticket, present
+  it for in-session human review, then invoke `gauntlet review -m "<approved>"
+  --intent-provenance … --approved-intent` and hand off to `/gauntlet-operator`) is
+  scoped out of this PRD. Decision recorded in Open Question 11.8.
 - **No autonomous push, PR open, or merge.** Fixes land locally; the human pushes
   and opens/merges. Inherits FR-9.8 unchanged.
 - **No write-back to the tracker.** The run never posts findings as PR review
@@ -180,7 +189,7 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 | Human gates | Zero routine gates; preserve the fail-closed escalation park | "Lightweight" means unattended-to-PR; the PR is the human review. The escalation park is safety, not ceremony, and dropping it would violate fail-closed. |
 | Where fixes land | In place on the branch under review / the PR head branch; no `gauntlet/<slug>` branch minted | The branch *is* the PR; matches "PR is the gate" and avoids a stacked branch + merge step. Diverges from FR-9.1, which is heavyweight-specific. |
 | Diff scope | Reuse `code_review` mode with `review_base` set to the base branch (not the default `handoff^`) | The reviewer must see the *whole* change, not one commit. Pure config; no engine change. |
-| Problem statement | Independent, tracker-sourced `intent.md`, fed to the reviewer | A correctness review needs a problem statement independent of the diff. Reviewing a solution only against its author's own description is circular. |
+| Problem statement | Provenance-tagged `intent.md` fed to the reviewer: tracker-independent when a ticket exists, else author/session-derived with mandatory pre-run human ratification (FR-2.1a/FR-2.5) | A correctness review is strongest with a problem statement independent of the diff, but author/session-derived intent is a supported first-class mode; its circularity is made tolerable by a human ratifying the synthesized statement before the review runs. |
 | Tracker integration | Pluggable `IssueTracker` provider via entry point; v1 = Linear only | "Tracker of choice" is a provider selection, not a fork (mirrors `AgentAdapter`, FR-2.4). Bounded honestly: non-`linear` fails closed at config load. |
 | Review artifacts | Not committed; default to an out-of-repo state dir | Bug intent is transient/low-value; `prd.md` is durable product understanding. Only `REVIEW.x` fix commits touch the repo — zero working-tree footprint. |
 | Tracker fetch location | Orchestrator-level (Python), into `intent.md`, not via an agent tool call | Determinism over cleverness / data over inference: a direct, logged, reproducible fetch beats asking an agent to gather the ticket via MCP. |
@@ -194,10 +203,16 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 ### FR-1: The `gauntlet review` command and its inputs
 
 - **FR-1.1** A new command exists:
-  `gauntlet review [<branch>] [--pr <N|url>] [--issue <ref|url>] [--intent <path>] [-m <text>] [--base <ref>] [--code-only] [--rounds <N>] [--test | --no-test]`.
+  `gauntlet review [<branch>] [--pr <N|url>] [--issue <ref|url>] [--intent <path>] [-m <text>] [--intent-provenance <tracker|tracker-session|author-session-summary>] [--approved-intent] [--base <ref>] [--code-only] [--rounds <N>] [--test | --no-test]`.
   The baseline-test step (§6) is **off by default**; `--test` enables it (and
   requires `config.test_command` to be set, else a usage error), `--no-test` is
   the explicit-off form. This resolves Open Question 11.5.
+  `--intent-provenance` declares the independence of a manually supplied intent
+  (`--intent`/`-m`/`$EDITOR`); it is ignored with a usage error if combined with
+  `--issue` (whose provenance is always `tracker`), and defaults to
+  `author-session-summary` for manual sources (FR-2.1a). `--approved-intent`
+  asserts a non-independent intent was ratified by a human out of band and is the
+  non-interactive form of the FR-2.5 ratification hook.
 - **FR-1.2** Target resolution: with no positional and no `--pr`, the target is
   the current branch. A positional `<branch>` targets that branch. `--pr`
   resolves and checks out a GitHub PR's head branch. `--pr` and a positional
@@ -211,7 +226,7 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   no new branch created; passing `--pr 123` and a positional branch exits non-zero
   with a usage error; `gauntlet review my-branch` operates on `my-branch`.
 
-### FR-2: Solution-correctness review against an independent problem statement
+### FR-2: Solution-correctness review against a provenance-tagged problem statement
 
 - **FR-2.1** The run resolves a problem statement into an `intent.md` artifact
   from exactly one source, in precedence order: `--issue` (tracker fetch) >
@@ -220,12 +235,45 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   above; the PR body is secondary context only and is **not** by itself a
   sufficient problem statement (FR-4.3). A change author's own PR body describes
   the solution, not an independent statement of the bug, so treating it as the
-  intent would make the correctness review circular (the failure mode G2/FR-2.3
-  guard against).
+  intent would make the correctness review circular.
+- **FR-2.1a** **Intent provenance is a first-class, supported spectrum, not a
+  single independent-ticket assumption.** Every resolved intent carries a
+  `provenance` value on an independence axis, and the flow supports all three as
+  legitimate modes (it does not require a tracker-independent statement):
+  - `tracker` — a ticket authored independently of the fix (strongest
+    independence). The only provenance produced by `--issue` and by PR-mode
+    linked-ticket auto-derive (FR-4.3).
+  - `tracker-session` — a ticket-seeded statement refined during the bug-fix
+    session (a vague ticket expanded into a concrete statement). Non-independent.
+  - `author-session-summary` — no ticket; the statement is synthesized from the
+    working session (supported, weakest independence). Non-independent.
+
+  Provenance is **derived from the source** for `--issue`/PR auto-derive (always
+  `tracker`) and **declared by the operator** for the manual sources via
+  `--intent-provenance {tracker|tracker-session|author-session-summary}` (FR-1.1).
+  A manual source (`--intent`/`-m`/`$EDITOR`) with no `--intent-provenance`
+  defaults to `author-session-summary` (the weakest, safest assumption — it forces
+  ratification per FR-2.5 rather than silently treating session-derived text as
+  independent). An `independent` boolean is derived from provenance
+  (`tracker` → `true`; the other two → `false`).
+- **FR-2.1b** A non-independent provenance is an explicit, deliberate ease-of-use
+  trade, **not** a degraded review. The reviewer prompt is told the provenance and
+  the `independent` flag (FR-2.2) so it calibrates how much weight to place on the
+  "is this the right problem?" axis. Even when that axis is non-independent, the
+  review still validates implementation-correctness, stated-acceptance coverage,
+  regressions, and code quality against the diff. The circularity is mitigated by
+  human ratification of the synthesized statement (FR-2.5), not by forbidding the
+  mode.
 - **FR-2.2** The reviewer is given both the commit-range diff and `intent.md`, and
   the review prompt explicitly requires evaluating whether the change resolves the
   stated problem and meets the stated acceptance/expected behavior — surfaced
-  through the existing `findings.json` `correctness` / `spec-gap` categories.
+  through the existing `findings.json` `correctness` / `spec-gap` categories. The
+  prompt is also told the intent `provenance` and `independent` flag (FR-2.1a) so
+  the reviewer calibrates the weight it places on the problem-correctness axis: a
+  `tracker`-independent statement is treated as an authoritative problem definition,
+  while a non-independent statement is treated as the author's own framing of the
+  problem, with the implementation-correctness / acceptance-coverage / regression /
+  quality axes carrying full weight regardless.
 - **FR-2.3** Intent is **required** unless `--code-only` is passed. With no intent
   source resolvable and no `--code-only`, the run fails closed before any agent
   call (degrading silently to a diff-only review is the failure mode this
@@ -256,11 +304,61 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   and never appears in any `REVIEW.x` commit, and after the run `git status` shows
   `bug.md` still present and untracked.
 
+- **FR-2.5** **Pre-run human ratification of non-independent intent (the
+  circularity mitigation).** When the resolved intent is **not** `tracker`
+  provenance (i.e. `tracker-session` or `author-session-summary`, `independent ==
+  false`), the synthesized problem statement must be surfaced to a human to
+  review/edit and explicitly approve **before** the review cycle starts — before
+  any reviewer agent is spawned. A human ratifying the problem statement is what
+  makes the accepted circularity tolerable; without it the run must not proceed.
+  This hook lives at **intent resolution / run entry**, not inside the cycle, and
+  is enforced by the CLI as follows (fail closed):
+  - **Interactive (a TTY is attached):** the CLI renders the resolved `intent.md`
+    and requires an explicit confirm/edit step (the operator may edit the text in
+    `$EDITOR` and must confirm) before the cycle begins. Declining aborts the run
+    with no agent spawned.
+  - **Non-interactive (no TTY — e.g. invoked by a skill or CI):** the CLI
+    **rejects** a non-independent intent **unless** the caller passes
+    `--approved-intent`, which asserts the statement was already ratified by a
+    human out of band (e.g. the `/gauntlet-review` skill's in-session review,
+    Non-Goal note / Open Question 11.8). Without `--approved-intent` the run fails
+    closed with guidance and spawns no agent.
+  - A `tracker`-provenance intent (independent ticket) needs **no** ratification
+    step and runs unattended; this preserves the zero-routine-gates property
+    (FR-3.1, G6) for the independent path.
+
+  This is a one-time setup/entry step that establishes an *approved* intent; it is
+  not a routine gate inside the review cycle. The zero-routine-gates guarantee of
+  FR-3.1/G6 governs the cycle (review → triage → fix → confirm) once an approved
+  intent has entered the run.
+
+- **FR-2.6** **Provenance and ratification are recorded honestly.** The resolved
+  `provenance` value, the derived `independent` flag, and — for non-independent
+  intent — the ratification record (method: `interactive-confirm` or
+  `approved-intent-flag`, the approving user, and timestamp) are persisted in the
+  run manifest and reflected in the `intent.md` header (§6). They are passed into
+  the reviewer prompt per FR-2.2 (data over inference: the reviewer is told how the
+  problem statement was sourced rather than guessing).
+
+  **Acceptance:** A run with `--issue ENG-1234` records `provenance: tracker`,
+  `independent: true`, requires no confirmation, and runs unattended; a run with
+  `-m "<text>"` and no `--intent-provenance` defaults to
+  `provenance: author-session-summary`, `independent: false`, and — with no TTY and
+  no `--approved-intent` — exits non-zero with guidance and spawns no agent; the
+  same run with `--approved-intent` proceeds and records
+  `ratification.method: approved-intent-flag` in the manifest; a run with
+  `-m "<text>" --intent-provenance tracker-session` is treated as non-independent
+  and still requires ratification.
+
 ### FR-3: Zero routine gates, fail-closed escalation preserved
 
-- **FR-3.1** `pipelines/review.yaml` contains no `human_gate` step. On the happy
-  path the run proceeds review → triage → fix → confirm to completion with no
-  human turn.
+- **FR-3.1** `pipelines/review.yaml` contains no `human_gate` step. Once an
+  approved intent has entered the run, the review **cycle** proceeds review →
+  triage → fix → confirm to completion with no human turn. "Zero routine gates"
+  is a property of the cycle, not of intent establishment: a non-independent
+  (author/session-derived) intent carries a one-time pre-run ratification step
+  (FR-2.5) that runs *before* the cycle and is not a gate within it. A
+  `tracker`-independent intent reaches the cycle with no human turn at all.
 - **FR-3.2** The `adversarial_cycle`'s fail-closed behavior is preserved
   unchanged: an unresolved blocking finding after `max_rounds` (or a
   low-confidence triage on a blocking finding with no `escalation_agent`) **parks
@@ -301,10 +399,17 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 - **FR-4.2** The diff base (`review_base`) is the PR's base ref.
 - **FR-4.3** The intent is auto-derived from the PR's linked ticket: the
   configured tracker's `extract_refs(pr_body)` scans the PR body for its ref
-  pattern (e.g. "Fixes ENG-1234"); the first resolved ticket supplies the problem
-  statement, with the PR body attached as **secondary context only** (it never
-  substitutes for the ticket-sourced problem statement). If no linked ticket ref
-  is found, the run does **not** silently fall back to the PR body as intent:
+  pattern (e.g. "Fixes ENG-1234"). **Multiple refs (normative v1, resolves Open
+  Question 11.7):** `extract_refs` returns refs in **textual order**; the **first
+  resolved** ref supplies the problem statement (`provenance: tracker`). When more
+  than one distinct ref is present, the run **emits a warning** naming the chosen
+  ref and lists **all** detected refs in the run summary as **ignored secondary
+  refs** (so a PR that intentionally spans several tickets is visible to the
+  human), and the operator may override with an explicit `--issue` to pick a
+  different ticket. v1 does **not** concatenate multiple tickets into one intent.
+  The PR body is attached as **secondary context only** (it never substitutes for
+  the ticket-sourced problem statement). If no linked ticket ref is found, the run
+  does **not** silently fall back to the PR body as intent:
   intent is still required (FR-2.3), so the run fails closed unless the user
   supplies an explicit `--issue` / `--intent` / `-m` / `$EDITOR` intent or opts
   into a diff-only review with `--code-only`. When intent is supplied, the PR body
@@ -390,7 +495,18 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 - **FR-6.4** Tracker failures map to the taxonomy and **halt** the review (never
   proceed with no/partial problem statement): missing/invalid token →
   `IssueTrackerAuthError`; unresolved ref → `IssueNotFound`; network/5xx/timeout →
-  `IssueTrackerUnavailable`. A tracker call is wrapped in a timeout.
+  `IssueTrackerUnavailable`. Every tracker call (both a run's `fetch` and the
+  `doctor` `verify_auth` probe) is wrapped in a **per-call timeout of
+  `config.issue_tracker.timeout_s`, default 10 seconds** (minimum 1; a non-positive
+  value is a config-load error). Exceeding it raises `IssueTrackerUnavailable`,
+  which fails the run/probe closed. The same timeout applies to `doctor` and to a
+  run fetch — `doctor` differs only in that it calls the cheap `verify_auth` probe
+  (FR-10.1) rather than fetching a ticket body.
+
+  **Acceptance:** A simulated tracker call that blocks past `timeout_s` raises
+  `IssueTrackerUnavailable` and fails the run closed before any review agent is
+  spawned; setting `issue_tracker.timeout_s: 0` (or negative) is rejected at config
+  load.
 - **FR-6.5** The `issue_tracker` config block is optional; absent (or
   `provider: none`), `--issue` is rejected with guidance while `--intent` / `-m` /
   `$EDITOR` still work.
@@ -420,11 +536,35 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   unratified, the run **halts and escalates** rather than proceeding (fail-closed,
   process fidelity); it never widens the boundary by relying on the LLM fallback
   in the interim. P1–P3 do not depend on this rule and are unaffected.
+- **FR-7.4** **Machine-checkable P4 preflight (deterministic, not probe-based).**
+  The PR-mode entry path runs a preflight **before** issuing any `gh pr view` /
+  `gh pr checkout` / `git fetch`, and the preflight does **not** work by attempting
+  the command and observing the judge's response (that would be the
+  "try-it-and-see" anti-pattern the fail-closed principle forbids). Concretely:
+  - The proposed allow rule (FR-7.3) carries a stable identifier and version,
+    `pr_read_commands@v1`, in `policy.yaml`.
+  - The review command's PR-mode preflight loads the active `policy.yaml`, looks
+    up the `pr_read_commands` rule, and verifies it is present, marked ratified,
+    and at the version the build expects. This is a deterministic config read with
+    no network and no agent call.
+  - If the rule is **absent, unratified, or version-mismatched**, the run fails
+    closed before any `gh`/`git fetch` command with the exact message:
+    `"P4 (PR mode) requires policy rule 'pr_read_commands@v1' to be ratified in
+    policy.yaml; it is <absent|unratified|version <found> != v1>. Ratify it through
+    the policy-change process (Open Question 11.4) before using --pr."`
+  - Branch-mode reviews (no `--pr`) issue none of these commands and skip the
+    preflight entirely.
 
-  **Acceptance:** A review run's attempt to `git push` from within the cycle is
-  denied with the FR-9.8 rationale; `gh pr checkout`/`git fetch` succeed; the
-  Linear token never appears in any judge-audit or transcript artifact (§7
-  redaction).
+  **Acceptance:** With a `policy.yaml` fixture **missing** `pr_read_commands@v1`, a
+  `gauntlet review --pr <N>` invocation exits non-zero with the exact preflight
+  message and issues **no** `gh`/`git fetch` command and spawns no agent; with the
+  ratified-rule fixture present, the same invocation proceeds to checkout; a
+  branch-mode review with the rule absent is unaffected.
+
+  **Acceptance (FR-7.1–FR-7.3):** A review run's attempt to `git push` from within
+  the cycle is denied with the FR-9.8 rationale; `gh pr checkout`/`git fetch`
+  succeed once `pr_read_commands@v1` is ratified; the Linear token never appears in
+  any judge-audit or transcript artifact (§7 redaction).
 
 ### FR-8: Out-of-repo, uncommitted review artifacts
 
@@ -434,8 +574,11 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   not even an untracked or gitignored file in the repo. The only exception is a
   pre-existing user-supplied `--intent` file that already lives inside the repo:
   that file is the user's own untracked dirt (not created by the review) and is
-  excluded from this guarantee per FR-2.4/FR-8.2. The default location is under
-  an XDG state path (Open Question 11.3 fixes the exact path).
+  excluded from this guarantee per FR-2.4/FR-8.2. The default location, the
+  `<repo-id>` derivation, slug sanitization, collision handling, and the
+  `review.state_dir` override precedence are **normatively specified** in §6
+  ("Review state path"); the default root is
+  `${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/<repo-id>/<slug>/`.
 - **FR-8.2** The only repo mutations a review run makes are the `REVIEW.x`
   accepted-fix commits on the target branch (and none if nothing is accepted). No
   `PR.md` or other artifact is committed. A user-supplied `--intent` file inside
@@ -446,7 +589,9 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
   default is out-of-repo.
 - **FR-8.4** The out-of-repo state is stable across invocations so a parked review
   is resumable; the review slug derives deterministically from the target (branch
-  name, or `pr-<N>` for PR mode).
+  name, or `pr-<N>` for PR mode), keyed under the deterministic `<repo-id>` per §6
+  ("Review state path"). Two invocations against the same repo + target resolve to
+  the identical state dir.
 
   **Acceptance:** After a completed `gauntlet review` that accepts fixes,
   `git status` shows a clean tree and `git log` shows only `REVIEW.x` commits — no
@@ -497,10 +642,11 @@ lightweight flow does not earn its place. P3 puts this to the test on real fixes
 issue_tracker:
   provider: linear              # v1: only "linear" accepted; github | jira reserved
   api_key_env: LINEAR_API_KEY   # NAME of the env var holding the token — never the token (FR-1.4 base spec)
+  timeout_s: 10                 # per-call tracker timeout (FR-6.4); default 10; min 1
   # workspace: acme             # optional, provider-specific (URL building/validation)
 
 review:                         # optional; controls review-run state location
-  state_dir: null               # null => out-of-repo XDG default (FR-8.1); set to e.g. .gauntlet/runs for in-repo
+  state_dir: null               # null => out-of-repo XDG default (FR-8.1, §6 "review state path"); set to e.g. .gauntlet/runs for in-repo
 ```
 
 **`IssueRef` / `Issue` (normalized provider payloads):**
@@ -527,6 +673,7 @@ class Issue:
 ```markdown
 # Intent — <identifier or "(manual)"> · <title>
 <source: linear ENG-1234 · https://linear.app/...>   # omitted for -m/file/editor
+<provenance: tracker · independent>                  # always emitted; e.g. "author-session-summary · non-independent"
 
 ## Problem
 <ticket description / supplied text>
@@ -540,7 +687,10 @@ class Issue:
 
 **`render_intent` is deterministic (v1):**
 
-- It **always** emits the `# Intent` header and a `## Problem` section.
+- It **always** emits the `# Intent` header, a `<provenance: …>` line carrying the
+  resolved `provenance` value and the `independent`/`non-independent` flag
+  (FR-2.1a/FR-2.6), and a `## Problem` section. (For a `tracker` source the
+  `<source: …>` line is also emitted; it is omitted for manual sources.)
 - `## Problem` contains the source text **verbatim** — the normalized
   `Issue.description` for a tracker source, or the `--intent` file / `-m` string /
   `$EDITOR` text otherwise. v1 performs **no** heading detection, regex
@@ -573,6 +723,47 @@ stages:
          review_prompt: prompts/review-code-intent.md}
          # review_base is injected by the review command from FR-5 resolution
 ```
+
+**Review run manifest — intent provenance block (new; FR-2.6):** the review run's
+manifest records the resolved intent metadata so provenance and ratification are
+auditable:
+
+```jsonc
+"intent": {
+  "source": "issue | intent-file | message | editor | code-only",
+  "provenance": "tracker | tracker-session | author-session-summary | none",
+  "independent": true,                 // derived: tracker => true, else false
+  "ratification": {                    // present only when independent == false
+    "method": "interactive-confirm | approved-intent-flag",
+    "user": "john.pletka@gmail.com",
+    "timestamp": "2026-06-30T20:01:26Z"
+  }
+}
+```
+
+For `--code-only` runs `provenance` is `none` and the block carries no
+`ratification` (there is no intent to ratify).
+
+**Review state path (resolves Open Question 11.3; FR-8.1/FR-8.4):** the default
+out-of-repo state root is
+`${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/<repo-id>/<slug>/`, where:
+- `<repo-id>` derives **deterministically** from the repo's `origin` remote URL,
+  normalized (scheme/credentials/trailing-`.git` stripped, lowercased) and SHA-256
+  hashed, taking the first 12 hex chars; if no `origin` remote exists, the repo's
+  absolute toplevel path (`git rev-parse --show-toplevel`) is normalized and hashed
+  the same way. This keeps the key stable across invocations and independent of the
+  checkout location for remote-backed repos, while still being defined for
+  local-only repos.
+- `<slug>` is the target branch name for branch mode, or `pr-<N>` for `--pr` mode
+  (FR-8.4), each sanitized to `[A-Za-z0-9._-]` (every other character replaced with
+  `-`, collapsed runs, trimmed) so a branch like `feature/x` maps to `feature-x`.
+- Two distinct targets that sanitize to the same `<slug>` are disambiguated by
+  appending a short hash of the unsanitized name, so collisions cannot silently
+  merge two runs' state.
+- **Override precedence:** `review.state_dir` (config, FR-8.3), when set, replaces
+  the entire out-of-repo root with the configured (in-repo, gitignored) location;
+  `<repo-id>/<slug>` layout under it is unchanged. The default (null) uses the XDG
+  path above.
 
 **Reused unchanged:** `findings.json`, `triage.json`, `confirm.json`, and the
 `manifest.json` shape (§7 of the base spec). A "fix does not resolve the problem"
@@ -616,15 +807,18 @@ assumptions first. No phase depends on a later phase.
 | Phase | Deliverable | Assumption it validates |
 |-------|-------------|-------------------------|
 | **P1** | `IssueTracker` abstraction (`base.py` payloads + errors, `intent.py` renderer, registry) + `LinearIssueTracker` + `IssueTrackerConfig` + `doctor` tracker check | A Linear ref (`ENG-1234`/URL) can be authenticated and resolved to a usable, normalized problem statement, failing closed on auth/not-found/unavailable. (Riskiest *external* dependency — an unowned third-party API and its auth.) |
-| **P2** | Review run lifecycle: review entry contract (clean tree, ahead-of-base, intent-or-`--code-only`), **full intent-source resolution and precedence (FR-2.1): `--intent <file>`, `-m <text>`, `$EDITOR` template, `--code-only`, and the precedence ordering over the P1 `--issue` tracker source — with `render_intent` snapshotting to the out-of-repo `intent.md` and the FR-2.4 in-repo `--intent` exclusion** , in-place branch adoption (no minting), base resolution + empty-diff guard (FR-5), out-of-repo state dir (FR-8). Acceptance tests cover each intent source (`--issue`, `--intent`, `-m`, `$EDITOR` fallback), the precedence order, the missing-intent fail-closed (no `--code-only`) path, and `--code-only`. | A review run can operate on an existing branch with **zero** repo footprint, resolve a problem statement from any of the four intent sources under the defined precedence (failing closed when none and no `--code-only`), and resolve a correct, non-empty diff base — including the `base_branch: current` degenerate case. |
-| **P3** | `pipelines/review.yaml` + `review-code-intent.md` + the `gauntlet review` command wiring the `adversarial_cycle` in `code_review` mode with injected `review_base` and `intent.md`; zero gates; escalation park preserved | **The core 1.3 assumption:** the cycle alone, on a small diff + independent intent, runs end-to-end, lands `REVIEW.x` fixes, and surfaces real correctness/spec-gap findings against the intent — at acceptable cost/latency. |
-| **P4** | GitHub PR mode (`--pr`): `gh` resolution + checkout, base-from-PR, PR-body linked-ticket auto-derive (FR-4). **Prerequisite gate:** the `gh`/`git fetch` allow rule (FR-7.3, Open Question 11.4) must be ratified through the policy-change process before P4 begins; if unratified at P4, the run halts and escalates. | A PR can be pulled down, reviewed against its base and linked ticket, and have fixes landed locally for a human to push — including the fork (no-push) case. |
+| **P2** | Review run lifecycle **plus the minimal `gauntlet review` CLI entrypoint that owns argument parsing and intent/base resolution** (it parses the FR-1.1 flags, runs the entry contract, resolves intent + base + state dir, and then **stops short of executing the `adversarial_cycle`** — cycle wiring is P3). Delivered here: review entry contract (clean tree, ahead-of-base, intent-or-`--code-only`); **full intent-source resolution and precedence (FR-2.1): `--intent <file>`, `-m <text>`, `$EDITOR` template, `--code-only`, and the precedence ordering over the P1 `--issue` tracker source — with `render_intent` snapshotting to the out-of-repo `intent.md` and the FR-2.4 in-repo `--intent` exclusion**; **intent provenance tagging + `--intent-provenance` + the FR-2.5 pre-run ratification hook (interactive confirm / `--approved-intent`) + the FR-2.6 manifest provenance/ratification record**; in-place branch adoption (no minting); base resolution + empty-diff guard (FR-5); out-of-repo state dir + path/repo-id/slug derivation (FR-8, §6 "Review state path"). Because the CLI entrypoint exists in P2, its acceptance tests are **command-level** (`gauntlet review …`), covering each intent source (`--issue`, `--intent`, `-m`, `$EDITOR` fallback), the precedence order, provenance defaulting + the non-interactive ratification gate (`--approved-intent`), the missing-intent fail-closed (no `--code-only`) path, `--code-only`, and the `base_branch: current` empty-diff guard — all reachable without the cycle running (the command resolves and validates, then exits at the documented pre-cycle boundary). | A review run can parse its inputs at the CLI, operate on an existing branch with **zero** repo footprint, resolve a provenance-tagged problem statement from any of the four intent sources under the defined precedence (failing closed when none and no `--code-only`, and requiring ratification for non-independent intent), and resolve a correct, non-empty diff base — including the `base_branch: current` degenerate case. |
+| **P3** | `pipelines/review.yaml` + `review-code-intent.md` + wiring the P2 `gauntlet review` entrypoint through to **executing** the `adversarial_cycle` in `code_review` mode with injected `review_base`, `intent.md`, and provenance (FR-2.2); zero gates; escalation park + FR-3.4 terminal severity rules preserved | **The core 1.3 assumption:** the cycle alone, on a small diff + a (possibly author-derived, ratified) intent, runs end-to-end, lands `REVIEW.x` fixes, and surfaces real correctness/spec-gap findings against the intent — at acceptable cost/latency. |
+| **P4** | GitHub PR mode (`--pr`): `gh` resolution + checkout (FR-4.5), base-from-PR, PR-body linked-ticket auto-derive incl. multi-ref handling (FR-4.3). **Prerequisite gate:** the machine-checkable FR-7.4 preflight verifies `pr_read_commands@v1` is ratified in `policy.yaml` (FR-7.3, Open Question 11.4) **before** any `gh`/`git fetch`; if absent/unratified/version-mismatched, the run halts and escalates with the FR-7.4 message. | A PR can be pulled down, reviewed against its base and linked ticket, and have fixes landed locally for a human to push — including the fork (no-push) case. |
 
 Ordering rationale: P1 attacks the external-API risk in isolation (it is testable
 without any review machinery). P2 establishes the no-footprint, in-place lifecycle
-the review depends on, including all manual intent sources and precedence
-(FR-2.1). P3 needs P1 (tracker intent) + P2 (lifecycle + manual intent) and
-proves the product thesis. P4 is a convenience surface over P1–P3 and so comes last.
+the review depends on **and the minimal CLI entrypoint that exposes it**, including
+all manual intent sources, provenance + ratification, and precedence (FR-2.1/2.5/
+2.6); its acceptance tests are therefore command-level without needing the cycle.
+P3 needs P1 (tracker intent) + P2 (lifecycle + CLI + manual intent) and adds only
+cycle execution, proving the product thesis. P4 is a convenience surface over
+P1–P3 (and gated by FR-7.4) and so comes last.
 
 ---
 
@@ -674,9 +868,14 @@ proves the product thesis. P4 is a convenience surface over P1–P3 and so comes
    optionally post findings as inline PR review comments (`gh pr review`)? This is
    an external write inside a step and would need a deliberate judge-policy
    amendment + findings→comment mapping. Out of scope for v1. *(Deferred.)*
-3. **Exact out-of-repo state path.** `$XDG_STATE_HOME/gauntlet/<repo-id>/<slug>/`
-   vs `~/.gauntlet/state/...`, and how `<repo-id>` is derived (remote URL hash vs
-   repo path). *(Must resolve before P2; cheap.)*
+3. **Exact out-of-repo state path.** *(Resolved — see §6 "Review state path" and
+   FR-8.1/FR-8.4.)* Default root
+   `${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/<repo-id>/<slug>/`;
+   `<repo-id>` is the first 12 hex of the SHA-256 of the normalized `origin` remote
+   URL (or the normalized repo toplevel path when there is no `origin`); `<slug>`
+   is the branch name (or `pr-<N>`) sanitized to `[A-Za-z0-9._-]`, with collisions
+   disambiguated by a short hash of the unsanitized name; `review.state_dir`
+   overrides the root.
 4. **Judge-policy rule for `gh`/`git fetch` reads.** The FR-7.3 allow rule for
    `gh pr view`/`gh pr checkout`/`git fetch` is a `policy.yaml` change, which per §0
    goes through the policy-change/ratification process, not this PRD. Confirm the
@@ -691,9 +890,19 @@ proves the product thesis. P4 is a convenience surface over P1–P3 and so comes
 6. **Closed-ticket handling.** When the fetched `Issue.state` is already "Done"/
    closed, should the review warn, proceed, or refuse? *(Judgment call; strawman:
    warn and proceed.)*
-7. **Multiple linked tickets in a PR body.** FR-4.3 takes the first resolved ref.
-   Is "first" right, or should multiple tickets be concatenated into the intent?
-   *(Strawman: first, with all refs listed in the summary.)*
+7. **Multiple linked tickets in a PR body.** *(Resolved — see FR-4.3.)* v1 takes
+   the **first resolved** ref in textual order as the intent, warns when more than
+   one ref is present, and lists all detected refs in the run summary as ignored
+   secondary refs (override with explicit `--issue`); v1 does not concatenate
+   multiple tickets.
+8. **`/gauntlet-review` Claude Code skill scope.** *(Resolved — follow-on, not v1;
+   see Non-Goals.)* The skill (synthesize intent from the active session / vague
+   ticket, present for in-session human review, then invoke `gauntlet review -m
+   "<approved>" --intent-provenance … --approved-intent` and hand off to
+   `/gauntlet-operator`) is out of scope for v1. v1's obligation is only that the
+   CLI exposes what the skill needs: non-interactive `-m`, `--intent-provenance`,
+   `--approved-intent`, and manifest provenance/ratification recording (FR-1.1,
+   FR-2.5, FR-2.6). Building the skill is deferred.
 
 ---
 
