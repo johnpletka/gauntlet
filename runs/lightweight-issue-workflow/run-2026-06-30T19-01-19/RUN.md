@@ -2,7 +2,7 @@
 
 - branch: `gauntlet/lightweight-issue-workflow` (base `docs/lightweight-issue-workflow-prd`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `implement`)
+- status: **running** (at `tests`)
 - totals: 690930in/226264out $20.3034
 
 | step | type | status | duration | usage | notes |
@@ -18,6 +18,7 @@
 | phase-commit.0 | commit | done | 19s | 3761in/1522out $0.0040 | committed 55ec6ad0b0 |
 | [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 957s | 225885in/29828out $1.8915 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
 | [implement.1](steps/implement.1/transcript.md) | agent_task | done | 6243s | 3418in/7123out $2.5078 | agent 'builder' completed |
+| tests.1 | shell | running | — | 0in/0out (tokens only) |  |
 
 ## Commits
 
