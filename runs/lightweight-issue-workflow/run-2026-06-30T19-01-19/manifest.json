@@ -310,7 +310,16 @@
       "base_sha": "aa59df8d96ec77a7d601b49c77cc7124894b8da7",
       "parked_reason": null,
       "failure_kind": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "implement-resp-1",
+          "response_text": "Prior implement[1] attempt was cut off by an Anthropic session/quota limit (429), not a plan or code problem. Quota is now restored — continue phase 1 implementation per the approved plan.",
+          "timestamp": "2026-07-01T14:05:42.089560+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
