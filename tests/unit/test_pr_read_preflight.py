@@ -29,7 +29,13 @@ from gauntlet.judge.preflight import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PROPOSAL = REPO_ROOT / "proposals" / "pr-read-commands.md"
+PROPOSAL = (
+    REPO_ROOT
+    / "runs"
+    / "lightweight-issue-workflow"
+    / "proposals"
+    / "pr-read-commands.md"
+)
 
 # The exact FR-7.4 messages, hardcoded here (NOT derived from the reader's own
 # helper) so a regression in the message construction is caught, not masked.
@@ -134,14 +140,13 @@ def test_missing_policy_file_is_absent(tmp_path):
     assert result.message == _ABSENT_MSG
 
 
-def test_rule_found_regardless_of_bucket(tmp_path):
-    # The lookup is by id, not by list: a rule mislaid under deny is still found
-    # and judged on its markers (here ratified v1 => ok).
-    path = _write_policy(
+def _misbucketed_policy(tmp_path: Path, bucket: str) -> Path:
+    # The governed id, ratified at v1, but parked under a non-allow bucket.
+    return _write_policy(
         tmp_path,
-        """\
+        f"""\
         version: 1
-        deny:
+        {bucket}:
           - name: pr-read-commands
             id: pr_read_commands
             version: v1
@@ -151,7 +156,25 @@ def test_rule_found_regardless_of_bucket(tmp_path):
               - '^\\s*gh\\s+pr\\s+(view|checkout)\\b'
         """,
     )
-    assert check_pr_read_commands(path).ok
+
+
+def test_ratified_rule_under_deny_fails_closed(tmp_path):
+    # The judge boundary FR-7.3/FR-7.4 require is an *allow* rule. A ratified v1
+    # rule parked under deny does NOT establish it: the preflight scopes its
+    # lookup to allow and reads a misbucketed id as absent (fails closed).
+    result = check_pr_read_commands(_misbucketed_policy(tmp_path, "deny"))
+    assert not result.ok
+    assert result.reason == ABSENT
+    assert result.message == _ABSENT_MSG
+
+
+def test_ratified_rule_under_ask_fails_closed(tmp_path):
+    # Same fail-closed behavior for the id parked under ask: only an allow rule
+    # counts, so this reads as absent.
+    result = check_pr_read_commands(_misbucketed_policy(tmp_path, "ask"))
+    assert not result.ok
+    assert result.reason == ABSENT
+    assert result.message == _ABSENT_MSG
 
 
 def test_current_repo_policy_lacks_the_rule():
@@ -187,7 +210,10 @@ def _proposal_rule_block() -> dict:
 
 
 def test_proposal_artifact_exists():
-    assert PROPOSAL.is_file(), "P4 must author proposals/pr-read-commands.md"
+    assert PROPOSAL.is_file(), (
+        "P4 must author the proposal under the run dir: "
+        "runs/lightweight-issue-workflow/proposals/pr-read-commands.md"
+    )
 
 
 def test_proposal_rule_is_well_formed_and_carries_governance_fields():

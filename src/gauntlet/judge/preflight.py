@@ -9,7 +9,8 @@ and at the expected version. No network, no agent — a pure config read, so the
 check is the machine-checkable precondition FR-7.4 mandates rather than the
 try-it-and-see anti-pattern the fail-closed principle forbids (CLAUDE.md §2).
 
-The rule itself is authored as a proposal (``proposals/pr-read-commands.md``) and
+The rule itself is authored as a proposal
+(``runs/lightweight-issue-workflow/proposals/pr-read-commands.md``) and
 ratified out of band through the policy-change process (CLAUDE.md §8, Open
 Question 11.4) — this reader **never** edits ``policy.yaml``. PR mode (a later
 phase) calls :func:`check_pr_read_commands` before any read command; on a not-ok
@@ -69,15 +70,17 @@ class PreflightResult:
 
 
 def _find_rule(policy: Policy) -> PolicyRule | None:
-    """The rule carrying ``id == RULE_ID``, searched across every rule list.
+    """The ``allow`` rule carrying ``id == RULE_ID`` (searched only in ``allow``).
 
-    A governed rule is conventionally an ``allow`` rule, but the lookup is by
-    identifier, not by list, so a mislaid rule is still found (and then judged on
-    its ratified/version markers, not its bucket)."""
-    for rules in (policy.deny, policy.allow, policy.ask):
-        for rule in rules:
-            if rule.id == RULE_ID:
-                return rule
+    The judge boundary FR-7.3/FR-7.4 require is an *allow* rule: it is what
+    blesses ``gh pr view`` / ``gh pr checkout`` / ``git fetch`` on the
+    deterministic fast path. A rule with the governed id parked under ``deny`` or
+    ``ask`` does **not** establish that boundary, so the lookup is scoped to
+    ``allow`` and a misbucketed id reads as :data:`ABSENT` — the preflight fails
+    closed rather than treating a non-allow rule as sufficient."""
+    for rule in policy.allow:
+        if rule.id == RULE_ID:
+            return rule
     return None
 
 
