@@ -14,6 +14,14 @@ def test_accepts_fix_round_and_reviewer_headers():
     assert validate_commit_message("P3.r1: Reviewer-applied changes — y\n\nbody") is None
 
 
+def test_accepts_review_flow_stage_label():
+    # The lightweight `gauntlet review` cycle carries `phase: REVIEW`, so its
+    # accepted-fix commits land as REVIEW.x / REVIEW.rx (PRD FR-8.2/FR-3.4).
+    assert validate_commit_message("REVIEW.1: Address review — fix z\n\nF-001: ...") is None
+    assert validate_commit_message("REVIEW.r1: Reviewer-applied changes — w\n\nbody") is None
+    assert header_prefix("REVIEW.1: Address review — fix z\n\nbody") == "REVIEW.1"
+
+
 def test_rejects_overlong_header():
     long = "P3: " + "x" * 80
     err = validate_commit_message(long + "\n\nbody")

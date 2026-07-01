@@ -323,22 +323,30 @@ def review(
         None, "--test/--no-test",
         help="Run config.test_command as a baseline step first (off by default).",
     ),
+    response: str = typer.Option(
+        None, "--response",
+        help="Resume a parked/failed review with a human decision (FR-3.2/FR-10.4).",
+    ),
 ) -> None:
     """Adversarially review a change in place against its originating intent.
 
-    Runs only the adversarial review cycle against an already-implemented change
-    on a branch, landing accepted fixes as REVIEW.x commits in place (no branch
-    minted, nothing pushed). In P2 the command resolves and validates its inputs
-    — target branch, intent (+ provenance/ratification), out-of-repo state dir,
-    and diff base — then stops at the pre-cycle boundary; cycle execution lands
-    in a later phase.
+    Runs only the adversarial review cycle (review → triage → fix → confirm)
+    against an already-implemented change on a branch, landing accepted fixes as
+    REVIEW.x commits in place (no branch minted, nothing pushed). Zero routine
+    gates; an unresolved blocking finding parks the run (resume with --response),
+    an unresolved legitimate non-blocking finding completes and is surfaced as
+    residual risk (FR-3.4).
     """
+    from gauntlet.engine import manifest as M
     from gauntlet.engine.review import (
         Hooks,
         ReviewInputs,
         ReviewLifecycle,
         ReviewUsageError,
         ReviewFailClosed,
+        drive_review,
+        load_review_run,
+        resume_review,
     )
 
     mgr = _manager()
@@ -364,7 +372,25 @@ def review(
     )
     lifecycle = ReviewLifecycle(mgr.repo_root, mgr.config, hooks=hooks)
     try:
-        resolution = lifecycle.resolve(inputs)
+        # Locate the (side-effect-free) state dir first so an existing parked/
+        # running review is resumed, not clobbered by a fresh resolution.
+        _target, _slug, state_dir = lifecycle.locate(inputs)
+        existing = load_review_run(state_dir)
+        if response is not None or existing is not None:
+            if existing is None:
+                typer.echo(
+                    f"review cannot proceed: no resumable review run at {state_dir} "
+                    "(nothing to resume). Run `gauntlet review` without --response "
+                    "to start one.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            outcome = resume_review(
+                mgr.repo_root, mgr.config, state_dir, response=response,
+            )
+        else:
+            resolution = lifecycle.resolve(inputs)
+            outcome = drive_review(mgr.repo_root, mgr.config, resolution)
     except ReviewUsageError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
@@ -372,15 +398,49 @@ def review(
         typer.echo(f"review cannot proceed: {exc}", err=True)
         raise typer.Exit(1) from exc
 
-    typer.echo(f"review resolved for branch {resolution.target_branch!r}")
-    typer.echo(f"  base: {resolution.base_ref} (merge-base {resolution.merge_base[:10]})")
-    typer.echo(
-        f"  intent: {resolution.intent_record.source} / "
-        f"{resolution.intent_record.provenance} "
-        f"({'independent' if resolution.intent_record.independent else 'non-independent'})"
-    )
-    typer.echo(f"  state: {resolution.state_dir}")
-    typer.echo("resolved to the pre-cycle boundary (cycle execution lands in a later phase)")
+    _render_review_outcome(outcome, M)
+
+
+def _render_review_outcome(outcome, M) -> None:
+    """Print a review run's terminal state: status, REVIEW.x commits, residual
+    risk / declined findings (FR-3.4), and the state dir."""
+    typer.echo(f"review {outcome.status} (branch operated on in place)")
+    if outcome.commits:
+        typer.echo(f"  landed {len(outcome.commits)} fix commit(s):")
+        for phase, sha in outcome.commits:
+            typer.echo(f"    {phase}: {sha[:10]}")
+    else:
+        typer.echo("  no fix commits landed")
+
+    summary = outcome.summary
+    if summary.residual_risk:
+        typer.echo(
+            f"  residual risk — {len(summary.residual_risk)} legitimate "
+            "non-blocking finding(s) not fully resolved (surface on the PR):"
+        )
+        for f in summary.residual_risk:
+            cv = f.confirm_verdict or "not confirmed"
+            typer.echo(f"    [{f.severity}] {f.id} @ {f.location}: {f.claim} ({cv})")
+    if summary.declined:
+        typer.echo(f"  declined — {len(summary.declined)} finding(s) not fixed:")
+        for f in summary.declined:
+            typer.echo(
+                f"    [{f.severity}] {f.id} ({f.triage_verdict}): {f.triage_reasoning}"
+            )
+
+    if outcome.parked:
+        typer.echo(
+            "  PARKED on an unresolved blocking finding (fail closed, FR-3.2); "
+            'resume with `gauntlet review --response "<decision>"`.'
+        )
+        if outcome.cycle_notes:
+            typer.echo(f"  reason: {outcome.cycle_notes}")
+    typer.echo(f"  state: {outcome.state_dir}")
+    # Any non-DONE terminal state is a non-zero exit: a park (fail closed, FR-3.2),
+    # a failure, or a budget/timeout halt — never a silent exit 0 on an incomplete
+    # review (data over inference).
+    if outcome.status != M.RUN_DONE:
+        raise typer.Exit(1)
 
 
 def _run_interactive(

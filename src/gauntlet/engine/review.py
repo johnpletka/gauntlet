@@ -22,6 +22,7 @@ intent halts before any state is committed — never a silent degrade.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -350,6 +351,24 @@ class ReviewLifecycle:
         self.hooks = hooks or Hooks()
 
     # ---- top-level -----------------------------------------------------------
+
+    def locate(self, inputs: ReviewInputs) -> tuple[str, str, Path]:
+        """Resolve the target branch, slug, and state dir — with NO side effects.
+
+        Runs input validation and target-name resolution (both read-only: no
+        checkout, no clean-tree check, no manifest write), then derives the
+        deterministic state dir. The CLI calls this BEFORE :meth:`resolve` so it
+        can detect an existing (parked/running) review run and route a resume to it
+        rather than clobbering it with a fresh resolution (FR-9.1/FR-8.4)."""
+        self._validate_inputs(inputs)
+        target = self._resolve_target(inputs)
+        slug = review_slug(target)
+        repo_id = derive_repo_id(self.repo_root)
+        state_dir = resolve_state_dir(
+            self.repo_root, self.config,
+            repo_id=repo_id, slug=slug, environ=self.hooks.environ,
+        )
+        return target, slug, state_dir
 
     def resolve(self, inputs: ReviewInputs) -> ReviewResolution:
         """Run the full P2 resolve-and-stop path; raise on any fail-closed halt."""
@@ -871,3 +890,590 @@ class ReviewLifecycle:
         path = state_dir / "manifest.json"
         man.write_atomic(path)
         return path
+
+
+# ---------------------------------------------------------------------------
+# P3 — cycle execution + the FR-3.4 terminal-severity summary
+# ---------------------------------------------------------------------------
+
+# Severity ordering for the residual-risk / declined summary (FR-3.4).
+_SEVERITY_RANK = {"blocking": 0, "major": 1, "minor": 2, "nit": 3}
+_LEGITIMATE = "legitimate"
+_CONFIRM_RESOLVED = "resolved"
+
+# The review pipeline asset is a single `adversarial_cycle` step (§6 review.yaml).
+_REVIEW_PIPELINE = "pipelines/review.yaml"
+# Terminal run statuses — a run in one of these is not resumable.
+_TERMINAL_STATUSES = (M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED)
+
+
+@dataclass(frozen=True)
+class SummaryFinding:
+    """One finding surfaced in a review run's terminal summary (FR-3.4)."""
+
+    id: str
+    severity: str
+    location: str
+    claim: str
+    triage_verdict: str | None
+    triage_reasoning: str
+    confirm_verdict: str | None  # last confirm verdict; None => never confirmed
+    round: int
+
+
+@dataclass(frozen=True)
+class ReviewSummary:
+    """The FR-3.4 terminal partition of a completed review's findings.
+
+    ``residual_risk`` — legitimate, non-blocking findings whose last confirm
+    verdict is not ``resolved`` (they complete the run but surface to the human on
+    the branch/PR, never silently dropped). ``declined`` — findings triaged
+    not-legitimate, carried with their triage reasoning. A legitimate *blocking*
+    finding never reaches this partition: it parks the run (FR-3.2), it does not
+    complete.
+    """
+
+    residual_risk: list[SummaryFinding]
+    declined: list[SummaryFinding]
+
+
+@dataclass(frozen=True)
+class RoundRecord:
+    """One cycle round's persisted findings / triage / confirm records.
+
+    The summary is a pure function of these — the review run adds no new finding
+    store (FR-3.4 residual-risk contract). ``findings`` carries the raw
+    ``findings.json`` entries, ``triage`` the ``triage.json`` verdicts, ``confirm``
+    the ``confirm.json`` verdicts, for a single round index.
+    """
+
+    round: int
+    findings: list[dict]
+    triage: list[dict]
+    confirm: list[dict]
+
+
+@dataclass
+class ReviewOutcome:
+    """The result of driving a review cycle to a terminal state (P3)."""
+
+    status: str  # a manifest RUN_* status
+    parked: bool
+    commits: list[tuple[str, str]]  # (phase-prefix, sha) for each REVIEW.x
+    summary: ReviewSummary
+    state_dir: Path
+    cycle_notes: str
+
+
+def summarize_cycle(rounds: list[RoundRecord]) -> ReviewSummary:
+    """Partition a cycle's findings into residual-risk / declined (FR-3.4).
+
+    A pure, deterministic function of the per-round records (no I/O, no clock):
+
+    - **Merge across rounds + dedup by id.** A finding id is unique within a round
+      but may recur across rounds; the merged entry takes the record from the
+      **highest round index** in which the id appears (latest triage and confirm
+      verdicts win). No id appears twice.
+    - **Partition.** *Residual risk* = ids whose final triage verdict is
+      ``legitimate`` and whose last confirm verdict is not ``resolved`` (i.e.
+      ``unresolved`` / ``partially_resolved`` / ``regression_introduced`` — or
+      absent, meaning never confirmed resolved), restricted to non-blocking
+      severities. *Declined* = ids whose final triage verdict is not
+      ``legitimate``, carrying their triage reasoning. A finding with no triage
+      record at all is neither (an anomaly, not surfaced).
+    - **Deterministic order.** Within each partition, sort by severity rank
+      (blocking > major > minor > nit), then ascending merged round index, then id
+      lexicographically — never dict/iteration order.
+    """
+    merged: dict[str, dict] = {}
+    for rec in sorted(rounds, key=lambda r: r.round):
+        for f in rec.findings:
+            fid = f.get("id")
+            if fid is None:
+                continue
+            m = merged.setdefault(fid, {"id": fid})
+            m["severity"] = f.get("severity", "")
+            m["location"] = f.get("location", "")
+            m["claim"] = f.get("claim", "")
+            m["round"] = rec.round
+        for v in rec.triage:
+            fid = v.get("finding_id")
+            if fid is None:
+                continue
+            m = merged.setdefault(fid, {"id": fid})
+            m["triage_verdict"] = v.get("verdict")
+            m["triage_reasoning"] = v.get("reasoning", "")
+            m["round"] = rec.round
+        for c in rec.confirm:
+            fid = c.get("finding_id")
+            if fid is None:
+                continue
+            m = merged.setdefault(fid, {"id": fid})
+            m["confirm_verdict"] = c.get("verdict")
+            m["round"] = rec.round
+
+    residual: list[SummaryFinding] = []
+    declined: list[SummaryFinding] = []
+    for m in merged.values():
+        verdict = m.get("triage_verdict")
+        sf = SummaryFinding(
+            id=m["id"],
+            severity=m.get("severity", ""),
+            location=m.get("location", ""),
+            claim=m.get("claim", ""),
+            triage_verdict=verdict,
+            triage_reasoning=m.get("triage_reasoning", ""),
+            confirm_verdict=m.get("confirm_verdict"),
+            round=m.get("round", 0),
+        )
+        if verdict == _LEGITIMATE:
+            # A legitimate blocking finding parks the run (FR-3.2) and never
+            # reaches a completion summary; exclude it defensively. Everything
+            # else legitimate but not confirmed-resolved is residual risk.
+            if sf.severity != "blocking" and sf.confirm_verdict != _CONFIRM_RESOLVED:
+                residual.append(sf)
+        elif verdict is not None:
+            declined.append(sf)
+
+    def _key(sf: SummaryFinding) -> tuple[int, int, str]:
+        return (_SEVERITY_RANK.get(sf.severity, 99), sf.round, sf.id)
+
+    residual.sort(key=_key)
+    declined.sort(key=_key)
+    return ReviewSummary(residual_risk=residual, declined=declined)
+
+
+def _collect_round_records(state_dir: Path) -> list[RoundRecord]:
+    """Assemble the cycle's persisted records into round records for the summary.
+
+    Reads the terminal authoritative artifacts the cycle already persists —
+    ``artifacts/{findings,triage,confirm}.json`` under the run dir (latest round
+    wins). This is the highest-round record for every id present at completion,
+    which is exactly what :func:`summarize_cycle`'s cross-round merge selects; the
+    default ``max_rounds: 1`` review has a single round, so this is the whole
+    story. Missing/torn artifacts read as empty (fail soft for the summary: an
+    absent record simply surfaces nothing, never a crash)."""
+    artifacts = state_dir / "artifacts"
+
+    def _load(name: str, key: str) -> list[dict]:
+        path = artifacts / name
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return []
+        value = data.get(key)
+        return value if isinstance(value, list) else []
+
+    findings = _load("findings.json", "findings")
+    triage = _load("triage.json", "verdicts")
+    confirm = _load("confirm.json", "verdicts")
+    if not (findings or triage or confirm):
+        return []
+    return [RoundRecord(round=1, findings=findings, triage=triage, confirm=confirm)]
+
+
+def _find_cycle_step(raw: dict) -> dict:
+    """The single ``adversarial_cycle`` step dict in a parsed ``review.yaml``.
+
+    Raises ``ReviewError`` if the asset is malformed (no cycle step) — fail closed
+    rather than drive a review that reviews nothing."""
+    for stage in raw.get("stages", []):
+        for step in stage.get("steps", []):
+            if step.get("type") == "adversarial_cycle":
+                return step
+    raise ReviewError(
+        f"{_REVIEW_PIPELINE} has no adversarial_cycle step; the review pipeline "
+        "asset is malformed"
+    )
+
+
+def _prepend_baseline_tests(raw: dict, config: RunConfig) -> None:
+    """Inject the optional baseline-tests shell step ahead of the cycle (FR-1.1).
+
+    ``--test`` opts a review into a pre-review test baseline; the CLI has already
+    verified ``config.test_command`` is set (else a usage error), so the step runs
+    a concrete command. A failing baseline fails the run closed before the cycle
+    (the shell step's non-zero exit is a step failure), giving the correctness
+    reviewer a known-green (or known-red) starting point."""
+    command = (config.test_command or "").strip()
+    stage = raw["stages"][0]
+    stage["steps"].insert(
+        0,
+        {
+            "id": "baseline-tests",
+            "type": "shell",
+            "run": command,
+            "timeout_s": 1800,
+        },
+    )
+
+
+def _bind_review_pipeline(
+    repo_root: Path, config: RunConfig, resolution: ReviewResolution
+):
+    """Load ``review.yaml``, inject the runtime fields, and snapshot it.
+
+    The review command injects what the cycle cannot know statically:
+    ``review_base`` (the merge-base SHA, so the two-dot ``range_diff`` yields the
+    FR-5.2 three-dot scope), ``max_rounds`` (from ``--rounds``), and — unless
+    ``--code-only`` — the resolved ``intent_path`` + provenance threaded into the
+    reviewer/triager prompts (FR-2.2). The **modified** pipeline (fields injected,
+    optional baseline step prepended) is snapshotted to ``state_dir/pipeline.yaml``
+    and its content hash recorded, so a ``resume`` reloads exactly what drove the
+    run (FR-5.6 / FR-9.1) — the injected concrete SHA and out-of-repo intent path
+    are stable across a resume. Returns ``(pipeline, content_hash)``."""
+    import yaml
+
+    from gauntlet.engine.pipeline import Pipeline, content_hash
+
+    pipeline_path = repo_root / config.asset_root / _REVIEW_PIPELINE
+    if not pipeline_path.is_file():
+        raise ReviewFailClosed(
+            f"review pipeline asset {_REVIEW_PIPELINE!r} is missing under "
+            f"asset_root {config.asset_root!r}; run `gauntlet init` to scaffold "
+            "the review pipeline + prompt, or add it before running a review."
+        )
+    raw = yaml.safe_load(pipeline_path.read_text())
+    if not isinstance(raw, dict):
+        raise ReviewError(f"{_REVIEW_PIPELINE} is not a YAML mapping")
+
+    if resolution.run_tests:
+        _prepend_baseline_tests(raw, config)
+
+    step = _find_cycle_step(raw)
+    step["review_base"] = resolution.merge_base
+    step["max_rounds"] = resolution.rounds
+    if resolution.intent_path is not None:
+        step["intent_path"] = str(resolution.intent_path)
+        step["intent_provenance"] = resolution.intent_record.provenance
+        step["intent_independent"] = resolution.intent_record.independent
+
+    snapshot = yaml.safe_dump(raw, sort_keys=False)
+    phash = content_hash(snapshot)
+    (resolution.state_dir / "pipeline.yaml").write_text(snapshot)
+    return Pipeline.model_validate(raw), phash
+
+
+def _judge_model(config: RunConfig) -> str | None:
+    profile = config.agents.get("judge_llm")
+    return profile.model if profile is not None else None
+
+
+def _with_review_judge(config, repo_root: Path, state_dir: Path, man: Manifest, fn):
+    """Run ``fn(judge_env)`` under a run-scoped judge (FR-7.1).
+
+    Mirrors the heavyweight run's judge wiring: a review run carries a ``RUN_ID``
+    and ``step_id`` so the existing FR-9.8 rule keeps denying in-step
+    ``git push`` / ``gh pr create`` — fixes land locally, the operator pushes.
+    The judge enforces the run's own ``policy.yaml`` and audits to the (out-of-repo)
+    state dir. Started before the drive and stopped after, always."""
+    from gauntlet.engine.judgeproc import ManagedJudge
+
+    judge = ManagedJudge(
+        policy_path=repo_root / config.asset_root / "policy.yaml",
+        audit_path=state_dir / "judge-audit.jsonl",
+        run_id=man.run_id,
+        judge_model=_judge_model(config),
+        repo_root=repo_root,
+        run_dir=state_dir,
+    )
+    env = judge.start()
+    try:
+        return fn(env)
+    finally:
+        judge.stop()
+
+
+def _build_review_orchestrator(
+    repo_root: Path,
+    config: RunConfig,
+    resolution: ReviewResolution,
+    pipeline,
+    man: Manifest,
+    *,
+    judge_env: dict,
+    adapter_factory,
+    writer,
+    clock,
+    response_action,
+):
+    from gauntlet.engine.orchestrator import Orchestrator
+
+    kwargs = dict(
+        repo_root=repo_root,
+        run_dir=resolution.state_dir,
+        artifact_root=resolution.state_dir,
+        config=config,
+        pipeline=pipeline,
+        manifest=man,
+        writer=writer,
+        judge_env=judge_env,
+        adapter_factory=adapter_factory,
+        response_action=response_action,
+    )
+    if clock is not None:
+        kwargs["clock"] = clock
+    orch = Orchestrator(**kwargs)
+    # FR-2.4: an in-repo, untracked --intent file is excluded from the cycle's
+    # clean-tree / clean-handoff checks and from every REVIEW.x fix commit, so it
+    # is neither swept into a commit nor allowed to trip the handoff guard. The
+    # engine's own bookkeeping excludes (run dir, PR.md) are already resolved by
+    # the Orchestrator; append the review's intent exclude to that same set.
+    for rel in resolution.excludes:
+        if rel not in orch.excludes:
+            orch.excludes.append(rel)
+    return orch
+
+
+def _outcome(state_dir: Path, man: Manifest, status: str) -> ReviewOutcome:
+    return ReviewOutcome(
+        status=status,
+        parked=(status == M.RUN_PARKED),
+        commits=[(c.phase, c.sha) for c in man.commits],
+        summary=summarize_cycle(_collect_round_records(state_dir)),
+        state_dir=state_dir,
+        cycle_notes=_cycle_notes(man),
+    )
+
+
+def _cycle_notes(man: Manifest) -> str:
+    rec = man.record("review-cycle")
+    return (rec.notes or "").strip() if rec is not None else ""
+
+
+def drive_review(
+    repo_root: Path,
+    config: RunConfig,
+    resolution: ReviewResolution,
+    *,
+    adapter_factory: Callable[[str], object] | None = None,
+    use_judge: bool = True,
+    writer: object | None = None,
+    clock: Callable[[], str] | None = None,
+) -> ReviewOutcome:
+    """Execute the review `adversarial_cycle` for a resolved run (P3).
+
+    Binds ``review.yaml`` with the injected ``review_base`` / ``max_rounds`` /
+    intent (FR-2.2/FR-5.2), rebinds the manifest's pipeline ref, then drives the
+    single-stage, zero-gate pipeline to a terminal state. The cycle's fail-closed
+    behavior is preserved unchanged (FR-3.2): an unresolved legitimate blocking
+    finding parks; anything else completes. The returned :class:`ReviewOutcome`
+    carries the FR-3.4 residual-risk / declined partition and the REVIEW.x
+    commits."""
+    from gauntlet.logging.redact import RedactingWriter
+
+    state_dir = resolution.state_dir
+    pipeline, phash = _bind_review_pipeline(repo_root, config, resolution)
+
+    man = Manifest.load(resolution.manifest_path)
+    man.pipeline = PipelineRef(
+        name=pipeline.name, version=pipeline.version, hash=phash
+    )
+    man.write_atomic(resolution.manifest_path)
+
+    writer = writer or RedactingWriter()
+
+    def _drive(judge_env: dict) -> str:
+        orch = _build_review_orchestrator(
+            repo_root, config, resolution, pipeline, man,
+            judge_env=judge_env, adapter_factory=adapter_factory,
+            writer=writer, clock=clock, response_action=None,
+        )
+        return orch.drive()
+
+    if use_judge:
+        status = _with_review_judge(config, repo_root, state_dir, man, _drive)
+    else:
+        status = _drive({})
+    return _outcome(state_dir, man, status)
+
+
+def load_review_run(state_dir: Path) -> Manifest | None:
+    """The bound, non-terminal review run at ``state_dir``, if one exists.
+
+    A review run is *resumable* once its cycle has been wired (``pipeline.yaml``
+    snapshotted, FR-9.1) and it is not in a terminal state. Returns the manifest
+    then, else ``None`` — so the CLI can refuse to clobber a parked run and route
+    a ``--response`` to it instead."""
+    manifest_path = state_dir / "manifest.json"
+    if not (manifest_path.is_file() and (state_dir / "pipeline.yaml").is_file()):
+        return None
+    try:
+        man = Manifest.load(manifest_path)
+    except (OSError, ValueError):
+        return None
+    if man.pipeline.hash == "" or man.status in _TERMINAL_STATUSES:
+        return None
+    return man
+
+
+def resume_review(
+    repo_root: Path,
+    config: RunConfig,
+    state_dir: Path,
+    *,
+    response: str | None = None,
+    adapter_factory: Callable[[str], object] | None = None,
+    use_judge: bool = True,
+    writer: object | None = None,
+    clock: Callable[[], str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> ReviewOutcome:
+    """Resume a parked/failed review run, optionally injecting a `--response` (FR-3.2).
+
+    Reloads the snapshotted pipeline (refusing a content-hash drift, FR-5.6),
+    re-adopts the target branch, and re-drives the cycle. A ``--response`` on a
+    parked cycle escalation (or a failed cycle) is appended as an authoritative
+    human decision and injected into the reviewer/triager on the re-drive (the
+    same FR-10.4 mechanism the heavyweight run uses); a response-less resume just
+    re-drives from the last checkpoint."""
+    from gauntlet.engine.pipeline import load_pipeline
+    from gauntlet.logging.redact import RedactingWriter
+
+    environ = environ if environ is not None else dict(os.environ)
+    manifest_path = state_dir / "manifest.json"
+    man = Manifest.load(manifest_path)
+    pipeline, phash = load_pipeline(state_dir / "pipeline.yaml")
+    if phash != man.pipeline.hash:
+        raise ReviewFailClosed(
+            "the snapshotted review pipeline changed since the run started "
+            f"({man.pipeline.hash} -> {phash}); resume refuses to run a different "
+            "pipeline against an existing manifest (FR-5.6)."
+        )
+
+    # Re-adopt the target branch in place so HEAD is where REVIEW.x commits land.
+    if gitops.current_branch(repo_root) != man.branch:
+        if not gitops.branch_exists(repo_root, man.branch):
+            raise ReviewFailClosed(
+                f"resume: review target branch {man.branch!r} is missing; "
+                "restore it before resuming."
+            )
+        try:
+            gitops.checkout_branch(repo_root, man.branch)
+        except gitops.GitError as exc:
+            raise ReviewFailClosed(
+                f"resume: could not check out target branch {man.branch!r}: {exc}"
+            ) from exc
+
+    action = _plan_review_response(repo_root, man, response, environ)
+
+    writer = writer or RedactingWriter()
+    resolution = _resolution_from_manifest(man, state_dir)
+
+    def _drive(judge_env: dict) -> str:
+        orch = _build_review_orchestrator(
+            repo_root, config, resolution, pipeline, man,
+            judge_env=judge_env, adapter_factory=adapter_factory,
+            writer=writer, clock=clock, response_action=action,
+        )
+        return orch.drive()
+
+    if use_judge:
+        status = _with_review_judge(config, repo_root, state_dir, man, _drive)
+    else:
+        status = _drive({})
+    return _outcome(state_dir, man, status)
+
+
+def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolution:
+    """A minimal :class:`ReviewResolution` for a resume drive.
+
+    Only the fields :func:`_build_review_orchestrator` reads are needed — the
+    state dir and the intent exclude. The excludes are not persisted in the
+    manifest (they are worktree-local), so a resumed run does not re-derive the
+    in-repo ``--intent`` exclude; a review whose intent lived inside the repo is
+    an uncommon case, and the intent file is untracked either way. The rest of the
+    fields carry manifest-recorded values for completeness."""
+    return ReviewResolution(
+        slug=man.slug,
+        target_branch=man.branch,
+        base_ref=man.base_branch,
+        merge_base="",  # already baked into the snapshotted pipeline's review_base
+        state_dir=state_dir,
+        manifest_path=state_dir / "manifest.json",
+        intent_path=None,
+        intent_record=man.intent
+        or IntentRecord(source="unknown", provenance=M.PROVENANCE_NONE, independent=False),
+        excludes=[],
+        rounds=ROUNDS_MIN,
+        code_only=man.intent is not None and man.intent.source == M.INTENT_SOURCE_CODE_ONLY,
+        run_tests=False,
+    )
+
+
+def _plan_review_response(
+    repo_root: Path,
+    man: Manifest,
+    response: str | None,
+    environ: Mapping[str, str],
+):
+    """Plan the `--response` transition for a review resume (fail closed).
+
+    Recovery FIRST (a still-``pending`` entry from a crashed transition is
+    reused, never re-appended, FR-7.1); then a response-less re-drive
+    (``kind='none'``); then a new ``--response`` append onto the run's stuck
+    respondable cycle step. Operator identity is resolved LAST so a fail-closed
+    identity error leaves the manifest untouched."""
+    from gauntlet.engine.orchestrator import ResponseAction
+
+    for rec in man.steps:
+        if rec.human_responses and rec.human_responses[-1].state == M.RESPONSE_PENDING:
+            latest = rec.human_responses[-1]
+            if response is not None and response != latest.response_text:
+                raise ReviewFailClosed(
+                    f"a pending response ({latest.response_id}) is awaiting "
+                    f"processing; re-run resume to finish it before supplying a "
+                    "new one."
+                )
+            return ResponseAction(kind="recover", step_id=rec.id, iteration=rec.iteration)
+
+    if response is None:
+        # A cycle-escalation park is response-resolvable (FR-3.2/FR-10.4): a plain
+        # re-drive would only re-surface it. Require a decision, like the
+        # heavyweight resume does — never a silent re-park loop.
+        for rec in man.steps:
+            if (
+                rec.status == M.PARKED
+                and rec.parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
+            ):
+                raise ReviewFailClosed(
+                    f"review step {rec.id!r} parked on a cycle escalation its own "
+                    'loop cannot resolve; resume it with --response "<decision>". '
+                    "Re-running without a decision would only re-surface it."
+                )
+        return ResponseAction(kind="none")
+
+    if man.status not in (M.RUN_PARKED, M.RUN_FAILED):
+        raise ReviewFailClosed(
+            f"review run is {man.status}, neither parked nor failed; cannot "
+            "resume with --response."
+        )
+    stuck = None
+    for rec in man.steps:
+        if rec.status == M.PARKED:
+            stuck = rec
+            break
+    if stuck is None:
+        for rec in reversed(man.steps):
+            if rec.status == M.FAILED:
+                stuck = rec
+                break
+    if stuck is None:
+        raise ReviewFailClosed(
+            "review run has no parked or failed step to resume with --response."
+        )
+    if stuck.type not in M.RESPONDABLE_STEP_TYPES:
+        raise ReviewFailClosed(
+            f"step {stuck.id!r} is a {stuck.type}; --response only applies to "
+            f"{' / '.join(sorted(M.RESPONDABLE_STEP_TYPES))} steps."
+        )
+    try:
+        user = resolve_operator_identity(repo_root, environ)
+    except OperatorIdentityError as exc:
+        raise ReviewFailClosed(f"cannot record the response: {exc}") from exc
+    return ResponseAction(
+        kind="append", step_id=stuck.id, iteration=stuck.iteration,
+        text=response, user=user,
+    )
