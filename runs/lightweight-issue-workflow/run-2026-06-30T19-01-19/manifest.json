@@ -636,7 +636,16 @@
       "base_sha": "b662529827f5f204426caff733e368b591e51495",
       "parked_reason": "upstream_conflict",
       "failure_kind": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "implement-resp-1",
+          "response_text": "pr_read_commands@v1 has been ratified in policy.yaml through the human policy-change process (commit 2dbb742); the deterministic preflight check_pr_read_commands now returns ok='ratified' at version v1. The P4->P5 gate has cleared. Proceed with P5 as specified in the plan.",
+          "timestamp": "2026-07-01T18:48:53.960544+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 25370,
         "output_tokens": 12651,
