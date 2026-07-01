@@ -431,7 +431,7 @@ def _render_review_outcome(outcome, M) -> None:
     if outcome.parked:
         typer.echo(
             "  PARKED on an unresolved blocking finding (fail closed, FR-3.2); "
-            'resume with `gauntlet review --response "<decision>"`.'
+            'resume with `gauntlet resume --response "<decision>"`.'
         )
         if outcome.cycle_notes:
             typer.echo(f"  reason: {outcome.cycle_notes}")
@@ -826,6 +826,59 @@ def reject(
     )
 
 
+def _locate_review_run(mgr, slug: str) -> Path | None:
+    """The out-of-repo state dir of a resumable review run named by ``slug``, else None.
+
+    A review run's on-disk ``<slug>`` is `review_slug(<target-branch>)`, so accept
+    either the review slug itself or a raw branch name (which is sanitized to that
+    slug). Returns the state dir only when a *bound, non-terminal* review run lives
+    there (``load_review_run``), so a slug that collides with a heavyweight run —
+    or a review run that never bound / already finished — falls through to the
+    heavyweight resume path unchanged."""
+    import os
+
+    from gauntlet.engine.review import (
+        ReviewFailClosed,
+        derive_repo_id,
+        load_review_run,
+        resolve_state_dir,
+        review_slug,
+    )
+
+    repo_id = derive_repo_id(mgr.repo_root)
+    seen: set[str] = set()
+    for candidate in (slug, review_slug(slug)):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            state_dir = resolve_state_dir(
+                mgr.repo_root, mgr.config,
+                repo_id=repo_id, slug=candidate, environ=os.environ,
+            )
+        except ReviewFailClosed:
+            continue
+        if load_review_run(state_dir) is not None:
+            return state_dir
+    return None
+
+
+def _resume_review_cli(mgr, state_dir: Path, *, response: str | None, no_judge: bool) -> None:
+    """Resume a parked/failed review run and render its terminal outcome (FR-3.2)."""
+    from gauntlet.engine import manifest as M
+    from gauntlet.engine.review import ReviewFailClosed, resume_review
+
+    try:
+        outcome = resume_review(
+            mgr.repo_root, mgr.config, state_dir,
+            response=response, use_judge=not no_judge,
+        )
+    except ReviewFailClosed as exc:
+        typer.echo(f"resume cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _render_review_outcome(outcome, M)
+
+
 @app.command()
 def resume(
     slug: str,
@@ -846,9 +899,19 @@ def resume(
     an adversarial_cycle escalation its own loop cannot resolve (FR-10.4/10.5) —
     supply `--response "<decision>"` to record it (audited in the manifest) and
     re-drive with it injected. Other parks resume as before.
+
+    A lightweight `gauntlet review` run keeps its state out-of-repo (not in
+    run_root), so when the slug names a resumable review run this routes to the
+    review resume path — the PRD-documented recovery for a parked review is
+    `gauntlet resume --response` (FR-3.2), not only `gauntlet review --response`.
     """
+    mgr = _manager()
+    review_dir = _locate_review_run(mgr, slug)
+    if review_dir is not None:
+        _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
+        return
     try:
-        status = _manager().resume(slug, response=response, use_judge=not no_judge)
+        status = mgr.resume(slug, response=response, use_judge=not no_judge)
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and

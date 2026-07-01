@@ -266,6 +266,58 @@ def test_blocking_finding_parks_and_is_resumable(review_repo, tmp_path):
     assert resumed.status == M.RUN_DONE
 
 
+def test_resume_reapplies_in_repo_intent_exclude(review_repo, tmp_path):
+    # FR-2.4: an in-repo, *untracked* --intent file must stay excluded across a
+    # resume — it must neither trip the resumed round's clean-handoff guard nor
+    # be swept into a REVIEW.x fix commit. The exclude is worktree-local, so a
+    # resume can only re-apply it if the fresh run persisted it in the manifest.
+    intent_file = review_repo / "bug.md"  # inside the repo, left untracked
+    intent_file.write_text("The widget crashes on click; fix it.\n")
+
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")),
+        CONFIRM(CV("F-001", "unresolved")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "escalation": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("feature1.py", "def one():\n    return 11\n", {})),
+    }
+    outcome, resolution = run_review(
+        review_repo, tmp_path, adapters, message=None, intent_path="bug.md",
+    )
+    assert outcome.status == M.RUN_PARKED
+    # The exclude was derived and PERSISTED on the manifest's intent record so a
+    # resume can rehydrate it.
+    man = M.Manifest.load(resolution.manifest_path)
+    assert man.intent is not None and man.intent.repo_exclude == "bug.md"
+    # The fresh run left bug.md present and untracked (never swept into REVIEW.1).
+    assert intent_file.is_file()
+    assert "bug.md" in git(review_repo, "status", "--porcelain")
+
+    # Resume with a decision. The untracked bug.md is still in the tree; without
+    # the rehydrated exclude the resumed round-1 clean-handoff guard would fail on
+    # it (FR-9.3). With it, the review converges cleanly.
+    reviewer2 = SeqAdapter(REVIEW())  # human decision resolved it → converge
+    adapters2 = {
+        "reviewer": reviewer2, "triage": SeqAdapter(),
+        "escalation": SeqAdapter(), "builder": SeqAdapter(),
+    }
+    resumed = resume_review(
+        review_repo, _config(), resolution.state_dir,
+        response="F-001 is acceptable; the fix is correct.",
+        adapter_factory=lambda n: adapters2[n], use_judge=False,
+        environ={"GAUNTLET_USER_EMAIL": "john.pletka@gmail.com"},
+    )
+    assert resumed.status == M.RUN_DONE
+    # bug.md is still untracked and appears in no commit on any branch.
+    assert intent_file.is_file()
+    assert "bug.md" in git(review_repo, "status", "--porcelain")
+    committed = git(review_repo, "log", "--all", "--name-only", "--pretty=format:")
+    assert "bug.md" not in committed
+
+
 def test_response_less_resume_of_parked_review_refuses(review_repo, tmp_path):
     reviewer = SeqAdapter(
         REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),
@@ -320,6 +372,50 @@ def test_major_residual_risk_and_declined_findings(review_repo, tmp_path):
     assert [f.id for f in declined] == ["F-002"]
     assert declined[0].triage_verdict == "bikeshedding"
     assert declined[0].triage_reasoning  # carries the triage reasoning
+
+
+# ===========================================================================
+# Multi-round residual risk: an earlier round's non-blocking finding survives a
+# later blocking-resolution round in the terminal summary (FR-3.4)
+# ===========================================================================
+def test_earlier_round_residual_survives_later_blocking_resolution(review_repo, tmp_path):
+    # Round 1 surfaces a legitimate *major* (non-blocking, stays open) alongside a
+    # legitimate *blocking* finding (forces another round). Round 2 resolves only
+    # the blocker and converges. The terminal residual-risk summary must still
+    # carry the round-1 major — reading only the latest (round-2) artifacts would
+    # silently drop it, since round 2 never saw the major.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-maj", "major"), F("F-blk", "blocking")),  # round 1 review
+        CONFIRM(CV("F-maj", "unresolved"), CV("F-blk", "unresolved")),  # round 1 confirm
+        REVIEW(F("F-blk", "blocking")),                        # round 2 regression review
+        CONFIRM(CV("F-blk", "resolved")),                      # round 2 confirm: blocker fixed
+    )
+    adapters = {
+        "reviewer": reviewer,
+        # F-maj triaged (no escalation, major); F-blk base triage in each round
+        # (both escalate because blocking).
+        "triage": SeqAdapter(V("F-maj"), V("F-blk"), V("F-blk")),
+        "escalation": SeqAdapter(V("F-blk"), V("F-blk")),
+        "builder": SeqAdapter(
+            writer("feature1.py", "def one():\n    return 11\n", {}),   # round 1 fix
+            writer("feature1.py", "def one():\n    return 111\n", {}),  # round 2 fix
+        ),
+    }
+    outcome, _resolution = run_review(review_repo, tmp_path, adapters, rounds=2)
+
+    # The blocker resolved in round 2 → the run COMPLETES (does not park).
+    assert outcome.status == M.RUN_DONE
+    assert not outcome.parked
+    assert [p for p, _ in outcome.commits] == ["REVIEW.1", "REVIEW.2"]
+
+    # The round-1 major is still surfaced as residual risk with its round-1
+    # confirm verdict; the round-2-resolved blocker is not (resolved + blocking).
+    residual = outcome.summary.residual_risk
+    assert [f.id for f in residual] == ["F-maj"]
+    assert residual[0].severity == "major"
+    assert residual[0].confirm_verdict == "unresolved"
+    assert "F-blk" not in {f.id for f in residual}
+    assert outcome.summary.declined == []
 
 
 # ===========================================================================

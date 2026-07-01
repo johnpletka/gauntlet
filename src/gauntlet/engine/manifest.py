@@ -236,12 +236,21 @@ class IntentRecord(BaseModel):
     For a ``code-only`` run ``source`` is ``code-only``, ``provenance`` is
     ``none``, ``independent`` is ``False``, and there is no ratification (there
     is no intent to ratify).
+
+    ``repo_exclude`` is the repo-relative path of an in-repo, untracked
+    ``--intent`` file (FR-2.4): it is persisted so a ``resume`` re-applies the
+    same worktree exclusion the fresh run derived, keeping the user's intent
+    file out of the clean-handoff checks and every ``REVIEW.x`` fix commit.
+    Absent (``None``) whenever the intent did not come from an in-repo untracked
+    file (a tracker issue, ``-m`` text, the ``$EDITOR`` template, an out-of-repo
+    or tracked ``--intent`` path, or ``--code-only``).
     """
 
     source: str
     provenance: str
     independent: bool
     ratification: RatificationRecord | None = None
+    repo_exclude: str | None = None
 
 
 # --- recovery audit (operator-aids P4, FR-5.3 / §6.4) ------------------------

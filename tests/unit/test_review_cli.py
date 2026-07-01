@@ -17,6 +17,7 @@ the review pipeline asset is absent (an un-``init``-ed repo).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -109,3 +110,65 @@ def test_code_only_drives_and_fails_closed_without_assets(
     result = runner.invoke(app, ["review", "fix", "--code-only"])
     assert result.exit_code == 1
     assert "review pipeline asset" in result.output
+
+
+def test_resume_routes_a_parked_review_to_review_resume(
+    fixture_repo, tmp_path, monkeypatch
+):
+    # A lightweight `gauntlet review` run keeps its state out-of-repo, not in
+    # run_root, so the heavyweight RunManager.resume can't find it. The PRD's
+    # documented recovery for a parked review is `gauntlet resume --response`
+    # (FR-3.2), so the generic `resume` command must locate the review run by slug
+    # and dispatch to the review resume path. resume_review is stubbed so the
+    # routing is asserted without spawning real agents/judge.
+    from gauntlet.engine import manifest as M
+    from gauntlet.engine import review as review_mod
+    from gauntlet.engine.config import RunConfig
+
+    _repo_with_fix(fixture_repo)
+    _env(monkeypatch, tmp_path)
+    monkeypatch.chdir(fixture_repo)
+
+    cfg = RunConfig.load(fixture_repo / ".gauntlet/config.yaml")
+    slug = review_mod.review_slug("fix")
+    repo_id = review_mod.derive_repo_id(fixture_repo)
+    state_dir = review_mod.resolve_state_dir(
+        fixture_repo, cfg, repo_id=repo_id, slug=slug, environ=os.environ,
+    )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    # A minimal *bound, parked* review run at that state dir (load_review_run
+    # requires manifest + pipeline.yaml present, a non-empty pipeline hash, and a
+    # non-terminal status).
+    man = M.Manifest(
+        run_id=slug, slug=slug, branch="fix", base_branch="main",
+        pipeline=M.PipelineRef(name="review", version=1, hash="deadbeef"),
+        status=M.RUN_PARKED,
+        steps=[M.StepRecord(id="review-cycle", type="adversarial_cycle",
+                            status=M.PARKED,
+                            parked_reason=M.PARKED_REASON_CYCLE_ESCALATION)],
+        intent=M.IntentRecord(source=M.INTENT_SOURCE_MESSAGE,
+                              provenance=M.PROVENANCE_AUTHOR_SESSION_SUMMARY,
+                              independent=False),
+    )
+    man.write_atomic(state_dir / "manifest.json")
+    (state_dir / "pipeline.yaml").write_text("name: review\nversion: 1\n")
+
+    calls: dict = {}
+
+    def fake_resume(repo_root, config, sdir, *, response=None, use_judge=True, **kw):
+        calls["state_dir"] = sdir
+        calls["response"] = response
+        return review_mod.ReviewOutcome(
+            status=M.RUN_DONE, parked=False, commits=[],
+            summary=review_mod.ReviewSummary(residual_risk=[], declined=[]),
+            state_dir=sdir, cycle_notes="",
+        )
+
+    monkeypatch.setattr(review_mod, "resume_review", fake_resume)
+
+    result = runner.invoke(app, ["resume", slug, "--response", "ok, ship it"])
+    assert result.exit_code == 0, result.output
+    # Routed to the review resume path with the review's out-of-repo state dir.
+    assert calls["state_dir"] == state_dir
+    assert calls["response"] == "ok, ship it"
+    assert "review done" in result.output

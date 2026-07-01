@@ -412,6 +412,12 @@ class ReviewLifecycle:
         intent_record, intent_path = self._resolve_intent(
             inputs, source=source, state_dir=state_dir,
         )
+        # Persist the in-repo, untracked --intent exclude on the intent record so
+        # a resume re-derives the same FR-2.4 worktree exclusion (worktree state
+        # is not otherwise recoverable from the out-of-repo manifest). At most one
+        # such path exists (see _intent_excludes).
+        if excludes:
+            intent_record.repo_exclude = excludes[0]
 
         # 8) Persist the manifest (intent block) and stop at the pre-cycle boundary.
         manifest_path = self._persist_manifest(
@@ -1043,32 +1049,120 @@ def summarize_cycle(rounds: list[RoundRecord]) -> ReviewSummary:
     return ReviewSummary(residual_risk=residual, declined=declined)
 
 
+# One cycle round's persisted sub-step dir: ``r<N>-{review,triage,confirm}``.
+_ROUND_DIR_RE = re.compile(r"^r(\d+)-(review|triage|confirm)$")
+
+
+def _load_json_list(path: Path, key: str) -> list[dict]:
+    """The ``key`` list out of a JSON object file, or ``[]`` (fail soft).
+
+    A missing / torn / non-object file — or a ``key`` that is absent or not a
+    list — reads as empty, so a summary is never a crash on incomplete state."""
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    value = data.get(key)
+    return value if isinstance(value, list) else []
+
+
 def _collect_round_records(state_dir: Path) -> list[RoundRecord]:
-    """Assemble the cycle's persisted records into round records for the summary.
+    """Assemble the cycle's per-round persisted records for the summary (FR-3.4).
 
-    Reads the terminal authoritative artifacts the cycle already persists —
-    ``artifacts/{findings,triage,confirm}.json`` under the run dir (latest round
-    wins). This is the highest-round record for every id present at completion,
-    which is exactly what :func:`summarize_cycle`'s cross-round merge selects; the
-    default ``max_rounds: 1`` review has a single round, so this is the whole
-    story. Missing/torn artifacts read as empty (fail soft for the summary: an
-    absent record simply surfaces nothing, never a crash)."""
+    The summary is a pure function of the per-round ``findings``/``triage``/
+    ``confirm`` records the cycle persists (plan P3 residual-risk contract). A
+    multi-round run (``--rounds > 1``) can resolve a blocker in a later round
+    while a non-blocking finding from an earlier round stays open; reading only
+    the latest ``artifacts/*.json`` (which the cycle overwrites each round) would
+    drop those earlier-round findings and silently omit their residual risk. So
+    this reconstructs every round from the lossless per-sub-step logs the cycle
+    already writes under ``steps/<cycle-step>/r<N>-{review,triage,confirm}/``:
+
+    - ``r<N>-review/findings.json`` → that round's findings.
+    - ``r<N>-triage/<finding-id>[-escalated]/verdict.json`` → one verdict per
+      finding. When a finding was escalated, the ``-escalated`` verdict is the
+      authoritative one (it overrode the base triager verdict), so — processed in
+      sorted order, base before escalated — it wins by finding id.
+    - ``r<N>-confirm/confirm.json`` → that round's confirm verdicts.
+
+    :func:`summarize_cycle` then merges across rounds (highest round wins per id).
+    Missing/torn files read as empty (fail soft). When no per-round step dirs
+    exist at all (an older/torn run that only left the terminal artifacts), falls
+    back to the latest ``artifacts/*.json`` as a single round record."""
+    steps_dir = state_dir / "steps"
+    if steps_dir.is_dir():
+        rounds = _rounds_from_step_logs(steps_dir)
+        if rounds:
+            return rounds
+    return _rounds_from_terminal_artifacts(state_dir)
+
+
+def _rounds_from_step_logs(steps_dir: Path) -> list[RoundRecord]:
+    """Reconstruct per-round records from the cycle's ``steps/*/r<N>-*`` logs."""
+    by_round: dict[int, dict[str, object]] = {}
+
+    def _round(n: int) -> dict[str, object]:
+        return by_round.setdefault(
+            n, {"findings": [], "triage": {}, "confirm": []}
+        )
+
+    for step_dir in sorted(steps_dir.iterdir()):
+        if not step_dir.is_dir():
+            continue
+        for sub in sorted(step_dir.iterdir()):
+            m = _ROUND_DIR_RE.match(sub.name)
+            if not (m and sub.is_dir()):
+                continue
+            rnd, kind = int(m.group(1)), m.group(2)
+            acc = _round(rnd)
+            if kind == "review":
+                acc["findings"].extend(  # type: ignore[union-attr]
+                    _load_json_list(sub / "findings.json", "findings")
+                )
+            elif kind == "confirm":
+                acc["confirm"].extend(  # type: ignore[union-attr]
+                    _load_json_list(sub / "confirm.json", "verdicts")
+                )
+            else:  # triage: one <finding-id>[-escalated]/verdict.json per finding
+                triage: dict = acc["triage"]  # type: ignore[assignment]
+                for vdir in sorted(sub.iterdir()):
+                    if not vdir.is_dir():
+                        continue
+                    vpath = vdir / "verdict.json"
+                    if not vpath.is_file():
+                        continue
+                    try:
+                        verdict = json.loads(vpath.read_text())
+                    except (OSError, ValueError):
+                        continue
+                    fid = isinstance(verdict, dict) and verdict.get("finding_id")
+                    if not fid:
+                        continue
+                    # sorted() visits "<id>" before "<id>-escalated", so the
+                    # escalated verdict overrides the base one for that finding.
+                    triage[fid] = verdict
+
+    return [
+        RoundRecord(
+            round=rnd,
+            findings=acc["findings"],  # type: ignore[arg-type]
+            triage=list(acc["triage"].values()),  # type: ignore[union-attr]
+            confirm=acc["confirm"],  # type: ignore[arg-type]
+        )
+        for rnd, acc in sorted(by_round.items())
+    ]
+
+
+def _rounds_from_terminal_artifacts(state_dir: Path) -> list[RoundRecord]:
+    """Fallback: the terminal ``artifacts/*.json`` as one round (older/torn runs)."""
     artifacts = state_dir / "artifacts"
-
-    def _load(name: str, key: str) -> list[dict]:
-        path = artifacts / name
-        if not path.is_file():
-            return []
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return []
-        value = data.get(key)
-        return value if isinstance(value, list) else []
-
-    findings = _load("findings.json", "findings")
-    triage = _load("triage.json", "verdicts")
-    confirm = _load("confirm.json", "verdicts")
+    findings = _load_json_list(artifacts / "findings.json", "findings")
+    triage = _load_json_list(artifacts / "triage.json", "verdicts")
+    confirm = _load_json_list(artifacts / "confirm.json", "verdicts")
     if not (findings or triage or confirm):
         return []
     return [RoundRecord(round=1, findings=findings, triage=triage, confirm=confirm)]
@@ -1381,11 +1475,13 @@ def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolutio
     """A minimal :class:`ReviewResolution` for a resume drive.
 
     Only the fields :func:`_build_review_orchestrator` reads are needed — the
-    state dir and the intent exclude. The excludes are not persisted in the
-    manifest (they are worktree-local), so a resumed run does not re-derive the
-    in-repo ``--intent`` exclude; a review whose intent lived inside the repo is
-    an uncommon case, and the intent file is untracked either way. The rest of the
+    state dir and the intent exclude. The FR-2.4 in-repo ``--intent`` exclude is
+    rehydrated from the manifest's intent record (``repo_exclude``), which the
+    fresh run persisted, so a resumed fixer round keeps the user's untracked
+    intent file out of the clean-handoff checks and out of every ``REVIEW.x``
+    commit — never sweeping it in or letting it block resumption. The rest of the
     fields carry manifest-recorded values for completeness."""
+    excludes = [man.intent.repo_exclude] if (man.intent and man.intent.repo_exclude) else []
     return ReviewResolution(
         slug=man.slug,
         target_branch=man.branch,
@@ -1396,7 +1492,7 @@ def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolutio
         intent_path=None,
         intent_record=man.intent
         or IntentRecord(source="unknown", provenance=M.PROVENANCE_NONE, independent=False),
-        excludes=[],
+        excludes=excludes,
         rounds=ROUNDS_MIN,
         code_only=man.intent is not None and man.intent.source == M.INTENT_SOURCE_CODE_ONLY,
         run_tests=False,
