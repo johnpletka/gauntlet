@@ -17,7 +17,7 @@
 | [tests.0](steps/tests.0/) | shell | done | 224s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.0 | commit | done | 19s | 3761in/1522out $0.0040 | committed 55ec6ad0b0 |
 | [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 957s | 225885in/29828out $1.8915 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.1](steps/implement.1/) | agent_task | failed | 1048s | 0in/0out (tokens only) | handler error: claude reported failure: exit code 1; stderr:  |
+| [implement.1](steps/implement.1/) | agent_task | failed | 2431s | 0in/0out (tokens only) | handler error: claude reported failure: exit code 1; stderr:  |
 
 ## Commits
 

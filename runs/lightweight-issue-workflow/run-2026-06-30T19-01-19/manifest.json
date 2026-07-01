@@ -305,8 +305,8 @@
       "agent": "builder",
       "session_id": null,
       "started": "2026-07-01T13:44:57.327852+00:00",
-      "ended": "2026-07-01T14:02:25.401415+00:00",
-      "attempts": 1,
+      "ended": "2026-07-01T14:25:28.550614+00:00",
+      "attempts": 2,
       "base_sha": "aa59df8d96ec77a7d601b49c77cc7124894b8da7",
       "parked_reason": null,
       "failure_kind": null,
@@ -317,7 +317,7 @@
           "timestamp": "2026-07-01T14:05:42.089560+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
