@@ -79,6 +79,18 @@ class PolicyRule(BaseModel):
     # push or open PRs) — while still allowing it in the operator's own
     # interactive sessions, where push/PR is ordinary directed workflow.
     pipeline_step_only: bool = False
+    # --- policy-change governance markers (FR-7.4) --------------------------
+    # A stable identifier + version + ratification flag for a rule that a feature
+    # preflight verifies deterministically before acting (the pr_read_commands@v1
+    # gate for review PR-mode: gauntlet.judge.preflight). They are absent on every
+    # ordinary rule (id/version None, ratified False), so the existing policy loads
+    # unchanged; only a governed, version-pinned rule sets them. `ratified` is
+    # asserted by the human policy-change process when the rule is added — an agent
+    # never sets it (CLAUDE.md §2: humans ratify, agents propose). `version` is a
+    # rule-level pin (e.g. "v1"), distinct from the file-level Policy.version.
+    id: str | None = None
+    version: str | int | None = None
+    ratified: bool = False
 
     @field_validator("command_patterns")
     @classmethod
