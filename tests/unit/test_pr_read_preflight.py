@@ -177,19 +177,23 @@ def test_ratified_rule_under_ask_fails_closed(tmp_path):
     assert result.message == _ABSENT_MSG
 
 
-def test_current_repo_policy_lacks_the_rule():
-    # The rule is ratified out of band (P4->P5 gate); until then the live policy
-    # correctly reports it absent — the intended fail-closed state.
+def test_current_repo_policy_has_ratified_rule():
+    # Ratified out of band (the P4->P5 gate): the live policy now carries
+    # pr_read_commands@v1 as ratified, so the preflight clears.
     result = check_pr_read_commands(REPO_ROOT / "policy.yaml")
-    assert not result.ok
-    assert result.reason == ABSENT
+    assert result.ok
+    assert result.reason == "ratified"
+    assert result.message is None
 
 
 def test_existing_rules_load_without_governance_fields():
-    # The new optional fields must not break loading the real repo policy: every
-    # ordinary rule defaults id/version None, ratified False.
+    # The optional governance fields must not break loading: every *ordinary*
+    # rule defaults id/version None, ratified False. The one governed rule
+    # (pr_read_commands) legitimately carries them and is excluded.
     policy = Policy.load(REPO_ROOT / "policy.yaml")
     for rule in policy.allow + policy.deny + policy.ask:
+        if rule.id == RULE_ID:
+            continue
         assert rule.id is None
         assert rule.version is None
         assert rule.ratified is False
