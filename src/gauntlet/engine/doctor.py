@@ -70,6 +70,24 @@ def _no_auth_probe(_name: str) -> bool | None:
     return None
 
 
+def _real_tracker_auth_probe(config, env: Mapping[str, str]) -> str | None:
+    """None if the configured tracker authenticates, else a short error (FR-10.1).
+
+    Builds the provider via the entry-point registry, resolves the token by
+    env-var name, and runs the cheap ``verify_auth`` probe under the configured
+    per-call timeout (FR-6.4). Injected so the tracker check runs offline in the
+    unit suite."""
+    from gauntlet.trackers import get_tracker
+    from gauntlet.trackers.base import IssueTrackerError
+
+    try:
+        tracker = get_tracker(config, env=env)
+        tracker.verify_auth()
+    except IssueTrackerError as exc:
+        return str(exc)
+    return None
+
+
 def _real_judge_model_resolvable(model: str) -> str | None:
     """None if LiteLLM can resolve a provider for ``model``, else a short error.
     Delegates to the shared :func:`model_provider_error` so doctor and the judge
@@ -95,6 +113,11 @@ class DoctorProbes:
     # judge_llm model id -> None if LiteLLM resolves a provider, else a short
     # error string. Injected so the classifier check runs offline/deterministic.
     judge_model_resolvable: Callable[[str], str | None] = _real_judge_model_resolvable
+    # issue_tracker config + env -> None if verify_auth succeeds, else a short
+    # error string (FR-10.1). Injected so the tracker check runs offline.
+    tracker_auth_probe: Callable[[object, Mapping[str, str]], str | None] = (
+        _real_tracker_auth_probe
+    )
 
 
 def _real_cli_version(name: str) -> str | None:
@@ -159,6 +182,7 @@ def real_probes() -> DoctorProbes:
         cli_authenticated=_real_cli_authenticated,
         which=shutil.which,
         judge_model_resolvable=_real_judge_model_resolvable,
+        tracker_auth_probe=_real_tracker_auth_probe,
     )
 
 
@@ -552,6 +576,40 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
     )
 
 
+def _check_tracker(config, probes: DoctorProbes) -> CheckResult | None:
+    """FR-10.1: validate the `gauntlet review` issue-tracker when configured.
+
+    Only emitted when an ``issue_tracker`` block is present (and not disabled via
+    ``provider: none``). Checks provider is supported (config load already
+    enforces this), the named auth env var is set, and a cheap ``verify_auth``
+    probe succeeds — each failing closed with an actionable remedy."""
+    tracker = getattr(config, "issue_tracker", None)
+    if tracker is None or not tracker.enabled:
+        return None
+    env_name = tracker.api_key_env
+    if not probes.env.get(env_name):
+        return CheckResult(
+            "issue-tracker", FAIL,
+            f"issue_tracker provider {tracker.provider!r} configured but "
+            f"{env_name} is not set",
+            remedy=f"export {env_name} with a {tracker.provider} API token "
+            "(the token lives in the environment, never in repo config)",
+        )
+    err = probes.tracker_auth_probe(tracker, probes.env)
+    if err:
+        return CheckResult(
+            "issue-tracker", FAIL,
+            f"issue_tracker {tracker.provider!r} auth probe failed: {err}",
+            remedy=f"check that {env_name} holds a valid {tracker.provider} token "
+            "and the API is reachable (a review with --issue will fail closed "
+            "otherwise)",
+        )
+    return CheckResult(
+        "issue-tracker", OK,
+        f"{tracker.provider} authenticated (env {env_name})",
+    )
+
+
 def _check_test_command(config) -> CheckResult:
     """Issue #18: a config left with the un-configured placeholder would fail
     every phase's test gate. Surface it as a WARN here, before a run, rather than
@@ -769,6 +827,9 @@ def run_doctor(
         results.append(_check_api_keys(config, probes, referenced))
         results.append(_check_judge_classifier(config, probes))
         results.append(_check_test_command(config))
+        tracker_check = _check_tracker(config, probes)
+        if tracker_check is not None:
+            results.append(tracker_check)
     results.append(_check_pin_file(repo_root, pins))
     return results
 

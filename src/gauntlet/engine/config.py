@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
@@ -110,6 +110,61 @@ class AgentProfile(BaseModel):
         return self.adapter_class().capabilities
 
 
+class IssueTrackerConfig(BaseModel):
+    """The optional `issue_tracker:` config block (§6, FR-6.1/FR-6.2/FR-6.4).
+
+    Selects the pluggable issue-tracker provider for the lightweight
+    `gauntlet review` flow. Absent (or ``provider: none``), tracker resolution is
+    disabled and `--issue` is rejected while `--intent`/`-m`/`$EDITOR` still work
+    (FR-6.5). ``api_key_env`` is the **name** of the env var holding the token —
+    never the token itself (FR-1.4 base spec, §7).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    provider: str = "linear"
+    api_key_env: str = "LINEAR_API_KEY"
+    timeout_s: float = 10.0
+    workspace: str | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, v: str) -> str:
+        """v1 accepts only a registered provider (FR-6.2). ``none`` disables the
+        block; any other unregistered value fails closed at load, naming the
+        supported set."""
+        name = (v or "").strip().lower()
+        if name == "none":
+            return name
+        from gauntlet.trackers import available_trackers
+
+        known = sorted(available_trackers())
+        if name not in known:
+            raise ValueError(
+                f"unsupported issue_tracker provider {v!r}; supported: "
+                f"{known} (or 'none' to disable). github / jira are reserved but "
+                "not implemented in v1."
+            )
+        return name
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _validate_timeout(cls, v: float) -> float:
+        """Per-call tracker timeout (FR-6.4): default 10, minimum 1. A
+        non-positive value — and anything below the stated 1s floor — fails
+        closed at load."""
+        if v < 1:
+            raise ValueError(
+                f"issue_tracker.timeout_s must be at least 1 second; got {v!r}"
+            )
+        return v
+
+    @property
+    def enabled(self) -> bool:
+        """False when the block disables tracking (``provider: none``)."""
+        return self.provider != "none"
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -164,6 +219,11 @@ class RunConfig(BaseModel):
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
 
+    # Optional issue-tracker provider for the `gauntlet review` flow (§6,
+    # FR-6.1). Absent => tracker resolution disabled; `--issue` is rejected while
+    # `--intent`/`-m`/`$EDITOR` still work (FR-6.5).
+    issue_tracker: IssueTrackerConfig | None = None
+
     # NOTE: the optional console `web:` block (FR-9.4) is intentionally NOT a
     # field here — console settings stay above the orchestrator (plan ground
     # rules / review F-004). It rides on `extra="allow"` and is parsed/validated
@@ -184,6 +244,22 @@ class RunConfig(BaseModel):
         value would let ``gauntlet serve`` browse files outside the repo (review
         F-001). Same repo-relative containment as asset_root."""
         return _validate_repo_relative("run_root", v)
+
+    @model_validator(mode="after")
+    def _redact_tracker_token(self) -> RunConfig:
+        """Extend the redaction list with the tracker's ``api_key_env`` (§7).
+
+        The env-name heuristic (KEY/TOKEN/SECRET/…) already masks the default
+        ``LINEAR_API_KEY``, but a custom env-var name that misses the heuristic
+        would otherwise leak. Adding it to ``extra_env_vars`` guarantees the
+        resolved tracker token can never be written to any artifact, regardless
+        of the chosen env-var name. Additive and idempotent."""
+        tracker = self.issue_tracker
+        if tracker is not None and tracker.enabled:
+            name = tracker.api_key_env
+            if name and name not in self.redaction.extra_env_vars:
+                self.redaction.extra_env_vars.append(name)
+        return self
 
     def profile(self, name: str) -> AgentProfile:
         try:
