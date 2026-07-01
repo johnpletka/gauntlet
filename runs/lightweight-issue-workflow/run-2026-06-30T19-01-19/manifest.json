@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-lint",
+  "current_step": "plan-approve",
   "warnings": [],
   "steps": [
     {
@@ -152,11 +152,11 @@
     {
       "id": "plan-lint",
       "type": "phase_lint",
-      "status": "halted",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-06-30T20:39:19.463603+00:00",
-      "ended": "2026-06-30T20:46:32.428538+00:00",
+      "ended": "2026-06-30T20:59:29.047779+00:00",
       "attempts": 0,
       "base_sha": null,
       "parked_reason": null,
@@ -168,7 +168,30 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
-      "notes": "phase lint: plan.md gauntlet-phases block is invalid — phase #4 has id 'P4a'; phase ids must match 'P<n>' (numeric phases drive sequencing and rollback, FR-9.9/FR-10.3)",
+      "notes": "phase lint: 5 phase(s) valid (P1, P2, P3, P4, P5)",
+      "iteration": null,
+      "metrics": {}
+    },
+    {
+      "id": "plan-approve",
+      "type": "human_gate",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-06-30T20:59:29.049414+00:00",
+      "ended": "2026-07-01T13:09:52.289354+00:00",
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "failure_kind": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "notes": "approved",
       "iteration": null,
       "metrics": {}
     }

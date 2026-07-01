@@ -2,7 +2,7 @@
 
 - branch: `gauntlet/lightweight-issue-workflow` (base `docs/lightweight-issue-workflow-prd`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `plan-lint`)
+- status: **running** (at `plan-approve`)
 - totals: 331881in/130563out $10.3212
 
 | step | type | status | duration | usage | notes |
@@ -11,7 +11,8 @@
 | prd-approve | human_gate | done | 4184s | 0in/0out (tokens only) | approved |
 | [plan-author](steps/plan-author/transcript.md) | agent_task | done | 233s | 9565in/16323out $2.3259 | agent 'builder' completed |
 | [plan-cycle](steps/plan-cycle/) | adversarial_cycle | done | 755s | 80123in/34416out $2.1829 | converged in round 1 (blocking policy): no open blocking; 8 fixed, 0 non-blocking item(s) surfaced for the gate |
-| plan-lint | phase_lint | halted | 433s | 0in/0out (tokens only) | phase lint: plan.md gauntlet-phases block is invalid — phase #4 has id 'P4a'; phase ids must match 'P<n>' (numeric phases drive sequencing and rollback, FR-9.9/FR-10.3) |
+| plan-lint | phase_lint | done | 1210s | 0in/0out (tokens only) | phase lint: 5 phase(s) valid (P1, P2, P3, P4, P5) |
+| plan-approve | human_gate | done | 58223s | 0in/0out (tokens only) | approved |
 
 ## Commits
 
