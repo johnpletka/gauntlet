@@ -306,6 +306,113 @@ def diff_head(repo: Path, *, exclude: list[str] | None = None) -> str:
     return _run(repo, "diff", "HEAD", *_exclude_pathspec(exclude))
 
 
+def merge_base(repo: Path, a: str, b: str) -> str | None:
+    """The best common ancestor of ``a`` and ``b``, or ``None`` if none exists.
+
+    The review command resolves ``merge-base(resolved_base, HEAD)`` and injects
+    that concrete SHA as the cycle's two-dot ``review_base`` so the existing
+    ``range_diff`` yields the three-dot ``base...HEAD`` scope FR-5.2 mandates.
+    ``None`` means unrelated histories (no shared commit) — a fail-closed guard
+    condition (FR-5.3), not an error to raise.
+    """
+    try:
+        out = _run(repo, "merge-base", a, b).strip()
+    except GitError:
+        return None
+    return out or None
+
+
+def diff_range_empty(repo: Path, base: str, head: str) -> bool:
+    """True iff ``git diff <base> <head>`` reports no changes (FR-5.3 guard).
+
+    ``git diff --quiet`` exits 0 when the two tree states are identical and 1
+    when they differ, so this is the cheap two-dot emptiness check. With
+    ``base`` set to ``merge-base(resolved_base, head)`` it answers "does HEAD
+    introduce anything since it diverged from base?" — the three-dot semantics.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--quiet", base, head],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def remote_url(repo: Path, remote: str = "origin") -> str | None:
+    """The fetch URL of ``remote`` (``git remote get-url``), or ``None``.
+
+    Used to derive the stable, checkout-independent ``<repo-id>`` for a review
+    run's out-of-repo state dir (§6 "Review state path"); ``None`` when the
+    remote is unset, so the caller falls back to the repo toplevel path.
+    """
+    try:
+        out = _run(repo, "remote", "get-url", remote).strip()
+    except GitError:
+        return None
+    return out or None
+
+
+def show_toplevel(repo: Path) -> str:
+    """Absolute path of the repo's worktree root (``git rev-parse --show-toplevel``)."""
+    return _run(repo, "rev-parse", "--show-toplevel").strip()
+
+
+def remote_default_branch(repo: Path, remote: str = "origin") -> str | None:
+    """The remote's default branch as ``<remote>/<name>`` (from ``<remote>/HEAD``).
+
+    Resolves the ``refs/remotes/<remote>/HEAD`` symbolic ref set by ``clone`` or
+    ``git remote set-head``; returns e.g. ``origin/main``, or ``None`` when the
+    symref is absent. This is the last fallback in the FR-5.1 base-resolution
+    order (after ``--base`` and a concrete ``config.base_branch``).
+    """
+    try:
+        out = _run(repo, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD").strip()
+    except GitError:
+        return None
+    prefix = f"refs/remotes/{remote}/"
+    if out.startswith(prefix):
+        return f"{remote}/{out[len(prefix):]}"
+    return None
+
+
+def path_is_ignored(repo: Path, relpath: str) -> bool:
+    """True iff ``relpath`` is covered by a gitignore rule (``git check-ignore``).
+
+    Used to enforce that an in-repo ``review.state_dir`` override is gitignored
+    (FR-8.3), so the only legal in-repo review state is state invisible to
+    ``git status``. ``check-ignore -q`` exits 0 when ignored, 1 when not; a
+    non-existent path is fine (it matches patterns, not files).
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "check-ignore", "-q", "--", relpath],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def tag_exists(repo: Path, name: str) -> bool:
+    """True iff ``refs/tags/<name>`` exists (used for the ambiguous-ref guard)."""
+    try:
+        _run(repo, "rev-parse", "--verify", f"refs/tags/{name}")
+        return True
+    except GitError:
+        return False
+
+
+def ref_is_valid_commit(repo: Path, ref: str) -> bool:
+    """True iff ``ref`` resolves to a commit object (any ref namespace).
+
+    A read-only validity probe for a user-supplied ``--base`` (FR-5.1): it must
+    name a real commit-ish before merge-base/diff run against it.
+    """
+    try:
+        _run(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        return True
+    except GitError:
+        return False
+
+
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     try:
         subprocess.run(

@@ -200,6 +200,23 @@ class IssueTrackerConfig(BaseModel):
         return self.provider != "none"
 
 
+class ReviewConfig(BaseModel):
+    """The optional `review:` config block (§6, FR-8.1/FR-8.3).
+
+    Controls where a lightweight `gauntlet review` run keeps its state
+    (manifest, `intent.md`, transcripts, summary). ``state_dir`` defaults to
+    ``null`` — the out-of-repo XDG location (``${XDG_STATE_HOME:-~/.local/state}
+    /gauntlet/reviews/<repo-id>/<slug>/``) so a review leaves zero Git-status
+    footprint. Set it (e.g. ``.gauntlet/runs``) to opt into an in-repo,
+    gitignored layout for teams that want the review audit trail committable; an
+    in-repo value that is not gitignored fails closed at resolution (FR-8.3).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    state_dir: str | None = None
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -264,6 +281,10 @@ class RunConfig(BaseModel):
     # FR-6.1). Absent => tracker resolution disabled; `--issue` is rejected while
     # `--intent`/`-m`/`$EDITOR` still work (FR-6.5).
     issue_tracker: IssueTrackerConfig | None = None
+
+    # Optional `review:` block controlling the `gauntlet review` state location
+    # (§6, FR-8.3). Absent => the out-of-repo XDG default (zero repo footprint).
+    review: ReviewConfig = Field(default_factory=ReviewConfig)
 
     # NOTE: the optional console `web:` block (FR-9.4) is intentionally NOT a
     # field here — console settings stay above the orchestrator (plan ground

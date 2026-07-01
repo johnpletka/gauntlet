@@ -179,6 +179,71 @@ class CommitRecord(BaseModel):
     sha: str
 
 
+# --- review-run intent provenance (lightweight `gauntlet review`, §6/FR-2.6) --
+# A review run resolves its problem statement (`intent.md`) from one of four
+# sources and tags it with a provenance on an independence axis. The block is
+# persisted here so provenance and — for a non-independent statement — the
+# human ratification that made its circularity tolerable (FR-2.5) are auditable,
+# and so the reviewer prompt can be told how the intent was sourced (FR-2.2).
+
+# The single intent source that produced the statement (§6 manifest block).
+INTENT_SOURCE_ISSUE = "issue"
+INTENT_SOURCE_INTENT_FILE = "intent-file"
+INTENT_SOURCE_MESSAGE = "message"
+INTENT_SOURCE_EDITOR = "editor"
+INTENT_SOURCE_CODE_ONLY = "code-only"
+
+# Provenance on the independence axis (FR-2.1a). `tracker` is the only
+# independent value; the rest are the author's own framing of the problem.
+PROVENANCE_TRACKER = "tracker"
+PROVENANCE_TRACKER_SESSION = "tracker-session"
+PROVENANCE_AUTHOR_SESSION_SUMMARY = "author-session-summary"
+PROVENANCE_NONE = "none"  # `--code-only`: there is no intent to place on the axis
+
+# Manual `--intent-provenance` choices (declared by the operator; FR-1.1). The
+# tracker/none provenances are never operator-declared — they are derived from
+# the source.
+MANUAL_PROVENANCES = frozenset(
+    {PROVENANCE_TRACKER, PROVENANCE_TRACKER_SESSION, PROVENANCE_AUTHOR_SESSION_SUMMARY}
+)
+
+# How a non-independent intent was ratified before the cycle (FR-2.5/FR-2.6).
+RATIFICATION_INTERACTIVE = "interactive-confirm"
+RATIFICATION_APPROVED_FLAG = "approved-intent-flag"
+
+
+class RatificationRecord(BaseModel):
+    """The pre-run human ratification of a non-independent intent (FR-2.5/2.6).
+
+    Present only when ``IntentRecord.independent`` is ``False``. ``method`` is
+    ``interactive-confirm`` (a TTY operator confirmed/edited the statement) or
+    ``approved-intent-flag`` (``--approved-intent`` asserted an out-of-band
+    ratification, e.g. a skill's in-session review). ``user`` is the resolved
+    human operator identity; ``timestamp`` is UTC ISO-8601.
+    """
+
+    method: str
+    user: str
+    timestamp: str
+
+
+class IntentRecord(BaseModel):
+    """The resolved intent's provenance for a review run (§6 manifest block).
+
+    ``independent`` is derived from ``provenance`` (``tracker`` ⇒ ``True``, every
+    other value ⇒ ``False``); it is stored explicitly so a reader need not
+    re-derive it. ``ratification`` is present iff ``independent`` is ``False``.
+    For a ``code-only`` run ``source`` is ``code-only``, ``provenance`` is
+    ``none``, ``independent`` is ``False``, and there is no ratification (there
+    is no intent to ratify).
+    """
+
+    source: str
+    provenance: str
+    independent: bool
+    ratification: RatificationRecord | None = None
+
+
 # --- recovery audit (operator-aids P4, FR-5.3 / §6.4) ------------------------
 # `gauntlet recover` terminates a verified wedged driver. Which signal ended the
 # recorded process group — or that it was already gone by the time we signalled.
@@ -244,6 +309,10 @@ class Manifest(BaseModel):
     # accumulates the full history. Defaults empty, so older manifests load
     # unchanged (additive — the field is absent on pre-P4 runs).
     recoveries: list[RecoveryRecord] = Field(default_factory=list)
+    # Resolved intent provenance for a lightweight `gauntlet review` run (§6,
+    # FR-2.6). Absent (``None``) for every heavyweight `gauntlet run` — the field
+    # is additive, so older manifests and non-review runs load unchanged.
+    intent: IntentRecord | None = None
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

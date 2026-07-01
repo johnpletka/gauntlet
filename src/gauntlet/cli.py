@@ -7,6 +7,7 @@ P3 adds the run lifecycle (`new`, `run`, `status`, `approve`, `reject`,
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
@@ -279,6 +280,107 @@ def run(
         reservation_token=reservation_token,
     )
     typer.echo(f"run status: {status}")
+
+
+@app.command()
+def review(
+    branch: str = typer.Argument(
+        None, help="Local branch to review (default: the current branch)."
+    ),
+    pr: str = typer.Option(
+        None, "--pr", help="GitHub PR number or URL to review (later phase)."
+    ),
+    issue: str = typer.Option(
+        None, "--issue", help="Issue tracker ref/URL (e.g. ENG-1234) for intent."
+    ),
+    intent: Path = typer.Option(
+        None, "--intent", help="Path to a problem-statement file for intent."
+    ),
+    message: str = typer.Option(
+        None, "-m", "--message", help="Inline problem statement for intent."
+    ),
+    intent_provenance: str = typer.Option(
+        None, "--intent-provenance",
+        help="Independence of a manual intent: tracker | tracker-session | "
+        "author-session-summary (default author-session-summary). Rejected with "
+        "--issue (always 'tracker').",
+    ),
+    approved_intent: bool = typer.Option(
+        False, "--approved-intent",
+        help="Assert a non-independent intent was ratified out of band (the "
+        "non-interactive form of the FR-2.5 ratification hook).",
+    ),
+    base: str = typer.Option(
+        None, "--base", help="Diff base ref (default: config.base_branch or origin/HEAD).",
+    ),
+    code_only: bool = typer.Option(
+        False, "--code-only", help="Diff-only review with no intent (FR-2.3)."
+    ),
+    rounds: int = typer.Option(
+        1, "--rounds", help="Adversarial-cycle rounds, 1..10 (default 1)."
+    ),
+    test: bool = typer.Option(
+        None, "--test/--no-test",
+        help="Run config.test_command as a baseline step first (off by default).",
+    ),
+) -> None:
+    """Adversarially review a change in place against its originating intent.
+
+    Runs only the adversarial review cycle against an already-implemented change
+    on a branch, landing accepted fixes as REVIEW.x commits in place (no branch
+    minted, nothing pushed). In P2 the command resolves and validates its inputs
+    — target branch, intent (+ provenance/ratification), out-of-repo state dir,
+    and diff base — then stops at the pre-cycle boundary; cycle execution lands
+    in a later phase.
+    """
+    from gauntlet.engine.review import (
+        Hooks,
+        ReviewInputs,
+        ReviewLifecycle,
+        ReviewUsageError,
+        ReviewFailClosed,
+    )
+
+    mgr = _manager()
+    inputs = ReviewInputs(
+        branch=branch,
+        pr=pr,
+        issue=issue,
+        intent_path=str(intent) if intent is not None else None,
+        message=message,
+        intent_provenance=intent_provenance,
+        approved_intent=approved_intent,
+        base=base,
+        code_only=code_only,
+        rounds=rounds,
+        test=test,
+    )
+    hooks = Hooks(
+        isatty=sys.stdin.isatty,
+        edit_statement=lambda text, _root: typer.edit(text) or text,
+        confirm_statement=lambda text: typer.confirm(
+            "Ratify this problem statement and start the review?", default=False
+        ),
+    )
+    lifecycle = ReviewLifecycle(mgr.repo_root, mgr.config, hooks=hooks)
+    try:
+        resolution = lifecycle.resolve(inputs)
+    except ReviewUsageError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except ReviewFailClosed as exc:
+        typer.echo(f"review cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"review resolved for branch {resolution.target_branch!r}")
+    typer.echo(f"  base: {resolution.base_ref} (merge-base {resolution.merge_base[:10]})")
+    typer.echo(
+        f"  intent: {resolution.intent_record.source} / "
+        f"{resolution.intent_record.provenance} "
+        f"({'independent' if resolution.intent_record.independent else 'non-independent'})"
+    )
+    typer.echo(f"  state: {resolution.state_dir}")
+    typer.echo("resolved to the pre-cycle boundary (cycle execution lands in a later phase)")
 
 
 def _run_interactive(
