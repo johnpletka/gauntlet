@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/lightweight-issue-workflow` (base `docs/lightweight-issue-workflow-prd`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `implement`)
-- totals: 3454260in/601926out $71.3356
+- status: **done**
+- totals: 4256315in/685203out $79.4988
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -30,6 +30,10 @@
 | phase-commit.3 | commit | done | 13s | 596in/1082out $0.0023 | committed 2e001bd838 |
 | [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 529s | 429517in/14324out $0.8636 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
 | [implement.4](steps/implement.4/transcript.md) | agent_task | done | 8036s | 34616in/90233out $15.8236 | agent 'builder' completed |
+| [tests.4](steps/tests.4/) | shell | done | 219s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.4 | commit | done | 73s | 24242in/4893out $0.0158 | committed 8023444c73 |
+| [impl-cycle.4](steps/impl-cycle.4/) | adversarial_cycle | done | 1304s | 724177in/69914out $7.7871 | converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [retrospective](steps/retrospective/) | retrospective | done | 163s | 53636in/8470out $0.3603 | retrospective: 2 self-critique(s); 3 proposal(s) generated, 0 applyable |
 
 ## Commits
 
@@ -45,3 +49,5 @@
 - `1d53fd337d` P3.1 (step `impl-cycle`)
 - `2e001bd838` P4 (step `phase-commit`)
 - `b662529827` P4.1 (step `impl-cycle`)
+- `8023444c73` P5 (step `phase-commit`)
+- `4802b122b0` P5.1 (step `impl-cycle`)
