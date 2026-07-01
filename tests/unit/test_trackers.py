@@ -105,6 +105,26 @@ def test_extract_refs_empty_text():
     assert tk.extract_refs("no refs here") == []
 
 
+def test_extract_refs_ignores_false_keys_in_url_slug():
+    # F-002: the slug of a Linear URL must not yield spurious bare keys.
+    tk = _tracker(_json_response({}))
+    body = "See https://linear.app/acme/issue/ENG-1/fix-eng-2-regression for context."
+    refs = [r.key for r in tk.extract_refs(body)]
+    assert refs == ["ENG-1"]
+
+
+def test_extract_refs_url_and_surrounding_bare_keys_in_order():
+    # The URL contributes only its own key; bare keys outside the URL span are
+    # still harvested, in textual order, de-duplicated.
+    tk = _tracker(_json_response({}))
+    body = (
+        "OPS-9 before, then https://linear.app/acme/issue/ENG-1/fix-eng-2-bug "
+        "and ENG-3 after."
+    )
+    refs = [r.key for r in tk.extract_refs(body)]
+    assert refs == ["OPS-9", "ENG-1", "ENG-3"]
+
+
 # ---- fetch normalization ----------------------------------------------------
 
 
@@ -347,6 +367,38 @@ def test_config_rejects_unsupported_provider():
     assert "linear" in str(exc.value)
 
 
+def test_config_accepts_valid_env_var_name():
+    cfg = IssueTrackerConfig(api_key_env="MY_LINEAR_CREDS")
+    assert cfg.api_key_env == "MY_LINEAR_CREDS"
+    # Surrounding whitespace is stripped.
+    assert IssueTrackerConfig(api_key_env="  LINEAR_API_KEY  ").api_key_env == (
+        "LINEAR_API_KEY"
+    )
+
+
+def test_config_rejects_empty_api_key_env():
+    # F-001: the field names an env var; empty/whitespace is not a name.
+    for bad in ("", "   "):
+        with pytest.raises(ValueError):
+            IssueTrackerConfig(api_key_env=bad)
+
+
+def test_config_rejects_token_shaped_api_key_env():
+    # F-001: a pasted Linear token must not be persisted as an env-var NAME,
+    # and the error must not echo the raw (secret) value.
+    token = "lin_api_0123456789abcdef0123456789abcdef01234567"
+    with pytest.raises(ValueError) as exc:
+        IssueTrackerConfig(api_key_env=token)
+    assert token not in str(exc.value)
+
+
+def test_config_rejects_api_key_env_with_invalid_chars():
+    # F-001: names with spaces / punctuation (typical of pasted secrets) fail.
+    for bad in ("has space", "with-dash", "with/slash", "9leadingdigit"):
+        with pytest.raises(ValueError):
+            IssueTrackerConfig(api_key_env=bad)
+
+
 def test_config_rejects_non_positive_timeout():
     with pytest.raises(ValueError):
         IssueTrackerConfig(timeout_s=0)
@@ -364,6 +416,17 @@ def test_config_rejects_below_one_second_timeout():
 def test_runconfig_rejects_unsupported_provider_at_load():
     with pytest.raises(ValueError):
         RunConfig.model_validate({"issue_tracker": {"provider": "github"}})
+
+
+def test_runconfig_rejects_token_shaped_api_key_env_without_echo():
+    # F-001: the real load path (nested under RunConfig) must reject a pasted
+    # token and never echo it back in the ValidationError text.
+    token = "lin_api_" + "0123456789abcdef" * 2
+    with pytest.raises(ValueError) as exc:
+        RunConfig.model_validate(
+            {"issue_tracker": {"provider": "linear", "api_key_env": token}}
+        )
+    assert token not in str(exc.value)
 
 
 def test_runconfig_without_tracker_block():

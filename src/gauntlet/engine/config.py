@@ -10,6 +10,7 @@ effect of constructing the CLI adapters and is invoked explicitly for ``api``.
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,10 @@ from gauntlet.engine.gitops import Identity
 from gauntlet.logging.redact import RedactionSettings
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
+
+# A POSIX environment-variable identifier. ``issue_tracker.api_key_env`` must
+# match this — it names the env var holding the token, never the token (§7).
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_repo_relative(field: str, v: str) -> str:
@@ -120,12 +125,42 @@ class IssueTrackerConfig(BaseModel):
     never the token itself (FR-1.4 base spec, §7).
     """
 
-    model_config = ConfigDict(extra="allow")
+    # ``hide_input_in_errors``: a rejected ``api_key_env`` may be a pasted token,
+    # so never let pydantic echo the raw input back in the ValidationError text
+    # (FR-1.4 base spec, §7; review F-001).
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
 
     provider: str = "linear"
     api_key_env: str = "LINEAR_API_KEY"
     timeout_s: float = 10.0
     workspace: str | None = None
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, v: str) -> str:
+        """``api_key_env`` is the NAME of the env var holding the token, never
+        the token itself (FR-1.4 base spec, §7).
+
+        Without this guard a pasted token would be persisted in repo config and
+        later echoed back verbatim by ``gauntlet doctor``'s tracker check — a
+        secret leak. Enforce a POSIX env-var identifier and reject the known
+        Linear token shape (``lin_api_…``) so an actual token fails closed at
+        load. The error never echoes the raw value (it may be a secret): it
+        reports only the value's length/shape."""
+        raw = (v or "").strip()
+        if not raw:
+            raise ValueError(
+                "issue_tracker.api_key_env must be a non-empty env-var NAME "
+                "(e.g. LINEAR_API_KEY), not the token itself"
+            )
+        if raw.lower().startswith("lin_api_") or not _ENV_NAME_RE.match(raw):
+            raise ValueError(
+                "issue_tracker.api_key_env must be a valid environment-variable "
+                "NAME matching [A-Za-z_][A-Za-z0-9_]* (e.g. LINEAR_API_KEY); it "
+                "holds the name of the env var, never the token itself "
+                f"(got a {len(raw)}-character value that is not a valid name)"
+            )
+        return raw
 
     @field_validator("provider")
     @classmethod
@@ -168,7 +203,13 @@ class IssueTrackerConfig(BaseModel):
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
-    model_config = ConfigDict(extra="allow")
+    # ``hide_input_in_errors``: config load is the entry point that validates the
+    # nested ``issue_tracker.api_key_env``; pydantic renders the whole
+    # ValidationError with the top-level model's config, so this flag must live
+    # here too or a token pasted into ``api_key_env`` would be echoed back in the
+    # load error (FR-1.4 base spec, §7; review F-001). The bespoke field
+    # validators already include any non-secret value in their own message.
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
 
     # Branch a run is created from. A literal branch name (default "main"), or
     # the sentinel "current" meaning "branch from whatever branch is checked out

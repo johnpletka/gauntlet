@@ -37,6 +37,14 @@ _URL_RE = re.compile(
     r"linear\.app/[^/\s]+/issue/([A-Za-z][A-Za-z0-9]*-[0-9]+)",
     re.IGNORECASE,
 )
+# The same URL, but consuming any trailing slug/query/fragment so extract_refs
+# treats the whole URL run as one span. Without this the bare-key scan would
+# harvest false keys from the slug (e.g. ENG-2 out of
+# ``.../issue/ENG-1/fix-eng-2-regression``) — F-002.
+_URL_SPAN_RE = re.compile(
+    r"linear\.app/[^/\s]+/issue/([A-Za-z][A-Za-z0-9]*-[0-9]+)(?:[/?#]\S*)?",
+    re.IGNORECASE,
+)
 # A ref token embedded in free text (word-bounded), for extract_refs.
 _EMBEDDED_RE = re.compile(rf"(?<![A-Za-z0-9])({_KEY_RE.pattern})(?![A-Za-z0-9])")
 
@@ -101,15 +109,34 @@ class LinearIssueTracker:
 
     def extract_refs(self, text: str) -> list[IssueRef]:
         """Scan ``text`` for Linear refs in textual order, de-duplicated by key
-        preserving first occurrence (FR-4.3)."""
+        preserving first occurrence (FR-4.3).
+
+        Linear issue URLs are matched first and contribute *only* their
+        ``/issue/<KEY>`` key; the bare-key scan runs only on the text outside
+        those URL spans. So a URL like ``.../issue/ENG-1/fix-eng-2-regression``
+        yields ``ENG-1`` alone and never a spurious ``ENG-2`` harvested from the
+        slug (F-002)."""
+        text = text or ""
+        # Full URL spans (incl. slug/query/fragment); bare keys inside them are
+        # slug false positives — the URL already contributed its own key.
+        url_spans: list[tuple[int, int]] = []
+        # (position, raw_text, key) so refs can be emitted in textual order.
+        hits: list[tuple[int, str, str]] = []
+        for match in _URL_SPAN_RE.finditer(text):
+            url_spans.append((match.start(), match.end()))
+            hits.append((match.start(), match.group(1), match.group(1).upper()))
+        for match in _EMBEDDED_RE.finditer(text):
+            if any(start <= match.start() < end for start, end in url_spans):
+                continue
+            hits.append((match.start(), match.group(1), match.group(1).upper()))
+        hits.sort(key=lambda h: h[0])
         seen: set[str] = set()
         refs: list[IssueRef] = []
-        for match in _EMBEDDED_RE.finditer(text or ""):
-            key = match.group(1).upper()
+        for _pos, raw_text, key in hits:
             if key in seen:
                 continue
             seen.add(key)
-            refs.append(IssueRef(provider=PROVIDER, raw=match.group(1), key=key))
+            refs.append(IssueRef(provider=PROVIDER, raw=raw_text, key=key))
         return refs
 
     # ---- network calls ------------------------------------------------------
