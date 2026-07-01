@@ -253,6 +253,26 @@ class IntentRecord(BaseModel):
     repo_exclude: str | None = None
 
 
+class ReviewPrRecord(BaseModel):
+    """PR-mode facts a review's terminal summary needs (§6, FR-4.3/FR-4.4).
+
+    Persisted at the pre-cycle boundary so a review that parks/fails and is later
+    resumed still renders the chosen linked ticket, the ignored secondary refs,
+    and (for a fork PR) the "push-back is manual" note. On a fresh drive these
+    live only in the in-memory ``ReviewResolution``; without persistence a resume
+    would default them away and silently drop mandated summary facts.
+
+    Absent (``None``) for every branch-mode review and every heavyweight run —
+    the field is additive, so older/non-PR manifests load unchanged.
+    """
+
+    number: str | None = None
+    url: str | None = None
+    is_fork: bool = False
+    chosen_ref: str | None = None
+    ignored_refs: list[str] = Field(default_factory=list)
+
+
 # --- recovery audit (operator-aids P4, FR-5.3 / §6.4) ------------------------
 # `gauntlet recover` terminates a verified wedged driver. Which signal ended the
 # recorded process group — or that it was already gone by the time we signalled.
@@ -322,6 +342,11 @@ class Manifest(BaseModel):
     # FR-2.6). Absent (``None``) for every heavyweight `gauntlet run` — the field
     # is additive, so older manifests and non-review runs load unchanged.
     intent: IntentRecord | None = None
+    # PR-mode summary facts for a `gauntlet review --pr` run (§6, FR-4.3/4.4).
+    # Persisted so a resumed PR review still renders the chosen/ignored refs and
+    # the fork manual-push note. Absent (``None``) for branch mode / heavyweight
+    # runs; additive, so older manifests load unchanged.
+    pr: ReviewPrRecord | None = None
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

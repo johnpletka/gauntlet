@@ -42,9 +42,14 @@ PR_TEMP_REF = "refs/gauntlet/pr/{n}"
 # repo — same-repo and fork PRs alike — so one fetch spec resolves both.
 _PR_HEAD_REFSPEC = "pull/{n}/head:{ref}"
 
-# A `--pr` value: a bare number, or a github.com PR URL.
+# A `--pr` value: a bare number, or a github.com PR URL. The URL form captures
+# owner/repo so the caller can confirm the URL targets the *current* repo before
+# reducing it to a bare number (a bare number can only ever mean this repo).
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
-_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/[^/\s]+/pull/([0-9]+)", re.IGNORECASE)
+_PR_URL_RE = re.compile(
+    r"github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<num>[0-9]+)",
+    re.IGNORECASE,
+)
 
 
 class PrModeError(RuntimeError):
@@ -78,8 +83,24 @@ class PrCheckout:
     local_branch: str
 
 
-def parse_pr_number(raw: str) -> str:
-    """The PR number from a bare number or a github.com PR URL (usage-class).
+@dataclass(frozen=True)
+class PrRef:
+    """A parsed ``--pr`` value (usage-class): the number plus URL owner/repo.
+
+    ``owner``/``repo`` are the case-folded slug halves of a github.com PR URL, so
+    the lifecycle can confirm the URL names the *current* repo before applying its
+    number to repo-scoped commands (FR-1.1/FR-4.1). Both are ``None`` for a bare
+    number — that unambiguously means the current repo, so there is nothing to
+    confirm.
+    """
+
+    number: str
+    owner: str | None = None
+    repo: str | None = None
+
+
+def parse_pr_ref(raw: str) -> PrRef:
+    """The :class:`PrRef` for a bare number or a github.com PR URL (usage-class).
 
     Raises :class:`ValueError` (a usage-class failure the CLI maps to exit 2)
     when ``raw`` is neither a positive integer nor a recognizable PR URL — never
@@ -87,14 +108,28 @@ def parse_pr_number(raw: str) -> str:
     """
     s = (raw or "").strip()
     if _PR_NUM_RE.match(s):
-        return s
+        return PrRef(number=s)
     m = _PR_URL_RE.search(s)
     if m:
-        return m.group(1)
+        return PrRef(
+            number=m.group("num"),
+            owner=m.group("owner").lower(),
+            repo=m.group("repo").lower(),
+        )
     raise ValueError(
         f"--pr must be a PR number or a github.com/<owner>/<repo>/pull/<N> URL; "
         f"got {raw!r}"
     )
+
+
+def parse_pr_number(raw: str) -> str:
+    """The PR number from a bare number or a github.com PR URL (usage-class).
+
+    Thin wrapper over :func:`parse_pr_ref` for callers that only key on the
+    number (state-dir slug, usage validation); raises :class:`ValueError` on a
+    malformed value exactly as :func:`parse_pr_ref` does.
+    """
+    return parse_pr_ref(raw).number
 
 
 class PrClient(Protocol):
@@ -181,8 +216,30 @@ class GhPrClient:
         self._gh("pr", "checkout", pr)
 
 
+def candidate_branch(md: PrMetadata, pr_number: str) -> str:
+    """The local branch name ``gh pr checkout`` will land the PR on (FR-4.5).
+
+    The head ref for a same-repo PR; ``<owner>/<head-ref>`` for a fork (`gh`'s
+    fork-disambiguated name). Exposed so the lifecycle can learn the target
+    branch from ``gh pr view`` metadata *before* the checkout — e.g. to refuse a
+    competing run that already owns it (FR-9.3) before the worktree is touched.
+    Raises :class:`PrModeError` when no head branch name resolves — the same
+    fail-closed condition :func:`resolve_pr_checkout` enforces.
+    """
+    if md.is_cross_repository and md.head_owner:
+        candidate = f"{md.head_owner}/{md.head_ref}"
+    else:
+        candidate = md.head_ref
+    if not candidate:
+        raise PrModeError(
+            f"PR #{pr_number} resolved no head branch name from `gh pr view`; "
+            "cannot check it out"
+        )
+    return candidate
+
+
 def resolve_pr_checkout(
-    repo_root: Path, pr_number: str, client: PrClient
+    repo_root: Path, pr_number: str, client: PrClient, *, md: PrMetadata | None = None
 ) -> PrCheckout:
     """Run the FR-4.5 PR checkout contract; fail closed on divergence/detach.
 
@@ -202,17 +259,13 @@ def resolve_pr_checkout(
 
     The scratch ref is always deleted (``finally``), including on every
     fail-closed path.
+
+    ``md`` may be supplied by a caller that already ran ``gh pr view`` (e.g. to
+    compute the candidate branch for a pre-checkout competing-run refusal), so
+    the view is not repeated; when ``None`` it is fetched here.
     """
-    md = client.view(pr_number)
-    if md.is_cross_repository and md.head_owner:
-        candidate = f"{md.head_owner}/{md.head_ref}"
-    else:
-        candidate = md.head_ref
-    if not candidate:
-        raise PrModeError(
-            f"PR #{pr_number} resolved no head branch name from `gh pr view`; "
-            "cannot check it out"
-        )
+    md = md or client.view(pr_number)
+    candidate = candidate_branch(md, pr_number)
 
     temp_ref = PR_TEMP_REF.format(n=pr_number)
     existing_sha = (

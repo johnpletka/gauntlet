@@ -40,6 +40,7 @@ from gauntlet.engine.manifest import (
     Manifest,
     PipelineRef,
     RatificationRecord,
+    ReviewPrRecord,
 )
 from gauntlet.trackers import (
     IssueTrackerError,
@@ -419,7 +420,7 @@ class ReviewLifecycle:
             )
 
         # 3) Refuse if another non-terminal run already owns the target branch.
-        self._refuse_competing_run(target)
+        self._refuse_competing_run(target, self_slug=review_slug(target))
 
         # 4) Adopt the target branch in place (no gauntlet/<slug> minted).
         self._adopt_target(target)
@@ -627,19 +628,31 @@ class ReviewLifecycle:
                 "refusing to run a review from an unexpected HEAD (FR-5.3)."
             )
 
-    def _refuse_competing_run(self, target: str) -> None:
+    def _refuse_competing_run(self, target: str, *, self_slug: str) -> None:
+        """Fail closed if any non-terminal run already owns ``target`` (FR-9.3).
+
+        Two run families can own a branch, kept in different stores, so both are
+        scanned: heavyweight ``gauntlet run`` runs (under ``run_root`` by slug,
+        keyed via ``active-run.txt``) and lightweight ``gauntlet review`` runs
+        (under the out-of-repo review state root by slug). Launching a review's
+        fix agents against a worktree another run is already driving would break
+        the clean-handoff invariant. ``self_slug`` is this run's own review slug,
+        skipped in the review scan so a run never refuses against itself."""
+        self._refuse_competing_heavyweight_run(target)
+        self._refuse_competing_review_run(target, self_slug=self_slug)
+
+    def _refuse_competing_heavyweight_run(self, target: str) -> None:
         """Fail closed if a non-terminal heavyweight run owns ``target`` (FR-9.3).
 
         Read-only: scans ``run_root`` for active runs and refuses if any
-        non-terminal run's branch equals the target — launching a review's fix
-        agents against a worktree another run is driving would break the
-        clean-handoff invariant. A missing run_root (fresh repo) means no
-        competing runs, and reading it writes nothing under the repo.
+        non-terminal run's branch equals the target. A missing run_root (fresh
+        repo) means no competing runs, and reading it writes nothing under the
+        repo.
         """
         run_root = self.repo_root / self.config.run_root
         if not run_root.is_dir():
             return
-        terminal = M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED
+        terminal = _TERMINAL_STATUSES
         for slug_dir in sorted(run_root.iterdir()):
             if not slug_dir.is_dir():
                 continue
@@ -657,6 +670,51 @@ class ReviewLifecycle:
                     f"{target!r}; refusing to launch a review against a worktree "
                     "another run is driving (FR-9.3). Finish/abort it first."
                 )
+
+    def _refuse_competing_review_run(self, target: str, *, self_slug: str) -> None:
+        """Fail closed if another non-terminal *review* run owns ``target`` (FR-9.3).
+
+        Lightweight review runs live under the out-of-repo review state root by
+        slug, not in ``run_root`` — and PR mode keys its slug on ``pr-<N>``, not
+        the head branch — so a branch-mode review of the same head branch, or a
+        second ``--pr`` run whose PR resolves to the same head branch, is a
+        different slug and invisible to the ``run_root`` scan. Enumerate the
+        sibling review runs for this repo id and refuse if any non-terminal one is
+        bound to the same target branch, skipping this run's own slug dir.
+        Read-only: it only reads out-of-repo manifests, writing nothing."""
+        root = self._review_state_root(self_slug)
+        if not root.is_dir():
+            return
+        terminal = _TERMINAL_STATUSES
+        for slug_dir in sorted(root.iterdir()):
+            if not slug_dir.is_dir() or slug_dir.name == self_slug:
+                continue
+            manifest_path = slug_dir / "manifest.json"
+            if not manifest_path.is_file():
+                continue
+            try:
+                man = Manifest.load(manifest_path)
+            except (OSError, ValueError):
+                continue
+            if man.status not in terminal and man.branch == target:
+                raise ReviewFailClosed(
+                    f"review run {man.slug!r} ({man.status}) already owns branch "
+                    f"{target!r}; refusing to launch a second review against a "
+                    "worktree another review is driving (FR-9.3). Finish/abort it "
+                    "first."
+                )
+
+    def _review_state_root(self, slug: str) -> Path:
+        """The ``<repo-id>`` dir holding every review run's state for this repo.
+
+        Resolved as the parent of this run's own state dir, so it honors the same
+        ``review.state_dir`` override / XDG default and repo-id derivation the run
+        itself uses (the slug is always the leaf path component)."""
+        repo_id = derive_repo_id(self.repo_root)
+        return resolve_state_dir(
+            self.repo_root, self.config,
+            repo_id=repo_id, slug=slug, environ=self.hooks.environ,
+        ).parent
 
     # ---- base resolution + empty-diff guard (FR-5) ---------------------------
 
@@ -728,7 +786,14 @@ class ReviewLifecycle:
         local-branch review of that head branch (FR-4.1)."""
         from gauntlet.engine import reviewpr
 
-        pr_number = reviewpr.parse_pr_number(inputs.pr)
+        ref = reviewpr.parse_pr_ref(inputs.pr)
+        pr_number = ref.number
+
+        # A `--pr <url>` carries its own owner/repo; confirm it names THIS repo
+        # before its number is applied to repo-scoped `gh`/`git` commands, else a
+        # URL for a different repo would silently review this repo's PR N instead
+        # (fail-closed target resolution, FR-4.1).
+        self._verify_pr_url_repo(ref)
 
         # FR-7.4: verify pr_read_commands@v1 is ratified BEFORE any gh/git fetch.
         self._pr_read_preflight(pr_number)
@@ -745,9 +810,19 @@ class ReviewLifecycle:
             )
 
         client = self._pr_client()
+        slug = review_slug(f"pr-{pr_number}")
         try:
+            # Resolve the head branch from `gh pr view` metadata FIRST, so the
+            # competing-run refusal runs BEFORE `gh pr checkout` touches the
+            # worktree — exactly as branch mode refuses before adoption. A
+            # branch-mode review of the same head branch, or a different PR whose
+            # head resolves to it, keys on another slug (so `self_slug` excludes
+            # only this PR run's own dir) and would be invisible otherwise (FR-9.3).
+            pre_md = client.view(pr_number)
+            target = reviewpr.candidate_branch(pre_md, pr_number)
+            self._refuse_competing_run(target, self_slug=slug)
             checkout = reviewpr.resolve_pr_checkout(
-                self.repo_root, pr_number, client
+                self.repo_root, pr_number, client, md=pre_md
             )
         except reviewpr.PrModeError as exc:
             raise ReviewFailClosed(str(exc)) from exc
@@ -755,11 +830,6 @@ class ReviewLifecycle:
         md = checkout.metadata
         target = checkout.local_branch
 
-        # Another non-terminal run owning the checked-out head branch is refused
-        # (FR-9.3), exactly as branch mode.
-        self._refuse_competing_run(target)
-
-        slug = review_slug(f"pr-{pr_number}")
         repo_id = derive_repo_id(self.repo_root)
         state_dir = resolve_state_dir(
             self.repo_root, self.config,
@@ -777,9 +847,18 @@ class ReviewLifecycle:
         if excludes:
             intent_record.repo_exclude = excludes[0]
 
+        # Persist the PR summary facts so a resumed run rehydrates them (FR-4.3/4.4).
+        pr_record = ReviewPrRecord(
+            number=pr_number,
+            url=md.url or None,
+            is_fork=md.is_cross_repository,
+            chosen_ref=chosen_ref,
+            ignored_refs=ignored_refs,
+        )
         manifest_path = self._persist_manifest(
             slug=slug, target=target, base_ref=base_ref,
             intent_record=intent_record, state_dir=state_dir,
+            pr_record=pr_record,
         )
 
         return ReviewResolution(
@@ -814,6 +893,37 @@ class ReviewLifecycle:
         result = check_pr_read_commands(policy_path)
         if not result.ok:
             raise ReviewFailClosed(result.message)
+
+    def _verify_pr_url_repo(self, ref) -> None:
+        """Fail closed if a `--pr <url>` names a repo other than local `origin`.
+
+        A github.com PR URL carries its own ``owner/repo`` (a bare number does
+        not); reducing it to a number and running ``gh pr view``/``gh pr
+        checkout`` against the current repo would review *this* repo's PR N —
+        a different PR than the operator supplied — whenever the URL points at
+        another repo (or the local ``origin`` is mismatched/unset). Refuse before
+        any network happens. A bare number has no owner/repo, so it is always the
+        current repo and always allowed."""
+        if ref.owner is None or ref.repo is None:
+            return
+        want = f"{ref.owner}/{ref.repo}"
+        origin = gitops.remote_url(self.repo_root, "origin")
+        if not origin:
+            raise ReviewFailClosed(
+                f"--pr was given a URL for {want!r}, but this repo has no `origin` "
+                "remote to confirm the URL targets it; run --pr from a clone of "
+                f"{want!r} (pass the bare PR number), or set origin (FR-4.1)."
+            )
+        # normalize_repo_key -> e.g. "github.com/owner/repo"; the trailing two
+        # segments are the owner/repo, spelling-independent (https/ssh/.git).
+        have = "/".join(normalize_repo_key(origin).split("/")[-2:])
+        if have != want:
+            raise ReviewFailClosed(
+                f"--pr URL names repo {want!r} but this repo's `origin` is {have!r}; "
+                "refusing to apply the URL's PR number to a different repository. "
+                f"Run --pr from a clone of {want!r}, or pass the bare PR number "
+                "for this repo (FR-4.1)."
+            )
 
     def _pr_client(self):
         if self.hooks.pr_client is not None:
@@ -1151,6 +1261,7 @@ class ReviewLifecycle:
         base_ref: str,
         intent_record: IntentRecord,
         state_dir: Path,
+        pr_record: ReviewPrRecord | None = None,
     ) -> Path:
         """Write the review run's manifest (with the §6 intent block) out of repo.
 
@@ -1158,6 +1269,9 @@ class ReviewLifecycle:
         the stable slug (so a resume resolves the same dir, FR-8.4), branch is the
         in-place target, base_branch is the resolved review base. The pipeline
         ref is the P3-pending placeholder — no cycle is bound or driven here.
+        ``pr_record`` carries the FR-4.3/4.4 PR summary facts in PR mode (``None``
+        for branch mode) so a resumed run can rehydrate them (see
+        :func:`_resolution_from_manifest`).
         """
         man = Manifest(
             run_id=slug,
@@ -1166,6 +1280,7 @@ class ReviewLifecycle:
             base_branch=base_ref,
             pipeline=_PIPELINE_PENDING,
             intent=intent_record,
+            pr=pr_record,
         )
         path = state_dir / "manifest.json"
         man.write_atomic(path)
@@ -1759,7 +1874,7 @@ def resume_review(
         status = _with_review_judge(config, repo_root, state_dir, man, _drive)
     else:
         status = _drive({})
-    return _outcome(state_dir, man, status)
+    return _outcome(state_dir, man, status, resolution=resolution)
 
 
 def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolution:
@@ -1770,9 +1885,13 @@ def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolutio
     rehydrated from the manifest's intent record (``repo_exclude``), which the
     fresh run persisted, so a resumed fixer round keeps the user's untracked
     intent file out of the clean-handoff checks and out of every ``REVIEW.x``
-    commit — never sweeping it in or letting it block resumption. The rest of the
-    fields carry manifest-recorded values for completeness."""
+    commit — never sweeping it in or letting it block resumption. The PR-mode
+    summary facts (FR-4.3/4.4) are likewise rehydrated from the persisted
+    ``man.pr`` record so a resumed PR review still renders the chosen/ignored refs
+    and the fork manual-push note. The rest of the fields carry manifest-recorded
+    values for completeness."""
     excludes = [man.intent.repo_exclude] if (man.intent and man.intent.repo_exclude) else []
+    pr = man.pr
     return ReviewResolution(
         slug=man.slug,
         target_branch=man.branch,
@@ -1787,6 +1906,11 @@ def _resolution_from_manifest(man: Manifest, state_dir: Path) -> ReviewResolutio
         rounds=ROUNDS_MIN,
         code_only=man.intent is not None and man.intent.source == M.INTENT_SOURCE_CODE_ONLY,
         run_tests=False,
+        pr_number=pr.number if pr else None,
+        pr_url=pr.url if pr else None,
+        pr_is_fork=bool(pr.is_fork) if pr else False,
+        pr_chosen_ref=pr.chosen_ref if pr else None,
+        pr_ignored_refs=list(pr.ignored_refs) if pr else [],
     )
 
 

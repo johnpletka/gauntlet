@@ -26,6 +26,7 @@ import pytest
 from gauntlet.adapters.base import AgentResult, Usage
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
+from gauntlet.engine import reviewpr
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import DATA_BEGIN
 from gauntlet.engine.review import (
@@ -39,8 +40,10 @@ from gauntlet.engine.review import (
     summarize_cycle,
     _bind_review_pipeline,
 )
+from gauntlet.trackers.base import Issue, IssueRef
 
 from conftest import FakeAdapter, git
+from test_review_pr import RATIFIED_POLICY, FakePrClient, FakeTracker
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -336,6 +339,96 @@ def test_response_less_resume_of_parked_review_refuses(review_repo, tmp_path):
     # rather than silently re-park (fail closed).
     with pytest.raises(ReviewFailClosed, match="resume it with --response"):
         resume_review(review_repo, _config(), resolution.state_dir, use_judge=False)
+
+
+# ===========================================================================
+# F-003 — a parked PR review keeps its FR-4.3/4.4 summary facts across resume
+# ===========================================================================
+def test_pr_resume_preserves_summary_facts(review_repo, tmp_path, monkeypatch):
+    # A multi-ref FORK PR that parks on a blocking finding must, on resume, still
+    # surface the chosen linked ticket, the ignored secondary refs, and the fork
+    # manual-push note. These live only in the in-memory ReviewResolution on a
+    # fresh drive, so the run persists them in the manifest and rehydrates them on
+    # resume (FR-4.3/4.4); without that, a resumed PR review drops them.
+    repo = review_repo
+    cfg = _config(issue_tracker={"provider": "linear", "api_key_env": "LINEAR_API_KEY"})
+
+    # Ratified PR-read policy committed on main (FR-7.4 preflight).
+    (repo / "policy.yaml").write_text(RATIFIED_POLICY)
+    git(repo, "add", "policy.yaml")
+    git(repo, "commit", "-qm", "policy")
+
+    # PR head is the existing 2-commit `feature` tip; a fork (head_owner unset so
+    # the local branch is plain `feature`, reusing the fixture's divergence).
+    head_sha = git(repo, "rev-parse", "feature").strip()
+    md = reviewpr.PrMetadata(
+        number="7", head_ref="feature", base_ref="main", is_cross_repository=True,
+        title="Fix widget", body="Fixes ENG-1234 and ENG-5678",
+        url="https://github.com/acme/w/pull/7", head_owner=None,
+    )
+    client = FakePrClient(repo, md, head_sha, local_branch="feature")
+    refs = [IssueRef("linear", "ENG-1234", "ENG-1234"),
+            IssueRef("linear", "ENG-5678", "ENG-5678")]
+    issue = Issue(
+        identifier="ENG-1234", title="Widget crashes on empty input",
+        description="Clicking Save with an empty widget name throws NPE.",
+        url="https://linear.app/acme/issue/ENG-1234", state="In Progress",
+    )
+    monkeypatch.setattr(
+        ReviewLifecycle, "_get_tracker",
+        lambda self: FakeTracker(refs=refs, issue=issue),
+    )
+
+    hooks = _hooks(tmp_path, pr_client=client)
+    lc = ReviewLifecycle(repo, cfg, hooks=hooks)
+    resolution = lc.resolve(ReviewInputs(pr="7"))
+
+    # The facts are persisted on the manifest at the pre-cycle boundary.
+    assert resolution.pr_chosen_ref == "ENG-1234"
+    assert resolution.pr_ignored_refs == ["ENG-5678"]
+    assert resolution.pr_is_fork is True
+    man = M.Manifest.load(resolution.manifest_path)
+    assert man.pr is not None
+    assert man.pr.chosen_ref == "ENG-1234"
+    assert man.pr.ignored_refs == ["ENG-5678"]
+    assert man.pr.is_fork is True
+    assert man.pr.url == "https://github.com/acme/w/pull/7"
+
+    # Drive to a park on an unresolved blocking finding.
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),
+        ),
+        "triage": SeqAdapter(V("F-001")),
+        "escalation": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("feature1.py", "def one():\n    return 11\n", {})),
+    }
+    outcome = drive_review(
+        repo, cfg, resolution,
+        adapter_factory=lambda n: adapters[n], use_judge=False,
+    )
+    assert outcome.status == M.RUN_PARKED
+    # The fresh drive's outcome carries the facts (baseline).
+    assert outcome.pr_is_fork is True
+    assert outcome.pr_chosen_ref == "ENG-1234"
+    assert outcome.pr_ignored_refs == ["ENG-5678"]
+
+    # Resume with a human decision — the summary facts must survive (the fix).
+    adapters2 = {
+        "reviewer": SeqAdapter(REVIEW()),
+        "triage": SeqAdapter(), "escalation": SeqAdapter(), "builder": SeqAdapter(),
+    }
+    resumed = resume_review(
+        repo, cfg, resolution.state_dir,
+        response="F-001 is acceptable; the fix is correct.",
+        adapter_factory=lambda n: adapters2[n], use_judge=False,
+        environ={"GAUNTLET_USER_EMAIL": "john.pletka@gmail.com"},
+    )
+    assert resumed.status == M.RUN_DONE
+    assert resumed.pr_is_fork is True
+    assert resumed.pr_chosen_ref == "ENG-1234"
+    assert resumed.pr_ignored_refs == ["ENG-5678"]
+    assert resumed.pr_url == "https://github.com/acme/w/pull/7"
 
 
 # ===========================================================================

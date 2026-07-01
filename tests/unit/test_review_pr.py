@@ -26,9 +26,11 @@ from pathlib import Path
 import pytest
 
 from gauntlet.engine import gitops
+from gauntlet.engine import manifest as M
 from gauntlet.engine import review as review_mod
 from gauntlet.engine import reviewpr
 from gauntlet.engine.config import RunConfig
+from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.review import (
     Hooks,
     ReviewFailClosed,
@@ -174,6 +176,20 @@ def _md(number: str = "7", *, body: str, head="feature", base="main",
         title="Fix widget crash", body=body, url=f"https://github.com/acme/w/pull/{number}",
         head_owner=owner,
     )
+
+
+def _plant_review_run(repo, tmp_path, *, slug, branch, status=M.RUN_RUNNING):
+    """Write a lightweight review run's manifest under the out-of-repo review
+    state root, so a competing-run scan (FR-9.3, F-002) can discover it. Mirrors
+    the XDG layout `_hooks` configures (`tmp_path/xdg`)."""
+    repo_id = review_mod.derive_repo_id(repo)
+    d = tmp_path / "xdg" / "gauntlet" / "reviews" / repo_id / slug
+    d.mkdir(parents=True, exist_ok=True)
+    man = Manifest(
+        run_id=slug, slug=slug, branch=branch, base_branch="main",
+        pipeline=PipelineRef(name="review", version=1, hash=""), status=status,
+    )
+    man.write_atomic(d / "manifest.json")
 
 
 def _lifecycle(repo, tmp_path, client, *, tracker=None, cfg=None) -> ReviewLifecycle:
@@ -420,6 +436,10 @@ def test_bad_pr_value_is_usage_error(fixture_repo, tmp_path):
 
 def test_pr_url_parses_to_number(fixture_repo, tmp_path):
     _write_policy(fixture_repo, RATIFIED_POLICY)
+    # A URL is only accepted when its owner/repo matches this repo's origin (see
+    # test_pr_url_mismatched_repo_fails_closed); the scp-form origin normalizes
+    # to acme/w, matching the URL.
+    git(fixture_repo, "remote", "add", "origin", "git@github.com:acme/w.git")
     head = _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
     git(fixture_repo, "branch", "-q", "-D", "feature")
     client = FakePrClient(fixture_repo, _md(number="42", body="Fixes ENG-1234"),
@@ -431,3 +451,116 @@ def test_pr_url_parses_to_number(fixture_repo, tmp_path):
     res = lc.resolve(ReviewInputs(pr="https://github.com/acme/w/pull/42"))
     assert res.slug == "pr-42"
     assert res.pr_number == "42"
+
+
+def test_pr_url_mismatched_repo_fails_closed(fixture_repo, tmp_path):
+    # A URL for a DIFFERENT repo must not have its number applied to this repo's
+    # PR N — refuse before any gh/git command runs (F-001, FR-4.1).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    git(fixture_repo, "remote", "add", "origin", "git@github.com:acme/w.git")
+    client = FakePrClient(fixture_repo, _md(number="42", body="Fixes ENG-1234"),
+                          "deadbeef", local_branch="feature")
+    lc = _lifecycle(fixture_repo, tmp_path, client, tracker=FakeTracker())
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(pr="https://github.com/other/repo/pull/42"))
+    assert "other/repo" in str(exc.value)
+    assert "acme/w" in str(exc.value)
+    # No gh/git-fetch command issued and HEAD unmoved (refused before any work).
+    assert client.calls == []
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_pr_url_without_origin_fails_closed(fixture_repo, tmp_path):
+    # A URL cannot be confirmed to target this repo when there is no origin remote
+    # (the default fixture has none); fail closed rather than guess (F-001).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    client = FakePrClient(fixture_repo, _md(number="42", body="Fixes ENG-1234"),
+                          "deadbeef", local_branch="feature")
+    lc = _lifecycle(fixture_repo, tmp_path, client, tracker=FakeTracker())
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(pr="https://github.com/acme/w/pull/42"))
+    assert "origin" in str(exc.value)
+    assert client.calls == []
+
+
+def test_pr_bare_number_needs_no_origin(fixture_repo, tmp_path):
+    # A bare number is unambiguously this repo, so it is accepted with no origin
+    # remote and no URL-repo check (F-001).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    head = _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
+    git(fixture_repo, "branch", "-q", "-D", "feature")
+    client = FakePrClient(fixture_repo, _md(number="7", body="Fixes ENG-1234"),
+                          head, local_branch="feature")
+    lc = _lifecycle(
+        fixture_repo, tmp_path, client,
+        tracker=FakeTracker(refs=[IssueRef("linear", "ENG-1234", "ENG-1234")], issue=_issue()),
+    )
+    res = lc.resolve(ReviewInputs(pr="7"))
+    assert res.pr_number == "7"
+
+
+# --- FR-9.3 competing-run refusal across the review state root (F-002) --------
+
+def test_pr_refuses_when_branch_mode_review_owns_head(fixture_repo, tmp_path):
+    # A branch-mode review already driving `feature` must block a --pr run whose
+    # head resolves to `feature`, even though it keys on a different slug (`pr-7`
+    # vs `feature`) invisible to the run_root scan (F-002).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    head = _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
+    _plant_review_run(fixture_repo, tmp_path, slug="feature", branch="feature")
+    client = FakePrClient(fixture_repo, _md(body="Fixes ENG-1234"), head, local_branch="feature")
+    lc = _lifecycle(
+        fixture_repo, tmp_path, client,
+        tracker=FakeTracker(refs=[IssueRef("linear", "ENG-1234", "ENG-1234")], issue=_issue()),
+    )
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(pr="7"))
+    assert "already owns branch 'feature'" in str(exc.value)
+    # Refused BEFORE checkout: HEAD unmoved, no `gh pr checkout` issued.
+    assert gitops.current_branch(fixture_repo) == "main"
+    assert ("checkout", "7") not in client.calls
+
+
+def test_pr_refuses_when_another_pr_owns_same_head(fixture_repo, tmp_path):
+    # Two PRs sharing a head branch: the second is refused against the first (F-002).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    head = _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
+    _plant_review_run(fixture_repo, tmp_path, slug="pr-5", branch="feature")
+    client = FakePrClient(fixture_repo, _md(number="7", body="Fixes ENG-1234"),
+                          head, local_branch="feature")
+    lc = _lifecycle(
+        fixture_repo, tmp_path, client,
+        tracker=FakeTracker(refs=[IssueRef("linear", "ENG-1234", "ENG-1234")], issue=_issue()),
+    )
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(pr="7"))
+    assert "pr-5" in str(exc.value)
+    assert ("checkout", "7") not in client.calls
+
+
+def test_pr_allows_when_competing_review_is_terminal(fixture_repo, tmp_path):
+    # A terminal review run owning the same head branch does not block (F-002).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    head = _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
+    git(fixture_repo, "branch", "-q", "-D", "feature")
+    _plant_review_run(fixture_repo, tmp_path, slug="pr-5", branch="feature", status=M.RUN_DONE)
+    client = FakePrClient(fixture_repo, _md(number="7", body="Fixes ENG-1234"),
+                          head, local_branch="feature")
+    lc = _lifecycle(
+        fixture_repo, tmp_path, client,
+        tracker=FakeTracker(refs=[IssueRef("linear", "ENG-1234", "ENG-1234")], issue=_issue()),
+    )
+    res = lc.resolve(ReviewInputs(pr="7"))
+    assert res.target_branch == "feature"
+
+
+def test_branch_review_refuses_when_pr_review_owns_head(fixture_repo, tmp_path):
+    # Symmetric direction: an active --pr review of `feature` blocks a later
+    # branch-mode review of the same branch (F-002).
+    _write_policy(fixture_repo, RATIFIED_POLICY)
+    _pr_head_branch(fixture_repo, "feature", files={"fix.py": "print('x')\n"})
+    _plant_review_run(fixture_repo, tmp_path, slug="pr-5", branch="feature")
+    lc = _lifecycle(fixture_repo, tmp_path, client=None)
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(branch="feature", code_only=True))
+    assert "pr-5" in str(exc.value)
