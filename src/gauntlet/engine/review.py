@@ -299,6 +299,10 @@ class Hooks:
         default=lambda: datetime.now(timezone.utc)
     )
     tracker_transport: object | None = None
+    # Injectable PR-mode `gh`/`git fetch` seam (FR-4). None => the real
+    # GhPrClient is built lazily in PR mode; the unit suite injects a fake so the
+    # checkout contract is exercised offline against a real git fixture.
+    pr_client: object | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +333,12 @@ class ReviewResolution:
     rounds: int
     code_only: bool
     run_tests: bool
+    # PR-mode facts (FR-4), surfaced in the run summary; empty for branch mode.
+    pr_number: str | None = None
+    pr_url: str | None = None
+    pr_is_fork: bool = False
+    pr_chosen_ref: str | None = None
+    pr_ignored_refs: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +371,17 @@ class ReviewLifecycle:
         can detect an existing (parked/running) review run and route a resume to it
         rather than clobbering it with a fresh resolution (FR-9.1/FR-8.4)."""
         self._validate_inputs(inputs)
-        target = self._resolve_target(inputs)
+        if inputs.pr is not None:
+            # PR mode keys its state on `pr-<N>` (FR-8.4), independent of the head
+            # branch name — resolvable with NO gh/git (no checkout here), so
+            # locate() stays side-effect-free and issues none of the FR-7.4-gated
+            # read commands. The real head branch is resolved later, in resolve().
+            from gauntlet.engine import reviewpr
+
+            pr_number = reviewpr.parse_pr_number(inputs.pr)
+            target = f"pr-{pr_number}"
+        else:
+            target = self._resolve_target(inputs)
         slug = review_slug(target)
         repo_id = derive_repo_id(self.repo_root)
         state_dir = resolve_state_dir(
@@ -371,8 +391,16 @@ class ReviewLifecycle:
         return target, slug, state_dir
 
     def resolve(self, inputs: ReviewInputs) -> ReviewResolution:
-        """Run the full P2 resolve-and-stop path; raise on any fail-closed halt."""
+        """Resolve a review run to the pre-cycle boundary; raise on any halt.
+
+        Branch mode (default) and PR mode (`--pr`, FR-4) share everything after
+        the target branch is on HEAD — intent snapshot, base/merge-base guard,
+        manifest — so PR mode is a distinct front half (preflight + checkout +
+        PR-derived base/intent) that then produces the same
+        :class:`ReviewResolution`."""
         self._validate_inputs(inputs)
+        if inputs.pr is not None:
+            return self._resolve_pr(inputs)
 
         source = self._intent_source(inputs)
         excludes = self._intent_excludes(inputs)
@@ -483,13 +511,15 @@ class ReviewLifecycle:
                 "combined with --issue/--intent/-m/--intent-provenance/"
                 "--approved-intent (FR-2.3)"
             )
-        # --pr is parsed here but its checkout/auto-derive path is P4/P5.
+        # --pr value must be a PR number or a github.com PR URL (usage class),
+        # validated before any lifecycle work so a bad value exits 2 up front.
         if inputs.pr is not None:
-            raise ReviewUsageError(
-                "--pr (GitHub PR mode) is not implemented yet; it lands in a later "
-                "phase. Review a local branch instead (positional <branch> or the "
-                "current branch)."
-            )
+            from gauntlet.engine import reviewpr
+
+            try:
+                reviewpr.parse_pr_number(inputs.pr)
+            except ValueError as exc:
+                raise ReviewUsageError(str(exc)) from exc
 
     def _intent_source(self, inputs: ReviewInputs) -> str:
         """The single resolved intent source, by FR-2.1 precedence."""
@@ -631,8 +661,18 @@ class ReviewLifecycle:
     # ---- base resolution + empty-diff guard (FR-5) ---------------------------
 
     def _resolve_base(self, inputs: ReviewInputs, target: str) -> tuple[str, str]:
-        repo = self.repo_root
         base_ref = self._resolve_base_ref(inputs)
+        return base_ref, self._merge_base_guard(base_ref, target)
+
+    def _merge_base_guard(self, base_ref: str, target: str) -> str:
+        """Validate ``base_ref`` and return ``merge-base(base_ref, HEAD)`` (FR-5.2/5.3).
+
+        The concrete merge-base SHA is what P3 injects as the cycle's two-dot
+        ``review_base`` so ``range_diff`` yields the three-dot ``base...HEAD``
+        scope. Fails closed on an invalid base, unrelated histories (no
+        merge-base), or an empty three-dot diff — with the FR-5.3 messages,
+        before any agent. Shared by branch mode and PR mode (FR-4.2)."""
+        repo = self.repo_root
         if not gitops.ref_is_valid_commit(repo, base_ref):
             raise ReviewFailClosed(
                 f"the resolved review base {base_ref!r} is not a valid ref; pass "
@@ -650,7 +690,7 @@ class ReviewLifecycle:
                 "base resolves to the branch under review or has no changes to "
                 f"review; nothing to diff — pass `--base <ref>` (base {base_ref!r})."
             )
-        return base_ref, mb
+        return mb
 
     def _resolve_base_ref(self, inputs: ReviewInputs) -> str:
         """FR-5.1 order: --base > concrete config.base_branch > origin/HEAD.
@@ -673,6 +713,222 @@ class ReviewLifecycle:
                 "base_branch, or pass --base <ref> (FR-5.1)."
             )
         return default
+
+    # ---- PR mode (FR-4) ------------------------------------------------------
+
+    def _resolve_pr(self, inputs: ReviewInputs) -> ReviewResolution:
+        """Resolve `--pr` to the pre-cycle boundary (FR-4), fail-closed throughout.
+
+        Order matters for safety: the FR-7.4 policy preflight runs **before any**
+        `gh`/`git fetch` (it is a deterministic config read, no network, no
+        agent); the clean-tree entry contract runs **before** `gh pr checkout`
+        (FR-4.5 step 1) so the checkout never runs against a dirty tree; the
+        non-destructive checkout contract (FR-4.5) lands the PR head on a named
+        local branch; then intent + base + manifest are resolved exactly as a
+        local-branch review of that head branch (FR-4.1)."""
+        from gauntlet.engine import reviewpr
+
+        pr_number = reviewpr.parse_pr_number(inputs.pr)
+
+        # FR-7.4: verify pr_read_commands@v1 is ratified BEFORE any gh/git fetch.
+        self._pr_read_preflight(pr_number)
+
+        excludes = self._intent_excludes(inputs)
+        # FR-4.5 step 1 / FR-9.2: clean tree BEFORE gh pr checkout (an in-repo
+        # --intent file is exempt, FR-2.4). No checkout runs against a dirty tree.
+        if not gitops.is_clean(self.repo_root, exclude=excludes or None):
+            raise ReviewFailClosed(
+                "the worktree has uncommitted changes; --pr mode checks the PR "
+                "out in place, so commit or stash first before it runs "
+                "`gh pr checkout` (FR-4.5/FR-9.2). A --intent file inside the repo "
+                "is exempt."
+            )
+
+        client = self._pr_client()
+        try:
+            checkout = reviewpr.resolve_pr_checkout(
+                self.repo_root, pr_number, client
+            )
+        except reviewpr.PrModeError as exc:
+            raise ReviewFailClosed(str(exc)) from exc
+
+        md = checkout.metadata
+        target = checkout.local_branch
+
+        # Another non-terminal run owning the checked-out head branch is refused
+        # (FR-9.3), exactly as branch mode.
+        self._refuse_competing_run(target)
+
+        slug = review_slug(f"pr-{pr_number}")
+        repo_id = derive_repo_id(self.repo_root)
+        state_dir = resolve_state_dir(
+            self.repo_root, self.config,
+            repo_id=repo_id, slug=slug, environ=self.hooks.environ,
+        )
+
+        # Base = the PR's base ref (FR-4.2), three-dot merge-base (FR-5.2);
+        # --base still overrides if given.
+        base_ref, merge_base = self._resolve_pr_base(inputs, md, target)
+
+        state_dir.mkdir(parents=True, exist_ok=True)
+        intent_record, intent_path, chosen_ref, ignored_refs = self._resolve_pr_intent(
+            inputs, md, state_dir=state_dir
+        )
+        if excludes:
+            intent_record.repo_exclude = excludes[0]
+
+        manifest_path = self._persist_manifest(
+            slug=slug, target=target, base_ref=base_ref,
+            intent_record=intent_record, state_dir=state_dir,
+        )
+
+        return ReviewResolution(
+            slug=slug,
+            target_branch=target,
+            base_ref=base_ref,
+            merge_base=merge_base,
+            state_dir=state_dir,
+            manifest_path=manifest_path,
+            intent_path=intent_path,
+            intent_record=intent_record,
+            excludes=excludes,
+            rounds=inputs.rounds,
+            code_only=inputs.code_only,
+            run_tests=bool(inputs.test),
+            pr_number=pr_number,
+            pr_url=md.url or None,
+            pr_is_fork=md.is_cross_repository,
+            pr_chosen_ref=chosen_ref,
+            pr_ignored_refs=ignored_refs,
+        )
+
+    def _pr_read_preflight(self, pr_number: str) -> None:
+        """FR-7.4 deterministic gate: pr_read_commands@v1 ratified in policy.yaml.
+
+        A pure config read (no network, no agent). On absent/unratified/
+        version-mismatch it fails closed with the EXACT FR-7.4 message before any
+        `gh`/`git fetch` command is issued (never the try-it-and-see anti-pattern)."""
+        from gauntlet.judge.preflight import check_pr_read_commands
+
+        policy_path = self.repo_root / self.config.asset_root / "policy.yaml"
+        result = check_pr_read_commands(policy_path)
+        if not result.ok:
+            raise ReviewFailClosed(result.message)
+
+    def _pr_client(self):
+        if self.hooks.pr_client is not None:
+            return self.hooks.pr_client
+        from gauntlet.engine import reviewpr
+
+        return reviewpr.GhPrClient(self.repo_root)
+
+    def _resolve_pr_base(self, inputs: ReviewInputs, md, target: str) -> tuple[str, str]:
+        """The PR's base ref as the review base (FR-4.2); --base overrides.
+
+        The PR base ref name (e.g. ``main``) is resolved to a commit-ish,
+        preferring the remote-tracking ``origin/<base>`` (reliable after the
+        checkout fetch) and falling back to a local ``<base>``. Fails closed with
+        guidance when neither resolves, rather than diffing against nothing."""
+        if inputs.base:
+            return inputs.base, self._merge_base_guard(inputs.base, target)
+        for cand in (f"origin/{md.base_ref}", md.base_ref):
+            if cand and gitops.ref_is_valid_commit(self.repo_root, cand):
+                return cand, self._merge_base_guard(cand, target)
+        raise ReviewFailClosed(
+            f"the PR base ref {md.base_ref!r} does not resolve to a local or "
+            f"remote-tracking commit; fetch it or pass --base <ref> (FR-4.2)."
+        )
+
+    def _resolve_pr_intent(
+        self, inputs: ReviewInputs, md, *, state_dir: Path
+    ) -> tuple[IntentRecord, Path | None, str | None, list[str]]:
+        """Resolve PR-mode intent (FR-2.1 precedence + FR-4.3 linked-ticket derive).
+
+        Precedence: an explicit `--code-only` / `--issue` / `--intent` / `-m`
+        wins (the PR body is never the problem statement). Otherwise the intent is
+        auto-derived from the PR's linked ticket: the first ref `extract_refs`
+        finds in textual order supplies it (`provenance: tracker`); any further
+        refs are recorded as ignored secondary refs. No linked ref (and no
+        explicit intent / `--code-only`) fails closed — the run does NOT fall back
+        to the PR body (FR-4.3). Returns
+        ``(record, intent_path, chosen_ref, ignored_refs)``."""
+        # Explicit sources (highest precedence) reuse the branch-mode resolver;
+        # the PR body is then attached as secondary context only.
+        if inputs.code_only:
+            return (
+                IntentRecord(
+                    source=M.INTENT_SOURCE_CODE_ONLY,
+                    provenance=M.PROVENANCE_NONE,
+                    independent=False,
+                ),
+                None, None, [],
+            )
+        if (
+            inputs.issue is not None
+            or inputs.intent_path is not None
+            or inputs.message is not None
+        ):
+            source = self._intent_source(inputs)
+            record, intent_path = self._resolve_intent(
+                inputs, source=source, state_dir=state_dir
+            )
+            self._append_pr_context(intent_path, md)
+            return record, intent_path, None, []
+
+        # Auto-derive from the PR's linked ticket (FR-4.3).
+        tracker = self._get_tracker()
+        if tracker is None:
+            raise ReviewFailClosed(
+                f"PR #{md.number} has no configured issue_tracker to auto-derive "
+                "its linked-ticket intent from; pass --issue/--intent/-m, or "
+                "--code-only for a diff-only review (FR-4.3). The PR body is not "
+                "used as the problem statement."
+            )
+        refs = tracker.extract_refs(md.body or "")
+        if not refs:
+            raise ReviewFailClosed(
+                f"PR #{md.number} body links no {self.config.issue_tracker.provider} "
+                "ticket, so there is no problem statement to review against; pass "
+                "--issue/--intent/-m, or --code-only (FR-4.3). The PR body is not "
+                "used as the intent."
+            )
+        chosen = refs[0]
+        ignored = [r.key for r in refs[1:]]
+        issue = self._fetch_parsed_issue(tracker, chosen)
+        body = render_intent(
+            issue,
+            provenance=M.PROVENANCE_TRACKER,
+            independent=True,
+            source=M.INTENT_SOURCE_ISSUE,
+            provider=self.config.issue_tracker.provider,
+        )
+        record = IntentRecord(
+            source=M.INTENT_SOURCE_ISSUE,
+            provenance=M.PROVENANCE_TRACKER,
+            independent=True,
+        )
+        intent_path = self._write_intent(state_dir, body)
+        self._append_pr_context(intent_path, md)
+        return record, intent_path, chosen.key, ignored
+
+    def _append_pr_context(self, intent_path: Path | None, md) -> None:
+        """Append the PR title/url/body to ``intent.md`` as secondary context.
+
+        FR-4.3: the PR body may be attached as **secondary context only** — it
+        never substitutes for the ticket-sourced problem statement. It is clearly
+        labeled so the reviewer weighs it as author framing, and (like the rest of
+        ``intent.md``) it is wrapped as untrusted data on the triager path (§7).
+        No-op for ``--code-only`` (no ``intent.md``)."""
+        if intent_path is None:
+            return
+        trailer = (
+            "\n## PR context (secondary — not the problem statement)\n"
+            f"PR #{md.number}: {md.title}\n"
+            f"{md.url}\n\n"
+            f"{md.body or '(no PR description)'}\n"
+        )
+        with intent_path.open("a") as fh:
+            fh.write(trailer)
 
     # ---- intent resolution + ratification (FR-2) -----------------------------
 
@@ -722,16 +978,19 @@ class ReviewLifecycle:
         intent_path = self._write_intent(state_dir, body)
         return record, intent_path
 
-    def _fetch_issue(self, ref: str):
+    def _get_tracker(self):
+        """The configured, usable tracker, or ``None`` when tracking is disabled.
+
+        Returns ``None`` for an absent ``issue_tracker`` block or ``provider:
+        none`` (FR-6.5) — the caller decides whether that is a fail-closed halt
+        (``--issue`` / PR auto-derive) or a no-op (a lower-precedence source is
+        present). Raises :class:`ReviewFailClosed` only for a *configured but
+        unregistered* provider (a config load normally catches this, FR-6.2)."""
         tracker_cfg = self.config.issue_tracker
         if tracker_cfg is None or not tracker_cfg.enabled:
-            raise ReviewFailClosed(
-                "--issue requires a configured issue_tracker; none is set (or "
-                "provider: none). Configure one, or supply --intent/-m instead "
-                "(FR-6.5)."
-            )
+            return None
         try:
-            tracker = get_tracker(
+            return get_tracker(
                 tracker_cfg,
                 env=self.hooks.environ,
                 transport=self.hooks.tracker_transport,
@@ -741,20 +1000,35 @@ class ReviewLifecycle:
                 f"issue tracker provider {tracker_cfg.provider!r} is not "
                 f"registered: {exc}"
             ) from exc
+
+    def _fetch_issue(self, ref: str):
+        tracker = self._get_tracker()
+        if tracker is None:
+            raise ReviewFailClosed(
+                "--issue requires a configured issue_tracker; none is set (or "
+                "provider: none). Configure one, or supply --intent/-m instead "
+                "(FR-6.5)."
+            )
         try:
             parsed = tracker.parse_ref(ref)
         except ValueError as exc:
             raise ReviewFailClosed(
                 f"--issue {ref!r} is not a valid reference for provider "
-                f"{tracker_cfg.provider!r}: {exc}"
+                f"{self.config.issue_tracker.provider!r}: {exc}"
             ) from exc
+        return self._fetch_parsed_issue(tracker, parsed)
+
+    def _fetch_parsed_issue(self, tracker, ref):
+        """Fetch a parsed :class:`IssueRef`, mapping tracker errors to fail-closed.
+
+        The tracker family is the sole, highest-precedence intent source for the
+        ref it resolves (an explicit ``--issue`` or a PR's linked ticket); a
+        failure NEVER falls back to a lower-precedence source (FR-2.1/FR-6.4)."""
         try:
-            return tracker.fetch(parsed)
+            return tracker.fetch(ref)
         except IssueTrackerError as exc:
-            # --issue is the sole, highest-precedence source; a failure NEVER
-            # falls back to a lower one (FR-2.1). Fail closed with the typed error.
             raise ReviewFailClosed(
-                f"could not resolve --issue {ref!r} from the tracker "
+                f"could not resolve issue {ref.key!r} from the tracker "
                 f"({type(exc).__name__}): {exc}"
             ) from exc
 
@@ -969,6 +1243,13 @@ class ReviewOutcome:
     summary: ReviewSummary
     state_dir: Path
     cycle_notes: str
+    # PR-mode facts surfaced in the run summary (FR-4.3/FR-4.4); empty for
+    # branch mode. Carried from the resolution so the CLI can render the chosen
+    # linked ticket, the ignored secondary refs, and the fork manual-push note.
+    pr_url: str | None = None
+    pr_is_fork: bool = False
+    pr_chosen_ref: str | None = None
+    pr_ignored_refs: list[str] = field(default_factory=list)
 
 
 def summarize_cycle(rounds: list[RoundRecord]) -> ReviewSummary:
@@ -1321,7 +1602,13 @@ def _build_review_orchestrator(
     return orch
 
 
-def _outcome(state_dir: Path, man: Manifest, status: str) -> ReviewOutcome:
+def _outcome(
+    state_dir: Path,
+    man: Manifest,
+    status: str,
+    *,
+    resolution: ReviewResolution | None = None,
+) -> ReviewOutcome:
     return ReviewOutcome(
         status=status,
         parked=(status == M.RUN_PARKED),
@@ -1329,6 +1616,10 @@ def _outcome(state_dir: Path, man: Manifest, status: str) -> ReviewOutcome:
         summary=summarize_cycle(_collect_round_records(state_dir)),
         state_dir=state_dir,
         cycle_notes=_cycle_notes(man),
+        pr_url=resolution.pr_url if resolution else None,
+        pr_is_fork=bool(resolution.pr_is_fork) if resolution else False,
+        pr_chosen_ref=resolution.pr_chosen_ref if resolution else None,
+        pr_ignored_refs=list(resolution.pr_ignored_refs) if resolution else [],
     )
 
 
@@ -1381,7 +1672,7 @@ def drive_review(
         status = _with_review_judge(config, repo_root, state_dir, man, _drive)
     else:
         status = _drive({})
-    return _outcome(state_dir, man, status)
+    return _outcome(state_dir, man, status, resolution=resolution)
 
 
 def load_review_run(state_dir: Path) -> Manifest | None:

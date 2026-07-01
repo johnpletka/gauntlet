@@ -288,7 +288,9 @@ def review(
         None, help="Local branch to review (default: the current branch)."
     ),
     pr: str = typer.Option(
-        None, "--pr", help="GitHub PR number or URL to review (later phase)."
+        None, "--pr",
+        help="GitHub PR number or URL: check it out locally and review it "
+        "against its base + linked ticket, landing fixes locally (FR-4).",
     ),
     issue: str = typer.Option(
         None, "--issue", help="Issue tracker ref/URL (e.g. ENG-1234) for intent."
@@ -405,6 +407,21 @@ def _render_review_outcome(outcome, M) -> None:
     """Print a review run's terminal state: status, REVIEW.x commits, residual
     risk / declined findings (FR-3.4), and the state dir."""
     typer.echo(f"review {outcome.status} (branch operated on in place)")
+    # PR-mode notes (FR-4.3/FR-4.4): the chosen linked ticket + any ignored
+    # secondary refs, and the fork manual-push note, surfaced in the summary.
+    if outcome.pr_chosen_ref:
+        typer.echo(f"  PR intent from linked ticket {outcome.pr_chosen_ref}")
+    if outcome.pr_ignored_refs:
+        typer.echo(
+            "  warning: PR body links multiple tickets; using "
+            f"{outcome.pr_chosen_ref}. Ignored secondary refs: "
+            f"{', '.join(outcome.pr_ignored_refs)} (override with --issue)."
+        )
+    if outcome.pr_is_fork:
+        typer.echo(
+            "  fork PR: fixes landed locally; push-back is your action and may "
+            "need maintainer-edit access on the PR (FR-4.4)."
+        )
     if outcome.commits:
         typer.echo(f"  landed {len(outcome.commits)} fix commit(s):")
         for phase, sha in outcome.commits:

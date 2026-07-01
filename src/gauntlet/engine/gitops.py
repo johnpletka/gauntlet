@@ -447,6 +447,24 @@ def create_ref(repo: Path, ref: str, sha: str) -> None:
     _run(repo, "update-ref", ref, sha)
 
 
+def delete_ref(repo: Path, ref: str) -> None:
+    """Delete an arbitrary ref, tolerating an already-absent one.
+
+    The PR-mode checkout contract (FR-4.5) fetches the PR head into a scratch
+    ref (``refs/gauntlet/pr/<N>``) purely to compute fast-forwardability without
+    touching the user's local branch, then deletes it. The delete runs in a
+    ``finally`` — including on the diverged/failure fail-closed paths — so it
+    must not itself raise when the ref was never created; ``update-ref -d``
+    against a missing ref is treated as a no-op.
+    """
+    try:
+        _run(repo, "update-ref", "-d", ref)
+    except GitError:
+        # The scratch ref may never have been created (e.g. the fetch failed
+        # before writing it); cleaning up nothing is not an error.
+        pass
+
+
 def reset_hard(repo: Path, sha: str) -> None:
     _run(repo, "reset", "--hard", sha)
 

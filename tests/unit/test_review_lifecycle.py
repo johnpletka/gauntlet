@@ -274,11 +274,21 @@ def test_test_flag_requires_test_command(fixture_repo, tmp_path):
     assert "test_command" in str(exc.value)
 
 
-def test_pr_is_stubbed_as_usage_error_in_p2(fixture_repo, tmp_path):
+def test_pr_mode_gated_by_fr74_preflight_when_rule_unratified(fixture_repo, tmp_path):
+    # P5 implements --pr: it is no longer a P2 "not implemented" stub. It now
+    # enters PR mode, whose FIRST action is the deterministic FR-7.4 preflight —
+    # a pure policy read, before any gh/git fetch. This repo has no ratified
+    # pr_read_commands@v1 (no policy.yaml at all), so the run fails closed with
+    # the EXACT FR-7.4 message (a fail-closed halt, not a usage error). The full
+    # PR-mode happy/edge paths live in test_review_pr.py.
     lc = _lifecycle(fixture_repo, tmp_path)
-    with pytest.raises(ReviewUsageError) as exc:
+    with pytest.raises(ReviewFailClosed) as exc:
         lc.resolve(ReviewInputs(pr="123"))
-    assert "not implemented yet" in str(exc.value)
+    assert str(exc.value) == (
+        "P4 (PR mode) requires policy rule 'pr_read_commands@v1' to be ratified "
+        "in policy.yaml; it is absent. Ratify it through the policy-change "
+        "process (Open Question 11.4) before using --pr."
+    )
 
 
 # ===========================================================================
