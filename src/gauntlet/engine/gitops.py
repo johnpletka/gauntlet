@@ -391,6 +391,22 @@ def path_is_ignored(repo: Path, relpath: str) -> bool:
     return proc.returncode == 0
 
 
+def path_is_untracked(repo: Path, relpath: str) -> bool:
+    """True iff ``relpath`` is an untracked file (porcelain ``??``).
+
+    Used to decide whether an in-repo ``--intent`` file is user-owned untracked
+    dirt — safe to exempt from the clean-tree entry contract (FR-2.4) — versus a
+    tracked path whose uncommitted changes must NOT be masked (FR-9.2). Scoped to
+    the single path with untracked-files pinned to ``all`` (never left to adopter
+    git config): a tracked path, whether clean or modified, yields no ``??`` line
+    and returns False, so it is never silently exempted from the clean checks.
+    """
+    out = _run(
+        repo, "status", "--porcelain", "--untracked-files=all", "--", relpath
+    )
+    return any(line.startswith("?? ") for line in out.splitlines())
+
+
 def tag_exists(repo: Path, name: str) -> bool:
     """True iff ``refs/tags/<name>`` exists (used for the ambiguous-ref guard)."""
     try:

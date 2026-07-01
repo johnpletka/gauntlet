@@ -181,6 +181,33 @@ def test_resolve_state_dir_default_is_xdg(fixture_repo: Path, tmp_path: Path):
     assert p == tmp_path / "xdg" / "gauntlet" / "reviews" / "deadbeef0000" / "main"
 
 
+def test_resolve_state_dir_ignores_relative_xdg_state_home(
+    fixture_repo: Path, tmp_path: Path
+):
+    # A relative XDG_STATE_HOME is invalid per the XDG spec and must be ignored:
+    # honoring `.state` would land the default state dir inside the repo (against
+    # CWD) and dirty git status. It falls back to ~/.local/state under HOME.
+    environ = {"XDG_STATE_HOME": ".state", "HOME": str(tmp_path / "home")}
+    p = resolve_state_dir(
+        fixture_repo, _config(), repo_id="rid", slug="main", environ=environ
+    )
+    assert p == (
+        tmp_path / "home" / ".local" / "state"
+        / "gauntlet" / "reviews" / "rid" / "main"
+    )
+
+
+def test_resolve_state_dir_default_inside_repo_fails_closed(fixture_repo: Path):
+    # If HOME/XDG_STATE_HOME resolves inside the repo, the un-gitignored default
+    # path would write review bytes into the tree under review — fail closed.
+    environ = {"XDG_STATE_HOME": str(fixture_repo / "sneaky-state")}
+    with pytest.raises(ReviewFailClosed) as exc:
+        resolve_state_dir(
+            fixture_repo, _config(), repo_id="rid", slug="main", environ=environ
+        )
+    assert "zero-footprint" in str(exc.value)
+
+
 def test_resolve_state_dir_inrepo_override_requires_gitignore(fixture_repo: Path):
     cfg = _config(review={"state_dir": ".gauntlet/reviews"})
     # Not gitignored => fail closed at resolution.
@@ -361,6 +388,34 @@ def test_intent_file_inside_repo_is_excluded_and_left_untracked(fixture_repo, tm
     assert "The thing is broken." in res.intent_path.read_text()
 
 
+def test_inrepo_intent_pointing_at_dirty_tracked_file_fails_closed(
+    fixture_repo, tmp_path
+):
+    # --intent must not silently exempt a TRACKED file from the clean check: a
+    # dirty tracked file it points at still trips the entry contract, so the
+    # review never starts from an unclean worktree (F-003 / FR-9.2).
+    _make_branch(fixture_repo, "fix", "fix.py", "orig\n")
+    git(fixture_repo, "checkout", "-q", "fix")
+    (fixture_repo / "fix.py").write_text("uncommitted edit\n")  # tracked + dirty
+    lc = _lifecycle(fixture_repo, tmp_path)
+    # The dirty tracked path is NOT exempted (only untracked in-repo files are).
+    assert lc._intent_excludes(ReviewInputs(intent_path="fix.py")) == []
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(intent_path="fix.py", approved_intent=True))
+    assert "uncommitted" in str(exc.value)
+
+
+def test_inrepo_intent_pointing_at_clean_tracked_file_proceeds(fixture_repo, tmp_path):
+    # A tracked-and-clean in-repo --intent file has no dirt to mask: it is simply
+    # not excluded, and the review resolves normally (no over-rejection).
+    _make_branch(fixture_repo, "fix", "notes.md", "The widget crashes.\n")
+    git(fixture_repo, "checkout", "-q", "fix")
+    lc = _lifecycle(fixture_repo, tmp_path)
+    res = lc.resolve(ReviewInputs(intent_path="notes.md", approved_intent=True))
+    assert res.excludes == []  # clean tracked file => nothing to exclude
+    assert "The widget crashes." in res.intent_path.read_text()
+
+
 def test_empty_intent_file_fails_closed(fixture_repo, tmp_path):
     _make_branch(fixture_repo, "fix", "fix.py", "x\n")
     (fixture_repo / "bug.md").write_text("   \n")
@@ -377,8 +432,16 @@ def test_editor_source_yields_intent(fixture_repo, tmp_path):
     editor = tmp_path / "fake-editor.sh"
     editor.write_text('#!/bin/sh\necho "Editor-entered problem." >> "$1"\n')
     editor.chmod(0o755)
-    lc = _lifecycle(fixture_repo, tmp_path, environ_extra={"EDITOR": f"sh {editor}"})
-    res = lc.resolve(ReviewInputs(branch="fix", approved_intent=True))
+    # The $EDITOR source is only reachable interactively (a TTY must be present);
+    # the same interactive session then confirms the resolved statement.
+    lc = _lifecycle(
+        fixture_repo,
+        tmp_path,
+        isatty=lambda: True,
+        confirm_statement=lambda text: True,
+        environ_extra={"EDITOR": f"sh {editor}"},
+    )
+    res = lc.resolve(ReviewInputs(branch="fix"))
     assert res.intent_record.source == M.INTENT_SOURCE_EDITOR
     assert "Editor-entered problem." in res.intent_path.read_text()
     # The editor temp file lives under the state dir, never in the repo.
@@ -388,9 +451,46 @@ def test_editor_source_yields_intent(fixture_repo, tmp_path):
 def test_editor_source_empty_fails_closed(fixture_repo, tmp_path):
     _make_branch(fixture_repo, "fix", "fix.py", "x\n")
     # `true` leaves the template untouched => stripped empty => fail closed.
-    lc = _lifecycle(fixture_repo, tmp_path, environ_extra={"EDITOR": "true"})
-    with pytest.raises(ReviewFailClosed):
+    lc = _lifecycle(
+        fixture_repo, tmp_path, isatty=lambda: True, environ_extra={"EDITOR": "true"}
+    )
+    with pytest.raises(ReviewFailClosed) as exc:
         lc.resolve(ReviewInputs(branch="fix", approved_intent=True))
+    assert "no problem statement" in str(exc.value)
+
+
+def test_editor_source_non_interactive_fails_closed_before_launch(
+    fixture_repo, tmp_path
+):
+    # No explicit intent + no --code-only + no TTY: the review must fail closed
+    # BEFORE any lifecycle work, never launching $EDITOR (which would wedge a
+    # headless run on a `vi` that never returns) — F-001 / FR-2.3.
+    _make_branch(fixture_repo, "fix", "fix.py", "x\n")
+    # A "bomb" editor: if it were ever launched the run would hang/crash. It must
+    # not run, so a plain `false` (non-zero exit) proves the launch never happens
+    # — the fail-closed halt is raised regardless of what $EDITOR would do.
+    lc = _lifecycle(
+        fixture_repo, tmp_path, isatty=lambda: False, environ_extra={"EDITOR": "false"}
+    )
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(branch="fix"))
+    assert "no TTY" in str(exc.value)
+    # Fail-closed before lifecycle work: no state dir, no editor temp file, repo
+    # untouched.
+    assert git(fixture_repo, "status", "--porcelain").strip() == ""
+
+
+def test_editor_nonzero_exit_maps_to_fail_closed(fixture_repo, tmp_path):
+    # Interactive, but $EDITOR exits non-zero: a subprocess failure must map to a
+    # fail-closed halt with operator guidance, not an uncaught CalledProcessError
+    # (F-001 "map editor failures into ReviewFailClosed").
+    _make_branch(fixture_repo, "fix", "fix.py", "x\n")
+    lc = _lifecycle(
+        fixture_repo, tmp_path, isatty=lambda: True, environ_extra={"EDITOR": "false"}
+    )
+    with pytest.raises(ReviewFailClosed) as exc:
+        lc.resolve(ReviewInputs(branch="fix", approved_intent=True))
+    assert "$EDITOR" in str(exc.value)
 
 
 def test_code_only_writes_no_intent(fixture_repo, tmp_path):

@@ -164,9 +164,17 @@ def derive_repo_id(repo_root: Path) -> str:
 
 
 def _xdg_state_home(environ: Mapping[str, str]) -> Path:
-    """``${XDG_STATE_HOME:-~/.local/state}`` from the environment (§6)."""
+    """``${XDG_STATE_HOME:-~/.local/state}`` from the environment (§6).
+
+    Per the XDG Base Directory spec a relative ``XDG_STATE_HOME`` is invalid and
+    MUST be ignored: honoring one (e.g. ``XDG_STATE_HOME=.state``) would resolve
+    the default review state dir against the caller's CWD — landing it inside the
+    repo and dirtying ``git status``, which breaks the zero-footprint invariant
+    (FR-8.1). A relative value therefore falls back to ``~/.local/state`` exactly
+    as if unset.
+    """
     xdg = environ.get("XDG_STATE_HOME")
-    if xdg:
+    if xdg and Path(xdg).is_absolute():
         return Path(xdg)
     home = environ.get("HOME") or str(Path.home())
     return Path(home) / ".local" / "state"
@@ -220,13 +228,27 @@ def resolve_state_dir(
                     "out-of-repo path / the default (unset)."
                 )
         return state_dir
-    return (
+    default = (
         _xdg_state_home(environ)
         / "gauntlet"
         / "reviews"
         / repo_id
         / slug
     )
+    # The default path must be strictly out-of-repo — unlike an override, it is
+    # never gitignore-guarded, so any byte it writes under the repo would dirty
+    # git status (FR-8.1). This can only happen if HOME/XDG_STATE_HOME itself
+    # points inside the repo; fail closed rather than write review state into the
+    # tree under review.
+    if _within(default, repo_root):
+        raise ReviewFailClosed(
+            f"the default review state dir {default!s} resolves inside the repo, "
+            "which would dirty git status and break the zero-footprint invariant "
+            "(FR-8.1). HOME/XDG_STATE_HOME points inside the repo; set "
+            "XDG_STATE_HOME to an absolute path outside the repo, or set an "
+            "out-of-repo review.state_dir."
+        )
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -454,15 +476,36 @@ class ReviewLifecycle:
             return M.INTENT_SOURCE_INTENT_FILE
         if inputs.message is not None:
             return M.INTENT_SOURCE_MESSAGE
+        # No explicit intent: the $EDITOR template is the last resort, and it can
+        # only be completed interactively. In a non-interactive context (CI, a
+        # headless `gauntlet review fix`) launching $EDITOR would block forever
+        # with no way to close it, wedging the run. Fail closed here — before any
+        # git/lifecycle work — rather than spawn a `vi` that never returns
+        # (FR-2.3 fail-closed; CLAUDE.md §2 "fail closed").
+        if not self.hooks.isatty():
+            raise ReviewFailClosed(
+                "no intent source was given and no TTY is attached, so the "
+                "$EDITOR intent template cannot be opened. Pass --issue/--intent/"
+                "-m to supply a problem statement, or --code-only for a diff-only "
+                "review (FR-2.3)."
+            )
         return M.INTENT_SOURCE_EDITOR
 
     def _intent_excludes(self, inputs: ReviewInputs) -> list[str]:
-        """Repo-relative exclude for an in-repo ``--intent`` file (FR-2.4).
+        """Repo-relative exclude for an in-repo, **untracked** ``--intent`` file.
 
         A ``--intent`` path resolving inside the repo is added to the run's
         worktree-exclude set so it cannot trip the clean-tree entry contract or
-        be swept into a fix commit; the file is left present and untracked. A
-        path outside the repo needs no exclusion.
+        be swept into a fix commit — but ONLY when it is genuinely untracked
+        user-owned dirt (FR-2.4/G3). The file is left present and untracked.
+
+        A tracked in-repo path (clean, staged, or modified) is NEVER exempted:
+        excluding it would let ``--intent src/foo.py`` mask uncommitted changes
+        to a tracked file and start the review from an unclean worktree, breaking
+        the requirement that the target branch's committed state be clean before
+        review (FR-9.2). A dirty tracked path is left in the clean checks so the
+        entry contract fails closed on it; a clean tracked path has nothing to
+        exclude. A path outside the repo needs no exclusion either way.
         """
         if not inputs.intent_path:
             return []
@@ -472,6 +515,8 @@ class ReviewLifecycle:
         if not _within(p, self.repo_root):
             return []
         rel = _normabs(p).relative_to(_normabs(self.repo_root)).as_posix()
+        if not gitops.path_is_untracked(self.repo_root, rel):
+            return []
         return [rel]
 
     # ---- target-branch resolution + adoption ---------------------------------
@@ -729,7 +774,11 @@ class ReviewLifecycle:
         try:
             _default_editor(tmp, self.hooks.environ)
             raw = tmp.read_text()
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
+            # A missing editor binary (OSError) or a non-zero editor exit /
+            # timeout (SubprocessError, incl. CalledProcessError) is a
+            # fail-closed halt, not an uncaught crash — the review never
+            # proceeds on an unconfirmed intent.
             raise ReviewFailClosed(
                 f"could not run $EDITOR for the intent template: {exc}"
             ) from exc

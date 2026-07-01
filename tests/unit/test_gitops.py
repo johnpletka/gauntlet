@@ -26,6 +26,28 @@ def test_is_clean_ignores_show_untracked_files_config(fixture_repo):
     assert "stray.txt" in gitops.status_porcelain(fixture_repo, untracked_all=True)
 
 
+def test_path_is_untracked_distinguishes_tracked_states(fixture_repo):
+    """Only a genuinely untracked file reports ``??``; tracked files never do.
+
+    The review command uses this to exempt an in-repo ``--intent`` file from the
+    clean checks ONLY when it is untracked user-owned dirt — a tracked file,
+    clean or modified, must not be masked (FR-2.4/FR-9.2).
+    """
+    untracked = fixture_repo / "note.md"
+    untracked.write_text("scratch\n")
+    assert gitops.path_is_untracked(fixture_repo, "note.md")
+
+    # Once committed it is tracked and clean => not untracked.
+    gitops.commit_all(
+        fixture_repo, "P1: add note\n\nbody", identity=Identity("B", "b@g.local")
+    )
+    assert not gitops.path_is_untracked(fixture_repo, "note.md")
+
+    # Tracked + modified is still not "untracked" (it must trip the clean check).
+    untracked.write_text("edited\n")
+    assert not gitops.path_is_untracked(fixture_repo, "note.md")
+
+
 def test_commit_all_uses_identity(fixture_repo):
     (fixture_repo / "f.py").write_text("code")
     sha = gitops.commit_all(
