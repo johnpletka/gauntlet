@@ -29,7 +29,7 @@
 | [tests.3](steps/tests.3/) | shell | done | 212s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.3 | commit | done | 13s | 596in/1082out $0.0023 | committed 2e001bd838 |
 | [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 529s | 429517in/14324out $0.8636 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.4](steps/implement.4/transcript.md) | agent_task | parked | 184s | 25370in/12651out $2.1156 | agent signalled 'UPSTREAM CONFLICT' (FR-10.4 upstream conflict / halt); parked for a human instead of marking the step done (#32) |
+| [implement.4](steps/implement.4/transcript.md) | agent_task | failed | 5716s | 25370in/12651out $2.1156 | handler error: claude reported failure: exit code 1; stderr:  |
 
 ## Commits
 
