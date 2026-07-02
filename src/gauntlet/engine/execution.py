@@ -59,6 +59,13 @@ class StepResult:
     # when unreported). Both ``None`` for every non-usage-limit outcome.
     retry_after_s: int | None = None
     quota_reset_at: str | None = None
+    # Which cycle sub-step produced the preserved ``session_id`` on a usage-limit
+    # park (harness-efficiency FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``,
+    # ``"r2-triage"``. Carried onto the StepRecord by ``_finalize`` so a resume
+    # continues the preserved session only in the matching sub-step and never
+    # misroutes a fixer/triager session into the round-1 reviewer. ``None`` for
+    # every non-usage-limit outcome (current-state, like ``parked_reason``).
+    parked_substep: str | None = None
     # Failure-kind discriminator (current-state, like ``parked_reason``): set to a
     # ``manifest.FAILURE_KIND_*`` value ONLY when this step failed a re-runnable
     # PRECONDITION guard (no adapter invoked, no cost — e.g. the FR-9.3 round-1

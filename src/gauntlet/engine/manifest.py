@@ -176,6 +176,14 @@ class StepRecord(BaseModel):
     # of these is P3.
     retry_after_s: int | None = None
     quota_reset_at: str | None = None
+    # Which adversarial_cycle sub-step produced the preserved ``session_id`` on a
+    # usage-limit park (FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``. Current-state
+    # like ``parked_reason`` — set on a usage-limit park, cleared on any other
+    # finalization. The cycle resume continues the preserved session only when it
+    # re-reaches this exact sub-step, so a fixer/triager session is never
+    # misrouted into the round-1 reviewer. Additive/nullable: older manifests load
+    # unchanged.
+    parked_substep: str | None = None
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)

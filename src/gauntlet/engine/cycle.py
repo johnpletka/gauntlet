@@ -186,11 +186,26 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # the record still carries parked_reason=usage_limit (the orchestrator clears
     # it only when the step finalizes to a non-park state), so it uniquely marks
     # the resume; it is never a `--response` resume (a usage-limit park needs no
-    # decision). `resume_session` is fed to the FIRST sub-agent call of the
-    # re-driven round (the round-1 reviewer) so the CLI session continues instead
-    # of a full cold re-run (see `_resume_review`).
+    # decision).
+    #
+    # The preserved session belongs to WHICHEVER sub-step parked (recorded as
+    # `parked_substep`), not necessarily the reviewer. P1 re-drives the round from
+    # its start, so the only sub-step re-reached with its session still meaningful
+    # is the round-1 review; continuing that session there conserves budget (see
+    # `_resume_review`). A park in the fixer/triager/confirmer — or a round>1
+    # review — leaves a session that belongs to work being re-driven from the top:
+    # feeding it to the round-1 reviewer would splice one role's conversation into
+    # another (review F-001), so `resume_session` is withheld and the round re-runs
+    # sessionless. That preserved session is discarded (the round-loss deferral;
+    # P5's per-sub-step checkpoints will instead re-enter at the failing sub-step
+    # and continue it there).
     is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-    resume_session = ctx.record.session_id if is_quota_resume else None
+    resume_substep = ctx.record.parked_substep if is_quota_resume else None
+    resume_session = (
+        ctx.record.session_id
+        if is_quota_resume and resume_substep == "r1-review"
+        else None
+    )
     # A fixer that parked mid-edit left the worktree dirty; P1 re-enters the
     # cycle at the round's start, whose clean-handoff guard (FR-9.3) requires a
     # committed tree. Back up the preserved partial work (lossless) and reset to
@@ -244,6 +259,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     logger=review_logger,
                     structured_name="findings.json",
                     after_attempt=guard.check,
+                    substep=f"r{rnd}-review",
                 )
         except _ParkCycle as park:
             return _finish(park.result, usage, commits, artifact_writes, metrics)
@@ -356,6 +372,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             _run_sub(
                 ctx, fixer, fix_prompt, schema=None, usage=usage,
                 logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
+                substep=f"r{rnd}-fix",
             )
         except _ParkCycle as park:
             return _finish(park.result, usage, commits, artifact_writes, metrics)
@@ -391,6 +408,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 schema=confirm_schema, usage=usage,
                 logger=step_logger(ctx, f"r{rnd}-confirm"),
                 structured_name="confirm.json",
+                substep=f"r{rnd}-confirm",
             )
         except _ParkCycle as park:
             return _finish(park.result, usage, commits, artifact_writes, metrics)
@@ -475,6 +493,7 @@ def _run_sub(
     max_retries: int = 1,
     after_attempt: Any = None,
     session: str | None = None,
+    substep: str | None = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
@@ -493,6 +512,11 @@ def _run_sub(
     (FR-3.3). When set, a :class:`SessionNotFoundError` propagates unchanged so
     the caller can fall back to a full, sessionless re-drive; it is never
     swallowed here.
+
+    ``substep`` labels this call (e.g. ``"r1-review"``, ``"r2-fix"``); on a
+    usage-limit park it is stamped onto the park result so resume knows which
+    sub-step owns the preserved session and continues it there rather than
+    misrouting it into the round-1 reviewer (FR-3.3).
     """
     from gauntlet.engine.steptypes import open_step_stream
 
@@ -554,6 +578,7 @@ def _run_sub(
                         status=PARKED,
                         parked_reason=M.PARKED_REASON_USAGE_LIMIT,
                         session_id=sess,
+                        parked_substep=substep,
                         retry_after_s=info.retry_after_s,
                         notes=(
                             f"usage-limit park (FR-3.2): {agent_name} sub-agent hit "
@@ -604,14 +629,14 @@ def _resume_review(
         return _run_sub(
             ctx, reviewer, _CONTINUATION_PROMPT, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
-            after_attempt=guard.check, session=session,
+            after_attempt=guard.check, session=session, substep="r1-review",
         )
     except SessionNotFoundError as exc:
         logger.log_text("session-expired.txt", str(exc))
         return _run_sub(
             ctx, reviewer, full_prompt, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
-            after_attempt=guard.check,
+            after_attempt=guard.check, substep="r1-review",
         )
 
 
@@ -952,6 +977,7 @@ def _triage(
         verdict = _run_sub(
             ctx, triager, prompt, schema=schema, usage=usage,
             logger=logger, structured_name="verdict.json",
+            substep=f"r{rnd}-triage",
         ).structured
         verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
         if needs_escalation(finding.get("severity", ""), verdict):
@@ -962,6 +988,7 @@ def _triage(
                 verdict = _run_sub(
                     ctx, escalation_agent, prompt, schema=schema, usage=usage,
                     logger=esc_logger, structured_name="verdict.json",
+                    substep=f"r{rnd}-triage",
                 ).structured
                 verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
                 verdict["escalated"] = True

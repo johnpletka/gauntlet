@@ -1210,6 +1210,8 @@ def test_plain_resume_redrives_parked_cycle(cycle_repo):
     orch, man = _build_cycle_orch(cycle_repo, adapters)
     assert orch.drive() == M.RUN_PARKED
     assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    # the round-1 reviewer owns the preserved session (F-001).
+    assert man.record("cycle").parked_substep == "r1-review"
     # plain resume: re-drive (no --response); the cycle re-runs round 1 and converges
     assert orch.drive() == M.RUN_DONE
     rec = man.record("cycle")
@@ -1225,6 +1227,34 @@ def test_plain_resume_redrives_parked_cycle(cycle_repo):
 
     assert reviewer.calls[-1]["prompt"] == _CONTINUATION_PROMPT
     assert "ARTIFACT-BODY-SENTINEL" not in reviewer.calls[-1]["prompt"]
+
+
+def test_triager_park_resume_redrives_reviewer_sessionless(cycle_repo):
+    # F-001: a triager usage-limit park preserves the TRIAGER's session, not the
+    # reviewer's. On a plain resume P1 re-drives the round from its start; the
+    # re-driven reviewer must run SESSIONLESS (a fresh review) and must never be
+    # handed the triager's session — splicing one role's conversation into another
+    # was the reported defect.
+    reviewer = SeqAdapter(REVIEW(F("F-001")), REVIEW())  # drive1 finds; resume converges
+    triage = SeqAdapter(_transient_exc(session="triage-sess"))  # parks on first call
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "triage-sess"
+    assert rec.parked_substep == "r1-triage"
+    # plain resume: the reviewer re-runs, converges to DONE.
+    assert orch.drive() == M.RUN_DONE
+    assert man.record("cycle").status == M.DONE
+    # the triager session is NOT continued in the reviewer: the re-review is a
+    # fresh, sessionless full review (carries the artifact body, not the short
+    # continuation prompt).
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    assert reviewer.calls[-1]["session"] is None
+    assert reviewer.calls[-1]["prompt"] != _CONTINUATION_PROMPT
+    assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[-1]["prompt"]
 
 
 def test_fixer_transient_after_dirtying_worktree_resumes_past_clean_handoff(cycle_repo):
@@ -1246,6 +1276,8 @@ def test_fixer_transient_after_dirtying_worktree_resumes_past_clean_handoff(cycl
     rec = man.record("cycle")
     assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
     assert rec.session_id == "builder-sess"
+    # the fixer's sub-step owns the preserved session, not the reviewer (F-001).
+    assert rec.parked_substep == "r1-fix"
     # park leaves the worktree untouched: the partial fixer edit survives.
     assert (cycle_repo / "partial.py").exists()
     # plain resume: the dirty tree is reset to the handoff (round-loss) so the
@@ -1255,8 +1287,12 @@ def test_fixer_transient_after_dirtying_worktree_resumes_past_clean_handoff(cycl
     # the discarded partial work is gone from the worktree (backed up to a ref).
     assert not (cycle_repo / "partial.py").exists()
     assert gitops.is_clean(cycle_repo, exclude=["runs"])
-    # the round-1 reviewer of the resume continued the preserved session.
-    assert reviewer.calls[-1]["session"] == "builder-sess"
+    # F-001: the builder session is NOT spliced into the round-1 reviewer. The
+    # fixer parked, so its session belongs to work re-driven from the round start;
+    # the re-driven reviewer runs SESSIONLESS (a fresh review), never continuing a
+    # different role's conversation. The parked_substep is cleared on the DONE.
+    assert reviewer.calls[-1]["session"] is None
+    assert man.record("cycle").parked_substep is None
 
 
 def test_cycle_resume_falls_back_to_full_review_when_session_expired(cycle_repo):

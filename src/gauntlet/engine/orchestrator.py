@@ -786,6 +786,11 @@ class Orchestrator:
         rec.quota_reset_at = result.quota_reset_at or self._quota_reset_at(
             result.retry_after_s
         )
+        # The parked sub-step is current-state alongside the usage-limit stamps
+        # (FR-3.3): set on a usage-limit cycle park so resume continues the
+        # preserved session in the matching sub-step, cleared on any other
+        # finalization so a step resumed to DONE never carries a stale value.
+        rec.parked_substep = result.parked_substep
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:
