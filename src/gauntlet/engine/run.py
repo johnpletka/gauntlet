@@ -17,13 +17,15 @@ import secrets
 import shutil
 import signal
 import socket
+import sys
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from gauntlet.engine import gitops, manifest as M, prd_stub
-from gauntlet.engine.config import RunConfig
+from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import run_bookkeeping_excludes
 from gauntlet.engine.identity import resolve_operator_identity
 from gauntlet.engine.judgeproc import (
@@ -232,6 +234,48 @@ _TERMINAL_RUN_STATES = frozenset({M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED})
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+
+# Poll cadence for the in-process auto-resume wait (FR-3.4): the wait re-checks
+# the wall clock at least this often so a host suspension during the wait shortens
+# it correctly (the heartbeat/wall clock jumped forward) instead of over-sleeping.
+_AUTO_RESUME_POLL_S = 60.0
+
+# Auto-resume decisions (return of :func:`next_auto_resume_action`).
+AUTO_RESUME_NONE = "none"
+AUTO_RESUME_WAIT = "wait"
+AUTO_RESUME_RESUME = "resume"
+AUTO_RESUME_EXHAUST = "exhaust"
+
+
+def next_auto_resume_action(
+    scheduled_resume: "M.ScheduledResume | None", now: datetime
+) -> tuple[str, float]:
+    """Decide the next auto-resume step for a scheduled usage-limit park (FR-3.4).
+
+    Pure so the reconciliation logic is unit-testable with a stubbed clock:
+
+    * ``none`` — nothing scheduled.
+    * ``exhaust`` — attempts hit the ceiling; fall back to a plain park.
+    * ``resume`` — the reset time has passed (or is unparseable → resume now);
+      the driver should perform the continuation resume.
+    * ``wait`` — the reset time is still ahead; the second element is the seconds
+      to wait (the caller re-checks after, staying suspend-aware).
+    """
+    if scheduled_resume is None:
+        return (AUTO_RESUME_NONE, 0.0)
+    if scheduled_resume.attempts >= scheduled_resume.max_attempts:
+        return (AUTO_RESUME_EXHAUST, 0.0)
+    try:
+        target = datetime.fromisoformat(scheduled_resume.attempt_at)
+    except (ValueError, TypeError):
+        return (AUTO_RESUME_RESUME, 0.0)  # unparseable → resume now (fail toward action)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    remaining = (target - now).total_seconds()
+    if remaining <= 0:
+        return (AUTO_RESUME_RESUME, 0.0)
+    return (AUTO_RESUME_WAIT, remaining)
 
 
 @dataclass
@@ -1089,18 +1133,48 @@ class RunManager:
                 pipeline=PipelineRef(name=pipeline.name, version=pipeline.version, hash=phash),
                 prompt_hashes=self._prompt_hashes(pipeline),
             )
-            return self._drive(
+            status = self._drive(
                 layout, run_dir, pipeline, man,
                 use_judge=use_judge, adapter_factory=adapter_factory,
                 extra_context=extra_context, clock=clock,
             )
         finally:
             self._release_worktree_lock(handle)
+        # Auto-resume runs OUTSIDE the lock (each attempt re-acquires it via
+        # `_resume_once`) so the wait between attempts holds no worktree lock —
+        # matching the reconciliation model (FR-3.4). A no-op unless the run
+        # parked on a usage limit under `resume_on_quota: auto`.
+        return self._auto_resume_if_scheduled(
+            slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
+            extra_context=extra_context, clock=clock,
+        )
 
     # ---- resume (FR-8.2) ----------------------------------------------------
     def resume(self, slug: str, *, response: str | None = None,
                use_judge: bool = True, adapter_factory=None,
-               extra_context: dict | None = None, clock=None) -> str:
+               extra_context: dict | None = None, clock=None,
+               auto_sleep=None) -> str:
+        """One resume, then in-process auto-resume of a usage-limit park (FR-3.4).
+
+        A manual resume always continues the session once immediately (the
+        "manual override resumes now" branch): that is ``_resume_once``. If the
+        run re-parks on the usage limit under ``resume_on_quota: auto``, the live
+        driver waits until the projected reset and resumes again, bounded by
+        ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
+        ``notify`` mode the wrapper is a no-op.
+        """
+        status = self._resume_once(
+            slug, response=response, use_judge=use_judge,
+            adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
+        )
+        return self._auto_resume_if_scheduled(
+            slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
+            extra_context=extra_context, clock=clock, sleep=auto_sleep,
+        )
+
+    def _resume_once(self, slug: str, *, response: str | None = None,
+                     use_judge: bool = True, adapter_factory=None,
+                     extra_context: dict | None = None, clock=None) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
@@ -1166,6 +1240,82 @@ class RunManager:
             )
         finally:
             self._release_worktree_lock(handle)
+
+    def _auto_resume_if_scheduled(
+        self, slug: str, status: str, *, use_judge: bool, adapter_factory,
+        extra_context: dict | None, clock, sleep=None,
+    ) -> str:
+        """Drive the in-process auto-resume wait loop for a usage-limit park (FR-3.4).
+
+        A no-op unless ``resume_on_quota: auto``. Reads the parked step's
+        ``scheduled_resume`` (armed by the orchestrator at park time), and on each
+        pass either waits for the projected reset (suspend-aware: sleeps in bounded
+        polls and re-checks the wall clock), performs one continuation resume
+        (incrementing ``attempts`` write-ahead so a crash never re-tries for free),
+        or — at the attempt ceiling — falls back to a plain park with an exhaustion
+        note. Restart-safe: it re-reads the persisted schedule from disk every
+        pass, so a driver restart before/after the reset reconciles identically.
+        """
+        if self.config.resume_on_quota != RESUME_ON_QUOTA_AUTO:
+            return status
+        _sleep = sleep or time.sleep
+        layout = self.layout(slug)
+        while True:
+            try:
+                run_dir = layout.active_run_dir()
+                man = Manifest.load(run_dir / "manifest.json")
+            except (FileNotFoundError, OSError, ValueError):
+                return status
+            if man.status != M.RUN_PARKED:
+                return status
+            step = next(
+                (
+                    s for s in man.steps
+                    if s.status == M.PARKED
+                    and s.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+                    and s.scheduled_resume is not None
+                ),
+                None,
+            )
+            if step is None:
+                return status
+            now = self._auto_resume_now(clock)
+            action, wait_s = next_auto_resume_action(step.scheduled_resume, now)
+            if action == AUTO_RESUME_NONE:
+                return status
+            if action == AUTO_RESUME_EXHAUST:
+                step.scheduled_resume = None
+                note = (
+                    f"auto-resume exhausted after {self.config.max_auto_resume_attempts} "
+                    "attempts (FR-3.4); left as a plain usage_limit park — resume "
+                    "manually once the window clears, or abort"
+                )
+                step.notes = f"{step.notes}\n{note}" if step.notes else note
+                man.write_atomic(run_dir / "manifest.json")
+                return status
+            if action == AUTO_RESUME_WAIT:
+                _sleep(min(wait_s, _AUTO_RESUME_POLL_S))
+                continue
+            # AUTO_RESUME_RESUME: count the attempt write-ahead, then continue.
+            step.scheduled_resume.attempts += 1
+            man.write_atomic(run_dir / "manifest.json")
+            status = self._resume_once(
+                slug, response=None, use_judge=use_judge,
+                adapter_factory=adapter_factory, extra_context=extra_context,
+                clock=clock,
+            )
+
+    @staticmethod
+    def _auto_resume_now(clock) -> datetime:
+        """The wall-clock 'now' for auto-resume timing, consistent with the clock
+        the schedule's ``attempt_at`` was derived from (the orchestrator clock)."""
+        if clock is not None:
+            try:
+                dt = datetime.fromisoformat(clock())
+                return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                pass
+        return datetime.now(timezone.utc)
 
     def _plan_response_action(
         self, man: Manifest, response: str | None, pipeline=None
@@ -2351,19 +2501,55 @@ class RunManager:
 
     def _drive(self, layout, run_dir, pipeline, man, *, use_judge, adapter_factory,
                extra_context, clock, response_action=None) -> str:
-        if not use_judge:
-            orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
-                                      adapter_factory=adapter_factory,
-                                      extra_context=extra_context, clock=clock,
-                                      response_action=response_action)
-            status = orch.drive()
-        else:
-            status = self._with_judge(man, run_dir, lambda env: self._orchestrator(
-                layout, run_dir, pipeline, man, judge_env=env,
-                adapter_factory=adapter_factory, extra_context=extra_context,
-                clock=clock, response_action=response_action).drive())
+        # Suspend/sleep resilience (FR-5): a heartbeat writer runs for the life of
+        # the drive so a host sleep is detectable + creditable (via the process-
+        # global registry adapters/process.py polls), and — opt-in — `caffeinate`
+        # keeps the host awake. Both are no-ops off their preconditions, so a run
+        # with the defaults behaves exactly as before.
+        from gauntlet.engine.heartbeat import HeartbeatWriter, KeepAwake
+
+        if self.config.keep_awake and sys.platform != "darwin":
+            warnings.warn(
+                "keep_awake: true is ignored on this non-darwin platform "
+                f"({sys.platform}); `caffeinate` is a macOS tool (FR-5.4).",
+                stacklevel=2,
+            )
+        writer = HeartbeatWriter(
+            run_dir,
+            interval_s=self.config.heartbeat_interval_s,
+            credit_cap_s=self.config.suspend_credit_cap_s,
+        )
+        with KeepAwake(enabled=self.config.keep_awake), writer:
+            try:
+                if not use_judge:
+                    orch = self._orchestrator(
+                        layout, run_dir, pipeline, man, judge_env={},
+                        adapter_factory=adapter_factory,
+                        extra_context=extra_context, clock=clock,
+                        response_action=response_action)
+                    status = orch.drive()
+                else:
+                    status = self._with_judge(man, run_dir, lambda env: self._orchestrator(
+                        layout, run_dir, pipeline, man, judge_env=env,
+                        adapter_factory=adapter_factory, extra_context=extra_context,
+                        clock=clock, response_action=response_action).drive())
+            finally:
+                # Fold any detected suspension intervals into the manifest (the
+                # orchestrator is the sole in-drive manifest writer, so this drains
+                # only after driving stops — no concurrent write). Best-effort.
+                self._drain_suspensions(writer, man, run_dir)
         self._maybe_draft_pr(layout, run_dir, man, status)
         return status
+
+    def _drain_suspensions(self, writer, man: Manifest, run_dir: Path) -> None:
+        """Append heartbeat-detected suspension intervals to the manifest (FR-5.1)."""
+        intervals = writer.drain_suspensions()
+        if not intervals:
+            return
+        man.suspensions.extend(
+            M.Suspension(start=s.start, end=s.end, gap_s=s.gap_s) for s in intervals
+        )
+        man.write_atomic(run_dir / "manifest.json")
 
     def _maybe_draft_pr(self, layout, run_dir, man, status: str) -> None:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.

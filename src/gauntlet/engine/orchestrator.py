@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
 from gauntlet.engine import gitops, manifest as M
-from gauntlet.engine.config import RunConfig
+from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
     FAILED,
@@ -479,9 +479,10 @@ class Orchestrator:
             except AgentTimeoutError as exc:
                 result = StepResult(
                     status=HALTED,
+                    halt_reason=M.HALT_REASON_TIMEOUT,
                     usage=exc.partial.usage if exc.partial else None,
                     session_id=exc.partial.session_id if exc.partial else None,
-                    notes=f"timeout halt (FR-3.3): {exc}",
+                    notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
                 )
             except AgentFailedError as exc:
                 # FR-3.2: a TRANSIENT failure (usage limit / overload) is not a
@@ -772,6 +773,11 @@ class Orchestrator:
         # CONFLICT, and None for every other outcome — so a conflict park later
         # resumed to done/failed/non-conflict-park clears the stale value here.
         rec.parked_reason = result.parked_reason
+        # Terminal halt reason is CURRENT-STATE and DISJOINT from parked_reason
+        # (FR-7.2): copy the just-finished execution's value (only ``timeout`` in
+        # P2), so a step later resumed to DONE/PARKED never carries a stale halt
+        # reason and the two reason fields are never both set on one record.
+        rec.halt_reason = result.halt_reason
         # Failure kind is CURRENT-STATE too (FR-9.3 recovery): copy the just-
         # finished execution's value so a precondition failure is re-runnable on
         # resume, and any later non-precondition finalization clears a stale value.
@@ -791,6 +797,28 @@ class Orchestrator:
         # preserved session in the matching sub-step, cleared on any other
         # finalization so a step resumed to DONE never carries a stale value.
         rec.parked_substep = result.parked_substep
+        # Auto-resume schedule (FR-3.4) is current-state and armed at park time so
+        # a usage-limit park under `resume_on_quota: auto` carries its schedule the
+        # instant `_drive` returns (before any wait), and a process death loses
+        # nothing. Preserve the prior attempts count across re-parks (the
+        # RunManager increments it around each in-process resume). Cleared on any
+        # non-usage-limit-park finalization so a step resumed to DONE never carries
+        # a stale schedule. `notify` mode never arms one.
+        if (
+            result.status == PARKED
+            and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+            and self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
+        ):
+            prior_attempts = (
+                rec.scheduled_resume.attempts if rec.scheduled_resume else 0
+            )
+            rec.scheduled_resume = M.ScheduledResume(
+                attempt_at=rec.quota_reset_at or self.clock(),
+                attempts=prior_attempts,
+                max_attempts=self.config.max_auto_resume_attempts,
+            )
+        else:
+            rec.scheduled_resume = None
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:

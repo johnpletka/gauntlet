@@ -35,6 +35,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from datetime import datetime, timezone
+
+from gauntlet.engine import heartbeat as HB
 from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.run import (
@@ -769,6 +772,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "failure",
     "reconciliation",
     "current_step_freshness",
+    "suspension",
     "steps",
     "next_actions"
   ],
@@ -912,6 +916,37 @@ _STATUS_SCHEMA_JSON = r'''{
         "last_event_age_s": {
           "type": "number",
           "description": "Age in seconds of the newest streamed event (now - mtime of the current step's events.jsonl). Always a number when the object is present."
+        }
+      }
+    },
+    "suspension": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
+      "properties": {
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["host_suspended", "driver_orphaned", "agent_silent", null],
+          "description": "The stalled-run classification: host_suspended (a detected sleep gap on a live driver), driver_orphaned (heartbeat stale, driver process dead), agent_silent (live driver, no agent output / a live-but-stale heartbeat with no clock evidence — fail closed to hung, never sleep), or null (healthy / not applicable)."
+        },
+        "last_heartbeat_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "intervals": {
+          "type": "array",
+          "description": "Detected host-suspension intervals (manifest.suspensions), in detection order.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "gap_s"],
+            "properties": {
+              "start": {"type": "string", "description": "Wallclock of the heartbeat before the gap."},
+              "end": {"type": "string", "description": "Wallclock of the heartbeat after the gap."},
+              "gap_s": {"type": "integer", "description": "Wallclock width of the suspension in seconds."}
+            }
+          }
         }
       }
     },
@@ -1092,6 +1127,7 @@ def status_payload(
     run_root: Path,
     run_instance_dir: Path,
     current_step_freshness: float | None = None,
+    suspension: dict | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -1160,6 +1196,10 @@ def status_payload(
             if current_step_freshness is not None
             else None
         ),
+        # Suspend/sleep view (FR-5.3): heartbeat age, detected intervals, and the
+        # stall classification. Always present; null only when there is neither a
+        # heartbeat nor any recorded interval (nothing to report).
+        "suspension": suspension,
         "steps": [
             {
                 "id": rec.id,
@@ -1273,6 +1313,97 @@ def compute_current_step_freshness(
     if now is None:
         now = time.time()
     return max(0.0, now - st.st_mtime)
+
+
+# --- suspend/sleep view (harness-efficiency FR-5.3) --------------------------
+def _agent_output_age_s(
+    man: Manifest, run_instance_dir: Path, now: datetime
+) -> float | None:
+    """Age (s) since the current running step's adapter child last wrote output.
+
+    Best-effort and advisory (the ``agent_silent`` signal for
+    :func:`compute_suspension_view`): the ``now − mtime`` of the running step's
+    ``events.jsonl``, regardless of streaming. Any resolution/stat failure (no
+    running step, absent file, corrupt id) is ``None`` — never an exception, so
+    the classification simply omits the agent-silence input rather than failing.
+    """
+    if man.status != M.RUN_RUNNING:
+        return None
+    rec = select_default_step(man)
+    if rec is None:
+        return None
+    try:
+        safe_run_segment(render_step_id(rec), kind="step id")
+        events_path = resolve_transcript_dir(run_instance_dir, rec) / _EVENTS_NAME
+        st = events_path.stat()
+    except (UnsafeRunSegment, StatusContractError, OSError, ValueError):
+        return None
+    return max(0.0, now.timestamp() - st.st_mtime)
+
+
+def compute_suspension_view(
+    man: Manifest,
+    run_instance_dir: Path,
+    liveness: str,
+    *,
+    now: datetime | None = None,
+    agent_silence_s: float = HB.DEFAULT_AGENT_SILENCE_S,
+    interval_s: float = HB.DEFAULT_HEARTBEAT_INTERVAL_S,
+    threshold_s: float = HB.SUSPEND_THRESHOLD_S,
+) -> dict | None:
+    """The §6 ``suspension`` block for ``status --json`` (FR-5.3).
+
+    Surfaces the driver heartbeat age, the detected suspension intervals
+    (``manifest.suspensions``), and the fail-closed stall classification
+    (``host_suspended`` / ``driver_orphaned`` / ``agent_silent`` / null). All
+    inputs are sampled from disk here (the I/O point) and fed to the pure
+    :func:`heartbeat.classify_stall`, so the serializer stays pure. Returns
+    ``None`` (→ ``suspension: null``) only when there is neither a heartbeat nor
+    any recorded interval — nothing to say.
+
+    Classification inputs:
+
+    * ``pid_alive`` — the driver is proven alive only when liveness is ``alive``;
+      an ``orphaned`` (proven-dead/reused) driver with a stale heartbeat is the
+      ``driver_orphaned`` shape. ``indeterminate``/``none`` never assert
+      ``host_suspended`` (fail closed) and never credit.
+    * the *current* skew pair — the latest recorded interval counts as the pair
+      straddling the current heartbeat gap only when its ``end`` equals the live
+      heartbeat's wallclock (i.e. the driver detected the suspend on its most
+      recent write). Once the driver writes a later, non-suspend heartbeat the
+      match lapses and the run reads as working again, not perpetually suspended.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    hb = HB.HeartbeatSample.read(run_instance_dir / HB.HEARTBEAT_FILENAME)
+    hb_age_s: float | None = None
+    if hb is not None:
+        hb_wall = HB.parse_wallclock(hb.wallclock_utc)
+        if hb_wall is not None:
+            hb_age_s = max(0.0, (now - hb_wall).total_seconds())
+    intervals = list(man.suspensions)
+    if hb is None and not intervals:
+        return None
+
+    last = intervals[-1] if intervals else None
+    is_current_pair = (
+        last is not None and hb is not None and last.end == hb.wallclock_utc
+    )
+    classification = HB.classify_stall(
+        pid_alive=(liveness == LIVENESS_ALIVE),
+        pair_gap_s=(last.gap_s if is_current_pair else None),
+        clock_skew=is_current_pair,
+        hb_age_s=hb_age_s,
+        agent_output_age_s=_agent_output_age_s(man, run_instance_dir, now),
+        interval_s=interval_s,
+        threshold_s=threshold_s,
+        agent_silence_s=agent_silence_s,
+    )
+    return {
+        "classification": classification,
+        "last_heartbeat_age_s": hb_age_s,
+        "intervals": [s.model_dump() for s in intervals],
+    }
 
 
 class LogsError(RuntimeError):

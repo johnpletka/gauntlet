@@ -636,6 +636,17 @@ def status(
             streaming=bool(getattr(mgr.config, "stream_step_output", False)),
         )
 
+        # Suspend/sleep view (FR-5.3): heartbeat age, detected intervals, and the
+        # stall classification, sampled from disk here and threaded into the pure
+        # renderers so the JSON contract and human footer report the same value.
+        suspension = operator.compute_suspension_view(
+            man, run_instance_dir, driver.state,
+            agent_silence_s=getattr(mgr.config, "agent_silence_s",
+                                    operator.HB.DEFAULT_AGENT_SILENCE_S),
+            interval_s=getattr(mgr.config, "heartbeat_interval_s",
+                               operator.HB.DEFAULT_HEARTBEAT_INTERVAL_S),
+        )
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -644,6 +655,7 @@ def status(
                 man, driver, rstate, recon,
                 run_root=run_root, run_instance_dir=run_instance_dir,
                 current_step_freshness=freshness,
+                suspension=suspension,
             )
             typer.echo(json.dumps(payload, indent=2))
             return

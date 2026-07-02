@@ -43,6 +43,14 @@ _READ_CHUNK = 65536
 # grandchild holding a pipe open can never hang teardown.
 _FINAL_DRAIN_S = 5.0
 
+# Poll cadence for the suspend-aware deadline path (FR-5.2). When a heartbeat is
+# active the deadline can be credited *upward* mid-run (a detected host suspend),
+# so neither path may commit to a single fixed wall-clock wait: both re-evaluate
+# ``deadline.remaining_s()`` at least this often. Off the deadline path (no active
+# heartbeat) this constant is unused and behavior is byte-for-byte the historical
+# single-``communicate()`` / uncapped-``select`` path.
+_DEADLINE_POLL_S = 5.0
+
 # Grace granted to reap a child whose pipes have already hit EOF when the
 # wall-clock budget is exhausted. Pipe EOF is strong evidence the child is
 # exiting, but EOF and reaping can be separated by scheduler latency; without a
@@ -100,9 +108,19 @@ def run_with_timeout(
     timeout+kill semantics in a ``selectors`` loop. When ``sink`` is ``None``
     the historical buffered ``communicate()`` path runs unchanged.
     """
+    # A suspend-aware deadline is used only while a driver heartbeat is active
+    # (FR-5.2): it credits detected host-suspension back to the wait, bounded by
+    # the configured cap. Outside a driven run (tests, one-shot CLI, disabled
+    # heartbeat) this is ``None`` and both paths keep their exact historical
+    # timing. Imported lazily so the low-level adapter layer never hard-depends on
+    # the engine package at import time.
+    from gauntlet.engine.heartbeat import build_active_deadline
+
+    deadline = build_active_deadline(timeout_s)
     if sink is None:
         return _run_buffered(
-            argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env
+            argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
+            deadline=deadline,
         )
     return _run_streaming(
         argv,
@@ -111,6 +129,7 @@ def run_with_timeout(
         cwd=cwd,
         env=env,
         sink=sink,
+        deadline=deadline,
     )
 
 
@@ -121,8 +140,16 @@ def _run_buffered(
     stdin_text: str | None,
     cwd: Path | None,
     env: Mapping[str, str] | None,
+    deadline: "object | None" = None,
 ) -> ProcessOutput:
-    """The historical buffered path — one ``communicate()``, unchanged."""
+    """The buffered path — one ``communicate()`` (or a polled one under a deadline).
+
+    With ``deadline is None`` this is byte-for-byte the historical path: a single
+    ``communicate(timeout=timeout_s)`` with the same kill/drain on expiry. With a
+    suspend-aware ``deadline`` it polls ``communicate`` so the wait can absorb a
+    mid-run host suspension (the deadline credits it, FR-5.2) — retrying
+    ``communicate`` after a ``TimeoutExpired`` does not lose output.
+    """
     start = time.monotonic()
     proc = subprocess.Popen(
         list(argv),
@@ -134,14 +161,19 @@ def _run_buffered(
         text=True,
         start_new_session=True,  # own process group, so killpg reaps children
     )
-    try:
-        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        # Second communicate() collects whatever the pipes still hold.
-        stdout, stderr = proc.communicate()
-        timed_out = True
+    if deadline is None:
+        try:
+            stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            # Second communicate() collects whatever the pipes still hold.
+            stdout, stderr = proc.communicate()
+            timed_out = True
+    else:
+        stdout, stderr, timed_out = _communicate_with_deadline(
+            proc, stdin_text, deadline
+        )
     return ProcessOutput(
         argv=list(argv),
         stdout=stdout or "",
@@ -152,6 +184,47 @@ def _run_buffered(
     )
 
 
+def _communicate_with_deadline(
+    proc: subprocess.Popen, stdin_text: str | None, deadline
+) -> tuple[str, str, bool]:
+    """Poll ``communicate`` until the child exits or the credited deadline lapses.
+
+    ``deadline.remaining_s()`` is re-read each poll so a host suspension detected
+    mid-wait (credited upward, FR-5.2) extends the wait instead of killing a
+    healthy child. On genuine expiry the process group is killed and the pipes
+    drained, mirroring the single-shot path's kill/drain contract. Input is fed
+    only on the first ``communicate`` call (subprocess requires this); retries
+    pass ``None`` and continue reading without re-writing stdin.
+    """
+    first = True
+    while True:
+        remaining = deadline.remaining_s()
+        poll = max(0.0, min(remaining, _DEADLINE_POLL_S))
+        try:
+            stdout, stderr = proc.communicate(
+                input=stdin_text if first else None, timeout=poll
+            )
+            return stdout or "", stderr or "", False
+        except subprocess.TimeoutExpired:
+            first = False
+            if deadline.expired():
+                _kill_process_group(proc)
+                stdout, stderr = proc.communicate()
+                return stdout or "", stderr or "", True
+
+
+def _stream_remaining(deadline, timeout_s: float, start: float) -> float:
+    """Remaining wall-clock budget for the streaming loop.
+
+    Delegates to a suspend-aware ``deadline`` when one is active (FR-5.2), else
+    the historical monotonic computation. Identical to the old expression when
+    ``deadline is None``, so the non-driven path is unchanged.
+    """
+    if deadline is not None:
+        return deadline.remaining_s()
+    return timeout_s - (time.monotonic() - start)
+
+
 def _run_streaming(
     argv: Sequence[str],
     *,
@@ -160,6 +233,7 @@ def _run_streaming(
     cwd: Path | None,
     env: Mapping[str, str] | None,
     sink: Callable[[str], None],
+    deadline: "object | None" = None,
 ) -> ProcessOutput:
     """Incremental, deadlock-safe reader that frames stdout on ``\\n``.
 
@@ -292,11 +366,16 @@ def _run_streaming(
     pending_exc: BaseException | None = None
     try:
         while open_tags:
-            remaining = timeout_s - (time.monotonic() - start)
+            remaining = _stream_remaining(deadline, timeout_s, start)
             if remaining <= 0:
                 timed_out = True
                 break
-            for key, _mask in sel.select(timeout=remaining):
+            # Under a suspend-aware deadline the budget can be credited upward
+            # mid-wait, so never block longer than the poll cadence without
+            # re-evaluating it; off the deadline path the select waits the full
+            # remaining as before.
+            sel_timeout = remaining if deadline is None else min(remaining, _DEADLINE_POLL_S)
+            for key, _mask in sel.select(timeout=sel_timeout):
                 if key.data == "stdin":
                     _feed_stdin()
                 else:
@@ -308,7 +387,7 @@ def _run_streaming(
         # to the same killpg/drain/reap teardown as the in-loop timeout instead
         # of blocking forever on the final ``proc.wait()``.
         if not timed_out:
-            remaining = timeout_s - (time.monotonic() - start)
+            remaining = _stream_remaining(deadline, timeout_s, start)
             # Both pipes are at EOF, so the child has closed fd 1 and fd 2 and is
             # almost certainly exiting. ``proc.wait(timeout=0.0)`` does NOT sleep —
             # it polls once and raises ``TimeoutExpired`` if the child has not yet

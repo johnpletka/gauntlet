@@ -18,6 +18,7 @@
     "failure",
     "reconciliation",
     "current_step_freshness",
+    "suspension",
     "steps",
     "next_actions"
   ],
@@ -161,6 +162,37 @@
         "last_event_age_s": {
           "type": "number",
           "description": "Age in seconds of the newest streamed event (now - mtime of the current step's events.jsonl). Always a number when the object is present."
+        }
+      }
+    },
+    "suspension": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
+      "properties": {
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["host_suspended", "driver_orphaned", "agent_silent", null],
+          "description": "The stalled-run classification: host_suspended (a detected sleep gap on a live driver), driver_orphaned (heartbeat stale, driver process dead), agent_silent (live driver, no agent output / a live-but-stale heartbeat with no clock evidence — fail closed to hung, never sleep), or null (healthy / not applicable)."
+        },
+        "last_heartbeat_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "intervals": {
+          "type": "array",
+          "description": "Detected host-suspension intervals (manifest.suspensions), in detection order.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "gap_s"],
+            "properties": {
+              "start": {"type": "string", "description": "Wallclock of the heartbeat before the gap."},
+              "end": {"type": "string", "description": "Wallclock of the heartbeat after the gap."},
+              "gap_s": {"type": "integer", "description": "Wallclock width of the suspension in seconds."}
+            }
+          }
         }
       }
     },

@@ -52,6 +52,12 @@ class StepResult:
     # park on a *different* ``halt_on`` marker, a human_gate, or a budget halt).
     # ``_finalize`` copies this onto the record so the field stays current-state.
     parked_reason: str | None = None
+    # Terminal halt discriminator (harness-efficiency FR-7.2), DISJOINT from
+    # ``parked_reason``. P2 sets only ``manifest.HALT_REASON_TIMEOUT`` on the
+    # suspend-cap timeout halt (FR-5.2); P3 completes the enum. ``_finalize``
+    # copies it onto the record so it stays current-state. ``None`` for every
+    # non-terminal or non-timeout outcome.
+    halt_reason: str | None = None
     # Usage-limit park stamps (harness-efficiency FR-3.2), carried onto the
     # StepRecord by ``_finalize`` when a transient failure parks the step.
     # ``retry_after_s`` is the provider's structured retry hint (``None`` when

@@ -201,6 +201,8 @@ def test_section_6_2_example_validates():
         "failure": None,
         "reconciliation": None,
         "current_step_freshness": None,
+        # Additive FR-5.3 field: always present, null when nothing to report.
+        "suspension": None,
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done"},
             {"id": "impl-cycle", "iteration": 0, "status": "parked"},

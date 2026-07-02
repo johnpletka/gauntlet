@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
 from gauntlet.engine.gitops import Identity
+from gauntlet.engine.heartbeat import (
+    DEFAULT_AGENT_SILENCE_S,
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_SUSPEND_CREDIT_CAP_S,
+)
 from gauntlet.logging.redact import RedactionSettings
+
+# Auto-resume modes (FR-3.4). ``notify`` (default) parks + notifies with the
+# reset time and never self-resumes; ``auto`` arms an in-process wait that
+# performs the FR-3.3 continuation resume when the quota window replenishes.
+RESUME_ON_QUOTA_NOTIFY = "notify"
+RESUME_ON_QUOTA_AUTO = "auto"
+_RESUME_ON_QUOTA_MODES = frozenset({RESUME_ON_QUOTA_NOTIFY, RESUME_ON_QUOTA_AUTO})
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
@@ -255,6 +268,34 @@ class RunConfig(BaseModel):
     # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
 
+    # --- suspend/sleep resilience (harness-efficiency FR-5) ------------------
+    # The driver's heartbeat cadence (FR-5.1). Detection threshold is a fixed 2×
+    # this in engine/heartbeat.py, so lengthening the cadence loosens detection.
+    heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
+    # Max detected host-suspension credited back to a step deadline (FR-5.2);
+    # past it the step halts with halt_reason=timeout. Default 12h.
+    suspend_credit_cap_s: float = DEFAULT_SUSPEND_CREDIT_CAP_S
+    # `agent_silent` threshold (FR-5.3): a healthy driver whose adapter child has
+    # produced no output for longer than this is classified hung, not asleep.
+    agent_silence_s: float = DEFAULT_AGENT_SILENCE_S
+    # Keep the host awake for the driver's lifetime via `caffeinate -i` on darwin
+    # (FR-5.4). Default false — changing host power behavior is an explicit human
+    # choice (CLAUDE.md machine-state rule). Ignored (with a warning) off darwin.
+    keep_awake: bool = False
+
+    # --- usage-limit auto-resume (harness-efficiency FR-3.4) -----------------
+    # `notify` (default): park on a usage limit + notify with the reset time; the
+    # operator resumes. `auto`: the live driver waits until the projected reset
+    # and performs the FR-3.3 continuation resume itself. `auto` needs the driver
+    # to survive the wait — `keep_awake: true` or an external scheduler
+    # (`external_scheduler: true` declares the operator re-invokes `gauntlet
+    # resume` via cron/launchd); enabling `auto` with neither is a load warning.
+    resume_on_quota: str = RESUME_ON_QUOTA_NOTIFY
+    external_scheduler: bool = False
+    # Spaced auto-resume attempts before falling back to a plain usage_limit park
+    # with an exhaustion note (FR-3.4) — a persistent limit is not a hot loop.
+    max_auto_resume_attempts: int = 3
+
     # Live run observability (live-run-observability PRD, FR-6.1): stream each
     # CLI agent's NDJSON stdout to events.jsonl incrementally as it arrives,
     # instead of one buffered write at step end. Default OFF for all of v1 — the
@@ -306,6 +347,42 @@ class RunConfig(BaseModel):
         value would let ``gauntlet serve`` browse files outside the repo (review
         F-001). Same repo-relative containment as asset_root."""
         return _validate_repo_relative("run_root", v)
+
+    @field_validator("resume_on_quota")
+    @classmethod
+    def _validate_resume_on_quota(cls, v: str) -> str:
+        """Only ``notify``/``auto`` are valid; anything else fails closed (FR-3.4)."""
+        name = (v or "").strip().lower()
+        if name not in _RESUME_ON_QUOTA_MODES:
+            raise ValueError(
+                f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
+                f"got {v!r}"
+            )
+        return name
+
+    @model_validator(mode="after")
+    def _warn_auto_resume_needs_survival(self) -> RunConfig:
+        """Warn when ``auto`` cannot keep the driver alive across the wait (FR-3.4).
+
+        ``auto`` performs an in-process wait, so the driver must survive it —
+        either via ``keep_awake: true`` (caffeinate) or a declared external
+        scheduler that re-invokes ``gauntlet resume``. With neither, ``auto`` will
+        still reconcile a due schedule on the next manual resume, but its
+        promise (self-resume without operator action) does not hold — surface
+        that at load rather than silently."""
+        if (
+            self.resume_on_quota == RESUME_ON_QUOTA_AUTO
+            and not self.keep_awake
+            and not self.external_scheduler
+        ):
+            warnings.warn(
+                "resume_on_quota: auto without keep_awake or an external "
+                "scheduler — the driver may not survive the quota wait, so "
+                "auto-resume falls back to reconciliation on the next manual "
+                "`gauntlet resume` (FR-3.4).",
+                stacklevel=2,
+            )
+        return self
 
     @model_validator(mode="after")
     def _redact_tracker_token(self) -> RunConfig:

@@ -56,6 +56,16 @@ RESPONSE_RESOLVABLE_PARK_REASONS = frozenset(
 # reviewer/triager so they re-evaluate the parked finding.
 RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle"})
 
+# --- halt reasons (terminal HALTED/FAILED/INTERRUPTED discriminator) ---------
+# The disjoint sibling of ``parked_reason`` (harness-efficiency FR-7.2): a
+# terminal step carries a ``halt_reason`` while ``parked_reason`` is null, and a
+# PARKED step the reverse — the two are never both set. P2 introduces the field
+# with the single value it needs — ``timeout`` — for the suspend-cap timeout
+# halt (FR-5.2); P3 completes the enum (budget/judge_deny/signal_kill/…) and the
+# full disjointness invariant. Current-state like ``parked_reason``: set on the
+# just-finished execution and cleared on any other finalization.
+HALT_REASON_TIMEOUT = "timeout"
+
 # --- failure kinds (current-state discriminator on a FAILED step) ------------
 # Most FAILED steps are TERMINAL: re-running them only re-invokes the adapter and
 # repeats the same failure (`_is_terminal_failure`). A PRECONDITION failure is the
@@ -142,6 +152,35 @@ class HumanResponse(BaseModel):
     state: Literal["pending", "consumed"]
 
 
+class ScheduledResume(BaseModel):
+    """An armed auto-resume schedule on a usage-limit park (FR-3.4).
+
+    Persisted on the parked step BEFORE the run parks, so a process death
+    between scheduling and ``attempt_at`` loses nothing — the next driver start
+    or ``gauntlet resume`` reconciles from disk. ``attempt_at`` is the absolute
+    UTC time to resume (``now + retry_after_s``, else the quota reset time);
+    ``attempts`` counts spaced attempts made; once ``attempts >= max_attempts``
+    the step re-parks plain (no schedule) with an exhaustion note.
+    """
+
+    attempt_at: str
+    attempts: int = 0
+    max_attempts: int = 3
+
+
+class Suspension(BaseModel):
+    """A detected host-suspension interval (FR-5.1), appended to the manifest.
+
+    ``gap_s`` is the wallclock width of the interval; ``start``/``end`` are the
+    straddling heartbeats' wallclock stamps. Additive/append-only — older
+    manifests load with an empty list.
+    """
+
+    start: str
+    end: str
+    gap_s: int
+
+
 class StepRecord(BaseModel):
     id: str
     type: str
@@ -159,6 +198,13 @@ class StepRecord(BaseModel):
     # execution halted on an UPSTREAM CONFLICT. A stale value therefore can never
     # cause a later generic park to be misclassified as a conflict park.
     parked_reason: str | None = None
+    # Terminal halt discriminator (harness-efficiency FR-7.2), DISJOINT from
+    # ``parked_reason``: a HALTED/FAILED/INTERRUPTED step carries ``halt_reason``
+    # with ``parked_reason=None``, and a PARKED step the reverse. P2 sets only
+    # ``timeout`` (the FR-5.2 suspend-cap halt); P3 completes the enum. Current-
+    # state: set on the just-finished execution, cleared on any finalization that
+    # does not re-set it. Additive/nullable — older manifests load unchanged.
+    halt_reason: str | None = None
     # Failure-kind discriminator on a FAILED step (current-state, like
     # ``parked_reason``): ``FAILURE_KIND_CLEAN_HANDOFF`` when this execution failed
     # a re-runnable PRECONDITION guard (no adapter invoked, no cost) rather than
@@ -184,6 +230,10 @@ class StepRecord(BaseModel):
     # misrouted into the round-1 reviewer. Additive/nullable: older manifests load
     # unchanged.
     parked_substep: str | None = None
+    # Armed auto-resume schedule on a usage-limit park (FR-3.4). Set only when
+    # ``resume_on_quota: auto`` parked this step; ``None`` otherwise and after a
+    # successful resume. Additive/nullable — older manifests load unchanged.
+    scheduled_resume: ScheduledResume | None = None
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)
@@ -351,6 +401,10 @@ class Manifest(BaseModel):
     # deliverable (review F-005).
     warnings: list[str] = Field(default_factory=list)
     steps: list[StepRecord] = Field(default_factory=list)
+    # Detected host-suspension intervals (FR-5.1), drained from the driver's
+    # heartbeat writer at safe points. Append-only; additive, so older manifests
+    # load with an empty list.
+    suspensions: list[Suspension] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
     totals: UsageTotals = Field(default_factory=UsageTotals)
     # Per-agent-profile usage (FR-3.2): `gauntlet report` needs the spend split
