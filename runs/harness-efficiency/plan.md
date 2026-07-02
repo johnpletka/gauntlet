@@ -18,7 +18,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 
 - **Fail closed.** Every new classifier, validator, or admission check defaults to halt/park on the unrecognized case. No new path silently continues.
 - **Additive schemas only.** `schemas/status.json` and manifest records gain fields; none are removed or renamed. `schema_version` stays `1` (FR-7.1).
-- **Two disjoint reason fields.** `parked_reason` (park enum) and `halt_reason` (terminal enum) are never both set. P1/P2 write only `parked_reason`; P3 introduces `halt_reason` and the disjointness invariant.
+- **Two disjoint reason fields.** `parked_reason` (park enum) and `halt_reason` (terminal enum) are never both set. P1 writes only `parked_reason`; **P2 introduces the `halt_reason` field with the single `timeout` value it needs** (the suspend-cap halt, FR-5.2) and never sets it alongside `parked_reason`; P3 completes the `halt_reason` enum and the disjointness invariant. No phase sets both fields on one record.
 - **Config is opt-in.** Every new knob defaults to today's behavior (`inline` context, `notify` auto-resume, `keep_awake: false`, advisory ledger, `keep` checkpoints). Shipped `standard.yaml` defaults flip only where the PRD says so, and effort *values* are explicitly out of scope (Q2).
 - **Pinned markers carry fixtures.** Any CLI-error or effort-flag fact is pinned beside `.gauntlet/pins.yaml` with a captured fixture and a contract test (BOOTSTRAP-NOTES #26).
 
@@ -82,7 +82,13 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 **Assumption validated:** the manifest already holds (or, after P1/P2, now holds) everything needed to explain any run state without opening a transcript — this phase is pure additive rendering.
 
 **Deliverables (FR-7.1–7.4):**
-- `engine/manifest.py`: complete the disjoint reason model. `halt_reason ∈ {timeout, budget, judge_deny, signal_kill, adapter_error, precondition, operator_recover}` on HALTED/FAILED/INTERRUPTED with `parked_reason=null`; `parked_reason ∈ {usage_limit, usage_window, artifact_invalid, response, gate}` on PARKED with `halt_reason=null`. (Reconcile the existing `upstream_conflict`/`cycle_escalation` values with the PRD's `response`/`gate` naming; keep back-compat by mapping, not renaming persisted values — surface any naming conflict as an UPSTREAM CONFLICT rather than amending the PRD.) The applicable enum is mandatory for every non-DONE terminal/parked step. On an `artifact_invalid` park (built in P4) the `revalidation` content-hash pair is recorded — P3 defines the field shape; P4 populates it.
+- `engine/manifest.py`: complete the disjoint reason model. `halt_reason ∈ {timeout, budget, judge_deny, signal_kill, adapter_error, precondition, operator_recover}` on HALTED/FAILED/INTERRUPTED with `parked_reason=null`; `parked_reason ∈ {usage_limit, usage_window, artifact_invalid, response, gate}` on PARKED with `halt_reason=null`. The applicable enum is mandatory for every non-DONE terminal/parked step. On an `artifact_invalid` park (built in P4) the `revalidation` content-hash pair is recorded — P3 defines the field shape; P4 populates it.
+- **Legacy parked-reason compatibility contract (normative — one rule, not a menu).** The engine today persists two current-state values absent from the PRD enum — `upstream_conflict` (a builder `agent_task` conflict park) and `cycle_escalation` (a reviewer/triager `adversarial_cycle` park) — and stamps `parked_reason=null` on a `human_gate` park; all three are human-decision-resolvable via `gauntlet resume --response`. P3 reconciles them to the PRD enum as follows:
+  1. **Writes stamp PRD enum values only.** New parks stamp `parked_reason=response` for both the builder-conflict and cycle-escalation cases and `parked_reason=gate` for a `human_gate` park. No record is newly written with a legacy value or a null parked-reason on a park.
+  2. **Reads normalize through a one-way mapper.** A pure `normalize_parked_reason` maps any legacy persisted value on load — `upstream_conflict → response`, `cycle_escalation → response`, and `null` on a `human_gate` record → `gate` — so the manifest validator, resume-response logic, and status rendering all operate on the PRD enum set. Legacy manifests on disk are read through the mapper, never rewritten in place.
+  3. **`status --json` and the schema never emit or accept legacy values.** The status `parked_reason` field and its schema enum are exactly the PRD set; legacy values enter only through the read-side mapper, never the output.
+  4. **Routing is preserved by step type, not the collapsed value.** The builder-conflict / cycle-escalation distinction the two legacy values carried is already recovered from the step *type* (`agent_task` vs `adversarial_cycle`) that drives the `--response` re-drive (`RESPONDABLE_STEP_TYPES`), so mapping both to `response` loses no resume-routing information; `RESPONSE_RESOLVABLE_PARK_REASONS` becomes `{response}` with the two legacy values accepted only on read.
+  5. **Any current-state value that cannot map 1:1 to a PRD enum is an UPSTREAM CONFLICT**, surfaced — never a silent amendment to the PRD enum.
 - The engine stamps `halt_reason` on every terminal path (timeout, budget, judge_deny, signal_kill, adapter_error, precondition); `gauntlet recover` stamps `operator_recover` with operator identity.
 - `schemas/status.json` + `engine/operator.py`: additive always-present, nullable fields — `current_step_elapsed_s`, `current_step_timeout_remaining_s`, `run_elapsed_s`, `totals` (UsageTotals incl. cost), `agent_usage` (per-profile), per-`steps[]` `duration_s`/`notes`/`halt_reason`/`parked_reason`, plus `quota {reset_at}` when parked `usage_limit` and `suspension {last_heartbeat_age_s, intervals[]}` (from P2). `additionalProperties: false` continues to validate against the *shipped* schema; `schema_version` stays 1.
 - Human `gauntlet status` footer renders elapsed, cost-so-far, and — when parked — reason + reset time (quota) or awaited decision + the next command.
@@ -92,6 +98,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 
 **Test strategy:**
 - Unit per terminal path → asserts stamped `halt_reason`; unit per park path (`usage_limit`, `usage_window` [shape only, wired P10], `artifact_invalid` [shape only, wired P4], `response`, `gate`) → asserts `parked_reason` + null `halt_reason`; `recover` → `operator_recover` + identity.
+- Unit (legacy compatibility): a fixture manifest carrying legacy `upstream_conflict` and one carrying `cycle_escalation` both normalize to `response` on read; a legacy `human_gate` record with `parked_reason=null` normalizes to `gate`; `status --json` emits only PRD enum values for all three; `resume --response` on each legacy fixture routes by step type exactly as its normalized-value equivalent does; the on-disk manifest bytes are unchanged (read-through mapper, not rewrite).
 - Schema test: all new fields present/nullable/never-omitted, `additionalProperties: false` validates against shipped schema; **regression test** validating new output against a captured *v0* schema copy with `additionalProperties: false` **fails** (documents the re-pin cost, FR-7.1).
 - Golden test: manifest fixture → status JSON.
 - Snapshot tests of the rendered footer per park/halt kind include the identifying line + next-action.
@@ -154,8 +161,8 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 **Deliverables (FR-1.1–1.3):**
 - `adapters/base.py`: add `reads_repo: bool` to `AdapterCapabilities`; claude-code/codex declare `true`, api declares `false`. A profile's *effective* capability is the adapter's value under that profile's actual sandbox (cwd/repo-root/path exposure), not the class alone.
 - `engine/steptypes.py` `_render_prompt`: per-input `mode: inline | reference | phase`. `inline` = today (default). `reference` = inject the artifact's repo-relative path + a one-line "read it" instruction. `phase` (plan.md only) = inject the current `foreach` phase's plan section + the full-document path.
-- **Load-time enforcement (fail closed):** pipeline load fails, naming step/input/profile, if a `reference`/`phase` input binds to a profile whose effective `reads_repo` is false; **and** if a `reference` input's repo-relative path does not resolve to a file under the repo root.
-- **Preflight enforcement:** compose with `doctor` (delivered in P7) — a one-file repo-read probe per reference-capable profile. *Note:* P6 ships the load-time checks (self-contained); the doctor read-probe rides on P7's doctor work to avoid P6 depending on P7. P6's acceptance tests (a)/(b) are load-time; (c) is asserted in P7.
+- **Load-time enforcement (fail closed):** pipeline load fails, naming step/input/profile/path, if a `reference`/`phase` input binds to a profile whose effective `reads_repo` is false; if a `reference` input's repo-relative path does not resolve to a file under the repo root; **and** if a `phase` input's referenced plan artifact does not resolve to an existing `plan.md` file under the repo root. Both `reference` and `phase` referenced-artifact paths are validated at load — no referenced path (reference or phase) escapes preflight to fail later inside a prompt.
+- **Preflight enforcement:** compose with `doctor` (delivered in P7) — a one-file repo-read probe per reference-capable profile. *Note:* P6 ships the load-time checks (self-contained); the doctor read-probe rides on P7's doctor work to avoid P6 depending on P7. P6's acceptance tests (a)/(b)/(c) are load-time; (d) is asserted in P7.
 - `engine/cycle.py`: artifact-mode cycles snapshot the artifact at each review handoff; rounds 2+ send the reviewer the unified diff (snapshot → current) + carried findings + artifact path, not full text.
 - `pipelines/standard.yaml`: the implement step opts into `prd.md: reference`, `plan.md: phase` (per PRD; this is the sanctioned default flip, guarded by the Q3 comparison run before it's considered validated).
 
@@ -164,7 +171,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 **Test strategy:**
 - Unit (FR-1.1): 3-phase run, 34KB PRD + 27KB plan → each implement `prompt.md` contains the phase excerpt + both paths and is ≤25% of the all-inline byte size.
 - Unit (FR-1.2): round-2 review prompt for a 40-line edit contains the diff + carried findings, **not** the full body; snapshot used is the round-1 version.
-- Unit (FR-1.3): (a) `reference`/`phase` input on an api-profile raises at load naming step/input/profile; (b) a `reference` path not under repo root raises a named path error at load. [(c) doctor read-probe → asserted in P7.]
+- Unit (FR-1.3): (a) `reference`/`phase` input on an api-profile raises at load naming step/input/profile; (b) a `reference` path not under repo root raises a named path error at load; (c) a `phase` input whose plan path is missing / is not a file / is not `plan.md` / does not resolve under the repo root raises a named path error at load. [(d) doctor read-probe → asserted in P7.]
 - Integration: a real implement phase completes normally with reference/phase context.
 
 **Exit criteria:** implement-step payload ≤40% of the all-inline baseline on a ≥3-phase run; load-time fail-closed checks green; the Q3 guardrail comparison is run on the next real run (defaults stay opt-in until it holds).
@@ -189,7 +196,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 - Unit per adapter: canonical value maps to and lands in the constructed command/params (incl. `minimal→low` claude warning); unsupported value raises at config load; profile+step compose with step winning.
 - Unit: mixed-severity low-confidence verdicts → exactly the blocking/major escalation calls; minor/nit in the gate payload flagged, zero escalation-profile invocations.
 - Config-inspection test: mechanical steps bound to the cheap profile, not builder; wiring test that the commit step invokes the cheap profile and the drafted message still passes the format validator. (Assertions independent of any effort *value*.)
-- Doctor test: a bad model alias in one profile → that profile FAIL, others PASS; a reference-capable profile whose sandbox can't read a repo file → FAIL on the read probe (satisfies FR-1.3(c)); unauthenticated CLI → WARN.
+- Doctor test: a bad model alias in one profile → that profile FAIL, others PASS; a reference-capable profile whose sandbox can't read a repo file → FAIL on the read probe (satisfies FR-1.3(d)); unauthenticated CLI → WARN.
 
 **Exit criteria:** plumbing/wiring tests green with no dependency on ratified default values; doctor catches a bad alias and a blind reference profile before any run step executes.
 
@@ -256,7 +263,9 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 - Unit: synthetic ledger + config → correct headroom + estimate; no-history → fallback.
 - Unit: advisory mode launches with a recorded warning; enforce mode parks pre-step with the projection in the step record + a `resume` next-action.
 
-**Exit criteria:** with `enforce: true`, ≥80% of usage-limit interruptions in the harness become pre-step `usage_window` parks rather than mid-step `usage_limit` parks; advisory default never blocks a launch.
+**Exit criteria (deterministic, verifiable at phase handoff):** ledger append + sliding-window query tests green; admission estimate tests green (median from history; configured fallback with no history); advisory mode records a warning and never blocks a launch; with `enforce: true` and a synthetic ledger + config that give insufficient headroom, the run parks pre-step with `parked_reason=usage_window` + projected replenishment before any adapter call, with a `resume` next-action present. No exit criterion depends on naturally occurring quota events or live provider-window behavior.
+
+**Post-merge success metric (live measurement, not a handoff gate):** with `enforce: true`, ≥80% of real usage-limit interruptions become pre-step `usage_window` parks rather than mid-step `usage_limit` parks — measured on live runs after merge, never asserted at phase handoff.
 
 **Deferrals:** ledger self-calibration from observed halt times (Q9), per-account keying (Q7) — both post-v1.
 
@@ -286,7 +295,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
 ## Sequencing notes
 
 - **No phase depends on a later phase (FR-10.3).** P1 parks using only `parked_reason` (existing field). P2 introduces the single `halt_reason=timeout` value it needs and the `scheduled_resume`/heartbeat records; P3 completes the `halt_reason` enum + disjointness and renders whatever P1/P2 stamped. P4 populates the `artifact_invalid` `revalidation` fields whose shape P3 defined. P5 checkpoints cycle sub-steps; P8 renders them + existing `metrics`; P11 refines P5's triage checkpoint to per-finding. P9–P11 are independent of each other.
-- **P6/P7 coupling handled without a cycle:** P6 ships the FR-1.3 *load-time* checks (self-contained); the FR-1.3 *doctor read-probe* rides on P7's doctor work (P6 acceptance (c) asserted in P7). P6 precedes P7, so nothing in P6 depends on P7 code — only the probe *test* lands in P7.
+- **P6/P7 coupling handled without a cycle:** P6 ships the FR-1.3 *load-time* checks (self-contained); the FR-1.3 *doctor read-probe* rides on P7's doctor work (P6 acceptance (d) asserted in P7). P6 precedes P7, so nothing in P6 depends on P7 code — only the probe *test* lands in P7.
 - **P9 placement** is by risk, not code dependency: its risk is behavioral (does the builder follow the commit discipline?), which P1's integration experience informs. It has no code dependency on P2–P8.
 - **Self-hosting:** per CLAUDE.md §"self-hosting switchover", from the point the pipeline engine supports it these phases run through `gauntlet run`; any forced fallback to manual execution is recorded in `BOOTSTRAP-NOTES.md`.
 
