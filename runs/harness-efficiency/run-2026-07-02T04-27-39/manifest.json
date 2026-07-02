@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-cycle",
+  "current_step": "plan-approve",
   "warnings": [],
   "steps": [
     {
@@ -168,11 +168,11 @@
     {
       "id": "plan-lint",
       "type": "phase_lint",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-02T13:37:46.802229+00:00",
-      "ended": null,
+      "ended": "2026-07-02T17:03:32.375368+00:00",
       "attempts": 0,
       "base_sha": null,
       "parked_reason": null,
@@ -191,11 +191,11 @@
     {
       "id": "plan-approve",
       "type": "human_gate",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-02T13:45:52.227335+00:00",
-      "ended": null,
+      "ended": "2026-07-02T19:30:37.972336+00:00",
       "attempts": 0,
       "base_sha": null,
       "parked_reason": null,
@@ -207,7 +207,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
-      "notes": "awaiting human decision; review: plan.md, findings.json, triage.json, confirm.json",
+      "notes": "approved",
       "iteration": null,
       "metrics": {}
     }
@@ -240,10 +240,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 842067,
-    "output_tokens": 147987,
+    "input_tokens": 849859,
+    "output_tokens": 149454,
     "cached_input_tokens": 8020896,
-    "cost_usd": 10.210823399999999
+    "cost_usd": 10.2157054
   },
   "agent_usage": {
     "reviewer": {
@@ -271,10 +271,10 @@
       "cost_usd": 10.115502999999999
     },
     "judge_llm": {
-      "input_tokens": 52721,
-      "output_tokens": 9561,
+      "input_tokens": 60513,
+      "output_tokens": 11028,
       "cached_input_tokens": 0,
-      "cost_usd": 0.03230225
+      "cost_usd": 0.037184249999999995
     }
   },
   "recoveries": [],
