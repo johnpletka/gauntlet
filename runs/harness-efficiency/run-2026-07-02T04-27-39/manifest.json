@@ -126,6 +126,14 @@
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
           "state": "consumed"
+        },
+        {
+          "response_id": "plan-cycle-resp-2",
+          "response_text": "Infrastructure failure only: the triage step crashed on a missing OPENAI_API_KEY in the invoking shell; no decision change. Re-run the plan cycle honoring the prior rejection notes: (1) extend transient/quota failure classification to adversarial_cycle sub-steps in P1+P5 — a transient_* failure from a reviewer/triager/fixer/confirmer sub-invocation parks the cycle as usage_limit (not a terminal cycle failure), sub-agent session ids persist, and plain resume re-enters at the first incomplete sub-step continuing that sub-agent's session where supported, with unit tests for a mid-round reviewer quota park; (2) state explicitly in P6 that it ships the standard.yaml flip to prd.md:reference / plan.md:phase per FR-1.1, with Q3's guardrail comparison being the first real run after this PRD lands and a config-only revert if the guardrail misses — so the P6 builder does not halt on an FR-1.1-vs-Q3 upstream conflict; (3) P1 execution note: harvest captured error-envelope fixtures from existing failed-run transcripts (runs/*/run-*/steps/*/events.jsonl, 2026-06-29 through 2026-07-01 quota halts) rather than waiting for a live usage limit; (4) P10 execution note: one-shot backfill of ~/.gauntlet/usage-ledger.jsonl from existing run manifests so the median estimator has history from the first enforced run.",
+          "timestamp": "2026-07-02T16:26:36.400932+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 2,
+          "state": "pending"
         }
       ],
       "usage": {
