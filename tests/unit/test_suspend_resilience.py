@@ -8,6 +8,7 @@ suspension block (FR-5.3), and the in-process auto-resume loop (FR-3.4).
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +115,23 @@ def test_notify_mode_never_arms_a_schedule(fixture_repo):
     assert man.record("implement").scheduled_resume is None
 
 
+def test_auto_mode_no_schedule_without_reset_time(fixture_repo):
+    # F-003: a transient usage-limit park with NO reported reset time must not arm
+    # a schedule — arming with attempt_at=now() makes the auto loop treat it as due
+    # immediately and burn every attempt in an unspaced hot loop (FR-3.4 spacing).
+    man = _manifest()
+    cfg = {"agents": {"builder": {"adapter": "claude-code"}},
+           "resume_on_quota": "auto", "keep_awake": True}
+    orch = _build(fixture_repo, PIPE, config=cfg,
+                  adapters={"builder": _RaiseOnce(_transient(retry_after_s=None))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.quota_reset_at is None
+    assert rec.scheduled_resume is None  # plain park, no hot-loop schedule
+
+
 # --- FR-3.4 / FR-5.4: config validation + load warnings ----------------------
 def test_resume_on_quota_rejects_unknown_value():
     with pytest.raises(ValueError):
@@ -205,6 +223,107 @@ def test_status_view_null_when_no_heartbeat_and_no_intervals(tmp_path):
     assert op.compute_suspension_view(m, tmp_path, op.LIVENESS_ALIVE, now=T0) is None
 
 
+def test_heartbeat_writer_persists_detected_interval_live(tmp_path):
+    # F-001: the writer appends a detected interval to suspensions.jsonl the
+    # instant it fires — before any manifest drain — so live status and a crash
+    # both see it, while it also stays in memory for the drive-exit drain.
+    monos = iter([100.0, 130.0])  # monotonic barely advanced (suspend excluded)
+    walls = iter([T0, T0 + timedelta(minutes=40)])  # wallclock jumped 40m
+    w = HB.HeartbeatWriter(
+        tmp_path, monotonic_clock=lambda: next(monos), wall_clock=lambda: next(walls)
+    )
+    w._write_sample()  # prev
+    w._write_sample()  # cur → detects the ~40m gap
+    persisted = HB.read_persisted_suspensions(tmp_path)
+    assert len(persisted) == 1 and persisted[0].gap_s == 2400
+    assert len(w.drain_suspensions()) == 1  # also queued for the manifest drain
+
+
+def test_read_persisted_suspensions_skips_malformed_lines(tmp_path):
+    # Fail-closed: a torn/foreign line is skipped, never a bogus interval.
+    (tmp_path / HB.SUSPENSIONS_LOG_FILENAME).write_text(
+        'not json\n{"start":"a","end":"b","gap_s":5}\n{"start":"x"}\n\n'
+    )
+    out = HB.read_persisted_suspensions(tmp_path)
+    assert len(out) == 1 and out[0].gap_s == 5
+
+
+def test_read_persisted_suspensions_absent_file_is_empty(tmp_path):
+    assert HB.read_persisted_suspensions(tmp_path) == []
+
+
+def test_status_view_reads_live_persisted_suspensions(tmp_path):
+    # F-001: a just-detected interval in suspensions.jsonl (NOT yet drained into
+    # the manifest) is surfaced live and classifies host_suspended.
+    import json
+
+    now = T0 + timedelta(minutes=41)
+    woke_at = T0 + timedelta(minutes=40)
+    _write_heartbeat(tmp_path, 115.0, woke_at)
+    (tmp_path / HB.SUSPENSIONS_LOG_FILENAME).write_text(
+        json.dumps(
+            HB.Suspension(
+                start=HB.format_wallclock(T0),
+                end=HB.format_wallclock(woke_at),
+                gap_s=2400,
+            ).to_dict()
+        )
+        + "\n"
+    )
+    m = _man_running()  # manifest has NO suspensions yet (drive still running)
+    view = op.compute_suspension_view(m, tmp_path, op.LIVENESS_ALIVE, now=now)
+    assert view["classification"] == HB.STALL_HOST_SUSPENDED
+    assert view["intervals"][0]["gap_s"] == 2400
+
+
+def test_status_view_dedups_manifest_and_live_suspensions(tmp_path):
+    # A drained interval lives in BOTH the manifest and the append-only log;
+    # status must union-dedup so one sleep is not reported twice.
+    import json
+
+    now = T0 + timedelta(minutes=41)
+    woke_at = T0 + timedelta(minutes=40)
+    _write_heartbeat(tmp_path, 115.0, woke_at)
+    iv = M.Suspension(
+        start=HB.format_wallclock(T0), end=HB.format_wallclock(woke_at), gap_s=2400
+    )
+    m = _man_running()
+    m.suspensions.append(iv)
+    (tmp_path / HB.SUSPENSIONS_LOG_FILENAME).write_text(
+        json.dumps({"start": iv.start, "end": iv.end, "gap_s": iv.gap_s}) + "\n"
+    )
+    view = op.compute_suspension_view(m, tmp_path, op.LIVENESS_ALIVE, now=now)
+    assert len(view["intervals"]) == 1  # deduped, not double-reported
+
+
+def test_render_footer_surfaces_suspension_view():
+    # F-004: the human status footer surfaces classification, heartbeat age, and
+    # each detected interval — FR-5.3 parity with `--json`, not JSON-only.
+    driver = op.DriverInfo(op.LIVENESS_ALIVE, 4242, "host", "2026-07-02T12-00-00")
+    m = _man_running()
+    rstate = op.compute_run_state(m, driver.state)
+    view = {
+        "classification": HB.STALL_HOST_SUSPENDED,
+        "last_heartbeat_age_s": 3.0,
+        "intervals": [
+            {"start": "2026-07-02T12-00-00Z", "end": "2026-07-02T12-40-00Z", "gap_s": 2400}
+        ],
+    }
+    text = "\n".join(op.render_footer(driver, rstate, suspension=view))
+    assert "host_suspended" in text
+    assert "heartbeat: last written 3.0s ago" in text
+    assert "detected suspensions: 1" in text
+    assert "2400s" in text
+
+
+def test_render_footer_no_suspension_lines_when_none():
+    driver = op.DriverInfo(op.LIVENESS_ALIVE, 4242, "host", "s")
+    m = _man_running()
+    rstate = op.compute_run_state(m, driver.state)
+    lines = op.render_footer(driver, rstate, suspension=None)
+    assert not any(ln.startswith("suspension:") for ln in lines)
+
+
 def test_status_payload_with_suspension_validates(tmp_path):
     _write_heartbeat(tmp_path, 100.0, T0)
     m = _man_running()
@@ -240,7 +359,15 @@ class _AutoResumeHarness:
         self.outcomes = list(outcomes)
         self.resume_calls = 0
         self.now = T0
+        self.wait_entries = 0  # how many times the wait context was entered
         self.mgr._resume_once = self._fake_resume  # type: ignore[assignment]
+
+    @contextlib.contextmanager
+    def _wait_context(self, run_dir):
+        # A hermetic stand-in for the real heartbeat/keep-awake wait context so
+        # the loop is exercised without spawning a heartbeat thread or caffeinate.
+        self.wait_entries += 1
+        yield
 
     def _clock(self) -> str:
         return self.now.isoformat()
@@ -285,6 +412,7 @@ class _AutoResumeHarness:
         return self.mgr._auto_resume_if_scheduled(
             "demo", M.RUN_PARKED, use_judge=False, adapter_factory=None,
             extra_context=None, clock=self._clock, sleep=self._sleep,
+            wait_context=self._wait_context,
         )
 
 
@@ -320,3 +448,36 @@ def test_notify_mode_auto_loop_is_a_noop(tmp_path):
     h.park(attempt_at=T0 - timedelta(seconds=1))
     assert h.run() == M.RUN_PARKED
     assert h.resume_calls == 0  # never re-invoked in notify mode
+
+
+def test_auto_resume_wait_runs_under_heartbeat_keepawake_context(tmp_path):
+    # F-002: the quota wait keeps the heartbeat/keep-awake context live so the
+    # waiting driver still heartbeats and (opt-in) holds the host awake.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 + timedelta(seconds=90))  # a real wait precedes resume
+    h.run()
+    assert h.wait_entries >= 1  # the wait context wrapped the wait
+    assert h.resume_calls == 1
+
+
+def test_auto_resume_no_wait_context_when_immediately_due(tmp_path):
+    # No wait → no heartbeat/keep-awake churn (context entered only for waits).
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 - timedelta(seconds=1))  # already due
+    h.run()
+    assert h.wait_entries == 0
+
+
+def test_auto_resume_defers_to_a_concurrent_lock_holder(tmp_path):
+    # F-005: with another driver holding the worktree lock, the auto-resume loop
+    # must NOT write attempts/exhaustion outside the lock — it defers, consuming
+    # no attempt and driving no resume.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 - timedelta(seconds=1))  # due → would otherwise resume
+    handle = h.mgr._acquire_worktree_lock("demo", "other-run")
+    try:
+        assert h.run() == M.RUN_PARKED  # deferred, not resumed
+    finally:
+        h.mgr._release_worktree_lock(handle)
+    assert h.resume_calls == 0
+    assert h._load().record("implement").scheduled_resume.attempts == 0

@@ -670,7 +670,7 @@ def status(
 
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
-        current_step_freshness=freshness,
+        current_step_freshness=freshness, suspension=suspension,
     ):
         typer.echo(line)
 

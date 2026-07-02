@@ -1381,18 +1381,27 @@ def compute_suspension_view(
         hb_wall = HB.parse_wallclock(hb.wallclock_utc)
         if hb_wall is not None:
             hb_age_s = max(0.0, (now - hb_wall).total_seconds())
-    intervals = list(man.suspensions)
+    # Union the manifest's drained intervals with the heartbeat writer's live,
+    # still-un-drained ``suspensions.jsonl`` (FR-5.1/5.3): a run that just woke
+    # but is still driving, and a crash before the drive drained, both surface.
+    intervals = _merge_suspension_intervals(
+        man.suspensions, HB.read_persisted_suspensions(run_instance_dir)
+    )
     if hb is None and not intervals:
         return None
 
-    last = intervals[-1] if intervals else None
-    is_current_pair = (
-        last is not None and hb is not None and last.end == hb.wallclock_utc
-    )
+    # The current skew pair is the interval whose end equals the live heartbeat's
+    # wallclock (the driver detected the suspend on its most recent write); once a
+    # later non-suspend heartbeat lands the match lapses and the run reads working.
+    current = None
+    if hb is not None:
+        current = next(
+            (iv for iv in intervals if iv["end"] == hb.wallclock_utc), None
+        )
     classification = HB.classify_stall(
         pid_alive=(liveness == LIVENESS_ALIVE),
-        pair_gap_s=(last.gap_s if is_current_pair else None),
-        clock_skew=is_current_pair,
+        pair_gap_s=(current["gap_s"] if current is not None else None),
+        clock_skew=current is not None,
         hb_age_s=hb_age_s,
         agent_output_age_s=_agent_output_age_s(man, run_instance_dir, now),
         interval_s=interval_s,
@@ -1402,8 +1411,30 @@ def compute_suspension_view(
     return {
         "classification": classification,
         "last_heartbeat_age_s": hb_age_s,
-        "intervals": [s.model_dump() for s in intervals],
+        "intervals": intervals,
     }
+
+
+def _merge_suspension_intervals(manifest_intervals, persisted) -> list[dict]:
+    """Union manifest + live-persisted intervals, deduped, manifest order first.
+
+    A drained interval is in the manifest AND still in the append-only log, so
+    dedup by (start, end, gap_s) keeps `status` from double-reporting one sleep.
+    """
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for s in manifest_intervals:
+        d = s.model_dump()
+        key = (d["start"], d["end"], d["gap_s"])
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    for s in persisted:
+        key = (s.start, s.end, s.gap_s)
+        if key not in seen:
+            seen.add(key)
+            out.append(s.to_dict())
+    return out
 
 
 class LogsError(RuntimeError):
@@ -1851,6 +1882,7 @@ def render_footer(
     reconciliation: Reconciliation | None = None,
     anomaly: str | None = None,
     current_step_freshness: float | None = None,
+    suspension: dict | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -1861,6 +1893,12 @@ def render_footer(
     ≥1 streamed event), a single advisory line reports the age of the newest
     event (live-run-observability FR-5). ``None`` (a non-streamed/not-applicable
     step) adds no line, so the footer is unchanged for every existing run.
+
+    When ``suspension`` is present (the :func:`compute_suspension_view` block),
+    the footer surfaces the stall classification, the heartbeat age, and each
+    detected suspension interval — FR-5.3 requires the human ``status`` to show
+    the same heartbeat age + intervals as ``--json``, not just the JSON path.
+    ``None`` (no heartbeat and no interval) adds no line.
     """
     lines: list[str] = []
     if driver.state == LIVENESS_NONE:
@@ -1883,6 +1921,23 @@ def render_footer(
             f"freshness: last streamed event {current_step_freshness:.1f}s ago "
             "(advisory — drives no action)"
         )
+
+    if suspension is not None:
+        classification = suspension.get("classification")
+        lines.append(
+            f"suspension: {classification if classification else 'none'} "
+            "(stall classification, FR-5.3)"
+        )
+        age = suspension.get("last_heartbeat_age_s")
+        if age is not None:
+            lines.append(f"heartbeat: last written {age:.1f}s ago")
+        intervals = suspension.get("intervals") or []
+        if intervals:
+            lines.append(f"detected suspensions: {len(intervals)}")
+            for iv in intervals:
+                lines.append(
+                    f"  - {iv['start']} → {iv['end']} ({iv['gap_s']}s)"
+                )
 
     # A lingering lock under a terminal/parked run is harmless residue (§6.3 P2).
     if (

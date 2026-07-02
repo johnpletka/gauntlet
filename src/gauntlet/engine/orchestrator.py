@@ -808,12 +808,18 @@ class Orchestrator:
             result.status == PARKED
             and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
             and self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
+            # Arm ONLY with a structured reset time (FR-3.4): a park with no
+            # reported reset has ``quota_reset_at is None``; falling back to
+            # ``self.clock()`` would make the schedule due immediately, and the
+            # auto-resume loop would burn every attempt in an unspaced hot loop.
+            # With no reset time, leave a plain usage-limit park for a human.
+            and rec.quota_reset_at is not None
         ):
             prior_attempts = (
                 rec.scheduled_resume.attempts if rec.scheduled_resume else 0
             )
             rec.scheduled_resume = M.ScheduledResume(
-                attempt_at=rec.quota_reset_at or self.clock(),
+                attempt_at=rec.quota_reset_at,
                 attempts=prior_attempts,
                 max_attempts=self.config.max_auto_resume_attempts,
             )

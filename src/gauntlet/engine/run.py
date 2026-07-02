@@ -9,6 +9,7 @@ review F-010).
 from __future__ import annotations
 
 import atexit
+import contextlib
 import getpass
 import hmac
 import json
@@ -1241,9 +1242,90 @@ class RunManager:
         finally:
             self._release_worktree_lock(handle)
 
+    @staticmethod
+    def _parked_usage_limit_step(man: Manifest) -> "M.StepRecord | None":
+        """The scheduled-resume-armed usage-limit park, or ``None`` (shared find)."""
+        return next(
+            (
+                s for s in man.steps
+                if s.status == M.PARKED
+                and s.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+                and s.scheduled_resume is not None
+            ),
+            None,
+        )
+
+    @contextlib.contextmanager
+    def _auto_resume_wait_context(self, run_dir: Path):
+        """Heartbeat + keep-awake spanning the auto-resume quota wait (FR-3.4/FR-5).
+
+        The wait between resume attempts is a *live* driver, not a stopped one, so
+        it must keep the FR-5 liveness signals up: the heartbeat writer keeps
+        stamping ``heartbeat.json`` (so ``status`` reads a live driver, and a sleep
+        during the wait is detected + persisted) and — opt-in — ``caffeinate`` holds
+        the host awake for the wait. Scoped to the wait only: the continuation
+        resume's own ``_drive`` owns the heartbeat while it runs, so the two never
+        overlap on the single-slot writer registry (heartbeat._active).
+        """
+        from gauntlet.engine.heartbeat import HeartbeatWriter, KeepAwake
+
+        writer = HeartbeatWriter(
+            run_dir,
+            interval_s=self.config.heartbeat_interval_s,
+            credit_cap_s=self.config.suspend_credit_cap_s,
+        )
+        with KeepAwake(enabled=self.config.keep_awake), writer:
+            yield
+
+    def _arm_next_attempt(self, slug: str, run_dir: Path, run_id: str | None) -> bool:
+        """Increment the parked step's auto-resume attempt count under the lock (F-005).
+
+        Auto-resume runs outside the worktree lock (each attempt re-acquires it),
+        but its manifest writes must not race a concurrent manual resume. Reload +
+        revalidate under the lock so a state change between the loop's read and this
+        write is not clobbered; return ``False`` (re-loop and re-decide) if the
+        parked usage-limit schedule is gone or already at the ceiling.
+        """
+        handle = self._acquire_worktree_lock(slug, run_id)
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            step = self._parked_usage_limit_step(man)
+            if step is None or step.scheduled_resume is None:
+                return False
+            if step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts:
+                return False
+            step.scheduled_resume.attempts += 1
+            man.write_atomic(run_dir / "manifest.json")
+            return True
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _exhaust_schedule(self, slug: str, run_dir: Path, run_id: str | None) -> None:
+        """Clear the auto-resume schedule at the ceiling under the lock (F-005).
+
+        Same lock discipline as :meth:`_arm_next_attempt`: reload + revalidate so
+        the exhaustion note never overwrites a concurrent manual resume's state.
+        """
+        handle = self._acquire_worktree_lock(slug, run_id)
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            step = self._parked_usage_limit_step(man)
+            if step is None or step.scheduled_resume is None:
+                return
+            step.scheduled_resume = None
+            note = (
+                f"auto-resume exhausted after {self.config.max_auto_resume_attempts} "
+                "attempts (FR-3.4); left as a plain usage_limit park — resume "
+                "manually once the window clears, or abort"
+            )
+            step.notes = f"{step.notes}\n{note}" if step.notes else note
+            man.write_atomic(run_dir / "manifest.json")
+        finally:
+            self._release_worktree_lock(handle)
+
     def _auto_resume_if_scheduled(
         self, slug: str, status: str, *, use_judge: bool, adapter_factory,
-        extra_context: dict | None, clock, sleep=None,
+        extra_context: dict | None, clock, sleep=None, wait_context=None,
     ) -> str:
         """Drive the in-process auto-resume wait loop for a usage-limit park (FR-3.4).
 
@@ -1255,55 +1337,69 @@ class RunManager:
         or — at the attempt ceiling — falls back to a plain park with an exhaustion
         note. Restart-safe: it re-reads the persisted schedule from disk every
         pass, so a driver restart before/after the reset reconciles identically.
+
+        The quota wait itself runs under a heartbeat + keep-awake context
+        (``wait_context``, FR-5/F-002) so the waiting driver stays live and — opt-in
+        — the host stays awake; the context is entered lazily on the first wait and
+        released before each continuation resume (which owns its own heartbeat). All
+        manifest mutations (attempt increment, exhaustion note) happen under the
+        worktree lock (F-005) so they never clobber a concurrent manual resume.
         """
         if self.config.resume_on_quota != RESUME_ON_QUOTA_AUTO:
             return status
         _sleep = sleep or time.sleep
+        _wait_ctx = wait_context or self._auto_resume_wait_context
         layout = self.layout(slug)
-        while True:
-            try:
-                run_dir = layout.active_run_dir()
-                man = Manifest.load(run_dir / "manifest.json")
-            except (FileNotFoundError, OSError, ValueError):
-                return status
-            if man.status != M.RUN_PARKED:
-                return status
-            step = next(
-                (
-                    s for s in man.steps
-                    if s.status == M.PARKED
-                    and s.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-                    and s.scheduled_resume is not None
-                ),
-                None,
-            )
-            if step is None:
-                return status
-            now = self._auto_resume_now(clock)
-            action, wait_s = next_auto_resume_action(step.scheduled_resume, now)
-            if action == AUTO_RESUME_NONE:
-                return status
-            if action == AUTO_RESUME_EXHAUST:
-                step.scheduled_resume = None
-                note = (
-                    f"auto-resume exhausted after {self.config.max_auto_resume_attempts} "
-                    "attempts (FR-3.4); left as a plain usage_limit park — resume "
-                    "manually once the window clears, or abort"
+        wait_cm = None  # heartbeat/keep-awake held across contiguous waits only
+        try:
+            while True:
+                try:
+                    run_dir = layout.active_run_dir()
+                    man = Manifest.load(run_dir / "manifest.json")
+                except (FileNotFoundError, OSError, ValueError):
+                    return status
+                if man.status != M.RUN_PARKED:
+                    return status
+                step = self._parked_usage_limit_step(man)
+                if step is None:
+                    return status
+                now = self._auto_resume_now(clock)
+                action, wait_s = next_auto_resume_action(step.scheduled_resume, now)
+                # Leaving the wait: release the heartbeat/keep-awake before any
+                # resume so its `_drive` heartbeat does not overlap this one.
+                if action != AUTO_RESUME_WAIT and wait_cm is not None:
+                    wait_cm.__exit__(None, None, None)
+                    wait_cm = None
+                if action == AUTO_RESUME_NONE:
+                    return status
+                if action == AUTO_RESUME_EXHAUST:
+                    try:
+                        self._exhaust_schedule(slug, run_dir, man.run_id)
+                    except WorktreeLockError:
+                        pass  # a concurrent driver holds the lock — defer to it
+                    return status
+                if action == AUTO_RESUME_WAIT:
+                    if wait_cm is None:
+                        wait_cm = _wait_ctx(run_dir)
+                        wait_cm.__enter__()
+                    _sleep(min(wait_s, _AUTO_RESUME_POLL_S))
+                    continue
+                # AUTO_RESUME_RESUME: count the attempt write-ahead (under the
+                # lock, F-005), then continue with one continuation resume.
+                try:
+                    armed = self._arm_next_attempt(slug, run_dir, man.run_id)
+                except WorktreeLockError:
+                    return status  # a concurrent driver holds the lock — defer
+                if not armed:
+                    continue  # state changed under us — re-read and re-decide
+                status = self._resume_once(
+                    slug, response=None, use_judge=use_judge,
+                    adapter_factory=adapter_factory, extra_context=extra_context,
+                    clock=clock,
                 )
-                step.notes = f"{step.notes}\n{note}" if step.notes else note
-                man.write_atomic(run_dir / "manifest.json")
-                return status
-            if action == AUTO_RESUME_WAIT:
-                _sleep(min(wait_s, _AUTO_RESUME_POLL_S))
-                continue
-            # AUTO_RESUME_RESUME: count the attempt write-ahead, then continue.
-            step.scheduled_resume.attempts += 1
-            man.write_atomic(run_dir / "manifest.json")
-            status = self._resume_once(
-                slug, response=None, use_judge=use_judge,
-                adapter_factory=adapter_factory, extra_context=extra_context,
-                clock=clock,
-            )
+        finally:
+            if wait_cm is not None:
+                wait_cm.__exit__(None, None, None)
 
     @staticmethod
     def _auto_resume_now(clock) -> datetime:

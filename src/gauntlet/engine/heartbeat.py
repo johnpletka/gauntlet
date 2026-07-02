@@ -40,6 +40,10 @@ from typing import Callable
 
 # --- constants (Q5-ratified) -------------------------------------------------
 HEARTBEAT_FILENAME = "heartbeat.json"
+# The writer appends each detected interval here the instant it fires, so live
+# `status` sees a just-ended sleep before the drive drains into the manifest and
+# a `kill -9` mid-drive keeps the evidence (FR-5.1/5.3, data over inference).
+SUSPENSIONS_LOG_FILENAME = "suspensions.jsonl"
 # Cadence: a heartbeat every 15s (FR-5.1). The detector threshold (30s) is 2×
 # the cadence so ordinary scheduler jitter between two writes never trips it.
 DEFAULT_HEARTBEAT_INTERVAL_S = 15.0
@@ -131,6 +135,48 @@ class Suspension:
 
     def to_dict(self) -> dict:
         return {"start": self.start, "end": self.end, "gap_s": self.gap_s}
+
+    @classmethod
+    def from_dict(cls, data: object) -> "Suspension | None":
+        """Parse a persisted interval, or ``None`` if malformed (fail closed)."""
+        if not isinstance(data, dict):
+            return None
+        start = data.get("start")
+        end = data.get("end")
+        gap = data.get("gap_s")
+        if not isinstance(start, str) or not isinstance(end, str):
+            return None
+        if not isinstance(gap, int) or isinstance(gap, bool):
+            return None
+        return cls(start=start, end=end, gap_s=gap)
+
+
+def read_persisted_suspensions(run_dir: Path) -> list[Suspension]:
+    """Read the intervals the heartbeat writer persisted live (FR-5.1/5.3).
+
+    The append-only ``suspensions.jsonl`` is the run-safe store `status` reads so
+    a just-ended sleep surfaces before the drive drains it into the manifest, and
+    a crash mid-drive does not lose it. Fail-closed: a torn/foreign line is
+    skipped rather than yielding a bogus interval. Absent file → empty list.
+    """
+    import json
+
+    out: list[Suspension] = []
+    try:
+        text = (run_dir / SUSPENSIONS_LOG_FILENAME).read_text()
+    except (OSError, ValueError):
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = Suspension.from_dict(json.loads(line))
+        except ValueError:
+            continue
+        if parsed is not None:
+            out.append(parsed)
+    return out
 
 
 def detect_suspension(
@@ -392,6 +438,7 @@ class HeartbeatWriter:
     ) -> None:
         self.run_dir = run_dir
         self.path = run_dir / HEARTBEAT_FILENAME
+        self.suspend_log = run_dir / SUSPENSIONS_LOG_FILENAME
         self.interval_s = interval_s
         self.threshold_s = threshold_s
         self.credit_cap_s = credit_cap_s
@@ -468,6 +515,27 @@ class HeartbeatWriter:
                 with self._lock:
                     self._suspensions.append(interval)
                     self._total_suspend_s += interval.gap_s
+                # Persist promptly so live `status` and a crash both see it
+                # (FR-5.1/5.3), independent of the drive's manifest drain.
+                self._append_suspension_log(interval)
+
+    def _append_suspension_log(self, interval: "Suspension") -> None:
+        """Append a detected interval to the run-safe log (best-effort, FR-5.1).
+
+        Append-only + fsync so a live reader gets whole lines and a crash keeps
+        the evidence. A failed append must never crash the heartbeat thread — the
+        interval is still in memory and will drain into the manifest at drive
+        exit, so the file is a best-effort live/crash mirror, not the source.
+        """
+        import json
+
+        try:
+            with open(self.suspend_log, "a") as fh:
+                fh.write(json.dumps(interval.to_dict()) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            pass
 
     def _persist(self, sample: HeartbeatSample) -> None:
         import json
