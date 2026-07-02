@@ -1,8 +1,8 @@
 # PRD: Harness Efficiency & Resilience
 
-**Status:** Draft v0.1
-**Author:** John Pletka (drafted with Claude from a four-track code exploration, 2026-07-01)
-**Date:** 2026-07-01
+**Status:** Draft v0.2
+**Author:** John Pletka (drafted with Claude from a four-track code exploration, 2026-07-01; v0.2 adds FR-9–FR-12 from a goals-first pass, 2026-07-02)
+**Date:** 2026-07-02
 **Working name:** harness-efficiency
 **Relationship to existing artifacts:** Does **not** amend `PRD-gauntlet.md` or any approved `prd.md`/`plan.md`/`policy.yaml`. Builds on existing machinery: the manifest write-ahead state machine (`engine/manifest.py`, `engine/orchestrator.py`), the adversarial cycle (`engine/cycle.py`), the adapter layer (`adapters/`), the status contract (`engine/operator.py`, `schemas/status.json`), and the console (`web/`). Two FRs (FR-6.4 doctor model probes, FR-8 gate context) deliver items already recorded as gaps in `BOOTSTRAP-NOTES.md` (#24, #54-adjacent) and `FUTURE.md`; they implement those recorded follow-ups rather than amending anything approved. No judge `policy.yaml` change is in scope (see Non-Goals).
 
@@ -24,7 +24,9 @@ Finally, the operator (human or `gauntlet-operator` skill) is partially blind: `
 
 ### 1.2 Solution summary
 
-Harden the run lifecycle end-to-end without changing the pipeline model: (a) classify adapter failures as transient-vs-terminal with usage-limit detection, park (don't fail) on transient, and resume by continuing the persisted CLI session against the preserved worktree; (b) checkpoint adversarial-cycle sub-steps so resume re-enters mid-round; (c) make deadlines suspension-aware via a driver heartbeat that detects sleep gaps and credits them back to the step; (d) validate agent-authored structured blocks at authoring time with a bounded in-session repair loop, and park-with-hand-edit-then-revalidate as the fallback; (e) scope context per stage — implement steps get the current phase's plan section plus artifact *paths* (the CLI agents already have Read access), artifact re-reviews get a diff since the last reviewed version; (f) wire `effort` into agent profiles, tier escalation by severity, and move mechanical steps to cheap profiles, with `doctor` probing every profile's model resolution; (g) enrich `status --json` and gate views so every park/halt/failure is explainable without opening a transcript.
+Harden the run lifecycle end-to-end without changing the pipeline model: (a) classify adapter failures as transient-vs-terminal with usage-limit detection, park (don't fail) on transient, and resume by continuing the persisted CLI session against the preserved worktree; (b) checkpoint adversarial-cycle sub-steps so resume re-enters mid-round; (c) make deadlines suspension-aware via a driver heartbeat that detects sleep gaps and credits them back to the step; (d) validate agent-authored structured blocks at authoring time with a bounded in-session repair loop, and park-with-hand-edit-then-revalidate as the fallback; (e) scope context per stage — implement steps get the current phase's plan section plus artifact *paths* (the CLI agents already have Read access), artifact re-reviews get a diff since the last reviewed version; (f) wire `effort` into agent profiles, tier escalation by severity, and move mechanical steps to cheap profiles, with `doctor` probing every profile's model resolution; (g) enrich `status --json` and gate views so every park/halt/failure is explainable without opening a transcript; (h) stop losing work to *predictable* window exhaustion — a machine-global usage ledger built from data the manifests already record lets the engine park at a clean boundary before launching a step that won't fit, and prompt-directed intra-phase checkpoint commits shrink the maximum repeatable work unit from "a phase" to "a milestone"; (i) cut latency that buys nothing — triage's independent per-finding calls run concurrently, and the judge stops re-evaluating byte-identical tool calls.
+
+One organizing principle runs through v0.2: **the builder's provider window is the scarce resource; everything else is comparatively free.** Reviewer, triage, escalation, and judge all run on unconstrained providers today (`.gauntlet/config.yaml`). Efficiency work should therefore bias toward (a) protecting and metering the constrained budget (FR-3, FR-10, FR-11) and (b) spending the unconstrained budget more freely where it adds speed or quality (FR-9; the companion `pipeline-effectiveness` PRD takes this further with ensemble review).
 
 ### 1.3 The assumption this validates
 
@@ -42,11 +44,14 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 | G4 | Per-call context is scoped to what the stage needs; large artifacts travel by reference or diff | Faster, cheaper, sharper agent calls; slower usage-budget burn |
 | G5 | Model effort/tier matches step difficulty; escalation cost is severity-gated; misconfigured models caught at `doctor` time | Quality where it matters, savings where it doesn't, no mid-run 404s |
 | G6 | Every run state (parked/halted/failed/interrupted, elapsed, cost) is explainable from `status --json` alone | Humans and the operator skill decide without reading transcripts |
+| G7 | Predictable window exhaustion parks at a clean commit boundary before the doomed step starts, and the maximum work unit lost to any interruption is one intra-phase milestone, not one phase | Large PRDs become a scheduling problem, not a gamble |
+| G8 | Latency that changes no decision is eliminated: independent triage calls run concurrently; identical tool calls are judged once | Faster rounds and tool calls at zero quality cost |
 
 ### 2.2 Non-Goals (v1)
 
-- **Phase-completeness gating** (acceptance-clause→test mapping, completeness-critic review — BOOTSTRAP-NOTES #54 preventions). Deserves its own PRD; conflating it here would double this document's blast radius.
+- **Pipeline-shape changes** — ensemble/multi-lens review, behavioral verification, acceptance-clause→test gating (BOOTSTRAP-NOTES #54 preventions), evidence-tiered gate auto-approval, and cross-run learning. These change what the pipeline *is*, a different risk class than this PRD's plumbing hardening; drafted separately as `runs/pipeline-effectiveness/prd.md`.
 - **Worktree isolation / concurrent same-repo runs** (already deferred in FUTURE.md).
+- **Speculative phase overlap** (starting phase N+1's implement while phase N's review runs). On a laptop the binding constraint is the provider window, not wall-clock — overlap burns the same window faster while adding rollback complexity to the state machine. Revisit only if the window constraint disappears.
 - **LLM-based summarization of artifacts** for context reduction. v1 scopes context deterministically (phase excerpts, diffs, paths) — determinism over cleverness; no new lossy agent step whose output quality we'd then have to review.
 - **Dynamic/cost-based model routing** (choosing models per finding at runtime by predicted difficulty). v1 is static config: effort per profile, severity-gated escalation. Adaptive routing is post-v1.
 - **Batch triage.** Point-by-point triage with untrusted-data wrapping is a deliberate injection-containment design (PRD-gauntlet §8); its per-call overhead is small on `gpt-5-mini`.
@@ -80,7 +85,11 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 | `src/gauntlet/engine/operator.py`, `schemas/status.json` | Additive status fields: elapsed, timeout remaining, usage totals, step notes, halt_reason, suspension info, quota reset time | Touched |
 | `src/gauntlet/web/gate.py`, templates | Convergence summary, prior-response history, per-finding triage reasoning in GateView | Touched |
 | `src/gauntlet/cli.py` (`doctor`) | Per-profile model-resolution probe (one-token round trip) + effort-flag acceptance check | Touched |
-| `pipelines/standard.yaml`, `.gauntlet/config.yaml` | Effort defaults; cheap profiles for `commit_message`/disposition; context-mode opt-ins | Touched |
+| `pipelines/standard.yaml`, `.gauntlet/config.yaml` | Effort defaults; cheap profiles for `commit_message`/disposition; context-mode opt-ins; provider window config | Touched |
+| `src/gauntlet/engine/ledger.py` | Machine-global usage ledger (`~/.gauntlet/usage-ledger.jsonl`): per-step provider usage appended from every run; sliding-window headroom query | **New** |
+| `src/gauntlet/engine/cycle.py` (triage loop) | Bounded-concurrency per-finding triage execution with deterministic result ordering | Touched |
+| `src/gauntlet/judge/core.py` | Per-run allow-decision cache keyed on canonical payload + policy hash | Touched |
+| `prompts/implement-phase.md`, `engine/orchestrator.py` | Intra-phase checkpoint-commit instruction; interrupted-step reset targets the latest checkpoint commit instead of `base_sha` | Touched |
 
 ### 4.2 Key design decisions
 
@@ -94,6 +103,10 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 | Malformed-artifact recovery | In-step bounded repair loop (same session, error fed back) → then **park** with `parked_reason=artifact_invalid`; plain `resume` revalidates the (possibly hand-edited) artifact without re-running the author | Mirrors the proven schema-retry loop in `cycle.py:451–464`; the park+revalidate path makes hand-editing sanctioned and audited instead of off-book file surgery. `phase_lint` stays as the backstop gate. |
 | Effort/tier configuration | Static per-profile/per-step config, severity-gated escalation | Inspectable, resumable, testable. Dynamic routing is a Non-Goal. |
 | Status enrichment | Additive fields only; `schema_version` stays 1 per the documented compatibility policy | Existing consumers keep working. |
+| Window management | Approximate local ledger + advisory-first admission (warn by default, park only when `enforce: true`) | The ledger cannot see non-gauntlet usage, so it under-counts; a wrong warn is noise, a wrong park is an annoyance, but a wrong *continue* is now survivable via FR-3. Data over inference: estimates come from recorded per-step usage, not guesses. |
+| Interruption work unit | Prompt-directed intra-phase checkpoint commits, kept in history (squash optional) | Deterministic and CLI-agnostic, unlike session resume (FR-3) which bets on provider behavior — the two compose: session resume when it works, checkpoint rewind when it doesn't. Review diffs are range-based, so extra commits change nothing downstream. |
+| Triage concurrency | Parallelize only the point-by-point triage calls (cheap unconstrained provider); merge in finding-id order | Findings are independent by design (injection containment already isolates them); ordering the merge keeps artifacts byte-deterministic. No builder-window contention. |
+| Judge caching | Cache **allow** decisions only, keyed on canonical payload + policy content hash, per run | A repeated identical call cannot become more dangerous than its first evaluation under the same policy; deny/ask are never cached so nothing fails open. |
 
 ## §5 Functional Requirements
 
@@ -171,6 +184,36 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 - **FR-8.2** Gate `next_actions` entries carry a one-line consequence description (approve → what proceeds; reject → which cycle re-runs with the notes injected).
   *Acceptance:* golden test of `next_actions` payload for a gate downstream of an adversarial cycle names the cycle that a rejection re-runs.
 
+### FR-9 — Concurrent triage
+
+- **FR-9.1** Per-finding triage calls within a round execute concurrently with a bounded worker pool (`triage_concurrency`, default 4), preserving today's per-finding prompt isolation. Results are merged in finding-id order so the persisted `triage.json` is byte-identical to the sequential output.
+  *Acceptance:* unit test with an instrumented stub adapter shows overlapping in-flight calls and an artifact identical to a sequential run of the same fixtures.
+- **FR-9.2** Failure of any single triage call fails the round's triage step (fail closed, unchanged semantics); verdicts already completed are persisted as sub-step checkpoints (composes with FR-4) so resume re-runs only the incomplete findings.
+  *Acceptance:* unit test: one stubbed failure among five findings → step fails, four verdicts checkpointed, resume issues exactly one triage call.
+
+### FR-10 — Usage-window ledger and step admission
+
+- **FR-10.1** Every run appends per-step provider usage (provider, model, tokens, cost, started/ended) to a machine-global ledger (`~/.gauntlet/usage-ledger.jsonl`, append-only, no prompt content) — the same data the manifest already records, aggregated across runs and repos because parallel runs share one account window.
+  *Acceptance:* unit test: two simulated runs append; a sliding-window query over the fixture returns the correct per-provider sum.
+- **FR-10.2** Config may declare a provider window (`providers.anthropic: {window_hours: 5, window_budget: <tokens|cost>}`). Before launching an agent step on a window-constrained provider, the engine estimates the step's usage (median of historical same-type/same-profile steps from the ledger; configured fallback when no history) and compares it to remaining headroom.
+  *Acceptance:* unit test: synthetic ledger + config → correct headroom and estimate; no-history case uses the fallback.
+- **FR-10.3** On insufficient headroom: default is a **warning** stamped into the manifest, `status`, and a notification (the ledger cannot see non-gauntlet usage, so it is advisory); with `enforce: true`, the run parks *before* the step starts with `parked_reason=usage_window` and the projected replenishment time — a park at a clean boundary with zero work in flight, in contrast to FR-3's reactive mid-step park.
+  *Acceptance:* unit test: advisory mode launches with a recorded warning; enforce mode parks pre-step with the projection in the step record and a `resume` next-action.
+
+### FR-11 — Intra-phase checkpoint commits
+
+- **FR-11.1** The implement-phase prompt instructs the builder to commit at each passing-test milestone with the prefix `PN wip:` (one-line summary; final `PN:` phase commit unchanged). WIP commits are ordinary commits on the run branch; review diffs are commit-range-based and unaffected. `checkpoint_commits: keep | squash` (default `keep` — the milestones are audit data) controls whether the phase-end commit squashes them.
+  *Acceptance:* prompt-content test; with `squash`, the phase ends as one commit whose body lists the squashed milestones; with `keep`, the range `handoff..HEAD` reviews identically.
+- **FR-11.2** Interrupted-step recovery rewinds a dirty worktree to the **latest intra-phase checkpoint commit** instead of `base_sha` (falling back to `base_sha` when no checkpoint exists), preserving completed milestones; the pre-rewind backup ref is still taken. The continuation/re-run prompt names the checkpoint it resumes from.
+  *Acceptance:* unit test: kill after `P3 wip: model layer` with further dirty edits → recovery lands on the wip commit, the milestone's files survive, backup ref exists, and the re-run prompt references the checkpoint.
+
+### FR-12 — Judge decision cache
+
+- **FR-12.1** The judge caches **allow** decisions per run, keyed on SHA-256 of (tool name, canonicalized input payload, repo_root, policy content hash, agent profile). `deny` and `ask` outcomes are never cached; any policy file change rotates the key. Cache hits are recorded in the audit log with the original decision id and `cached: true`.
+  *Acceptance:* unit test: two byte-identical calls → one evaluation + one audited hit; a denied call repeated → two evaluations; a policy edit between identical calls → two evaluations.
+- **FR-12.2** Cache effect on the LLM rung specifically: a repeated identical call that previously required the classifier is answered from cache in fast-path time (<150ms), eliminating repeated classifier cost and the intermittent fail-closed errors on benign repeats (BOOTSTRAP-NOTES #39's symptom, without touching `policy.yaml`).
+  *Acceptance:* unit test with a stubbed classifier: second identical call does not invoke the classifier and returns the cached allow.
+
 ## §6 Data & Schemas (normative excerpts)
 
 **FailureInfo (adapter → engine, carried on AgentFailedError):**
@@ -210,6 +253,18 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 { "monotonic_s": 12345.6, "wallclock_utc": "2026-07-01T17-42-10Z", "pid": 4242 }
 ```
 
+**Usage ledger line (`~/.gauntlet/usage-ledger.jsonl`, append-only, content-free):**
+```json
+{ "ts": "2026-07-02T10-15-00Z", "provider": "anthropic", "model": "claude-opus-4-8",
+  "profile": "builder", "step_type": "agent_task", "repo": "<repo-root-hash>",
+  "run_id": "run-...", "input_tokens": 41200, "output_tokens": 9800, "cost_usd": 1.87,
+  "duration_s": 1420 }
+```
+
+**Judge cache key (never persisted across runs):** `sha256(tool_name ‖ canonical_json(payload) ‖ repo_root ‖ sha256(policy.yaml) ‖ agent_profile)` → allow-decision id.
+
+**Checkpoint commit convention:** subject `P<N> wip: <milestone, ≤60 chars>`; recovery selects the newest commit on the run branch matching `^P<N> wip:` that is a descendant of the step's `base_sha`.
+
 ## §7 Security & Privacy
 
 - **Failure classification fails closed.** Only structured error fields are matched against a pinned allowlist; free-text prose is never trusted for classification; unknown → `terminal` (run halts for a human). Markers live beside `.gauntlet/pins.yaml` contract tests and are re-verified when a pinned CLI version changes.
@@ -218,6 +273,9 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 - **`keep_awake` is opt-in** and process-scoped (`caffeinate -i` on the driver only); default off because altering host sleep behavior is a human decision.
 - **Reference-mode context widens nothing:** builder/reviewer agents already hold repo read access; a path reference exposes no file the inline mode didn't.
 - **Status/gate enrichment reuses the existing redaction path** (`logging/redact.py`) for any content-bearing field (notes, raw_excerpt).
+- **The usage ledger is content-free** (counts, models, hashes — never prompts or output) and local-only; the repo path is stored as a hash so the ledger leaks nothing about project names across contexts.
+- **The judge cache cannot fail open:** only allow decisions for byte-identical payloads under an identical policy hash are served from cache; deny/ask always re-evaluate; the cache dies with the run.
+- **Checkpoint commits carry the builder's agent identity** like every other builder commit — no new authorship path, and the rewind-target selection matches only descendants of the step's own `base_sha`, so a checkpoint from a stale attempt can never be adopted.
 
 ## §8 Implementation Plan (phased, assumption-validating)
 
@@ -231,8 +289,11 @@ Harden the run lifecycle end-to-end without changing the pipeline model: (a) cla
 | P6 | Scoped context: input modes + artifact-diff re-review (FR-1) | Reference/phase-scoped context does not degrade builder/reviewer output (guardrail: cycle findings-per-phase and gate outcomes on a comparison run). |
 | P7 | Effort tiering + severity-gated escalation + cheap mechanical profile + doctor probes (FR-6) | Effort/tier settings measurably cut cost without raising blocking-finding escape rate. |
 | P8 | Gate context enrichment (FR-8) | Gate decisions are makeable from the gate view alone. |
+| P9 | Intra-phase checkpoint commits + checkpoint-aware recovery (FR-11) | A prompt-directed commit discipline is followed reliably enough to bound lost work deterministically — the hedge for P1's bet on CLI session resume. |
+| P10 | Usage ledger + window admission (FR-10) | Local manifest data approximates the shared provider window well enough that proactive warnings/parks beat reactive halts. |
+| P11 | Concurrent triage + judge decision cache (FR-9, FR-12) | Concurrency and caching change wall-clock and cost without changing any artifact byte or any judge outcome. |
 
-Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to survive the wait; pairs with heartbeat). No phase depends on a later phase; P3 renders whatever P1/P2 stamped, P8 renders what P5's checkpoints and existing metrics already persist.
+Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to survive the wait; pairs with heartbeat). No phase depends on a later phase; P3 renders whatever P1/P2 stamped, P8 renders what P5's checkpoints and existing metrics already persist, P9–P11 are independent of each other. P9 sits after the observability phases only because its risk is behavioral (does the builder follow the discipline?), which P1's integration experience will inform — it has no code dependency on P2–P8.
 
 ## §9 Success Metrics
 
@@ -243,6 +304,9 @@ Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to s
 - **Cost shape:** triage + escalation + mechanical steps ≤ 10% of run cost (per `agent_usage`); escalation-profile calls occur only for blocking/major findings.
 - **Observability:** for every park/halt/fail state reachable in the test suite, `status --json` alone identifies cause and next command (asserted by a table-driven test); `doctor` catches a bad model alias before any run step executes.
 - **Quality guardrail (must not regress):** blocking findings per phase and gate rejection rate on a comparison run with scoped context are within noise of the inline baseline (Open Question Q3 sets the comparison protocol).
+- **Lost work bound:** worst-case repeated work after any interruption ≤ 1 intra-phase milestone (manifest-verifiable: recovery rewind target is a `wip:` commit, not `base_sha`, whenever ≥ 1 checkpoint existed).
+- **Proactive vs reactive:** with `enforce: true` on a window-constrained run, ≥ 80% of usage-limit interruptions are pre-step `usage_window` parks rather than mid-step `usage_limit` parks.
+- **Latency:** triage wall-clock for a 5-finding round ≤ 40% of sequential baseline; on a repeat-heavy step (e.g., iterated test runs), judge LLM-rung invocations drop ≥ 50% with zero decision changes.
 
 ## §10 Risks & Mitigations
 
@@ -256,6 +320,10 @@ Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to s
 | Checkpoint reuse resumes against a moved worktree | Handoff-SHA guard invalidates checkpoints (FR-4.2), falling back to a full round |
 | Cheap mechanical profiles produce format-invalid commit messages | Existing message-schema validation loop retained; escalate-to-builder-profile fallback after retries |
 | Status additions break `additionalProperties: false` consumers | Additive-only with always-present nullable fields, per the documented compatibility policy; schema test in FR-7.1 |
+| Builder ignores or misuses the checkpoint-commit instruction (garbage milestones, none at all) | Recovery falls back to `base_sha` (today's behavior) when no checkpoint exists; milestone quality is observable in history and correctable via prompt iteration; `keep` default makes compliance auditable |
+| Ledger under-counts (non-gauntlet usage invisible) or over-parks | Advisory-by-default (FR-10.3); estimates use medians, not maxima; a wrong continue is survivable via FR-3, making the ledger a pure improvement rather than a correctness dependency |
+| Concurrent triage hits provider rate limits | Bounded pool (default 4) on the cheap unconstrained provider; a 429 there is a `transient_overload` classification (FR-3.1) — park and resume with checkpointed verdicts |
+| Judge cache masks a policy change mid-run | Policy content hash is part of the key; any edit invalidates the entire cache immediately |
 
 ## §11 Open Questions
 
@@ -265,3 +333,6 @@ Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to s
 - **Q4 — Escalation-park response coverage.** BOOTSTRAP-NOTES #51 recorded that `resume --response` did not reach an adversarial_cycle FR-10.4 park; later work (`test_cycle_resume_response.py`, the resume-terminal-cycle path) may have closed part of this. Verify remaining gaps during P1 planning; if a park variant is still unreachable by `--response`, add it to FR-3's scope.
 - **Q5 — Threshold ratification.** The numbers in §9 (80% session-resume success, ≤40% payload, ≤10% cost share, 2 repair attempts, 15s/30s heartbeat constants, 12h credit cap) are proposals, not measurements. Ratify or adjust at the PRD gate.
 - **Q6 — `signal_kill` attribution.** FR-7.2 stamps `operator_recover` when `gauntlet recover` kills a step, but an external `kill -9`/crash is indistinguishable from power loss at stamp time. Is post-hoc attribution on next resume ("stamped on reconciliation") sufficient? *Proposal: yes — stamp `signal_kill` during resume reconciliation with a note that attribution is inferred.*
+- **Q7 — Ledger scope and location.** Machine-global (`~/.gauntlet/`) is proposed because parallel runs across repos share one account window. Should it also be per-account-keyed (multiple operators on one machine, one operator across machines)? *Proposal: machine-global v1; account keying post-v1.*
+- **Q8 — Checkpoint squash default.** `keep` preserves audit granularity but adds commits to the PR; `squash` keeps history clean but discards milestone timing. *Proposal: `keep` — the PR is squash-mergeable anyway.*
+- **Q9 — Window budget value.** The provider window budget (FR-10.2) has no API to query; it must be configured from observed limits. What starting value — and should the ledger self-calibrate from observed `usage_limit` halt times (each reactive halt is a data point on where the ceiling is)? *Proposal: configure conservatively from experience; self-calibration recorded as post-v1.*
