@@ -1,0 +1,49 @@
+# The lightweight `gauntlet review` pipeline (PRD "Lightweight Issue Workflow").
+#
+# A single-stage pipeline: ONE `adversarial_cycle` step in `code_review` mode,
+# and NOTHING else — no PRD/plan ceremony, no `human_gate`. The engineer brings
+# their own fix on a branch; this reviews that change (review → triage → fix →
+# confirm) against the originating problem statement (`intent.md`) and lands any
+# accepted fixes as `REVIEW.x` commits in place. Fixes are local; the harness
+# never pushes (FR-9.8 / FR-4.4).
+#
+# ZERO ROUTINE GATES (FR-3.1 / G6): the cycle runs unattended to completion. The
+# only human touch-point is the one-time pre-run ratification of a non-independent
+# (author/session-derived) intent, which happens at run ENTRY (FR-2.5), before
+# this pipeline is driven — never inside the cycle. An independent `tracker`
+# intent reaches the cycle with no human turn at all.
+#
+# FAIL CLOSED (FR-3.2 / FR-3.4): an unresolved legitimate BLOCKING finding parks
+# the run for a human (recoverable via `gauntlet resume --response`); an
+# unresolved legitimate non-blocking finding completes but is recorded in the run
+# summary as residual risk. Nothing is ever silently dropped.
+#
+# The review command injects the fields the cycle cannot know statically:
+#   - `review_base`: the concrete merge-base SHA of the resolved base and HEAD,
+#     so the cycle's two-dot `range_diff(review_base, HEAD)` yields the FR-5.2
+#     three-dot `base...HEAD` scope (the whole change since divergence).
+#   - `max_rounds`: from `--rounds` (default 1, FR-3.3).
+#   - `intent_path` / `intent_provenance` / `intent_independent`: the resolved
+#     `intent.md` and its provenance, threaded into the reviewer prompt (FR-2.2)
+#     and wrapped as untrusted data where it flows to the triager (§7). Absent for
+#     a `--code-only` run (a diff-quality review with no intent).
+
+name: review
+version: 1
+
+stages:
+  - id: review
+    steps:
+      # Optional baseline test step — OFF by default (FR-1.1, Open Question 11.5).
+      # `--test` prepends this step at runtime (it requires `config.test_command`
+      # to be set); `--no-test` is the explicit-off form. Left commented here so
+      # the shipped asset validates without a test_command; the review command
+      # injects the concrete step only when `--test` is passed.
+      # - {id: baseline-tests, type: shell, run: "{{config.test_command}}",
+      #    timeout_s: 1800}
+      - {id: review-cycle, type: adversarial_cycle, mode: code_review,
+         phase: REVIEW, reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 1,
+         review_prompt: prompts/review-code-intent.md}
+         # review_base / max_rounds / intent_* are injected by the review command
+         # from the FR-5 base resolution and FR-2 intent resolution.

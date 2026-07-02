@@ -7,6 +7,7 @@ P3 adds the run lifecycle (`new`, `run`, `status`, `approve`, `reject`,
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
@@ -279,6 +280,184 @@ def run(
         reservation_token=reservation_token,
     )
     typer.echo(f"run status: {status}")
+
+
+@app.command()
+def review(
+    branch: str = typer.Argument(
+        None, help="Local branch to review (default: the current branch)."
+    ),
+    pr: str = typer.Option(
+        None, "--pr",
+        help="GitHub PR number or URL: check it out locally and review it "
+        "against its base + linked ticket, landing fixes locally (FR-4).",
+    ),
+    issue: str = typer.Option(
+        None, "--issue", help="Issue tracker ref/URL (e.g. ENG-1234) for intent."
+    ),
+    intent: Path = typer.Option(
+        None, "--intent", help="Path to a problem-statement file for intent."
+    ),
+    message: str = typer.Option(
+        None, "-m", "--message", help="Inline problem statement for intent."
+    ),
+    intent_provenance: str = typer.Option(
+        None, "--intent-provenance",
+        help="Independence of a manual intent: tracker | tracker-session | "
+        "author-session-summary (default author-session-summary). Rejected with "
+        "--issue (always 'tracker').",
+    ),
+    approved_intent: bool = typer.Option(
+        False, "--approved-intent",
+        help="Assert a non-independent intent was ratified out of band (the "
+        "non-interactive form of the FR-2.5 ratification hook).",
+    ),
+    base: str = typer.Option(
+        None, "--base", help="Diff base ref (default: config.base_branch or origin/HEAD).",
+    ),
+    code_only: bool = typer.Option(
+        False, "--code-only", help="Diff-only review with no intent (FR-2.3)."
+    ),
+    rounds: int = typer.Option(
+        1, "--rounds", help="Adversarial-cycle rounds, 1..10 (default 1)."
+    ),
+    test: bool = typer.Option(
+        None, "--test/--no-test",
+        help="Run config.test_command as a baseline step first (off by default).",
+    ),
+    response: str = typer.Option(
+        None, "--response",
+        help="Resume a parked/failed review with a human decision (FR-3.2/FR-10.4).",
+    ),
+) -> None:
+    """Adversarially review a change in place against its originating intent.
+
+    Runs only the adversarial review cycle (review → triage → fix → confirm)
+    against an already-implemented change on a branch, landing accepted fixes as
+    REVIEW.x commits in place (no branch minted, nothing pushed). Zero routine
+    gates; an unresolved blocking finding parks the run (resume with --response),
+    an unresolved legitimate non-blocking finding completes and is surfaced as
+    residual risk (FR-3.4).
+    """
+    from gauntlet.engine import manifest as M
+    from gauntlet.engine.review import (
+        Hooks,
+        ReviewInputs,
+        ReviewLifecycle,
+        ReviewUsageError,
+        ReviewFailClosed,
+        drive_review,
+        load_review_run,
+        resume_review,
+    )
+
+    mgr = _manager()
+    inputs = ReviewInputs(
+        branch=branch,
+        pr=pr,
+        issue=issue,
+        intent_path=str(intent) if intent is not None else None,
+        message=message,
+        intent_provenance=intent_provenance,
+        approved_intent=approved_intent,
+        base=base,
+        code_only=code_only,
+        rounds=rounds,
+        test=test,
+    )
+    hooks = Hooks(
+        isatty=sys.stdin.isatty,
+        edit_statement=lambda text, _root: typer.edit(text) or text,
+        confirm_statement=lambda text: typer.confirm(
+            "Ratify this problem statement and start the review?", default=False
+        ),
+    )
+    lifecycle = ReviewLifecycle(mgr.repo_root, mgr.config, hooks=hooks)
+    try:
+        # Locate the (side-effect-free) state dir first so an existing parked/
+        # running review is resumed, not clobbered by a fresh resolution.
+        _target, _slug, state_dir = lifecycle.locate(inputs)
+        existing = load_review_run(state_dir)
+        if response is not None or existing is not None:
+            if existing is None:
+                typer.echo(
+                    f"review cannot proceed: no resumable review run at {state_dir} "
+                    "(nothing to resume). Run `gauntlet review` without --response "
+                    "to start one.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            outcome = resume_review(
+                mgr.repo_root, mgr.config, state_dir, response=response,
+            )
+        else:
+            resolution = lifecycle.resolve(inputs)
+            outcome = drive_review(mgr.repo_root, mgr.config, resolution)
+    except ReviewUsageError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except ReviewFailClosed as exc:
+        typer.echo(f"review cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    _render_review_outcome(outcome, M)
+
+
+def _render_review_outcome(outcome, M) -> None:
+    """Print a review run's terminal state: status, REVIEW.x commits, residual
+    risk / declined findings (FR-3.4), and the state dir."""
+    typer.echo(f"review {outcome.status} (branch operated on in place)")
+    # PR-mode notes (FR-4.3/FR-4.4): the chosen linked ticket + any ignored
+    # secondary refs, and the fork manual-push note, surfaced in the summary.
+    if outcome.pr_chosen_ref:
+        typer.echo(f"  PR intent from linked ticket {outcome.pr_chosen_ref}")
+    if outcome.pr_ignored_refs:
+        typer.echo(
+            "  warning: PR body links multiple tickets; using "
+            f"{outcome.pr_chosen_ref}. Ignored secondary refs: "
+            f"{', '.join(outcome.pr_ignored_refs)} (override with --issue)."
+        )
+    if outcome.pr_is_fork:
+        typer.echo(
+            "  fork PR: fixes landed locally; push-back is your action and may "
+            "need maintainer-edit access on the PR (FR-4.4)."
+        )
+    if outcome.commits:
+        typer.echo(f"  landed {len(outcome.commits)} fix commit(s):")
+        for phase, sha in outcome.commits:
+            typer.echo(f"    {phase}: {sha[:10]}")
+    else:
+        typer.echo("  no fix commits landed")
+
+    summary = outcome.summary
+    if summary.residual_risk:
+        typer.echo(
+            f"  residual risk — {len(summary.residual_risk)} legitimate "
+            "non-blocking finding(s) not fully resolved (surface on the PR):"
+        )
+        for f in summary.residual_risk:
+            cv = f.confirm_verdict or "not confirmed"
+            typer.echo(f"    [{f.severity}] {f.id} @ {f.location}: {f.claim} ({cv})")
+    if summary.declined:
+        typer.echo(f"  declined — {len(summary.declined)} finding(s) not fixed:")
+        for f in summary.declined:
+            typer.echo(
+                f"    [{f.severity}] {f.id} ({f.triage_verdict}): {f.triage_reasoning}"
+            )
+
+    if outcome.parked:
+        typer.echo(
+            "  PARKED on an unresolved blocking finding (fail closed, FR-3.2); "
+            'resume with `gauntlet resume --response "<decision>"`.'
+        )
+        if outcome.cycle_notes:
+            typer.echo(f"  reason: {outcome.cycle_notes}")
+    typer.echo(f"  state: {outcome.state_dir}")
+    # Any non-DONE terminal state is a non-zero exit: a park (fail closed, FR-3.2),
+    # a failure, or a budget/timeout halt — never a silent exit 0 on an incomplete
+    # review (data over inference).
+    if outcome.status != M.RUN_DONE:
+        raise typer.Exit(1)
 
 
 def _run_interactive(
@@ -664,6 +843,59 @@ def reject(
     )
 
 
+def _locate_review_run(mgr, slug: str) -> Path | None:
+    """The out-of-repo state dir of a resumable review run named by ``slug``, else None.
+
+    A review run's on-disk ``<slug>`` is `review_slug(<target-branch>)`, so accept
+    either the review slug itself or a raw branch name (which is sanitized to that
+    slug). Returns the state dir only when a *bound, non-terminal* review run lives
+    there (``load_review_run``), so a slug that collides with a heavyweight run —
+    or a review run that never bound / already finished — falls through to the
+    heavyweight resume path unchanged."""
+    import os
+
+    from gauntlet.engine.review import (
+        ReviewFailClosed,
+        derive_repo_id,
+        load_review_run,
+        resolve_state_dir,
+        review_slug,
+    )
+
+    repo_id = derive_repo_id(mgr.repo_root)
+    seen: set[str] = set()
+    for candidate in (slug, review_slug(slug)):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            state_dir = resolve_state_dir(
+                mgr.repo_root, mgr.config,
+                repo_id=repo_id, slug=candidate, environ=os.environ,
+            )
+        except ReviewFailClosed:
+            continue
+        if load_review_run(state_dir) is not None:
+            return state_dir
+    return None
+
+
+def _resume_review_cli(mgr, state_dir: Path, *, response: str | None, no_judge: bool) -> None:
+    """Resume a parked/failed review run and render its terminal outcome (FR-3.2)."""
+    from gauntlet.engine import manifest as M
+    from gauntlet.engine.review import ReviewFailClosed, resume_review
+
+    try:
+        outcome = resume_review(
+            mgr.repo_root, mgr.config, state_dir,
+            response=response, use_judge=not no_judge,
+        )
+    except ReviewFailClosed as exc:
+        typer.echo(f"resume cannot proceed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _render_review_outcome(outcome, M)
+
+
 @app.command()
 def resume(
     slug: str,
@@ -684,9 +916,19 @@ def resume(
     an adversarial_cycle escalation its own loop cannot resolve (FR-10.4/10.5) —
     supply `--response "<decision>"` to record it (audited in the manifest) and
     re-drive with it injected. Other parks resume as before.
+
+    A lightweight `gauntlet review` run keeps its state out-of-repo (not in
+    run_root), so when the slug names a resumable review run this routes to the
+    review resume path — the PRD-documented recovery for a parked review is
+    `gauntlet resume --response` (FR-3.2), not only `gauntlet review --response`.
     """
+    mgr = _manager()
+    review_dir = _locate_review_run(mgr, slug)
+    if review_dir is not None:
+        _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
+        return
     try:
-        status = _manager().resume(slug, response=response, use_judge=not no_judge)
+        status = mgr.resume(slug, response=response, use_judge=not no_judge)
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and

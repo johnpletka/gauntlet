@@ -28,6 +28,22 @@ interrupted_step: park
 # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
 reviewer_mutation: commit
 
+# Lightweight `gauntlet review` issue tracker (FR-6, optional). Uncomment to let
+# `gauntlet review --issue ENG-1234` (and `--pr`'s linked-ticket auto-derive)
+# fetch the originating problem statement. v1 supports only `linear`; the token
+# lives in the ENVIRONMENT under the name below, NEVER in this file (§7).
+# issue_tracker:
+#   provider: linear            # v1: only "linear"; github / jira reserved
+#   api_key_env: LINEAR_API_KEY # NAME of the env var holding the token, not the token
+#   timeout_s: 10               # per-call tracker timeout (min 1)
+#   # workspace: acme           # optional, provider-specific
+
+# Where a `gauntlet review` run keeps its state (FR-8, optional). Default (unset)
+# is out-of-repo so a review leaves ZERO git-status footprint. Set to an in-repo,
+# gitignored path (e.g. .gauntlet/runs) to keep the review audit trail committable.
+# review:
+#   state_dir: null
+
 agents:
   builder:
     adapter: claude-code

@@ -1,6 +1,6 @@
 [project]
 name = "gauntlet-spec"
-version = "0.3.3"
+version = "0.4.0"
 description = "Adversarial multi-agent development harness: PRD -> plan -> phased implementation, every artifact reviewed adversarially"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,6 +49,11 @@ gauntlet-judge-hook = "gauntlet.judge.hook_client:main"
 claude-code = "gauntlet.adapters.claude_code:ClaudeCodeAdapter"
 codex = "gauntlet.adapters.codex:CodexAdapter"
 api = "gauntlet.adapters.api:ApiAdapter"
+
+# FR-6.1: issue trackers are plugins registered via entry points; v1 registers
+# exactly one (linear). GitHub Issues / Jira are a registry seam, not built code.
+[project.entry-points."gauntlet.issue_trackers"]
+linear = "gauntlet.trackers.linear:LinearIssueTracker"
 
 [build-system]
 requires = ["hatchling"]

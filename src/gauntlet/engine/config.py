@@ -10,11 +10,12 @@ effect of constructing the CLI adapters and is invoked explicitly for ``api``.
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
@@ -22,6 +23,10 @@ from gauntlet.engine.gitops import Identity
 from gauntlet.logging.redact import RedactionSettings
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
+
+# A POSIX environment-variable identifier. ``issue_tracker.api_key_env`` must
+# match this — it names the env var holding the token, never the token (§7).
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_repo_relative(field: str, v: str) -> str:
@@ -110,10 +115,118 @@ class AgentProfile(BaseModel):
         return self.adapter_class().capabilities
 
 
+class IssueTrackerConfig(BaseModel):
+    """The optional `issue_tracker:` config block (§6, FR-6.1/FR-6.2/FR-6.4).
+
+    Selects the pluggable issue-tracker provider for the lightweight
+    `gauntlet review` flow. Absent (or ``provider: none``), tracker resolution is
+    disabled and `--issue` is rejected while `--intent`/`-m`/`$EDITOR` still work
+    (FR-6.5). ``api_key_env`` is the **name** of the env var holding the token —
+    never the token itself (FR-1.4 base spec, §7).
+    """
+
+    # ``hide_input_in_errors``: a rejected ``api_key_env`` may be a pasted token,
+    # so never let pydantic echo the raw input back in the ValidationError text
+    # (FR-1.4 base spec, §7; review F-001).
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
+
+    provider: str = "linear"
+    api_key_env: str = "LINEAR_API_KEY"
+    timeout_s: float = 10.0
+    workspace: str | None = None
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, v: str) -> str:
+        """``api_key_env`` is the NAME of the env var holding the token, never
+        the token itself (FR-1.4 base spec, §7).
+
+        Without this guard a pasted token would be persisted in repo config and
+        later echoed back verbatim by ``gauntlet doctor``'s tracker check — a
+        secret leak. Enforce a POSIX env-var identifier and reject the known
+        Linear token shape (``lin_api_…``) so an actual token fails closed at
+        load. The error never echoes the raw value (it may be a secret): it
+        reports only the value's length/shape."""
+        raw = (v or "").strip()
+        if not raw:
+            raise ValueError(
+                "issue_tracker.api_key_env must be a non-empty env-var NAME "
+                "(e.g. LINEAR_API_KEY), not the token itself"
+            )
+        if raw.lower().startswith("lin_api_") or not _ENV_NAME_RE.match(raw):
+            raise ValueError(
+                "issue_tracker.api_key_env must be a valid environment-variable "
+                "NAME matching [A-Za-z_][A-Za-z0-9_]* (e.g. LINEAR_API_KEY); it "
+                "holds the name of the env var, never the token itself "
+                f"(got a {len(raw)}-character value that is not a valid name)"
+            )
+        return raw
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, v: str) -> str:
+        """v1 accepts only a registered provider (FR-6.2). ``none`` disables the
+        block; any other unregistered value fails closed at load, naming the
+        supported set."""
+        name = (v or "").strip().lower()
+        if name == "none":
+            return name
+        from gauntlet.trackers import available_trackers
+
+        known = sorted(available_trackers())
+        if name not in known:
+            raise ValueError(
+                f"unsupported issue_tracker provider {v!r}; supported: "
+                f"{known} (or 'none' to disable). github / jira are reserved but "
+                "not implemented in v1."
+            )
+        return name
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _validate_timeout(cls, v: float) -> float:
+        """Per-call tracker timeout (FR-6.4): default 10, minimum 1. A
+        non-positive value — and anything below the stated 1s floor — fails
+        closed at load."""
+        if v < 1:
+            raise ValueError(
+                f"issue_tracker.timeout_s must be at least 1 second; got {v!r}"
+            )
+        return v
+
+    @property
+    def enabled(self) -> bool:
+        """False when the block disables tracking (``provider: none``)."""
+        return self.provider != "none"
+
+
+class ReviewConfig(BaseModel):
+    """The optional `review:` config block (§6, FR-8.1/FR-8.3).
+
+    Controls where a lightweight `gauntlet review` run keeps its state
+    (manifest, `intent.md`, transcripts, summary). ``state_dir`` defaults to
+    ``null`` — the out-of-repo XDG location (``${XDG_STATE_HOME:-~/.local/state}
+    /gauntlet/reviews/<repo-id>/<slug>/``) so a review leaves zero Git-status
+    footprint. Set it (e.g. ``.gauntlet/runs``) to opt into an in-repo,
+    gitignored layout for teams that want the review audit trail committable; an
+    in-repo value that is not gitignored fails closed at resolution (FR-8.3).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    state_dir: str | None = None
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
-    model_config = ConfigDict(extra="allow")
+    # ``hide_input_in_errors``: config load is the entry point that validates the
+    # nested ``issue_tracker.api_key_env``; pydantic renders the whole
+    # ValidationError with the top-level model's config, so this flag must live
+    # here too or a token pasted into ``api_key_env`` would be echoed back in the
+    # load error (FR-1.4 base spec, §7; review F-001). The bespoke field
+    # validators already include any non-secret value in their own message.
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
 
     # Branch a run is created from. A literal branch name (default "main"), or
     # the sentinel "current" meaning "branch from whatever branch is checked out
@@ -164,6 +277,15 @@ class RunConfig(BaseModel):
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
 
+    # Optional issue-tracker provider for the `gauntlet review` flow (§6,
+    # FR-6.1). Absent => tracker resolution disabled; `--issue` is rejected while
+    # `--intent`/`-m`/`$EDITOR` still work (FR-6.5).
+    issue_tracker: IssueTrackerConfig | None = None
+
+    # Optional `review:` block controlling the `gauntlet review` state location
+    # (§6, FR-8.3). Absent => the out-of-repo XDG default (zero repo footprint).
+    review: ReviewConfig = Field(default_factory=ReviewConfig)
+
     # NOTE: the optional console `web:` block (FR-9.4) is intentionally NOT a
     # field here — console settings stay above the orchestrator (plan ground
     # rules / review F-004). It rides on `extra="allow"` and is parsed/validated
@@ -184,6 +306,22 @@ class RunConfig(BaseModel):
         value would let ``gauntlet serve`` browse files outside the repo (review
         F-001). Same repo-relative containment as asset_root."""
         return _validate_repo_relative("run_root", v)
+
+    @model_validator(mode="after")
+    def _redact_tracker_token(self) -> RunConfig:
+        """Extend the redaction list with the tracker's ``api_key_env`` (§7).
+
+        The env-name heuristic (KEY/TOKEN/SECRET/…) already masks the default
+        ``LINEAR_API_KEY``, but a custom env-var name that misses the heuristic
+        would otherwise leak. Adding it to ``extra_env_vars`` guarantees the
+        resolved tracker token can never be written to any artifact, regardless
+        of the chosen env-var name. Additive and idempotent."""
+        tracker = self.issue_tracker
+        if tracker is not None and tracker.enabled:
+            name = tracker.api_key_env
+            if name and name not in self.redaction.extra_env_vars:
+                self.redaction.extra_env_vars.append(name)
+        return self
 
     def profile(self, name: str) -> AgentProfile:
         try:

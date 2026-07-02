@@ -53,6 +53,7 @@ def _probes(
     authed: dict[str, bool | None] | None = None,
     which: object | None = None,
     judge_model_resolvable: object | None = None,
+    tracker_auth_probe: object | None = None,
 ) -> DoctorProbes:
     # Default: every present CLI is authenticated and the hook binary is on PATH,
     # so a "healthy" environment passes without a real subprocess/PATH probe.
@@ -68,6 +69,11 @@ def _probes(
             judge_model_resolvable
             if judge_model_resolvable is not None
             else (lambda _model: None)
+        ),
+        tracker_auth_probe=(
+            tracker_auth_probe
+            if tracker_auth_probe is not None
+            else (lambda _cfg, _env: None)
         ),
     )
 
@@ -568,3 +574,70 @@ def test_skill_check_warns_and_does_not_dereference_symlinked_parent(tmp_path):
     assert skill.status == WARN
     assert skill.status != FAIL
     assert "symlink" in skill.detail.lower()
+
+
+# ---- issue-tracker check (FR-10.1) ------------------------------------------
+
+
+def _set_issue_tracker(repo: Path, block: dict | None) -> None:
+    """Set (or, with block=None, remove) the `issue_tracker` config block."""
+    cfg_path = repo / ".gauntlet/config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    if block is None:
+        cfg.pop("issue_tracker", None)
+    else:
+        cfg["issue_tracker"] = block
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+
+def test_no_tracker_block_emits_no_check(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert "issue-tracker" not in _by_name(results)
+
+
+def test_tracker_ok_when_env_set_and_probe_succeeds(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    _set_issue_tracker(repo, {"provider": "linear", "api_key_env": "LINEAR_API_KEY"})
+    env = {**_GOOD_ENV, "LINEAR_API_KEY": "lin_secret"}
+    results = run_doctor(
+        repo,
+        probes=_probes(_GOOD_VERSIONS, env, tracker_auth_probe=lambda _c, _e: None),
+    )
+    tr = _by_name(results)["issue-tracker"]
+    assert tr.status == OK
+    assert not has_failure(results)
+
+
+def test_tracker_fails_when_env_var_unset(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    _set_issue_tracker(repo, {"provider": "linear", "api_key_env": "LINEAR_API_KEY"})
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    tr = _by_name(results)["issue-tracker"]
+    assert tr.status == FAIL
+    assert "LINEAR_API_KEY" in tr.detail
+    assert has_failure(results)
+
+
+def test_tracker_fails_when_probe_reports_auth_error(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    _set_issue_tracker(repo, {"provider": "linear", "api_key_env": "LINEAR_API_KEY"})
+    env = {**_GOOD_ENV, "LINEAR_API_KEY": "bad"}
+    results = run_doctor(
+        repo,
+        probes=_probes(
+            _GOOD_VERSIONS, env,
+            tracker_auth_probe=lambda _c, _e: "HTTP 401",
+        ),
+    )
+    tr = _by_name(results)["issue-tracker"]
+    assert tr.status == FAIL
+    assert "401" in tr.detail
+    assert has_failure(results)
+
+
+def test_tracker_none_provider_emits_no_check(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    _set_issue_tracker(repo, {"provider": "none"})
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert "issue-tracker" not in _by_name(results)

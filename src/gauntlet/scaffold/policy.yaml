@@ -195,6 +195,25 @@ allow:
     command_patterns:
       - '^\s*(uv\s+run\s+)?(python\s+-m\s+)?gauntlet\b'
 
+  - name: pr-read-commands
+    id: pr_read_commands
+    version: v1
+    ratified: true
+    description: "Review PR-mode (FR-7.3) reads: gh pr view / gh pr checkout /
+        git fetch. All are read-only — they resolve PR metadata and fetch the PR
+        head into a local branch; none mutate a remote. The harness issues them
+        from its own process on every --pr run, so they are blessed explicitly
+        here rather than left to the LLM fallback (FR-7.3), under a stable
+        id/version the deterministic FR-7.4 preflight verifies before any read
+        runs. Remote-mutating gh/git (push, pr create, pr merge) stay independently
+        denied by the deny-first rules in every context (FR-9.8), so this allow
+        never widens the blast radius. Like every allow rule it is skipped on a
+        chained/piped/redirected command, so a benign prefix cannot bless a
+        dangerous trailing segment."
+    applies_to_tools: [ Bash ]
+    command_patterns:
+      - '^\s*gh\s+pr\s+(view|checkout)\b'
+      - '^\s*git\s+fetch\b'
 ask:
   - name: package-install
     description: "Installing packages can run arbitrary install scripts."

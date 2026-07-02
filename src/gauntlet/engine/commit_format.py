@@ -13,6 +13,11 @@ Accepted header forms (the phase prefix is structural, not free text):
   phases, so their fix rounds carry the stage name instead (FR-10.4
   resolution ratified 2026-06-12, BOOTSTRAP-NOTES #28). Rollback targets
   stay numeric — ``PRD``/``PLAN`` commits are not ``--phase N`` boundaries.
+- ``REVIEW.1:`` / ``REVIEW.r1:``          the lightweight ``gauntlet review``
+  flow's single ``adversarial_cycle`` carries ``phase: REVIEW`` (no numbered
+  phase), so its accepted-fix commits land as ``REVIEW.x`` in place on the
+  branch under review (PRD "Lightweight Issue Workflow" FR-8.2/FR-3.4). Like
+  ``PRD``/``PLAN`` it is a stage label, not a numeric rollback boundary.
 """
 
 from __future__ import annotations
@@ -22,8 +27,8 @@ from dataclasses import dataclass
 
 HEADER_MAX = 72
 
-# P<n> | PRD | PLAN, optionally .<round> or .r<round>, then ": " + summary.
-_PREFIX = r"(?:P\d+|PRD|PLAN)"
+# P<n> | PRD | PLAN | REVIEW, optionally .<round> or .r<round>, then ": " + summary.
+_PREFIX = r"(?:P\d+|PRD|PLAN|REVIEW)"
 _HEADER_RE = re.compile(rf"^{_PREFIX}(?:\.\d+|\.r\d+)?: \S.*$")
 
 

@@ -311,6 +311,28 @@ def test_init_flags_multi_module_repo(tmp_path):
     assert "cd frontend && npm test" in text
 
 
+def test_init_scaffolds_review_pipeline_and_issue_tracker_config(tmp_path):
+    """FR-10.2: a fresh init ships pipelines/review.yaml + the review prompt and a
+    commented issue_tracker block in the config."""
+    from gauntlet.engine.pipeline import load_pipeline
+
+    init_repo(tmp_path)
+    review_yaml = tmp_path / ".gauntlet/pipelines/review.yaml"
+    assert review_yaml.exists(), "init must ship pipelines/review.yaml (FR-10.2)"
+    pipeline, _ = load_pipeline(review_yaml)  # loads + validates
+    assert pipeline.name == "review"
+    assert (tmp_path / ".gauntlet/prompts/review-code-intent.md").exists()
+
+    config_text = (tmp_path / ".gauntlet/config.yaml").read_text()
+    # A COMMENTED example (not an active block) carrying the Linear provider +
+    # the env-var NAME (never a token).
+    assert "# issue_tracker:" in config_text
+    assert "provider: linear" in config_text
+    assert "LINEAR_API_KEY" in config_text
+    # It stays commented — RunConfig loads with tracker resolution disabled.
+    assert RunConfig.load(tmp_path / ".gauntlet/config.yaml").issue_tracker is None
+
+
 def test_shipped_scaffold_matches_repo_canonical_assets():
     """The bundled defaults must not drift from the repo's live assets.
 
@@ -321,6 +343,7 @@ def test_shipped_scaffold_matches_repo_canonical_assets():
         SCAFFOLD_DIR / "policy.yaml": REPO / "policy.yaml",
         SCAFFOLD_DIR / "pins.yaml": REPO / ".gauntlet/pins.yaml",
         SCAFFOLD_DIR / "pipelines/standard.yaml": REPO / "pipelines/standard.yaml",
+        SCAFFOLD_DIR / "pipelines/review.yaml": REPO / "pipelines/review.yaml",
         SCAFFOLD_DIR / "claude-settings.json": REPO / ".claude/settings.json",
     }
     for schema in (

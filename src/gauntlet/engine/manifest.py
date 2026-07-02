@@ -179,6 +179,100 @@ class CommitRecord(BaseModel):
     sha: str
 
 
+# --- review-run intent provenance (lightweight `gauntlet review`, §6/FR-2.6) --
+# A review run resolves its problem statement (`intent.md`) from one of four
+# sources and tags it with a provenance on an independence axis. The block is
+# persisted here so provenance and — for a non-independent statement — the
+# human ratification that made its circularity tolerable (FR-2.5) are auditable,
+# and so the reviewer prompt can be told how the intent was sourced (FR-2.2).
+
+# The single intent source that produced the statement (§6 manifest block).
+INTENT_SOURCE_ISSUE = "issue"
+INTENT_SOURCE_INTENT_FILE = "intent-file"
+INTENT_SOURCE_MESSAGE = "message"
+INTENT_SOURCE_EDITOR = "editor"
+INTENT_SOURCE_CODE_ONLY = "code-only"
+
+# Provenance on the independence axis (FR-2.1a). `tracker` is the only
+# independent value; the rest are the author's own framing of the problem.
+PROVENANCE_TRACKER = "tracker"
+PROVENANCE_TRACKER_SESSION = "tracker-session"
+PROVENANCE_AUTHOR_SESSION_SUMMARY = "author-session-summary"
+PROVENANCE_NONE = "none"  # `--code-only`: there is no intent to place on the axis
+
+# Manual `--intent-provenance` choices (declared by the operator; FR-1.1). The
+# tracker/none provenances are never operator-declared — they are derived from
+# the source.
+MANUAL_PROVENANCES = frozenset(
+    {PROVENANCE_TRACKER, PROVENANCE_TRACKER_SESSION, PROVENANCE_AUTHOR_SESSION_SUMMARY}
+)
+
+# How a non-independent intent was ratified before the cycle (FR-2.5/FR-2.6).
+RATIFICATION_INTERACTIVE = "interactive-confirm"
+RATIFICATION_APPROVED_FLAG = "approved-intent-flag"
+
+
+class RatificationRecord(BaseModel):
+    """The pre-run human ratification of a non-independent intent (FR-2.5/2.6).
+
+    Present only when ``IntentRecord.independent`` is ``False``. ``method`` is
+    ``interactive-confirm`` (a TTY operator confirmed/edited the statement) or
+    ``approved-intent-flag`` (``--approved-intent`` asserted an out-of-band
+    ratification, e.g. a skill's in-session review). ``user`` is the resolved
+    human operator identity; ``timestamp`` is UTC ISO-8601.
+    """
+
+    method: str
+    user: str
+    timestamp: str
+
+
+class IntentRecord(BaseModel):
+    """The resolved intent's provenance for a review run (§6 manifest block).
+
+    ``independent`` is derived from ``provenance`` (``tracker`` ⇒ ``True``, every
+    other value ⇒ ``False``); it is stored explicitly so a reader need not
+    re-derive it. ``ratification`` is present iff ``independent`` is ``False``.
+    For a ``code-only`` run ``source`` is ``code-only``, ``provenance`` is
+    ``none``, ``independent`` is ``False``, and there is no ratification (there
+    is no intent to ratify).
+
+    ``repo_exclude`` is the repo-relative path of an in-repo, untracked
+    ``--intent`` file (FR-2.4): it is persisted so a ``resume`` re-applies the
+    same worktree exclusion the fresh run derived, keeping the user's intent
+    file out of the clean-handoff checks and every ``REVIEW.x`` fix commit.
+    Absent (``None``) whenever the intent did not come from an in-repo untracked
+    file (a tracker issue, ``-m`` text, the ``$EDITOR`` template, an out-of-repo
+    or tracked ``--intent`` path, or ``--code-only``).
+    """
+
+    source: str
+    provenance: str
+    independent: bool
+    ratification: RatificationRecord | None = None
+    repo_exclude: str | None = None
+
+
+class ReviewPrRecord(BaseModel):
+    """PR-mode facts a review's terminal summary needs (§6, FR-4.3/FR-4.4).
+
+    Persisted at the pre-cycle boundary so a review that parks/fails and is later
+    resumed still renders the chosen linked ticket, the ignored secondary refs,
+    and (for a fork PR) the "push-back is manual" note. On a fresh drive these
+    live only in the in-memory ``ReviewResolution``; without persistence a resume
+    would default them away and silently drop mandated summary facts.
+
+    Absent (``None``) for every branch-mode review and every heavyweight run —
+    the field is additive, so older/non-PR manifests load unchanged.
+    """
+
+    number: str | None = None
+    url: str | None = None
+    is_fork: bool = False
+    chosen_ref: str | None = None
+    ignored_refs: list[str] = Field(default_factory=list)
+
+
 # --- recovery audit (operator-aids P4, FR-5.3 / §6.4) ------------------------
 # `gauntlet recover` terminates a verified wedged driver. Which signal ended the
 # recorded process group — or that it was already gone by the time we signalled.
@@ -244,6 +338,15 @@ class Manifest(BaseModel):
     # accumulates the full history. Defaults empty, so older manifests load
     # unchanged (additive — the field is absent on pre-P4 runs).
     recoveries: list[RecoveryRecord] = Field(default_factory=list)
+    # Resolved intent provenance for a lightweight `gauntlet review` run (§6,
+    # FR-2.6). Absent (``None``) for every heavyweight `gauntlet run` — the field
+    # is additive, so older manifests and non-review runs load unchanged.
+    intent: IntentRecord | None = None
+    # PR-mode summary facts for a `gauntlet review --pr` run (§6, FR-4.3/4.4).
+    # Persisted so a resumed PR review still renders the chosen/ignored refs and
+    # the fork manual-push note. Absent (``None``) for branch mode / heavyweight
+    # runs; additive, so older manifests load unchanged.
+    pr: ReviewPrRecord | None = None
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:
