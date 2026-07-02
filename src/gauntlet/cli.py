@@ -647,6 +647,27 @@ def status(
                                operator.HB.DEFAULT_HEARTBEAT_INTERVAL_S),
         )
 
+        # Timing/usage inputs (FR-7.1/FR-7.3), sampled once here (the clock is the
+        # single non-pure input) and threaded into both the JSON serializer and the
+        # human footer so the two never diverge. The current running step's
+        # effective timeout is best-effort from its profile (a per-step pipeline
+        # override is not visible here; the field is advisory + nullable).
+        from datetime import datetime as _dt, timezone as _tz
+
+        now = _dt.now(_tz.utc)
+        current_step_timeout_s = None
+        if rstate.current_step:
+            cur = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.current_step),
+                None,
+            )
+            if (
+                cur is not None and cur.status == "running"
+                and cur.agent and cur.agent in mgr.config.agents
+            ):
+                current_step_timeout_s = mgr.config.profile(cur.agent).step_timeout_s
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -656,6 +677,8 @@ def status(
                 run_root=run_root, run_instance_dir=run_instance_dir,
                 current_step_freshness=freshness,
                 suspension=suspension,
+                now=now,
+                current_step_timeout_s=current_step_timeout_s,
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -668,9 +691,23 @@ def status(
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
 
+    # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
+    # usage limit — the reset time, all sourced from the manifest so no parked
+    # state requires reading a transcript to identify the next command.
+    quota_reset_at = None
+    if rstate.state == operator.STATE_PARKED_USAGE_LIMIT and rstate.parked is not None:
+        pr = next(
+            (r for r in man.steps
+             if operator.render_step_id(r) == rstate.parked.step_id),
+            None,
+        )
+        quota_reset_at = pr.quota_reset_at if pr is not None else None
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
+        run_elapsed_s=operator._run_elapsed_s(man, now),
+        cost_usd=man.totals.cost_usd,
+        quota_reset_at=quota_reset_at,
     ):
         typer.echo(line)
 

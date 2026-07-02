@@ -31,7 +31,11 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
-    PARKED_REASON_UPSTREAM_CONFLICT,
+    HALT_REASON_ADAPTER_ERROR,
+    HALT_REASON_PRECONDITION,
+    HALT_REASON_TIMEOUT,
+    PARKED_REASON_GATE,
+    PARKED_REASON_RESPONSE,
     PARKED_REASON_USAGE_LIMIT,
     RESPONSE_CONSUMED,
     RESPONSE_PENDING,
@@ -76,15 +80,15 @@ RESUME_DISPOSITION_SCHEMA = "schemas/resume-disposition.json"
 # FR-3 / FR-5 / FR-10: how a builder's structured `disposition` drives the step
 # outcome on a `--response` resume. The enum maps 1:1 to the FR-3 categories —
 # proceed_* completes the step (DONE → commit); amendment_required / new_conflict
-# re-park it for a human (parked_reason=upstream_conflict, the FR-10.4 gate). This
+# re-park it for a human (parked_reason=response, the FR-10.4 gate). This
 # structured signal — not the textual UPSTREAM CONFLICT marker — is authoritative
 # once a response is being consumed (the marker is only the FIRST-conflict signal,
 # before any response exists).
 _DISPOSITION_OUTCOMES: dict[str, tuple[str, str | None]] = {
     "proceed_in_place": (DONE, None),
     "proceed_with_deviation": (DONE, None),
-    "amendment_required": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
-    "new_conflict": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
+    "amendment_required": (PARKED, PARKED_REASON_RESPONSE),
+    "new_conflict": (PARKED, PARKED_REASON_RESPONSE),
 }
 
 
@@ -117,7 +121,11 @@ def render_shell_command(template: str, config) -> str:
 def handle_shell(step: Step, ctx: StepContext) -> StepResult:
     template = step.get("run")
     if not template:
-        return StepResult(status=FAILED, notes="shell step has no `run:` command")
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes="shell step has no `run:` command",
+        )
     command = render_shell_command(template, ctx.config)
     timeout = step.timeout_s  # per-step guard (FR-3.3); None => unbounded
     try:
@@ -134,12 +142,16 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
         # Halt at a checkpoint rather than letting a stuck command burn on.
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_TIMEOUT,
             notes=f"shell timeout halt (FR-3.3): `{command}` exceeded {timeout}s",
         )
     _write_step_log(ctx, "output.txt", _proc_log(command, proc))
     if proc.returncode != 0:
+        # The command ran and reported failure (e.g. a failing test suite): a
+        # terminal execution failure, not a fail-closed precondition guard (FR-7.2).
         return StepResult(
             status=FAILED,
+            halt_reason=HALT_REASON_ADAPTER_ERROR,
             notes=f"`{command}` exited {proc.returncode}",
         )
     return StepResult(status=DONE, notes=f"`{command}` exited 0")
@@ -150,6 +162,7 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
     show = step.get("show", []) or []
     return StepResult(
         status=PARKED,
+        parked_reason=PARKED_REASON_GATE,  # FR-7.2: a gate park stamps `gate`
         notes=f"awaiting human decision; review: {', '.join(show) or '(nothing listed)'}",
     )
 
@@ -175,6 +188,7 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     if not path.exists():
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=f"phase lint: {artifact} is missing at the plan gate",
         )
     try:
@@ -182,11 +196,13 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     except PlanPhasesError as exc:
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=f"phase lint: {artifact} gauntlet-phases block is invalid — {exc}",
         )
     if not phases:
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=(
                 f"phase lint: {artifact} declares no gauntlet-phases block; the "
                 "phases stage would have nothing to fan out over (FR-5.1)"
@@ -202,7 +218,11 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
 def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     agent_name = step.agent
     if not agent_name:
-        return StepResult(status=FAILED, notes="agent_task step has no `agent:`")
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes="agent_task step has no `agent:`",
+        )
     adapter = ctx.build_adapter(agent_name)
     # FR-3.3: a usage-limit resume continues the persisted CLI session with a
     # SHORT continuation prompt instead of re-sending the full original prompt.
@@ -321,11 +341,11 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # disposition already governed the conflict) while require_signal still binds.
     signal = _completion_signal(step, result.text, check_halt=not consuming_response)
     if signal is not None:
-        status, note, parked_reason = signal
+        status, note, parked_reason, halt_reason = signal
         return StepResult(
             status=status, session_id=result.session_id, usage=result.usage,
             usage_by_agent=usage_by_agent, notes=note,
-            parked_reason=parked_reason,
+            parked_reason=parked_reason, halt_reason=halt_reason,
         )
 
     artifact_writes: dict[str, Path] = {}
@@ -432,15 +452,18 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
 def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     """Read an agent_task's final output for a halt/completion contract (#32).
 
-    Returns ``None`` to proceed normally, or ``(status, note, parked_reason)`` to
-    short-circuit. Both checks are opt-in (absent keys → no contract), so
-    existing steps and the document-authoring tasks keep their plain exit-code
-    semantics.
+    Returns ``None`` to proceed normally, or ``(status, note, parked_reason,
+    halt_reason)`` to short-circuit. Both checks are opt-in (absent keys → no
+    contract), so existing steps and the document-authoring tasks keep their plain
+    exit-code semantics. Exactly one of ``parked_reason`` / ``halt_reason`` is set
+    (FR-7.2 disjointness): the halt_on park carries ``parked_reason`` and a null
+    ``halt_reason``; the require_signal failure carries ``halt_reason`` and a null
+    ``parked_reason``.
 
-    ``parked_reason`` is ``PARKED_REASON_UPSTREAM_CONFLICT`` only when the matched
+    ``parked_reason`` is ``PARKED_REASON_RESPONSE`` only when the matched
     ``halt_on`` marker is *exactly* the canonical :data:`UPSTREAM_CONFLICT_MARKER`
-    (FR-2.1) — a step parking on a *different* ``halt_on`` marker, or failing on a
-    missing ``require_signal``, carries no ``parked_reason``.
+    (FR-10.4) — a step parking on a *different* ``halt_on`` marker carries no
+    ``parked_reason`` (``_finalize`` then defaults it, keeping the invariant).
 
     ``check_halt=False`` suppresses only the ``halt_on`` check (review F-004): on a
     proceed-disposition `--response` resume the textual UPSTREAM CONFLICT marker is
@@ -450,20 +473,22 @@ def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     halt_on = step.get("halt_on")
     if check_halt and halt_on and _marker_signalled(halt_on, text):
         parked_reason = (
-            PARKED_REASON_UPSTREAM_CONFLICT
+            PARKED_REASON_RESPONSE
             if halt_on == UPSTREAM_CONFLICT_MARKER
             else None
         )
         return PARKED, (
             f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
             "parked for a human instead of marking the step done (#32)"
-        ), parked_reason
+        ), parked_reason, None
     require = step.get("require_signal")
     if require and not _marker_signalled(require, text):
+        # The agent ran but did not satisfy the completion contract — a terminal
+        # adapter/output failure (FR-7.2), not a fail-closed precondition guard.
         return FAILED, (
             f"agent did not emit the required completion signal {require!r}; "
             "failing closed rather than advancing on a silent non-completion (#32)"
-        ), None
+        ), None, HALT_REASON_ADAPTER_ERROR
     return None
 
 
@@ -620,7 +645,7 @@ def _resume_disposition_result(
     """Map a builder's structured `disposition` to the step outcome (FR-3/FR-5).
 
     proceed_* → DONE (the run proceeds to commit); amendment_required /
-    new_conflict → PARKED with ``parked_reason=upstream_conflict`` so P1's
+    new_conflict → PARKED with ``parked_reason=response`` so P1's
     current-state ``_finalize`` records the re-park and the human is asked for the
     next decision (FR-3(b)/FR-10.4 gate). Fail closed (CLAUDE.md §2): a missing or
     unrecognized disposition is NEVER read as success — it fails the step rather
@@ -684,9 +709,15 @@ def _resume_disposition_result(
 
 
 def _resume_failure(result, usage_by_agent, note: str) -> StepResult:
-    """A fail-closed resume outcome (FR-10): FAILED, carrying the agent's cost."""
+    """A fail-closed resume outcome (FR-10): FAILED, carrying the agent's cost.
+
+    Stamps ``halt_reason=adapter_error`` (FR-7.2): the agent ran but emitted a
+    missing/unrecognized/malformed disposition — a terminal output-contract
+    failure, not a fail-closed precondition guard.
+    """
     return StepResult(
         status=FAILED,
+        halt_reason=HALT_REASON_ADAPTER_ERROR,
         session_id=result.session_id,
         usage=result.usage,
         usage_by_agent=usage_by_agent,

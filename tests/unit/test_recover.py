@@ -315,7 +315,12 @@ def test_recover_terminates_group_and_records(tmp_path, procs):
 
     man = Manifest.load(run_dir / "manifest.json")
     assert man.status == M.RUN_FAILED
-    assert man.record("implement").status == M.INTERRUPTED
+    step = man.record("implement")
+    assert step.status == M.INTERRUPTED
+    # FR-7.2: `gauntlet recover` stamps the disjoint operator_recover halt_reason
+    # so `status --json` names the cause; the operator identity is on the record.
+    assert step.halt_reason == M.HALT_REASON_OPERATOR_RECOVER
+    assert step.parked_reason is None
     assert len(man.recoveries) == 1
     rec = man.recoveries[0]
     assert rec.signal_outcome in (M.SIGNAL_TERMINATED_SIGTERM, M.SIGNAL_TERMINATED_SIGKILL)

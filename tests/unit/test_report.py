@@ -76,3 +76,61 @@ def test_empty_manifest_renders_without_error():
     )
     text = render_report(man)
     assert "no per-agent usage recorded" in text
+
+
+# --- FR-7.4: cache-effectiveness columns per step type and per profile -------
+def _cached(i, o, cached, cost=None):
+    return UsageTotals(input_tokens=i, output_tokens=o,
+                       cached_input_tokens=cached, cost_usd=cost)
+
+
+def _cache_manifest() -> Manifest:
+    man = Manifest(
+        run_id="run-x", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="standard", version=1, hash="sha256:h"),
+    )
+    # implement: 250 fresh + 750 cached input → 75% cache read.
+    man.steps.append(StepRecord(id="implement", type="agent_task", agent="builder",
+                                usage=_cached(250, 100, 750, 0.90)))
+    # a second agent_task with no cache reads at all → real 0%, not blank.
+    man.steps.append(StepRecord(id="plan", type="agent_task", agent="builder",
+                                usage=_cached(200, 40, 0, 0.10)))
+    man.agent_usage["builder"] = _cached(450, 140, 750, 1.00)
+    man.agent_usage["reviewer"] = _cached(0, 0, 0)  # no ingest → share is None
+    man.totals = _cached(450, 140, 750, 1.00)
+    return man
+
+
+def test_cache_read_share_per_profile_and_step_type():
+    data = build_report(_cache_manifest())
+    by_agent = {a.agent: a for a in data.agents}
+    # builder: 750 cached / (450 fresh + 750 cached) = 62.5%.
+    assert by_agent["builder"].cached_input_tokens == 750
+    assert by_agent["builder"].cache_read_share == pytest.approx(62.5)
+    # reviewer had no ingest at all → share is None (rendered "—", not "0%").
+    assert by_agent["reviewer"].cache_read_share is None
+    # per step type: both steps are agent_task → aggregated 750 / (450 + 750).
+    by_type = {s.step_type: s for s in data.step_types}
+    assert "agent_task" in by_type
+    assert by_type["agent_task"].cache_read_share == pytest.approx(62.5)
+    # run-level cache-read share.
+    assert data.total_cache_read_share == pytest.approx(62.5)
+
+
+def test_zero_cached_renders_zero_percent_not_blank():
+    # A profile/step with fresh input but zero cache reads is 0.0%, never blank —
+    # "no cache benefit" must be distinguishable from "no usage" (FR-7.4).
+    man = Manifest(
+        run_id="r", slug="d", branch="b", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+    )
+    man.steps.append(StepRecord(id="s", type="agent_task", agent="builder",
+                                usage=_cached(500, 50, 0, 0.5)))
+    man.agent_usage["builder"] = _cached(500, 50, 0, 0.5)
+    man.totals = _cached(500, 50, 0, 0.5)
+    data = build_report(man)
+    assert data.agents[0].cache_read_share == 0.0
+    text = render_report(man)
+    assert "0.0%" in text          # rendered as a real 0%, not "—"
+    assert "cache%" in text        # the per-profile + per-step-type columns
+    assert "Cache read share per step type" in text

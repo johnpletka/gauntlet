@@ -132,7 +132,7 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
     )
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT  # still a conflict
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE  # still a conflict
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED

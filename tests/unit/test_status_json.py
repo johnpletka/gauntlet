@@ -196,16 +196,32 @@ def test_section_6_2_example_validates():
         "run_status": "parked",
         "state": "parked_gate",
         "current_step": "impl-cycle.0",
+        # Additive FR-7.1 timing/usage fields: always present, null when N/A.
+        "current_step_elapsed_s": None,
+        "current_step_timeout_remaining_s": None,
+        "run_elapsed_s": 1820.0,
+        "totals": {"input_tokens": 41200, "output_tokens": 9800,
+                   "cached_input_tokens": 12000, "cost_usd": 1.87},
+        "agent_usage": {
+            "builder": {"input_tokens": 41200, "output_tokens": 9800,
+                        "cached_input_tokens": 12000, "cost_usd": 1.87}
+        },
+        "quota": None,
         "driver": {"state": "none", "pid": None, "since": None, "host": None},
-        "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": None},
+        # FR-7.2: a human_gate park now stamps/emits the normalized `gate` reason.
+        "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": "gate"},
         "failure": None,
         "reconciliation": None,
         "current_step_freshness": None,
         # Additive FR-5.3 field: always present, null when nothing to report.
         "suspension": None,
         "steps": [
-            {"id": "prd-cycle", "iteration": None, "status": "done"},
-            {"id": "impl-cycle", "iteration": 0, "status": "parked"},
+            {"id": "prd-cycle", "iteration": None, "status": "done",
+             "duration_s": 620.0, "notes": None,
+             "halt_reason": None, "parked_reason": None},
+            {"id": "impl-cycle", "iteration": 0, "status": "parked",
+             "duration_s": None, "notes": "awaiting human decision",
+             "halt_reason": None, "parked_reason": "gate"},
         ],
         "next_actions": [
             {"label": "approve", "kind": "decide",
@@ -361,6 +377,139 @@ def test_embedded_schema_matches_committed_file():
     # operator validates against an EMBEDDED copy of the schema (the committed
     # file is not packaged in the wheel); guard the two against drift (F-003).
     assert op.STATUS_SCHEMA == STATUS_SCHEMA
+
+
+# --- FR-7.1: additive status fields (timing, usage, quota, per-step) ----------
+from datetime import datetime, timezone  # noqa: E402
+
+_V0_SCHEMA = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "status_schema_v0.json").read_text()
+)
+
+
+def test_new_fields_present_and_valid():
+    # Every FR-7.1 field is always present (nullable, never omitted) and the
+    # payload validates against the shipped schema.
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    for key in ("current_step_elapsed_s", "current_step_timeout_remaining_s",
+                "run_elapsed_s", "totals", "agent_usage", "quota"):
+        assert key in payload, key
+    for key in ("duration_s", "notes", "halt_reason", "parked_reason"):
+        assert key in payload["steps"][0], key
+    assert set(payload["totals"]) == {
+        "input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"
+    }
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_timing_and_usage_values_from_manifest():
+    # Deterministic timing with a fixed `now`; totals/agent_usage from the manifest.
+    man = _manifest(M.RUN_RUNNING, [
+        StepRecord(id="s", type="agent_task", status=M.RUNNING,
+                   started="2026-07-02T04:00:00+00:00"),
+    ])
+    man.totals = M.UsageTotals(input_tokens=100, output_tokens=20,
+                               cached_input_tokens=40, cost_usd=1.25)
+    man.agent_usage["builder"] = M.UsageTotals(input_tokens=100, output_tokens=20,
+                                               cached_input_tokens=40, cost_usd=1.25)
+    now = datetime(2026, 7, 2, 4, 5, 0, tzinfo=timezone.utc)  # +300s
+    rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
+    payload = op.status_payload(
+        man, op.DriverInfo(op.LIVENESS_ALIVE, None, None, None), rstate, None,
+        run_root=Path("/runs"), run_instance_dir=Path("/runs/demo/run-x"),
+        now=now, current_step_timeout_s=600.0,
+    )
+    assert payload["current_step_elapsed_s"] == 300.0
+    assert payload["current_step_timeout_remaining_s"] == 300.0  # 600 - 300
+    assert payload["run_elapsed_s"] == 300.0
+    assert payload["steps"][0]["duration_s"] == 300.0
+    assert payload["totals"]["cost_usd"] == 1.25
+    assert payload["agent_usage"]["builder"]["cached_input_tokens"] == 40
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_quota_block_present_only_on_usage_limit_park():
+    man = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                   quota_reset_at="2026-07-02T09:00:00+00:00"),
+    ])
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["state"] == "parked_usage_limit"
+    assert payload["quota"] == {"reset_at": "2026-07-02T09:00:00+00:00"}
+    validate_schema(payload, STATUS_SCHEMA)
+    # A gate park has no quota block.
+    gate = _manifest(M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)])
+    assert _payload(gate, op.LIVENESS_NONE)["quota"] is None
+
+
+def test_per_step_reason_fields_are_disjoint_and_normalized():
+    man = _manifest(M.RUN_FAILED, [
+        StepRecord(id="a", type="agent_task", status=M.HALTED,
+                   halt_reason=M.HALT_REASON_TIMEOUT),
+        StepRecord(id="b", type="adversarial_cycle", status=M.PARKED,
+                   parked_reason="cycle_escalation"),  # legacy → response
+    ])
+    payload = _payload(man, op.LIVENESS_NONE)
+    a, b = payload["steps"]
+    assert a["halt_reason"] == "timeout" and a["parked_reason"] is None
+    assert b["parked_reason"] == "response" and b["halt_reason"] is None
+
+
+def test_new_output_fails_against_captured_v0_schema():
+    # FR-7.1 re-pin cost, documented not hidden: a consumer validating the new
+    # output against a PINNED pre-PRD schema copy (additionalProperties:false)
+    # rejects the additive fields. This asserts the break surfaces at upgrade.
+    assert _V0_SCHEMA.get("additionalProperties") is False
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    with pytest.raises(ValueError):
+        validate_schema(payload, _V0_SCHEMA)
+
+
+# --- P3 exit criterion: every reachable state is explainable from --json alone
+@pytest.mark.parametrize(
+    "status, steps, liveness, expect_state, expect_cause_field",
+    [
+        (M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)], op.LIVENESS_NONE,
+         "parked_gate", ("parked", "reason", "gate")),
+        (M.RUN_PARKED,
+         [StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                     parked_reason=M.PARKED_REASON_RESPONSE)],
+         op.LIVENESS_NONE, "parked_for_response", ("parked", "reason", "response")),
+        (M.RUN_PARKED,
+         [StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                     parked_reason=M.PARKED_REASON_USAGE_LIMIT)],
+         op.LIVENESS_NONE, "parked_usage_limit", ("parked", "reason", "usage_limit")),
+        (M.RUN_PARKED,
+         [StepRecord(id="s", type="agent_task", status=M.HALTED,
+                     halt_reason=M.HALT_REASON_TIMEOUT)],
+         op.LIVENESS_NONE, "halted", ("steps", 0, "halt_reason", "timeout")),
+        (M.RUN_FAILED,
+         [StepRecord(id="s", type="agent_task", status=M.FAILED,
+                     halt_reason=M.HALT_REASON_ADAPTER_ERROR)],
+         op.LIVENESS_NONE, "failed", ("steps", 0, "halt_reason", "adapter_error")),
+        (M.RUN_PARKED,
+         [StepRecord(id="s", type="agent_task", status=M.INTERRUPTED,
+                     halt_reason=M.HALT_REASON_SIGNAL_KILL)],
+         op.LIVENESS_NONE, "interrupted", ("steps", 0, "halt_reason", "signal_kill")),
+    ],
+)
+def test_every_state_explainable_from_json(
+    status, steps, liveness, expect_state, expect_cause_field
+):
+    payload = _payload(_manifest(status, steps), liveness)
+    assert payload["state"] == expect_state
+    # The identifying cause is present in the JSON, and a next action is offered.
+    if expect_cause_field[0] == "parked":
+        _, key, val = expect_cause_field
+        assert payload["parked"][key] == val
+    else:
+        _, idx, key, val = expect_cause_field
+        assert payload["steps"][idx][key] == val
+    assert payload["next_actions"]  # a concrete next command is always offered
+    validate_schema(payload, STATUS_SCHEMA)
 
 
 # --- F-004: the schema enforces the normative §6.1 timestamp for driver.since -

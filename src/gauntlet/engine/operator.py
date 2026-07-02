@@ -78,12 +78,10 @@ STATE_UNKNOWN = "unknown"
 # composite states (failed→failed, halted→halted, interrupted→interrupted).
 _FAILURE_STATUSES = (M.FAILED, M.HALTED, M.INTERRUPTED)
 
-# Park reasons that classify a parked step as `parked_for_response` regardless
-# of the parked step's `type` (§6.3a — the *reason* defines the response).
-_RESPONSE_REASONS = (
-    M.PARKED_REASON_UPSTREAM_CONFLICT,
-    M.PARKED_REASON_CYCLE_ESCALATION,
-)
+# The normalized (PRD FR-7.2) park reason that classifies a parked step as
+# `parked_for_response` (§6.3a — the *reason* defines the response). Legacy
+# on-disk values map to it through `manifest.normalize_parked_reason`.
+_RESPONSE_REASON = M.PARKED_REASON_RESPONSE
 
 # Composite step types whose evidence lives in role sub-directories, not a
 # direct ``steps/<leaf>/transcript.md`` (FR-3.1a). Mirrors the cycle/retro
@@ -586,28 +584,35 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
         if len(parked_steps) != 1 or halt_steps:
             return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
         ps = parked_steps[0]
-        if ps.parked_reason in _RESPONSE_REASONS:
+        # Normalize any legacy on-disk parked_reason to the PRD enum (FR-7.2): a
+        # pre-P3 `upstream_conflict`/`cycle_escalation` reads as `response`, and a
+        # pre-P3 gate (null reason) reads as `gate`. The descriptor carries the
+        # NORMALIZED value so `status --json` never emits a legacy value.
+        reason = M.normalize_parked_reason(ps.parked_reason, ps.type, ps.status)
+        if reason == _RESPONSE_REASON:
             return (
                 STATE_PARKED_FOR_RESPONSE,
-                ParkedDescriptor(render_step_id(ps), ps.type, ps.parked_reason),
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        if ps.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+        if reason == M.PARKED_REASON_USAGE_LIMIT:
             # FR-3.2: a usage-limit park — a plain `resume` continues the session,
             # no human decision required (distinct from the response parks above).
             return (
                 STATE_PARKED_USAGE_LIMIT,
-                ParkedDescriptor(render_step_id(ps), ps.type, ps.parked_reason),
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        if ps.parked_reason is None and ps.type == "human_gate":
+        if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
             return (
                 STATE_PARKED_GATE,
-                ParkedDescriptor(render_step_id(ps), ps.type, None),
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        # A non-gate step parked with no reason, or an unknown reason value, has
-        # no defined operator response → contradiction.
+        # A non-gate step parked with no reason, an unknown reason value, or a
+        # park reason whose classification behavior lands in a later phase
+        # (usage_window → P10, artifact_invalid → P4) has no defined P3 operator
+        # response → contradiction (fail closed, read-only inspection).
         return STATE_UNKNOWN, None, None
 
     # P2: failed — the last failure step in manifest order is authoritative (§6.3a).
@@ -757,9 +762,23 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "usage_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"],
+      "description": "Aggregated provider usage (harness-efficiency FR-7.1). cost_usd is null on the degraded tokens-only path (a subscription-auth CLI may not report cost); the token counts are always integers.",
+      "properties": {
+        "input_tokens": {"type": "integer", "description": "Fresh (uncached) input tokens."},
+        "output_tokens": {"type": "integer", "description": "Output tokens."},
+        "cached_input_tokens": {"type": "integer", "description": "Cache-read input tokens."},
+        "cost_usd": {"type": ["number", "null"], "description": "Cost in USD, or null when unpriced."}
+      }
+    }
+  },
   "required": [
     "schema_version",
     "slug",
@@ -767,6 +786,12 @@ _STATUS_SCHEMA_JSON = r'''{
     "run_status",
     "state",
     "current_step",
+    "current_step_elapsed_s",
+    "current_step_timeout_remaining_s",
+    "run_elapsed_s",
+    "totals",
+    "agent_usage",
+    "quota",
     "driver",
     "parked",
     "failure",
@@ -817,6 +842,39 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["string", "null"],
       "description": "Rendered id of the active/most-recent non-terminal step, or null. When non-null it MUST equal the rendered id of exactly one steps[] entry (`<id>` or `<id>.<iteration>`). Derived convenience; steps[] is authoritative."
     },
+    "current_step_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds the current step has been running (harness-efficiency FR-7.1): now - started for a running step, or ended - started for a finished one. null when there is no current step or its timestamps are absent/unparseable."
+    },
+    "current_step_timeout_remaining_s": {
+      "type": ["number", "null"],
+      "description": "Best-effort seconds remaining before the current running step's deadline (harness-efficiency FR-7.1), computed as the resolved effective timeout minus elapsed and clamped to 0 (never negative). null when there is no running step or no resolvable timeout. Advisory — suspend credit (FR-5.2) is not folded in here."
+    },
+    "run_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds from the first step start to now (a live run) or to the last step end (a finished run) (harness-efficiency FR-7.1). null when no step has started."
+    },
+    "totals": {
+      "$ref": "#/$defs/usage_totals",
+      "description": "Run-level aggregated provider usage incl. cost (harness-efficiency FR-7.1). Always present."
+    },
+    "agent_usage": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/usage_totals"},
+      "description": "Per-agent-profile usage totals keyed by profile name (harness-efficiency FR-7.1). Always present; an empty object when no per-profile usage was recorded."
+    },
+    "quota": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["reset_at"],
+      "description": "Provider usage-limit reset info (harness-efficiency FR-7.1), non-null only when parked on a usage_limit park; null otherwise.",
+      "properties": {
+        "reset_at": {
+          "type": ["string", "null"],
+          "description": "Absolute UTC reset time (ISO-8601), or null when the provider reported no structured retry hint."
+        }
+      }
+    },
     "driver": {
       "type": "object",
       "additionalProperties": false,
@@ -859,9 +917,9 @@ _STATUS_SCHEMA_JSON = r'''{
           "description": "The parked step's type."
         },
         "reason": {
-          "type": ["string", "null"],
-          "enum": ["upstream_conflict", "cycle_escalation", "usage_limit", null],
-          "description": "Park reason; null for a plain human_gate; usage_limit for a provider usage-limit park (FR-3.2)."
+          "type": "string",
+          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate"],
+          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
         }
       }
     },
@@ -956,7 +1014,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -976,6 +1034,24 @@ _STATUS_SCHEMA_JSON = r'''{
               "skipped"
             ],
             "description": "Step status."
+          },
+          "duration_s": {
+            "type": ["number", "null"],
+            "description": "Wall-clock seconds the step ran (harness-efficiency FR-7.1): ended - started, or now - started while running. null when the step has no start timestamp or its timestamps are unparseable."
+          },
+          "notes": {
+            "type": ["string", "null"],
+            "description": "The step's engine/human notes verbatim (harness-efficiency FR-7.1), or null when none. Content-bearing; already redacted on write."
+          },
+          "halt_reason": {
+            "type": ["string", "null"],
+            "enum": ["timeout", "budget", "judge_deny", "signal_kill", "adapter_error", "precondition", "operator_recover", null],
+            "description": "Terminal halt reason (harness-efficiency FR-7.2) on a HALTED/FAILED/INTERRUPTED step; null otherwise. DISJOINT from parked_reason — never both set. null on steps predating P3."
+          },
+          "parked_reason": {
+            "type": ["string", "null"],
+            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", null],
+            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim."
           }
         }
       }
@@ -1118,6 +1194,70 @@ def _evidence_path(
     return posix
 
 
+# --- timing / usage rendering (harness-efficiency FR-7.1) --------------------
+def _parse_iso(ts: str | None) -> datetime | None:
+    """Parse an ISO-8601 manifest timestamp (``started``/``ended``); None on any
+    failure, so a malformed/absent timestamp yields a null duration rather than
+    an exception."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _elapsed_between(start: datetime | None, end: datetime | None) -> float | None:
+    """``(end - start)`` in seconds, clamped to ≥0; None if either is missing or
+    the subtraction is not well-defined (e.g. mixed naive/aware timestamps)."""
+    if start is None or end is None:
+        return None
+    try:
+        return max(0.0, (end - start).total_seconds())
+    except TypeError:
+        return None
+
+
+def _step_duration_s(rec: StepRecord, now: datetime) -> float | None:
+    """Wall-clock seconds a step ran (FR-7.1): ``ended - started`` for a finished
+    step, ``now - started`` while running, else None (no start, or a started step
+    with no end that is not currently running)."""
+    start = _parse_iso(rec.started)
+    if start is None:
+        return None
+    if rec.ended:
+        end = _parse_iso(rec.ended)
+    elif rec.status == M.RUNNING:
+        end = now
+    else:
+        end = None
+    return _elapsed_between(start, end)
+
+
+def _run_elapsed_s(man: Manifest, now: datetime) -> float | None:
+    """Wall-clock seconds from the earliest step start to now (a running run) or
+    to the latest step end (a finished run) (FR-7.1); None if no step started."""
+    starts = [t for t in (_parse_iso(s.started) for s in man.steps) if t is not None]
+    if not starts:
+        return None
+    if man.status == M.RUN_RUNNING:
+        end: datetime | None = now
+    else:
+        ends = [t for t in (_parse_iso(s.ended) for s in man.steps) if t is not None]
+        end = max(ends) if ends else now
+    return _elapsed_between(min(starts), end)
+
+
+def _usage_totals_dict(u) -> dict:
+    """A UsageTotals rendered as the §6.1 ``usage_totals`` object (FR-7.1)."""
+    return {
+        "input_tokens": u.input_tokens or 0,
+        "output_tokens": u.output_tokens or 0,
+        "cached_input_tokens": u.cached_input_tokens or 0,
+        "cost_usd": u.cost_usd,
+    }
+
+
 def status_payload(
     man: Manifest,
     driver: DriverInfo,
@@ -1128,6 +1268,8 @@ def status_payload(
     run_instance_dir: Path,
     current_step_freshness: float | None = None,
     suspension: dict | None = None,
+    now: datetime | None = None,
+    current_step_timeout_s: float | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -1155,6 +1297,31 @@ def status_payload(
     :class:`StatusContractError`, so emission fails closed rather than printing a
     contract-breaking object.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    # FR-7.1 timing: current-step elapsed is the current step's own duration; the
+    # timeout remaining is best-effort from a caller-resolved effective timeout
+    # (null when there is no running current step or no resolvable timeout).
+    by_rendered = {render_step_id(rec): rec for rec in man.steps}
+    current_rec = (
+        by_rendered.get(rstate.current_step) if rstate.current_step else None
+    )
+    current_elapsed = (
+        _step_duration_s(current_rec, now) if current_rec is not None else None
+    )
+    timeout_remaining: float | None = None
+    if (
+        current_rec is not None
+        and current_rec.status == M.RUNNING
+        and current_step_timeout_s is not None
+        and current_elapsed is not None
+    ):
+        timeout_remaining = max(0.0, current_step_timeout_s - current_elapsed)
+    # FR-7.1 quota: the reset time of a usage_limit park (else null).
+    quota = None
+    if rstate.state == STATE_PARKED_USAGE_LIMIT and rstate.parked is not None:
+        parked_rec = by_rendered.get(rstate.parked.step_id)
+        quota = {"reset_at": parked_rec.quota_reset_at if parked_rec else None}
     payload = {
         "schema_version": SCHEMA_VERSION,
         "slug": man.slug,
@@ -1162,6 +1329,15 @@ def status_payload(
         "run_status": man.status,
         "state": rstate.state,
         "current_step": rstate.current_step,
+        "current_step_elapsed_s": current_elapsed,
+        "current_step_timeout_remaining_s": timeout_remaining,
+        "run_elapsed_s": _run_elapsed_s(man, now),
+        # FR-7.1 usage: run-level totals + per-profile split (empty {} when none).
+        "totals": _usage_totals_dict(man.totals),
+        "agent_usage": {
+            name: _usage_totals_dict(u) for name, u in man.agent_usage.items()
+        },
+        "quota": quota,
         "driver": {
             "state": driver.state,
             "pid": driver.pid,
@@ -1205,6 +1381,16 @@ def status_payload(
                 "id": rec.id,
                 "iteration": _iteration_for_json(rec),
                 "status": rec.status,
+                # FR-7.1/FR-7.2 per-step explainers: duration, notes, and the
+                # disjoint reason fields. parked_reason is normalized to the PRD
+                # enum (a legacy on-disk value / pre-P3 gate is never emitted
+                # verbatim); halt_reason is engine-written PRD values (or null).
+                "duration_s": _step_duration_s(rec, now),
+                "notes": rec.notes,
+                "halt_reason": rec.halt_reason,
+                "parked_reason": M.normalize_parked_reason(
+                    rec.parked_reason, rec.type, rec.status
+                ),
             }
             for rec in man.steps
         ],
@@ -1883,6 +2069,9 @@ def render_footer(
     anomaly: str | None = None,
     current_step_freshness: float | None = None,
     suspension: dict | None = None,
+    run_elapsed_s: float | None = None,
+    cost_usd: float | None = None,
+    quota_reset_at: str | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -1915,6 +2104,21 @@ def render_footer(
         lines.append(f"driver: {driver.state}{suffix}")
 
     lines.append(f"state: {rstate.state} — {_MEANING.get(rstate.state, '')}")
+
+    # FR-7.3: elapsed + cost-so-far, so a parked/running state is legible without
+    # opening a transcript. Each line is added only when its datum is available,
+    # so an existing run with no timing/cost recorded renders unchanged.
+    if run_elapsed_s is not None:
+        lines.append(f"elapsed: {run_elapsed_s:.0f}s")
+    if cost_usd is not None:
+        lines.append(f"cost so far: ${cost_usd:.4f}")
+    # When parked on a provider usage limit, name the reset time (the datum the
+    # operator needs to know when a plain `resume` will get past the wall).
+    if rstate.state == STATE_PARKED_USAGE_LIMIT:
+        lines.append(
+            f"quota reset: {quota_reset_at}" if quota_reset_at
+            else "quota reset: unknown (no provider retry hint reported)"
+        )
 
     if current_step_freshness is not None:
         lines.append(

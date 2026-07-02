@@ -161,7 +161,7 @@ def test_upstream_invalidation_park_sets_cycle_escalation_reason(cycle_repo):
     assert status == M.RUN_PARKED
     rec = man.record("cycle")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_CYCLE_ESCALATION
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert rec.parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
     assert "FR-10.4" in rec.notes
 
@@ -188,7 +188,7 @@ def test_max_rounds_escalation_sets_cycle_escalation_reason(cycle_repo):
     )
     assert status == M.RUN_PARKED
     rec = man.record("cycle")
-    assert rec.parked_reason == M.PARKED_REASON_CYCLE_ESCALATION
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert "FR-10.5" in rec.notes
 
 
@@ -390,7 +390,7 @@ def test_resume_response_unsticks_parked_cycle_end_to_end(tmp_path):
     )
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("cycle")
-    assert rec.parked_reason == M.PARKED_REASON_CYCLE_ESCALATION
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
 
     # Resume with a decision: reviewer still raises F-001, but triage now rejects
     # it (operator ruled it in scope) → the cycle accepts nothing → converges.

@@ -1448,13 +1448,25 @@ class RunManager:
             # path exists to prevent. Every other park keeps its existing
             # response-less re-run behavior unchanged.
             parked = self._parked_step(man)
+            # Normalize any legacy on-disk parked_reason to the PRD enum before
+            # comparing (FR-7.2 read-side contract): a pre-P3 manifest carrying
+            # `upstream_conflict`/`cycle_escalation` must still route as `response`.
+            parked_reason = (
+                M.normalize_parked_reason(
+                    parked.parked_reason, parked.type, parked.status
+                )
+                if parked is not None else None
+            )
             if (
                 parked is not None
-                and parked.parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
+                and parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
             ):
+                # Both the builder conflict and the cycle escalation collapse to
+                # `response`; the agent_task-vs-cycle distinction is recovered from
+                # the step type (FR-7.2), not the reason value.
                 what = (
                     "an upstream conflict"
-                    if parked.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+                    if parked.type == "agent_task"
                     else "a cycle escalation its own loop cannot resolve"
                 )
                 raise ValueError(
@@ -2083,6 +2095,12 @@ class RunManager:
             # append the §6.4 record, built from the frozen intent + the observed
             # signal outcome, in a single durable write-temp→fsync→rename→fsync-dir.
             rec.status = M.INTERRUPTED
+            # FR-7.2: `gauntlet recover` terminated the step; stamp the disjoint
+            # halt_reason (clearing any prior parked_reason) so `status --json`
+            # names the cause. The operator identity is on the RecoveryRecord
+            # appended below (`actor`/`actor_source`).
+            rec.halt_reason = M.HALT_REASON_OPERATOR_RECOVER
+            rec.parked_reason = None
             man.status = M.RUN_FAILED
             man.recoveries.append(
                 M.RecoveryRecord(

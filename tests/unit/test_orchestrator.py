@@ -392,14 +392,17 @@ stages:
 
 
 def test_upstream_conflict_sets_parked_reason(fixture_repo):
-    # An UPSTREAM CONFLICT halt parks AND stamps the discriminator (FR-2.1) so
-    # `--response` scoping can tell a conflict park from every other park.
+    # An UPSTREAM CONFLICT halt parks AND stamps the discriminator so `--response`
+    # scoping can tell a conflict park from every other park. Under FR-7.2 the
+    # discriminator is the PRD value `response` (the agent_task type distinguishes
+    # it from a cycle escalation), with a null halt_reason (disjoint).
     adapter = FakeAdapter(text="UPSTREAM CONFLICT\nplan contradicts the impl")
     orch = _build(fixture_repo, CONFLICT_PIPELINE, adapters={"builder": adapter})
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
+    assert rec.halt_reason is None  # disjoint (FR-7.2)
 
 
 def test_non_conflict_halt_marker_parks_without_reason(fixture_repo):
@@ -422,7 +425,9 @@ stages:
     assert rec.parked_reason is None
 
 
-def test_human_gate_park_leaves_parked_reason_unset(fixture_repo):
+def test_human_gate_park_sets_gate_reason(fixture_repo):
+    # FR-7.2: a human_gate park stamps the PRD `gate` reason (never a null
+    # parked-reason on a park), with a null halt_reason (disjoint).
     text = """
 name: demo
 version: 1
@@ -433,10 +438,14 @@ stages:
 """
     orch = _build(fixture_repo, text)
     assert orch.drive() == M.RUN_PARKED
-    assert orch.manifest.record("gate").parked_reason is None
+    rec = orch.manifest.record("gate")
+    assert rec.parked_reason == M.PARKED_REASON_GATE
+    assert rec.halt_reason is None
 
 
-def test_budget_halt_leaves_parked_reason_unset(fixture_repo):
+def test_budget_halt_stamps_budget_reason(fixture_repo):
+    # FR-7.2: a budget halt is terminal (HALTED) → stamps halt_reason=budget with
+    # a null parked_reason (disjoint), never a parked_reason.
     adapter = FakeAdapter(usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.5))
     text = """
 name: demo
@@ -450,6 +459,7 @@ stages:
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("pricey")
     assert rec.status == M.HALTED
+    assert rec.halt_reason == M.HALT_REASON_BUDGET
     assert rec.parked_reason is None
 
 
@@ -470,7 +480,7 @@ def test_parked_reason_cleared_when_conflict_resumes_to_done(fixture_repo):
     orch = _build(fixture_repo, CONFLICT_PIPELINE, adapters={"builder": adapter})
     assert orch.drive() == M.RUN_PARKED
     assert orch.manifest.record("implement").parked_reason == (
-        M.PARKED_REASON_UPSTREAM_CONFLICT
+        M.PARKED_REASON_RESPONSE
     )
     # resume: the PARKED step re-executes; this run does not signal a conflict
     assert orch.drive() == M.RUN_DONE
@@ -517,7 +527,7 @@ def test_conflict_parked_agent_task_is_not_approvable_as_a_gate(fixture_repo):
         orch.reject_gate("implement", notes="nope")
     # the conflict discriminator is untouched by the refused attempts
     assert orch.manifest.record("implement").parked_reason == (
-        M.PARKED_REASON_UPSTREAM_CONFLICT
+        M.PARKED_REASON_RESPONSE
     )
 
 
@@ -558,6 +568,81 @@ stages:
     rec = orch.manifest.record("gate")
     assert rec.status == M.FAILED
     assert rec.parked_reason is None
+
+
+# --- FR-7.2: halt_reason stamped on every terminal path, disjoint from parked --
+def test_shell_no_command_stamps_precondition(fixture_repo):
+    # A fail-closed guard that fired before running anything → precondition.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: broken, type: shell}
+"""
+    orch = _build(fixture_repo, text)
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("broken")
+    assert rec.status == M.FAILED
+    assert rec.halt_reason == M.HALT_REASON_PRECONDITION
+    assert rec.parked_reason is None
+
+
+def test_shell_nonzero_exit_stamps_adapter_error(fixture_repo):
+    # The command ran and reported failure → a terminal execution failure.
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: tests, type: shell, run: "exit 3"}
+"""
+    orch = _build(fixture_repo, text)
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("tests")
+    assert rec.status == M.FAILED
+    assert rec.halt_reason == M.HALT_REASON_ADAPTER_ERROR
+    assert rec.parked_reason is None
+
+
+def test_finalize_stamps_and_enforces_disjoint_reasons(fixture_repo):
+    # The stamping mechanism carries EVERY halt_reason enum member (incl.
+    # judge_deny / signal_kill, which have no synthetic producer here) onto the
+    # record with a null parked_reason (disjoint), and vice-versa for a park.
+    from gauntlet.engine.execution import HALTED, PARKED, StepResult
+
+    orch = _build(fixture_repo, CONFLICT_PIPELINE)
+    for halt in sorted(M.HALT_REASONS):
+        rec = M.StepRecord(id="x", type="agent_task")
+        orch._finalize(rec, StepResult(status=HALTED, halt_reason=halt))
+        assert rec.halt_reason == halt
+        assert rec.parked_reason is None
+        assert M.reason_fields_disjoint(rec.halt_reason, rec.parked_reason)
+    # A park carries parked_reason with a null halt_reason.
+    rec = M.StepRecord(id="x", type="agent_task")
+    orch._finalize(rec, StepResult(status=PARKED,
+                                   parked_reason=M.PARKED_REASON_USAGE_LIMIT))
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.halt_reason is None
+
+
+def test_finalize_defaults_mandatory_halt_reason(fixture_repo):
+    # A terminal StepResult that carries NO halt_reason is defaulted so the
+    # mandatory invariant always holds: a precondition failure (failure_kind set)
+    # → precondition; anything else → adapter_error.
+    from gauntlet.engine.execution import FAILED, StepResult
+
+    orch = _build(fixture_repo, CONFLICT_PIPELINE)
+    rec = M.StepRecord(id="x", type="agent_task")
+    orch._finalize(rec, StepResult(status=FAILED))  # no halt_reason
+    assert rec.halt_reason == M.HALT_REASON_ADAPTER_ERROR
+
+    rec = M.StepRecord(id="y", type="adversarial_cycle")
+    orch._finalize(rec, StepResult(status=FAILED,
+                                   failure_kind=M.FAILURE_KIND_CLEAN_HANDOFF))
+    assert rec.halt_reason == M.HALT_REASON_PRECONDITION
 
 
 def test_mark_skipped_clears_parked_reason(fixture_repo):

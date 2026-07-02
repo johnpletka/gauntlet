@@ -244,6 +244,9 @@ class Orchestrator:
             rec.status = M.FAILED
             rec.ended = self.clock()
             rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
+            # FR-7.2: a terminal reject has no re-runnable path (no upstream cycle
+            # to iterate) — the precondition to proceed past the gate is unmet.
+            rec.halt_reason = M.HALT_REASON_PRECONDITION
             why = (
                 "no upstream adversarial_cycle to iterate"
                 if cycle_step is None
@@ -493,7 +496,11 @@ class Orchestrator:
                 # decides), exactly as an unclassified handler fault would.
                 result = self._agent_failure_result(exc)
             except Exception as exc:  # fail closed: a handler fault halts the step
-                result = StepResult(status=FAILED, notes=f"handler error: {exc}")
+                result = StepResult(
+                    status=FAILED,
+                    halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+                    notes=f"handler error: {exc}",
+                )
 
             result = self._apply_budget_guard(step, rec, result)
             # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
@@ -603,6 +610,9 @@ class Orchestrator:
             return None  # tree restored to base; checkpoints preserved; re-run cleanly
         return StepResult(
             status=INTERRUPTED,
+            # FR-7.2: a dirty worktree vs base means the prior attempt was killed
+            # mid-edit by a signal / crash — attribute the interruption to that.
+            halt_reason=M.HALT_REASON_SIGNAL_KILL,
             notes=(
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
@@ -615,8 +625,8 @@ class Orchestrator:
     ) -> StepResult:
         """Restore the clean-worktree invariant on a conflict park (review F-001).
 
-        A conflict park (``parked_reason == upstream_conflict``) returns control
-        to a human, so the worktree must be clean (CLAUDE.md §1). But the builder
+        A builder conflict park (an ``agent_task`` parked ``response``) returns
+        control to a human, so the worktree must be clean (CLAUDE.md §1). But the builder
         ran with repo-write access and may have written implementation edits
         before deciding to signal the conflict; those edits are uncommitted (the
         checkpoint commits stage ONLY bookkeeping, never the implementation
@@ -637,9 +647,15 @@ class Orchestrator:
         checkpoint (the rewind-past-checkpoint hazard ``_resume_disposition``
         guards against does not arise here).
         """
+        # A `response` park on an ``agent_task`` is the builder UPSTREAM CONFLICT;
+        # the SAME `response` value on an ``adversarial_cycle`` is a cycle
+        # escalation whose commits the cycle already manages — the step type
+        # disambiguates the two now that both collapse to ``response`` (FR-7.2).
+        # Restore clean ONLY for the builder-conflict case.
         if (
             result.status != PARKED
-            or result.parked_reason != M.PARKED_REASON_UPSTREAM_CONFLICT
+            or result.parked_reason != M.PARKED_REASON_RESPONSE
+            or step.type != "agent_task"
             or rec.base_sha is None
             or not spec.step_touches_worktree(step)
         ):
@@ -707,6 +723,7 @@ class Orchestrator:
             )
         return StepResult(
             status=FAILED,
+            halt_reason=M.HALT_REASON_ADAPTER_ERROR,
             usage=partial.usage if partial else None,
             session_id=partial.session_id if partial else None,
             notes=f"agent failed (terminal, FR-3.1): {exc}",
@@ -751,6 +768,7 @@ class Orchestrator:
                 f"budget ${budget:.4f}; halting at checkpoint"
             )
             result.status = HALTED
+            result.halt_reason = M.HALT_REASON_BUDGET  # FR-7.2
             result.notes = (
                 f"{result.notes}\n{halt_note}" if result.notes else halt_note
             )
@@ -767,21 +785,45 @@ class Orchestrator:
             INTERRUPTED: M.INTERRUPTED,
         }[result.status]
         rec.ended = self.clock()
-        # Conflict-park discriminator is CURRENT-STATE, not a latch (FR-2.1):
-        # copy the just-finished execution's parked_reason onto the record. It is
-        # PARKED_REASON_UPSTREAM_CONFLICT only when this run halted on an UPSTREAM
-        # CONFLICT, and None for every other outcome — so a conflict park later
-        # resumed to done/failed/non-conflict-park clears the stale value here.
+        # Reason discriminators are CURRENT-STATE, not a latch: copy the just-
+        # finished execution's values so a step later resumed to a different
+        # outcome never carries a stale reason.
         rec.parked_reason = result.parked_reason
-        # Terminal halt reason is CURRENT-STATE and DISJOINT from parked_reason
-        # (FR-7.2): copy the just-finished execution's value (only ``timeout`` in
-        # P2), so a step later resumed to DONE/PARKED never carries a stale halt
-        # reason and the two reason fields are never both set on one record.
         rec.halt_reason = result.halt_reason
         # Failure kind is CURRENT-STATE too (FR-9.3 recovery): copy the just-
         # finished execution's value so a precondition failure is re-runnable on
         # resume, and any later non-precondition finalization clears a stale value.
         rec.failure_kind = result.failure_kind
+        # FR-7.2 disjoint-reason invariant, enforced in one place for every
+        # terminal/parked outcome: a PARKED step carries exactly a `parked_reason`
+        # (halt_reason null); a HALTED/FAILED/INTERRUPTED step carries exactly a
+        # `halt_reason` (parked_reason null); a DONE/SKIPPED step carries neither.
+        # The applicable field is MANDATORY, so a handler that returned a terminal
+        # status without one is defaulted here rather than persisting an
+        # unexplainable state (`reason_fields_disjoint` holds afterward).
+        if rec.status == M.PARKED:
+            rec.halt_reason = None
+            # A human_gate park stamps `gate` (belt-and-suspenders; the handler
+            # already sets it). A non-canonical `halt_on:` marker park legitimately
+            # carries NO PRD reason (its plain-`resume`-re-runs semantics differ
+            # from every PRD park); it is left null and read back as null by
+            # `normalize_parked_reason`, exactly as before P3 — never coerced into
+            # `response`, which would wrongly demand a `--response` decision.
+            if rec.parked_reason is None and rec.type == "human_gate":
+                rec.parked_reason = M.PARKED_REASON_GATE
+        elif rec.status in (M.HALTED, M.FAILED, M.INTERRUPTED):
+            rec.parked_reason = None
+            if rec.halt_reason is None:
+                # A precondition guard fired before any adapter call (carries a
+                # failure_kind); everything else is a terminal adapter/execution
+                # failure.
+                rec.halt_reason = (
+                    M.HALT_REASON_PRECONDITION if rec.failure_kind
+                    else M.HALT_REASON_ADAPTER_ERROR
+                )
+        else:  # DONE / SKIPPED carry neither reason
+            rec.parked_reason = None
+            rec.halt_reason = None
         # Usage-limit park stamps are CURRENT-STATE as well (FR-3.2): set on a
         # usage_limit park, cleared (back to None) on any other finalization —
         # so a step later resumed to DONE never carries a stale reset time. The

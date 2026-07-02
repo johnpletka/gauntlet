@@ -206,7 +206,7 @@ def _drive_to_conflict(repo: Path, mgr: RunManager, pipeline: str = PIPELINE):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     return adapter
 
 
@@ -306,7 +306,7 @@ def test_response_reparks_consumes_entry_and_keeps_discriminator(tmp_path):
     rec = mgr.status("demo").record("implement")
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
 
     # A second --response appends a distinct entry (latest is consumed, not

@@ -316,7 +316,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if park_reason is not None:
             return _finish(
                 StepResult(status=PARKED, notes=park_reason,
-                           parked_reason=M.PARKED_REASON_CYCLE_ESCALATION),
+                           parked_reason=M.PARKED_REASON_RESPONSE),
                 usage, commits, artifact_writes, metrics,
             )
 
@@ -351,7 +351,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             return _finish(
                 StepResult(status=PARKED,
                            notes="escalation: " + "; ".join(reasons),
-                           parked_reason=M.PARKED_REASON_CYCLE_ESCALATION),
+                           parked_reason=M.PARKED_REASON_RESPONSE),
                 usage, commits, artifact_writes, metrics,
             )
 
@@ -458,7 +458,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 f"{_fmt_ids(last_forcing)}; a human must resolve"
                 + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
                    if surfaced else ""),
-                parked_reason=M.PARKED_REASON_CYCLE_ESCALATION,
+                parked_reason=M.PARKED_REASON_RESPONSE,
             ),
             usage, commits, artifact_writes, metrics,
         )

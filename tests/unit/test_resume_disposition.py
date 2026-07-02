@@ -274,7 +274,7 @@ def test_amendment_required_reparks_no_implementation(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
     assert not (repo / "feature.py").exists()  # nothing implemented
     # the response is consumed (terminal outcome), audit trail intact
@@ -315,7 +315,7 @@ def test_new_conflict_reparks_with_requested_input(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert disp["conflict"]["requested_input"] == "which of option 1 or 2 to take"
     assert disp["responses_considered"] == ["implement-resp-1"]
 
@@ -598,7 +598,7 @@ def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     # The builder's uncommitted edit was discarded; no implementation change
     # survives to the handoff (the only residual dirt is engine bookkeeping,
     # which the clean-handoff invariant deliberately excludes).
