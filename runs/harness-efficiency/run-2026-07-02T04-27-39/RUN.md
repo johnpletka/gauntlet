@@ -3,7 +3,7 @@
 - branch: `gauntlet/harness-efficiency` (base `chore/fable-review`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
 - status: **running** (at `phase-commit`)
-- totals: 948669in/286487out $36.8907
+- totals: 2519610in/549083out $71.8013
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -15,7 +15,11 @@
 | plan-approve | human_gate | done | 20686s | 0in/0out (tokens only) | approved |
 | [implement.0](steps/implement.0/transcript.md) | agent_task | done | 2446s | 15330in/122426out $26.6249 | agent 'builder' completed |
 | [tests.0](steps/tests.0/) | shell | done | 267s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
-| phase-commit.0 | commit | pending | 0s | 0in/0out (tokens only) | operator surgery: reset failed->pending after stale-module handler crash (import verified clean in fresh process); backup at scratchpad/manifest.backup.json |
+| phase-commit.0 | commit | done | 278s | 14017in/1319out $0.0061 | committed 96f33bd960 |
+| [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 2770s | 1392695in/96291out $10.4645 | converged in round 2 (blocking policy): no open blocking; 1 fixed, 1 non-blocking item(s) surfaced for the gate: NEW |
+| [implement.1](steps/implement.1/transcript.md) | agent_task | done | 2857s | 12231in/139974out $24.3525 | agent 'builder' completed |
+| [tests.1](steps/tests.1/) | shell | done | 279s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.1 | commit | pending | 57s | 37490in/5543out $0.0205 | operator surgery: reset failed->pending after commit-message header overflow (85>72); fresh redraft on resume; backup at scratchpad/manifest.backup2.json |
 
 ## Commits
 
@@ -24,3 +28,6 @@
 - `f99c079ada` PLAN.1 (step `plan-cycle`)
 - `971b137943` PLAN.1 (step `plan-cycle`)
 - `fc8fc7a7c7` PLAN.1 (step `plan-cycle`)
+- `96f33bd960` P1 (step `phase-commit`)
+- `779e060215` P1.1 (step `impl-cycle`)
+- `39af7ed82e` P1.2 (step `impl-cycle`)
