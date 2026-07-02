@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-approve",
+  "current_step": "plan-cycle",
   "warnings": [],
   "steps": [
     {
@@ -109,11 +109,11 @@
     {
       "id": "plan-cycle",
       "type": "adversarial_cycle",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-02T13:26:52.192203+00:00",
-      "ended": null,
+      "ended": "2026-07-02T17:03:32.265778+00:00",
       "attempts": 1,
       "base_sha": "09f2a9cea0a3f55b74d3f572b5b0f5be75f7571a",
       "parked_reason": null,
@@ -141,29 +141,27 @@
           "timestamp": "2026-07-02T16:54:46.901681+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 3,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 628581,
-        "output_tokens": 61784,
-        "cached_input_tokens": 4446403,
-        "cost_usd": 4.614101799999999
+        "input_tokens": 696781,
+        "output_tokens": 79510,
+        "cached_input_tokens": 5551354,
+        "cost_usd": 6.102183899999999
       },
-      "notes": "converged in round 1 (blocking policy): no open blocking; 6 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": null,
       "metrics": {
         "rounds": 1,
-        "findings_total": 7,
-        "accepted_total": 6,
-        "accepted_resolved_total": 6,
+        "findings_total": 2,
+        "accepted_total": 2,
+        "accepted_resolved_total": 2,
         "verdict_counts": {
-          "legitimate": 6,
-          "not_applicable": 1
+          "legitimate": 2
         },
         "confirm_counts": {
-          "resolved": 6,
-          "unresolved": 1
+          "resolved": 2
         }
       }
     },
@@ -234,38 +232,43 @@
       "step_id": "plan-cycle",
       "phase": "PLAN.1",
       "sha": "971b13794395bc5e9b5b41bbb67b91d2cbdcc923"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN.1",
+      "sha": "fc8fc7a7c76c994bc3850ccb91b03240757a0c86"
     }
   ],
   "totals": {
-    "input_tokens": 773867,
-    "output_tokens": 130261,
-    "cached_input_tokens": 6915945,
-    "cost_usd": 8.7227413
+    "input_tokens": 842067,
+    "output_tokens": 147987,
+    "cached_input_tokens": 8020896,
+    "cost_usd": 10.210823399999999
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 651762,
-      "output_tokens": 12971,
-      "cached_input_tokens": 371072,
+      "input_tokens": 706542,
+      "output_tokens": 14669,
+      "cached_input_tokens": 375936,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 44395,
-      "output_tokens": 8965,
+      "input_tokens": 50429,
+      "output_tokens": 9771,
       "cached_input_tokens": 0,
-      "cost_usd": 0.02660955
+      "cost_usd": 0.02892365
     },
     "escalation": {
-      "input_tokens": 7680,
-      "output_tokens": 1777,
+      "input_tokens": 10682,
+      "output_tokens": 2319,
       "cached_input_tokens": 0,
-      "cost_usd": 0.024922
+      "cost_usd": 0.0340945
     },
     "builder": {
-      "input_tokens": 17309,
-      "output_tokens": 96987,
-      "cached_input_tokens": 6544873,
-      "cost_usd": 8.638907499999998
+      "input_tokens": 21693,
+      "output_tokens": 111667,
+      "cached_input_tokens": 7644960,
+      "cost_usd": 10.115502999999999
     },
     "judge_llm": {
       "input_tokens": 52721,
