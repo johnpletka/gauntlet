@@ -6,6 +6,135 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-01
+
+A new **lightweight review** surface. `gauntlet review` brings the adversarial
+review cycle (review → triage → fix → confirm) to small changes — bug fixes,
+one-off patches — **without** the PRD → plan → phase ceremony. The engineer fixes
+the bug however they like (plain Claude Code, by hand) on a branch or PR;
+`gauntlet review` reviews that change against its originating ticket, lands
+accepted fixes as `REVIEW.x` commits **in place**, and stops — the resulting
+branch/PR *is* the human review. It runs with zero routine human gates while
+keeping the cycle's fail-closed escalation park as the safety stop. Everything is
+additive; no existing CLI workflow changes, and no approved artifact
+(`PRD-gauntlet.md`, `policy.yaml`, any `prd.md`/`plan.md`) is amended.
+
+### Added — `gauntlet review`
+
+- **New `gauntlet review [<branch>]` command.** Reviews an already-implemented
+  change on a local branch (default: the current branch) against a three-dot diff
+  from its base, reusing the trusted `adversarial_cycle` machinery verbatim — same
+  reviewer, triage rubric, severity-aware escalation, reviewer-mutation guard, and
+  audit-trail fix commits. Only the PRD/plan/phase ceremony is removed. (FR-1, FR-3)
+- **Solution-correctness review against the originating ticket.** The reviewer is
+  given both the diff **and** a provenance-tagged problem statement (`intent.md`,
+  the lightweight analog of `prd.md`) and asked whether the change actually
+  *resolves the stated problem* — not just whether the diff is internally sound.
+  Intent comes, in precedence order, from `--issue <ref|url>` (tracker fetch),
+  `--intent <path>`, `-m <text>`, or an `$EDITOR` template; `--code-only` skips
+  intent entirely. (FR-2, G2)
+- **Pluggable issue trackers; v1 ships Linear.** A new `gauntlet.issue_trackers`
+  entry-point registry (mirroring the adapter registry) resolves a Linear ref
+  (`ENG-1234` or a `linear.app/.../issue/<KEY>` URL) into a normalized problem
+  statement via the Linear GraphQL API. Auth is by env-var name
+  (`config.issue_tracker.api_key_env`, default `LINEAR_API_KEY`) — never a token
+  in config — and every fetch fails closed on auth / not-found / unavailable /
+  timeout with a typed, actionable error. GitHub Issues / Jira are a registry
+  seam, not built code. (FR-6)
+- **GitHub PR mode (`--pr <N|url>`).** Checks out a PR locally, resolves its base
+  and linked ticket (auto-derived from the PR body in textual order; the first
+  resolved ref supplies the intent, secondary refs are reported as ignored), and
+  reviews the head branch against its base — including the fork / cross-repository
+  case. Fixes land locally; the harness never pushes (FR-9.8 boundary unchanged).
+  A non-fast-forward update to a diverged local branch is refused **before** the
+  branch is touched, so a checkout failure never leaves a destructive partial
+  state. (FR-4)
+- **Zero Git-status footprint.** A review run adds nothing — tracked or untracked
+  — to the target repo's `git status`, at every point including completion. Run
+  state (intent, findings, manifest) lives out-of-repo by default under
+  `${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/`; an in-repo
+  `review.state_dir` override is permitted only when git-ignored (verified via
+  `git check-ignore`, else fail closed). A user-supplied in-repo `--intent` file is
+  excluded from the entry contract and never swept into a fix commit. (FR-8, G3)
+- **`--rounds`, `--test` / `--no-test` controls.** `--rounds` is validated at parse
+  time to the closed range `[1, 10]` (default 1) as a deterministic runaway guard;
+  `--test` runs the configured `test_command` as an optional baseline step.
+- **Terminal-severity contract for gate-less runs.** An unresolved legitimate
+  **blocking** finding parks the run (resumable via `resume --response`); an
+  unresolved legitimate **non-blocking** finding (`major`/`minor`/`nit`) *completes*
+  but is recorded in the run summary as **residual risk**; a not-legitimate finding
+  is recorded with its triage reasoning. The summary is a pure, deterministic
+  function of the cycle's persisted findings/triage/confirm records. (FR-3.4)
+
+### Added — supporting surface
+
+- **`gauntlet doctor` tracker health check.** When an `issue_tracker` block is
+  configured, `doctor` validates the provider is supported, the named env var is
+  set, and `verify_auth` succeeds — with fail-closed, actionable messages. (FR-10.1)
+- **`gauntlet init` scaffolding.** Ships `pipelines/review.yaml` and the
+  `review-code-intent.md` prompt in the standard asset set, and scaffolds a
+  commented-out `issue_tracker` block (Linear example + env-var name) and the
+  `gauntlet-cli` / `pr_read_commands` policy examples. (FR-10.2)
+- **Deterministic PR-read policy preflight.** PR mode is gated by a machine-checkable
+  read of `policy.yaml` that verifies the `pr_read_commands@v1` rule is present,
+  ratified, and version-`v1` — no network, no agent — and halts with the exact
+  FR-7.4 message on absent / unratified / version-mismatch. `PolicyRule` now carries
+  `id` / `version` / `ratified` governance markers. Branch-mode reviews skip the
+  preflight entirely. The rule is *proposed*, never silently applied; ratification
+  is the human gate. (FR-7)
+
+### Notes
+
+- **Adopters:** run `gauntlet init` (new repos) or `gauntlet upgrade` (existing) to
+  pick up `pipelines/review.yaml`, the review prompt, and the commented
+  `issue_tracker` / policy examples. PR mode additionally requires the
+  `pr_read_commands@v1` rule to be ratified in `policy.yaml` via the policy-change
+  process; branch mode needs no policy change.
+- **Engine surface:** the review lifecycle composes existing `RunManager`
+  primitives (manifest, writer/redactor, worktree lock, `resume`/`status`/`abort`)
+  and reaches the `adversarial_cycle` through configuration only — `engine/cycle.py`
+  loop logic is unchanged.
+
+## [0.3.3] — 2026-06-30
+
+A patch release that stops two operator dead-ends where a run could brick itself,
+plus a commit-isolation correctness fix. All bug fixes; existing workflows are
+unchanged. (#47)
+
+### Fixed
+
+- **`gauntlet reject` is no longer a dead end.** A `human_gate` rejection marked
+  the run terminally `failed`, and a plain `resume` then no-op'd — so a rejection
+  with an actionable note went nowhere. `reject_gate` now re-drives: when the gate
+  sits downstream of an `adversarial_cycle` (the PRD/plan loops), the rejection
+  note is injected into that cycle as a pending `--response` (audited and
+  checkpoint-committed), the cycle and everything after it in the stage is reset,
+  and the loop re-runs with the note as authoritative reviewer/triager guidance
+  before re-parking the gate for a fresh decision. A gate with no upstream cycle to
+  iterate still fails terminally with a clear note — reject is never a silent
+  no-op. `reject` now takes the worktree lock and honors the judge like `approve`.
+- **A clean-handoff precondition failure no longer bricks the run.** Re-running a
+  failed clean-handoff precondition kept a stale `base_sha` (stamped on the failed
+  run and never refreshed), so a later interrupt would diff/rewind against a SHA
+  behind the operator's cleanup commit. Re-arming a re-runnable precondition
+  failure now clears `base_sha` so the fresh attempt re-stamps the boundary at the
+  current HEAD.
+- **Producer-commit isolation.** `commit_paths` ran `git commit -F -` with no
+  pathspec, so any file already staged when a producer commit (or the FR-6.4
+  proposal apply) ran was swept in — defeating the "stages only its output"
+  isolation both callers depend on. The commit is now pathspec-limited; a
+  pre-staged file is left staged and uncommitted.
+- **Fail-closed on artifact-commit git errors.** `_commit_output_artifact`
+  promised fail-closed on git errors but let them bubble out as a generic "handler
+  error"; it now catches `GitError` and returns an actionable `StepResult` naming
+  the path and phase.
+- **Rejecting an already-run cycle guard.** `reject_gate` now iterates only when
+  the upstream cycle ran to `DONE`, else terminal-rejects with a clear reason —
+  re-arming a non-`DONE` upstream cycle re-skips and orphans the note.
+- **Operator-facing message polish.** The terminal-failure resume refusal now
+  names the run by slug (operators act by slug, not `run_id`), and `--no-judge`
+  gained a help string for discoverability.
+
 ## [0.3.2] — 2026-06-27
 
 A patch release that fixes two ways the interactive operator/monitor session
@@ -289,6 +418,8 @@ safety invariant rather than being able to weaken one.
   worktree active-run lock); everything else reads on-disk state or shells out to
   CLI verbs.
 
+[0.4.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.4.0
+[0.3.3]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.3
 [0.3.2]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.2
 [0.3.1]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.1
 [0.3.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.0
