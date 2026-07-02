@@ -1,0 +1,5 @@
+{
+  "exception_class": "RateLimitError",
+  "message": "litellm.RateLimitError: RateLimitError: Anthropic 429 - rate limit exceeded",
+  "retry_after": 30
+}

@@ -17,7 +17,14 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from gauntlet.adapters.base import AgentResult, MalformedOutputError, Usage
+from gauntlet.adapters.base import (
+    FAILURE_TRANSIENT_USAGE_LIMIT,
+    AgentFailedError,
+    AgentResult,
+    FailureInfo,
+    MalformedOutputError,
+    Usage,
+)
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import (
@@ -1111,3 +1118,99 @@ def test_cycle_writes_substep_transcripts(cycle_repo):
     assert (steps / "r1-review" / "findings.json").exists()
     assert (steps / "r1-triage" / "F-001" / "verdict.json").exists()
     assert (steps / "r1-confirm" / "confirm.json").exists()
+
+
+# --- FR-3.2: a transient sub-agent failure parks the whole cycle -------------
+def _transient_exc(session="rev-sess"):
+    return AgentFailedError(
+        "usage limit hit mid-cycle",
+        partial=AgentResult(text="", session_id=session, exit_code=1),
+        failure_info=FailureInfo(
+            kind=FAILURE_TRANSIENT_USAGE_LIMIT, marker="codex_usage_limit_message",
+            retry_after_s=600,
+        ),
+    )
+
+
+def _build_cycle_orch(repo, adapters, *, man=None, step_extra=None, config=None):
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [cycle_step(**(step_extra or {}))]}],
+    })
+    cfg = RunConfig.model_validate(config or BASE_CONFIG)
+    man = man or Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                          pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    orch = Orchestrator(
+        repo_root=repo, run_dir=repo / "runs" / "demo" / "run-1",
+        artifact_root=repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    return orch, man
+
+
+def test_transient_reviewer_failure_parks_cycle_usage_limit(cycle_repo):
+    adapters = {
+        "reviewer": SeqAdapter(_transient_exc()),  # reviewer hits a usage limit
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.status == M.PARKED
+    # a usage_limit park — NOT a terminal failure, NOT a cycle_escalation
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "rev-sess"  # failing sub-agent session preserved
+    assert rec.retry_after_s == 600 and rec.quota_reset_at is not None
+    # worktree untouched: no fix-round commit, tree still clean
+    assert man.commits == []
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+
+
+def test_transient_failure_on_schema_retry_inside_run_sub_parks(cycle_repo):
+    # A transient failure raised on the schema-retry re-invocation inside
+    # _run_sub (attempt 2, after a malformed attempt 1) still parks usage_limit.
+    adapters = {
+        "reviewer": SeqAdapter(
+            MalformedOutputError("not json"),  # attempt 1: retry
+            _transient_exc(),                    # attempt 2: usage limit
+        ),
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+
+
+def test_transient_triage_failure_parks_cycle_usage_limit(cycle_repo):
+    # The park is uniform across sub-roles: a triager usage limit parks too
+    # (the triage call site is wrapped just like the reviewer's).
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(_transient_exc(session="triage-sess")),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "triage-sess"
+
+
+def test_plain_resume_redrives_parked_cycle(cycle_repo):
+    # A usage_limit cycle park is re-driven by a PLAIN resume (no --response).
+    # P1 re-enters the round at its start (round-loss deferred to P5); here the
+    # re-driven reviewer converges, so the cycle completes DONE.
+    reviewer = SeqAdapter(_transient_exc(), REVIEW())  # park, then converge on resume
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    # plain resume: re-drive (no --response); the cycle re-runs round 1 and converges
+    assert orch.drive() == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None  # cleared on DONE (current-state)

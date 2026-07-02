@@ -59,6 +59,10 @@ STATE_ORPHANED = "orphaned"
 STATE_INDETERMINATE = "indeterminate"
 STATE_PARKED_GATE = "parked_gate"
 STATE_PARKED_FOR_RESPONSE = "parked_for_response"
+# A step parked by a provider usage limit / overload (harness-efficiency FR-3.2).
+# Distinct from parked_for_response: it needs NO human decision — a plain
+# `gauntlet resume` continues the preserved session (FR-3.3).
+STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
 STATE_FAILED = "failed"
 STATE_HALTED = "halted"
 STATE_INTERRUPTED = "interrupted"
@@ -92,6 +96,7 @@ _MEANING: dict[str, str] = {
     STATE_INDETERMINATE: "cannot prove the driver is alive or dead — inspect read-only before acting",
     STATE_PARKED_GATE: "awaiting a human decision at a gate",
     STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision",
+    STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
     STATE_FAILED: "a step failed",
     STATE_HALTED: "the budget/timeout guard tripped",
     STATE_INTERRUPTED: "the run was killed mid-step",
@@ -350,6 +355,9 @@ def _actions_for(
         return [_decide_approve(slug), _decide_reject(slug)]
     if state == STATE_PARKED_FOR_RESPONSE:
         return [_decide_resume_response(slug)]
+    if state == STATE_PARKED_USAGE_LIMIT:
+        # FR-3.3: a plain `resume` continues the preserved session — no decision.
+        return [_control_resume(slug)]
     if state == STATE_FAILED:
         # A re-runnable PRECONDITION failure (FR-9.3 clean-handoff): plain
         # `resume` re-runs the guard once the operator fixes the named
@@ -581,6 +589,14 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
                 ParkedDescriptor(render_step_id(ps), ps.type, ps.parked_reason),
                 None,
             )
+        if ps.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+            # FR-3.2: a usage-limit park — a plain `resume` continues the session,
+            # no human decision required (distinct from the response parks above).
+            return (
+                STATE_PARKED_USAGE_LIMIT,
+                ParkedDescriptor(render_step_id(ps), ps.type, ps.parked_reason),
+                None,
+            )
         if ps.parked_reason is None and ps.type == "human_gate":
             return (
                 STATE_PARKED_GATE,
@@ -783,6 +799,7 @@ _STATUS_SCHEMA_JSON = r'''{
         "indeterminate",
         "parked_gate",
         "parked_for_response",
+        "parked_usage_limit",
         "failed",
         "halted",
         "interrupted",
@@ -826,7 +843,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -839,8 +856,8 @@ _STATUS_SCHEMA_JSON = r'''{
         },
         "reason": {
           "type": ["string", "null"],
-          "enum": ["upstream_conflict", "cycle_escalation", null],
-          "description": "Park reason; null for a plain human_gate."
+          "enum": ["upstream_conflict", "cycle_escalation", "usage_limit", null],
+          "description": "Park reason; null for a plain human_gate; usage_limit for a provider usage-limit park (FR-3.2)."
         }
       }
     },
@@ -977,7 +994,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

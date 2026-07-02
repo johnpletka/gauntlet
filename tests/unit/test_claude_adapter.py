@@ -234,3 +234,57 @@ def test_structured_unparseable_text_raises(monkeypatch):
     patch_run(monkeypatch, fake_output(json.dumps(RESULT_EVENT)))
     with pytest.raises(MalformedOutputError):
         ClaudeCodeAdapter().run("ping", schema=SCHEMA)
+
+
+# --- FR-3.1 failure classification on AgentFailedError ------------------------
+def _fail_event(result_text, *, subtype="success"):
+    ev = dict(RESULT_EVENT)
+    ev["is_error"] = True
+    ev["subtype"] = subtype
+    ev["result"] = result_text
+    return ev
+
+
+def test_usage_limit_message_classified_transient(monkeypatch):
+    ev = _fail_event("You've hit your session limit · resets 5:40pm (America/New_York)")
+    patch_run(monkeypatch, fake_output(json.dumps(ev)))
+    with pytest.raises(AgentFailedError) as excinfo:
+        ClaudeCodeAdapter().run("ping")
+    info = excinfo.value.failure_info
+    assert info is not None and info.kind == "transient_usage_limit"
+    assert info.retry_after_s is None  # reset time is prose, never scraped (§7)
+
+
+def test_overload_message_classified_transient(monkeypatch):
+    ev = _fail_event("API Error: Overloaded")
+    patch_run(monkeypatch, fake_output(json.dumps(ev)))
+    with pytest.raises(AgentFailedError) as excinfo:
+        ClaudeCodeAdapter().run("ping")
+    assert excinfo.value.failure_info.kind == "transient_overload"
+
+
+def test_unlisted_error_classified_terminal(monkeypatch):
+    ev = _fail_event("API Error: Connection closed mid-response.")
+    patch_run(monkeypatch, fake_output(json.dumps(ev)))
+    with pytest.raises(AgentFailedError) as excinfo:
+        ClaudeCodeAdapter().run("ping")
+    assert excinfo.value.failure_info.kind == "terminal"
+
+
+def test_session_not_found_on_resume_raises_session_error(monkeypatch):
+    from gauntlet.adapters.base import SessionNotFoundError
+
+    ev = _fail_event("Error: No conversation found for session deadbeef")
+    patch_run(monkeypatch, fake_output(json.dumps(ev), exit_code=1))
+    with pytest.raises(SessionNotFoundError):
+        ClaudeCodeAdapter().run("continue", session="deadbeef")
+
+
+def test_no_session_not_found_without_a_session(monkeypatch):
+    # The same message off the resume path is a plain terminal failure — the
+    # fallback only applies when a session was actually requested (FR-3.3).
+    ev = _fail_event("Error: No conversation found for session deadbeef")
+    patch_run(monkeypatch, fake_output(json.dumps(ev), exit_code=1))
+    with pytest.raises(AgentFailedError) as excinfo:
+        ClaudeCodeAdapter().run("fresh")
+    assert excinfo.value.failure_info.kind == "terminal"

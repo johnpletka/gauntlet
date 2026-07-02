@@ -122,3 +122,51 @@ def test_resume_unsupported(fake_litellm):
 def test_extra_flags_unsupported(fake_litellm):
     with pytest.raises(UnsupportedFeatureError):
         ApiAdapter(model="m").run("x", extra_flags=["--whatever"])
+
+
+# --- FR-3.1 failure classification: LiteLLM exceptions ----------------------
+def test_rate_limit_exception_classified_transient(fake_litellm):
+    from gauntlet.adapters.base import AgentFailedError
+
+    class RateLimitError(Exception):
+        retry_after = 30
+
+    def boom(**kwargs):
+        raise RateLimitError("429 rate limit exceeded")
+
+    fake_litellm.completion = boom
+    with pytest.raises(AgentFailedError) as excinfo:
+        ApiAdapter(model="m").run("classify")
+    info = excinfo.value.failure_info
+    assert info is not None and info.kind == "transient_usage_limit"
+    assert info.retry_after_s == 30
+
+
+def test_internal_server_error_classified_overload(fake_litellm):
+    from gauntlet.adapters.base import AgentFailedError
+
+    class InternalServerError(Exception):
+        pass
+
+    def boom(**kwargs):
+        raise InternalServerError("Overloaded")
+
+    fake_litellm.completion = boom
+    with pytest.raises(AgentFailedError) as excinfo:
+        ApiAdapter(model="m").run("classify")
+    assert excinfo.value.failure_info.kind == "transient_overload"
+
+
+def test_unknown_exception_classified_terminal(fake_litellm):
+    from gauntlet.adapters.base import AgentFailedError
+
+    class AuthenticationError(Exception):
+        pass
+
+    def boom(**kwargs):
+        raise AuthenticationError("bad api key")
+
+    fake_litellm.completion = boom
+    with pytest.raises(AgentFailedError) as excinfo:
+        ApiAdapter(model="m").run("classify")
+    assert excinfo.value.failure_info.kind == "terminal"

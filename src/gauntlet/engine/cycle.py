@@ -34,7 +34,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from gauntlet.adapters.base import AdapterError, MalformedOutputError
+from gauntlet.adapters.base import AdapterError, AgentFailedError, MalformedOutputError
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine.commit_format import validate_commit_message
@@ -223,7 +223,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             )
 
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
-        verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
+        # A transient (usage-limit/overload) failure in any triage sub-call parks
+        # the whole cycle (FR-3.2), mirroring the reviewer wrapper above.
+        try:
+            verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
+        except _ParkCycle as park:
+            return _finish(park.result, usage, commits, artifact_writes, metrics)
         metrics.record_verdicts(verdicts)
         # Integrity backstop BEFORE the authoritative write (data over inference):
         # every verdict must map to a finding in THIS round. The triager forces
@@ -299,10 +304,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
 
         # ---- 3. fix + fix-round commit (FR-9.4) -------------------------------
         fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
-        _run_sub(
-            ctx, fixer, fix_prompt, schema=None, usage=usage,
-            logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
-        )
+        try:
+            _run_sub(
+                ctx, fixer, fix_prompt, schema=None, usage=usage,
+                logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
+            )
+        except _ParkCycle as park:
+            return _finish(park.result, usage, commits, artifact_writes, metrics)
         if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
             return _finish(
                 StepResult(
@@ -329,12 +337,15 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         confirm_prompt = _confirm_prompt(
             step, ctx, handoff, fix_sha, findings, verdicts
         )
-        confirm = _run_sub(
-            ctx, confirmer, confirm_prompt,
-            schema=confirm_schema, usage=usage,
-            logger=step_logger(ctx, f"r{rnd}-confirm"),
-            structured_name="confirm.json",
-        )
+        try:
+            confirm = _run_sub(
+                ctx, confirmer, confirm_prompt,
+                schema=confirm_schema, usage=usage,
+                logger=step_logger(ctx, f"r{rnd}-confirm"),
+                structured_name="confirm.json",
+            )
+        except _ParkCycle as park:
+            return _finish(park.result, usage, commits, artifact_writes, metrics)
         cdata = confirm.structured or {}
         metrics.record_confirm(cdata)
         actions = {v["finding_id"]: v["action"] for v in verdicts}
@@ -469,6 +480,33 @@ def _run_sub(
             _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
                 after_attempt()
+            # FR-3.2: a TRANSIENT sub-agent failure (usage limit / overload) is
+            # the observed real cycle-death mode. Park the whole CYCLE step with
+            # parked_reason=usage_limit (worktree untouched, the failing
+            # sub-agent's session preserved) instead of failing it — a plain
+            # `gauntlet resume` re-drives the cycle (P1 re-enters the round at its
+            # start; P5's checkpoints tighten this to the first incomplete
+            # sub-step). Raised as a _ParkCycle so the round-loop wrapper returns
+            # it uniformly for any sub-role (reviewer/triager/fixer/confirmer).
+            if isinstance(exc, AgentFailedError) and (
+                exc.failure_info is not None and exc.failure_info.is_transient
+            ):
+                info = exc.failure_info
+                sess = exc.partial.session_id if exc.partial else None
+                raise _ParkCycle(
+                    StepResult(
+                        status=PARKED,
+                        parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                        session_id=sess,
+                        retry_after_s=info.retry_after_s,
+                        notes=(
+                            f"usage-limit park (FR-3.2): {agent_name} sub-agent hit "
+                            f"{info.kind} [{info.marker}] in the cycle; worktree "
+                            "untouched, session preserved — `gauntlet resume` "
+                            "re-drives the cycle"
+                        ),
+                    )
+                ) from exc
             raise
         finally:
             # Close the per-attempt stream regardless of outcome (a StreamSinkError

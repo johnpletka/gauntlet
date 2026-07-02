@@ -52,6 +52,13 @@ class StepResult:
     # park on a *different* ``halt_on`` marker, a human_gate, or a budget halt).
     # ``_finalize`` copies this onto the record so the field stays current-state.
     parked_reason: str | None = None
+    # Usage-limit park stamps (harness-efficiency FR-3.2), carried onto the
+    # StepRecord by ``_finalize`` when a transient failure parks the step.
+    # ``retry_after_s`` is the provider's structured retry hint (``None`` when
+    # none); ``quota_reset_at`` is its derived absolute UTC reset time (``None``
+    # when unreported). Both ``None`` for every non-usage-limit outcome.
+    retry_after_s: int | None = None
+    quota_reset_at: str | None = None
     # Failure-kind discriminator (current-state, like ``parked_reason``): set to a
     # ``manifest.FAILURE_KIND_*`` value ONLY when this step failed a re-runnable
     # PRECONDITION guard (no adapter invoked, no cost — e.g. the FR-9.3 round-1

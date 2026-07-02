@@ -21,11 +21,13 @@ from gauntlet.adapters._structured import (
 )
 from gauntlet.adapters.base import (
     AdapterCapabilities,
+    AgentFailedError,
     AgentResult,
     MalformedOutputError,
     UnsupportedFeatureError,
     Usage,
 )
+from gauntlet.adapters.failure_markers import classify_api_failure
 
 DEFAULT_TIMEOUT_S = 120.0
 
@@ -95,7 +97,19 @@ class ApiAdapter:
                         ),
                     }
                 )
-            response = self._complete(messages)
+            try:
+                response = self._complete(messages)
+            except Exception as exc:  # noqa: BLE001 — classify then fail closed
+                # FR-3.1: a LiteLLM RateLimitError (429) / InternalServerError
+                # (overload) is a transient park-and-resume condition, not a step
+                # failure; classify by exception class and carry it on the error
+                # so the orchestrator parks with parked_reason=usage_limit. Any
+                # unrecognized exception classifies terminal (fail closed).
+                raise AgentFailedError(
+                    f"api call failed: {type(exc).__name__}: {exc}",
+                    partial=self._result(text, None, usage_total, raw_events),
+                    failure_info=classify_api_failure(exc),
+                ) from exc
             raw_events.append(_response_to_dict(response))
             text = response.choices[0].message.content or ""
             _accumulate_usage(usage_total, response)

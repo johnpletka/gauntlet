@@ -18,7 +18,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from gauntlet.adapters.base import AdapterError
+from gauntlet.adapters.base import AdapterError, SessionNotFoundError
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -32,6 +32,7 @@ from gauntlet.engine.execution import (
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
     PARKED_REASON_UPSTREAM_CONFLICT,
+    PARKED_REASON_USAGE_LIMIT,
     RESPONSE_CONSUMED,
     RESPONSE_PENDING,
 )
@@ -47,6 +48,17 @@ _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
 # different `halt_on:` marker parks with `parked_reason` unset. Pipelines use
 # this string verbatim (pipelines/standard.yaml `halt_on: "UPSTREAM CONFLICT"`).
 UPSTREAM_CONFLICT_MARKER = "UPSTREAM CONFLICT"
+
+# FR-3.3 continuation prompt: sent (instead of the full original prompt) when a
+# usage-limit park is resumed against a preserved CLI session. Short by design —
+# the session already holds the task context; re-sending the full prompt would
+# waste the very usage budget the resume exists to conserve.
+_CONTINUATION_PROMPT = (
+    "You were interrupted by a provider usage limit before finishing this task. "
+    "Continue from where you left off and complete it. The worktree is exactly "
+    "as you left it — your prior edits are intact. Do not restart from scratch "
+    "or redo work you already completed."
+)
 
 # FR-4: the single, fixed-name synthetic artifact that carries the full
 # chronological human-decision history into a `--response` resume. There is
@@ -192,7 +204,15 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     if not agent_name:
         return StepResult(status=FAILED, notes="agent_task step has no `agent:`")
     adapter = ctx.build_adapter(agent_name)
-    prompt = _render_prompt(step, ctx)
+    # FR-3.3: a usage-limit resume continues the persisted CLI session with a
+    # SHORT continuation prompt instead of re-sending the full original prompt.
+    # The record still carries parked_reason=usage_limit (the orchestrator clears
+    # it only when this run finalizes), so it uniquely identifies the resume; it
+    # is never a `--response` resume (a usage_limit park needs no decision).
+    is_quota_resume = bool(
+        ctx.record.parked_reason == PARKED_REASON_USAGE_LIMIT and ctx.record.session_id
+    )
+    prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
     # FR-10: while this invocation is consuming a pending `--response`, bind the
     # resume-disposition schema invocation-locally and let the structured
     # disposition drive the outcome — without touching the approved pipeline.
@@ -211,36 +231,59 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
-    logger.log_prompt(prompt)  # before the call: the prompt survives a crash
-    # Live-observability streaming (live-run-observability FR-2): when enabled and
-    # the adapter is line-streamable, thread a per-line sink so events.jsonl grows
-    # during the step. sink is passed ONLY when streaming — the buffered path's
-    # call shape (and existing fakes) stay untouched (FR-6.1).
-    stream = open_step_stream(ctx, adapter, logger)
-    run_kwargs: dict = {
-        "session": ctx.record.session_id,
-        "schema": schema,
-        "cwd": ctx.repo_root,
-    }
-    if stream is not None:
-        run_kwargs["sink"] = stream.append_line
-    try:
-        result = adapter.run(prompt, **run_kwargs)
-    except AdapterError as exc:
-        # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
-        # partial evidence the adapter salvaged before the orchestrator
-        # classifies the error.
-        if exc.partial is not None:
-            logger.log_result(exc.partial, suffix="-failed")
-        logger.log_text("failure.txt", str(exc))
-        raise
-    finally:
-        # A streaming sink fault surfaces as a StreamSinkError (not an
-        # AdapterError) that propagates past the except above; the orchestrator
-        # records the step FAILED (fail closed, FR-6.2). Close the stream either
-        # way so it is never left half-open.
+
+    def _invoke(call_prompt: str, session: str | None):
+        """One adapter call with FR-4 lossless logging + FR-6 streaming.
+
+        Factored so a usage-limit resume can fall back to a second, full-prompt
+        call when the stored session is gone (FR-3.3). ``log_prompt`` runs before
+        the call (survives a crash); a per-attempt stream is opened/closed here so
+        events.jsonl reflects the current attempt.
+        """
+        logger.log_prompt(call_prompt)
+        # Live-observability streaming (live-run-observability FR-2): when enabled
+        # and the adapter is line-streamable, thread a per-line sink so
+        # events.jsonl grows during the step. sink is passed ONLY when streaming —
+        # the buffered path's call shape (and existing fakes) stay untouched.
+        stream = open_step_stream(ctx, adapter, logger)
+        kwargs: dict = {"session": session, "schema": schema, "cwd": ctx.repo_root}
         if stream is not None:
-            stream.close()
+            kwargs["sink"] = stream.append_line
+        try:
+            return adapter.run(call_prompt, **kwargs)
+        except AdapterError as exc:
+            # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
+            # partial evidence the adapter salvaged before it is re-raised (the
+            # orchestrator classifies transient-vs-terminal, FR-3.1).
+            if exc.partial is not None:
+                logger.log_result(exc.partial, suffix="-failed")
+            logger.log_text("failure.txt", str(exc))
+            raise
+        finally:
+            # A streaming sink fault surfaces as a StreamSinkError (not an
+            # AdapterError) that propagates past the except above; the
+            # orchestrator records the step FAILED (fail closed, FR-6.2). Close
+            # the stream either way so it is never left half-open.
+            if stream is not None:
+                stream.close()
+
+    fallback_note = ""
+    try:
+        result = _invoke(prompt, ctx.record.session_id)
+    except SessionNotFoundError as exc:
+        # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
+        # to a full re-run with no session (recoverable, not a run-halting fault)
+        # and record the fallback. Off the quota-resume path a SessionNotFoundError
+        # is unexpected, so re-raise it to fail closed like any other adapter error.
+        if not is_quota_resume:
+            raise
+        logger.log_text("session-expired.txt", str(exc))
+        fallback_note = (
+            "usage-limit resume: stored session was unknown/expired; fell back "
+            "to a full re-run with no session (FR-3.3)"
+        )
+        prompt = _render_prompt(step, ctx)
+        result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     usage_by_agent = {agent_name: result.usage} if result.usage else {}
 
@@ -313,7 +356,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         artifact_writes=artifact_writes,
         commit_sha=commit_sha,
         commit_phase=commit_phase,
-        notes=f"agent {agent_name!r} completed",
+        notes=(
+            f"agent {agent_name!r} completed\n{fallback_note}"
+            if fallback_note else f"agent {agent_name!r} completed"
+        ),
     )
 
 

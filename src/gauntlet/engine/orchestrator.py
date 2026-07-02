@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from gauntlet.adapters.base import AgentTimeoutError
+from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.execution import (
@@ -483,6 +483,14 @@ class Orchestrator:
                     session_id=exc.partial.session_id if exc.partial else None,
                     notes=f"timeout halt (FR-3.3): {exc}",
                 )
+            except AgentFailedError as exc:
+                # FR-3.2: a TRANSIENT failure (usage limit / overload) is not a
+                # step failure — park (not FAILED) with parked_reason=usage_limit,
+                # preserving the worktree (no reset on this park kind) and the CLI
+                # session so a plain `gauntlet resume` continues it (FR-3.3). A
+                # TERMINAL or unclassified failure fails closed → FAILED (a human
+                # decides), exactly as an unclassified handler fault would.
+                result = self._agent_failure_result(exc)
             except Exception as exc:  # fail closed: a handler fault halts the step
                 result = StepResult(status=FAILED, notes=f"handler error: {exc}")
 
@@ -666,6 +674,58 @@ class Orchestrator:
         result.notes = f"{result.notes}\n{note}" if result.notes else note
         return result
 
+    def _agent_failure_result(self, exc: AgentFailedError) -> StepResult:
+        """Turn a classified adapter failure into a park (transient) or FAILED.
+
+        FR-3.2: a ``transient_*`` classification parks the step with
+        ``parked_reason=usage_limit``, the failing call's ``session_id`` preserved
+        (so a plain ``gauntlet resume`` continues it, FR-3.3) and its usage
+        accounted (the failed call still cost tokens). The worktree is left
+        untouched — this park kind bypasses the reset/conflict-restore paths (both
+        key on other reasons). An absent/terminal ``failure_info`` fails closed to
+        FAILED (never auto-continued past an unknown error, §7).
+        """
+        info = exc.failure_info
+        partial = exc.partial
+        if info is not None and info.is_transient:
+            after = (
+                f"; provider retry hint ~{info.retry_after_s}s"
+                if info.retry_after_s else ""
+            )
+            return StepResult(
+                status=PARKED,
+                parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                session_id=partial.session_id if partial else None,
+                usage=partial.usage if partial else None,
+                retry_after_s=info.retry_after_s,
+                notes=(
+                    f"usage-limit park (FR-3.2): {info.kind} [{info.marker}]; "
+                    "worktree and CLI session preserved — `gauntlet resume` "
+                    "continues the session" + after
+                ),
+            )
+        return StepResult(
+            status=FAILED,
+            usage=partial.usage if partial else None,
+            session_id=partial.session_id if partial else None,
+            notes=f"agent failed (terminal, FR-3.1): {exc}",
+        )
+
+    def _quota_reset_at(self, retry_after_s: int | None) -> str | None:
+        """Absolute UTC reset time = now + ``retry_after_s`` (FR-3.2 "when reported").
+
+        Derived from the orchestrator clock so tests are deterministic; ``None``
+        when no structured retry hint was reported, or when the clock string is
+        not ISO-parseable (fail-safe — an un-parseable reset is simply omitted).
+        """
+        if not retry_after_s:
+            return None
+        try:
+            base = datetime.fromisoformat(self.clock())
+        except ValueError:
+            return None
+        return (base + timedelta(seconds=retry_after_s)).isoformat()
+
     def _apply_budget_guard(
         self, step: Step, rec: StepRecord, result: StepResult
     ) -> StepResult:
@@ -716,6 +776,16 @@ class Orchestrator:
         # finished execution's value so a precondition failure is re-runnable on
         # resume, and any later non-precondition finalization clears a stale value.
         rec.failure_kind = result.failure_kind
+        # Usage-limit park stamps are CURRENT-STATE as well (FR-3.2): set on a
+        # usage_limit park, cleared (back to None) on any other finalization —
+        # so a step later resumed to DONE never carries a stale reset time. The
+        # absolute reset time is derived here (from the retry hint + the engine
+        # clock) so both the agent_task and cycle park paths get it uniformly;
+        # an explicit ``quota_reset_at`` on the result (rare) still wins.
+        rec.retry_after_s = result.retry_after_s
+        rec.quota_reset_at = result.quota_reset_at or self._quota_reset_at(
+            result.retry_after_s
+        )
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:

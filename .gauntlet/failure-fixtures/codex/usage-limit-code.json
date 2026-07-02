@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"type": "thread.started", "thread_id": "th_def456"},
+    {"type": "turn.failed", "error": {"code": "usage_limit_reached", "message": "quota exhausted"}}
+  ]
+}

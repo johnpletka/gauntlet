@@ -48,6 +48,7 @@
         "indeterminate",
         "parked_gate",
         "parked_for_response",
+        "parked_usage_limit",
         "failed",
         "halted",
         "interrupted",
@@ -91,7 +92,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -104,8 +105,8 @@
         },
         "reason": {
           "type": ["string", "null"],
-          "enum": ["upstream_conflict", "cycle_escalation", null],
-          "description": "Park reason; null for a plain human_gate."
+          "enum": ["upstream_conflict", "cycle_escalation", "usage_limit", null],
+          "description": "Park reason; null for a plain human_gate; usage_limit for a provider usage-limit park (FR-3.2)."
         }
       }
     },
@@ -242,7 +243,7 @@
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

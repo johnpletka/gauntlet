@@ -23,7 +23,12 @@ from gauntlet.adapters.base import (
     AgentResult,
     AgentTimeoutError,
     MalformedOutputError,
+    SessionNotFoundError,
     Usage,
+)
+from gauntlet.adapters.failure_markers import (
+    classify_claude_failure,
+    looks_like_session_not_found,
 )
 from gauntlet.adapters.process import ProcessOutput, run_with_timeout
 from gauntlet.config import lint_flags
@@ -120,7 +125,7 @@ class ClaudeCodeAdapter:
                 f"claude killed after {self.timeout_s}s timeout",
                 partial=self._partial_result(out),
             )
-        result = self._parse(out, schema=schema)
+        result = self._parse(out, schema=schema, session=session)
         return result
 
     # -- command construction -------------------------------------------------
@@ -154,7 +159,9 @@ class ClaudeCodeAdapter:
 
     # -- output parsing --------------------------------------------------------
 
-    def _parse(self, out: ProcessOutput, *, schema: dict | None) -> AgentResult:
+    def _parse(
+        self, out: ProcessOutput, *, schema: dict | None, session: str | None = None
+    ) -> AgentResult:
         events = self._decode_events(out, strict=True)
         result_event = next(
             (e for e in reversed(events) if e.get("type") == "result"), None
@@ -170,9 +177,24 @@ class ClaudeCodeAdapter:
         # Fail closed on reported failure, even when output parses (F-001).
         failure = self._failure_marker(out, result_event)
         if failure:
+            # FR-3.1: classify transient-vs-terminal from the structured result
+            # event so the engine can park-and-resume a usage-limit/overload hit
+            # instead of failing the step. FR-3.3: a resume whose session the CLI
+            # no longer knows falls back to a full re-run — raise the dedicated
+            # error so the handler can retry with no session (best-effort, only
+            # when a session was requested and the failure is not itself transient).
+            failure_info = classify_claude_failure(result_event, out.exit_code)
+            if not failure_info.is_transient and session and looks_like_session_not_found(
+                (result_event or {}).get("result")
+            ):
+                raise SessionNotFoundError(
+                    f"claude could not resume session {session}: {failure}",
+                    partial=partial,
+                )
             raise AgentFailedError(
                 f"claude reported failure: {failure}; stderr: {out.stderr[:500]}",
                 partial=partial,
+                failure_info=failure_info,
             )
         if result_event is None:
             raise MalformedOutputError(

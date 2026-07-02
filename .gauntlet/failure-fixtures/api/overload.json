@@ -1,0 +1,4 @@
+{
+  "exception_class": "InternalServerError",
+  "message": "litellm.InternalServerError: Overloaded - the upstream provider is temporarily unavailable"
+}

@@ -77,6 +77,9 @@ def _payload(
         (M.RUN_PARKED,
          [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_UPSTREAM_CONFLICT)],
          op.LIVENESS_NONE, op.STATE_PARKED_FOR_RESPONSE),
+        (M.RUN_PARKED,
+         [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+         op.LIVENESS_NONE, op.STATE_PARKED_USAGE_LIMIT),
         (M.RUN_FAILED, [_step("s", "agent_task", M.FAILED)], op.LIVENESS_NONE,
          op.STATE_FAILED),
         (M.RUN_FAILED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
@@ -331,6 +334,25 @@ def test_malformed_driver_since_fails_closed():
     bad_driver = op.DriverInfo(op.LIVENESS_ALIVE, 42, "host", "2026-06-25T16:41:22+00:00")
     with pytest.raises(op.StatusContractError):
         _payload(man, op.LIVENESS_ALIVE, driver=bad_driver)
+
+
+def test_usage_limit_park_reports_resume_next_action():
+    # FR-3.2: a usage_limit park surfaces as the distinct `parked_usage_limit`
+    # state whose ONLY next action is a plain `resume` (no --response decision).
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("implement", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["state"] == "parked_usage_limit"
+    assert payload["parked"]["reason"] == "usage_limit"
+    assert payload["parked"]["step_id"] == "implement"
+    validate_schema(payload, STATUS_SCHEMA)
+    actions = payload["next_actions"]
+    assert [a["label"] for a in actions] == ["resume"]
+    assert actions[0]["kind"] == "control"
+    assert actions[0]["executable"] is True
+    assert actions[0]["command"] == "gauntlet resume demo"
 
 
 def test_embedded_schema_matches_committed_file():

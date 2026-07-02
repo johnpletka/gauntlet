@@ -1,0 +1,7 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "result": "You've hit your session limit · resets 5:40pm (America/New_York)",
+  "total_cost_usd": 3.4018990000000002
+}

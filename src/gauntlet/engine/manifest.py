@@ -35,6 +35,14 @@ PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"
 # next re-drive). It is current-state, not a latch, cleared like every other
 # parked_reason on any non-cycle-escalation finalization.
 PARKED_REASON_CYCLE_ESCALATION = "cycle_escalation"
+# A step (agent_task or adversarial_cycle) interrupted by a provider usage limit
+# / rate limit / overload (harness-efficiency FR-3.2). Unlike the two conflict
+# parks above, this needs NO human decision — the worktree and CLI session are
+# preserved and a PLAIN `gauntlet resume` continues the persisted session with a
+# short continuation prompt (FR-3.3). It is therefore deliberately NOT in
+# RESPONSE_RESOLVABLE_PARK_REASONS. Current-state like every parked_reason:
+# cleared on any non-usage-limit finalization of the step.
+PARKED_REASON_USAGE_LIMIT = "usage_limit"
 
 # Park reasons a human resolves by supplying a `gauntlet resume --response`
 # decision (FR-1.1 / FR-10.4): resuming such a park WITHOUT `--response` errors
@@ -159,6 +167,15 @@ class StepRecord(BaseModel):
     # terminal. ``None`` for every other outcome; cleared on any finalization that
     # does not re-set it (so a stale value can never mislabel a later failure).
     failure_kind: str | None = None
+    # Usage-limit park stamps (harness-efficiency FR-3.2). Set only when this step
+    # parked with ``parked_reason == PARKED_REASON_USAGE_LIMIT``: ``retry_after_s``
+    # is the provider's structured retry hint (never scraped from prose; ``None``
+    # when the envelope carried no structured field), and ``quota_reset_at`` is the
+    # absolute UTC reset time derived from it (``None`` when no hint was reported).
+    # Additive/nullable, so older manifests load unchanged; full status surfacing
+    # of these is P3.
+    retry_after_s: int | None = None
+    quota_reset_at: str | None = None
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)
