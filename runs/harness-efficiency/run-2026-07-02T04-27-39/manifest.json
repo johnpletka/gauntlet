@@ -109,11 +109,11 @@
     {
       "id": "plan-cycle",
       "type": "adversarial_cycle",
-      "status": "failed",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-02T13:26:52.192203+00:00",
-      "ended": "2026-07-02T13:50:19.457679+00:00",
+      "ended": "2026-07-02T16:41:11.429491+00:00",
       "attempts": 1,
       "base_sha": "09f2a9cea0a3f55b74d3f572b5b0f5be75f7571a",
       "parked_reason": null,
@@ -133,27 +133,29 @@
           "timestamp": "2026-07-02T16:26:36.400932+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 2,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 536549,
-        "output_tokens": 22462,
-        "cached_input_tokens": 1342404,
-        "cost_usd": 1.3904457500000003
+        "input_tokens": 628581,
+        "output_tokens": 61784,
+        "cached_input_tokens": 4446403,
+        "cost_usd": 4.614101799999999
       },
-      "notes": "handler error: litellm.InternalServerError: InternalServerError: OpenAIException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `OPENAI_API_KEY` or `OPENAI_ADMIN_KEY` environment variable.",
+      "notes": "converged in round 1 (blocking policy): no open blocking; 6 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": null,
       "metrics": {
         "rounds": 1,
-        "findings_total": 4,
-        "accepted_total": 4,
-        "accepted_resolved_total": 4,
+        "findings_total": 7,
+        "accepted_total": 6,
+        "accepted_resolved_total": 6,
         "verdict_counts": {
-          "legitimate": 4
+          "legitimate": 6,
+          "not_applicable": 1
         },
         "confirm_counts": {
-          "resolved": 4
+          "resolved": 6,
+          "unresolved": 1
         }
       }
     },
@@ -219,38 +221,43 @@
       "step_id": "plan-cycle",
       "phase": "PLAN.1",
       "sha": "f99c079ada4e92c0f8384f5b2b0a80b67cc3f0d0"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN.1",
+      "sha": "971b13794395bc5e9b5b41bbb67b91d2cbdcc923"
     }
   ],
   "totals": {
-    "input_tokens": 662732,
-    "output_tokens": 87339,
-    "cached_input_tokens": 3811946,
-    "cost_usd": 5.487109500000001
+    "input_tokens": 754764,
+    "output_tokens": 126661,
+    "cached_input_tokens": 6915945,
+    "cost_usd": 8.71076555
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 591044,
-      "output_tokens": 9981,
-      "cached_input_tokens": 366208,
+      "input_tokens": 651762,
+      "output_tokens": 12971,
+      "cached_input_tokens": 371072,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 24703,
-      "output_tokens": 5155,
+      "input_tokens": 44395,
+      "output_tokens": 8965,
       "cached_input_tokens": 0,
-      "cost_usd": 0.01648575
+      "cost_usd": 0.02660955
     },
     "escalation": {
-      "input_tokens": 1969,
-      "output_tokens": 653,
+      "input_tokens": 7680,
+      "output_tokens": 1777,
       "cached_input_tokens": 0,
-      "cost_usd": 0.008991250000000001
+      "cost_usd": 0.024922
     },
     "builder": {
-      "input_tokens": 11398,
-      "output_tokens": 65589,
-      "cached_input_tokens": 3445738,
-      "cost_usd": 5.441306
+      "input_tokens": 17309,
+      "output_tokens": 96987,
+      "cached_input_tokens": 6544873,
+      "cost_usd": 8.638907499999998
     },
     "judge_llm": {
       "input_tokens": 33618,
