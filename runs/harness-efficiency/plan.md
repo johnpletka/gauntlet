@@ -333,7 +333,7 @@ The organizing constraint (PRD §1.2): **the builder's provider window is the sc
   goal: Render convergence summary, prior responses/rejections, and per-finding triage reasoning into the gate view and status gate block, with consequence lines on gate next_actions. Validates that a gate decision is makeable from the gate view alone.
 - id: P9
   title: Intra-phase checkpoint commits + checkpoint-aware recovery
-  goal: Add prompt-directed PN-wip milestone commits with a normative git-history contract (handoff always a PN: commit) and rewind recovery to the latest checkpoint. Validates that the commit discipline bounds worst-case lost work to one milestone.
+  goal: "Add prompt-directed PN-wip milestone commits with a normative git-history contract (handoff always a PN: commit) and rewind recovery to the latest checkpoint. Validates that the commit discipline bounds worst-case lost work to one milestone."
 - id: P10
   title: Usage-window ledger + step admission
   goal: Append content-free per-step usage to a machine-global ledger and admit window-constrained steps by median-estimate vs headroom, warning by default and parking pre-step under enforce. Validates that local data approximates the shared window well enough to beat reactive halts.
