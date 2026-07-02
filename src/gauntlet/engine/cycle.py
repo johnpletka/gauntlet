@@ -34,7 +34,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from gauntlet.adapters.base import AdapterError, AgentFailedError, MalformedOutputError
+from gauntlet.adapters.base import (
+    AdapterError,
+    AgentFailedError,
+    MalformedOutputError,
+    SessionNotFoundError,
+)
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine.commit_format import validate_commit_message
@@ -175,6 +180,38 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         commits.append((phase, baseline))
         handoff = baseline
 
+    # FR-3.3 usage-limit resume: this cycle previously parked on a transient
+    # sub-agent failure (P1), leaving the worktree untouched and the failing
+    # sub-agent's session preserved on the record. On a plain `gauntlet resume`
+    # the record still carries parked_reason=usage_limit (the orchestrator clears
+    # it only when the step finalizes to a non-park state), so it uniquely marks
+    # the resume; it is never a `--response` resume (a usage-limit park needs no
+    # decision). `resume_session` is fed to the FIRST sub-agent call of the
+    # re-driven round (the round-1 reviewer) so the CLI session continues instead
+    # of a full cold re-run (see `_resume_review`).
+    is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    resume_session = ctx.record.session_id if is_quota_resume else None
+    # A fixer that parked mid-edit left the worktree dirty; P1 re-enters the
+    # cycle at the round's start, whose clean-handoff guard (FR-9.3) requires a
+    # committed tree. Back up the preserved partial work (lossless) and reset to
+    # the handoff before re-driving. This is the P1 round-loss deferral — the
+    # partial fixer edits are discarded on resume; P5's per-round checkpoints
+    # will instead re-enter at the first incomplete sub-step. Without this, a
+    # mid-fixer quota park would resume straight into `_clean_handoff_failure`.
+    if is_quota_resume and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+        backup = (
+            f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
+            f"{ctx.record.id}-usage-limit-resume"
+        )
+        gitops.backup_dirty_worktree(
+            ctx.repo_root, backup,
+            f"usage-limit resume: preserved partial work for {ctx.record.id} "
+            "(round-loss, P1 deferral)",
+            exclude=ctx.excludes,
+        )
+        gitops.reset_hard(ctx.repo_root, handoff)
+        gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+
     for rnd in range(1, max_rounds + 1):
         # FR-9.3: control passes to a reviewer only on a clean, committed tree.
         if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
@@ -189,14 +226,25 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # a dirty tree) and on the failure path (so the policy always applies).
         review_prompt = _review_prompt(step, ctx, handoff, rnd, carried)
         guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
+        review_logger = step_logger(ctx, f"r{rnd}-review")
         try:
-            review = _run_sub(
-                ctx, reviewer, review_prompt,
-                schema=findings_schema, usage=usage,
-                logger=step_logger(ctx, f"r{rnd}-review"),
-                structured_name="findings.json",
-                after_attempt=guard.check,
-            )
+            if resume_session is not None and rnd == 1:
+                # FR-3.3: continue the parked reviewer session on the first
+                # re-driven call; consume the session so later rounds/calls run
+                # fresh (a full re-review, not a continuation).
+                review = _resume_review(
+                    ctx, reviewer, resume_session, review_prompt,
+                    findings_schema, usage, review_logger, guard,
+                )
+                resume_session = None
+            else:
+                review = _run_sub(
+                    ctx, reviewer, review_prompt,
+                    schema=findings_schema, usage=usage,
+                    logger=review_logger,
+                    structured_name="findings.json",
+                    after_attempt=guard.check,
+                )
         except _ParkCycle as park:
             return _finish(park.result, usage, commits, artifact_writes, metrics)
 
@@ -426,6 +474,7 @@ def _run_sub(
     structured_name: str,
     max_retries: int = 1,
     after_attempt: Any = None,
+    session: str | None = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
@@ -439,6 +488,11 @@ def _run_sub(
     F-004) runs after every adapter invocation — success, malformed, or
     failure — so the reviewer-mutation guard can never be skipped by an error
     path or hand a dirty tree to a retry.
+
+    ``session`` continues a preserved CLI session on a usage-limit resume
+    (FR-3.3). When set, a :class:`SessionNotFoundError` propagates unchanged so
+    the caller can fall back to a full, sessionless re-drive; it is never
+    swallowed here.
     """
     from gauntlet.engine.steptypes import open_step_stream
 
@@ -459,6 +513,8 @@ def _run_sub(
         # when streaming — the buffered call shape is untouched (FR-6.1).
         stream = open_step_stream(ctx, adapter, logger)
         run_kwargs: dict = {"schema": schema, "cwd": ctx.repo_root}
+        if session is not None:
+            run_kwargs["session"] = session  # FR-3.3 usage-limit continuation
         if stream is not None:
             run_kwargs["sink"] = stream.append_line
         try:
@@ -519,6 +575,44 @@ def _run_sub(
             after_attempt()
         return result
     raise last_exc  # fail closed after bounded retries
+
+
+def _resume_review(
+    ctx: StepContext,
+    reviewer: str,
+    session: str,
+    full_prompt: str,
+    schema: dict | None,
+    usage: Any,
+    logger: Any,
+    guard: "_MutationGuard",
+):
+    """Continue the parked reviewer session on a usage-limit resume (FR-3.3).
+
+    Sends the SHORT continuation prompt against the preserved CLI ``session``
+    (the session already holds the task context; re-sending the full review
+    prompt would waste the very budget the resume conserves). If the stored
+    session is unknown/expired — the common case when the parked sub-agent was a
+    *different* role/adapter than the reviewer, since P1 re-enters the round at
+    its start regardless of which sub-step parked — fall back to a full,
+    sessionless re-review (recoverable, not a run-halting fault). Fail-safe: a
+    wrong-adapter session simply triggers the fallback.
+    """
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    try:
+        return _run_sub(
+            ctx, reviewer, _CONTINUATION_PROMPT, schema=schema, usage=usage,
+            logger=logger, structured_name="findings.json",
+            after_attempt=guard.check, session=session,
+        )
+    except SessionNotFoundError as exc:
+        logger.log_text("session-expired.txt", str(exc))
+        return _run_sub(
+            ctx, reviewer, full_prompt, schema=schema, usage=usage,
+            logger=logger, structured_name="findings.json",
+            after_attempt=guard.check,
+        )
 
 
 def _log_partial(

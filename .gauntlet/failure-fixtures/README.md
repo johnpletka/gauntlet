@@ -29,3 +29,16 @@ Provenance of each fixture is recorded in the `real_capture` flag on its
       `error.code`/`error.type` matches (0.139.0 carries only `error.message`).
     - `codex/overload.json` — codex overload message shape.
     - `api/rate-limit.json`, `api/overload.json` — LiteLLM exception descriptors.
+
+> **Tracked coverage gap (F-002 / plan.md:33 — "one per adapter per kind").**
+> Three required `(adapter, kind)` pairs — `codex`/overload,
+> `api`/usage-limit (`rate-limit.json`), and `api`/overload — have **no** live
+> capture: those adapter failure-modes were never exercised in a real failed
+> run, so the harvestable transcripts hold no envelope to redact and pin. They
+> are covered only by synthesized fixtures **as a knowing, tracked phase
+> conflict**, not a met acceptance criterion. The contract is machine-enforced
+> by `test_required_adapter_kinds_have_real_capture_or_a_tracked_gap` and
+> `test_uncaptured_gap_set_is_exactly_the_pairs_missing_a_live_capture`
+> (`tests/unit/test_failure_markers.py`): the pinned gap set makes a *new*
+> synthesized-only pair fail loudly, and each listed pair must be re-pinned with
+> a live capture — and removed from the set — when one is observed.

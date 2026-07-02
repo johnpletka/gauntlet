@@ -23,6 +23,7 @@ from gauntlet.adapters.base import (
     AgentResult,
     FailureInfo,
     MalformedOutputError,
+    SessionNotFoundError,
     Usage,
 )
 from gauntlet.engine import gitops, manifest as M
@@ -56,7 +57,7 @@ class SeqAdapter:
         self.timeout_s = 600.0
 
     def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
-        self.calls.append({"prompt": prompt, "schema": schema})
+        self.calls.append({"prompt": prompt, "schema": schema, "session": session})
         if not self.responses:
             raise AssertionError("SeqAdapter exhausted; unexpected extra call")
         r = self.responses.pop(0)
@@ -1214,3 +1215,65 @@ def test_plain_resume_redrives_parked_cycle(cycle_repo):
     rec = man.record("cycle")
     assert rec.status == M.DONE
     assert rec.parked_reason is None  # cleared on DONE (current-state)
+    # FR-3.3: the re-driven reviewer call CONTINUED the persisted session (the
+    # first drive's call carried no session; the resume call carried "rev-sess").
+    assert reviewer.calls[0]["session"] is None
+    assert reviewer.calls[-1]["session"] == "rev-sess"
+    # the continuation call sends the SHORT continuation prompt, not the full
+    # review prompt (budget conservation) — the artifact body is not re-sent.
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    assert reviewer.calls[-1]["prompt"] == _CONTINUATION_PROMPT
+    assert "ARTIFACT-BODY-SENTINEL" not in reviewer.calls[-1]["prompt"]
+
+
+def test_fixer_transient_after_dirtying_worktree_resumes_past_clean_handoff(cycle_repo):
+    # F-001: a fixer that hits a usage limit AFTER writing partial changes parks
+    # with the worktree left dirty. A plain resume must re-drive the cycle, not
+    # trip the round-1 clean-handoff guard (FR-9.3) on the preserved partial work.
+    def dirty_then_transient(cwd):
+        (Path(cwd) / "partial.py").write_text("half-done\n")
+        raise _transient_exc(session="builder-sess")
+
+    reviewer = SeqAdapter(REVIEW(F("F-001")), REVIEW())  # round1 finds; resume converges
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(dirty_then_transient),
+    }
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "builder-sess"
+    # park leaves the worktree untouched: the partial fixer edit survives.
+    assert (cycle_repo / "partial.py").exists()
+    # plain resume: the dirty tree is reset to the handoff (round-loss) so the
+    # clean-handoff guard passes; the re-driven reviewer converges to DONE.
+    assert orch.drive() == M.RUN_DONE
+    assert man.record("cycle").status == M.DONE
+    # the discarded partial work is gone from the worktree (backed up to a ref).
+    assert not (cycle_repo / "partial.py").exists()
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+    # the round-1 reviewer of the resume continued the preserved session.
+    assert reviewer.calls[-1]["session"] == "builder-sess"
+
+
+def test_cycle_resume_falls_back_to_full_review_when_session_expired(cycle_repo):
+    # F-001 / FR-3.3: if the preserved session is unknown/expired on resume, the
+    # cycle falls back to a full, sessionless re-review rather than failing.
+    reviewer = SeqAdapter(
+        _transient_exc(),                                # drive 1: park
+        SessionNotFoundError("no conversation found"),   # resume: session gone
+        REVIEW(),                                        # fallback: full re-run converges
+    )
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.drive() == M.RUN_DONE
+    # the resume first tried the stored session (continuation prompt), then fell
+    # back to a full review with NO session and the full artifact body.
+    assert reviewer.calls[-2]["session"] == "rev-sess"
+    assert reviewer.calls[-1]["session"] is None
+    assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[-1]["prompt"]
+    assert man.record("cycle").status == M.DONE
