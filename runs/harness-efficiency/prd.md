@@ -1,7 +1,7 @@
 # PRD: Harness Efficiency & Resilience
 
-**Status:** Draft v0.2
-**Author:** John Pletka (drafted with Claude from a four-track code exploration, 2026-07-01; v0.2 adds FR-9–FR-12 from a goals-first pass, 2026-07-02)
+**Status:** Draft v0.3
+**Author:** John Pletka (drafted with Claude from a four-track code exploration, 2026-07-01; v0.2 adds FR-9–FR-12 from a goals-first pass; v0.3 adds FR-7.4 and resolves Q1/Q3/Q4/Q5, 2026-07-02)
 **Date:** 2026-07-02
 **Working name:** harness-efficiency
 **Relationship to existing artifacts:** Does **not** amend `PRD-gauntlet.md` or any approved `prd.md`/`plan.md`/`policy.yaml`. Builds on existing machinery: the manifest write-ahead state machine (`engine/manifest.py`, `engine/orchestrator.py`), the adversarial cycle (`engine/cycle.py`), the adapter layer (`adapters/`), the status contract (`engine/operator.py`, `schemas/status.json`), and the console (`web/`). Two FRs (FR-6.4 doctor model probes, FR-8 gate context) deliver items already recorded as gaps in `BOOTSTRAP-NOTES.md` (#24, #54-adjacent) and `FUTURE.md`; they implement those recorded follow-ups rather than amending anything approved. No judge `policy.yaml` change is in scope (see Non-Goals).
@@ -305,7 +305,7 @@ Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to s
 - **Context:** implement-step prompt payload ≤ 40% of the all-inline baseline on runs with ≥ 3 phases; artifact re-review round-2 payload ≤ diff + findings + 1KB scaffold.
 - **Cost shape:** triage + escalation + mechanical steps ≤ 10% of run cost (per `agent_usage`); escalation-profile calls occur only for blocking/major findings.
 - **Observability:** for every park/halt/fail state reachable in the test suite, `status --json` alone identifies cause and next command (asserted by a table-driven test); `doctor` catches a bad model alias before any run step executes.
-- **Quality guardrail (must not regress):** blocking findings per phase and gate rejection rate on a comparison run with scoped context are within noise of the inline baseline (Open Question Q3 sets the comparison protocol).
+- **Quality guardrail (must not regress):** blocking findings per phase and gate rejection rate on the first real run with scoped context enabled are within noise of the recent-runs inline baseline (protocol ratified at Q3: next real run, no dedicated A/B).
 - **Lost work bound:** worst-case repeated work after any interruption ≤ 1 intra-phase milestone (manifest-verifiable: recovery rewind target is a `wip:` commit, not `base_sha`, whenever ≥ 1 checkpoint existed).
 - **Proactive vs reactive:** with `enforce: true` on a window-constrained run, ≥ 80% of usage-limit interruptions are pre-step `usage_window` parks rather than mid-step `usage_limit` parks.
 - **Latency:** triage wall-clock for a 5-finding round ≤ 40% of sequential baseline; on a repeat-heavy step (e.g., iterated test runs), judge LLM-rung invocations drop ≥ 50% with zero decision changes.
@@ -329,11 +329,11 @@ Auto-resume (`resume_on_quota: auto`, FR-3.4) lands in P2 (needs the driver to s
 
 ## §11 Open Questions
 
-- **Q1 — Auto-resume default.** FR-3.4 proposes `notify` as default with `auto` opt-in. Is unattended auto-resume at quota reset acceptable on a laptop (driver must stay alive through the wait, possibly through sleep — interacts with FR-5)? *Proposal: notify-only default; auto documented as requiring `keep_awake` or an external scheduler.*
+- ~~**Q1 — Auto-resume default.**~~ **Resolved (2026-07-02, human):** `notify` is the default; `auto` is opt-in and documented as requiring `keep_awake` or an external scheduler.
 - **Q2 — Effort values.** Which effort levels per profile/step? *Proposal to react to: builder implement=high, builder fix=medium, reviewer round-1=high, re-review/confirm=medium, triage/mechanic=low.* Needs a live A/B before shipping as defaults.
-- **Q3 — Scoped-context rollout.** Opt-in knob only in v1, or flip `standard.yaml` defaults after one clean comparison run? What is the comparison protocol (same PRD re-run, or side-by-side on the next real run)? *Proposal: opt-in in P6, flip defaults in a follow-up once §9 guardrail holds on one real run.*
+- ~~**Q3 — Scoped-context rollout.**~~ **Resolved (2026-07-02, human):** opt-in in P6; the comparison protocol is the next real run with scoped modes enabled, comparing findings-per-phase and gate outcomes against the recent-runs baseline (no dedicated A/B re-run). `standard.yaml` defaults flip in a follow-up change only after the §9 guardrail holds on that run.
 - ~~**Q4 — Escalation-park response coverage.** BOOTSTRAP-NOTES #51 recorded that `resume --response` did not reach an adversarial_cycle FR-10.4 park; verify remaining gaps.~~ **Resolved (2026-07-02, by inspection):** `engine/cycle.py:527–556` renders `--response` decisions into the re-driven cycle as authoritative triage input (FR-10.4), and `tests/unit/test_cycle_resume_response.py` covers both `cycle_escalation` park variants (upstream invalidation, max-rounds), failed cycles, and end-to-end unsticking. The #51 gap is closed; nothing to add to FR-3's scope.
-- **Q5 — Threshold ratification.** The numbers in §9 (80% session-resume success, ≤40% payload, ≤10% cost share, 2 repair attempts, 15s/30s heartbeat constants, 12h credit cap) are proposals, not measurements. Ratify or adjust at the PRD gate.
+- ~~**Q5 — Threshold ratification.**~~ **Resolved (2026-07-02, human):** all §9 numbers and FR constants (80% session-resume success, ≤40% payload, ≤10% cost share, 2 repair attempts, 15s/30s heartbeat constants, 12h credit cap) ratified as drafted; adjustable through this PRD's own review loop before approval.
 - **Q6 — `signal_kill` attribution.** FR-7.2 stamps `operator_recover` when `gauntlet recover` kills a step, but an external `kill -9`/crash is indistinguishable from power loss at stamp time. Is post-hoc attribution on next resume ("stamped on reconciliation") sufficient? *Proposal: yes — stamp `signal_kill` during resume reconciliation with a note that attribution is inferred.*
 - **Q7 — Ledger scope and location.** Machine-global (`~/.gauntlet/`) is proposed because parallel runs across repos share one account window. Should it also be per-account-keyed (multiple operators on one machine, one operator across machines)? *Proposal: machine-global v1; account keying post-v1.*
 - **Q8 — Checkpoint squash default.** `keep` preserves audit granularity but adds commits to the PR; `squash` keeps history clean but discards milestone timing. *Proposal: `keep` — the PR is squash-mergeable anyway.*
