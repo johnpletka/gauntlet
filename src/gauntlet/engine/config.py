@@ -35,6 +35,15 @@ RESUME_ON_QUOTA_NOTIFY = "notify"
 RESUME_ON_QUOTA_AUTO = "auto"
 _RESUME_ON_QUOTA_MODES = frozenset({RESUME_ON_QUOTA_NOTIFY, RESUME_ON_QUOTA_AUTO})
 
+# Intra-phase checkpoint-commit disposition (harness-efficiency FR-11.1).
+# ``keep`` (default) leaves ``PN wip:`` milestone commits in history; ``squash``
+# collapses them into the phase-end ``PN:`` commit.
+CHECKPOINT_COMMITS_KEEP = "keep"
+CHECKPOINT_COMMITS_SQUASH = "squash"
+_CHECKPOINT_COMMIT_MODES = frozenset(
+    {CHECKPOINT_COMMITS_KEEP, CHECKPOINT_COMMITS_SQUASH}
+)
+
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
 # --- effort tiering (harness-efficiency FR-6.1) ------------------------------
@@ -380,6 +389,15 @@ class RunConfig(BaseModel):
     # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
 
+    # --- intra-phase checkpoint commits (harness-efficiency FR-11.1) ---------
+    # How the phase-end `PN:` commit treats the builder's `PN wip:` milestone
+    # commits: `keep` (default — the milestones are audit data, left in history;
+    # if they already committed all of the phase's work, the `PN:` commit is an
+    # empty marker so the reviewer handoff always lands on a `PN:` commit) or
+    # `squash` (collapse the `wip:` commits into one non-empty `PN:` commit). The
+    # reviewed range diff `base..<PN:>` is identical either way.
+    checkpoint_commits: str = "keep"
+
     # --- suspend/sleep resilience (harness-efficiency FR-5) ------------------
     # The driver's heartbeat cadence (FR-5.1). Detection threshold is a fixed 2×
     # this in engine/heartbeat.py, so lengthening the cadence loosens detection.
@@ -469,6 +487,18 @@ class RunConfig(BaseModel):
             raise ValueError(
                 f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
                 f"got {v!r}"
+            )
+        return name
+
+    @field_validator("checkpoint_commits")
+    @classmethod
+    def _validate_checkpoint_commits(cls, v: str) -> str:
+        """Only ``keep``/``squash`` are valid; anything else fails closed (FR-11.1)."""
+        name = (v or "").strip().lower()
+        if name not in _CHECKPOINT_COMMIT_MODES:
+            raise ValueError(
+                f"checkpoint_commits must be one of "
+                f"{sorted(_CHECKPOINT_COMMIT_MODES)}; got {v!r}"
             )
         return name
 

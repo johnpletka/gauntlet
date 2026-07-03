@@ -108,3 +108,64 @@ def test_backup_and_clean_round_trip(fixture_repo):
     assert not (fixture_repo / "untracked.py").exists()
     refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
     assert "refs/gauntlet/backup/test" in refs
+
+
+# --- intra-phase checkpoint discovery (harness-efficiency FR-11.1/11.2) -------
+def _wip(repo, phase_subject: str, rel: str, content: str) -> str:
+    """Write `rel` and commit it as a `P<N> wip:` checkpoint; return the SHA."""
+    (repo / rel).write_text(content)
+    return gitops.commit_all(
+        repo, f"{phase_subject}\n\nbody", identity=Identity("B", "b@g.local")
+    )
+
+
+def test_wip_checkpoints_trailing_run_stops_at_non_checkpoint(fixture_repo):
+    """Without a base, the TRAILING run of `P<N> wip:` commits is returned,
+    newest first, stopping at the first non-checkpoint commit (FR-11.1)."""
+    # A prior phase commit (non-checkpoint) then two checkpoints for this phase.
+    gitops.commit_all(
+        fixture_repo, "P8: prior phase\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    m1 = _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    m2 = _wip(fixture_repo, "P9 wip: cli wiring", "b.py", "b\n")
+    wips = gitops.wip_checkpoints(fixture_repo)
+    assert [s for _sha, s in wips] == ["P9 wip: cli wiring", "P9 wip: model layer"]
+    assert [sha for sha, _s in wips] == [m2, m1]  # newest first
+    # squash base = parent of the oldest checkpoint = the prior P8: commit.
+    assert gitops.commit_parent(fixture_repo, m1) == gitops.rev_parse(
+        fixture_repo, "HEAD~2"
+    )
+
+
+def test_wip_checkpoints_since_base_are_descendants(fixture_repo):
+    """With a base, every `P<N> wip:` commit in base..HEAD is returned newest
+    first — the recovery rewind candidates (FR-11.2)."""
+    base = gitops.head_sha(fixture_repo)
+    m1 = _wip(fixture_repo, "P3 wip: one", "a.py", "a\n")
+    m2 = _wip(fixture_repo, "P3 wip: two", "b.py", "b\n")
+    wips = gitops.wip_checkpoints(fixture_repo, base=base)
+    assert [sha for sha, _s in wips] == [m2, m1]
+    # A commit at/under the base is excluded (base..HEAD is exclusive of base).
+    assert base not in [sha for sha, _s in wips]
+
+
+def test_wip_checkpoints_none_when_no_checkpoints(fixture_repo):
+    (fixture_repo / "x.py").write_text("x\n")
+    gitops.commit_all(
+        fixture_repo, "P1: normal phase\n\nbody", identity=Identity("B", "b@g.local")
+    )
+    assert gitops.wip_checkpoints(fixture_repo) == []
+
+
+def test_reset_soft_keeps_worktree_and_stages_changes(fixture_repo):
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P1 wip: one", "a.py", "a\n")
+    _wip(fixture_repo, "P1 wip: two", "b.py", "b\n")
+    gitops.reset_soft(fixture_repo, base)
+    # HEAD moved back to base; both files still present and staged.
+    assert gitops.head_sha(fixture_repo) == base
+    assert (fixture_repo / "a.py").read_text() == "a\n"
+    assert (fixture_repo / "b.py").read_text() == "b\n"
+    staged = gitops._run(fixture_repo, "diff", "--cached", "--name-only").split()
+    assert set(staged) == {"a.py", "b.py"}

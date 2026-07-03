@@ -590,31 +590,42 @@ class Orchestrator:
             # rewind, so the bookkeeping the rewind preserves carries the latest
             # response state (e.g. a still-`pending` entry the re-run consumes).
             self._persist()
-            # F-001: base_sha predates the engine bookkeeping commits stacked on
-            # top of it — notably the pending-response checkpoint (FR-2.2/FR-7.1).
-            # A plain `reset --hard base_sha` would delete the force-committed
-            # manifest from disk AND orphan that checkpoint, so a kill in the gap
-            # before it was re-persisted would lose the human response. Instead,
-            # rewind the implementation to base_sha in a single reset whose target
-            # commit still carries the manifest — the response is never, even for
-            # an instant, absent from both disk and reachable history. Label that
-            # commit with the canonical response-checkpoint subject so it stands in
-            # as the pending checkpoint itself (the post-rewind reconcile below is
-            # then a no-op rather than stacking a duplicate).
+            # FR-11.2: rewind to the latest intra-phase checkpoint commit that is
+            # a descendant of base_sha (a `P<N> wip:` milestone) rather than all
+            # the way to base_sha, so completed milestones survive the rewind and
+            # the worst-case repeated work is one milestone, not one phase. Falls
+            # back to base_sha (today's behavior) when the phase landed none. The
+            # subject is recorded so the re-run prompt can name the checkpoint it
+            # resumes from.
+            target, checkpoint_subject = self._checkpoint_rewind_target(rec)
+            rec.resumed_from_checkpoint = checkpoint_subject
+            # F-001: the rewind target predates the engine bookkeeping commits
+            # stacked on top of it — notably the pending-response checkpoint
+            # (FR-2.2/FR-7.1). A plain `reset --hard target` would delete the
+            # force-committed manifest from disk AND orphan that checkpoint, so a
+            # kill in the gap before it was re-persisted would lose the human
+            # response. Instead, rewind the implementation to the target in a
+            # single reset whose target commit still carries the manifest — the
+            # response is never, even for an instant, absent from both disk and
+            # reachable history. Label that commit with the canonical
+            # response-checkpoint subject so it stands in as the pending
+            # checkpoint itself (the post-rewind reconcile below is then a no-op
+            # rather than stacking a duplicate).
             paths = self._bookkeeping_paths()
-            if paths and gitops.head_sha(self.repo_root) != rec.base_sha:
+            if paths and gitops.head_sha(self.repo_root) != target:
                 message = (
                     self._response_checkpoint_message()
-                    or f"gauntlet: rewind implementation to base for re-run ({rec.id})"
+                    or f"gauntlet: rewind implementation to {target[:10]} "
+                    f"for re-run ({rec.id})"
                 )
                 gitops.rewind_impl_preserving_bookkeeping(
-                    self.repo_root, rec.base_sha, paths, message,
+                    self.repo_root, target, paths, message,
                     identity=ENGINE_IDENTITY,
                 )
             else:
-                # No checkpoint sits above base_sha (HEAD == base_sha, or no
+                # Nothing to preserve above the target (HEAD == target, or no
                 # bookkeeping on disk): the plain rewind is already crash-safe.
-                gitops.reset_hard(self.repo_root, rec.base_sha)
+                gitops.reset_hard(self.repo_root, target)
             # `clean` is broader than the dirty check on purpose: it spares the
             # whole run root so the reset never wipes the run pointer, manifests,
             # the authored prd.md, or prior declared artifacts — the re-run
@@ -1041,6 +1052,22 @@ class Orchestrator:
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
+
+    def _checkpoint_rewind_target(self, rec: StepRecord) -> tuple[str, str | None]:
+        """Rewind target + checkpoint subject for a dirty re-run (FR-11.2).
+
+        Returns ``(target_sha, subject)``: the newest ``P<N> wip:`` checkpoint
+        commit reachable from HEAD and descended from ``rec.base_sha`` (so
+        completed milestones survive the rewind), with its subject for the re-run
+        prompt / audit trail. Falls back to ``(base_sha, None)`` when the phase
+        landed no checkpoint — today's reset-to-base behavior. Only reached with a
+        non-null ``base_sha`` (the caller guards it).
+        """
+        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha)
+        if wips:
+            sha, subject = wips[0]  # newest first
+            return sha, subject
+        return rec.base_sha, None
 
     def _set_run_status(self, step_status: str) -> str:
         self.manifest.status = {

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from gauntlet.adapters.base import AdapterError, SessionNotFoundError
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
+from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
     DONE,
     FAILED,
@@ -875,6 +876,19 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
     input_refs = iter_inputs(step)
     artifacts = dict(ctx.artifacts)
     parts = [base]
+    # FR-11.2: a reset_to_base recovery that rewound to an intra-phase checkpoint
+    # names it here, so the re-run knows its completed milestones were preserved
+    # and it is continuing from that checkpoint, not restarting the phase.
+    checkpoint = ctx.record.resumed_from_checkpoint
+    if checkpoint:
+        parts.append(
+            "\n\n--- recovery: resuming from an intra-phase checkpoint ---\n"
+            "The previous attempt was interrupted and the worktree was rewound to "
+            f"your last passing-test checkpoint commit: {checkpoint!r}. That "
+            "milestone's work is committed and preserved; only the uncommitted "
+            "edits after it were discarded. Continue the phase from that "
+            "checkpoint — do not redo the committed milestones.\n"
+        )
     for ref in input_refs:
         parts.append(_render_input(ref, ctx, artifacts))
     # FR-1 verbatim requirement (review F-001): the builder must receive the
@@ -1216,9 +1230,29 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # them) AND an audit trailer is appended deterministically below — data over
     # inference: the linkage never depends on the drafter remembering to add it.
     consumed = _consumed_responses(step, ctx)
-    message, draft_usage, draft_session, drafter = _commit_message(step, ctx, consumed)
+    # FR-11.1: the builder commits at each passing-test milestone as `P<N> wip:`.
+    # Discover the trailing run of such checkpoint commits at the branch tip —
+    # the set this phase commit collapses (squash) or lists in an empty marker
+    # (keep). Empty when the builder made none (today's single-commit phase).
+    wips = gitops.wip_checkpoints(repo)
+    squash = (
+        ctx.config.checkpoint_commits == CHECKPOINT_COMMITS_SQUASH and bool(wips)
+    )
+    # The squash base is the parent of the OLDEST checkpoint: where the collapsed
+    # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
+    # so the drafter sees the cumulative phase diff, not an empty residual tree.
+    squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
+    message, draft_usage, draft_session, drafter = _commit_message(
+        step, ctx, consumed, diff_base=(squash_base if wips else None)
+    )
     if consumed:
         message = _append_response_trailer(message, [r.response_id for r in consumed])
+    if wips:
+        # Chronological (oldest first) milestone list in the body — engine-
+        # appended (data over inference) so the milestones are always recorded,
+        # whether the drafter mentioned them or not.
+        subjects = [subject for _sha, subject in reversed(wips)]
+        message = _append_checkpoint_trailer(message, subjects, squashed=squash)
     usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
     if err is not None:
@@ -1233,9 +1267,35 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         )
     prefix = header_prefix(message)
 
+    # Commit AUTHORSHIP is the implementer's, never the message drafter's
+    # (FR-9.7, review F-003): a phase commit records the builder's work, so the
+    # message_agent (typically `triage`) drafting the text must not bleed into
+    # the commit identity — that mislabels implementation work as triage-
+    # authored and breaks the builder/triage provenance split. An explicit
+    # `agent:` on the commit step overrides; otherwise the builder authors it.
+    agent_name = step.agent or "builder"
+    identity = ctx.config.identity(agent_name)
+
+    # SQUASH (FR-11.1): soft-reset to the squash base so every `wip:` change (and
+    # any residual) stages together, then commit once. The reviewer handoff SHA
+    # is a single non-empty `P<N>:` commit; the reviewed range diff base..<PN:>
+    # is unchanged from the keep case (same base, same final tree).
+    if squash:
+        gitops.reset_soft(repo, squash_base)
+        sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
+        return StepResult(
+            status=DONE, commit_sha=sha, commit_phase=prefix,
+            usage=draft_usage, usage_by_agent=usage_by_agent,
+            session_id=draft_session,
+            notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
+        )
+
     # Mid-commit resume reconciliation (review F-003): if a prior attempt
     # already created the commit (HEAD moved off the recorded base) but died
     # before recording the SHA, adopt that commit rather than double-committing.
+    # A `wip:` commit is never adopted here — `header_prefix` returns None for a
+    # `P<N> wip:` subject (no `:` immediately after the prefix), so only a real
+    # `P<N>:` phase commit matches.
     base = ctx.record.base_sha
     if base and gitops.head_sha(repo) != base and gitops.is_clean(repo, exclude=exclude):
         existing = gitops.head_sha(repo)
@@ -1251,6 +1311,24 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             )
 
     if gitops.is_clean(repo, exclude=exclude):
+        if wips:
+            # KEEP, no residual: the `wip:` commits already carry all of the
+            # phase's work. The reviewer handoff must STILL land on a `P<N>:`
+            # commit (git-history contract, CLAUDE.md §1), so record an explicit
+            # empty marker (`--allow-empty`) whose body lists the milestones. The
+            # range diff base..<marker> equals the cumulative `wip:` diff.
+            sha = gitops.commit_all(
+                repo, message, identity=identity, allow_empty=True, exclude=exclude
+            )
+            return StepResult(
+                status=DONE, commit_sha=sha, commit_phase=prefix,
+                usage=draft_usage, usage_by_agent=usage_by_agent,
+                session_id=draft_session,
+                notes=(
+                    f"empty P<N>: marker over {len(wips)} checkpoint(s): "
+                    f"{sha[:10]}"
+                ),
+            )
         return StepResult(
             status=FAILED,
             usage=draft_usage,
@@ -1259,14 +1337,8 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             notes="commit step found a clean worktree with nothing to commit",
         )
 
-    # Commit AUTHORSHIP is the implementer's, never the message drafter's
-    # (FR-9.7, review F-003): a phase commit records the builder's work, so the
-    # message_agent (typically `triage`) drafting the text must not bleed into
-    # the commit identity — that mislabels implementation work as triage-
-    # authored and breaks the builder/triage provenance split. An explicit
-    # `agent:` on the commit step overrides; otherwise the builder authors it.
-    agent_name = step.agent or "builder"
-    identity = ctx.config.identity(agent_name)
+    # KEEP with residual (or no checkpoints at all): commit the remaining work as
+    # the `P<N>:` phase commit on top of any `wip:` commits.
     sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
     return StepResult(
         status=DONE, commit_sha=sha, commit_phase=prefix,
@@ -1275,16 +1347,16 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
-def _commit_message(step: Step, ctx: StepContext, consumed=()):
+def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
     """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
     are None for a literal message (no model call)."""
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
-    return _draft_commit_message(step, ctx, consumed)
+    return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
 
 
-def _draft_commit_message(step: Step, ctx: StepContext, consumed=()):
+def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
     """Draft a commit message via the message_agent with bounded redraft.
 
     The agent sees the change as data — both the tracked diff AND the untracked
@@ -1299,7 +1371,7 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=()):
     if not agent_name:
         raise ValueError("commit step needs either `message:` or `message_agent:`")
     adapter = ctx.build_adapter(agent_name)
-    change = _change_context(ctx)
+    change = _change_context(ctx, diff_base=diff_base)
     base_prompt = (
         (ctx.repo_root / ctx.config.asset_root / step.get("prompt")).read_text()
         if step.get("prompt")
@@ -1393,14 +1465,26 @@ class _UsageAccumulator:
         return out
 
 
-def _change_context(ctx: StepContext) -> str:
-    """The diff vs HEAD plus the untracked files staging will add (F-008)."""
+def _change_context(ctx: StepContext, *, diff_base=None) -> str:
+    """The change a commit is about to record, as data for the drafter (F-008).
+
+    Normally the tracked diff vs HEAD plus the untracked files staging will add.
+    When the phase already landed `P<N> wip:` checkpoint commits (FR-11.1), the
+    tip may be clean while the real change is the cumulative diff since the phase
+    base — pass ``diff_base`` (the squash base) so the drafted message reflects
+    the whole phase, not an empty residual tree.
+    """
     repo = ctx.repo_root
-    diff = gitops.diff_head(repo, exclude=ctx.excludes)
+    if diff_base:
+        diff = gitops.diff_worktree_vs(repo, diff_base, exclude=ctx.excludes)
+        label = f"diff (tracked, vs phase base {diff_base[:10]})"
+    else:
+        diff = gitops.diff_head(repo, exclude=ctx.excludes)
+        label = "diff (tracked, vs HEAD)"
     status = gitops.status_porcelain(repo, exclude=ctx.excludes)
     return (
         f"--- git status (incl. untracked) ---\n{status}\n"
-        f"\n--- diff (tracked, vs HEAD) ---\n{diff}"
+        f"\n--- {label} ---\n{diff}"
     )
 
 
@@ -1440,6 +1524,28 @@ def _append_response_trailer(message: str, response_ids: list[str]) -> str:
     """
     body = message.rstrip("\n")
     return f"{body}\n\nGauntlet-Response: {', '.join(response_ids)}\n"
+
+
+def _append_checkpoint_trailer(
+    message: str, wip_subjects: list[str], *, squashed: bool
+) -> str:
+    """List the intra-phase checkpoint milestones in the phase commit body (FR-11.1).
+
+    Engine-appended (not left to the message drafter), so the milestones a phase
+    was built from are always recorded — in the squash case where the `wip:`
+    commits are collapsed and their subjects would otherwise be lost, and in the
+    keep/empty-marker case where the marker commit summarizes the phase. Data
+    over inference; keeps the git-history contract auditable from the `P<N>:`
+    commit alone.
+    """
+    body = message.rstrip("\n")
+    label = (
+        "Squashed checkpoint milestones:"
+        if squashed
+        else "Checkpoint milestones:"
+    )
+    lines = "\n".join(f"- {subject}" for subject in wip_subjects)
+    return f"{body}\n\n{label}\n{lines}\n"
 
 
 def _response_section(consumed) -> str:

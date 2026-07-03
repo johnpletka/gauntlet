@@ -420,6 +420,14 @@ class StepRecord(BaseModel):
     # place on a converged/terminal cycle as a truthful record of the rounds it
     # ran. Additive/append-only — older manifests load with an empty list.
     checkpoints: list[Checkpoint] = Field(default_factory=list)
+    # The intra-phase checkpoint commit a reset_to_base recovery rewound to
+    # (harness-efficiency FR-11.2): the ``P<N> wip:`` subject the re-run resumes
+    # from, so the re-run prompt can name it and the audit trail records that
+    # completed milestones were preserved (not discarded to base_sha). ``None``
+    # when recovery fell back to ``base_sha`` (no checkpoint existed) or the step
+    # was never checkpoint-recovered. Additive/nullable — older manifests load
+    # unchanged.
+    resumed_from_checkpoint: str | None = None
 
 
 class CommitRecord(BaseModel):

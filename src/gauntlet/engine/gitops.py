@@ -10,9 +10,16 @@ treated as data (format-validated before it is used — see ``commit_format``).
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+# Intra-phase checkpoint-commit subject convention (harness-efficiency FR-11.1 /
+# §6): ``P<N> wip: <milestone>``. Matched at fixed field position (the subject
+# line), never against free-text prose — the checkpoint discovery below and the
+# recovery rewind-target selection both key on exactly this shape.
+_WIP_SUBJECT_RE = re.compile(r"^P\d+ wip:")
 
 
 class GitError(RuntimeError):
@@ -281,6 +288,53 @@ def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
 
+def commit_parent(repo: Path, sha: str) -> str:
+    """First-parent commit of ``sha`` (``<sha>^``); the squash base of a phase.
+
+    Used to anchor a checkpoint squash (FR-11.1): the parent of the OLDEST
+    ``P<N> wip:`` commit is where the collapsed ``P<N>:`` phase commit lands.
+    """
+    return _run(repo, "rev-parse", "--verify", f"{sha}^").strip()
+
+
+def wip_checkpoints(
+    repo: Path,
+    *,
+    base: str | None = None,
+    tip: str = "HEAD",
+    limit: int = 1000,
+) -> list[tuple[str, str]]:
+    """Intra-phase checkpoint commits at ``tip`` as ``(sha, subject)``, newest first.
+
+    A checkpoint is a commit whose subject matches ``P<N> wip:`` (§6 convention).
+    Two modes, both fail-closed on subject shape (nothing else is ever treated as
+    a checkpoint):
+
+    * ``base`` given (recovery, FR-11.2): every checkpoint in ``base..tip`` — i.e.
+      every ``P<N> wip:`` commit that is a descendant of ``base`` reachable from
+      ``tip`` — newest first. ``result[0]`` is the newest checkpoint the recovery
+      rewind targets. Non-checkpoint commits in the range are skipped, not a stop.
+    * ``base`` absent (commit step, FR-11.1): the TRAILING run of checkpoint
+      commits at ``tip`` — walk back and stop at the first non-checkpoint commit
+      (the prior phase's ``P<N>:`` commit / the branch base). This is the set the
+      phase-end commit collapses (squash) or lists in an empty marker (keep).
+    """
+    if base is not None:
+        out = _run(repo, "log", "--format=%H%x00%s", f"{base}..{tip}")
+        stop_at_gap = False
+    else:
+        out = _run(repo, "log", f"-{limit}", "--format=%H%x00%s", tip)
+        stop_at_gap = True
+    result: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\x00")
+        if _WIP_SUBJECT_RE.match(subject):
+            result.append((sha, subject))
+        elif stop_at_gap:
+            break
+    return result
+
+
 def commit_message(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%B", sha).rstrip("\n")
 
@@ -312,6 +366,17 @@ def log_range(repo: Path, base: str, head: str) -> str:
 def diff_head(repo: Path, *, exclude: list[str] | None = None) -> str:
     """Working-tree diff vs HEAD (the change a commit step is about to record)."""
     return _run(repo, "diff", "HEAD", *_exclude_pathspec(exclude))
+
+
+def diff_worktree_vs(repo: Path, base: str, *, exclude: list[str] | None = None) -> str:
+    """Working-tree diff vs an arbitrary ``base`` commit (harness-efficiency FR-11.1).
+
+    When the phase already landed ``P<N> wip:`` checkpoint commits, the change a
+    phase commit records is not ``diff HEAD`` (the tip may be clean) but the
+    cumulative diff since the phase base. The commit-message drafter is handed
+    this range so its body reflects the whole phase, not an empty residual tree.
+    """
+    return _run(repo, "diff", base, *_exclude_pathspec(exclude))
 
 
 def merge_base(repo: Path, a: str, b: str) -> str | None:
@@ -477,28 +542,45 @@ def reset_hard(repo: Path, sha: str) -> None:
     _run(repo, "reset", "--hard", sha)
 
 
+def reset_soft(repo: Path, sha: str) -> None:
+    """Move HEAD to ``sha`` keeping the index and working tree (``reset --soft``).
+
+    Used by the checkpoint squash (FR-11.1): resetting HEAD back to the squash
+    base leaves every ``P<N> wip:`` change staged, so a single follow-up commit
+    collapses them into one non-empty ``P<N>:`` phase commit. The working tree is
+    untouched — no implementation byte is lost, and residual uncommitted edits
+    stay staged for the same commit.
+    """
+    _run(repo, "reset", "--soft", sha)
+
+
 def rewind_impl_preserving_bookkeeping(
     repo: Path,
-    base_sha: str,
+    target_sha: str,
     bookkeeping: list[str],
     message: str,
     *,
     identity: Identity,
 ) -> str:
-    """Rewind tracked implementation files to ``base_sha`` in a single
+    """Rewind tracked implementation files to ``target_sha`` in a single
     ``reset --hard`` whose target commit STILL carries the run ``bookkeeping``.
 
-    A plain ``reset --hard base_sha`` is unsafe when an engine checkpoint sits
-    between ``base_sha`` and HEAD (a pending-response checkpoint, FR-2.2/FR-7.1):
+    ``target_sha`` is the phase base (F-003 re-run) or, when the phase landed
+    intra-phase checkpoint commits, the latest ``P<N> wip:`` checkpoint (FR-11.2):
+    rewinding to the checkpoint rather than the base preserves the completed
+    milestones instead of discarding them.
+
+    A plain ``reset --hard target_sha`` is unsafe when an engine checkpoint sits
+    between ``target_sha`` and HEAD (a pending-response checkpoint, FR-2.2/FR-7.1):
     the force-committed ``manifest.json`` is tracked at HEAD but absent from
-    ``base_sha``'s tree, so the reset *deletes it from disk* and moves the branch
+    ``target_sha``'s tree, so the reset *deletes it from disk* and moves the branch
     off the checkpoint — a kill in the gap before it is re-persisted permanently
     loses the human response (review F-001).
 
-    Instead, build a commit on top of ``base_sha`` whose tree is ``base_sha``'s
+    Instead, build a commit on top of ``target_sha`` whose tree is ``target_sha``'s
     tree with ``bookkeeping`` overlaid from the current working tree, then point
     HEAD at it with one reset. The commit carries ONLY the bookkeeping diff vs
-    ``base_sha`` (the implementation is unchanged), so passing the canonical
+    ``target_sha`` (the implementation is unchanged), so passing the canonical
     checkpoint ``message`` makes it the single reachable replacement for the
     pending-response checkpoint — collapsing any redundant intermediate
     checkpoints rather than orphaning the state. Because the reset target already
@@ -511,8 +593,8 @@ def rewind_impl_preserving_bookkeeping(
     ahead of the reset leaves the pre-existing on-disk manifest and checkpoint
     intact for recovery to redo the rewind.
     """
-    # Stage base_sha's tree, then overlay the live bookkeeping on top of it.
-    _run(repo, "read-tree", base_sha)
+    # Stage target_sha's tree, then overlay the live bookkeeping on top of it.
+    _run(repo, "read-tree", target_sha)
     _run(repo, "add", "-f", "--", *bookkeeping)
     tree = _run(repo, "write-tree").strip()
     args = [
@@ -521,7 +603,7 @@ def rewind_impl_preserving_bookkeeping(
         # commit-tree reads the log message from stdin when no -m/-F is given,
         # so no model-derived text ever reaches argv (it never does here — the
         # message is a fixed engine string — but keep the invariant uniform).
-        "commit-tree", tree, "-p", base_sha,
+        "commit-tree", tree, "-p", target_sha,
     ]
     new = _run(repo, *args, stdin=message).strip()
     reset_hard(repo, new)

@@ -16,8 +16,16 @@ inputs. Scope is everything.
   is genuinely wrong, fix it deliberately, not by deletion.
 - Run the tests and get everything green before you finish. Failing tests are a
   hard stop.
-- Do **not** commit — the pipeline's commit step handles that. Do **not** review
-  your own work — the reviewer step handles that.
+- **Checkpoint at each passing-test milestone.** When you reach a coherent
+  milestone whose tests pass (e.g. a data layer, one module, one FR), commit it
+  with a checkpoint subject `P<N> wip: <milestone, ≤60 chars>` (where `P<N>` is
+  this phase's id). These `wip:` commits bound how much work an interruption can
+  cost — recovery rewinds to your latest checkpoint, not to the phase start.
+  Keep them small and honest; do not fake a milestone with no passing tests.
+- Do **not** make the final `P<N>:` phase commit — the pipeline's commit step
+  handles that (it captures any residual work, or squashes/marks your `wip:`
+  checkpoints per config, so the reviewer handoff always lands on a `P<N>:`
+  commit). Do **not** review your own work — the reviewer step handles that.
 
 ## If the plan or PRD is wrong
 
