@@ -18,6 +18,7 @@ from gauntlet.engine.doctor import (
     OK,
     WARN,
     DoctorProbes,
+    ProbeResult,
     has_failure,
     run_doctor,
 )
@@ -54,12 +55,18 @@ def _probes(
     which: object | None = None,
     judge_model_resolvable: object | None = None,
     tracker_auth_probe: object | None = None,
+    profile_model_probe: object | None = None,
+    profile_read_probe: object | None = None,
 ) -> DoctorProbes:
     # Default: every present CLI is authenticated and the hook binary is on PATH,
     # so a "healthy" environment passes without a real subprocess/PATH probe.
     # Default judge model resolver says "resolvable" so the classifier check
     # never reaches into LiteLLM during offline tests.
     auth_map = authed if authed is not None else {c: True for c in versions}
+    # Default the FR-6.4 per-profile probes to fakes that pass — the REAL probes
+    # do live CLI round trips / LiteLLM lookups, which must never fire in the
+    # offline unit suite. Tests that exercise FR-6.4 inject their own.
+    from gauntlet.engine.doctor import OK, ProbeResult
     return DoctorProbes(
         cli_version=lambda name: versions.get(name),
         env=env,
@@ -74,6 +81,16 @@ def _probes(
             tracker_auth_probe
             if tracker_auth_probe is not None
             else (lambda _cfg, _env: None)
+        ),
+        profile_model_probe=(
+            profile_model_probe
+            if profile_model_probe is not None
+            else (lambda name, profile: ProbeResult(OK, f"{name} model ok"))
+        ),
+        profile_read_probe=(
+            profile_read_probe
+            if profile_read_probe is not None
+            else (lambda name, profile, root: ProbeResult(OK, f"{name} read ok"))
         ),
     )
 
@@ -641,3 +658,82 @@ def test_tracker_none_provider_emits_no_check(tmp_path):
     _set_issue_tracker(repo, {"provider": "none"})
     results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
     assert "issue-tracker" not in _by_name(results)
+
+
+# --- FR-6.4: per-profile model/effort + repo-read probes ---------------------
+def test_healthy_environment_probes_every_profile_ok(tmp_path):
+    # Every configured profile gets a model probe; the reference-mode profile
+    # (builder, used by the implement step) also gets a repo-read probe.
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    names = _by_name(results)
+    for profile in ("builder", "reviewer", "triage", "escalation", "mechanic"):
+        assert names[f"profile:{profile}"].status == OK, profile
+    # the builder is bound to reference/phase inputs -> it is read-probed too
+    assert names["profile:builder-read"].status == OK
+    assert not has_failure(results)
+
+
+def test_bad_model_alias_in_one_profile_fails_only_that_profile(tmp_path):
+    # FR-6.4 acceptance: a deliberately bad alias in one profile FAILs that
+    # profile's model probe; the others PASS.
+    repo = _healthy_repo(tmp_path)
+
+    def probe(name, profile):
+        if name == "reviewer":
+            return ProbeResult(FAIL, "model 'gpt-bogus' rejected by codex: 404")
+        return ProbeResult(OK, f"{name} ok")
+
+    results = run_doctor(
+        repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV, profile_model_probe=probe)
+    )
+    names = _by_name(results)
+    assert names["profile:reviewer"].status == FAIL
+    assert names["profile:builder"].status == OK
+    assert names["profile:triage"].status == OK
+    assert has_failure(results)
+
+
+def test_reference_profile_blind_sandbox_fails_read_probe(tmp_path):
+    # FR-1.3/FR-6.4: a reference-capable profile whose sandbox cannot read a repo
+    # file is a read-probe FAIL (its model probe can still pass).
+    repo = _healthy_repo(tmp_path)
+
+    def read_probe(name, profile, root):
+        return ProbeResult(FAIL, f"{name} sandbox could not read a repo file")
+
+    results = run_doctor(
+        repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV, profile_read_probe=read_probe)
+    )
+    names = _by_name(results)
+    assert names["profile:builder-read"].status == FAIL
+    assert names["profile:builder"].status == OK  # model probe unaffected
+    assert has_failure(results)
+
+
+def test_unauthenticated_cli_skips_profile_probes_with_warn(tmp_path):
+    # FR-6.4: an unauthenticated CLI skips its profiles' live probes with a WARN —
+    # never a silent PASS (and never a live subprocess call).
+    def boom(name, profile):  # the unauthenticated claude CLI must not be probed
+        if profile.adapter == "claude-code":
+            raise AssertionError("model probe must not run for an unauthenticated CLI")
+        return ProbeResult(OK, f"{name} ok")  # authed codex + api profiles are fine
+
+    def boom_read(name, profile, root):
+        raise AssertionError("read probe must not run for an unauthenticated CLI")
+
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(
+        repo,
+        probes=_probes(
+            _GOOD_VERSIONS, _GOOD_ENV,
+            authed={"claude": False, "codex": True},
+            profile_model_probe=boom,
+            profile_read_probe=boom_read,
+        ),
+    )
+    names = _by_name(results)
+    # builder (claude) is unauthenticated -> WARN skip, not PASS, not FAIL
+    assert names["profile:builder"].status == WARN
+    assert "not authenticated" in names["profile:builder"].detail
+    assert names["profile:builder-read"].status == WARN

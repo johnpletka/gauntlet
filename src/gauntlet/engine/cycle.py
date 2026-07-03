@@ -99,13 +99,20 @@ def triage_prompt(template: str, finding: dict[str, Any], *, context: str | None
 
 
 def needs_escalation(severity: str, verdict: dict[str, Any]) -> bool:
-    """Severity-aware escalation rule (review F-009, PRD §11 mitigation).
+    """Severity-gated escalation rule (FR-6.2, review F-009, PRD §11 mitigation).
 
-    Blocking findings never rest on the cheap triager's verdict; neither does
-    any verdict the triager itself is unsure of. Shared with the triage
-    accuracy harness so the measured guarantee is the shipped rule.
+    A ``blocking`` finding never rests on the cheap triager's verdict — it always
+    escalates. A low-confidence verdict escalates only when the finding is
+    consequential (``blocking``/``major``); a low-confidence verdict on a
+    ``minor``/``nit`` finding does NOT burn the escalation profile — it carries to
+    the human gate flagged ``low_confidence`` instead (FR-6.2). Shared with the
+    triage accuracy harness so the measured guarantee is the shipped rule.
     """
-    return severity == "blocking" or verdict.get("confidence") == "low"
+    if severity == "blocking":
+        return True
+    if verdict.get("confidence") == "low":
+        return severity == "major"
+    return False
 
 
 # --- sub-step checkpointing (FR-4.1/FR-4.2) ------------------------------------
@@ -1339,7 +1346,8 @@ def _triage(
             substep=f"r{rnd}-triage",
         ).structured
         verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
-        if needs_escalation(finding.get("severity", ""), verdict):
+        severity = finding.get("severity", "")
+        if needs_escalation(severity, verdict):
             if escalation_agent:
                 esc_logger = step_logger(
                     ctx, f"r{rnd}-triage", f"{finding.get('id', f'i{i}')}-escalated"
@@ -1356,6 +1364,11 @@ def _triage(
             else:
                 verdict["escalated"] = True
                 needs_human.append(verdict["finding_id"])
+        elif verdict.get("confidence") == "low":
+            # FR-6.2: a low-confidence verdict on a minor/nit finding does NOT
+            # escalate (the escalation profile is reserved for blocking/major
+            # doubt) — it is flagged so it carries to the human gate for eyes.
+            verdict["low_confidence"] = True
         verdicts.append(verdict)
     if needs_human:
         return verdicts, (
@@ -1798,11 +1811,12 @@ def _load_schema(ctx: StepContext, ref: str) -> dict:
 def _verdict_schema(triage_schema: dict) -> dict:
     """Per-call schema for one point-by-point verdict (PRD §7 triage entry).
 
-    Derived from the normative file so the enums have one home. ``escalated``
-    is engine-recorded, never model-asserted — strip it from what the model
-    may emit."""
+    Derived from the normative file so the enums have one home. ``escalated`` and
+    ``low_confidence`` are engine-recorded, never model-asserted — strip them from
+    what the model may emit (FR-6.2)."""
     verdict = json.loads(json.dumps(triage_schema["definitions"]["verdict"]))
     verdict["properties"].pop("escalated", None)
+    verdict["properties"].pop("low_confidence", None)
     return verdict
 
 

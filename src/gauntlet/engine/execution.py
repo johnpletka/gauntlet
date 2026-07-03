@@ -128,11 +128,16 @@ class StepContext:
     # (no orchestrator); such callers fall back to writing the manifest directly.
     persist: Callable[[], None] | None = None
 
-    def build_adapter(self, agent_name: str) -> Any:
-        """Resolve an agent profile to an adapter instance (override in tests)."""
+    def build_adapter(self, agent_name: str, *, effort: str | None = None) -> Any:
+        """Resolve an agent profile to an adapter instance (override in tests).
+
+        ``effort`` (FR-6.1) is a step-level canonical-effort override that wins
+        over the profile's own ``effort``; ``None`` uses the profile's value. An
+        injected ``adapter_factory`` (test double) ignores it — effort mapping is
+        exercised against real profiles/adapters, not fakes."""
         if self.adapter_factory is not None:
             return self.adapter_factory(agent_name)
-        return self.config.profile(agent_name).build_adapter()
+        return self.config.profile(agent_name).build_adapter(effort=effort)
 
     def steps_dir(self) -> Path:
         return self.run_dir / "steps"

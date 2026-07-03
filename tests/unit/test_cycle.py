@@ -699,10 +699,12 @@ def test_blocking_finding_escalates_to_stronger_model(cycle_repo):
     assert triage["verdicts"][0]["action"] == "fix_now"  # strong model overrode
 
 
-def test_low_confidence_verdict_escalates(cycle_repo):
+def test_low_confidence_major_verdict_escalates(cycle_repo):
+    # FR-6.2: a low-confidence verdict on a MAJOR finding is consequential enough
+    # to escalate (severity-gated). The escalation resolves it to reject.
     esc = SeqAdapter(V("F-001", "bikeshedding", "reject"))
     adapters = {
-        "reviewer": SeqAdapter(REVIEW(F("F-001", "minor"))),
+        "reviewer": SeqAdapter(REVIEW(F("F-001", "major"))),
         "triage": SeqAdapter(V("F-001", confidence="low")),
         "builder": SeqAdapter(),
         "esc": esc,
@@ -712,6 +714,49 @@ def test_low_confidence_verdict_escalates(cycle_repo):
     )
     assert status == M.RUN_DONE
     assert len(esc.calls) == 1
+
+
+def test_low_confidence_minor_nit_carry_flagged_without_escalation(cycle_repo):
+    # FR-6.2 acceptance: mixed-severity low-confidence verdicts escalate ONLY the
+    # blocking/major ones; a low-confidence minor/nit does NOT invoke the
+    # escalation profile — it carries to the gate flagged `low_confidence`.
+    esc = SeqAdapter(
+        V("F-001", "legitimate", "fix_now"),   # blocking low-conf -> escalated
+        V("F-002", "legitimate", "fix_now"),   # major low-conf    -> escalated
+    )
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(
+                F("F-001", "blocking"), F("F-002", "major"),
+                F("F-003", "minor"), F("F-004", "nit"),
+            ),
+            CONFIRM(CV("F-001"), CV("F-002")),  # only the fixed findings confirm
+        ),
+        "triage": SeqAdapter(
+            V("F-001", confidence="low"), V("F-002", confidence="low"),
+            V("F-003", "bikeshedding", "reject", confidence="low"),
+            V("F-004", "bikeshedding", "reject", confidence="low"),
+        ),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+        "esc": esc,
+    }
+    status, _, run_dir = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_DONE
+    # exactly the two blocking/major low-confidence findings escalated
+    assert len(esc.calls) == 2
+    verdicts = {
+        v["finding_id"]: v
+        for v in json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]
+    }
+    assert verdicts["F-001"].get("escalated") is True
+    assert verdicts["F-002"].get("escalated") is True
+    # minor/nit did NOT escalate and carry the low_confidence flag for the gate
+    assert not verdicts["F-003"].get("escalated")
+    assert not verdicts["F-004"].get("escalated")
+    assert verdicts["F-003"].get("low_confidence") is True
+    assert verdicts["F-004"].get("low_confidence") is True
 
 
 def test_blocking_without_escalation_agent_parks_for_human(cycle_repo):
@@ -727,9 +772,14 @@ def test_blocking_without_escalation_agent_parks_for_human(cycle_repo):
 
 
 def test_needs_escalation_rule():
+    # FR-6.2 severity-gated rule: blocking always escalates; low-confidence
+    # escalates only for blocking/major; low-confidence minor/nit does not.
     assert needs_escalation("blocking", {"confidence": "high"})
-    assert needs_escalation("nit", {"confidence": "low"})
+    assert needs_escalation("blocking", {"confidence": "low"})
+    assert needs_escalation("major", {"confidence": "low"})
     assert not needs_escalation("major", {"confidence": "high"})
+    assert not needs_escalation("minor", {"confidence": "low"})
+    assert not needs_escalation("nit", {"confidence": "low"})
 
 
 # --- schema-violation retry --------------------------------------------------------

@@ -72,6 +72,13 @@ agents:
   judge_llm:
     adapter: api
     model: gpt-5-mini
+  # Cheap profile for MECHANICAL emissions (FR-6.3): commit-message drafting and
+  # resume-disposition emission run here, not on the builder, so the builder's
+  # constrained provider window is spent on building. Effort *value* is Q2 (out
+  # of P7 scope); this is the profile *assignment* only.
+  mechanic:
+    adapter: api
+    model: gpt-5-mini
 
 # Per-agent commit identities (FR-9.7) so git log distinguishes who authored what.
 identities:

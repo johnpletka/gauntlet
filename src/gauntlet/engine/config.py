@@ -37,6 +37,78 @@ _RESUME_ON_QUOTA_MODES = frozenset({RESUME_ON_QUOTA_NOTIFY, RESUME_ON_QUOTA_AUTO
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
+# --- effort tiering (harness-efficiency FR-6.1) ------------------------------
+# The NORMATIVE canonical effort enum. A profile/step `effort:` is drawn from
+# this set; anything else is a config-load error (never a silent drop). The
+# per-adapter *surface* below maps each canonical value onto the flag the
+# adapter actually accepts — a static, pinned fact (the flags are live-verified
+# in `.gauntlet/pins.yaml`), independent of the not-yet-ratified default effort
+# *values* (Q2). P7 ships the plumbing; the shipped defaults are a later,
+# measurement-gated config change.
+CANONICAL_EFFORTS = ("minimal", "low", "medium", "high")
+
+# adapter name -> {kwarg, accepted, remap}. ``kwarg`` is the adapter constructor
+# parameter the mapped value lands on; ``accepted`` are the canonical values the
+# adapter passes straight through; ``remap`` names a canonical value the adapter
+# cannot express directly and the substitute it maps to (with a load warning).
+# claude `--effort` accepts {low, medium, high} (pins.yaml), so canonical
+# ``minimal`` maps to ``low``; codex `-c model_reasoning_effort=` and the api
+# `reasoning_effort` param accept the full canonical set.
+_EFFORT_SURFACE: dict[str, dict[str, Any]] = {
+    "claude-code": {
+        "kwarg": "effort",
+        "accepted": frozenset({"low", "medium", "high"}),
+        "remap": {"minimal": "low"},
+    },
+    "codex": {
+        "kwarg": "reasoning_effort",
+        "accepted": frozenset({"minimal", "low", "medium", "high"}),
+        "remap": {},
+    },
+    "api": {
+        "kwarg": "reasoning_effort",
+        "accepted": frozenset({"minimal", "low", "medium", "high"}),
+        "remap": {},
+    },
+}
+
+
+def map_effort(adapter: str, canonical: str) -> tuple[str, str, str | None]:
+    """Map a canonical effort onto an adapter's ``(kwarg, value, warning)`` (FR-6.1).
+
+    Fail closed: raises :class:`ValueError` — a config-/pipeline-load error — when
+    ``canonical`` is not a canonical value, the adapter has no known effort
+    surface, or the adapter cannot express the value. The value is never silently
+    dropped. Returns a non-``None`` ``warning`` when the canonical value had to be
+    remapped to an adapter substitute (claude ``minimal`` → ``low``); callers
+    surface it at load time.
+    """
+    if canonical not in CANONICAL_EFFORTS:
+        raise ValueError(
+            f"effort {canonical!r} is not a canonical effort value; use one of "
+            f"{list(CANONICAL_EFFORTS)} (FR-6.1)"
+        )
+    surface = _EFFORT_SURFACE.get(adapter)
+    if surface is None:
+        raise ValueError(
+            f"adapter {adapter!r} has no effort surface; `effort:` is supported "
+            f"only for adapters {sorted(_EFFORT_SURFACE)} (FR-6.1)"
+        )
+    kwarg = surface["kwarg"]
+    if canonical in surface["accepted"]:
+        return kwarg, canonical, None
+    remap = surface["remap"].get(canonical)
+    if remap is not None:
+        return kwarg, remap, (
+            f"effort {canonical!r} is not accepted by the {adapter!r} adapter; "
+            f"mapping it to {remap!r} (FR-6.1)"
+        )
+    raise ValueError(
+        f"adapter {adapter!r} does not accept effort {canonical!r} "
+        f"(accepted: {sorted(surface['accepted'])}); it is a canonical value the "
+        "adapter cannot express — a config-load error, not a silent drop (FR-6.1)"
+    )
+
 # A POSIX environment-variable identifier. ``issue_tracker.api_key_env`` must
 # match this — it names the env var holding the token, never the token (§7).
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -79,23 +151,63 @@ class AgentProfile(BaseModel):
     adapter: str
     model: str | None = None
 
+    # Canonical reasoning-effort tier (FR-6.1), drawn from CANONICAL_EFFORTS.
+    # Mapped to the adapter's accepted flag at build time (claude `--effort`,
+    # codex `-c model_reasoning_effort=`, api `reasoning_effort`); an unsupported
+    # value fails at config load, never silently drops. Engine-level: stripped
+    # from the generic kwargs and re-injected as the adapter's mapped parameter.
+    effort: str | None = None
+
     # --- engine-level guards (FR-3.3); not passed to the adapter ---
     max_turns: int | None = None
     budget_usd: float | None = None
     step_timeout_s: float | None = None
 
+    @field_validator("effort")
+    @classmethod
+    def _validate_effort_enum(cls, v: str | None) -> str | None:
+        """`effort` must be a canonical value (FR-6.1); anything else fails at load."""
+        if v is None:
+            return None
+        name = str(v).strip().lower()
+        if name not in CANONICAL_EFFORTS:
+            raise ValueError(
+                f"effort must be one of {list(CANONICAL_EFFORTS)} (canonical enum, "
+                f"FR-6.1); got {v!r}"
+            )
+        return name
+
+    @model_validator(mode="after")
+    def _validate_effort_surface(self) -> AgentProfile:
+        """Reject an effort the profile's adapter cannot express, at load (FR-6.1).
+
+        The canonical enum is checked by the field validator; this cross-field
+        check confirms the adapter accepts the value and warns on a remap (claude
+        ``minimal`` → ``low``) so the substitution is visible, not silent."""
+        if self.effort is not None:
+            _kwarg, _value, warning = map_effort(self.adapter, self.effort)
+            if warning:
+                warnings.warn(warning, stacklevel=2)
+        return self
+
     def adapter_class(self) -> type:
         return get_adapter_class(self.adapter)
 
-    def _adapter_kwargs(self) -> dict[str, Any]:
-        guard_fields = {"max_turns", "budget_usd", "step_timeout_s"}
+    def _adapter_kwargs(self, effort_override: str | None = None) -> dict[str, Any]:
+        guard_fields = {"max_turns", "budget_usd", "step_timeout_s", "effort"}
         data = self.model_dump(exclude_none=True)
         data.pop("adapter", None)
         for f in guard_fields:
             data.pop(f, None)
+        # FR-6.1: map the canonical effort onto the adapter's accepted parameter
+        # (an override — e.g. a step-level `effort:` — wins over the profile's).
+        effort = effort_override if effort_override is not None else self.effort
+        if effort is not None:
+            kwarg, value, _warning = map_effort(self.adapter, effort)
+            data[kwarg] = value
         return data
 
-    def build_adapter(self) -> Any:
+    def build_adapter(self, *, effort: str | None = None) -> Any:
         """Construct the adapter, filtering kwargs to its constructor signature.
 
         Unknown profile keys (e.g. an adapter-specific flag the engine has never
@@ -104,7 +216,7 @@ class AgentProfile(BaseModel):
         ``__init__``; ``base_flags`` is linted here regardless of adapter.
         """
         cls = self.adapter_class()
-        kwargs = self._adapter_kwargs()
+        kwargs = self._adapter_kwargs(effort)
         base_flags = kwargs.get("base_flags")
         if isinstance(base_flags, list):
             lint_flags(base_flags)

@@ -60,6 +60,7 @@ agents:
   reviewer: {adapter: codex, sandbox: read-only}
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
+  mechanic: {adapter: api, model: gpt-5-mini}
 identities:
   builder: {name: "Gauntlet Builder (claude)", email: "builder@gauntlet.local"}
   reviewer: {name: "Gauntlet Reviewer (codex)", email: "reviewer@gauntlet.local"}
@@ -152,11 +153,15 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
+            # retro proposal synthesis (FR-6.3): no change warranted this run.
+            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
+        ),
+        # FR-6.3: the phase-commit message is drafted by the cheap `mechanic`
+        # profile now, not the builder/triage.
+        "mechanic": Script(
             AgentResult(text="P1: build the widget\n\nImplements widget() for P1.\n"
                              "Validates the toy spec end-to-end.\n",
                         usage=_u(), exit_code=0),                # phase-commit draft
-            # retro proposal synthesis (FR-6.3): no change warranted this run.
-            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
         ),
         "escalation": Script(),
     }
@@ -241,9 +246,11 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
+            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
+        ),
+        "mechanic": Script(
             AgentResult(text="P1: build widget\n\nImplements widget() for P1.\nbody.\n",
                         usage=_u(), exit_code=0),
-            AgentResult(text="{}", structured={"proposals": []}, usage=_u(), exit_code=0),
         ),
         "escalation": Script(),
     }

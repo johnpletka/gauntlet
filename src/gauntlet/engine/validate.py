@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gauntlet.config import BannedFlagError
-from gauntlet.engine.config import RunConfig
+from gauntlet.engine.config import RunConfig, map_effort
 from gauntlet.engine.execution import get_spec
 from gauntlet.engine.pipeline import (
     INPUT_MODE_INLINE,
@@ -186,6 +186,23 @@ def _validate_step(
                 "session with the validation error and requires resume support"
             )
 
+    # 1e. step-level `effort:` (FR-6.1) is a canonical value the step's agent's
+    # adapter must accept — fail closed at load rather than silently drop it or
+    # raise mid-run. Validated against the step's own `agent` profile (a step
+    # `effort:` overrides that profile's effort; cycle roles carry effort via
+    # their own profiles, which RunConfig load already validated).
+    step_effort = step.get("effort")
+    if step_effort is not None and step.agent and step.agent in config.agents:
+        try:
+            _kwarg, _value, warning = map_effort(
+                config.profile(step.agent).adapter, str(step_effort).strip().lower()
+            )
+        except ValueError as exc:
+            report.errors.append(f"step {step.id!r} effort: {exc}")
+        else:
+            if warning:
+                report.warnings.append(f"step {step.id!r} effort: {warning}")
+
     # 2. dangling artifact dataflow (FR-5.3)
     for ref in input_refs:
         if ref.name not in available:
@@ -260,7 +277,11 @@ def _validate_step(
                 "pinned CLIs; use step_timeout_s / budget_usd (review F-006)"
             )
         caps = profile.capabilities()
-        if spec.step_requires_repo_write(step) and not caps.repo_write:
+        # Repo-write applies to the step's PRIMARY agent only — auxiliary emitters
+        # (message_agent, disposition_agent) never touch the worktree, so a cheap
+        # non-writing profile (api) is valid there (FR-6.3). The cycle's writing
+        # role (fixer) is checked in block 2b.
+        if ref == step.agent and spec.step_requires_repo_write(step) and not caps.repo_write:
             report.errors.append(
                 f"step {step.id!r} needs repo-write but agent {ref!r} "
                 f"(adapter {profile.adapter!r}) cannot write the repo (FR-2.3)"
@@ -362,8 +383,8 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     refs: list[str] = []
     if step.agent:
         refs.append(step.agent)
-    for key in ("message_agent", "reviewer", "triager", "fixer", "confirmer",
-                "escalation_agent", "proposer"):
+    for key in ("message_agent", "disposition_agent", "reviewer", "triager",
+                "fixer", "confirmer", "escalation_agent", "proposer"):
         ref = step.get(key)
         if ref:
             refs.append(ref)

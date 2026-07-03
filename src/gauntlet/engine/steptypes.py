@@ -301,7 +301,26 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # exactly like the usage-limit resume discriminator below.
     if ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID:
         return _revalidate_on_resume(step, ctx, agent_name)
-    adapter = ctx.build_adapter(agent_name)
+    # FR-10: while this invocation is consuming a pending `--response`, bind the
+    # resume-disposition schema invocation-locally and let the structured
+    # disposition drive the outcome — without touching the approved pipeline.
+    consuming_response = _consuming_response(ctx)
+    # FR-6.3: the resume-disposition emission is a mechanical structured
+    # classification (schema-bound + fail-closed engine checks), so a shipped
+    # pipeline can route it to a cheap `disposition_agent` profile instead of
+    # spending the builder's constrained window on it. Only on a `--response`
+    # resume; a different emitter runs a fresh sessionless call (a cheap `api`
+    # profile has no session to continue). The primary `agent` still owns every
+    # non-disposition invocation.
+    emit_agent = agent_name
+    disposition_agent = step.get("disposition_agent")
+    if consuming_response and disposition_agent and disposition_agent != agent_name:
+        emit_agent = disposition_agent
+    # FR-6.1: a step-level `effort:` overrides the profile's effort — but only for
+    # the step's own agent, never a substituted disposition emitter (which uses
+    # its own profile's effort).
+    effort_override = step.get("effort") if emit_agent == agent_name else None
+    adapter = ctx.build_adapter(emit_agent, effort=effort_override)
     # FR-3.3: a usage-limit resume continues the persisted CLI session with a
     # SHORT continuation prompt instead of re-sending the full original prompt.
     # The record still carries parked_reason=usage_limit (the orchestrator clears
@@ -311,15 +330,16 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         ctx.record.parked_reason == PARKED_REASON_USAGE_LIMIT and ctx.record.session_id
     )
     prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
-    # FR-10: while this invocation is consuming a pending `--response`, bind the
-    # resume-disposition schema invocation-locally and let the structured
-    # disposition drive the outcome — without touching the approved pipeline.
-    consuming_response = _consuming_response(ctx)
     schema = (
         _resume_disposition_schema(ctx)
         if consuming_response
         else _load_schema(step, ctx)
     )
+    # A substituted disposition emitter (emit_agent != agent_name) has no session
+    # to continue — the persisted session_id belongs to the primary agent — so it
+    # runs a fresh call. The primary agent (disposition or quota resume) continues
+    # its own session as before.
+    emit_session = ctx.record.session_id if emit_agent == agent_name else None
     # Per-step timeout overrides the profile's step_timeout_s, which overrides
     # the adapter default (FR-3.3). A timeout raises AgentTimeoutError, which the
     # orchestrator turns into a HALTED checkpoint. The status path resolves the
@@ -370,7 +390,7 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
 
     fallback_note = ""
     try:
-        result = _invoke(prompt, ctx.record.session_id)
+        result = _invoke(prompt, emit_session)
     except SessionNotFoundError as exc:
         # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
         # to a full re-run with no session (recoverable, not a run-halting fault)
@@ -386,16 +406,54 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         prompt = _render_prompt(step, ctx)
         result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
-    usage_by_agent = {agent_name: result.usage} if result.usage else {}
+    # Attribute usage to the agent that actually ran (the disposition emitter on a
+    # routed `--response` resume, else the step's agent) so `agent_usage` reflects
+    # the cheap profile's spend, not the builder's (FR-3.2/FR-6.3).
+    usage_by_agent = {emit_agent: result.usage} if result.usage else {}
 
-    # FR-3/FR-5/FR-10: on a `--response` resume the builder's STRUCTURED
-    # disposition is authoritative for the outcome, not the textual `halt_on`
-    # marker (which only signals the FIRST conflict, before any response). Map it
-    # to the step status here so a schema-valid `new_conflict` re-parks instead of
-    # being marked DONE; the FR-3.0 classification itself lives in the prompt.
+    if consuming_response and emit_agent != agent_name:
+        # FR-6.3 two-phase resume: the cheap `disposition_agent` CLASSIFIED the
+        # response, but it cannot do the step's work. Its verdict gates whether the
+        # primary agent runs at all:
+        #   * a re-park (amendment_required/new_conflict) or a fail-closed
+        #     disposition lands nothing — return it now, so the builder's
+        #     constrained window is never touched for a conflict that resolves to
+        #     "amend the artifact" or "still ambiguous" (the common case).
+        #   * a proceed means the conflict is resolved and the phase must actually
+        #     be implemented, which only the primary agent can do — re-drive it
+        #     exactly like an unrouted resume (full prompt + disposition schema +
+        #     its preserved session), and let ITS authoritative disposition drive
+        #     the outcome below.
+        classified = _resume_disposition_result(
+            emit_agent, result, usage_by_agent, ctx.record.human_responses
+        )
+        if classified.status != DONE:
+            return classified
+        # proceed: re-drive the primary agent to implement. Account BOTH the cheap
+        # classification and the builder's implementation as real spend (FR-3.2),
+        # split per profile — the classification is not free just because it was
+        # cheap.
+        spend = _UsageAccumulator()
+        spend.add(result.usage, agent=emit_agent)  # the disposition_agent's spend
+        adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
+        try:
+            result = _invoke(prompt, ctx.record.session_id, log_suffix="-implement")
+        except SessionNotFoundError:
+            result = _invoke(prompt, None, log_suffix="-implement")
+        logger.log_result(result, suffix="-implement")
+        spend.add(result.usage, agent=agent_name)
+        emit_agent = agent_name
+        result = result.model_copy(update={"usage": spend.result()})
+        usage_by_agent = spend.by_agent()
+
+    # FR-3/FR-5/FR-10: on a `--response` resume the STRUCTURED disposition is
+    # authoritative for the outcome, not the textual `halt_on` marker (which only
+    # signals the FIRST conflict, before any response). Map it to the step status
+    # here so a schema-valid `new_conflict` re-parks instead of being marked DONE;
+    # the FR-3.0 classification itself lives in the prompt.
     if consuming_response:
         outcome = _resume_disposition_result(
-            agent_name, result, usage_by_agent, ctx.record.human_responses
+            emit_agent, result, usage_by_agent, ctx.record.human_responses
         )
         # A re-park (amendment_required/new_conflict) or a fail-closed disposition
         # lands nothing: return immediately, skipping completion-signal handling

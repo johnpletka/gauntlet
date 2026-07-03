@@ -78,15 +78,23 @@ stages:
       # the reference/phase modes are load-validated as capable (FR-1.3). Q3
       # guardrail: the next real run after this PRD merges is the comparison
       # baseline; a miss reverts these two modes to `inline` (config-only).
+      # FR-6.3: `disposition_agent: mechanic` routes the MECHANICAL resume-
+      # disposition emission (the structured classification of a `--response`
+      # decision on this step's UPSTREAM CONFLICT park) to the cheap profile
+      # instead of the builder. A re-park/amend classification costs zero builder
+      # window; only a `proceed` re-drives the builder to actually implement.
       - {id: implement, type: agent_task, agent: builder,
+         disposition_agent: mechanic,
          prompt: prompts/implement-phase.md,
          inputs: [{name: prd.md, mode: reference}, {name: plan.md, mode: phase}],
          halt_on: "UPSTREAM CONFLICT"}
       - {id: tests, type: shell, run: "{{config.test_command}}",
          timeout_s: 1800, on_fail: {route_to: implement, max_retries: 2}}
       # clean worktree + commit BEFORE the reviewer handoff (FR-9.3); the phase
-      # prefix (P1, P2, …) comes from the foreach item's id.
-      - {id: phase-commit, type: commit, message_agent: triage,
+      # prefix (P1, P2, …) comes from the foreach item's id. FR-6.3: the commit
+      # message is a MECHANICAL draft — the cheap `mechanic` profile drafts it
+      # (still format-validated + redrafted), not the builder.
+      - {id: phase-commit, type: commit, message_agent: mechanic,
          prompt: prompts/commit-message.md}
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
          reviewer: reviewer, triager: triage, fixer: builder,
