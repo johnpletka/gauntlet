@@ -678,6 +678,43 @@ def test_detail_page_renders_gate_context(fixture_repo):
     assert "re-runs the" in html
 
 
+def test_reject_form_carries_resolved_consequence(fixture_repo):
+    # F-003: the reject form exposes the resolved consequence (data-reject-
+    # consequence) so the JS confirm states the SAME thing the control shows —
+    # for an upstream-cycle gate that is the re-drive, never "The run fails."
+    _gate_run_with_context(fixture_repo)
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    # The attribute value is HTML-escaped ('→&#39;); getAttribute() decodes it
+    # back for the confirm prompt at runtime.
+    assert (
+        "data-reject-consequence=\"re-runs the &#39;plan-cycle&#39; cycle with "
+        "your notes injected as a new round\"" in html
+    )
+
+
+def test_reject_form_consequence_terminal_without_cycle(fixture_repo):
+    # F-003: a gate with no upstream cycle carries the terminal consequence — the
+    # confirm reflects that a reject there really is terminal.
+    _gate_run_with_artifacts(fixture_repo)  # impl-gate, no preceding cycle
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert (
+        'data-reject-consequence="terminally rejects the gate '
+        '(no upstream cycle to re-run)"' in html
+    )
+
+
+def test_control_js_confirm_is_not_stale_run_fails():
+    # F-003 regression guard: the reject confirm must not hardcode the false
+    # "The run fails." copy; it reads the resolved consequence instead.
+    from gauntlet import web as _web
+
+    js = (Path(_web.__file__).parent / "static" / "control.js").read_text()
+    assert "The run fails." not in js
+    assert "data-reject-consequence" in js
+
+
 def _gate_run_all_artifacts(repo: Path) -> Path:
     (repo / "runs").mkdir(exist_ok=True)
     man = _man("demo", "run-1", status=RUN_PARKED, current_step="impl-gate",

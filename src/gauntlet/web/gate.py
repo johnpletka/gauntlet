@@ -238,8 +238,17 @@ class GateResolver:
         # FR-8.1 gate context — convergence, prior responses, escalated reasoning —
         # from the manifest + persisted artifacts (read-only, fail-soft). Shared
         # with `status --json` (operator.compute_gate_context) so the two surfaces
-        # can never disagree.
-        context = operator.compute_gate_context(man, run_dir, rec)
+        # can never disagree. The pipeline snapshot resolves the upstream cycle by
+        # the same rule the reject path re-drives (F-001), and the configured
+        # redaction list masks configured secrets in the block (F-002).
+        try:
+            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+        except (FileNotFoundError, ValueError):
+            pipeline = None
+        context = operator.compute_gate_context(
+            man, run_dir, rec,
+            pipeline=pipeline, redaction=self.store.config.redaction,
+        )
         return GateView(
             slug=slug,
             run_id=rid,

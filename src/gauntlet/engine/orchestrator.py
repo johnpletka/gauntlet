@@ -39,7 +39,12 @@ from gauntlet.engine.execution import (
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.planphases import PlanPhasesError
-from gauntlet.engine.pipeline import Pipeline, Stage, Step
+from gauntlet.engine.pipeline import (
+    Pipeline,
+    Stage,
+    Step,
+    upstream_cycle_for_gate,
+)
 from gauntlet.logging.redact import RedactingWriter
 from gauntlet.logging.transcript import write_run_index
 
@@ -268,23 +273,13 @@ class Orchestrator:
     def _upstream_cycle_for_gate(self, gate_id: str):
         """The ``adversarial_cycle`` step a gate ratifies, and its stage.
 
-        The cycle is the last ``adversarial_cycle`` before ``gate_id`` in the same
-        (non-``foreach``) stage — ``prd-cycle`` for ``prd-approve``, ``plan-cycle``
-        for ``plan-approve`` in ``standard.yaml``. Returns ``(None, None)`` when
-        there is none to iterate (so reject falls back to a terminal reject).
+        Delegates to the shared
+        :func:`~gauntlet.engine.pipeline.upstream_cycle_for_gate` so the cycle the
+        reject path re-drives is resolved by the *same* rule the status/web
+        surfaces name in the reject consequence and gate context (F-001) — one
+        definition, no drift.
         """
-        for stage in self.pipeline.stages:
-            ids = [s.id for s in stage.steps]
-            if gate_id not in ids:
-                continue
-            if stage.foreach is not None:
-                return None, None  # iteration re-arming is out of scope
-            gate_idx = ids.index(gate_id)
-            for step in reversed(stage.steps[:gate_idx]):
-                if step.type == "adversarial_cycle":
-                    return step, stage
-            return None, None
-        return None, None
+        return upstream_cycle_for_gate(self.pipeline, gate_id)
 
     # ---- stage / step walk ---------------------------------------------------
     def _run_stage(self, stage: Stage) -> str:

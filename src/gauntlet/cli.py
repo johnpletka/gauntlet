@@ -623,7 +623,42 @@ def status(
     # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty
     # rather than a contract-breaking object (operator F-001/F-002/F-003).
     try:
+        from gauntlet.engine.pipeline import (
+            load_pipeline,
+            upstream_cycle_id_for_gate,
+        )
+
+        # The run's own pipeline snapshot (FR-5.6), loaded once and reused for the
+        # gate→cycle resolution, the effective-timeout lookup, and the gate context
+        # below. Fail-soft to None (a corrupt/absent snapshot degrades an advisory
+        # field, never crashes status).
+        try:
+            pipeline, _ = load_pipeline(run_instance_dir / "pipeline.yaml")
+        except (OSError, ValueError):
+            pipeline = None
+
         rstate = operator.compute_run_state(man, driver.state)
+        # FR-8.2 / F-001: when parked at a gate, name the cycle a reject would
+        # ACTUALLY re-drive — resolved from the pipeline snapshot with the same
+        # rule as the reject path (same non-foreach stage), not the manifest-order
+        # heuristic which can name a cross-stage/foreach cycle a reject never
+        # touches. Recompute the actions with the pipeline-resolved id (fail-soft
+        # to the pure default when the snapshot is unavailable).
+        if (
+            pipeline is not None
+            and rstate.state == operator.STATE_PARKED_GATE
+            and rstate.parked is not None
+        ):
+            gate_rec0 = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            if gate_rec0 is not None:
+                rstate = operator.compute_run_state(
+                    man, driver.state,
+                    gate_cycle_id=upstream_cycle_id_for_gate(pipeline, gate_rec0.id),
+                )
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
         # Advisory freshness (live-run-observability FR-5): the single I/O point
@@ -657,7 +692,6 @@ def status(
         # field) when the snapshot or the step is unresolvable.
         from datetime import datetime as _dt, timezone as _tz
 
-        from gauntlet.engine.pipeline import load_pipeline
         from gauntlet.engine.steptypes import resolve_step_timeout_s
 
         now = _dt.now(_tz.utc)
@@ -669,10 +703,6 @@ def status(
                 None,
             )
             if cur is not None and cur.status == "running":
-                try:
-                    pipeline, _ = load_pipeline(run_instance_dir / "pipeline.yaml")
-                except (OSError, ValueError):
-                    pipeline = None
                 pstep = next(
                     (s for s in pipeline.all_steps() if s.id == cur.id), None
                 ) if pipeline is not None else None
@@ -684,7 +714,9 @@ def status(
         # Gate decision context (FR-8.1): assembled only when parked at a human
         # gate, from the manifest + the upstream cycle's persisted artifacts (the
         # I/O point), then threaded into the pure serializer below like the other
-        # sampled inputs. None for every other state → `gate: null`.
+        # sampled inputs. None for every other state → `gate: null`. The pipeline
+        # snapshot resolves the upstream cycle (F-001) and the configured redaction
+        # list masks configured secrets (F-002); both are threaded through.
         gate_ctx = None
         if rstate.state == operator.STATE_PARKED_GATE and rstate.parked is not None:
             gate_rec = next(
@@ -694,7 +726,8 @@ def status(
             )
             if gate_rec is not None:
                 gate_ctx = operator.compute_gate_context(
-                    man, run_instance_dir, gate_rec
+                    man, run_instance_dir, gate_rec,
+                    pipeline=pipeline, redaction=mgr.config.redaction,
                 )
 
         if json_output:

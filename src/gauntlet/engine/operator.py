@@ -34,12 +34,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from datetime import datetime, timezone
 
 from gauntlet.engine import heartbeat as HB
 from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.pipeline import Pipeline, upstream_cycle_id_for_gate
 from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
     RECOVERY_INTENT_NAME,
@@ -49,6 +51,9 @@ from gauntlet.engine.run import (
 )
 from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
 from gauntlet.procident import ProcessIdentity, read_process_identity
+
+if TYPE_CHECKING:
+    from gauntlet.logging.redact import RedactionSettings
 
 # --- liveness values (FR-2.4) ------------------------------------------------
 LIVENESS_ALIVE = "alive"
@@ -690,19 +695,41 @@ def _current_step(
     return None
 
 
-def compute_run_state(man: Manifest, liveness: str) -> RunState:
-    """The single computed composite state both the footer and ``--json`` render."""
+# Sentinel distinguishing "caller resolved the gate cycle from the pipeline (use
+# it, even if None → terminal reject)" from "caller did not resolve; fall back to
+# the pure manifest heuristic". A plain None default cannot express both (F-001).
+_UNRESOLVED: Any = object()
+
+
+def compute_run_state(
+    man: Manifest, liveness: str, *, gate_cycle_id: str | None = _UNRESOLVED
+) -> RunState:
+    """The single computed composite state both the footer and ``--json`` render.
+
+    ``gate_cycle_id`` (FR-8.2) is the ``adversarial_cycle`` a reject of the parked
+    gate would re-drive, which the reject action's consequence names. The
+    authoritative resolution is over the run's *pipeline snapshot* (same rule as
+    ``Orchestrator._upstream_cycle_for_gate``), so the I/O-bearing caller resolves
+    it via :func:`gauntlet.engine.pipeline.upstream_cycle_id_for_gate` and threads
+    it in — passing ``None`` when a reject is terminal (a foreach gate, or a gate
+    with no same-stage cycle). Left unset, this function falls back to a pure
+    manifest-order heuristic (``_upstream_cycle_record``) so pure/no-pipeline
+    callers still get a shaped consequence; the CLI/web always resolve from the
+    pipeline so their surfaces name the cycle a reject *actually* re-runs (F-001).
+    """
     state, parked, failure = _classify(man, liveness)
-    # FR-8.2: a gate's reject re-runs its upstream adversarial_cycle, so the reject
-    # action's consequence names that cycle. Resolved from manifest step order (the
-    # last cycle before the gate) — pure, no pipeline load.
-    gate_cycle_id: str | None = None
     if state == STATE_PARKED_GATE and parked is not None:
-        gate_rec = next(
-            (r for r in man.steps if render_step_id(r) == parked.step_id), None
-        )
-        cyc = _upstream_cycle_record(man, gate_rec) if gate_rec is not None else None
-        gate_cycle_id = cyc.id if cyc is not None else None
+        if gate_cycle_id is _UNRESOLVED:
+            gate_rec = next(
+                (r for r in man.steps if render_step_id(r) == parked.step_id), None
+            )
+            cyc = (
+                _upstream_cycle_record(man, gate_rec)
+                if gate_rec is not None else None
+            )
+            gate_cycle_id = cyc.id if cyc is not None else None
+    else:
+        gate_cycle_id = None
     return RunState(
         state=state,
         slug=man.slug,
@@ -1418,6 +1445,25 @@ def _upstream_cycle_record(man: Manifest, gate_rec: StepRecord) -> StepRecord | 
     return cyc
 
 
+def _resolve_upstream_cycle(
+    man: Manifest, gate_rec: StepRecord, pipeline: "Pipeline | None"
+) -> StepRecord | None:
+    """The cycle record a gate ratifies, resolved for a content-bearing surface.
+
+    With a ``pipeline`` snapshot, resolve the cycle *id* by the same rule the
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
+    stage) and return that manifest record, so the gate context names exactly the
+    cycle a reject re-runs (F-001). A foreach gate / a gate with no same-stage
+    cycle resolves to ``None`` (terminal reject, no convergence to show). Without
+    a snapshot, fall back to the pure manifest-order heuristic (fail-soft)."""
+    if pipeline is None:
+        return _upstream_cycle_record(man, gate_rec)
+    cyc_id = upstream_cycle_id_for_gate(pipeline, gate_rec.id)
+    if cyc_id is None:
+        return None
+    return next((r for r in man.steps if r.id == cyc_id), None)
+
+
 def _read_json_under(base: Path, rel: str | None) -> object | None:
     """Read+parse a run-relative JSON artifact, fail-soft, with containment.
 
@@ -1557,7 +1603,12 @@ def _escalated_findings(run_instance_dir: Path, redact) -> list[dict]:
 
 
 def compute_gate_context(
-    man: Manifest, run_instance_dir: Path, gate_rec: StepRecord
+    man: Manifest,
+    run_instance_dir: Path,
+    gate_rec: StepRecord,
+    *,
+    pipeline: "Pipeline | None" = None,
+    redaction: "RedactionSettings | None" = None,
 ) -> dict:
     """Assemble the FR-8.1 gate decision context for a parked ``human_gate``.
 
@@ -1569,19 +1620,32 @@ def compute_gate_context(
     caller threads the result in, mirroring ``current_step_freshness`` /
     ``suspension``. Content-bearing fields are redacted (PRD §7).
 
+    ``pipeline`` is the run's pipeline snapshot (loaded by the I/O-bearing
+    caller). When given, the upstream cycle is resolved by the *same* rule the
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
+    stage), so ``cycle_step_id`` names the cycle a reject actually re-runs and
+    never a cross-stage/foreach cycle it does not (F-001). Absent a snapshot it
+    falls back to the pure manifest-order heuristic (fail-soft).
+
+    ``redaction`` is the run's configured redaction list (``RunConfig.redaction``).
+    It must be threaded through: with it omitted, a secret whose env-var name
+    misses the default KEY/TOKEN heuristic but is configured under
+    ``extra_env_vars`` would leak verbatim into this block via ``status --json`` /
+    the web gate view (F-002). ``None`` falls back to default settings.
+
     Always returns a dict (never ``None``) so a gate park always emits a shaped
     block; a gate with no upstream cycle yields ``cycle_step_id``/``convergence``
     null and empty lists (fail-soft, still schema-valid)."""
     from gauntlet.logging.redact import build_redactor
 
-    redactor = build_redactor()
+    redactor = build_redactor(redaction)
 
     def redact(text: object) -> object:
         if not isinstance(text, str):
             return text
         return redactor.redact(text)[0]
 
-    cycle_rec = _upstream_cycle_record(man, gate_rec)
+    cycle_rec = _resolve_upstream_cycle(man, gate_rec, pipeline)
     return {
         "cycle_step_id": cycle_rec.id if cycle_rec is not None else None,
         "convergence": _convergence_summary(cycle_rec, run_instance_dir),

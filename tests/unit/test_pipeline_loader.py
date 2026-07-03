@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.pipeline import content_hash, load_pipeline
+from gauntlet.engine.pipeline import (
+    content_hash,
+    load_pipeline,
+    upstream_cycle_for_gate,
+    upstream_cycle_id_for_gate,
+)
 from gauntlet.engine.validate import PipelineValidationError, validate_pipeline
 
 GOOD_PIPELINE = """
@@ -49,6 +54,76 @@ def test_load_and_validate_good_pipeline(tmp_path):
 def test_content_hash_is_stable_and_sensitive():
     assert content_hash("a") == content_hash("a")
     assert content_hash("a") != content_hash("b")
+
+
+# --- upstream_cycle_for_gate: the single gate→cycle rule (FR-8.2, F-001) ------
+def test_upstream_cycle_same_stage_cycle_is_named(tmp_path):
+    # A gate downstream of a cycle in its own non-foreach stage resolves to it —
+    # the case the reject path actually re-drives.
+    text = """
+name: d
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-cycle, type: adversarial_cycle}
+      - {id: plan-approve, type: human_gate}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    step, stage = upstream_cycle_for_gate(pipeline, "plan-approve")
+    assert step is not None and step.id == "plan-cycle"
+    assert stage.id == "plan"
+    assert upstream_cycle_id_for_gate(pipeline, "plan-approve") == "plan-cycle"
+
+
+def test_upstream_cycle_foreach_gate_is_none(tmp_path):
+    # A gate inside a foreach stage is terminal on reject (iteration re-arming is
+    # out of scope), so it must NOT name a cycle — status/web would otherwise
+    # advertise a re-run reject never performs (F-001).
+    text = """
+name: d
+version: 1
+stages:
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: phase-cycle, type: adversarial_cycle}
+      - {id: phase-approve, type: human_gate}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    assert upstream_cycle_for_gate(pipeline, "phase-approve") == (None, None)
+    assert upstream_cycle_id_for_gate(pipeline, "phase-approve") is None
+
+
+def test_upstream_cycle_prior_stage_cycle_is_not_named(tmp_path):
+    # A cycle in an EARLIER stage is not the one a reject re-drives; a gate with no
+    # same-stage cycle resolves to None even though a cycle precedes it globally.
+    text = """
+name: d
+version: 1
+stages:
+  - id: plan
+    steps:
+      - {id: plan-cycle, type: adversarial_cycle}
+  - id: build
+    steps:
+      - {id: build-approve, type: human_gate}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    assert upstream_cycle_id_for_gate(pipeline, "build-approve") is None
+
+
+def test_upstream_cycle_unknown_gate_is_none(tmp_path):
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: g, type: human_gate}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    assert upstream_cycle_id_for_gate(pipeline, "nope") is None
 
 
 def test_duplicate_step_id_rejected(tmp_path):

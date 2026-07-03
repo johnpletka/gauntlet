@@ -23,6 +23,8 @@ from gauntlet.engine.manifest import (
     PipelineRef,
     StepRecord,
 )
+from gauntlet.engine.pipeline import Pipeline
+from gauntlet.logging.redact import RedactionSettings
 
 STATUS_SCHEMA = json.loads(
     (Path(__file__).resolve().parents[2] / "schemas" / "status.json").read_text()
@@ -222,6 +224,88 @@ def test_gate_context_no_upstream_cycle_is_fail_soft(tmp_path):
         "cycle_step_id": None, "convergence": None,
         "prior_responses": [], "escalated": [],
     }
+
+
+def test_gate_context_pipeline_resolves_same_stage_cycle(tmp_path):
+    # With the pipeline snapshot, the upstream cycle is resolved by the reject-path
+    # rule (same non-foreach stage). For the standard plan stage this still names
+    # plan-cycle — the pipeline path agrees with the manifest heuristic here.
+    man, _, gate_rec, run_dir = _write_cycle_run(tmp_path)
+    pipeline = Pipeline.model_validate({
+        "name": "standard", "version": 1, "stages": [
+            {"id": "plan", "steps": [
+                {"id": "plan-cycle", "type": "adversarial_cycle"},
+                {"id": "plan-approve", "type": "human_gate"},
+            ]},
+        ],
+    })
+    ctx = op.compute_gate_context(man, run_dir, gate_rec, pipeline=pipeline)
+    assert ctx["cycle_step_id"] == "plan-cycle"
+    assert ctx["convergence"]["rounds"] == 2
+
+
+def test_gate_context_pipeline_ignores_prior_stage_cycle(tmp_path):
+    # F-001: the manifest heuristic would name plan-cycle (the last cycle before
+    # the gate in step order), but the pipeline puts the gate in a LATER stage with
+    # no cycle of its own — a reject there is terminal. The gate context must not
+    # advertise a re-run reject will not perform: cycle_step_id/convergence null.
+    man, _, gate_rec, run_dir = _write_cycle_run(tmp_path)
+    # Manifest heuristic (no pipeline) still names the cross-stage cycle...
+    assert op.compute_gate_context(
+        man, run_dir, gate_rec
+    )["cycle_step_id"] == "plan-cycle"
+    # ...but resolving over the pipeline (cycle in a prior stage) yields None.
+    pipeline = Pipeline.model_validate({
+        "name": "standard", "version": 1, "stages": [
+            {"id": "plan", "steps": [
+                {"id": "plan-cycle", "type": "adversarial_cycle"},
+            ]},
+            {"id": "build", "steps": [
+                {"id": "plan-approve", "type": "human_gate"},
+            ]},
+        ],
+    })
+    ctx = op.compute_gate_context(man, run_dir, gate_rec, pipeline=pipeline)
+    assert ctx["cycle_step_id"] is None
+    assert ctx["convergence"] is None
+
+
+def test_gate_context_pipeline_foreach_gate_names_no_cycle(tmp_path):
+    # F-001: a gate inside a foreach stage is a terminal reject (iteration re-arming
+    # out of scope), so it must name no cycle even though one precedes it.
+    man, _, gate_rec, run_dir = _write_cycle_run(tmp_path)
+    pipeline = Pipeline.model_validate({
+        "name": "standard", "version": 1, "stages": [
+            {"id": "phases", "foreach": "plan.phases", "steps": [
+                {"id": "plan-cycle", "type": "adversarial_cycle"},
+                {"id": "plan-approve", "type": "human_gate"},
+            ]},
+        ],
+    })
+    ctx = op.compute_gate_context(man, run_dir, gate_rec, pipeline=pipeline)
+    assert ctx["cycle_step_id"] is None
+    assert ctx["convergence"] is None
+
+
+def test_gate_context_redacts_extra_env_var_only_secret(tmp_path, monkeypatch):
+    # F-002: a secret whose env-var name misses the default KEY/TOKEN heuristic but
+    # is configured under redaction.extra_env_vars must be masked. Without the
+    # configured redaction it leaks; threading it through masks it.
+    monkeypatch.setenv("TRACKER_PROJECT", "plaintext-value-abcdef123456")
+    man, cycle_rec, gate_rec, run_dir = _write_cycle_run(tmp_path)
+    cycle_rec.human_responses[0].response_text = (
+        "see project plaintext-value-abcdef123456 for context"
+    )
+    man.write_atomic(run_dir / "manifest.json")
+
+    # Default settings miss it (proves the name heuristic alone is insufficient).
+    leaked = op.compute_gate_context(man, run_dir, gate_rec)
+    assert "plaintext-value-abcdef123456" in leaked["prior_responses"][0]["response_text"]
+
+    # Configured redaction masks it.
+    redaction = RedactionSettings(extra_env_vars=["TRACKER_PROJECT"])
+    ctx = op.compute_gate_context(man, run_dir, gate_rec, redaction=redaction)
+    assert "plaintext-value-abcdef123456" not in ctx["prior_responses"][0]["response_text"]
 
 
 def test_gate_context_redacts_content_bearing_fields(tmp_path, monkeypatch):
