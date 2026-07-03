@@ -839,6 +839,12 @@ class Orchestrator:
         # preserved session in the matching sub-step, cleared on any other
         # finalization so a step resumed to DONE never carries a stale value.
         rec.parked_substep = result.parked_substep
+        # The revalidation content-hash pair is current-state too (FR-2.2/§6): set
+        # on an artifact_invalid park (hash_at_park) and on the resume that
+        # revalidates the hand-edited artifact (the full pair + passed_on_resume),
+        # cleared on any other finalization so a step later resumed to a clean DONE
+        # never carries a stale hand-edit record.
+        rec.revalidation = result.revalidation
         # Auto-resume schedule (FR-3.4) is current-state and armed at park time so
         # a usage-limit park under `resume_on_quota: auto` carries its schedule the
         # instant `_drive` returns (before any wait), and a process death loses

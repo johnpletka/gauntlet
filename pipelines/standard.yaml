@@ -41,9 +41,14 @@ stages:
       # "UPSTREAM CONFLICT" protocol as prose — gating on that marker only ever
       # false-positives and discards the authored plan.md. A genuinely broken
       # PRD is caught downstream at plan-cycle / plan-approve.
+      # `validate: plan_phases` (FR-2.3) checks the authored gauntlet-phases block
+      # in-step: a malformed block is repaired in-session (bounded, FR-2.1) or
+      # parks `artifact_invalid` for a hand-edit-then-resume (FR-2.2), instead of
+      # sailing through review to detonate at the phases fan-out. plan-lint below
+      # remains the fail-closed backstop gate.
       - {id: plan-author, type: agent_task, agent: builder,
          prompt: prompts/plan-author.md, inputs: [prd.md], output: plan.md,
-         phase: PLAN, commit_output: true}
+         phase: PLAN, commit_output: true, validate: plan_phases}
       # plan-author commits its own deliverable (PLAN: …) as it finalizes, so HEAD
       # advances at production time: the plan survives a crash before review, and
       # an unrelated dirty file can no longer defeat the review baseline (the

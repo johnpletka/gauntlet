@@ -13,6 +13,7 @@ can never be substituted into a command line.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -34,15 +35,23 @@ from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
     HALT_REASON_PRECONDITION,
     HALT_REASON_TIMEOUT,
+    PARKED_REASON_ARTIFACT_INVALID,
     PARKED_REASON_GATE,
     PARKED_REASON_RESPONSE,
     PARKED_REASON_USAGE_LIMIT,
     RESPONSE_CONSUMED,
     RESPONSE_PENDING,
+    RevalidationRecord,
 )
 from gauntlet.engine.pipeline import Step
 from gauntlet.engine.planphases import PlanPhasesError, extract_phases
+from gauntlet.engine.validators import validate_artifact
 from gauntlet.logging.transcript import StepLogger
+
+# FR-2.1: how many in-session repair attempts an invalid `output:` artifact gets
+# before the step parks `artifact_invalid` (FR-2.2). Two, per the PRD acceptance
+# ("succeeds on attempt 2") and §9 metric (≥80% repaired within 2 attempts).
+_MAX_ARTIFACT_REPAIRS = 2
 
 _CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
 _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
@@ -240,6 +249,14 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             halt_reason=HALT_REASON_PRECONDITION,
             notes="agent_task step has no `agent:`",
         )
+    # FR-2.2: a plain `gauntlet resume` of an artifact_invalid park re-runs ONLY
+    # the validator against the (possibly hand-edited) on-disk artifact — no
+    # adapter invocation. Done here, before the adapter is even built, so a
+    # hand-edit-then-resume never re-runs the author. `parked_reason` is still the
+    # park's value at handler time (the orchestrator clears it only in _finalize),
+    # exactly like the usage-limit resume discriminator below.
+    if ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID:
+        return _revalidate_on_resume(step, ctx, agent_name)
     adapter = ctx.build_adapter(agent_name)
     # FR-3.3: a usage-limit resume continues the persisted CLI session with a
     # SHORT continuation prompt instead of re-sending the full original prompt.
@@ -268,20 +285,24 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
 
-    def _invoke(call_prompt: str, session: str | None):
+    def _invoke(call_prompt: str, session: str | None, *, log_suffix: str = ""):
         """One adapter call with FR-4 lossless logging + FR-6 streaming.
 
         Factored so a usage-limit resume can fall back to a second, full-prompt
-        call when the stored session is gone (FR-3.3). ``log_prompt`` runs before
+        call when the stored session is gone (FR-3.3), and so an FR-2.1 repair
+        re-invocation gets its OWN evidence files. The prompt is persisted before
         the call (survives a crash); a per-attempt stream is opened/closed here so
-        events.jsonl reflects the current attempt.
+        the events file reflects the current attempt. ``log_suffix`` names a
+        distinct attempt (e.g. ``-repair1``) so a repair never overwrites the
+        initial attempt's prompt/events (lossless, FR-4).
         """
-        logger.log_prompt(call_prompt)
+        logger.log_text(f"prompt{log_suffix}.md", call_prompt)
         # Live-observability streaming (live-run-observability FR-2): when enabled
-        # and the adapter is line-streamable, thread a per-line sink so
-        # events.jsonl grows during the step. sink is passed ONLY when streaming —
-        # the buffered path's call shape (and existing fakes) stay untouched.
-        stream = open_step_stream(ctx, adapter, logger)
+        # and the adapter is line-streamable, thread a per-line sink so the events
+        # file grows during the step. sink is passed ONLY when streaming — the
+        # buffered path's call shape (and existing fakes) stay untouched. The
+        # suffix keeps a repair attempt's stream off the initial attempt's file.
+        stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
         kwargs: dict = {"session": session, "schema": schema, "cwd": ctx.repo_root}
         if stream is not None:
             kwargs["sink"] = stream.append_line
@@ -292,8 +313,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             # partial evidence the adapter salvaged before it is re-raised (the
             # orchestrator classifies transient-vs-terminal, FR-3.1).
             if exc.partial is not None:
-                logger.log_result(exc.partial, suffix="-failed")
-            logger.log_text("failure.txt", str(exc))
+                logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
+            logger.log_text(f"failure{log_suffix}.txt", str(exc))
             raise
         finally:
             # A streaming sink fault surfaces as a StreamSinkError (not an
@@ -366,10 +387,27 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
 
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")
+    validate_name = step.get("validate")
+    final_usage = result.usage
     commit_sha = commit_phase = None
     if output:
         out_path = ctx.artifact_root / output
         ctx.writer.write_text(out_path, result.text)
+        # FR-2.1: validate the freshly written artifact in-step, with a bounded
+        # in-session repair loop; on exhaustion park artifact_invalid (FR-2.2).
+        # Runs BEFORE any commit_output below, so an invalid artifact is never
+        # committed — it stays on disk (dirty) for the sanctioned hand-edit path.
+        if validate_name:
+            park, result, summed = _validate_output(
+                step, ctx, _invoke, logger, validate_name, output, out_path, result,
+            )
+            final_usage = summed
+            usage_by_agent = {agent_name: summed} if summed else {}
+            if park is not None:
+                park.session_id = result.session_id
+                park.usage = summed
+                park.usage_by_agent = usage_by_agent
+                return park
         artifact_writes[output] = out_path
         # Prevent-at-source (report #3): a producer that opts in commits its own
         # declared deliverable as it finalizes, so HEAD advances at production
@@ -387,7 +425,7 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     return StepResult(
         status=DONE,
         session_id=result.session_id,
-        usage=result.usage,
+        usage=final_usage,
         usage_by_agent=usage_by_agent,
         artifact_writes=artifact_writes,
         commit_sha=commit_sha,
@@ -395,6 +433,164 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         notes=(
             f"agent {agent_name!r} completed\n{fallback_note}"
             if fallback_note else f"agent {agent_name!r} completed"
+        ),
+    )
+
+
+# --- in-step artifact validation + repair (FR-2.1/2.2) -----------------------
+def _sha256(text: str) -> str:
+    """Content hash of an artifact's bytes for the revalidation pair (§6)."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _repair_prompt(output: str, error: str, attempt: int) -> str:
+    """The in-session correction prompt fed to the same agent on a repair (FR-2.1).
+
+    Short and directive — the session already holds the authoring context; this
+    just names the concrete validation failure and asks for a full rewrite of the
+    one artifact, mirroring the proven schema-retry re-ask in ``cycle.py``.
+    """
+    return (
+        f"The `{output}` artifact you just wrote failed validation "
+        f"(repair attempt {attempt} of {_MAX_ARTIFACT_REPAIRS}):\n\n{error}\n\n"
+        f"Rewrite `{output}` so it passes this check. Return only the full "
+        "corrected artifact as your response — no commentary, no code fences "
+        "around it unless the artifact itself requires them."
+    )
+
+
+def _validate_output(step, ctx, invoke, logger, validate_name, output, out_path, result):
+    """Validate ``output`` in-step with a bounded in-session repair loop (FR-2.1).
+
+    ``invoke(prompt, session)`` is ``handle_agent_task``'s per-call closure (it
+    logs the prompt, streams, and persists partial-failure evidence). Returns
+    ``(park_or_none, result, summed_usage)``:
+
+    * ``(None, valid_result, usage)`` — the artifact validated immediately or
+      after ≤``_MAX_ARTIFACT_REPAIRS`` repairs; ``valid_result`` is the
+      authoritative :class:`AgentResult` and ``out_path`` holds the valid bytes.
+    * ``(park_result, last_result, usage)`` — repairs exhausted → a PARKED
+      ``artifact_invalid`` :class:`StepResult` carrying the verbatim validator
+      error (FR-2.2) and the ``hash_at_park`` content hash; the caller stamps its
+      session/usage.
+
+    ``usage`` sums the initial call and every repair attempt — each is real spend
+    (FR-3.2) — or ``None`` when no attempt reported usage. Each repair result is
+    logged with a ``-repair<n>`` suffix so both attempts survive in the transcript.
+    An :class:`UnknownValidatorError` from a misconfigured ``validate:`` name
+    propagates (fail closed → the step FAILs), never a repairable park.
+    """
+    total = _UsageAccumulator()
+    total.add(result.usage)
+    error = validate_artifact(
+        validate_name, out_path.read_text(),
+        repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
+    )
+    attempt = 0
+    while error is not None and attempt < _MAX_ARTIFACT_REPAIRS:
+        attempt += 1
+        suffix = f"-repair{attempt}"
+        result = invoke(
+            _repair_prompt(output, error, attempt), result.session_id,
+            log_suffix=suffix,
+        )
+        logger.log_result(result, suffix=suffix)
+        total.add(result.usage)
+        ctx.writer.write_text(out_path, result.text)
+        error = validate_artifact(
+            validate_name, out_path.read_text(),
+            repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
+        )
+    summed = total.result()
+    if error is None:
+        return None, result, summed
+    park = StepResult(
+        status=PARKED,
+        parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+        revalidation=RevalidationRecord(
+            artifact=output, hash_at_park=_sha256(out_path.read_text())
+        ),
+        notes=(
+            f"artifact {output!r} failed validation ({validate_name}) after "
+            f"{_MAX_ARTIFACT_REPAIRS} in-session repair attempts (FR-2.2); parked "
+            f"for a hand-edit-then-`gauntlet resume`. Validator error:\n{error}"
+        ),
+    )
+    return park, result, summed
+
+
+def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> StepResult:
+    """Re-run ONLY the validator on a plain resume of an ``artifact_invalid`` park.
+
+    No adapter invocation (FR-2.2): validate the on-disk artifact — which a human
+    may have hand-edited while the run was parked — and record the revalidation
+    content-hash pair so the hand-edit is auditable rather than off-book file
+    surgery (PRD §7). On pass → DONE (committing the now-valid ``output`` when the
+    step opted into ``commit_output``, since the normal path commits only on
+    validity); still invalid → re-park ``artifact_invalid`` with refreshed hashes.
+    """
+    output = step.get("output")
+    validate_name = step.get("validate")
+    # An artifact_invalid park is only ever written for a step with both `output`
+    # and `validate` (see _validate_output). Missing either → inconsistent
+    # manifest; fail closed rather than silently completing (CLAUDE.md §2).
+    if not output or not validate_name:
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                "artifact_invalid resume on a step with no `output`/`validate` "
+                "(inconsistent manifest); failing closed (FR-2.2)"
+            ),
+        )
+    out_path = ctx.artifact_root / output
+    text = out_path.read_text() if out_path.exists() else ""
+    hash_at_resume = _sha256(text)
+    prior = ctx.record.revalidation
+    hash_at_park = prior.hash_at_park if prior is not None else hash_at_resume
+    changed = hash_at_resume != hash_at_park
+    error = validate_artifact(
+        validate_name, text, repo_root=ctx.repo_root, asset_root=ctx.config.asset_root
+    )
+    reval = RevalidationRecord(
+        artifact=output,
+        hash_at_park=hash_at_park,
+        hash_at_resume=hash_at_resume,
+        changed_while_parked=changed,
+        passed_on_resume=error is None,
+    )
+    if error is not None:
+        return StepResult(
+            status=PARKED,
+            parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=reval,
+            notes=(
+                f"artifact {output!r} still fails validation ({validate_name}) on "
+                f"resume ({'edited' if changed else 'unchanged'} while parked); "
+                f"hand-edit it and `gauntlet resume` again (FR-2.2). Validator "
+                f"error:\n{error}"
+            ),
+        )
+    # Valid on resume — complete the step with no adapter call. Commit the
+    # now-valid deliverable if the step opted into commit_output (the normal path
+    # committed only on validity; the resume path must too, to keep the
+    # clean-handoff invariant for the downstream cycle).
+    commit_sha = commit_phase = None
+    if step.get("commit_output"):
+        outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
+        if isinstance(outcome, StepResult):  # fail-closed format/commit error
+            return outcome
+        commit_sha, commit_phase = outcome
+    edited = "hand-edited while parked" if changed else "unchanged since park"
+    return StepResult(
+        status=DONE,
+        revalidation=reval,
+        artifact_writes={output: out_path},
+        commit_sha=commit_sha,
+        commit_phase=commit_phase,
+        notes=(
+            f"artifact {output!r} passed validation ({validate_name}) on resume "
+            f"({edited}); step completed with no agent re-invocation (FR-2.2)"
         ),
     )
 
@@ -1115,9 +1311,12 @@ def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
     return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
 
 
-def open_step_stream(ctx: StepContext, adapter, logger: StepLogger):
-    """Open a live ``events.jsonl`` stream, or return ``None`` for the buffered
-    path (live-run-observability FR-2/FR-6.1).
+def open_step_stream(ctx: StepContext, adapter, logger: StepLogger, *, suffix: str = ""):
+    """Open a live ``events<suffix>.jsonl`` stream, or return ``None`` for the
+    buffered path (live-run-observability FR-2/FR-6.1).
+
+    ``suffix`` isolates a repair re-invocation's stream (FR-2.1) so it never
+    truncates the initial attempt's events file.
 
     Returns a :class:`StepStream` (whose ``append_line`` is threaded into
     ``adapter.run`` as the per-line sink) only when **both** the run-level flag
@@ -1132,7 +1331,7 @@ def open_step_stream(ctx: StepContext, adapter, logger: StepLogger):
     streams = getattr(adapter, "streams_to_sink", None)
     if not callable(streams) or not streams():
         return None
-    return logger.open_stream()
+    return logger.open_stream(suffix=suffix)
 
 
 def _write_step_log(ctx: StepContext, name: str, text: str) -> None:

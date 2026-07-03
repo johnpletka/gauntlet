@@ -66,6 +66,12 @@ STATE_PARKED_FOR_RESPONSE = "parked_for_response"
 # Distinct from parked_for_response: it needs NO human decision — a plain
 # `gauntlet resume` continues the preserved session (FR-3.3).
 STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
+# A step parked because an agent-authored structured artifact failed validation
+# after the bounded in-session repair loop (harness-efficiency FR-2.2). Like the
+# usage-limit park it needs NO human decision in the `--response` sense — a plain
+# `gauntlet resume` re-runs ONLY the validator against the (possibly hand-edited)
+# artifact and completes the step if it now passes (FR-2.2).
+STATE_PARKED_ARTIFACT_INVALID = "parked_artifact_invalid"
 STATE_FAILED = "failed"
 STATE_HALTED = "halted"
 STATE_INTERRUPTED = "interrupted"
@@ -98,6 +104,7 @@ _MEANING: dict[str, str] = {
     STATE_PARKED_GATE: "awaiting a human decision at a gate",
     STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision",
     STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
+    STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
     STATE_FAILED: "a step failed",
     STATE_HALTED: "the budget/timeout guard tripped",
     STATE_INTERRUPTED: "the run was killed mid-step",
@@ -359,6 +366,10 @@ def _actions_for(
     if state == STATE_PARKED_USAGE_LIMIT:
         # FR-3.3: a plain `resume` continues the preserved session — no decision.
         return [_control_resume(slug)]
+    if state == STATE_PARKED_ARTIFACT_INVALID:
+        # FR-2.2: a plain `resume` re-runs only the validator against the
+        # (possibly hand-edited) artifact — inspect the error, then resume.
+        return [_observe_logs(slug), _control_resume(slug)]
     if state == STATE_FAILED:
         # A re-runnable PRECONDITION failure (FR-9.3 clean-handoff): plain
         # `resume` re-runs the guard once the operator fixes the named
@@ -603,6 +614,14 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
                 ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
+        if reason == M.PARKED_REASON_ARTIFACT_INVALID:
+            # FR-2.2: an in-step validation failure that exhausted its repair loop
+            # — a plain `resume` re-runs only the validator (hand-edit sanctioned).
+            return (
+                STATE_PARKED_ARTIFACT_INVALID,
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
+                None,
+            )
         if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
             return (
                 STATE_PARKED_GATE,
@@ -611,8 +630,8 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
             )
         # A non-gate step parked with no reason, an unknown reason value, or a
         # park reason whose classification behavior lands in a later phase
-        # (usage_window → P10, artifact_invalid → P4) has no defined P3 operator
-        # response → contradiction (fail closed, read-only inspection).
+        # (usage_window → P10) has no defined operator response → contradiction
+        # (fail closed, read-only inspection).
         return STATE_UNKNOWN, None, None
 
     # P2: failed — the last failure step in manifest order is authoritative (§6.3a).
@@ -830,6 +849,7 @@ _STATUS_SCHEMA_JSON = r'''{
         "parked_gate",
         "parked_for_response",
         "parked_usage_limit",
+        "parked_artifact_invalid",
         "failed",
         "halted",
         "interrupted",
@@ -906,7 +926,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -1111,7 +1131,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_artifact_invalid"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

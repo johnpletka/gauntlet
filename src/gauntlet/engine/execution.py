@@ -20,7 +20,7 @@ from typing import Any
 
 from gauntlet.adapters.base import AgentResult, Usage
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.manifest import Manifest, RevalidationRecord, StepRecord
 from gauntlet.engine.pipeline import Pipeline, Step
 from gauntlet.logging.redact import RedactingWriter
 
@@ -79,6 +79,13 @@ class StepResult:
     # it onto the record so ``_is_terminal_failure`` can let a plain ``resume``
     # re-run such a step once the operator fixes the precondition.
     failure_kind: str | None = None
+    # Content-hash pair for an ``artifact_invalid`` park / its resume-revalidate
+    # (harness-efficiency FR-2.2/§6). Set ONLY on an ``artifact_invalid`` park
+    # (``hash_at_park`` populated) and on the plain-resume revalidation that
+    # resolves it (``hash_at_resume``/``changed_while_parked``/``passed_on_resume``
+    # filled). ``None`` for every other outcome; ``_finalize`` copies it onto the
+    # record as current-state so the audit trail lands on the resolving step.
+    revalidation: RevalidationRecord | None = None
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
     # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent
