@@ -513,7 +513,15 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             result.notes = f"{result.notes}\n{extra}" if result.notes else extra
         return _finish(result, usage, commits, artifact_writes, metrics)
 
+    # FR-1.2: the SHA the previous round's reviewer saw the artifact at — the
+    # "last reviewed version" a round-2+ artifact diff is scoped against. Advanced
+    # to each round's review handoff at the bottom of the loop, so it composes
+    # with reuse (a reused round still advances `handoff`).
+    prev_review_handoff: str | None = None
     for rnd in range(1, max_rounds + 1):
+        # This round's review handoff — captured before `handoff` advances to the
+        # fix SHA at the loop bottom, so the next round can diff against it (FR-1.2).
+        review_handoff = handoff
         # FR-4.1 reuse is ordered-prefix and FAIL-CLOSED (review F-001): a
         # checkpoint whose round-scoped artifact is missing (corruption / manual
         # deletion) is NOT reused, and it ends reuse for every later sub-step too —
@@ -538,7 +546,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             open_questions = rdata.get("open_questions") or []
             review_summary = rdata.get("summary", "")
         else:
-            review_prompt = _review_prompt(step, ctx, handoff, rnd, carried)
+            review_prompt = _review_prompt(
+                step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
+            )
             guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
             review_logger = step_logger(ctx, f"r{rnd}-review")
             cont_session = resume_session if resume_substep == f"r{rnd}-review" else None
@@ -779,7 +789,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 f"; {len(accepted)} fixed, "
                 f"{len(surfaced)} non-blocking item(s) surfaced for the gate"
                 + (f": {', '.join(surfaced)}" if surfaced else "")))
-        # next round is regression-scoped and reviews only what still forces it
+        # next round is regression-scoped and reviews only what still forces it.
+        # Record what this round's reviewer saw as the base for the next round's
+        # artifact diff (FR-1.2) BEFORE advancing the handoff to the fix SHA.
+        prev_review_handoff = review_handoff
         handoff = fix_sha
         carried = forcing
 
@@ -1111,7 +1124,7 @@ def _intent_review_block(step: Step) -> str:
 
 def _review_prompt(
     step: Step, ctx: StepContext, handoff: str, rnd: int,
-    carried: list[dict[str, Any]],
+    carried: list[dict[str, Any]], prev_review_sha: str | None = None,
 ) -> str:
     # Round 1 is a full adversarial review; rounds 2+ are REGRESSION-SCOPED so
     # the loop converges instead of bikeshedding (BOOTSTRAP-NOTES #30): the
@@ -1138,7 +1151,21 @@ def _review_prompt(
         if not name:
             raise ValueError("adversarial_cycle in artifact mode needs `artifact:`")
         path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
-        parts.append(f"\n--- artifact under review: {name} ---\n{Path(path).read_text()}")
+        # FR-1.2: round 1 embeds the full artifact; rounds 2+ send only the diff
+        # since the LAST reviewed version (prev_review_sha → this round's handoff)
+        # plus the artifact path — not the full body — so re-review payload is
+        # scoped to what the fix changed. The snapshot is a committed SHA (the
+        # tree is clean at every handoff, FR-9.3), so the diff is deterministic
+        # and lossless-by-path: unchanged context is one `git show` away.
+        if rnd > 1 and prev_review_sha is not None:
+            rel = Path(path).resolve().relative_to(ctx.repo_root.resolve()).as_posix()
+            diff = gitops.range_diff_path(ctx.repo_root, prev_review_sha, handoff, rel)
+            parts.append(
+                f"\n--- artifact under review: {name} (diff since round {rnd - 1}; "
+                f"read the full file at {rel} for unchanged context) ---\n{diff}"
+            )
+        else:
+            parts.append(f"\n--- artifact under review: {name} ---\n{Path(path).read_text()}")
     if carried:
         parts.append(
             f"\n--- findings still open from round {rnd - 1} (re-review ONLY "

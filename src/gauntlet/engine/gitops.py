@@ -290,6 +290,14 @@ def range_diff(repo: Path, base: str, head: str) -> str:
     return _run(repo, "diff", f"{base}..{head}")
 
 
+def range_diff_path(repo: Path, base: str, head: str, relpath: str) -> str:
+    """`base..head` diff scoped to a single path (harness-efficiency FR-1.2).
+
+    Used by the artifact-mode re-review: rounds 2+ send the reviewer the diff of
+    the artifact since the last reviewed version, not the full document."""
+    return _run(repo, "diff", f"{base}..{head}", "--", relpath)
+
+
 def log_range(repo: Path, base: str, head: str) -> str:
     """One line per commit in ``base..head``: sha, author, subject.
 

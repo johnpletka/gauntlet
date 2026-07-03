@@ -12,10 +12,64 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+# --- scoped context input modes (harness-efficiency FR-1.1) ------------------
+# A step's `inputs:` entry is either a bare artifact name (INLINE — today's
+# behavior, the full document is embedded) or a `{name, mode}` mapping selecting
+# a scoped mode:
+#   * REFERENCE — inject the artifact's repo-relative path + a "read it yourself"
+#     instruction, not the body (the CLI agent reads it on demand, FR-1.3).
+#   * PHASE — plan.md only: inject the current `foreach` phase's section of the
+#     plan plus the path to the full document.
+INPUT_MODE_INLINE = "inline"
+INPUT_MODE_REFERENCE = "reference"
+INPUT_MODE_PHASE = "phase"
+INPUT_MODES = frozenset({INPUT_MODE_INLINE, INPUT_MODE_REFERENCE, INPUT_MODE_PHASE})
+
+
+class InputRef(NamedTuple):
+    """A step input normalized to ``(name, mode)`` (FR-1.1)."""
+
+    name: str
+    mode: str
+
+
+def iter_inputs(step: "Step") -> list[InputRef]:
+    """Normalize a step's ``inputs:`` into ``(name, mode)`` pairs (FR-1.1).
+
+    Each raw entry is either a string (INLINE) or a ``{name, mode}`` mapping.
+    Fail closed (§2): a malformed entry (no ``name``) or an unknown ``mode``
+    raises :class:`ValueError`, so a bad input is caught at load-time validation
+    rather than silently producing an unscoped or unreadable prompt mid-run.
+    """
+    refs: list[InputRef] = []
+    for raw in (step.get("inputs", []) or []):
+        if isinstance(raw, str):
+            refs.append(InputRef(raw, INPUT_MODE_INLINE))
+            continue
+        if isinstance(raw, dict):
+            name = raw.get("name")
+            mode = raw.get("mode", INPUT_MODE_INLINE)
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"step {step.id!r} has an input with no `name`: {raw!r} (FR-1.1)"
+                )
+            if mode not in INPUT_MODES:
+                raise ValueError(
+                    f"step {step.id!r} input {name!r} has unknown mode {mode!r}; "
+                    f"expected one of {sorted(INPUT_MODES)} (FR-1.1)"
+                )
+            refs.append(InputRef(name, mode))
+            continue
+        raise ValueError(
+            f"step {step.id!r} has a malformed input entry {raw!r}; expected a "
+            "name or a {name, mode} mapping (FR-1.1)"
+        )
+    return refs
 
 
 class OnFail(BaseModel):

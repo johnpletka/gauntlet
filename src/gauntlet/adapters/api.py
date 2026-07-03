@@ -35,7 +35,11 @@ DEFAULT_TIMEOUT_S = 120.0
 class ApiAdapter:
     name = "api"
     capabilities = AdapterCapabilities(
-        repo_write=False, structured_output="native", resume=False
+        # FR-1.3: the in-process API adapter has no repo access — it never runs a
+        # tool in the working tree — so reference/`phase` context modes are
+        # rejected for an api profile at load (reads_repo stays False).
+        repo_write=False, structured_output="native", resume=False,
+        reads_repo=False,
     )
 
     def __init__(

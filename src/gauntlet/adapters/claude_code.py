@@ -58,6 +58,7 @@ class ClaudeCodeAdapter:
         # best-effort. Verified by the contract suite and pinned.
         structured_output="native",
         resume=True,
+        reads_repo=True,  # FR-1.3: the CLI runs in the repo and can Read files
     )
 
     def __init__(

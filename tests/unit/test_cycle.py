@@ -590,6 +590,49 @@ def test_review_prompt_embeds_artifact_in_artifact_mode(cycle_repo):
     assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[0]["prompt"]
 
 
+def test_rereview_artifact_mode_sends_diff_not_full_body(cycle_repo):
+    # FR-1.2: round 1 embeds the full artifact; round 2+ sends only the diff
+    # since the last-reviewed version (round-1 snapshot) + carried findings + the
+    # path, NOT the full document body.
+    top = "TOP-SENTINEL-UNCHANGED"
+    filler = "\n".join(f"body-line-{i}" for i in range(1, 40))
+    original = f"{top}\n{filler}\nBOTTOM-ORIGINAL\n"
+    (cycle_repo / "prd.md").write_text(original)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qam", "big artifact"],
+                   check=True)
+    # The round-1 fix edits ONLY the bottom of the artifact, far from TOP-SENTINEL.
+    fixed = f"{top}\n{filler}\nBOTTOM-FIXED-BY-ROUND-1\n"
+
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1 loops
+        REVIEW(),                                                            # r2 converges
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "esc": SeqAdapter(V("F-001")),          # blocking escalates (F-009)
+        "builder": SeqAdapter(writer("prd.md", fixed, {})),
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_DONE
+
+    r2_review_prompt = reviewer.calls[2]["prompt"]
+    # the diff of the artifact since round 1 is present (both the -/+ lines)...
+    assert "diff since round 1" in r2_review_prompt
+    assert "BOTTOM-FIXED-BY-ROUND-1" in r2_review_prompt
+    assert "BOTTOM-ORIGINAL" in r2_review_prompt
+    # ...the carried finding and the artifact path are there...
+    assert "F-001" in r2_review_prompt
+    assert "prd.md" in r2_review_prompt
+    # ...and the full document body is NOT: the far-away unchanged line (well
+    # outside the diff's context window) never enters the round-2 prompt.
+    assert "TOP-SENTINEL-UNCHANGED" not in r2_review_prompt
+    # round 1 still saw the FULL artifact, including the sentinel (snapshot base).
+    assert "TOP-SENTINEL-UNCHANGED" in reviewer.calls[0]["prompt"]
+
+
 def test_code_review_mode_reviews_commit_range(cycle_repo):
     # seed a "phase commit" the cycle picks up from the manifest
     (cycle_repo / "feature.py").write_text("PHASE-WORK-SENTINEL\n")

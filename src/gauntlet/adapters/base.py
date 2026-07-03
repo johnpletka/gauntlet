@@ -43,6 +43,16 @@ class AdapterCapabilities(BaseModel):
     repo_write: bool
     structured_output: Literal["native", "best_effort", "none"]
     resume: bool
+    # harness-efficiency FR-1.3: can this adapter READ the repo working tree?
+    # Reference/`phase` context modes (FR-1.1) inject a repo-relative *path* the
+    # agent must open itself, so they are valid only on a repo-reading profile.
+    # Fail closed: default False, so an adapter that has not declared the
+    # capability can never be handed an unreadable-path prompt. The CLI agents
+    # (claude-code, codex) set it True; the in-process `api` adapter leaves it
+    # False (it has no repo access). This is the adapter-class declaration; a
+    # profile's *effective* capability is this value under that profile's actual
+    # sandbox, verified by `gauntlet doctor`'s read probe (FR-6.4, P7).
+    reads_repo: bool = False
 
 
 # --- failure classification (harness-efficiency FR-3.1) ----------------------

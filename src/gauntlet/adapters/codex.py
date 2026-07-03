@@ -53,7 +53,8 @@ class CodexAdapter:
     # (deferred) would otherwise be needed to catch.
     supports_line_streaming = False
     capabilities = AdapterCapabilities(
-        repo_write=True, structured_output="native", resume=True
+        repo_write=True, structured_output="native", resume=True,
+        reads_repo=True,  # FR-1.3: `codex exec` runs in the repo and can read files
     )
 
     def __init__(

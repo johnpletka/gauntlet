@@ -43,8 +43,14 @@ from gauntlet.engine.manifest import (
     RESPONSE_PENDING,
     RevalidationRecord,
 )
-from gauntlet.engine.pipeline import Step
-from gauntlet.engine.planphases import PlanPhasesError, extract_phases
+from gauntlet.engine.pipeline import (
+    INPUT_MODE_PHASE,
+    INPUT_MODE_REFERENCE,
+    InputRef,
+    Step,
+    iter_inputs,
+)
+from gauntlet.engine.planphases import PlanPhasesError, extract_phases, phase_section
 from gauntlet.engine.validators import validate_artifact
 from gauntlet.logging.transcript import StepLogger
 
@@ -779,33 +785,101 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
     # definition, and manifest.json are never mutated (FR-4.1). The artifact is
     # rebuilt fresh from `human_responses` on every render (chronological), so
     # repeated resumes regenerate one file rather than accumulating files.
-    inputs = list(step.get("inputs", []) or [])
+    # FR-1.1: each input carries a mode — `inline` (default; embed the body),
+    # `reference` (inject the repo-relative path, the agent reads it), or `phase`
+    # (plan.md only; inject the current phase's section + the full-doc path). The
+    # modes were fail-closed-validated at load (engine/validate.py) — an unknown
+    # mode / non-reading profile / escaping path never reaches here.
+    input_refs = iter_inputs(step)
     artifacts = dict(ctx.artifacts)
+    parts = [base]
+    for ref in input_refs:
+        parts.append(_render_input(ref, ctx, artifacts))
     # FR-1 verbatim requirement (review F-001): the builder must receive the
     # human-decision history EXACTLY as recorded. The on-disk copy is written
     # through the RedactingWriter (credential-shaped substrings become
     # placeholders), so re-reading it for the prompt would feed the adapter a
     # non-verbatim, redacted version that also diverges from the manifest record.
     # Inject the unmodified rendered text directly; the redacted copy stays on
-    # disk only for the audit trail.
+    # disk only for the audit trail. The history artifact is always inline (it is
+    # never committed to the repo, so it has no readable path to reference).
     history_text = _write_human_response_artifact(ctx)
-    verbatim: dict[str, str] = {}
     if history_text is not None:
-        inputs.append(HUMAN_RESPONSE_ARTIFACT)
-        verbatim[HUMAN_RESPONSE_ARTIFACT] = history_text
-    parts = [base]
-    for name in inputs:
-        if name in verbatim:
-            content = verbatim[name]
-        else:
-            path = artifacts.get(name) or (ctx.artifact_root / name)
-            content = Path(path).read_text() if Path(path).exists() else ""
-        parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
+        parts.append(
+            f"\n\n--- input artifact: {HUMAN_RESPONSE_ARTIFACT} ---\n{history_text}"
+        )
     if ctx.iteration_item is not None:
         item = ctx.iteration_item
         rendered = item if isinstance(item, str) else json.dumps(item, indent=2)
         parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{rendered}")
     return "".join(parts)
+
+
+def _artifact_path(name: str, ctx: StepContext, artifacts: dict) -> Path:
+    """Resolve an input artifact to its on-disk path (produced path or default)."""
+    return Path(artifacts.get(name) or (ctx.artifact_root / name))
+
+
+def _repo_relative(path: Path, repo_root: Path) -> str:
+    """The artifact's repo-relative POSIX path for a `reference` prompt (FR-1.1).
+
+    Reference/phase paths are containment-validated at load, so the artifact is
+    under the repo root; fall back to the bare name only for defensiveness.
+    """
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _render_input(ref: InputRef, ctx: StepContext, artifacts: dict) -> str:
+    """Render one input per its mode (FR-1.1): inline / reference / phase.
+
+    * ``reference`` — inject the repo-relative path + a read-it instruction; the
+      body never enters the prompt (the agent reads the file itself, FR-1.3).
+    * ``phase`` — inject the current `foreach` phase's section of plan.md plus
+      the full-document path; anything outside the phase is read on demand.
+    * ``inline`` — today's behavior: embed the whole document body.
+    """
+    name = ref.name
+    path = _artifact_path(name, ctx, artifacts)
+    if ref.mode == INPUT_MODE_REFERENCE:
+        rel = _repo_relative(path, ctx.repo_root)
+        return (
+            f"\n\n--- input artifact (by reference): {name} ---\n"
+            f"Read this file yourself from the repository — it is provided by path, "
+            f"not inlined, to keep this prompt small.\nPath: {rel}\n"
+        )
+    if ref.mode == INPUT_MODE_PHASE:
+        rel = _repo_relative(path, ctx.repo_root)
+        excerpt = _phase_excerpt(name, path, ctx)
+        return (
+            f"\n\n--- input artifact (current-phase excerpt): {name} ---\n"
+            f"Below is only THIS phase's section of {name}. Read the full document "
+            f"at the path for anything outside this phase.\nPath: {rel}\n\n{excerpt}\n"
+        )
+    content = path.read_text() if path.exists() else ""
+    return f"\n\n--- input artifact: {name} ---\n{content}"
+
+
+def _phase_excerpt(name: str, path: Path, ctx: StepContext) -> str:
+    """The current `foreach` phase's section of plan.md, or a read-the-full note.
+
+    Fail soft, not closed (§2): a missing locatable section is not a run halt —
+    the full-document path and the `foreach` item still anchor the phase — so we
+    return an explicit note rather than raising. Determinism: the slice is a pure
+    heading scan (:func:`phase_section`), never a summary.
+    """
+    phase_id = _iteration_phase(ctx)
+    text = path.read_text() if path.exists() else ""
+    if phase_id and text:
+        section = phase_section(text, phase_id)
+        if section:
+            return section
+    return (
+        f"(No self-contained section for phase {phase_id or '?'} could be located "
+        f"in {name}; read the full document at the path above.)"
+    )
 
 
 def render_human_responses(responses) -> str:

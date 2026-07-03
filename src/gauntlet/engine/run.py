@@ -1095,7 +1095,12 @@ class RunManager:
         try:
             self._refuse_if_active_run(layout)
             pipeline, phash = load_pipeline(pipeline_path)
-            validate_pipeline(pipeline, self.config)
+            # FR-1.3: pass the repo/artifact roots so reference/`phase` context
+            # inputs are containment- and existence-checked before any step runs.
+            validate_pipeline(
+                pipeline, self.config,
+                repo_root=self.repo_root, artifact_root=layout.slug_dir,
+            )
 
             base_branch = self._resolve_base_branch()
             branch = f"{self.config.branch_prefix}{slug}"
