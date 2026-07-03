@@ -1,5 +1,7 @@
 """Git wrapper helpers (FR-9), against throwaway fixture repos."""
 
+import pytest
+
 from gauntlet.engine import gitops
 from gauntlet.engine.gitops import Identity
 
@@ -156,6 +158,73 @@ def test_wip_checkpoints_none_when_no_checkpoints(fixture_repo):
         fixture_repo, "P1: normal phase\n\nbody", identity=Identity("B", "b@g.local")
     )
     assert gitops.wip_checkpoints(fixture_repo) == []
+
+
+def test_wip_checkpoints_scoped_to_phase_ignores_other_phases_in_range(fixture_repo):
+    """With a base, a `phase` scope collects ONLY that phase's checkpoints, so a
+    wrong-phase wip is never chosen as the recovery rewind target (review F-001)."""
+    base = gitops.head_sha(fixture_repo)
+    p3a = _wip(fixture_repo, "P3 wip: one", "a.py", "a\n")
+    _wip(fixture_repo, "P4 wip: stray", "b.py", "b\n")  # wrong phase, newest
+    scoped = gitops.wip_checkpoints(fixture_repo, base=base, phase="P3")
+    assert [s for _sha, s in scoped] == ["P3 wip: one"]
+    assert scoped[0][0] == p3a  # newest P3 checkpoint is the rewind target
+    # Unscoped still sees both (legacy behaviour) — and would pick the stray.
+    unscoped = gitops.wip_checkpoints(fixture_repo, base=base)
+    assert [s for _sha, s in unscoped] == ["P4 wip: stray", "P3 wip: one"]
+
+
+def test_wip_checkpoints_trailing_run_fails_closed_on_wrong_phase(fixture_repo):
+    """A wrong-phase `P<N> wip:` inside this phase's trailing run fails closed
+    rather than being squashed into the wrong phase (review F-001)."""
+    gitops.commit_all(
+        fixture_repo, "P8: prior\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    _wip(fixture_repo, "P9 wip: real", "a.py", "a\n")
+    _wip(fixture_repo, "P8 wip: mistyped", "b.py", "b\n")  # newest, wrong phase
+    with pytest.raises(gitops.WrongPhaseCheckpointError) as exc:
+        gitops.wip_checkpoints(fixture_repo, phase="P9")
+    assert exc.value.expected_phase == "P9"
+    assert exc.value.found_subject == "P8 wip: mistyped"
+
+
+def test_wip_checkpoints_trailing_run_walks_through_engine_commits(fixture_repo):
+    """An engine bookkeeping (`gauntlet:`) commit between this phase's wip commits
+    is transparent — the walk finds the checkpoints beneath it (review F-002)."""
+    gitops.commit_all(
+        fixture_repo, "P8: prior\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    m1 = _wip(fixture_repo, "P9 wip: one", "a.py", "a\n")
+    m2 = _wip(fixture_repo, "P9 wip: two", "b.py", "b\n")
+    # An engine bookkeeping commit lands on top (e.g. a recovery rewind commit).
+    gitops.commit_all(
+        fixture_repo, "gauntlet: response x consumed\n\nbody",
+        identity=Identity("Gauntlet Engine", "engine@gauntlet.local"),
+        allow_empty=True,
+    )
+    wips = gitops.wip_checkpoints(fixture_repo, phase="P9")
+    # Both checkpoints are found despite the intervening engine commit at HEAD.
+    assert [s for _sha, s in wips] == ["P9 wip: two", "P9 wip: one"]
+    assert [sha for sha, _s in wips] == [m2, m1]
+
+
+def test_unstage_removes_paths_from_index_leaving_worktree(fixture_repo):
+    """`unstage` resets the named index entries to HEAD without touching disk."""
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "keep.py").write_text("keep\n")
+    (fixture_repo / "drop.py").write_text("drop\n")
+    gitops._run(fixture_repo, "add", "-A")
+    gitops.unstage(fixture_repo, ["drop.py"])
+    staged = gitops._run(fixture_repo, "diff", "--cached", "--name-only").split()
+    assert staged == ["keep.py"]
+    # drop.py is still on disk (only its index entry was reset to base = absent).
+    assert (fixture_repo / "drop.py").read_text() == "drop\n"
+    assert gitops.head_sha(fixture_repo) == base
+    # No-ops are harmless (empty list, and paths absent from the index).
+    gitops.unstage(fixture_repo, [])
+    gitops.unstage(fixture_repo, ["never-tracked-dir"])
 
 
 def test_reset_soft_keeps_worktree_and_stages_changes(fixture_repo):

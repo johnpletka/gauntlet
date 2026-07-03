@@ -21,6 +21,48 @@ from pathlib import Path
 # recovery rewind-target selection both key on exactly this shape.
 _WIP_SUBJECT_RE = re.compile(r"^P\d+ wip:")
 
+# Engine bookkeeping-commit subject convention: every orchestrator-owned commit
+# (manifest/RUN.md response checkpoints, the FR-11.2 rewind commit) carries a
+# fixed ``gauntlet:`` prefix and never touches tracked implementation. A
+# checkpoint-preserving recovery can leave such a commit BETWEEN a phase's wip
+# commits, so the trailing-checkpoint walk (commit step) treats it as
+# transparent — walking through it to the wips beneath — rather than stopping at
+# it (review F-002). Phase (``P<N>:``) and checkpoint (``P<N> wip:``) subjects
+# never collide with this prefix.
+_ENGINE_SUBJECT_RE = re.compile(r"^gauntlet: ")
+
+
+def _wip_subject_re(phase: str | None) -> re.Pattern[str]:
+    """Checkpoint-subject matcher, scoped to ``phase`` (e.g. ``P9``) when given.
+
+    Unscoped (``phase is None``) it matches any ``P<N> wip:`` subject — the
+    legacy behaviour. Scoped, it matches ONLY ``<phase> wip:`` so a wrong-phase
+    checkpoint is never mistaken for this phase's (review F-001).
+    """
+    if phase is None:
+        return _WIP_SUBJECT_RE
+    return re.compile(rf"^{re.escape(phase)} wip:")
+
+
+class WrongPhaseCheckpointError(RuntimeError):
+    """A trailing checkpoint commit belongs to a different phase (fail closed).
+
+    Raised by the commit step's scoped checkpoint discovery when this phase's
+    trailing run of ``P<N> wip:`` commits contains a ``wip:`` commit for another
+    phase — e.g. a mistyped ``P8 wip:`` landed during a P9 implement (review
+    F-001). Squashing it into, or truncating the trailing run at, the wrong
+    phase would corrupt the phase boundary, so the engine fails closed instead.
+    """
+
+    def __init__(self, expected_phase: str, found_subject: str) -> None:
+        super().__init__(
+            f"trailing checkpoint {found_subject!r} is not a {expected_phase} "
+            "checkpoint; refusing to treat a wrong-phase wip commit as this "
+            "phase's checkpoint (failing closed, FR-11.1)"
+        )
+        self.expected_phase = expected_phase
+        self.found_subject = found_subject
+
 
 class GitError(RuntimeError):
     """A git invocation failed. Carries argv + stderr for the manifest/log."""
@@ -303,22 +345,33 @@ def wip_checkpoints(
     base: str | None = None,
     tip: str = "HEAD",
     limit: int = 1000,
+    phase: str | None = None,
 ) -> list[tuple[str, str]]:
     """Intra-phase checkpoint commits at ``tip`` as ``(sha, subject)``, newest first.
 
     A checkpoint is a commit whose subject matches ``P<N> wip:`` (§6 convention).
-    Two modes, both fail-closed on subject shape (nothing else is ever treated as
-    a checkpoint):
+    When ``phase`` (e.g. ``"P9"``) is given, discovery is SCOPED to that phase's
+    prefix (``<phase> wip:``): a wrong-phase checkpoint is never counted as this
+    phase's (review F-001). Unscoped (``phase is None``) it matches any
+    ``P<N> wip:`` — the legacy behaviour. Two modes, both fail-closed on subject
+    shape (nothing else is ever treated as a checkpoint):
 
-    * ``base`` given (recovery, FR-11.2): every checkpoint in ``base..tip`` — i.e.
-      every ``P<N> wip:`` commit that is a descendant of ``base`` reachable from
-      ``tip`` — newest first. ``result[0]`` is the newest checkpoint the recovery
-      rewind targets. Non-checkpoint commits in the range are skipped, not a stop.
-    * ``base`` absent (commit step, FR-11.1): the TRAILING run of checkpoint
-      commits at ``tip`` — walk back and stop at the first non-checkpoint commit
-      (the prior phase's ``P<N>:`` commit / the branch base). This is the set the
-      phase-end commit collapses (squash) or lists in an empty marker (keep).
+    * ``base`` given (recovery, FR-11.2): every (scoped) checkpoint in
+      ``base..tip`` — i.e. every matching ``wip:`` commit that is a descendant of
+      ``base`` reachable from ``tip`` — newest first. ``result[0]`` is the newest
+      checkpoint the recovery rewind targets. Non-matching commits in the range
+      are skipped, not a stop.
+    * ``base`` absent (commit step, FR-11.1): the TRAILING run of (scoped)
+      checkpoint commits at ``tip`` — walk back to the first real gap (the prior
+      phase's ``P<N>:`` commit / the branch base). Engine bookkeeping commits
+      (``gauntlet:`` subjects) are walked THROUGH, not treated as a gap, so a
+      checkpoint preserved beneath a recovery rewind is still found (review
+      F-002). When ``phase`` is scoped, a ``P<N> wip:`` commit for a DIFFERENT
+      phase in the trailing run raises :class:`WrongPhaseCheckpointError` (fail
+      closed, review F-001) rather than being squashed into the wrong phase. This
+      is the set the phase-end commit collapses (squash) or lists (keep marker).
     """
+    matcher = _wip_subject_re(phase)
     if base is not None:
         out = _run(repo, "log", "--format=%H%x00%s", f"{base}..{tip}")
         stop_at_gap = False
@@ -328,9 +381,19 @@ def wip_checkpoints(
     result: list[tuple[str, str]] = []
     for line in out.splitlines():
         sha, _, subject = line.partition("\x00")
-        if _WIP_SUBJECT_RE.match(subject):
+        if matcher.match(subject):
             result.append((sha, subject))
         elif stop_at_gap:
+            if phase is not None and _WIP_SUBJECT_RE.match(subject):
+                # A `P<N> wip:` for another phase inside this phase's trailing run
+                # (e.g. a mistyped `P8 wip:` during P9). Fail closed rather than
+                # squash it into — or truncate the run at — the wrong phase.
+                raise WrongPhaseCheckpointError(phase, subject)
+            if _ENGINE_SUBJECT_RE.match(subject):
+                # Engine bookkeeping commit (a response/rewind checkpoint) can sit
+                # between this phase's wip commits after a checkpoint-preserving
+                # recovery. It carries no implementation, so walk through it.
+                continue
             break
     return result
 
@@ -552,6 +615,23 @@ def reset_soft(repo: Path, sha: str) -> None:
     stay staged for the same commit.
     """
     _run(repo, "reset", "--soft", sha)
+
+
+def unstage(repo: Path, paths: list[str]) -> None:
+    """Reset the index entries under ``paths`` to HEAD (``git reset -- <paths>``).
+
+    Used by the checkpoint squash: the ``reset --soft`` to the squash base leaves
+    every commit in ``base..old-HEAD`` staged — INCLUDING any engine bookkeeping
+    commit swept into that range by a checkpoint-preserving recovery (FR-11.2),
+    whose force-committed ``manifest.json``/``RUN.md`` would otherwise land in the
+    phase commit. Unstaging the run-bookkeeping paths here keeps the collapsed
+    ``P<N>:`` commit free of engine state. The working tree is untouched — the
+    live run keeps its on-disk bookkeeping files. A no-op when ``paths`` is empty
+    or matches nothing in the index.
+    """
+    if not paths:
+        return
+    _run(repo, "reset", "-q", "HEAD", "--", *paths)
 
 
 def rewind_impl_preserving_bookkeeping(

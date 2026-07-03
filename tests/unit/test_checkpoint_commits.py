@@ -217,6 +217,176 @@ def test_recovery_rewinds_to_latest_checkpoint_preserving_milestones(fixture_rep
     assert "model.py" in diff and "feature.py" in diff
 
 
+_RECOVERY_SQUASH_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+      - {id: tests, type: shell, run: "true"}
+      - {id: commit, type: commit, phase: P3, message: "P3: phase\\n\\nthe body."}
+"""
+
+
+def _files_in_commit(repo, sha) -> list[str]:
+    out = gitops._run(repo, "show", "--name-only", "--format=", sha)
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def test_recovery_then_squash_collapses_preserved_checkpoints(fixture_repo):
+    """After a checkpoint-preserving recovery leaves an engine bookkeeping commit
+    atop the wip, the phase-end SQUASH still collapses the preserved checkpoints
+    into one clean `P<N>:` commit with a milestone trailer (review F-002), and no
+    engine bookkeeping state pollutes it."""
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P3 wip: model layer", "model.py", "MILESTONE\n")
+    (fixture_repo / "model.py").write_text("DIRTY — mid-edit\n")  # killed mid-edit
+
+    cfg = {
+        "agents": {"builder": {"adapter": "claude-code"}},
+        "interrupted_step": "reset_to_base",
+        "checkpoint_commits": "squash",
+    }
+    builder = _FileWriter("feature.py", "RECOVERED\n")
+    orch = _orch(
+        fixture_repo, _RECOVERY_SQUASH_PIPELINE, config=cfg,
+        adapters={"builder": builder},
+    )
+    orch.manifest.upsert(
+        StepRecord(id="implement", type="agent_task", agent="builder",
+                   status=M.RUNNING, base_sha=base)
+    )
+    assert orch.drive() == M.RUN_DONE
+
+    head = gitops.head_sha(fixture_repo)
+    assert gitops.commit_subject(fixture_repo, head) == "P3: phase"
+    # The squash collapsed EVERYTHING (wip + recovery engine commit) into one
+    # commit sitting directly on the phase base — the engine commit is gone.
+    log = gitops.log_range(fixture_repo, base, head)
+    assert len(log.splitlines()) == 1
+    assert gitops.commit_parent(fixture_repo, head) == base
+    # Non-empty: it carries the preserved milestone AND the re-run's work.
+    diff = gitops.range_diff(fixture_repo, base, head)
+    assert "model.py" in diff and "feature.py" in diff
+    # The preserved milestone is listed in the body (otherwise lost from history).
+    msg = gitops.commit_message(fixture_repo, head)
+    assert "Squashed checkpoint milestones" in msg
+    assert "P3 wip: model layer" in msg
+    # No engine bookkeeping pollutes the collapsed phase commit (review F-002).
+    committed = _files_in_commit(fixture_repo, head)
+    assert not any("manifest.json" in f or "run-1" in f for f in committed)
+    assert set(committed) == {"model.py", "feature.py"}
+
+
+def _engine_commit(repo, subject: str) -> str:
+    """A `gauntlet:` bookkeeping commit that force-tracks a run-dir file, exactly
+    as the FR-11.2 rewind / response-checkpoint commits do."""
+    rundir = repo / "runs" / "demo" / "run-1"
+    rundir.mkdir(parents=True, exist_ok=True)
+    (rundir / "manifest.json").write_text("{}\n")
+    git(repo, "add", "-f", "runs/demo/run-1/manifest.json")
+    git(
+        repo, "-c", "user.name=Gauntlet Engine",
+        "-c", "user.email=engine@gauntlet.local", "commit", "-qm", subject,
+    )
+    return gitops.head_sha(repo)
+
+
+_SQUASH_SPAN_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, phase: P3, message: "P3: phase\\n\\nthe body."}
+"""
+
+
+def test_squash_spanning_engine_commit_excludes_bookkeeping(fixture_repo):
+    """A SQUASH whose range spans an engine bookkeeping commit (as left by a
+    checkpoint-preserving recovery) collapses the phase's checkpoints without
+    dragging the force-tracked manifest into the phase commit (review F-002)."""
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P3 wip: model layer", "model.py", "MILESTONE\n")
+    _engine_commit(fixture_repo, "gauntlet: response r pending")  # sits above wip
+    (fixture_repo / "feature.py").write_text("RESIDUAL\n")  # re-run residual
+
+    cfg = {
+        "agents": {"builder": {"adapter": "claude-code"}},
+        "checkpoint_commits": "squash",
+    }
+    orch = _orch(fixture_repo, _SQUASH_SPAN_PIPELINE, config=cfg)
+    assert orch.drive() == M.RUN_DONE
+
+    head = gitops.head_sha(fixture_repo)
+    assert gitops.commit_subject(fixture_repo, head) == "P3: phase"
+    # One commit on base — the wip AND the intervening engine commit collapsed.
+    assert len(gitops.log_range(fixture_repo, base, head).splitlines()) == 1
+    assert gitops.commit_parent(fixture_repo, head) == base
+    # The phase commit carries only implementation — never the engine manifest.
+    committed = _files_in_commit(fixture_repo, head)
+    assert set(committed) == {"model.py", "feature.py"}
+    assert not any("manifest.json" in f for f in committed)
+    # Milestone trailer preserved.
+    assert "P3 wip: model layer" in gitops.commit_message(fixture_repo, head)
+
+
+def test_recovery_then_keep_marker_lists_preserved_milestones(fixture_repo):
+    """After recovery, a KEEP-mode phase-end commit still finds the preserved
+    checkpoint beneath the engine bookkeeping commit and lists its milestone in
+    the `P<N>:` body (review F-002)."""
+    base = gitops.head_sha(fixture_repo)
+    wip = _wip(fixture_repo, "P3 wip: model layer", "model.py", "MILESTONE\n")
+    (fixture_repo / "model.py").write_text("DIRTY — mid-edit\n")
+
+    cfg = {
+        "agents": {"builder": {"adapter": "claude-code"}},
+        "interrupted_step": "reset_to_base",
+        # checkpoint_commits defaults to keep
+    }
+    builder = _FileWriter("feature.py", "RECOVERED\n")
+    orch = _orch(
+        fixture_repo, _RECOVERY_PIPELINE, config=cfg, adapters={"builder": builder}
+    )
+    orch.manifest.upsert(
+        StepRecord(id="implement", type="agent_task", agent="builder",
+                   status=M.RUNNING, base_sha=base)
+    )
+    assert orch.drive() == M.RUN_DONE
+
+    head = gitops.head_sha(fixture_repo)
+    assert gitops.commit_subject(fixture_repo, head) == "P3: phase"
+    assert gitops.is_ancestor(fixture_repo, wip, head)  # milestone preserved
+    # The KEEP marker's body lists the milestone found beneath the engine commit.
+    assert "P3 wip: model layer" in gitops.commit_message(fixture_repo, head)
+    diff = gitops.range_diff(fixture_repo, base, head)
+    assert "model.py" in diff and "feature.py" in diff
+
+
+_WRONG_PHASE_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, phase: P9, message: "P9: phase\\n\\nthe body."}
+"""
+
+
+def test_commit_step_fails_closed_on_wrong_phase_checkpoint(fixture_repo):
+    """A wrong-phase `P<N> wip:` in this phase's trailing run makes the commit
+    step fail closed instead of squashing it into the wrong phase (review F-001)."""
+    _wip(fixture_repo, "P9 wip: real", "a.py", "a\n")
+    _wip(fixture_repo, "P8 wip: mistyped", "b.py", "b\n")  # wrong phase at HEAD
+
+    orch = _orch(fixture_repo, _WRONG_PHASE_PIPELINE)
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("commit")
+    assert rec.status == M.FAILED
+    assert "failed closed" in (rec.notes or "")
+
+
 def test_recovery_falls_back_to_base_when_no_checkpoint(fixture_repo):
     base = gitops.head_sha(fixture_repo)
     # No checkpoint commit — just a dirty mid-edit tree.

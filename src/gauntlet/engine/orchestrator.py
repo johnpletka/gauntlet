@@ -16,6 +16,7 @@ and per-step budget halts (FR-3.3).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +60,11 @@ def _utcnow() -> str:
 # engine identity so bookkeeping commits are attributable to the engine, never
 # mislabelled as a human's work.
 ENGINE_IDENTITY = gitops.Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
+
+# A numeric phase prefix (P1, P2…). Only these carry intra-phase `P<N> wip:`
+# checkpoints, so checkpoint discovery/recovery scopes to a matching prefix and
+# stays unscoped for non-numeric stage labels (PRD/PLAN/REVIEW).
+_NUMERIC_PHASE_RE = re.compile(r"P\d+")
 
 
 @dataclass
@@ -431,7 +437,7 @@ class Orchestrator:
             self.manifest.upsert(rec)
 
         if resuming:
-            short = self._resume_disposition(step, spec, rec)
+            short = self._resume_disposition(step, spec, rec, item)
             if short is not None:
                 self._finalize(rec, short)
                 return short
@@ -529,7 +535,7 @@ class Orchestrator:
                 os.environ["GAUNTLET_STEP_ID"] = prior_step_id
 
     def _resume_disposition(
-        self, step: Step, spec, rec: StepRecord
+        self, step: Step, spec, rec: StepRecord, item: Any = None
     ) -> StepResult | None:
         """Decide how to re-enter a step that was interrupted (review F-003).
 
@@ -597,7 +603,9 @@ class Orchestrator:
             # back to base_sha (today's behavior) when the phase landed none. The
             # subject is recorded so the re-run prompt can name the checkpoint it
             # resumes from.
-            target, checkpoint_subject = self._checkpoint_rewind_target(rec)
+            target, checkpoint_subject = self._checkpoint_rewind_target(
+                rec, self._expected_phase(step, item)
+            )
             rec.resumed_from_checkpoint = checkpoint_subject
             # F-001: the rewind target predates the engine bookkeeping commits
             # stacked on top of it — notably the pending-response checkpoint
@@ -1053,17 +1061,34 @@ class Orchestrator:
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
 
-    def _checkpoint_rewind_target(self, rec: StepRecord) -> tuple[str, str | None]:
+    def _expected_phase(self, step: Step, item: Any) -> str | None:
+        """The numeric phase prefix (P1, P2…) a step belongs to, or ``None``.
+
+        An explicit ``phase:`` wins; otherwise the ``foreach: plan.phases`` item
+        id supplies it. Non-numeric stage labels (PRD/PLAN/REVIEW) never carry
+        intra-phase checkpoints, so they scope to ``None`` (unscoped discovery).
+        """
+        candidate = step.get("phase")
+        if not candidate and isinstance(item, dict):
+            candidate = item.get("id")
+        candidate = str(candidate or "")
+        return candidate if _NUMERIC_PHASE_RE.fullmatch(candidate) else None
+
+    def _checkpoint_rewind_target(
+        self, rec: StepRecord, phase: str | None = None
+    ) -> tuple[str, str | None]:
         """Rewind target + checkpoint subject for a dirty re-run (FR-11.2).
 
         Returns ``(target_sha, subject)``: the newest ``P<N> wip:`` checkpoint
         commit reachable from HEAD and descended from ``rec.base_sha`` (so
         completed milestones survive the rewind), with its subject for the re-run
-        prompt / audit trail. Falls back to ``(base_sha, None)`` when the phase
-        landed no checkpoint — today's reset-to-base behavior. Only reached with a
-        non-null ``base_sha`` (the caller guards it).
+        prompt / audit trail. Discovery is SCOPED to ``phase`` when known (review
+        F-001), so a wrong-phase checkpoint is never chosen as the rewind target.
+        Falls back to ``(base_sha, None)`` when the phase landed no checkpoint —
+        today's reset-to-base behavior. Only reached with a non-null ``base_sha``
+        (the caller guards it).
         """
-        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha)
+        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha, phase=phase)
         if wips:
             sha, subject = wips[0]  # newest first
             return sha, subject

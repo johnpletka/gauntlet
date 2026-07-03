@@ -1234,7 +1234,23 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # Discover the trailing run of such checkpoint commits at the branch tip —
     # the set this phase commit collapses (squash) or lists in an empty marker
     # (keep). Empty when the builder made none (today's single-commit phase).
-    wips = gitops.wip_checkpoints(repo)
+    #
+    # Discovery is SCOPED to THIS phase's prefix (review F-001): an explicit
+    # `phase:` wins, else the `foreach: plan.phases` iteration id (P1, P2…). The
+    # scope keeps a wrong-phase `P<N> wip:` from being squashed into this phase
+    # and fails closed if one sits in the trailing run. Only a numeric `P<N>`
+    # prefix scopes; stage labels (PRD/PLAN/REVIEW) carry no checkpoints, so they
+    # discover unscoped (matching nothing, as before). The walk is transparent to
+    # engine bookkeeping commits so checkpoints preserved beneath a recovery
+    # rewind are still found (review F-002).
+    phase_prefix = step.get("phase") or _iteration_phase(ctx)
+    wip_scope = (
+        phase_prefix if phase_prefix and re.fullmatch(r"P\d+", phase_prefix) else None
+    )
+    try:
+        wips = gitops.wip_checkpoints(repo, phase=wip_scope)
+    except gitops.WrongPhaseCheckpointError as exc:
+        return StepResult(status=FAILED, notes=f"checkpoint discovery failed closed: {exc}")
     squash = (
         ctx.config.checkpoint_commits == CHECKPOINT_COMMITS_SQUASH and bool(wips)
     )
@@ -1282,6 +1298,13 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # is unchanged from the keep case (same base, same final tree).
     if squash:
         gitops.reset_soft(repo, squash_base)
+        # The soft reset re-stages every commit in squash_base..old-HEAD, which
+        # can include an engine bookkeeping commit swept in by a checkpoint-
+        # preserving recovery (FR-11.2). Unstage the run-bookkeeping paths so the
+        # collapsed `P<N>:` commit carries only implementation, never manifest/
+        # RUN.md state (review F-002). `commit_all`'s own `--exclude` then leaves
+        # them unstaged rather than re-adding them from the worktree.
+        gitops.unstage(repo, exclude)
         sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
         return StepResult(
             status=DONE, commit_sha=sha, commit_phase=prefix,
