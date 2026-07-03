@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/harness-efficiency` (base `chore/fable-review`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `phase-commit`)
-- totals: 2519610in/549083out $71.8013
+- status: **running** (at `impl-cycle`)
+- totals: 3756648in/795676out $104.1239
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -19,7 +19,12 @@
 | [impl-cycle.0](steps/impl-cycle.0/) | adversarial_cycle | done | 2770s | 1392695in/96291out $10.4645 | converged in round 2 (blocking policy): no open blocking; 1 fixed, 1 non-blocking item(s) surfaced for the gate: NEW |
 | [implement.1](steps/implement.1/transcript.md) | agent_task | done | 2857s | 12231in/139974out $24.3525 | agent 'builder' completed |
 | [tests.1](steps/tests.1/) | shell | done | 279s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
-| phase-commit.1 | commit | pending | 57s | 37490in/5543out $0.0205 | operator surgery: reset failed->pending after commit-message header overflow (85>72); fresh redraft on resume; backup at scratchpad/manifest.backup2.json |
+| phase-commit.1 | commit | done | 153s | 62473in/9679out $0.0322 | committed 7253c44790 |
+| [impl-cycle.1](steps/impl-cycle.1/) | adversarial_cycle | done | 1292s | 1010369in/69479out $4.4253 | converged in round 1 (blocking policy): no open blocking; 5 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.2](steps/implement.2/transcript.md) | agent_task | done | 3082s | 38925in/153396out $27.8058 | agent 'builder' completed |
+| [tests.2](steps/tests.2/) | shell | done | 248s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.2 | commit | done | 27s | 55285in/3036out $0.0199 | committed b8c642b88b |
+| [impl-cycle.2](steps/impl-cycle.2/) | adversarial_cycle | parked | 2s | 0in/0out (tokens only) | usage-limit park (FR-3.2): reviewer sub-agent hit transient_usage_limit [codex_usage_limit_message] in the cycle; worktree untouched, session preserved — `gauntlet resume` re-drives the cycle |
 
 ## Commits
 
@@ -31,3 +36,6 @@
 - `96f33bd960` P1 (step `phase-commit`)
 - `779e060215` P1.1 (step `impl-cycle`)
 - `39af7ed82e` P1.2 (step `impl-cycle`)
+- `7253c44790` P2 (step `phase-commit`)
+- `30ac8b5ed5` P2.1 (step `impl-cycle`)
+- `b8c642b88b` P3 (step `phase-commit`)
