@@ -117,6 +117,13 @@ _SUBSTEP_ARTIFACT = {
     "confirm": "confirm.json",
 }
 
+# The fixed within-round execution order of the sub-steps. Reuse (FR-4.1) is only
+# valid for a CONTIGUOUS completed prefix of this sequence (per round, and rounds
+# ascending): once a sub-step's checkpoint is absent/unloadable, every LATER
+# sub-step is stale and must re-run (review F-001), even if its own checkpoint
+# happens to survive on disk.
+_SUBSTEP_ORDER = {"review": 0, "triage": 1, "fix": 2, "confirm": 3}
+
 
 def _persist_manifest(ctx: StepContext) -> None:
     """Flush the manifest write-ahead from inside a cycle sub-step (FR-4.1).
@@ -171,68 +178,193 @@ class _Resume:
     """Checkpoint-reuse state for a resumed adversarial cycle (FR-4.1/FR-4.2).
 
     ``active`` is False for a fresh run, a ``--response`` re-drive (the human
-    decision must re-open review/triage), or when the SHA guard invalidates. When
-    active, :meth:`cp` returns the recorded checkpoint for a ``(round, sub_step)``
-    and :meth:`load` returns its persisted per-round artifact — so the agent is
-    not re-invoked and the round re-enters at the first sub-step with no
-    checkpoint.
+    decision must re-open review/triage), or when the SHA/worktree guard
+    invalidates.
+
+    Reuse is limited to the CONTIGUOUS completed prefix of the sub-step sequence
+    (review→triage→fix→confirm, rounds ascending; review F-001): the consuming
+    accessors :meth:`reuse_data`/:meth:`reuse_fix` are called in that execution
+    order, and the first one that finds its checkpoint absent or its artifact
+    unloadable trips ``broken`` — after which NO later sub-step is reused, even if
+    its own checkpoint survived on disk. That sub-step and everything after it
+    re-run, overwriting their downstream checkpoints. :meth:`cp` is a
+    non-consuming lookup (handoff / SHA-guard reads) that never trips the prefix.
     """
 
     def __init__(self, ctx: StepContext, *, active: bool) -> None:
         self.ctx = ctx
         self.active = active
+        self.broken = False
         self._by_key = (
             {(c.round, c.sub_step): c for c in ctx.record.checkpoints}
             if active else {}
         )
 
     def cp(self, rnd: int, sub_step: str) -> "M.Checkpoint | None":
+        """Non-consuming lookup; does NOT participate in the ordered prefix."""
         return self._by_key.get((rnd, sub_step)) if self.active else None
 
-    def load(self, rnd: int, sub_step: str) -> dict[str, Any] | None:
+    def _trip(self, rnd: int, sub_step: str, notes: list[str]) -> None:
+        """End reuse at this sub-step and every later one (FR-4.1 ordered prefix).
+
+        Records an audit line ONLY when a later checkpoint actually survives on
+        disk — i.e. a genuine out-of-order gap (an earlier sub-step missing while a
+        later one is present), the inconsistency F-001 targets — so the ordinary
+        "re-enter at the first incomplete sub-step" resume stays quiet.
+        """
+        if not self.broken:
+            here = (rnd, _SUBSTEP_ORDER[sub_step])
+            has_later = any(
+                (r, _SUBSTEP_ORDER[s]) > here for (r, s) in self._by_key
+            )
+            if has_later:
+                notes.append(
+                    f"checkpoint reuse truncated at round-{rnd} {sub_step} (FR-4.1 "
+                    "ordered prefix): an earlier sub-step is absent/unloadable while "
+                    "later checkpoints exist; discarding the stale later checkpoints "
+                    "and re-running from here"
+                )
+        self.broken = True
+
+    def reuse_data(
+        self, rnd: int, sub_step: str, notes: list[str]
+    ) -> dict[str, Any] | None:
+        """Reuse a data-artifact sub-step (review/triage/confirm) if it is part of
+        the contiguous completed prefix; otherwise trip the prefix and return None.
+
+        FAIL-CLOSED: a checkpoint with no/absent/unparseable artifact is NOT
+        reused — the sub-step re-runs rather than proceeding on empty data."""
+        if not self.active or self.broken:
+            return None
         c = self.cp(rnd, sub_step)
         if c is None or c.artifact is None:
+            self._trip(rnd, sub_step, notes)
             return None
         path = self.ctx.run_dir / c.artifact
-        if not path.exists():  # fail closed: a missing artifact is not reusable
+        if not path.exists():
+            self._trip(rnd, sub_step, notes)
             return None
-        return json.loads(path.read_text())
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            self._trip(rnd, sub_step, notes)
+            return None
+
+    def reuse_fix(self, rnd: int, notes: list[str]) -> "M.Checkpoint | None":
+        """Reuse the fix commit checkpoint (its ``result_sha``) if it is part of
+        the contiguous completed prefix; otherwise trip the prefix and return
+        None so the fixer re-runs from a clean handoff."""
+        if not self.active or self.broken:
+            return None
+        c = self.cp(rnd, "fix")
+        if c is None or not c.result_sha:
+            self._trip(rnd, "fix", notes)
+            return None
+        return c
 
     def invalidate(self) -> None:
         self.active = False
+        self.broken = False
         self._by_key = {}
         self.ctx.record.checkpoints = []
 
 
 def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
-    """FR-4.2: True iff the worktree/handoff has NOT moved since checkpointing.
+    """FR-4.2: True iff HEAD is still at a tip the cycle itself produced.
 
-    Reuse is safe only when git is where the cycle left it. The guard key is the
-    tip the cycle itself produced: the newest fix commit it recorded (attributed
-    by ``step_id``), or — before any fix landed — the round-1 review handoff SHA.
-    A manual commit during the park moves HEAD off that tip, so reuse would build
-    on a stale base; the round then restarts fresh.
+    Reuse is safe only when git is where the cycle left it. The valid tips are the
+    fix commits the cycle produced: those the manifest recorded (attributed by
+    ``step_id``) AND those recorded only as a fix checkpoint's ``result_sha`` — a
+    kill after the fix sub-step committed+checkpointed but before finalization
+    leaves the commit on HEAD yet absent from the manifest (review F-002), so a
+    manifest-only check would misread HEAD as "moved" and discard the cycle's own
+    checkpoints. Before any fix landed the tip is the round-1 review handoff SHA. A
+    manual commit during the park moves HEAD off every tip, so reuse would build on
+    a stale base; the round then restarts fresh.
     """
     head = gitops.head_sha(ctx.repo_root)
-    cycle_commits = [c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id]
-    if cycle_commits:
-        return head == cycle_commits[-1]
+    tips = {c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id}
+    tips.update(
+        c.result_sha for c in ctx.record.checkpoints
+        if c.sub_step == "fix" and c.result_sha
+    )
+    if tips:
+        return head in tips
     r1 = resume.cp(1, "review")
     return r1 is None or head == r1.handoff_sha
 
 
-def _reset_dirty_to_handoff(
-    ctx: StepContext, handoff: str, rnd: int
-) -> str | None:
-    """Discard a parked fixer's partial edits before re-running the fix sub-step.
+def _dirty_expected_at_reentry(ctx: StepContext) -> bool:
+    """True iff a dirty worktree is the SANCTIONED fixer state (review F-003).
 
-    A fixer that hit a usage limit mid-edit left the worktree dirty (FR-3.2 leaves
-    it untouched at park time). Re-entering at the fix sub-step (FR-4.1) re-runs
-    the fixer from the clean round handoff, so the partial edits are backed up
-    (lossless) and reset away first. A no-op on a fresh run — the tree is already
-    clean before the fixer. Returns an audit note when it reset, else ``None``.
+    The only resume that legitimately re-enters on a dirty tree is one whose next
+    sub-step is the fixer: a usage-limit fixer park (worktree left untouched,
+    FR-3.2) or a kill mid-fixer-edit both leave partial edits that the fix sub-step
+    backs up and resets before re-running (FR-4.2). In every other re-entry
+    (review/triage/confirm next), a dirty tree is an unexpected hand-edit made
+    during the park — HEAD is unchanged, so the SHA guard cannot see it, and reuse
+    must NOT build on it. Keyed on the completed prefix of the highest checkpointed
+    round: dirty is expected iff the first sub-step still missing there is ``fix``.
     """
-    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+    rounds = [c.round for c in ctx.record.checkpoints]
+    if not rounds:
+        return False
+    top = max(rounds)
+    have = {c.sub_step for c in ctx.record.checkpoints if c.round == top}
+    for sub in ("review", "triage", "fix", "confirm"):
+        if sub not in have:
+            return sub == "fix"
+    return False  # all four present → next is round top+1 review, clean expected
+
+
+def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | None:
+    """Why checkpoint reuse must be discarded (FR-4.2), or ``None`` if safe.
+
+    Two ways the cycle is no longer where it left off:
+      * HEAD moved off every tip the cycle produced (a manual commit during the
+        park) — the SHA guard;
+      * the worktree is UNEXPECTEDLY dirty (review F-003): a hand-edit during a
+        review/triage/confirm park changes file contents while leaving HEAD put,
+        so the SHA guard alone cannot see it. The one sanctioned dirty state is a
+        pending fixer re-run (:func:`_dirty_expected_at_reentry`).
+    Either way, reuse is discarded and the cycle re-runs from a clean handoff.
+    """
+    if not _sha_guard_ok(ctx, resume):
+        return (
+            "checkpoint reuse invalidated (FR-4.2): HEAD moved since the round was "
+            "checkpointed (manual commit during the park?); re-running the cycle "
+            "from a clean handoff"
+        )
+    if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not (
+        _dirty_expected_at_reentry(ctx)
+    ):
+        return (
+            "checkpoint reuse invalidated (FR-4.2): the worktree is dirty at a "
+            "re-entry that expects a clean tree (a hand-edit during the park?); "
+            "re-running the cycle from a clean handoff"
+        )
+    return None
+
+
+def _reset_dirty_to_handoff(
+    ctx: StepContext, handoff: str, rnd: int, *, force: bool = False
+) -> str | None:
+    """Return HEAD to the round handoff before (re-)running the fix sub-step.
+
+    Two states force a reset before the fixer re-runs:
+      * a fixer that hit a usage limit (or was killed) mid-edit left the worktree
+        DIRTY (FR-3.2 leaves it untouched at park time);
+      * ``force`` — an ordered-prefix rerun (review F-001) must discard a stale fix
+        commit a prior interrupted attempt left recorded for this round and still
+        on HEAD; the tree is clean but HEAD sits AHEAD of the handoff.
+    Either way the partial edits / stale commit are backed up (lossless) and reset
+    away so the fixer re-runs from the clean round handoff (FR-4.1/FR-4.2). A no-op
+    on a fresh run — the tree is clean and no stale fix commit is recorded, so a
+    legitimate same-round reviewer-mutation commit (which advances HEAD past the
+    handoff) is preserved for the fixer to build on. Returns an audit note when it
+    reset, else ``None``.
+    """
+    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not force:
         return None
     backup = (
         f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
@@ -240,14 +372,14 @@ def _reset_dirty_to_handoff(
     )
     gitops.backup_dirty_worktree(
         ctx.repo_root, backup,
-        f"resume: partial fixer edits for {ctx.record.id} round {rnd} "
-        "(P5 re-enter at fix)",
+        f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
+        f"round {rnd} (P5 re-enter at fix)",
         exclude=ctx.excludes,
     )
     gitops.reset_hard(ctx.repo_root, handoff)
     gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
     return (
-        f"resume: reset round-{rnd} partial fixer edits to the handoff "
+        f"resume: reset round-{rnd} worktree to the handoff "
         f"(backed up at {backup}) before re-running the fix sub-step (FR-4.1)"
     )
 
@@ -346,14 +478,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         ctx, active=bool(ctx.record.checkpoints) and not is_response_redrive
     )
     invalidated = False
-    if resume.active and not _sha_guard_ok(ctx, resume):
-        resume.invalidate()
-        invalidated = True
-        resume_notes.append(
-            "checkpoint reuse invalidated (FR-4.2): HEAD moved since the round was "
-            "checkpointed (manual commit during the park?); re-running the cycle "
-            "from a clean handoff"
-        )
+    if resume.active:
+        guard_note = _reuse_invalidation_reason(ctx, resume)
+        if guard_note is not None:
+            resume.invalidate()
+            invalidated = True
+            resume_notes.append(guard_note)
     if not resume.active:
         # Fresh run (first drive, a `--response` re-drive, or post-invalidation):
         # rebuild checkpoints cleanly so a later park's reuse is unambiguous.
@@ -384,10 +514,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         return _finish(result, usage, commits, artifact_writes, metrics)
 
     for rnd in range(1, max_rounds + 1):
-        # FR-4.1 reuse is per-artifact and FAIL-CLOSED: a checkpoint whose
-        # round-scoped artifact is missing (corruption / manual deletion) is NOT
-        # reused — the sub-step re-runs rather than proceeding on empty data.
-        rdata = resume.load(rnd, "review")
+        # FR-4.1 reuse is ordered-prefix and FAIL-CLOSED (review F-001): a
+        # checkpoint whose round-scoped artifact is missing (corruption / manual
+        # deletion) is NOT reused, and it ends reuse for every later sub-step too —
+        # the sub-step re-runs rather than proceeding on empty or stale data.
+        rdata = resume.reuse_data(rnd, "review", resume_notes)
         reuse_review = rdata is not None
         # FR-9.3 clean handoff guards control passing to a REVIEWER. When this
         # round's review is reused we re-enter PAST that handoff (the guard held
@@ -458,7 +589,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # A transient (usage-limit/overload) failure in any triage sub-call parks
         # the whole cycle (FR-3.2), mirroring the reviewer wrapper above. On resume
         # the whole batch is reused as one sub-step (P5; P11 refines it per-finding).
-        tdata = resume.load(rnd, "triage")  # None → not reusable, re-run (fail closed)
+        tdata = resume.reuse_data(rnd, "triage", resume_notes)  # None → re-run (fail closed / prefix broken)
         reuse_triage = tdata is not None
         if reuse_triage:
             verdicts = list(tdata.get("verdicts") or [])
@@ -532,14 +663,37 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 "(declines recorded with reasons in triage.json)"))
 
         # ---- 3. fix + fix-round commit (FR-9.4) -------------------------------
-        fix_cp = resume.cp(rnd, "fix")
-        if fix_cp is not None and fix_cp.result_sha:
-            # FR-4.1 reuse: the fixer already committed this round; the commit is
-            # already in the manifest, so DO NOT re-add it to `commits` (which
-            # would double-record) — just adopt its SHA as this round's fix.
+        fix_cp = resume.reuse_fix(rnd, resume_notes)
+        if fix_cp is not None:
+            # FR-4.1 reuse: the fixer already committed this round; adopt its SHA.
             fix_sha = fix_cp.result_sha
+            # F-002: a kill after the fix checkpoint but before finalization leaves
+            # the commit on HEAD yet ABSENT from the manifest (finalization is what
+            # records `commits`). Re-adopt it here — idempotent: skip when a prior
+            # park's finalization already recorded it, so we never double-record —
+            # so the resumed cycle's fix commit is never lost from the audit trail.
+            recorded = any(
+                c.step_id == ctx.record.id and c.sha == fix_sha
+                for c in ctx.manifest.commits
+            )
+            if not recorded:
+                commits.append((f"{phase}.{rnd}", fix_sha))
+                resume_notes.append(
+                    f"adopted fix checkpoint commit {fix_sha[:10]} into the manifest "
+                    "(a kill after the fix checkpoint pre-empted finalization; "
+                    "FR-4.1/F-002)"
+                )
         else:
-            note = _reset_dirty_to_handoff(ctx, handoff, rnd)  # discard parked partial edits
+            # A stale fix commit for THIS round recorded by a prior interrupted
+            # attempt (F-001 ordered-prefix rerun) sits on HEAD ahead of the
+            # handoff; force its discard even though the tree is clean. A fresh run
+            # has no such record, so a same-round reviewer-mutation commit is kept.
+            phase_tag = f"{phase}.{rnd}"
+            stale_fix = any(
+                c.step_id == ctx.record.id and c.phase == phase_tag
+                for c in ctx.manifest.commits
+            )
+            note = _reset_dirty_to_handoff(ctx, handoff, rnd, force=stale_fix)  # discard parked/stale edits
             if note is not None:
                 resume_notes.append(note)
             fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
@@ -565,11 +719,20 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 ctx.repo_root, message,
                 identity=ctx.config.identity(fixer), exclude=ctx.excludes,
             )
-            commits.append((f"{phase}.{rnd}", fix_sha))
+            # An ordered-prefix rerun (F-001) that reset a stale fix commit off HEAD
+            # may have left that discarded commit recorded in the manifest from a
+            # prior park's finalization. Drop any such stale record for THIS round
+            # so the manifest names exactly the fix commit now on the branch (data
+            # over inference); the fresh one is appended via `commits` at finalize.
+            ctx.manifest.commits = [
+                c for c in ctx.manifest.commits
+                if not (c.step_id == ctx.record.id and c.phase == phase_tag)
+            ]
+            commits.append((phase_tag, fix_sha))
             _checkpoint(ctx, "fix", rnd, handoff, result_sha=fix_sha)
 
         # ---- 4. diff-scoped confirm (FR-9.5) ----------------------------------
-        stored = resume.load(rnd, "confirm")  # None → not reusable, re-run (fail closed)
+        stored = resume.reuse_data(rnd, "confirm", resume_notes)  # None → re-run (fail closed / prefix broken)
         reuse_confirm = stored is not None
         if reuse_confirm:
             # FR-4.1 reuse: strip the engine-added reconciliation/gate keys to

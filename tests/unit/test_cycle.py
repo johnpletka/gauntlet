@@ -1410,3 +1410,132 @@ def test_cycle_resume_falls_back_to_full_review_when_session_expired(cycle_repo)
     assert reviewer.calls[-1]["session"] is None
     assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[-1]["prompt"]
     assert man.record("cycle").status == M.DONE
+
+
+def _kill(cwd):
+    # A SeqAdapter callable that simulates a process kill (SIGINT) mid-sub-step:
+    # BaseException propagates uncaught through the handler and `_execute`, so the
+    # step never finalizes — the on-disk manifest keeps the write-ahead checkpoints
+    # but no finalized commit record (mirrors a real kill before finalization).
+    raise KeyboardInterrupt("simulated kill before finalize")
+
+
+def test_ordered_prefix_missing_triage_reruns_fix_not_stale_reuse(cycle_repo):
+    # review F-001: checkpoint reuse must be limited to the CONTIGUOUS completed
+    # prefix. A cycle parks during round-1 confirm with review/triage/fix all
+    # checkpointed; the operator then loses artifacts/r1/triage.json. On resume the
+    # review is reused, but triage is absent — so triage AND every LATER sub-step
+    # (fix, confirm) must re-run, never reuse the now-stale fix commit.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),                  # r1 review (reused on resume)
+        _transient_exc(session="conf-sess"), # r1 confirm parks (usage limit)
+        CONFIRM(CV("F-001")),                # resume: re-run confirm → converge
+    )
+    triage = SeqAdapter(V("F-001"), V("F-001"))   # drive1 + resume re-run
+    builder = SeqAdapter(
+        writer("src.py", "fixed\n", {"done": True}),   # r1 fix (drive 1)
+        writer("src.py", "fixed2\n", {"done": True}),  # r1 fix RE-RUN on resume
+    )
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.parked_substep == "r1-confirm"
+    # review, triage AND fix were all checkpointed before the confirm parked
+    assert _substep_rounds(rec) == {("review", 1), ("triage", 1), ("fix", 1)}
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    stale_fix_sha = man.commits[0].sha
+    # the operator loses the round-1 triage artifact during the park
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    (run_dir / "artifacts" / "r1" / "triage.json").unlink()
+    # resume: the ordered prefix truncates at the missing triage; triage and the
+    # fixer BOTH re-run (the stale fix commit is not reused), then confirm converges
+    assert orch.drive() == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    # triager re-invoked (prefix broke at triage) and — the F-001 fix — the FIXER
+    # re-invoked too rather than adopting the stale fix checkpoint
+    assert len(triage.calls) == 2
+    assert len(builder.calls) == 2
+    # exactly ONE round-1 fix commit is recorded (the stale one was discarded and
+    # its manifest record purged, not left double-recorded)
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    assert man.commits[0].sha != stale_fix_sha  # HEAD is the freshly re-run fix
+    assert gitops.head_sha(cycle_repo) == man.commits[0].sha
+    assert (cycle_repo / "src.py").read_text() == "fixed2\n"
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+    # the truncation is recorded in the audit trail (a genuine out-of-order gap:
+    # fix survived while the earlier triage did not)
+    assert "ordered prefix" in rec.notes
+
+
+def test_kill_after_fix_checkpoint_resumes_and_adopts_fix_commit(cycle_repo):
+    # review F-002: a real kill AFTER the fix sub-step commits+checkpoints but
+    # BEFORE finalization leaves the commit on HEAD yet absent from the manifest.
+    # The generic interrupted-step recovery must NOT intercept (park INTERRUPTED /
+    # rewind past the fix); the cycle handler owns recovery — it adopts the fix
+    # checkpoint, records the commit, and re-runs only the confirm sub-step.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),   # r1 review
+        _kill,                # r1 confirm: simulated kill before finalize
+        CONFIRM(CV("F-001")), # resume: re-run confirm → converge
+    )
+    triage = SeqAdapter(V("F-001"))                       # r1 triage (reused)
+    builder = SeqAdapter(writer("src.py", "fixed\n", {})) # r1 fix (reused, not re-run)
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    with pytest.raises(KeyboardInterrupt):
+        orch.drive()
+    # on-disk state: the fix sub-step checkpointed its result_sha, but finalization
+    # never ran, so the commit is on HEAD yet NOT recorded in the manifest.
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    on_disk = Manifest.load(run_dir / "manifest.json")
+    dead = on_disk.record("cycle")
+    assert dead.status == M.RUNNING  # never finalized
+    assert _substep_rounds(dead) == {("review", 1), ("triage", 1), ("fix", 1)}
+    assert [c.phase for c in on_disk.commits] == []  # fix commit NOT yet recorded
+    fix_cp = next(c for c in dead.checkpoints if c.sub_step == "fix")
+    committed_sha = fix_cp.result_sha
+    assert gitops.head_sha(cycle_repo) == committed_sha  # the commit is on HEAD
+
+    # resume from the reloaded (killed) manifest with the same adapters
+    orch2, man2 = _build_cycle_orch(cycle_repo, adapters, man=on_disk)
+    assert orch2.drive() == M.RUN_DONE
+    rec = man2.record("cycle")
+    assert rec.status == M.DONE
+    # the fix checkpoint was ADOPTED (fixer NOT re-invoked) and its commit recorded
+    # exactly once — never lost, never double-counted
+    assert len(builder.calls) == 1
+    assert [(c.phase, c.sha) for c in man2.commits] == [("P5.1", committed_sha)]
+    assert gitops.head_sha(cycle_repo) == committed_sha
+    # only the confirm sub-step re-ran (reviewer: review + killed-confirm + confirm)
+    assert len(reviewer.calls) == 3
+    assert "adopted fix checkpoint commit" in rec.notes
+
+
+def test_dirty_worktree_during_non_fixer_park_invalidates_reuse(cycle_repo):
+    # review F-003: a hand-edit to a tracked NON-artifact file during a triage park
+    # leaves HEAD unchanged but the worktree dirty. A HEAD-only guard would reuse
+    # the review checkpoint on the changed tree; the worktree-cleanliness guard
+    # invalidates reuse instead, and a dirty round-1 handoff then fails the
+    # clean-handoff invariant (FR-9.3) rather than reviewing a dirty tree.
+    reviewer = SeqAdapter(REVIEW(F("F-001")))  # drive 1 review; never re-invoked
+    triage = SeqAdapter(_transient_exc(session="triage-sess"))  # parks after review checkpoint
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert _substep_rounds(man.record("cycle")) == {("review", 1)}
+    # hand-edit a tracked file that is NOT the artifact (so the artifact-baseline
+    # commit does not fire and HEAD stays put): worktree dirty, HEAD unchanged.
+    (cycle_repo / "README.md").write_text("HAND-EDITED DURING PARK\n")
+    status = orch.drive()
+    rec = man.record("cycle")
+    # reuse was discarded (dirty, and not the sanctioned fixer re-entry) and the
+    # dirty handoff then failed the clean-handoff precondition
+    assert status == M.RUN_FAILED
+    assert rec.status == M.FAILED
+    assert "worktree is dirty" in rec.notes
+    assert "clean-handoff" in rec.notes
+    # the review checkpoint was NOT reused on the changed tree — reviewer not re-run
+    assert len(reviewer.calls) == 1

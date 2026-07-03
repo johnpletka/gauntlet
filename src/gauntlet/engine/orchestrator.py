@@ -558,9 +558,20 @@ class Orchestrator:
         # re-enter — proceed.
         if rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID:
             return None
-        # agent_task killed mid-edit AND adversarial_cycle killed mid-round are
-        # both non-idempotent worktree writers: park (or reset) on a dirty base
-        # rather than re-running over partial fixer edits / unmanifested
+        # F-002: an adversarial_cycle that recorded sub-step checkpoints owns its
+        # OWN checkpoint-aware recovery (cycle.py `_Resume` + the SHA/worktree
+        # guards). A kill after the fix sub-step commits+checkpoints but before
+        # finalization leaves HEAD ahead of base_sha with the commit still absent
+        # from the manifest; the generic dirty-base recovery below would then park
+        # INTERRUPTED (or, under reset_to_base, rewind past — and orphan — that fix
+        # commit) instead of letting the cycle adopt its fix checkpoint. Defer to
+        # the handler: it reuses the completed prefix, re-records the fix commit,
+        # and resets a genuinely dirty mid-fixer-edit tree from the round handoff.
+        if step.type == "adversarial_cycle" and rec.checkpoints:
+            return None
+        # agent_task killed mid-edit AND a checkpoint-less adversarial_cycle killed
+        # mid-round are both non-idempotent worktree writers: park (or reset) on a
+        # dirty base rather than re-running over partial fixer edits / unmanifested
         # fix-round commits. shell and commit re-enter safely on their own.
         is_agent_write = (
             step.type == "agent_task" and spec.step_requires_repo_write(step)
