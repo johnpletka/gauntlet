@@ -249,6 +249,20 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             halt_reason=HALT_REASON_PRECONDITION,
             notes="agent_task step has no `agent:`",
         )
+    # FR-2.1 (review F-003): `validate:` runs against the step's `output:`
+    # artifact, so a `validate:` with no `output:` would silently validate
+    # nothing — a fail-OPEN skip. The loader rejects this shape at load time
+    # (engine/validate.py); this runtime precondition is defense in depth for a
+    # hand-built / bypassed pipeline, failing closed before the adapter is built.
+    if step.get("validate") and not step.get("output"):
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                "agent_task declares `validate:` without `output:`; the validator "
+                "would be silently skipped — failing closed (FR-2.1 / review F-003)"
+            ),
+        )
     # FR-2.2: a plain `gauntlet resume` of an artifact_invalid park re-runs ONLY
     # the validator against the (possibly hand-edited) on-disk artifact — no
     # adapter invocation. Done here, before the adapter is even built, so a
@@ -552,18 +566,21 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
     error = validate_artifact(
         validate_name, text, repo_root=ctx.repo_root, asset_root=ctx.config.asset_root
     )
-    reval = RevalidationRecord(
-        artifact=output,
-        hash_at_park=hash_at_park,
-        hash_at_resume=hash_at_resume,
-        changed_while_parked=changed,
-        passed_on_resume=error is None,
-    )
     if error is not None:
+        # Re-park on the CURRENT (still-invalid) on-disk bytes (review F-001): the
+        # new park pair must baseline against `hash_at_resume` — what is actually
+        # parked now — NOT the original `hash_at_park`. Reusing the prior park hash
+        # would keep comparing every later resume against stale bytes, so an invalid
+        # hand-edit (A→B) followed by a resume with no further edit would wrongly
+        # report `changed_while_parked=True` against B, contradicting the P4 audit
+        # contract. Resume-side fields reset to their park defaults; the note below
+        # still describes THIS resume's transition for the transcript.
         return StepResult(
             status=PARKED,
             parked_reason=PARKED_REASON_ARTIFACT_INVALID,
-            revalidation=reval,
+            revalidation=RevalidationRecord(
+                artifact=output, hash_at_park=hash_at_resume
+            ),
             notes=(
                 f"artifact {output!r} still fails validation ({validate_name}) on "
                 f"resume ({'edited' if changed else 'unchanged'} while parked); "
@@ -571,6 +588,15 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
                 f"error:\n{error}"
             ),
         )
+    # Passed: the full audit pair documents the sanctioned hand-edit (park bytes
+    # → resume bytes → changed? → passed) that resolved the park.
+    reval = RevalidationRecord(
+        artifact=output,
+        hash_at_park=hash_at_park,
+        hash_at_resume=hash_at_resume,
+        changed_while_parked=changed,
+        passed_on_resume=True,
+    )
     # Valid on resume — complete the step with no adapter call. Commit the
     # now-valid deliverable if the step opted into commit_output (the normal path
     # committed only on validity; the resume path must too, to keep the

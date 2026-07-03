@@ -140,6 +140,40 @@ stages:
     assert validate_pipeline(pipeline, RunConfig.model_validate(CONFIG)).ok()
 
 
+def test_validate_without_output_rejected(tmp_path):
+    # review F-003: a `validate:` with no `output:` has no artifact to run
+    # against, so the runtime would silently skip validation (fail open). Reject
+    # at load. (builder is resume-capable, so only the no-output shape trips.)
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, validate: plan_phases, prompt_text: go}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="validate.*but no .output"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_validate_on_non_resume_agent_rejected(tmp_path):
+    # review F-004: `validate:` on an agent whose adapter cannot resume (api)
+    # means the in-session repair loop would repair in a fresh, context-less call.
+    # Reject at load — the resume-specific error must be present.
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: triage, output: plan.md, validate: plan_phases, prompt_text: go}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="cannot resume its session"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
 def test_banned_flag_rejected(tmp_path):
     text = """
 name: d

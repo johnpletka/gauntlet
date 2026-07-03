@@ -113,6 +113,31 @@ def _validate_step(
             "(FR-4 / review F-002); choose another name"
         )
 
+    # 1d. `validate:` shape + capability (FR-2.1 / review F-003, F-004). The
+    # named validator runs against the step's `output:` artifact and, on failure,
+    # re-invokes the SAME agent session with the error (the bounded in-session
+    # repair loop). Two ways to fail open, both rejected at load:
+    #   * `validate:` without `output:` — the validator has no artifact to run
+    #     against, so `handle_agent_task` would silently skip it (F-003).
+    #   * `validate:` on an agent whose adapter cannot resume — the repair would
+    #     be a fresh call lacking the authoring context, a non-session repair
+    #     masquerading as the required in-session correction path (F-004).
+    validate_name = step.get("validate")
+    if validate_name and not step.get("output"):
+        report.errors.append(
+            f"step {step.id!r} declares `validate:` but no `output:`; the "
+            "validator would be silently skipped (fail closed, FR-2.1 / F-003)"
+        )
+    if validate_name and step.agent and step.agent in config.agents:
+        vprofile = config.profile(step.agent)
+        if not vprofile.capabilities().resume:
+            report.errors.append(
+                f"step {step.id!r} declares `validate:` but agent {step.agent!r} "
+                f"(adapter {vprofile.adapter!r}) cannot resume its session "
+                "(FR-2.1 / F-004): the in-session repair loop re-invokes the same "
+                "session with the validation error and requires resume support"
+            )
+
     # 2. dangling artifact dataflow (FR-5.3)
     for name in (step.get("inputs", []) or []):
         if name not in available:

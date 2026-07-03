@@ -66,6 +66,18 @@ MALFORMED_PLAN = """# Plan
 
 NO_BLOCK_PLAN = "# Plan\n\nJust prose, no gauntlet-phases block at all.\n"
 
+# A SECOND malformed block whose bytes differ from MALFORMED_PLAN, so a hand-edit
+# from one to the other is a real content change (distinct hash) that still fails
+# validation — exercises the re-park path (review F-001).
+MALFORMED_PLAN_2 = """# Plan
+
+```gauntlet-phases
+- id: X2
+  title: Still a bad id
+  goal: A different body, still not matching P<n>.
+```
+"""
+
 
 def _manifest() -> Manifest:
     return Manifest(
@@ -215,6 +227,80 @@ def test_resume_without_fixing_reparks_no_adapter_call(fixture_repo):
     assert rec.revalidation.changed_while_parked is False
 
 
+def test_invalid_edit_repark_then_resume_unchanged_reports_no_edit(fixture_repo):
+    """review F-001: after an invalid hand-edit (A→B) re-parks, a later resume
+    with NO further edit must read as `changed_while_parked=False`.
+
+    The re-park must refresh the park hash to the current on-disk bytes; keeping
+    the original park hash makes the next resume compare B against A and wrongly
+    report a hand-edit that never happened, corrupting the P4 audit pair.
+    """
+    man = _manifest()
+    adapter = ScriptedTextAdapter([MALFORMED_PLAN, MALFORMED_PLAN, MALFORMED_PLAN])
+    assert _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man).drive() == M.RUN_PARKED
+    calls_at_park = len(adapter.calls)
+    park_hash = man.record("plan-author").revalidation.hash_at_park
+
+    # Hand-edit to DIFFERENT but still-invalid bytes, then resume → re-park. The
+    # edit is recorded in the note; the re-park itself is a FRESH park baseline on
+    # the current bytes, so hash_at_park is refreshed (not the original park hash)
+    # and the resume-side fields reset — this is what makes the NEXT resume
+    # compare against the right bytes.
+    _plan_path(fixture_repo).write_text(MALFORMED_PLAN_2)
+    assert _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man).drive() == M.RUN_PARKED
+    assert len(adapter.calls) == calls_at_park  # validator-only, no adapter call
+    rec = man.record("plan-author")
+    assert "edited while parked" in (rec.notes or "")  # the transition is audited
+    # the re-park baselines on the CURRENT bytes, not the original park hash
+    assert rec.revalidation.hash_at_park != park_hash
+    assert rec.revalidation.hash_at_resume is None  # fresh park baseline
+    reparked_hash = rec.revalidation.hash_at_park
+
+    # Resume AGAIN with no further edit: nothing changed since the re-park, so the
+    # audit pair must report changed_while_parked=False (the F-001 defect).
+    assert _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man).drive() == M.RUN_PARKED
+    assert len(adapter.calls) == calls_at_park
+    rec = man.record("plan-author")
+    assert rec.revalidation.changed_while_parked is False
+    assert rec.revalidation.hash_at_park == reparked_hash
+    assert rec.revalidation.passed_on_resume is False
+
+
+def test_crash_after_writeahead_on_artifact_invalid_resume_revalidates(fixture_repo):
+    """review F-005: a crash after the write-ahead RUNNING persist on an
+    artifact_invalid resume must re-enter the validator-only path, not the
+    generic dirty-mid-edit recovery.
+
+    On resume the record goes RUNNING and is persisted before the validator runs;
+    a kill in that gap leaves a RUNNING record still carrying
+    parked_reason=artifact_invalid. The on-disk artifact is intentionally dirty
+    vs base_sha (the sanctioned hand-edit), so the mid-edit recovery would wrongly
+    park it INTERRUPTED. Recovery must instead just re-run the validator.
+    """
+    man = _manifest()
+    adapter = ScriptedTextAdapter([MALFORMED_PLAN, MALFORMED_PLAN, MALFORMED_PLAN])
+    assert _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man).drive() == M.RUN_PARKED
+    calls_at_park = len(adapter.calls)
+
+    rec = man.record("plan-author")
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert rec.base_sha is not None  # the agent_task stamped the transaction boundary
+    # Simulate kill -9 AFTER the write-ahead RUNNING persist, BEFORE finalize: the
+    # record is RUNNING but still carries parked_reason=artifact_invalid.
+    rec.status = M.RUNNING
+
+    # Hand-edit the (intentionally dirty) artifact to a valid plan, then resume.
+    _plan_path(fixture_repo).write_text(VALID_PLAN)
+    status = _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man).drive()
+
+    assert status == M.RUN_DONE  # NOT parked INTERRUPTED (the F-005 defect)
+    assert len(adapter.calls) == calls_at_park  # validator-only: no adapter re-invocation
+    rec = man.record("plan-author")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None
+    assert rec.revalidation.passed_on_resume is True
+
+
 # --- FR-2.3: shipped-pipeline wiring + backstop unchanged --------------------
 @pytest.mark.parametrize(
     "pipeline_path",
@@ -299,4 +385,27 @@ def test_schema_ref_missing_file_raises(tmp_path):
     with pytest.raises(UnknownValidatorError, match="not found"):
         validate_artifact(
             "schema:absent.json", "{}", repo_root=tmp_path, asset_root="."
+        )
+
+
+def test_schema_ref_rejects_parent_traversal(tmp_path):
+    # review F-002: a `../` ref that resolves OUTSIDE asset_root must fail closed,
+    # even when the escaping file exists — containment beats existence.
+    root = tmp_path / "assets"
+    root.mkdir()
+    (tmp_path / "outside.json").write_text('{"type": "object"}')  # real file, outside
+    with pytest.raises(UnknownValidatorError, match="escapes asset_root"):
+        validate_artifact(
+            "schema:../outside.json", "{}", repo_root=tmp_path, asset_root="assets"
+        )
+
+
+def test_schema_ref_rejects_absolute_path(tmp_path):
+    # review F-002: an absolute ref would discard the asset_root prefix entirely
+    # (`root / "/etc/x"` == `/etc/x`); reject it before any filesystem access.
+    target = tmp_path / "abs.json"
+    target.write_text('{"type": "object"}')
+    with pytest.raises(UnknownValidatorError, match="absolute path"):
+        validate_artifact(
+            f"schema:{target}", "{}", repo_root=tmp_path, asset_root="assets"
         )

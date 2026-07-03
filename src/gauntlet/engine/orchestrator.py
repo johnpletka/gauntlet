@@ -545,6 +545,19 @@ class Orchestrator:
         """
         if rec.base_sha is None or not spec.step_touches_worktree(step):
             return None
+        # F-005: an artifact_invalid park interrupted mid-revalidation must
+        # re-enter the validator-only path, NOT the generic dirty-mid-edit
+        # recovery. A plain resume of such a park sets the record RUNNING and
+        # write-ahead-persists BEFORE `_revalidate_on_resume` runs; a crash in
+        # that gap leaves a RUNNING record that still carries
+        # `parked_reason=artifact_invalid`. The on-disk artifact is INTENTIONALLY
+        # dirty vs base_sha (the sanctioned hand-edit awaiting revalidation), so
+        # the dirty-base check below would wrongly park it INTERRUPTED / rewind
+        # the hand-edit. `handle_agent_task` re-runs only the validator against
+        # the current bytes (no adapter call), which is idempotent and safe to
+        # re-enter — proceed.
+        if rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID:
+            return None
         # agent_task killed mid-edit AND adversarial_cycle killed mid-round are
         # both non-idempotent worktree writers: park (or reset) on a dirty base
         # rather than re-running over partial fixer edits / unmanifested

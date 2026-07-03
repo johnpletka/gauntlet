@@ -82,10 +82,32 @@ def _validate_against_schema(
     """Validate *text* (parsed as JSON) against the schema at *ref* (FR-2.1).
 
     Raises :class:`UnknownValidatorError` if the schema file does not resolve
-    under the repo (a misconfigured pipeline), returns an error string if the
-    artifact is not JSON or does not conform (a repairable artifact defect).
+    under the configured ``asset_root`` (a misconfigured pipeline), returns an
+    error string if the artifact is not JSON or does not conform (a repairable
+    artifact defect).
+
+    Path containment (review F-002): the contract is a repo-relative schema ref
+    *under* ``asset_root``. Two shapes escape a naive ``root / ref`` join and are
+    rejected before any filesystem access — fail closed, never read a file
+    outside the configured asset root:
+
+    * an **absolute** ref — ``root / "/etc/x"`` discards ``root`` entirely;
+    * a ``../`` **traversal** that resolves outside ``asset_root``.
     """
-    path = repo_root / asset_root / ref
+    root = (repo_root / asset_root).resolve()
+    if Path(ref).is_absolute():
+        raise UnknownValidatorError(
+            f"validator schema {ref!r} is an absolute path; schema refs must be "
+            f"repo-relative under asset_root {asset_root!r} (review F-002)"
+        )
+    path = (root / ref).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise UnknownValidatorError(
+            f"validator schema {ref!r} escapes asset_root {asset_root!r} "
+            f"(resolves to {path}); schema refs must stay within it (review F-002)"
+        )
     if not path.exists():
         raise UnknownValidatorError(
             f"validator schema {ref!r} not found at {path} (asset_root "
