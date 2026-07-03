@@ -249,6 +249,70 @@ class AgentProfile(BaseModel):
         return self.adapter_class().capabilities
 
 
+class ProviderWindow(BaseModel):
+    """One provider's usage-window budget (harness-efficiency FR-10.2).
+
+    Declares the sliding window (``window_hours``) and the budget within it
+    (``window_budget``, denominated in ``budget_unit`` — ``tokens`` sums
+    input+output, ``cost`` sums cost_usd). Before an agent step billing this
+    provider launches, the engine estimates the step's usage (median of historical
+    same-type/same-profile steps from the ledger, else ``fallback_estimate``) and
+    compares it to remaining headroom. With ``enforce: false`` (default) an
+    insufficient-headroom check is a WARNING (advisory: the ledger cannot see
+    non-gauntlet usage, so it under-counts); with ``enforce: true`` the run parks
+    ``usage_window`` before the step starts. All defaults are opt-in — an absent
+    ``providers:`` block leaves the run behaving exactly as before (FR-10.3).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    window_hours: float
+    window_budget: float
+    # Unit of ``window_budget`` and the per-step estimate; must agree with the
+    # ledger's canonical set (imported so config and estimator never drift).
+    budget_unit: str = "tokens"
+    # Advisory by default: warn, don't park (FR-10.3). ``true`` parks pre-step.
+    enforce: bool = False
+    # Per-step estimate used when the ledger has no same-type/same-profile
+    # history (FR-10.2 "configured fallback"). ``None`` ⇒ unknown ⇒ admit (a
+    # missing estimate never blocks a run — fail toward the run, PRD §4.2).
+    fallback_estimate: float | None = None
+
+    @field_validator("budget_unit")
+    @classmethod
+    def _validate_budget_unit(cls, v: str) -> str:
+        """``budget_unit`` must be a canonical ledger unit; else fail closed."""
+        from gauntlet.engine.ledger import BUDGET_UNITS
+
+        name = (v or "").strip().lower()
+        if name not in BUDGET_UNITS:
+            raise ValueError(
+                f"providers.*.budget_unit must be one of {sorted(BUDGET_UNITS)}; "
+                f"got {v!r} (FR-10.2)"
+            )
+        return name
+
+    @field_validator("window_hours")
+    @classmethod
+    def _validate_window_hours(cls, v: float) -> float:
+        """A window must span a positive number of hours (FR-10.2)."""
+        if v <= 0:
+            raise ValueError(
+                f"providers.*.window_hours must be positive; got {v!r}"
+            )
+        return v
+
+    @field_validator("window_budget")
+    @classmethod
+    def _validate_window_budget(cls, v: float) -> float:
+        """A window budget must be non-negative (FR-10.2)."""
+        if v < 0:
+            raise ValueError(
+                f"providers.*.window_budget must be non-negative; got {v!r}"
+            )
+        return v
+
+
 class IssueTrackerConfig(BaseModel):
     """The optional `issue_tracker:` config block (§6, FR-6.1/FR-6.2/FR-6.4).
 
@@ -382,6 +446,15 @@ class RunConfig(BaseModel):
     test_command: str = "uv run pytest"
     agents: dict[str, AgentProfile] = Field(default_factory=dict)
     identities: dict[str, Identity] = Field(default_factory=dict)
+
+    # --- usage-window admission (harness-efficiency FR-10.2/10.3) ------------
+    # Optional per-provider window budgets keyed by provider name (e.g.
+    # ``anthropic``). Empty by default → no admission check, so a run behaves
+    # exactly as before. A step billing a window-constrained provider is estimated
+    # against remaining headroom (from the machine-global ledger) before it
+    # launches; short headroom warns (advisory) or, with ``enforce: true``, parks
+    # the run ``usage_window`` at a clean boundary before any work is in flight.
+    providers: dict[str, ProviderWindow] = Field(default_factory=dict)
 
     # Transaction-boundary policy on resume of a dirty interrupted step (F-003).
     interrupted_step: str = "park"  # park | reset_to_base
