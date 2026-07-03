@@ -303,6 +303,41 @@ class Suspension(BaseModel):
     gap_s: int
 
 
+# --- adversarial-cycle sub-step checkpoints (FR-4.1) -------------------------
+# Named sub-steps of one cycle round, in execution order. The per-finding triage
+# batch is checkpointed as ONE ``triage`` sub-step in P5; P11 refines it to a
+# per-finding failure-path fragment.
+CHECKPOINT_SUBSTEPS = ("review", "triage", "fix", "confirm")
+
+
+class Checkpoint(BaseModel):
+    """A completed adversarial-cycle sub-step, recorded write-ahead (FR-4.1).
+
+    Each cycle sub-step (review, per-finding triage batch, fix, confirm) appends
+    one of these the instant it finishes AND flushes the manifest, so a
+    ``kill -9`` or usage-limit park mid-round leaves a durable record of exactly
+    which sub-steps completed. On a plain ``gauntlet resume`` the cycle loads the
+    completed sub-steps from ``artifact`` (a round-scoped copy under the run dir)
+    instead of re-invoking the agent, re-entering the round at the first sub-step
+    with no checkpoint — re-running zero completed work (PRD G1).
+
+    ``handoff_sha`` is the round's review-handoff SHA and the FR-4.2 guard key:
+    if the worktree/handoff moved since the checkpoint (e.g. manual commits during
+    a park), reuse is invalidated and the round restarts. ``artifact`` is the
+    run-dir-relative path of the sub-step's persisted output
+    (``artifacts/r1/findings.json`` etc.); it is ``None`` for the ``fix``
+    sub-step, whose product is a commit — that commit's SHA is ``result_sha``
+    (also the next round's handoff), so a reused fix advances the loop without
+    re-committing. Additive/append-only — older manifests load with an empty list.
+    """
+
+    sub_step: str  # one of CHECKPOINT_SUBSTEPS
+    round: int
+    handoff_sha: str
+    artifact: str | None = None
+    result_sha: str | None = None
+
+
 class StepRecord(BaseModel):
     id: str
     type: str
@@ -376,6 +411,15 @@ class StepRecord(BaseModel):
     # tallies here so trend math reads the manifest, never the log dirs (the
     # plan's P7 test strategy is "trend-metric math from fixture manifests").
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Write-ahead adversarial-cycle sub-step checkpoints (harness-efficiency
+    # FR-4.1). Appended (and the manifest flushed) as each round sub-step
+    # completes, so a mid-round interruption — a usage-limit park (P1) or a kill —
+    # resumes at the first INCOMPLETE sub-step instead of re-deriving the whole
+    # round (PRD G1). A fresh (non-reuse) drive rebuilds them from empty; the SHA
+    # guard (FR-4.2) invalidates and clears them when the handoff moved. Left in
+    # place on a converged/terminal cycle as a truthful record of the rounds it
+    # ran. Additive/append-only — older manifests load with an empty list.
+    checkpoints: list[Checkpoint] = Field(default_factory=list)
 
 
 class CommitRecord(BaseModel):

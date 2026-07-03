@@ -962,6 +962,7 @@ class Orchestrator:
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
+            persist=self._persist,  # FR-4.1: cycle sub-step write-ahead flush
         )
 
     def _context(self, item: Any = None, iteration: str | None = None) -> dict[str, Any]:

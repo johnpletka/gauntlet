@@ -121,6 +121,12 @@ class StepContext:
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
+    # Write-ahead persist hook (FR-4.1): the orchestrator wires this to its own
+    # atomic manifest+RUN.md flush so a long-running handler (the adversarial
+    # cycle) can checkpoint sub-step progress to disk mid-step, surviving a
+    # kill/park between sub-steps. ``None`` for a standalone handler invocation
+    # (no orchestrator); such callers fall back to writing the manifest directly.
+    persist: Callable[[], None] | None = None
 
     def build_adapter(self, agent_name: str) -> Any:
         """Resolve an agent profile to an adapter instance (override in tests)."""

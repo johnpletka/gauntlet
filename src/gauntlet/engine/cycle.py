@@ -108,6 +108,150 @@ def needs_escalation(severity: str, verdict: dict[str, Any]) -> bool:
     return severity == "blocking" or verdict.get("confidence") == "low"
 
 
+# --- sub-step checkpointing (FR-4.1/FR-4.2) ------------------------------------
+# Maps a checkpointable sub-step to the file its output is persisted under; the
+# ``fix`` sub-step produces a commit, not a file, so it is absent here.
+_SUBSTEP_ARTIFACT = {
+    "review": "findings.json",
+    "triage": "triage.json",
+    "confirm": "confirm.json",
+}
+
+
+def _persist_manifest(ctx: StepContext) -> None:
+    """Flush the manifest write-ahead from inside a cycle sub-step (FR-4.1).
+
+    Uses the orchestrator's own atomic manifest+RUN.md flush when wired
+    (``ctx.persist``); a standalone handler invocation (no orchestrator) writes
+    the manifest directly so the checkpoint is still durable.
+    """
+    if ctx.persist is not None:
+        ctx.persist()
+    else:  # pragma: no cover - exercised only outside the orchestrator
+        ctx.manifest.write_atomic(ctx.run_dir / "manifest.json")
+
+
+def _checkpoint(
+    ctx: StepContext, sub_step: str, rnd: int, handoff_sha: str,
+    *, data: dict[str, Any] | None = None, result_sha: str | None = None,
+) -> None:
+    """Record a completed cycle sub-step write-ahead (FR-4.1).
+
+    Persists a ROUND-SCOPED copy of the sub-step's artifact
+    (``artifacts/r<N>/<name>``) so a later round overwriting the shared
+    ``artifacts/<name>`` cannot clobber a prior round's checkpoint, then appends a
+    :class:`~gauntlet.engine.manifest.Checkpoint` and flushes the manifest — the
+    checkpoint and its artifact are on disk before the next sub-step (which might
+    park/die) begins. A re-run of the same ``(round, sub_step)`` supersedes the
+    prior record (dedup by key), so an invalidated-then-rerun sub-step leaves one
+    truthful checkpoint.
+    """
+    artifact_rel: str | None = None
+    if data is not None:
+        name = _SUBSTEP_ARTIFACT[sub_step]
+        rel = f"artifacts/r{rnd}/{name}"
+        ctx.writer.write_text(
+            ctx.run_dir / rel, json.dumps(data, indent=2, ensure_ascii=False)
+        )
+        artifact_rel = rel
+    ctx.record.checkpoints = [
+        c for c in ctx.record.checkpoints
+        if not (c.round == rnd and c.sub_step == sub_step)
+    ]
+    ctx.record.checkpoints.append(
+        M.Checkpoint(
+            sub_step=sub_step, round=rnd, handoff_sha=handoff_sha,
+            artifact=artifact_rel, result_sha=result_sha,
+        )
+    )
+    _persist_manifest(ctx)
+
+
+class _Resume:
+    """Checkpoint-reuse state for a resumed adversarial cycle (FR-4.1/FR-4.2).
+
+    ``active`` is False for a fresh run, a ``--response`` re-drive (the human
+    decision must re-open review/triage), or when the SHA guard invalidates. When
+    active, :meth:`cp` returns the recorded checkpoint for a ``(round, sub_step)``
+    and :meth:`load` returns its persisted per-round artifact — so the agent is
+    not re-invoked and the round re-enters at the first sub-step with no
+    checkpoint.
+    """
+
+    def __init__(self, ctx: StepContext, *, active: bool) -> None:
+        self.ctx = ctx
+        self.active = active
+        self._by_key = (
+            {(c.round, c.sub_step): c for c in ctx.record.checkpoints}
+            if active else {}
+        )
+
+    def cp(self, rnd: int, sub_step: str) -> "M.Checkpoint | None":
+        return self._by_key.get((rnd, sub_step)) if self.active else None
+
+    def load(self, rnd: int, sub_step: str) -> dict[str, Any] | None:
+        c = self.cp(rnd, sub_step)
+        if c is None or c.artifact is None:
+            return None
+        path = self.ctx.run_dir / c.artifact
+        if not path.exists():  # fail closed: a missing artifact is not reusable
+            return None
+        return json.loads(path.read_text())
+
+    def invalidate(self) -> None:
+        self.active = False
+        self._by_key = {}
+        self.ctx.record.checkpoints = []
+
+
+def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
+    """FR-4.2: True iff the worktree/handoff has NOT moved since checkpointing.
+
+    Reuse is safe only when git is where the cycle left it. The guard key is the
+    tip the cycle itself produced: the newest fix commit it recorded (attributed
+    by ``step_id``), or — before any fix landed — the round-1 review handoff SHA.
+    A manual commit during the park moves HEAD off that tip, so reuse would build
+    on a stale base; the round then restarts fresh.
+    """
+    head = gitops.head_sha(ctx.repo_root)
+    cycle_commits = [c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id]
+    if cycle_commits:
+        return head == cycle_commits[-1]
+    r1 = resume.cp(1, "review")
+    return r1 is None or head == r1.handoff_sha
+
+
+def _reset_dirty_to_handoff(
+    ctx: StepContext, handoff: str, rnd: int
+) -> str | None:
+    """Discard a parked fixer's partial edits before re-running the fix sub-step.
+
+    A fixer that hit a usage limit mid-edit left the worktree dirty (FR-3.2 leaves
+    it untouched at park time). Re-entering at the fix sub-step (FR-4.1) re-runs
+    the fixer from the clean round handoff, so the partial edits are backed up
+    (lossless) and reset away first. A no-op on a fresh run — the tree is already
+    clean before the fixer. Returns an audit note when it reset, else ``None``.
+    """
+    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+        return None
+    backup = (
+        f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
+        f"{ctx.record.id}-r{rnd}-fix-resume"
+    )
+    gitops.backup_dirty_worktree(
+        ctx.repo_root, backup,
+        f"resume: partial fixer edits for {ctx.record.id} round {rnd} "
+        "(P5 re-enter at fix)",
+        exclude=ctx.excludes,
+    )
+    gitops.reset_hard(ctx.repo_root, handoff)
+    gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+    return (
+        f"resume: reset round-{rnd} partial fixer edits to the handoff "
+        f"(backed up at {backup}) before re-running the fix sub-step (FR-4.1)"
+    )
+
+
 # --- the handler ---------------------------------------------------------------
 def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     from gauntlet.engine.steptypes import _UsageAccumulator, step_logger
@@ -156,6 +300,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     carried: list[dict[str, Any]] = []  # open findings carried into the next round
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
+    resume_notes: list[str] = []  # FR-4.1/FR-4.2 audit lines for the final result
 
     # Artifact-mode baseline commit (FR-5.1 ↔ FR-9.3). In `standard.yaml` the
     # plan-author writes plan.md, then plan-cycle reviews it with no commit step
@@ -180,99 +325,122 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         commits.append((phase, baseline))
         handoff = baseline
 
-    # FR-3.3 usage-limit resume: this cycle previously parked on a transient
-    # sub-agent failure (P1), leaving the worktree untouched and the failing
-    # sub-agent's session preserved on the record. On a plain `gauntlet resume`
-    # the record still carries parked_reason=usage_limit (the orchestrator clears
-    # it only when the step finalizes to a non-park state), so it uniquely marks
-    # the resume; it is never a `--response` resume (a usage-limit park needs no
-    # decision).
-    #
-    # The preserved session belongs to WHICHEVER sub-step parked (recorded as
-    # `parked_substep`), not necessarily the reviewer. P1 re-drives the round from
-    # its start, so the only sub-step re-reached with its session still meaningful
-    # is the round-1 review; continuing that session there conserves budget (see
-    # `_resume_review`). A park in the fixer/triager/confirmer — or a round>1
-    # review — leaves a session that belongs to work being re-driven from the top:
-    # feeding it to the round-1 reviewer would splice one role's conversation into
-    # another (review F-001), so `resume_session` is withheld and the round re-runs
-    # sessionless. That preserved session is discarded (the round-loss deferral;
-    # P5's per-sub-step checkpoints will instead re-enter at the failing sub-step
-    # and continue it there).
-    is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-    resume_substep = ctx.record.parked_substep if is_quota_resume else None
-    resume_session = (
-        ctx.record.session_id
-        if is_quota_resume and resume_substep == "r1-review"
-        else None
+    # --- FR-4.1/FR-4.2 resume: reuse completed sub-step checkpoints -----------
+    # A cycle that parked (usage-limit, P1) or was killed mid-round left write-
+    # ahead `checkpoints` on the record. On a PLAIN resume we reuse the completed
+    # sub-steps (loading their persisted per-round artifacts) and re-enter the
+    # round at the first sub-step with no checkpoint — re-running zero completed
+    # work (PRD G1). Two cases DISABLE reuse:
+    #   * a `--response` re-drive (a cycle-escalation resolution): the human
+    #     decision re-opens review/triage, so the round must run fresh;
+    #   * the SHA guard (FR-4.2): the worktree/handoff moved since the round was
+    #     checkpointed (e.g. a manual commit during the park), so reuse would
+    #     build on a stale base.
+    # A fresh (non-reuse) drive rebuilds checkpoints from empty.
+    is_response_redrive = bool(
+        ctx.record.human_responses
+        and ctx.record.human_responses[-1].state == M.RESPONSE_PENDING
     )
-    # A fixer that parked mid-edit left the worktree dirty; P1 re-enters the
-    # cycle at the round's start, whose clean-handoff guard (FR-9.3) requires a
-    # committed tree. Back up the preserved partial work (lossless) and reset to
-    # the handoff before re-driving. This is the P1 round-loss deferral — the
-    # partial fixer edits are discarded on resume; P5's per-round checkpoints
-    # will instead re-enter at the first incomplete sub-step. Without this, a
-    # mid-fixer quota park would resume straight into `_clean_handoff_failure`.
-    if is_quota_resume and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-        backup = (
-            f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
-            f"{ctx.record.id}-usage-limit-resume"
+    is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    resume = _Resume(
+        ctx, active=bool(ctx.record.checkpoints) and not is_response_redrive
+    )
+    invalidated = False
+    if resume.active and not _sha_guard_ok(ctx, resume):
+        resume.invalidate()
+        invalidated = True
+        resume_notes.append(
+            "checkpoint reuse invalidated (FR-4.2): HEAD moved since the round was "
+            "checkpointed (manual commit during the park?); re-running the cycle "
+            "from a clean handoff"
         )
-        gitops.backup_dirty_worktree(
-            ctx.repo_root, backup,
-            f"usage-limit resume: preserved partial work for {ctx.record.id} "
-            "(round-loss, P1 deferral)",
-            exclude=ctx.excludes,
-        )
-        gitops.reset_hard(ctx.repo_root, handoff)
-        gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+    if not resume.active:
+        # Fresh run (first drive, a `--response` re-drive, or post-invalidation):
+        # rebuild checkpoints cleanly so a later park's reuse is unambiguous.
+        ctx.record.checkpoints = []
+    # Session continuation (FR-3.3) is applied only when we re-enter at the REVIEW
+    # sub-step that owns the parked session — the coherent, worktree-clean case.
+    # A triager park (a per-finding batch) or a fixer park (edits we reset) re-runs
+    # its sub-step sessionless: continuing there would splice one role's
+    # conversation into another / lie about worktree state (P1 F-001 lesson). It is
+    # also suppressed after an invalidation (the session belongs to discarded work).
+    resume_session = ctx.record.session_id if is_quota_resume and not invalidated else None
+    resume_substep = ctx.record.parked_substep if is_quota_resume and not invalidated else None
+    # Round-1 handoff on reuse is the SHA actually reviewed (the checkpoint), not
+    # `_phase_and_handoff`'s latest-commit heuristic — which would misread a
+    # committed round-1 fix as the round's handoff and confuse the SHA guard.
+    if resume.active:
+        r1_review = resume.cp(1, "review")
+        if r1_review is not None:
+            handoff = r1_review.handoff_sha
+
+    def finish(result: StepResult) -> StepResult:
+        # Fold any FR-4.1/FR-4.2 resume audit note into whatever result the
+        # (possibly re-run) cycle produced, so the invalidation/reset reason is
+        # visible in `status`/notes without a transcript read.
+        if resume_notes:
+            extra = "\n".join(resume_notes)
+            result.notes = f"{result.notes}\n{extra}" if result.notes else extra
+        return _finish(result, usage, commits, artifact_writes, metrics)
 
     for rnd in range(1, max_rounds + 1):
-        # FR-9.3: control passes to a reviewer only on a clean, committed tree.
-        if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            return _finish(
-                _clean_handoff_failure(ctx, rnd),
-                usage, commits, artifact_writes, metrics,
-            )
+        # FR-4.1 reuse is per-artifact and FAIL-CLOSED: a checkpoint whose
+        # round-scoped artifact is missing (corruption / manual deletion) is NOT
+        # reused — the sub-step re-runs rather than proceeding on empty data.
+        rdata = resume.load(rnd, "review")
+        reuse_review = rdata is not None
+        # FR-9.3 clean handoff guards control passing to a REVIEWER. When this
+        # round's review is reused we re-enter PAST that handoff (the guard held
+        # when it first ran), so skip it — and never fail a reused round on the
+        # partial fixer edits we reset just before the fix sub-step.
+        if not reuse_review and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            return finish(_clean_handoff_failure(ctx, rnd))
 
         # ---- 1. review, FR-9.6 guard applied after EVERY attempt (F-004) ------
         # A reviewer can mutate the tree and THEN fail schema validation; the
         # guard therefore runs between attempts (so a retry never re-enters on
         # a dirty tree) and on the failure path (so the policy always applies).
-        review_prompt = _review_prompt(step, ctx, handoff, rnd, carried)
-        guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
-        review_logger = step_logger(ctx, f"r{rnd}-review")
-        try:
-            if resume_session is not None and rnd == 1:
-                # FR-3.3: continue the parked reviewer session on the first
-                # re-driven call; consume the session so later rounds/calls run
-                # fresh (a full re-review, not a continuation).
-                review = _resume_review(
-                    ctx, reviewer, resume_session, review_prompt,
-                    findings_schema, usage, review_logger, guard,
-                )
-                resume_session = None
-            else:
-                review = _run_sub(
-                    ctx, reviewer, review_prompt,
-                    schema=findings_schema, usage=usage,
-                    logger=review_logger,
-                    structured_name="findings.json",
-                    after_attempt=guard.check,
-                    substep=f"r{rnd}-review",
-                )
-        except _ParkCycle as park:
-            return _finish(park.result, usage, commits, artifact_writes, metrics)
+        if reuse_review:
+            # FR-4.1 reuse: the reviewer already ran (its findings, incl. any
+            # synthetic mutation findings, are in the checkpoint); do not re-invoke.
+            findings = list(rdata.get("findings") or [])
+            open_questions = rdata.get("open_questions") or []
+            review_summary = rdata.get("summary", "")
+        else:
+            review_prompt = _review_prompt(step, ctx, handoff, rnd, carried)
+            guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
+            review_logger = step_logger(ctx, f"r{rnd}-review")
+            cont_session = resume_session if resume_substep == f"r{rnd}-review" else None
+            try:
+                if cont_session is not None:
+                    # FR-3.3: continue the parked reviewer session on the re-driven
+                    # call; consume it so later calls run fresh.
+                    review = _resume_review(
+                        ctx, reviewer, cont_session, review_prompt,
+                        findings_schema, usage, review_logger, guard,
+                        substep=f"r{rnd}-review",
+                    )
+                    resume_session = None
+                else:
+                    review = _run_sub(
+                        ctx, reviewer, review_prompt,
+                        schema=findings_schema, usage=usage,
+                        logger=review_logger,
+                        structured_name="findings.json",
+                        after_attempt=guard.check,
+                        substep=f"r{rnd}-review",
+                    )
+            except _ParkCycle as park:
+                return finish(park.result)
+            findings = list((review.structured or {}).get("findings") or [])
+            findings.extend(guard.synthetic_findings)
+            open_questions = (review.structured or {}).get("open_questions") or []
+            review_summary = (review.structured or {}).get("summary", "")
 
-        findings = list((review.structured or {}).get("findings") or [])
-        findings.extend(guard.synthetic_findings)
-        metrics.record_round(findings)
-        open_questions = (review.structured or {}).get("open_questions") or []
-        artifact_writes["findings.json"] = _write_artifact(
-            ctx, "findings.json",
-            {"findings": findings, "open_questions": open_questions,
-             "summary": (review.structured or {}).get("summary", "")},
-        )
+        metrics.record_round(findings)  # counted on reuse too, so trend math matches
+        review_out = {"findings": findings, "open_questions": open_questions,
+                      "summary": review_summary}
+        artifact_writes["findings.json"] = _write_artifact(ctx, "findings.json", review_out)
         # Drop any prior round/run's triage.json — from BOTH disk and the
         # in-memory registry — the instant new findings land: an interruption
         # before THIS round's triage rewrites it can otherwise leave findings.json
@@ -280,19 +448,26 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # surfaced a phantom FR-10.4 escalation). Clearing the registry too keeps
         # a converged DONE from registering a deleted path. Absent > stale.
         _invalidate_artifact(ctx, "triage.json", artifact_writes)
+        if not reuse_review:  # write-ahead checkpoint (FR-4.1); reuse never re-records
+            _checkpoint(ctx, "review", rnd, handoff, data=review_out)
         if not findings:
-            return _finish(
-                StepResult(status=DONE, notes=f"converged: round-{rnd} review returned no findings"),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(
+                status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
         # A transient (usage-limit/overload) failure in any triage sub-call parks
-        # the whole cycle (FR-3.2), mirroring the reviewer wrapper above.
-        try:
-            verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
-        except _ParkCycle as park:
-            return _finish(park.result, usage, commits, artifact_writes, metrics)
+        # the whole cycle (FR-3.2), mirroring the reviewer wrapper above. On resume
+        # the whole batch is reused as one sub-step (P5; P11 refines it per-finding).
+        tdata = resume.load(rnd, "triage")  # None → not reusable, re-run (fail closed)
+        reuse_triage = tdata is not None
+        if reuse_triage:
+            verdicts = list(tdata.get("verdicts") or [])
+            park_reason = None
+        else:
+            try:
+                verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
+            except _ParkCycle as park:
+                return finish(park.result)
         metrics.record_verdicts(verdicts)
         # Integrity backstop BEFORE the authoritative write (data over inference):
         # every verdict must map to a finding in THIS round. The triager forces
@@ -305,20 +480,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             ctx, findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
         )
         if stray:
-            return _finish(
-                StepResult(status=PARKED, notes=(
-                    "integrity: triage verdict(s) reference finding id(s) absent "
-                    f"from round-{rnd} findings ({', '.join(stray)}); refusing to "
-                    "surface a phantom escalation (findings/triage desync)"
-                )),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(status=PARKED, notes=(
+                "integrity: triage verdict(s) reference finding id(s) absent "
+                f"from round-{rnd} findings ({', '.join(stray)}); refusing to "
+                "surface a phantom escalation (findings/triage desync)"
+            )))
         if park_reason is not None:
-            return _finish(
-                StepResult(status=PARKED, notes=park_reason,
-                           parked_reason=M.PARKED_REASON_RESPONSE),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(status=PARKED, notes=park_reason,
+                                     parked_reason=M.PARKED_REASON_RESPONSE))
+        if not reuse_triage:  # checkpoint the completed, integrity-checked batch
+            _checkpoint(ctx, "triage", rnd, handoff, data={"verdicts": verdicts})
 
         by_id = {f["id"]: f for f in findings}
 
@@ -348,128 +519,122 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     "finding(s) whose fix lands in an upstream artifact "
                     f"(FR-10.4 upstream invalidation): {', '.join(upstream)}"
                 )
-            return _finish(
-                StepResult(status=PARKED,
-                           notes="escalation: " + "; ".join(reasons),
-                           parked_reason=M.PARKED_REASON_RESPONSE),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(
+                status=PARKED,
+                notes="escalation: " + "; ".join(reasons),
+                parked_reason=M.PARKED_REASON_RESPONSE))
 
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
         if not accepted:
-            return _finish(
-                StepResult(
-                    status=DONE,
-                    notes=f"converged: round-{rnd} accepted no findings "
-                    "(declines recorded with reasons in triage.json)",
-                ),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(
+                status=DONE,
+                notes=f"converged: round-{rnd} accepted no findings "
+                "(declines recorded with reasons in triage.json)"))
 
         # ---- 3. fix + fix-round commit (FR-9.4) -------------------------------
-        fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
-        try:
-            _run_sub(
-                ctx, fixer, fix_prompt, schema=None, usage=usage,
-                logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
-                substep=f"r{rnd}-fix",
-            )
-        except _ParkCycle as park:
-            return _finish(park.result, usage, commits, artifact_writes, metrics)
-        if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            return _finish(
-                StepResult(
+        fix_cp = resume.cp(rnd, "fix")
+        if fix_cp is not None and fix_cp.result_sha:
+            # FR-4.1 reuse: the fixer already committed this round; the commit is
+            # already in the manifest, so DO NOT re-add it to `commits` (which
+            # would double-record) — just adopt its SHA as this round's fix.
+            fix_sha = fix_cp.result_sha
+        else:
+            note = _reset_dirty_to_handoff(ctx, handoff, rnd)  # discard parked partial edits
+            if note is not None:
+                resume_notes.append(note)
+            fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
+            try:
+                _run_sub(
+                    ctx, fixer, fix_prompt, schema=None, usage=usage,
+                    logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
+                    substep=f"r{rnd}-fix",
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
+            if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+                return finish(StepResult(
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
-                    f"{len(accepted)} accepted finding(s); failing closed",
-                ),
-                usage, commits, artifact_writes, metrics,
+                    f"{len(accepted)} accepted finding(s); failing closed"))
+            message = _fix_commit_message(phase, rnd, findings, verdicts)
+            err = validate_commit_message(message)
+            if err is not None:  # engine-composed; a violation here is a bug
+                return finish(StepResult(
+                    status=FAILED, notes=f"fix-round commit message invalid: {err.reason}"))
+            fix_sha = gitops.commit_all(
+                ctx.repo_root, message,
+                identity=ctx.config.identity(fixer), exclude=ctx.excludes,
             )
-        message = _fix_commit_message(phase, rnd, findings, verdicts)
-        err = validate_commit_message(message)
-        if err is not None:  # engine-composed; a violation here is a bug
-            return _finish(
-                StepResult(status=FAILED, notes=f"fix-round commit message invalid: {err.reason}"),
-                usage, commits, artifact_writes, metrics,
-            )
-        fix_sha = gitops.commit_all(
-            ctx.repo_root, message,
-            identity=ctx.config.identity(fixer), exclude=ctx.excludes,
-        )
-        commits.append((f"{phase}.{rnd}", fix_sha))
+            commits.append((f"{phase}.{rnd}", fix_sha))
+            _checkpoint(ctx, "fix", rnd, handoff, result_sha=fix_sha)
 
         # ---- 4. diff-scoped confirm (FR-9.5) ----------------------------------
-        confirm_prompt = _confirm_prompt(
-            step, ctx, handoff, fix_sha, findings, verdicts
-        )
-        try:
-            confirm = _run_sub(
-                ctx, confirmer, confirm_prompt,
-                schema=confirm_schema, usage=usage,
-                logger=step_logger(ctx, f"r{rnd}-confirm"),
-                structured_name="confirm.json",
-                substep=f"r{rnd}-confirm",
-            )
-        except _ParkCycle as park:
-            return _finish(park.result, usage, commits, artifact_writes, metrics)
-        cdata = confirm.structured or {}
+        stored = resume.load(rnd, "confirm")  # None → not reusable, re-run (fail closed)
+        reuse_confirm = stored is not None
+        if reuse_confirm:
+            # FR-4.1 reuse: strip the engine-added reconciliation/gate keys to
+            # recover the confirmer's own structured output for reconciliation.
+            cdata = {k: v for k, v in stored.items()
+                     if k not in ("engine_reconciliation", "surfaced_for_gate")}
+        else:
+            confirm_prompt = _confirm_prompt(step, ctx, handoff, fix_sha, findings, verdicts)
+            try:
+                confirm = _run_sub(
+                    ctx, confirmer, confirm_prompt,
+                    schema=confirm_schema, usage=usage,
+                    logger=step_logger(ctx, f"r{rnd}-confirm"),
+                    structured_name="confirm.json",
+                    substep=f"r{rnd}-confirm",
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
+            cdata = confirm.structured or {}
         metrics.record_confirm(cdata)
         actions = {v["finding_id"]: v["action"] for v in verdicts}
         open_items, reconciliation = _open_after_confirm(by_id, actions, cdata)
         forcing = _forcing_open(open_items, convergence)
         # Non-blocking open items don't loop (policy A); they accumulate and are
         # surfaced at the human gate (BOOTSTRAP-NOTES #30). Dedup by id, latest
-        # round's verdict wins.
+        # round's verdict wins. Recomputed each round, so a resume that reuses
+        # earlier confirms rebuilds the same cumulative surfaced set.
         for it in open_items:
             if it not in forcing:
                 surfaced[str(it.get("id", "?"))] = {**it, "round": rnd}
         # The reconciliation + the gate-surfaced set are recorded next to the
         # verdicts — data over inference.
-        artifact_writes["confirm.json"] = _write_artifact(
-            ctx, "confirm.json",
-            {**cdata, "engine_reconciliation": reconciliation,
-             "surfaced_for_gate": list(surfaced.values())},
-        )
+        confirm_out = {**cdata, "engine_reconciliation": reconciliation,
+                       "surfaced_for_gate": list(surfaced.values())}
+        artifact_writes["confirm.json"] = _write_artifact(ctx, "confirm.json", confirm_out)
+        if not reuse_confirm:
+            _checkpoint(ctx, "confirm", rnd, handoff, data=confirm_out)
         last_forcing = forcing
         if not forcing:
-            return _finish(
-                StepResult(
-                    status=DONE,
-                    notes=f"converged in round {rnd} ({convergence} policy): no "
-                    f"open {'finding' if convergence == 'strict' else 'blocking'}"
-                    f"; {len(accepted)} fixed, "
-                    f"{len(surfaced)} non-blocking item(s) surfaced for the gate"
-                    + (f": {', '.join(surfaced)}" if surfaced else ""),
-                ),
-                usage, commits, artifact_writes, metrics,
-            )
+            return finish(StepResult(
+                status=DONE,
+                notes=f"converged in round {rnd} ({convergence} policy): no "
+                f"open {'finding' if convergence == 'strict' else 'blocking'}"
+                f"; {len(accepted)} fixed, "
+                f"{len(surfaced)} non-blocking item(s) surfaced for the gate"
+                + (f": {', '.join(surfaced)}" if surfaced else "")))
         # next round is regression-scoped and reviews only what still forces it
         handoff = fix_sha
         carried = forcing
 
     # max_rounds exhausted (FR-10.5): open blockers escalate, never carry forward.
     if last_forcing:
-        return _finish(
-            StepResult(
-                status=PARKED,
-                notes="escalation (FR-10.5): max_rounds="
-                f"{max_rounds} exhausted with open "
-                f"{'finding' if convergence == 'strict' else 'blocking'}(s): "
-                f"{_fmt_ids(last_forcing)}; a human must resolve"
-                + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
-                   if surfaced else ""),
-                parked_reason=M.PARKED_REASON_RESPONSE,
-            ),
-            usage, commits, artifact_writes, metrics,
-        )
-    return _finish(
-        StepResult(
-            status=DONE,
-            notes=f"max_rounds={max_rounds} reached with non-blocking items "
-            "still open; recorded in confirm.json and carried as history",
-        ),
-        usage, commits, artifact_writes, metrics,
-    )
+        return finish(StepResult(
+            status=PARKED,
+            notes="escalation (FR-10.5): max_rounds="
+            f"{max_rounds} exhausted with open "
+            f"{'finding' if convergence == 'strict' else 'blocking'}(s): "
+            f"{_fmt_ids(last_forcing)}; a human must resolve"
+            + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
+               if surfaced else ""),
+            parked_reason=M.PARKED_REASON_RESPONSE))
+    return finish(StepResult(
+        status=DONE,
+        notes=f"max_rounds={max_rounds} reached with non-blocking items "
+        "still open; recorded in confirm.json and carried as history"))
 
 
 # --- sub-agent execution --------------------------------------------------------
@@ -564,10 +729,11 @@ def _run_sub(
             # the observed real cycle-death mode. Park the whole CYCLE step with
             # parked_reason=usage_limit (worktree untouched, the failing
             # sub-agent's session preserved) instead of failing it — a plain
-            # `gauntlet resume` re-drives the cycle (P1 re-enters the round at its
-            # start; P5's checkpoints tighten this to the first incomplete
-            # sub-step). Raised as a _ParkCycle so the round-loop wrapper returns
-            # it uniformly for any sub-role (reviewer/triager/fixer/confirmer).
+            # `gauntlet resume` re-drives the cycle. The write-ahead sub-step
+            # checkpoints (FR-4.1) already recorded on the record let that resume
+            # re-enter at the first INCOMPLETE sub-step (`substep` records which
+            # sub-step owns the preserved session). Raised as a _ParkCycle so the
+            # round-loop wrapper returns it uniformly for any sub-role.
             if isinstance(exc, AgentFailedError) and (
                 exc.failure_info is not None and exc.failure_info.is_transient
             ):
@@ -611,6 +777,8 @@ def _resume_review(
     usage: Any,
     logger: Any,
     guard: "_MutationGuard",
+    *,
+    substep: str = "r1-review",
 ):
     """Continue the parked reviewer session on a usage-limit resume (FR-3.3).
 
@@ -618,10 +786,11 @@ def _resume_review(
     (the session already holds the task context; re-sending the full review
     prompt would waste the very budget the resume conserves). If the stored
     session is unknown/expired — the common case when the parked sub-agent was a
-    *different* role/adapter than the reviewer, since P1 re-enters the round at
-    its start regardless of which sub-step parked — fall back to a full,
-    sessionless re-review (recoverable, not a run-halting fault). Fail-safe: a
-    wrong-adapter session simply triggers the fallback.
+    *different* role/adapter than the reviewer — fall back to a full, sessionless
+    re-review (recoverable, not a run-halting fault). Fail-safe: a wrong-adapter
+    session simply triggers the fallback. ``substep`` labels the call so a fresh
+    park inside the continuation re-records the correct owning sub-step (the
+    re-entered round's review, which P5 may reach at round > 1).
     """
     from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
 
@@ -629,14 +798,14 @@ def _resume_review(
         return _run_sub(
             ctx, reviewer, _CONTINUATION_PROMPT, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
-            after_attempt=guard.check, session=session, substep="r1-review",
+            after_attempt=guard.check, session=session, substep=substep,
         )
     except SessionNotFoundError as exc:
         logger.log_text("session-expired.txt", str(exc))
         return _run_sub(
             ctx, reviewer, full_prompt, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
-            after_attempt=guard.check, substep="r1-review",
+            after_attempt=guard.check, substep=substep,
         )
 
 
