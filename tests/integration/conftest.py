@@ -18,6 +18,19 @@ from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
 
 
 @pytest.fixture(autouse=True)
+def _isolated_usage_ledger(tmp_path, monkeypatch):
+    """Redirect the machine-global usage ledger (FR-10) to a temp path.
+
+    An integration test that drives a real run would otherwise append rows to
+    the operator's real ``~/.gauntlet/usage-ledger.jsonl``; point it at a
+    throwaway file per test so the contract suite leaves no machine-global trace.
+    """
+    from gauntlet.engine.ledger import LEDGER_PATH_ENV
+
+    monkeypatch.setenv(LEDGER_PATH_ENV, str(tmp_path / "usage-ledger.jsonl"))
+
+
+@pytest.fixture(autouse=True)
 def _sanitize_gauntlet_env():
     """Clear engine-managed GAUNTLET_* vars for each integration test, restoring
     them after.

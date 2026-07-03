@@ -2378,6 +2378,47 @@ class RunManager:
         layout = self.layout(slug)
         return Manifest.load(layout.active_run_dir() / "manifest.json")
 
+    # ---- usage-ledger backfill (harness-efficiency FR-10.1) -----------------
+    def _iter_run_manifests(self) -> "list[Manifest]":
+        """Every parseable run manifest under the run root (``run_root/*/*/``).
+
+        Scans the on-disk layout the orchestrator writes — one manifest per run
+        instance. A malformed/torn manifest is skipped (fail-safe: backfill is a
+        best-effort reconstruction, never a run-halting parse). Deduplicated by
+        run_id so a slug's `active-run.txt` pointer plus its run dir don't yield
+        the same manifest twice.
+        """
+        run_root = self.repo_root / self.config.run_root
+        manifests: list[Manifest] = []
+        seen: set[str] = set()
+        for manifest_path in sorted(run_root.glob("*/*/manifest.json")):
+            try:
+                man = Manifest.load(manifest_path)
+            except (OSError, ValueError):
+                continue
+            if man.run_id in seen:
+                continue
+            seen.add(man.run_id)
+            manifests.append(man)
+        return manifests
+
+    def backfill_ledger(self, *, ledger_path: Path | None = None):
+        """Reconstruct the machine-global usage ledger from existing manifests.
+
+        A one-shot, idempotent operator command (FR-10.1): so the median estimator
+        has history from the first enforced run instead of a cold start. Re-running
+        it appends nothing (de-dup by ``run_id::step_id``). Returns a
+        ``ledger.BackfillResult`` (manifests scanned, rows added vs skipped).
+        """
+        from gauntlet.engine.ledger import backfill_from_manifests
+
+        return backfill_from_manifests(
+            self._iter_run_manifests(),
+            repo_root=self.repo_root,
+            config=self.config,
+            path=ledger_path,
+        )
+
     # ---- feedback (FR-6.1) --------------------------------------------------
     def save_feedback(self, slug: str, data, *, run_dir: Path | None = None) -> Path:
         """Capture human feedback into the run's ``retro/feedback.md`` (+ json)."""

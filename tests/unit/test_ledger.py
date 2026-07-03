@@ -354,6 +354,48 @@ def test_backfill_from_manifests_is_idempotent(tmp_path: Path) -> None:
     assert total2 == total
 
 
+def test_run_manager_backfill_scans_run_root(tmp_path: Path, monkeypatch) -> None:
+    """`gauntlet ledger backfill` reconstructs from run_root/*/*/manifest.json,
+    idempotently, via RunManager (FR-10.1)."""
+    from gauntlet.engine.run import RunManager
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv(L.LEDGER_PATH_ENV, str(ledger_path))
+    repo = tmp_path / "repo"
+    (repo / "runs" / "demo" / "run-1").mkdir(parents=True)
+    (repo / "runs" / "other" / "run-2").mkdir(parents=True)
+    cfg = RunConfig.model_validate(
+        {
+            "run_root": "runs",
+            "agents": {"builder": {"adapter": "claude-code", "model": "opus"}},
+        }
+    )
+    now = _now()
+    ts = _iso(now - timedelta(hours=1))
+    m1 = _manifest_with_steps(
+        "run-1", [_step("impl", "builder", 100, 40, started=ts, ended=ts)]
+    )
+    m2 = _manifest_with_steps(
+        "run-2", [_step("impl", "builder", 200, 0, started=ts, ended=ts)]
+    )
+    m1.write_atomic(repo / "runs" / "demo" / "run-1" / "manifest.json")
+    m2.write_atomic(repo / "runs" / "other" / "run-2" / "manifest.json")
+    # A torn manifest must not abort the scan.
+    (repo / "runs" / "demo" / "run-1" / "..torn").write_text("{bad")
+
+    mgr = RunManager(repo, config=cfg)
+    res = mgr.backfill_ledger()
+    assert res.manifests == 2
+    assert res.rows_added == 2
+    total = L.window_usage(
+        L.load_rows(ledger_path), provider="anthropic", window_hours=5,
+        unit="tokens", now=now,
+    )
+    assert total == (100 + 40) + 200
+    # Idempotent: a second backfill adds nothing.
+    assert mgr.backfill_ledger().rows_added == 0
+
+
 def test_backfill_unknown_profile_records_null_provider(tmp_path: Path) -> None:
     """A run using a profile absent from the current config still records a row,
     with provider=None so it matches no window (FR-10.1)."""

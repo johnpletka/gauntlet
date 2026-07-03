@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import gitops, ledger as L, manifest as M
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
@@ -139,6 +139,7 @@ class Orchestrator:
         extra_context: dict[str, Any] | None = None,
         clock: Callable[[], str] = _utcnow,
         response_action: "ResponseAction | None" = None,
+        ledger_path: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.run_dir = run_dir
@@ -152,6 +153,10 @@ class Orchestrator:
         self.extra_context = extra_context or {}
         self.clock = clock
         self.response_action = response_action
+        # Machine-global usage ledger (FR-10.1): resolved once (honors
+        # GAUNTLET_LEDGER_PATH) so the append/admission paths agree on one file.
+        self.ledger_path = ledger_path or L.default_ledger_path()
+        self._repo_hash = L.repo_root_hash(repo_root)
         self.manifest_path = run_dir / "manifest.json"
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
@@ -478,30 +483,40 @@ class Orchestrator:
 
         try:
             ctx = self._make_context(step, rec, iteration, item)
-            try:
-                result = spec.handler(step, ctx)
-            except AgentTimeoutError as exc:
-                result = StepResult(
-                    status=HALTED,
-                    halt_reason=M.HALT_REASON_TIMEOUT,
-                    usage=exc.partial.usage if exc.partial else None,
-                    session_id=exc.partial.session_id if exc.partial else None,
-                    notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
-                )
-            except AgentFailedError as exc:
-                # FR-3.2: a TRANSIENT failure (usage limit / overload) is not a
-                # step failure — park (not FAILED) with parked_reason=usage_limit,
-                # preserving the worktree (no reset on this park kind) and the CLI
-                # session so a plain `gauntlet resume` continues it (FR-3.3). A
-                # TERMINAL or unclassified failure fails closed → FAILED (a human
-                # decides), exactly as an unclassified handler fault would.
-                result = self._agent_failure_result(exc)
-            except Exception as exc:  # fail closed: a handler fault halts the step
-                result = StepResult(
-                    status=FAILED,
-                    halt_reason=M.HALT_REASON_ADAPTER_ERROR,
-                    notes=f"handler error: {exc}",
-                )
+            # FR-10.3: window admission runs BEFORE the handler, so an enforce
+            # park lands at a clean boundary with zero work in flight (in
+            # contrast to FR-3's reactive mid-step usage_limit park). An advisory
+            # short-fall records a manifest warning and returns None (launch as
+            # usual); a `sufficient`/unconstrained step returns None too.
+            admission = self._window_admission(step, rec)
+            if admission is not None:
+                result = admission
+            else:
+                try:
+                    result = spec.handler(step, ctx)
+                except AgentTimeoutError as exc:
+                    result = StepResult(
+                        status=HALTED,
+                        halt_reason=M.HALT_REASON_TIMEOUT,
+                        usage=exc.partial.usage if exc.partial else None,
+                        session_id=exc.partial.session_id if exc.partial else None,
+                        notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
+                    )
+                except AgentFailedError as exc:
+                    # FR-3.2: a TRANSIENT failure (usage limit / overload) is not
+                    # a step failure — park (not FAILED) with
+                    # parked_reason=usage_limit, preserving the worktree (no reset
+                    # on this park kind) and the CLI session so a plain `gauntlet
+                    # resume` continues it (FR-3.3). A TERMINAL or unclassified
+                    # failure fails closed → FAILED (a human decides), exactly as
+                    # an unclassified handler fault would.
+                    result = self._agent_failure_result(exc)
+                except Exception as exc:  # fail closed: a handler fault halts it
+                    result = StepResult(
+                        status=FAILED,
+                        halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+                        notes=f"handler error: {exc}",
+                    )
 
             result = self._apply_budget_guard(step, rec, result)
             # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
@@ -729,6 +744,85 @@ class Orchestrator:
         result.notes = f"{result.notes}\n{note}" if result.notes else note
         return result
 
+    def _now_dt(self) -> datetime:
+        """The orchestrator clock as an aware UTC datetime (for window math).
+
+        Parses the injectable ISO clock so admission is deterministic under a
+        stubbed clock in tests; an unparseable clock falls back to wall-clock UTC.
+        """
+        try:
+            dt = datetime.fromisoformat(self.clock())
+        except (ValueError, TypeError):
+            return datetime.now(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    def _window_admission(self, step: Step, rec: StepRecord) -> StepResult | None:
+        """Pre-step provider-window admission (FR-10.2/10.3).
+
+        Returns a PARKED ``usage_window`` StepResult when the step's provider is
+        window-constrained, ``enforce: true``, and the estimated usage exceeds
+        remaining headroom — a clean-boundary park before any adapter call. In
+        advisory mode (default) the same short-fall records a manifest warning and
+        returns ``None`` (launch as usual). Returns ``None`` for a non-agent step,
+        a provider with no configured window, sufficient headroom, or any ledger
+        error (advisory — a ledger fault never blocks a run, PRD §4.2).
+        """
+        if step.type not in ("agent_task", "adversarial_cycle") or not step.agent:
+            return None
+        provider = L.profile_provider(self.config, step.agent)
+        if provider is None:
+            return None
+        window = self.config.providers.get(provider)
+        if window is None:
+            return None
+        try:
+            rows = L.load_rows(self.ledger_path)
+            decision = L.admit_step(
+                rows, window, provider=provider, step_type=step.type,
+                profile=step.agent, now=self._now_dt(),
+            )
+        except Exception:
+            return None  # advisory: never block a launch on a ledger error
+        if decision.sufficient:
+            return None
+        note = f"usage-window admission (FR-10.3): {decision.summary()}"
+        if window.enforce:
+            return StepResult(
+                status=PARKED,
+                parked_reason=M.PARKED_REASON_USAGE_WINDOW,
+                # Reuse the quota reset field for the projected replenishment time
+                # (the datum status surfaces for a usage_window park, mirroring a
+                # usage_limit park's reset time).
+                quota_reset_at=decision.replenish_at,
+                notes=note,
+            )
+        # Advisory: stamp the warning into the manifest (its non-fatal-anomaly
+        # channel) so it is recorded and surfaced without blocking the launch.
+        warning = f"[{step.id}] {note}"
+        if warning not in self.manifest.warnings:
+            self.manifest.warnings.append(warning)
+        return None
+
+    def _append_ledger_row(self, rec: StepRecord) -> None:
+        """Append this step's content-free usage to the machine-global ledger.
+
+        Best-effort and idempotent (FR-10.1): a step with no agent/usage yields no
+        row; the ``run_id::step_id`` de-dup key means a re-finalized (resumed) step
+        never double-counts — the first execution's spend wins. Any error is
+        swallowed: the ledger is advisory, never a correctness dependency (§4.2).
+        """
+        try:
+            provider = L.profile_provider(self.config, rec.agent)
+            model = L.profile_model(self.config, rec.agent)
+            row = L.row_from_step(
+                rec, run_id=self.manifest.run_id, repo_hash=self._repo_hash,
+                provider=provider, model=model,
+            )
+            if row is not None:
+                L.append_unique([row], path=self.ledger_path)
+        except Exception:
+            pass
+
     def _agent_failure_result(self, exc: AgentFailedError) -> StepResult:
         """Turn a classified adapter failure into a park (transient) or FAILED.
 
@@ -943,6 +1037,10 @@ class Orchestrator:
         if result.status == DONE:
             for name, path in result.artifact_writes.items():
                 self.artifacts[name] = path
+        # FR-10.1: append this step's content-free usage to the machine-global
+        # ledger the instant its usage is recorded, so later runs (and window
+        # admission on the next step) see it. Best-effort + idempotent inside.
+        self._append_ledger_row(rec)
         # Failure-only attempt increment (FR-6): the audit retry counter advances
         # ONLY when a run ends in failure — relocated here from `_execute`'s old
         # unconditional top-of-run bump. DONE / PARKED / HALTED / INTERRUPTED do

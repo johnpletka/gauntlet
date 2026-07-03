@@ -758,7 +758,9 @@ def status(
     # usage limit — the reset time, all sourced from the manifest so no parked
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
-    if rstate.state == operator.STATE_PARKED_USAGE_LIMIT and rstate.parked is not None:
+    if rstate.state in (
+        operator.STATE_PARKED_USAGE_LIMIT, operator.STATE_PARKED_USAGE_WINDOW
+    ) and rstate.parked is not None:
         pr = next(
             (r for r in man.steps
              if operator.render_step_id(r) == rstate.parked.step_id),
@@ -1236,6 +1238,30 @@ def rollback(
     """Reset the branch + manifest to a phase boundary (FR-9.9, guarded)."""
     target = _manager().rollback(slug, phase)
     typer.echo(f"rolled back to {target[:10]}")
+
+
+ledger_app = typer.Typer(
+    no_args_is_help=True, help="Machine-global usage ledger (FR-10)."
+)
+app.add_typer(ledger_app, name="ledger")
+
+
+@ledger_app.command("backfill")
+def ledger_backfill() -> None:
+    """Reconstruct the usage ledger from this repo's existing run manifests (FR-10.1).
+
+    One-shot and idempotent: gives the window estimator history from the first
+    enforced run instead of a cold start. Re-running appends nothing (de-dup by
+    run_id::step_id).
+    """
+    from gauntlet.engine.ledger import default_ledger_path
+
+    res = _manager().backfill_ledger()
+    typer.echo(
+        f"ledger backfill: scanned {res.manifests} manifest(s), "
+        f"added {res.rows_added} row(s), skipped {res.rows_skipped} duplicate(s) "
+        f"→ {default_ledger_path()}"
+    )
 
 
 @app.command()

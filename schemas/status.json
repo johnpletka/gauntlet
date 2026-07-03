@@ -71,6 +71,7 @@
         "parked_gate",
         "parked_for_response",
         "parked_usage_limit",
+        "parked_usage_window",
         "parked_artifact_invalid",
         "failed",
         "halted",
@@ -110,11 +111,11 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["reset_at"],
-      "description": "Provider usage-limit reset info (harness-efficiency FR-7.1), non-null only when parked on a usage_limit park; null otherwise.",
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
       "properties": {
         "reset_at": {
           "type": ["string", "null"],
-          "description": "Absolute UTC reset time (ISO-8601), or null when the provider reported no structured retry hint."
+          "description": "Absolute UTC reset time (ISO-8601): a usage_limit park's provider reset (null when no structured retry hint), or a usage_window park's projected window-replenishment time."
         }
       }
     },
@@ -148,7 +149,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -427,7 +428,7 @@
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_artifact_invalid"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

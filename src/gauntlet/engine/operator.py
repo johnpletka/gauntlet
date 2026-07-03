@@ -71,6 +71,12 @@ STATE_PARKED_FOR_RESPONSE = "parked_for_response"
 # Distinct from parked_for_response: it needs NO human decision — a plain
 # `gauntlet resume` continues the preserved session (FR-3.3).
 STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
+# A step parked pre-launch because the provider usage window had insufficient
+# headroom for the next step (harness-efficiency FR-10.3, ``enforce: true``).
+# Like the usage-limit park it needs NO human decision — a plain `gauntlet
+# resume` retries once the window replenishes (the projected time is surfaced in
+# the quota block).
+STATE_PARKED_USAGE_WINDOW = "parked_usage_window"
 # A step parked because an agent-authored structured artifact failed validation
 # after the bounded in-session repair loop (harness-efficiency FR-2.2). Like the
 # usage-limit park it needs NO human decision in the `--response` sense — a plain
@@ -109,6 +115,7 @@ _MEANING: dict[str, str] = {
     STATE_PARKED_GATE: "awaiting a human decision at a gate",
     STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision",
     STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
+    STATE_PARKED_USAGE_WINDOW: "parked before a step to stay within the provider usage window — `resume` retries once it replenishes",
     STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
     STATE_FAILED: "a step failed",
     STATE_HALTED: "the budget/timeout guard tripped",
@@ -396,6 +403,10 @@ def _actions_for(
     if state == STATE_PARKED_USAGE_LIMIT:
         # FR-3.3: a plain `resume` continues the preserved session — no decision.
         return [_control_resume(slug)]
+    if state == STATE_PARKED_USAGE_WINDOW:
+        # FR-10.3: parked pre-step to stay within the window — a plain `resume`
+        # retries once it replenishes (no human decision, no session to continue).
+        return [_control_resume(slug)]
     if state == STATE_PARKED_ARTIFACT_INVALID:
         # FR-2.2: a plain `resume` re-runs only the validator against the
         # (possibly hand-edited) artifact — inspect the error, then resume.
@@ -652,16 +663,23 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
                 ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
+        if reason == M.PARKED_REASON_USAGE_WINDOW:
+            # FR-10.3: an enforce-mode pre-step park for insufficient window
+            # headroom — a plain `resume` retries once the window replenishes.
+            return (
+                STATE_PARKED_USAGE_WINDOW,
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
+                None,
+            )
         if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
             return (
                 STATE_PARKED_GATE,
                 ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        # A non-gate step parked with no reason, an unknown reason value, or a
-        # park reason whose classification behavior lands in a later phase
-        # (usage_window → P10) has no defined operator response → contradiction
-        # (fail closed, read-only inspection).
+        # A non-gate step parked with no reason or an unknown reason value has no
+        # defined operator response → contradiction (fail closed, read-only
+        # inspection). Every PRD park reason is handled above.
         return STATE_UNKNOWN, None, None
 
     # P2: failed — the last failure step in manifest order is authoritative (§6.3a).
@@ -913,6 +931,7 @@ _STATUS_SCHEMA_JSON = r'''{
         "parked_gate",
         "parked_for_response",
         "parked_usage_limit",
+        "parked_usage_window",
         "parked_artifact_invalid",
         "failed",
         "halted",
@@ -952,11 +971,11 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["reset_at"],
-      "description": "Provider usage-limit reset info (harness-efficiency FR-7.1), non-null only when parked on a usage_limit park; null otherwise.",
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
       "properties": {
         "reset_at": {
           "type": ["string", "null"],
-          "description": "Absolute UTC reset time (ISO-8601), or null when the provider reported no structured retry hint."
+          "description": "Absolute UTC reset time (ISO-8601): a usage_limit park's provider reset (null when no structured retry hint), or a usage_window park's projected window-replenishment time."
         }
       }
     },
@@ -990,7 +1009,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -1269,7 +1288,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_artifact_invalid"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},
@@ -1720,9 +1739,14 @@ def status_payload(
         and current_elapsed is not None
     ):
         timeout_remaining = max(0.0, current_step_timeout_s - current_elapsed)
-    # FR-7.1 quota: the reset time of a usage_limit park (else null).
+    # FR-7.1/FR-10.3 quota: the reset time of a usage_limit park, OR the projected
+    # replenishment time of a usage_window park (both stored on quota_reset_at);
+    # else null.
     quota = None
-    if rstate.state == STATE_PARKED_USAGE_LIMIT and rstate.parked is not None:
+    if (
+        rstate.state in (STATE_PARKED_USAGE_LIMIT, STATE_PARKED_USAGE_WINDOW)
+        and rstate.parked is not None
+    ):
         parked_rec = by_rendered.get(rstate.parked.step_id)
         quota = {"reset_at": parked_rec.quota_reset_at if parked_rec else None}
     payload = {
@@ -2528,6 +2552,13 @@ def render_footer(
         lines.append(
             f"quota reset: {quota_reset_at}" if quota_reset_at
             else "quota reset: unknown (no provider retry hint reported)"
+        )
+    # A usage_window park (FR-10.3) names the projected window-replenishment time,
+    # so the operator knows when a plain `resume` will fit the next step.
+    if rstate.state == STATE_PARKED_USAGE_WINDOW:
+        lines.append(
+            f"window replenishes: {quota_reset_at}" if quota_reset_at
+            else "window replenishes: unknown"
         )
 
     if current_step_freshness is not None:
