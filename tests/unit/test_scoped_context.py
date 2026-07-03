@@ -169,6 +169,21 @@ def test_render_phase_mode_injects_excerpt_and_path(fixture_repo):
     assert "runs/demo/plan.md" in prompt     # full-document path
 
 
+def test_render_phase_mode_fails_closed_when_section_missing(fixture_repo):
+    # F-001: `phase` mode must NOT ship an implement prompt that quietly omits
+    # its scoped context. When the current phase has no locatable `## <id> …`
+    # section, rendering fails closed (raises) rather than emitting a soft note.
+    ctx = _ctx(fixture_repo, iteration_item={"id": "P9", "title": "t", "goal": "g"},
+               iteration_index=0)
+    (ctx.artifact_root / "plan.md").write_text(_PLAN)  # has P1/P2/P3, not P9
+    step = Step.model_validate({
+        "id": "implement", "type": "agent_task", "agent": "builder",
+        "prompt_text": "BASE", "inputs": [{"name": "plan.md", "mode": "phase"}],
+    })
+    with pytest.raises(ValueError, match="no locatable section for phase P9"):
+        _render_prompt(step, ctx)
+
+
 def test_render_inline_mode_unchanged(fixture_repo):
     ctx = _ctx(fixture_repo)
     (ctx.artifact_root / "prd.md").write_text("PRD-FULL-BODY-SENTINEL\n")

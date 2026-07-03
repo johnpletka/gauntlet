@@ -500,7 +500,9 @@ stages:
 """
 
 _VALID_PLAN = (
-    "# Plan\n\n```gauntlet-phases\n"
+    "# Plan\n\n"
+    "## P1 — Build it\nImplement the widget end-to-end.\n\n"
+    "```gauntlet-phases\n"
     "- id: P1\n  title: Build it\n  goal: Implement the widget end-to-end.\n"
     "```\n"
 )
@@ -538,3 +540,19 @@ def test_phase_lint_halts_when_block_absent(fixture_repo):
     rec = orch.manifest.record("plan-lint")
     assert rec.status == M.HALTED
     assert "no gauntlet-phases block" in rec.notes
+
+
+def test_phase_lint_halts_when_phase_has_no_prose_section(fixture_repo):
+    # F-001: a well-formed block whose P2 has no locatable `## P2 …` heading
+    # would silently lose its `phase`-mode excerpt; the gate parks before approval.
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text(
+        "# Plan\n\n## P1 — Build it\nImplement the widget.\n\n"
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: Build it\n  goal: Implement the widget.\n"
+        "- id: P2\n  title: Ship it\n  goal: Ship the widget.\n```\n"
+    )
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "no locatable prose section" in rec.notes and "P2" in rec.notes

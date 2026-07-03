@@ -25,6 +25,7 @@ import pytest
 from gauntlet.engine import gitops, manifest as M, proposals as P
 from gauntlet.engine.feedback import FeedbackData, TriageCorrection
 from gauntlet.engine.pipeline import content_hash, load_pipeline
+from gauntlet.engine.planphases import extract_phases, phase_section
 from gauntlet.engine.report import build_report
 from gauntlet.engine.run import RunManager
 
@@ -98,6 +99,58 @@ def _scaffold(tmp_path: Path) -> Path:
     _git(repo, "commit", "-qm", "seed toy project")
     _git(repo, "branch", "-M", "main")
     return repo
+
+
+@pytest.mark.skipif(
+    shutil.which("claude") is None or shutil.which("codex") is None,
+    reason="scoped-context end-to-end needs both claude and codex CLIs",
+)
+def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
+    """P6 FR-1.1: a real implement phase completes with scoped context.
+
+    The shipped `standard.yaml` implement step passes prd.md by `reference` and
+    plan.md by `phase`. This drives the full pipeline through the CLI/run path
+    (the P6 test-strategy integration case the unit tests could not cover) and
+    asserts the phase completes normally AND the persisted implement prompt
+    carries the repo-relative paths + this phase's plan excerpt — not the full
+    documents inlined. Guards F-001's fail-closed contract end-to-end: an empty
+    excerpt would surface here, not silently.
+    """
+    repo = _scaffold(tmp_path)
+    mgr = RunManager(repo)
+    pipe = repo / "pipelines" / "standard.yaml"
+
+    assert mgr.start("toy", pipe, use_judge=True) == M.RUN_PARKED   # PRD gate
+    assert mgr.approve("toy", use_judge=True) == M.RUN_PARKED        # plan gate
+    plan = (repo / "runs" / "toy" / "plan.md").read_text()
+    # phases → done: the implement phase(s) run through the real CLI path.
+    assert mgr.approve("toy", use_judge=True) == M.RUN_DONE, (
+        mgr.status("toy").model_dump()
+    )
+
+    # the phase actually completed: a numbered phase commit exists and the toy
+    # was implemented (the normal phase-completion path, not a park).
+    man = mgr.status("toy")
+    assert any(
+        p.split(".")[0].lstrip("P").isdigit() for p in (c.phase for c in man.commits)
+    )
+    assert (repo / "slugify.py").exists()
+
+    # the persisted implement prompt used scoped context (FR-1.1): paths present,
+    # bodies not inlined, and the plan's CURRENT-PHASE excerpt sliced in.
+    run_dir = mgr.layout("toy").active_run_dir()
+    prompts = sorted((run_dir / "steps").glob("implement*/prompt.md"))
+    assert prompts, sorted((run_dir / "steps").iterdir())
+    prompt = prompts[0].read_text()  # first phase iteration
+    assert "runs/toy/prd.md" in prompt          # prd BY REFERENCE (path only)
+    assert "by reference" in prompt             # reference-mode marker
+    assert "runs/toy/plan.md" in prompt         # plan full-document path
+    assert "current-phase excerpt" in prompt    # phase-mode marker
+    # the excerpt is the current phase's prose section, sliced deterministically.
+    first_phase_id = extract_phases(plan)[0]["id"]
+    section = phase_section(plan, first_phase_id)
+    assert section, f"no locatable section for {first_phase_id} (F-001)"
+    assert section.splitlines()[0] in prompt    # the phase heading is injected
 
 
 @pytest.mark.skipif(

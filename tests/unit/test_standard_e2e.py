@@ -29,6 +29,9 @@ PLAN_MD = """# Toy implementation plan
 
 One phase: build the widget.
 
+## P1 — Build the widget
+Implement widget(); validates the toy spec is satisfiable end-to-end.
+
 ```gauntlet-phases
 - id: P1
   title: Build the widget

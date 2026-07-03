@@ -43,6 +43,12 @@ VALID_PLAN = """# Plan
 
 Prose a human ratifies.
 
+## P1 — First phase
+Do the first thing.
+
+## P2 — Second phase
+Do the second thing.
+
 ```gauntlet-phases
 - id: P1
   title: First phase
@@ -357,6 +363,21 @@ def test_plan_phases_validator_rejects_missing_block():
         "plan_phases", NO_BLOCK_PLAN, repo_root=Path("/"), asset_root="."
     )
     assert err is not None and "gauntlet-phases" in err
+
+
+def test_plan_phases_validator_rejects_phase_without_prose_section():
+    # F-001: a well-formed phase list whose phases lack a locatable `## <id> …`
+    # heading would silently lose its `phase`-mode excerpt; reject before approval.
+    no_section_plan = (
+        "# Plan\n\n## P1 — First\np1 prose\n\n"
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: First\n  goal: do p1\n"
+        "- id: P2\n  title: Second\n  goal: do p2\n```\n"
+    )
+    err = validate_artifact(
+        "plan_phases", no_section_plan, repo_root=Path("/"), asset_root="."
+    )
+    assert err is not None and "P2" in err and "FR-1.1" in err
 
 
 def test_unknown_validator_name_raises():

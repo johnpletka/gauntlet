@@ -31,7 +31,12 @@ the phase loop over (`foreach: plan.phases`). Each entry has:
   validates.
 
 It must agree with the prose phases — the human ratifies the prose, the engine
-executes the list, and they must not drift. Example:
+executes the list, and they must not drift. Concretely: **every phase id in the
+block must have a matching prose heading** of the form `## <id> — <title>` (e.g.
+`## P1 — Core data model`). The engine slices each phase's section out of the
+plan by that heading to build the implement prompt's scoped context, so a phase
+in the list with no locatable `## <id> …` heading is rejected before approval.
+Example:
 
 ```gauntlet-phases
 - id: P1

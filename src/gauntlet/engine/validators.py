@@ -28,7 +28,11 @@ import json
 from pathlib import Path
 
 from gauntlet.adapters._structured import extract_json, validate_schema
-from gauntlet.engine.planphases import PlanPhasesError, extract_phases
+from gauntlet.engine.planphases import (
+    PlanPhasesError,
+    extract_phases,
+    missing_phase_sections,
+)
 
 # A ``validate:`` value with this prefix names a JSON-schema file (repo-relative,
 # under the configured ``asset_root``) rather than a registered named validator.
@@ -60,6 +64,18 @@ def _validate_plan_phases(text: str) -> str | None:
         return (
             "no gauntlet-phases block found; the plan must declare its phase "
             "list in a fenced ```gauntlet-phases``` block (FR-5.1)"
+        )
+    # FR-1.1: `phase`-mode context slices each phase's prose section by its ATX
+    # heading; a phase in the list with no locatable `## <id> …` heading would
+    # silently lose its implement-prompt excerpt (fail open). Reject it here so
+    # the plan-author repairs the prose before approval.
+    missing = missing_phase_sections(text, phases)
+    if missing:
+        return (
+            "no locatable prose section for phase(s) "
+            f"{', '.join(missing)}: every phase in the gauntlet-phases list must "
+            "have a matching '## <id> …' heading so `phase`-mode context can "
+            "slice its section (FR-1.1); add the heading(s) to the plan prose"
         )
     return None
 

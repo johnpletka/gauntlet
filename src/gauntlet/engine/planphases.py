@@ -147,6 +147,29 @@ def phase_section(plan_text: str, phase_id: str) -> str | None:
     return "\n".join(lines[start:end]).strip()
 
 
+def missing_phase_sections(
+    plan_text: str, phases: list[dict[str, Any]]
+) -> list[str]:
+    """Phase ids from *phases* with no locatable ``## <id>`` prose section.
+
+    `phase`-mode context (FR-1.1) slices each phase's prose out of plan.md by its
+    ATX heading (:func:`phase_section`). A phase present in the machine-readable
+    ``gauntlet-phases`` list but with no matching prose heading would silently
+    lose its excerpt at render time — the exact fail-open this closes. Returning
+    the offending ids lets the plan validators (``plan_phases`` / ``phase_lint``)
+    fail closed *before* human approval rather than after, and lets the renderer
+    assert the section exists at slice time. Order-preserving, deduped is
+    unnecessary (``extract_phases`` already rejects duplicate ids).
+    """
+    return [
+        p["id"]
+        for p in phases
+        if isinstance(p, dict)
+        and isinstance(p.get("id"), str)
+        and phase_section(plan_text, p["id"]) is None
+    ]
+
+
 def load_plan_phases(plan_path: Path) -> list[dict[str, Any]] | None:
     """Read ``plan.md`` and return its phase list, or ``None`` if absent.
 

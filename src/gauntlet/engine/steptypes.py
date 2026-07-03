@@ -50,7 +50,12 @@ from gauntlet.engine.pipeline import (
     Step,
     iter_inputs,
 )
-from gauntlet.engine.planphases import PlanPhasesError, extract_phases, phase_section
+from gauntlet.engine.planphases import (
+    PlanPhasesError,
+    extract_phases,
+    missing_phase_sections,
+    phase_section,
+)
 from gauntlet.engine.validators import validate_artifact
 from gauntlet.logging.transcript import StepLogger
 
@@ -223,8 +228,9 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
             halt_reason=HALT_REASON_PRECONDITION,
             notes=f"phase lint: {artifact} is missing at the plan gate",
         )
+    text = path.read_text()
     try:
-        phases = extract_phases(path.read_text())
+        phases = extract_phases(text)
     except PlanPhasesError as exc:
         return StepResult(
             status=HALTED,
@@ -238,6 +244,24 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
             notes=(
                 f"phase lint: {artifact} declares no gauntlet-phases block; the "
                 "phases stage would have nothing to fan out over (FR-5.1)"
+            ),
+        )
+    # FR-1.1: the implement step slices each phase's prose section out of plan.md
+    # by its ATX heading (`phase`-mode context). A phase declared in the list but
+    # lacking a locatable `## <id> …` heading would silently lose its excerpt at
+    # render time — a fail-open on scoped-context quality. Halt at the gate (same
+    # fail-closed path as a malformed block) so an unrunnable-for-phase-mode plan
+    # never reaches human approval.
+    missing = missing_phase_sections(text, phases)
+    if missing:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: {artifact} has no locatable prose section for "
+                f"phase(s) {', '.join(missing)}; every phase in the "
+                "gauntlet-phases list needs a matching '## <id> …' heading so "
+                "`phase`-mode context can slice it (FR-1.1)"
             ),
         )
     ids = ", ".join(p["id"] for p in phases)
@@ -863,12 +887,16 @@ def _render_input(ref: InputRef, ctx: StepContext, artifacts: dict) -> str:
 
 
 def _phase_excerpt(name: str, path: Path, ctx: StepContext) -> str:
-    """The current `foreach` phase's section of plan.md, or a read-the-full note.
+    """The current `foreach` phase's section of plan.md — or fail closed.
 
-    Fail soft, not closed (§2): a missing locatable section is not a run halt —
-    the full-document path and the `foreach` item still anchor the phase — so we
-    return an explicit note rather than raising. Determinism: the slice is a pure
-    heading scan (:func:`phase_section`), never a summary.
+    Fail closed (§2): P6 requires the implement prompt to carry THIS phase's plan
+    section (FR-1.1), so a missing locatable section is a defect, not a
+    degrade-and-continue. The plan validators (``plan_phases`` / ``phase_lint``)
+    reject a plan whose phases lack locatable `## <id> …` headings before
+    approval, so this raise is the last-ditch guard for a hand-built / bypassed
+    plan; it halts the step rather than shipping an implement prompt that quietly
+    omits its scoped context. Determinism: the slice is a pure heading scan
+    (:func:`phase_section`), never a summary.
     """
     phase_id = _iteration_phase(ctx)
     text = path.read_text() if path.exists() else ""
@@ -876,9 +904,11 @@ def _phase_excerpt(name: str, path: Path, ctx: StepContext) -> str:
         section = phase_section(text, phase_id)
         if section:
             return section
-    return (
-        f"(No self-contained section for phase {phase_id or '?'} could be located "
-        f"in {name}; read the full document at the path above.)"
+    raise ValueError(
+        f"`phase`-mode context for {name}: no locatable section for phase "
+        f"{phase_id or '?'} — the plan must carry a '## {phase_id or '<id>'} …' "
+        "heading so this phase's excerpt can be sliced (FR-1.1). Fail closed "
+        "rather than ship an implement prompt missing its scoped context."
     )
 
 
