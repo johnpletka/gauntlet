@@ -133,3 +133,61 @@ def test_pipeline_load_rejects_bad_step_effort():
 
 def test_canonical_enum_is_the_documented_set():
     assert CANONICAL_EFFORTS == ("minimal", "low", "medium", "high")
+
+
+# --- adversarial_cycle step-level `effort:` (review F-004) --------------------
+# The plan (P7) says a cycle step effort accepts the canonical enum and overrides
+# each role profile (step wins). Validation must therefore run for a cycle — whose
+# roles are `reviewer`/`triager`/`fixer`/`confirmer`, NOT `agent` — against every
+# role's adapter, rather than being silently skipped for the whole step type.
+_CYCLE_CONFIG = {
+    "agents": {
+        "reviewer": {"adapter": "codex"},
+        "triage": {"adapter": "api", "model": "gpt-5-mini"},
+        "builder": {"adapter": "claude-code", "model": "opus"},
+    },
+    "identities": {},
+}
+
+
+def _cycle_pipeline(effort: str) -> Pipeline:
+    return Pipeline.model_validate(
+        {
+            "name": "p", "version": 1,
+            "stages": [{"id": "s", "steps": [
+                {"id": "cyc", "type": "adversarial_cycle", "mode": "artifact",
+                 "artifact": "prd.md", "phase": "P1", "reviewer": "reviewer",
+                 "triager": "triage", "fixer": "builder", "effort": effort},
+            ]}],
+        }
+    )
+
+
+def test_cycle_step_effort_accepted_when_valid():
+    report = validate_pipeline(
+        _cycle_pipeline("high"), RunConfig.model_validate(_CYCLE_CONFIG)
+    )
+    assert report.ok()
+
+
+def test_cycle_step_effort_rejected_when_noncanonical():
+    # Regression (F-004): a non-canonical cycle effort must fail closed at load —
+    # previously it was silently ignored because the cycle has no `agent:` field.
+    with pytest.raises(PipelineValidationError) as exc:
+        validate_pipeline(
+            _cycle_pipeline("xhigh"), RunConfig.model_validate(_CYCLE_CONFIG)
+        )
+    assert any("effort" in e for e in exc.value.errors)
+
+
+def test_cycle_step_effort_minimal_warns_via_claude_role_surface():
+    # Per-role validation proof (F-004): `minimal` is canonical but claude's
+    # --effort surface only accepts {low, medium, high}, so it remaps minimal→low
+    # with a WARNING (not an error). A warning therefore only appears if the
+    # claude fixer role's adapter surface was actually consulted for the cycle
+    # step effort — the bug was that the whole step type was skipped.
+    report = validate_pipeline(
+        _cycle_pipeline("minimal"), RunConfig.model_validate(_CYCLE_CONFIG)
+    )
+    assert report.ok()  # a remap is a warning, not an error
+    assert any("effort" in w and "minimal" in w for w in report.warnings), report.warnings

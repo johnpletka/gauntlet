@@ -737,3 +737,117 @@ def test_unauthenticated_cli_skips_profile_probes_with_warn(tmp_path):
     assert names["profile:builder"].status == WARN
     assert "not authenticated" in names["profile:builder"].detail
     assert names["profile:builder-read"].status == WARN
+
+
+# --- review F-002: the REAL api model probe does a live effort round trip ------
+def test_api_model_probe_sends_mapped_effort_and_passes(monkeypatch, tmp_path):
+    # FR-6.4 / review F-002: the real api probe must do a LIVE completion carrying
+    # the profile's mapped reasoning_effort — not stop at the offline resolvability
+    # lookup — so a model that resolves but would reject the effort is caught.
+    from types import SimpleNamespace
+
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import OK, _real_profile_model_probe
+
+    # the model resolves offline; the live call is the thing under test
+    monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
+    captured: dict = {}
+
+    def fake_complete(self, messages):
+        captured["reasoning_effort"] = self.reasoning_effort
+        captured["model"] = self.model
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))],
+            usage=None,
+        )
+
+    monkeypatch.setattr(ApiAdapter, "_complete", fake_complete)
+    profile = AgentProfile(adapter="api", model="gpt-5-mini", effort="low")
+    result = _real_profile_model_probe("triage", profile)
+    assert result.status == OK
+    assert captured["model"] == "gpt-5-mini"
+    assert captured["reasoning_effort"] == "low"  # the mapped effort was sent live
+
+
+def test_api_model_probe_fails_when_effort_rejected(monkeypatch, tmp_path):
+    # A resolvable model whose provider REJECTS the configured reasoning_effort at
+    # call time is a FAIL row (not a silent OK on the offline lookup).
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import FAIL, _real_profile_model_probe
+
+    monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
+
+    def boom(self, messages):
+        raise ValueError("reasoning_effort is not supported by this model")
+
+    monkeypatch.setattr(ApiAdapter, "_complete", boom)
+    profile = AgentProfile(adapter="api", model="gpt-5-mini", effort="high")
+    result = _real_profile_model_probe("triage", profile)
+    assert result.status == FAIL
+    assert "rejected by the provider" in result.detail
+
+
+# --- review F-003: the REAL read probe uses the profile's OWN config -----------
+def test_read_probe_built_from_profile_configuration(monkeypatch, tmp_path):
+    # FR-1.3/FR-6.4 / review F-003: the read probe must drive the profile's real
+    # adapter (its allowed_tools/base_flags/model), not a fixed `--allowedTools
+    # Read` command — otherwise a profile whose config cannot read passes.
+    import re
+
+    from gauntlet.adapters.base import AgentResult
+    from gauntlet.adapters.claude_code import ClaudeCodeAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import OK, _real_profile_read_probe
+
+    captured: dict = {}
+
+    def fake_run(self, prompt, *, session=None, schema=None, cwd=None,
+                 extra_flags=None, sink=None):
+        # prove the adapter was built from the PROFILE, not a hardcoded command
+        captured["model"] = self.model
+        captured["allowed_tools"] = self.allowed_tools
+        captured["base_flags"] = self.base_flags
+        # simulate a real, successful read of the sentinel the probe staged
+        m = re.search(r"Read the file (\S+) ", prompt)
+        text = ""
+        if m and cwd is not None:
+            p = Path(cwd) / m.group(1)
+            if p.exists():
+                text = p.read_text()
+        return AgentResult(text=text, session_id="s", exit_code=0)
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "run", fake_run)
+    profile = AgentProfile(
+        adapter="claude-code", model="opus",
+        allowed_tools=["Read"], base_flags=["--append-system-prompt", "PROBE-CFG"],
+    )
+    result = _real_profile_read_probe("builder", profile, tmp_path)
+    assert result.status == OK
+    # the probe reflected the profile's OWN configuration
+    assert captured["model"] == "opus"
+    assert captured["allowed_tools"] == ["Read"]
+    assert captured["base_flags"] == ["--append-system-prompt", "PROBE-CFG"]
+    # the transient sentinel was cleaned up
+    assert not list(tmp_path.glob(".gauntlet-doctor-read-*.txt"))
+
+
+def test_read_probe_fails_when_profile_config_cannot_read(monkeypatch, tmp_path):
+    # A profile whose real invocation returns no marker (its sandbox/tool config
+    # withholds Read) FAILs the read probe — the F-003 signal a fixed command hid.
+    from gauntlet.adapters.base import AgentResult
+    from gauntlet.adapters.claude_code import ClaudeCodeAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import FAIL, _real_profile_read_probe
+
+    def blind_run(self, prompt, *, session=None, schema=None, cwd=None,
+                  extra_flags=None, sink=None):
+        return AgentResult(text="I do not have permission to read files.",
+                           session_id="s", exit_code=0)
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "run", blind_run)
+    profile = AgentProfile(adapter="claude-code", model="opus", tools=[])
+    result = _real_profile_read_probe("builder", profile, tmp_path)
+    assert result.status == FAIL
+    assert "could not read a repo file" in result.detail

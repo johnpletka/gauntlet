@@ -91,11 +91,13 @@ def _effort_detail(profile) -> str:
 def _real_profile_model_probe(name: str, profile) -> ProbeResult:
     """FR-6.4: verify a profile's model id resolves and its effort flag is accepted.
 
-    ``api`` profiles resolve offline through LiteLLM (no live call); CLI profiles
-    do a minimal tool-less live round trip with the profile's *own* model and
-    (mapped) effort, so a bad alias or an effort the model rejects is caught
-    before any run step. The caller auth-gates the CLI path, so this is only
-    invoked for an authenticated CLI (or for ``api``).
+    Every configured profile gets a minimal live round trip with the profile's
+    *own* model and (mapped) effort, so a bad alias — or a ``reasoning_effort``
+    the provider/model rejects — is caught before any run step (FR-6.4). ``api``
+    profiles first do the no-network LiteLLM resolvability check, then a bounded
+    live completion carrying the mapped effort; CLI profiles do the tool-less CLI
+    round trip. The caller auth-gates the CLI path, so this is only invoked for an
+    authenticated CLI (or for ``api``, which needs no CLI auth).
     """
     from gauntlet.adapters.api import model_provider_error
 
@@ -111,10 +113,62 @@ def _real_profile_model_probe(name: str, profile) -> ProbeResult:
                 remedy="use a valid LiteLLM model id; an unresolvable model fails "
                 "every call closed (FR-6.4)",
             )
-        return ProbeResult(OK, f"model {model!r} resolvable{_effort_detail(profile)}")
+        # A model can RESOLVE offline yet REJECT the configured reasoning_effort at
+        # call time (not every provider/model accepts the param). FR-6.4 requires a
+        # live round trip per profile that verifies effort acceptance, so probe it
+        # live rather than reporting OK on the offline lookup alone (review F-002).
+        return _api_profile_round_trip(name, profile)
     if adapter in _CLI_BY_ADAPTER:
         return _cli_profile_round_trip(name, profile)
     return ProbeResult(WARN, f"no model probe for adapter {adapter!r}")
+
+
+def _api_profile_round_trip(name: str, profile) -> ProbeResult:
+    """A bounded live LiteLLM completion with the profile's model + mapped effort
+    (FR-6.4, review F-002).
+
+    Verifies not just that the model id resolves (the caller already did the
+    offline lookup) but that the configured ``reasoning_effort`` is actually
+    accepted by the provider/model — a param a resolvable model can still reject,
+    failing every real call closed later. A terminal provider/model/parameter
+    rejection is a FAIL; a transient (rate-limit/overload) or unexpected error is a
+    WARN, never a false FAIL (best-effort, mirroring the CLI probe)."""
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.adapters.base import AdapterError, AgentFailedError
+    from gauntlet.engine.config import map_effort
+
+    model = profile.model
+    effort = getattr(profile, "effort", None)
+    reasoning_effort: str | None = None
+    if effort is not None:
+        try:
+            _kwarg, reasoning_effort, _warning = map_effort("api", effort)
+        except ValueError as exc:  # unmappable effort (should be caught at load)
+            return ProbeResult(WARN, f"could not construct probe for {name!r}: {exc}")
+    # Bounded: a short timeout + a tiny token cap keep the probe minimal and cheap.
+    adapter = ApiAdapter(
+        model=model, reasoning_effort=reasoning_effort, timeout_s=30.0, max_tokens=16,
+    )
+    try:
+        adapter.run("ping")
+    except AgentFailedError as exc:
+        info = exc.failure_info
+        if info is not None and info.is_transient:
+            return ProbeResult(
+                WARN, f"could not verify api profile {name!r} live "
+                f"(transient: {info.kind}); retry `gauntlet doctor`",
+            )
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return ProbeResult(
+            FAIL, f"model {model!r}{_effort_detail(profile)} rejected by the "
+            f"provider: {first[:200]}",
+            remedy="use a model/effort the provider accepts; a resolvable model "
+            "that rejects the configured reasoning_effort fails every call closed "
+            "(FR-6.4)",
+        )
+    except (AdapterError, OSError) as exc:
+        return ProbeResult(WARN, f"could not run the api model probe for {name!r}: {exc}")
+    return ProbeResult(OK, f"model {model!r} resolved live{_effort_detail(profile)}")
 
 
 def _cli_profile_round_trip(name: str, profile) -> ProbeResult:
@@ -164,57 +218,80 @@ def _cli_profile_round_trip(name: str, profile) -> ProbeResult:
 
 def _real_profile_read_probe(name: str, profile, repo_root: Path) -> ProbeResult:
     """FR-1.3/FR-6.4: verify a reference-capable profile's sandbox can read a repo
-    file. Writes a transient sentinel under the repo root, asks the agent to echo
-    its contents, and checks the marker came back. Best-effort: OS/parse faults
-    WARN. The caller only invokes this for a profile a shipped pipeline uses in
-    reference/`phase` mode, after auth-gating a CLI profile."""
-    adapter = getattr(profile, "adapter", None)
-    cli = _CLI_BY_ADAPTER.get(adapter)
-    if cli is None:
+    file — under the profile's OWN adapter configuration.
+
+    Writes a transient sentinel under the repo root, asks the agent to echo its
+    contents, and checks the marker came back. The probe is driven through the
+    profile's real adapter (``profile.build_adapter()`` → ``adapter.run``), so it
+    reflects the profile's actual tool/sandbox settings — ``allowed_tools``,
+    ``tools``, ``permission_mode``, ``base_flags``, the codex ``sandbox`` — rather
+    than a fixed ``--allowedTools Read`` / ``-s read-only`` command that would pass
+    a profile whose real invocation cannot read (review F-003). Best-effort: a
+    transient/OS/construction fault is a WARN, never a false FAIL; a terminal
+    inability to produce the marker under the real config is a FAIL. The caller
+    only invokes this for a profile a shipped pipeline uses in reference/`phase`
+    mode, after auth-gating a CLI profile."""
+    from gauntlet.adapters.base import AdapterError, AgentFailedError, AgentTimeoutError
+
+    adapter_name = getattr(profile, "adapter", None)
+    if _CLI_BY_ADAPTER.get(adapter_name) is None:
         # A non-reading adapter (api) should never reach here — load already fails
         # a reference/phase input bound to it (FR-1.3). Fail closed if it does.
         return ProbeResult(
-            FAIL, f"profile {name!r} (adapter {adapter!r}) cannot read the repo",
+            FAIL, f"profile {name!r} (adapter {adapter_name!r}) cannot read the repo",
             remedy="bind reference/phase inputs to a repo-reading profile (FR-1.3)",
         )
+    try:
+        adapter = profile.build_adapter()
+    except Exception as exc:  # banned flag / bad config → surface, don't crash
+        return ProbeResult(
+            WARN, f"could not construct profile {name!r} for the read probe: {exc}"
+        )
+    # Bound the probe: never the adapter's long default run timeout (600s).
+    if hasattr(adapter, "timeout_s"):
+        adapter.timeout_s = min(getattr(adapter, "timeout_s", None) or 120.0, 120.0)
     import uuid
 
     marker = f"GAUNTLET-READ-{uuid.uuid4().hex[:12]}"
     sentinel = repo_root / f".gauntlet-doctor-read-{uuid.uuid4().hex[:8]}.txt"
-    try:
-        sentinel.write_text(marker + "\n")
-    except OSError as exc:
-        return ProbeResult(WARN, f"could not stage the read probe for {name!r}: {exc}")
     prompt = (
         f"Read the file {sentinel.name} in the current directory and output ONLY "
         "its exact contents, nothing else."
     )
     try:
-        if adapter == "claude-code":
-            argv = ["claude", "-p", "--output-format", "json",
-                    "--model", getattr(profile, "model", None) or "haiku",
-                    "--allowedTools", "Read"]
-        else:  # codex
-            argv = ["codex", "exec", "--json", "-s", "read-only",
-                    "--model", getattr(profile, "model", None) or "gpt-5-mini", "-"]
-        proc = subprocess.run(
-            argv, input=prompt, capture_output=True, text=True,
-            timeout=120, cwd=str(repo_root),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+        sentinel.write_text(marker + "\n")
+    except OSError as exc:
+        return ProbeResult(WARN, f"could not stage the read probe for {name!r}: {exc}")
+    try:
+        result = adapter.run(prompt, cwd=repo_root)
+    except AgentTimeoutError:
+        return ProbeResult(WARN, f"the read probe for {name!r} timed out; retry doctor")
+    except AgentFailedError as exc:
+        info = getattr(exc, "failure_info", None)
+        if info is not None and info.is_transient:
+            return ProbeResult(
+                WARN, f"could not run the read probe for {name!r} "
+                f"(transient: {info.kind}); retry `gauntlet doctor`",
+            )
+        return _read_probe_fail(name)  # the real config could not complete the read
+    except (AdapterError, OSError) as exc:
         return ProbeResult(WARN, f"could not run the read probe for {name!r}: {exc}")
     finally:
         try:
             sentinel.unlink()
         except OSError:
             pass
-    if proc.returncode == 0 and marker in (proc.stdout or ""):
-        return ProbeResult(OK, f"sandbox read a repo file (reference/phase capable)")
+    if marker in (result.text or ""):
+        return ProbeResult(OK, "sandbox read a repo file (reference/phase capable)")
+    return _read_probe_fail(name)
+
+
+def _read_probe_fail(name: str) -> ProbeResult:
     return ProbeResult(
         FAIL, f"profile {name!r} declares reads_repo but its sandbox could not read "
-        "a repo file",
-        remedy="the profile's sandbox withholds repo access; a reference/phase "
-        "input would inject an unreadable path (FR-1.3/FR-6.4)",
+        "a repo file under its own configuration",
+        remedy="the profile's sandbox/tool config withholds repo access; a "
+        "reference/phase input would inject an unreadable path (FR-1.3/FR-6.4)",
     )
 
 

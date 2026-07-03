@@ -186,22 +186,33 @@ def _validate_step(
                 "session with the validation error and requires resume support"
             )
 
-    # 1e. step-level `effort:` (FR-6.1) is a canonical value the step's agent's
-    # adapter must accept — fail closed at load rather than silently drop it or
-    # raise mid-run. Validated against the step's own `agent` profile (a step
-    # `effort:` overrides that profile's effort; cycle roles carry effort via
-    # their own profiles, which RunConfig load already validated).
+    # 1e. step-level `effort:` (FR-6.1) is a canonical value that every adapter it
+    # will drive must accept — fail closed at load rather than silently drop it or
+    # raise mid-run. A step `effort:` overrides the profile's own effort (step wins
+    # over profile). The adapters it must be accepted by depend on the step type:
+    # an `agent_task` drives its own `agent`; an `adversarial_cycle` step effort
+    # applies to every cycle role (reviewer/triager/fixer/confirmer/escalation),
+    # so validate it against each role's adapter — otherwise a cycle effort a
+    # role's adapter cannot express would be silently ignored (review F-004).
+    # Deduped by adapter so shared surfaces warn once.
     step_effort = step.get("effort")
-    if step_effort is not None and step.agent and step.agent in config.agents:
-        try:
-            _kwarg, _value, warning = map_effort(
-                config.profile(step.agent).adapter, str(step_effort).strip().lower()
-            )
-        except ValueError as exc:
-            report.errors.append(f"step {step.id!r} effort: {exc}")
-        else:
-            if warning:
-                report.warnings.append(f"step {step.id!r} effort: {warning}")
+    if step_effort is not None:
+        effort_norm = str(step_effort).strip().lower()
+        seen_adapters: set[str] = set()
+        for target in _effort_target_agents(step):
+            if target not in config.agents:
+                continue  # undefined profile — already reported in block 3
+            adapter = config.profile(target).adapter
+            if adapter in seen_adapters:
+                continue
+            seen_adapters.add(adapter)
+            try:
+                _kwarg, _value, warning = map_effort(adapter, effort_norm)
+            except ValueError as exc:
+                report.errors.append(f"step {step.id!r} effort: {exc}")
+            else:
+                if warning:
+                    report.warnings.append(f"step {step.id!r} effort: {warning}")
 
     # 2. dangling artifact dataflow (FR-5.3)
     for ref in input_refs:
@@ -377,6 +388,20 @@ def _scoped_path_error(
     if not candidate.is_file():
         return f"repo-relative path {ref.name!r} is not a file"
     return None
+
+
+def _effort_target_agents(step: Step) -> list[str]:
+    """Agent profiles a step-level ``effort:`` must be accepted by (FR-6.1).
+
+    An ``adversarial_cycle`` step effort overrides every bound cycle role's own
+    effort (step wins), so it must map onto each role's adapter; any other step's
+    effort targets its own ``agent`` (the ``agent_task`` case). Returns only
+    the roles the step actually declares (``confirmer`` defaults to ``reviewer``,
+    which is already covered)."""
+    if step.type == "adversarial_cycle":
+        roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
+        return [a for a in (step.get(r) for r in roles) if a]
+    return [step.agent] if step.agent else []
 
 
 def _agent_refs(step: Step, needs_agent: bool) -> list[str]:

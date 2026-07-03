@@ -413,6 +413,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             f"{'|'.join(sorted(MUTATION_POLICIES))})",
         )
     max_rounds = int(step.get("max_rounds", 2))
+    # FR-6.1: a step-level `effort:` on the cycle overrides each role profile's
+    # own effort (step wins over profile) for every cycle sub-agent call. Its
+    # canonical value + adapter acceptance were validated at pipeline load
+    # (engine/validate.py); passed into `_run_sub` so it maps onto each role
+    # adapter's flag at build time. None → each role uses its profile's effort.
+    cycle_effort = step.get("effort")
     phase, handoff = _phase_and_handoff(step, ctx)
     if phase is None:
         return StepResult(
@@ -480,6 +486,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         ctx.record.human_responses
         and ctx.record.human_responses[-1].state == M.RESPONSE_PENDING
     )
+    # FR-3/FR-6.3/FR-10: on a `--response` resume the cycle can route the human
+    # decision through a cheap `disposition_agent` for a classify-only gate BEFORE
+    # spending the full review→triage→fix→confirm cycle (mirrors the agent_task
+    # two-phase resume). A re-park / malformed disposition returns immediately —
+    # the expensive roles are never invoked; a `proceed` falls through to the
+    # normal re-drive below. Unset `disposition_agent` → today's behavior (the
+    # cycle re-drives with the decision injected, unchanged).
+    disposition_agent = step.get("disposition_agent")
+    if is_response_redrive and disposition_agent:
+        gate = _response_disposition_gate(step, ctx, disposition_agent, usage)
+        if gate is not None:  # non-proceed: return without re-driving the cycle
+            return _finish(gate, usage, commits, artifact_writes, metrics)
     is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
     resume = _Resume(
         ctx, active=bool(ctx.record.checkpoints) and not is_response_redrive
@@ -566,7 +584,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     review = _resume_review(
                         ctx, reviewer, cont_session, review_prompt,
                         findings_schema, usage, review_logger, guard,
-                        substep=f"r{rnd}-review",
+                        substep=f"r{rnd}-review", effort=cycle_effort,
                     )
                     resume_session = None
                 else:
@@ -576,7 +594,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                         logger=review_logger,
                         structured_name="findings.json",
                         after_attempt=guard.check,
-                        substep=f"r{rnd}-review",
+                        substep=f"r{rnd}-review", effort=cycle_effort,
                     )
             except _ParkCycle as park:
                 return finish(park.result)
@@ -613,7 +631,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             park_reason = None
         else:
             try:
-                verdicts, park_reason = _triage(step, ctx, findings, usage, rnd, triager)
+                verdicts, park_reason = _triage(
+                    step, ctx, findings, usage, rnd, triager, effort=cycle_effort
+                )
             except _ParkCycle as park:
                 return finish(park.result)
         metrics.record_verdicts(verdicts)
@@ -718,7 +738,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 _run_sub(
                     ctx, fixer, fix_prompt, schema=None, usage=usage,
                     logger=step_logger(ctx, f"r{rnd}-fix"), structured_name="output.json",
-                    substep=f"r{rnd}-fix",
+                    substep=f"r{rnd}-fix", effort=cycle_effort,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
@@ -764,7 +784,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     schema=confirm_schema, usage=usage,
                     logger=step_logger(ctx, f"r{rnd}-confirm"),
                     structured_name="confirm.json",
-                    substep=f"r{rnd}-confirm",
+                    substep=f"r{rnd}-confirm", effort=cycle_effort,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
@@ -842,6 +862,7 @@ def _run_sub(
     after_attempt: Any = None,
     session: str | None = None,
     substep: str | None = None,
+    effort: str | None = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
@@ -865,10 +886,14 @@ def _run_sub(
     usage-limit park it is stamped onto the park result so resume knows which
     sub-step owns the preserved session and continues it there rather than
     misrouting it into the round-1 reviewer (FR-3.3).
+
+    ``effort`` is a canonical-effort override (FR-6.1) the caller passes for a
+    cycle-level ``effort:``; it wins over the role profile's own effort (``None``
+    uses the profile's value). Mapped to the adapter's accepted flag at build.
     """
     from gauntlet.engine.steptypes import open_step_stream
 
-    adapter = ctx.build_adapter(agent_name)
+    adapter = ctx.build_adapter(agent_name, effort=effort)
     timeout = None
     if agent_name in ctx.config.agents:
         timeout = ctx.config.profile(agent_name).step_timeout_s
@@ -962,6 +987,7 @@ def _resume_review(
     guard: "_MutationGuard",
     *,
     substep: str = "r1-review",
+    effort: str | None = None,
 ):
     """Continue the parked reviewer session on a usage-limit resume (FR-3.3).
 
@@ -982,13 +1008,14 @@ def _resume_review(
             ctx, reviewer, _CONTINUATION_PROMPT, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
             after_attempt=guard.check, session=session, substep=substep,
+            effort=effort,
         )
     except SessionNotFoundError as exc:
         logger.log_text("session-expired.txt", str(exc))
         return _run_sub(
             ctx, reviewer, full_prompt, schema=schema, usage=usage,
             logger=logger, structured_name="findings.json",
-            after_attempt=guard.check, substep=substep,
+            after_attempt=guard.check, substep=substep, effort=effort,
         )
 
 
@@ -1064,6 +1091,80 @@ def _human_decision_block(ctx: StepContext) -> str:
         "ruled in-scope) ---\n"
         + render_human_responses(responses)
         + "\n--- END HUMAN DECISION(S) ---"
+    )
+
+
+def _response_disposition_gate(
+    step: Step, ctx: StepContext, disposition_agent: str, usage: Any
+) -> StepResult | None:
+    """Classify a `--response` resume through a cheap `disposition_agent` before
+    re-driving the full cycle (FR-3/FR-6.3/FR-10).
+
+    Mirrors the ``agent_task`` two-phase resume (steptypes.handle_agent_task): the
+    authoritative human decision is classified by the cheap emitter into the
+    resume-disposition schema, and the SAME fail-closed oracle bounds the cheap
+    emission as a builder one (:func:`steptypes._resume_disposition_result`, which
+    enforces the conflict object-vs-null shape, response-awareness, and the
+    amendment-artifact rule). Returns:
+
+    * ``None`` — a ``proceed`` disposition: the block is resolved, so the caller
+      re-drives the full review→triage→fix→confirm cycle to apply it (only the
+      primary roles can do the actual work; a cheap non-writing emitter cannot).
+    * a PARKED/FAILED :class:`StepResult` — a re-park (amendment_required/
+      new_conflict) or a malformed disposition: returned so the caller finishes
+      WITHOUT invoking the expensive roles (the builder-window-saving common case).
+
+    The emitter's spend is added to ``usage`` (FR-3.2), so it is accounted even
+    when the roles never run. A transient sub-agent failure parks the cycle
+    (usage_limit) via the shared ``_run_sub`` path, like any other sub-call.
+    """
+    from gauntlet.engine.steptypes import (
+        _resume_disposition_result,
+        _resume_disposition_schema,
+        step_logger,
+    )
+
+    schema = _resume_disposition_schema(ctx)
+    prompt = _disposition_prompt(ctx)
+    logger = step_logger(ctx, "response-disposition")
+    try:
+        result = _run_sub(
+            ctx, disposition_agent, prompt, schema=schema, usage=usage,
+            logger=logger, structured_name="disposition.json",
+            substep="response-disposition",
+        )
+    except _ParkCycle as park:
+        return park.result
+    usage_by_agent = {disposition_agent: result.usage} if result.usage else {}
+    outcome = _resume_disposition_result(
+        disposition_agent, result, usage_by_agent, ctx.record.human_responses
+    )
+    # proceed → None (fall through to the full re-drive); re-park/fail → return it.
+    return None if outcome.status == DONE else outcome
+
+
+def _disposition_prompt(ctx: StepContext) -> str:
+    """The classify-only prompt for the cycle's response-disposition gate (FR-10).
+
+    Carries the authoritative human decision(s) as a trusted block (never wrapped
+    as untrusted data — it is an operator instruction, like the re-drive path's
+    :func:`_human_decision_block`) and asks the emitter to classify ONLY whether
+    the decision resolves the parked block — not to perform any review/triage/fix
+    work (that is the primary roles' job on a `proceed`)."""
+    return (
+        "An adversarial review cycle parked for a human decision — a reviewer- or "
+        "triager-surfaced escalation (FR-10.5) or an upstream invalidation "
+        "(FR-10.4). A human has now responded. Classify ONLY whether that response "
+        "resolves the block; do NOT perform any review, triage, or fix work.\n\n"
+        "Emit the resume-disposition object per the provided schema:\n"
+        "- proceed_in_place / proceed_with_deviation: the response resolves the "
+        "block (conflict = null) — the cycle will re-run to apply it.\n"
+        "- amendment_required: the response requires changing an approved artifact "
+        "(PRD/plan); name that artifact in conflict.artifact.\n"
+        "- new_conflict: the response is ambiguous or does not resolve the block; "
+        "describe what is still missing in conflict.\n"
+        "responses_considered MUST name the response id(s) you consumed."
+        + _human_decision_block(ctx)
     )
 
 
@@ -1298,7 +1399,7 @@ class _MutationGuard:
 
 def _triage(
     step: Step, ctx: StepContext, findings: list[dict[str, Any]],
-    usage: Any, rnd: int, triager: str,
+    usage: Any, rnd: int, triager: str, *, effort: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Point-by-point triage with severity-aware escalation (F-009).
 
@@ -1343,7 +1444,7 @@ def _triage(
         verdict = _run_sub(
             ctx, triager, prompt, schema=schema, usage=usage,
             logger=logger, structured_name="verdict.json",
-            substep=f"r{rnd}-triage",
+            substep=f"r{rnd}-triage", effort=effort,
         ).structured
         verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
         severity = finding.get("severity", "")
@@ -1355,7 +1456,7 @@ def _triage(
                 verdict = _run_sub(
                     ctx, escalation_agent, prompt, schema=schema, usage=usage,
                     logger=esc_logger, structured_name="verdict.json",
-                    substep=f"r{rnd}-triage",
+                    substep=f"r{rnd}-triage", effort=effort,
                 ).structured
                 verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
                 verdict["escalated"] = True

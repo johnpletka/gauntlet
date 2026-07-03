@@ -771,6 +771,33 @@ def test_blocking_without_escalation_agent_parks_for_human(cycle_repo):
     assert "F-009" in rec.notes and "F-001" in rec.notes
 
 
+def test_cycle_step_effort_passed_to_every_role_build(cycle_repo, monkeypatch):
+    # Regression (review F-004): a step-level `effort:` on an adversarial_cycle is
+    # applied to EVERY cycle sub-agent build (step wins over each role profile).
+    # Asserted on the effort the engine hands `build_adapter` for each role — the
+    # test double ignores it, so we capture at the StepContext boundary instead.
+    from gauntlet.engine.execution import StepContext
+
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001"))),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    built: list[tuple[str, str | None]] = []
+
+    def _recording_build(self, agent_name, *, effort=None):
+        built.append((agent_name, effort))
+        return adapters[agent_name]
+
+    monkeypatch.setattr(StepContext, "build_adapter", _recording_build)
+    status, man, _ = run_cycle(cycle_repo, adapters, step_extra={"effort": "low"})
+    assert status == M.RUN_DONE
+    # reviewer + triager + fixer (+ confirmer, which defaults to reviewer) all built
+    assert {name for name, _ in built} >= {"reviewer", "triage", "builder"}
+    # every cycle sub-agent build carried the step-level override, not the profile's
+    assert built and all(effort == "low" for _name, effort in built), built
+
+
 def test_needs_escalation_rule():
     # FR-6.2 severity-gated rule: blocking always escalates; low-confidence
     # escalates only for blocking/major; low-confidence minor/nit does not.

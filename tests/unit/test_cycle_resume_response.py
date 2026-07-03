@@ -349,7 +349,7 @@ agents:
 """
 
 
-def _build_cycle_runmanager(tmp_path):
+def _build_cycle_runmanager(tmp_path, *, pipeline=CYCLE_PIPELINE, config=CYCLE_CONFIG):
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
@@ -360,9 +360,9 @@ def _build_cycle_runmanager(tmp_path):
                    check=True)
     (repo / "README.md").write_text("cycle resume fixture\n")
     (repo / ".gauntlet").mkdir()
-    (repo / ".gauntlet" / "config.yaml").write_text(CYCLE_CONFIG)
+    (repo / ".gauntlet" / "config.yaml").write_text(config)
     (repo / "pipelines").mkdir()
-    (repo / "pipelines" / "cyc.yaml").write_text(CYCLE_PIPELINE)
+    (repo / "pipelines" / "cyc.yaml").write_text(pipeline)
     shutil.copytree(REPO / "schemas", repo / "schemas")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
@@ -457,3 +457,169 @@ def test_resume_response_unsticks_failed_cycle_end_to_end(tmp_path):
     entry = rec.human_responses[-1]
     assert entry.state == M.RESPONSE_CONSUMED
     assert entry.response_text == "F-001 is a non-issue; decline it."
+
+
+# --- 5. FR-6.3 / review F-001: disposition_agent routing on a parked cycle -------
+# A cycle whose `disposition_agent: mechanic` routes the `--response` classify to a
+# cheap profile BEFORE re-driving the expensive review→triage→fix→confirm cycle: a
+# re-park/malformed disposition returns without invoking the roles; only a proceed
+# re-drives them. Mirrors the agent_task two-phase resume (test_resume_disposition).
+DISPOSITION_CYCLE_PIPELINE = """
+name: cyc
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         phase: P1, reviewer: reviewer, triager: triage, fixer: builder,
+         disposition_agent: mechanic, max_rounds: 2}
+"""
+
+DISPOSITION_CYCLE_CONFIG = """
+base_branch: main
+run_root: runs
+agents:
+  reviewer: {adapter: codex}
+  triage: {adapter: api, model: h}
+  builder: {adapter: claude-code}
+  mechanic: {adapter: api, model: gpt-5-mini}
+"""
+
+
+def _disposition(disposition: str, *, responses=("cycle-resp-1",), artifact=None) -> dict:
+    """A schema-valid resume-disposition object the cheap `mechanic` returns:
+    `conflict` is null for a proceed, an object for a re-park (F-002 shape)."""
+    obj: dict = {
+        "disposition": disposition,
+        "responses_considered": list(responses),
+        "action_summary": f"{disposition} classification",
+        "conflict": None,
+    }
+    if disposition in ("amendment_required", "new_conflict"):
+        obj["conflict"] = {
+            "summary": "still blocked", "requested_input": "a clearer decision",
+            "artifact": artifact,
+        }
+    return obj
+
+
+def _drive_disposition_cycle_to_park(tmp_path):
+    """Start a disposition-routed cycle; park it on an FR-10.4 upstream invalidation."""
+    repo, mgr = _build_cycle_runmanager(
+        tmp_path, pipeline=DISPOSITION_CYCLE_PIPELINE, config=DISPOSITION_CYCLE_CONFIG
+    )
+    start = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001", action="defer", target_artifact="plan.md")),
+        "builder": SeqAdapter(),
+        "mechanic": SeqAdapter(),  # never touched on the initial park
+    }
+    status = mgr.start(
+        "demo", repo / "pipelines" / "cyc.yaml", use_judge=False,
+        adapter_factory=lambda n: start[n],
+    )
+    assert status == M.RUN_PARKED
+    assert mgr.status("demo").record("cycle").parked_reason == M.PARKED_REASON_RESPONSE
+    return repo, mgr
+
+
+def test_cycle_routed_repark_classifies_on_mechanic_without_roles(tmp_path):
+    # A re-park classification (new_conflict) is drafted by the cheap mechanic; the
+    # expensive reviewer/triager/fixer are NEVER invoked on the re-drive.
+    repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
+    mechanic = SeqAdapter(_disposition("new_conflict"))
+    resume_reviewer = SeqAdapter()  # exhausts (raises) if the roles are invoked
+    resume = {
+        "reviewer": resume_reviewer, "triage": SeqAdapter(),
+        "builder": SeqAdapter(), "mechanic": mechanic,
+    }
+    status = mgr.resume(
+        "demo", response="still ambiguous", use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+    assert status == M.RUN_PARKED
+    rec = mgr.status("demo").record("cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
+    assert rec.human_responses[-1].state == M.RESPONSE_CONSUMED
+    # the mechanic classified once; the roles were never invoked (window saved)
+    assert len(mechanic.calls) == 1
+    assert resume_reviewer.calls == []
+    # the mechanic emission was bound to the resume-disposition schema
+    assert mechanic.calls[0]["schema"]["$id"] == "gauntlet/schemas/resume-disposition.json"
+
+
+def test_cycle_routed_proceed_classifies_then_redrives_roles(tmp_path):
+    # A proceed classification by the mechanic re-drives the primary roles (only
+    # they can do the review/triage/fix work), and the decision reaches the
+    # reviewer on the re-drive.
+    repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
+    mechanic = SeqAdapter(_disposition("proceed_in_place"))
+    resume_reviewer = SeqAdapter(REVIEW(F("F-001")))
+    resume = {
+        "reviewer": resume_reviewer,
+        "triage": SeqAdapter(V("F-001", verdict="not_applicable", action="reject")),
+        "builder": SeqAdapter(),
+        "mechanic": mechanic,
+    }
+    decision = "F-001 is in scope for P1; proceed, do not defer it."
+    status = mgr.resume(
+        "demo", response=decision, use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+    assert status == M.RUN_DONE
+    rec = mgr.status("demo").record("cycle")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None
+    # mechanic classified first, THEN the roles were re-driven (reviewer ran)
+    assert len(mechanic.calls) == 1
+    assert resume_reviewer.calls, "a proceed must re-drive the primary roles"
+    assert decision in resume_reviewer.calls[0]["prompt"]
+
+
+def test_cycle_routed_malformed_disposition_fails_without_roles(tmp_path):
+    # A mechanic that emits no valid disposition fails the step closed — the
+    # expensive roles are never invoked on an unparseable classification.
+    repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
+    mechanic = SeqAdapter({"unexpected": "shape"})  # no `disposition` field
+    resume_reviewer = SeqAdapter()  # exhausts (raises) if invoked
+    resume = {
+        "reviewer": resume_reviewer, "triage": SeqAdapter(),
+        "builder": SeqAdapter(), "mechanic": mechanic,
+    }
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+    assert status == M.RUN_FAILED
+    assert len(mechanic.calls) == 1
+    assert resume_reviewer.calls == []  # builder/reviewer window untouched
+
+
+def test_cycle_unset_disposition_agent_uses_roles_directly(tmp_path):
+    # The negative control: with no `disposition_agent`, a `--response` resume
+    # re-drives the roles directly (today's behavior) — no classify gate, no
+    # mechanic. Uses the plain CYCLE_PIPELINE (no disposition_agent).
+    repo, mgr = _build_cycle_runmanager(tmp_path)
+    start = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001", action="defer", target_artifact="plan.md")),
+        "builder": SeqAdapter(),
+    }
+    assert mgr.start(
+        "demo", repo / "pipelines" / "cyc.yaml", use_judge=False,
+        adapter_factory=lambda n: start[n],
+    ) == M.RUN_PARKED
+    resume_reviewer = SeqAdapter(REVIEW(F("F-001")))
+    resume = {
+        "reviewer": resume_reviewer,
+        "triage": SeqAdapter(V("F-001", verdict="not_applicable", action="reject")),
+        "builder": SeqAdapter(),
+    }
+    status = mgr.resume(
+        "demo", response="F-001 in scope; proceed", use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+    assert status == M.RUN_DONE
+    # the reviewer ran directly on the re-drive — no gate short-circuited it
+    assert resume_reviewer.calls
