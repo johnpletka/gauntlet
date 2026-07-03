@@ -149,6 +149,10 @@ class Action:
     required_inputs: list[str]
     executable: bool
     command: str
+    # One-line "what this does when taken" (FR-8.2). Populated for gate decisions
+    # (approve → what proceeds; reject → which cycle re-runs with the notes
+    # injected); None for actions with no distinct consequence to spell out.
+    consequence: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -158,6 +162,7 @@ class Action:
             "required_inputs": list(self.required_inputs),
             "executable": self.executable,
             "command": self.command,
+            "consequence": self.consequence,
         }
 
 
@@ -332,17 +337,31 @@ def _control_resume(slug: str) -> Action:
                   f"gauntlet resume {slug}")
 
 
-def _decide_approve(slug: str) -> Action:
+def _decide_approve(slug: str, *, gate_cycle_id: str | None = None) -> Action:
+    # FR-8.2 consequence: approving ratifies the artifact and the run proceeds
+    # past the gate to the next stage/phase.
+    consequence = "continues the run past this gate to the next stage"
     return Action("approve", "decide", ["gauntlet", "approve", slug], [], True,
-                  f"gauntlet approve {slug}")
+                  f"gauntlet approve {slug}", consequence=consequence)
 
 
-def _decide_reject(slug: str) -> Action:
+def _decide_reject(slug: str, *, gate_cycle_id: str | None = None) -> Action:
     # `--notes` is a flag with no value here; the operator supplies the reason,
     # so the action is non-executable and `command` carries a placeholder.
+    # FR-8.2 consequence: a reject downstream of an adversarial_cycle injects the
+    # notes into that cycle and re-runs it (reject_gate); with no upstream cycle to
+    # iterate it is a terminal reject.
+    if gate_cycle_id:
+        consequence = (
+            f"re-runs the '{gate_cycle_id}' adversarial cycle with your notes "
+            "injected as a new round"
+        )
+    else:
+        consequence = "terminally rejects the gate (no upstream cycle to re-run)"
     return Action("reject", "decide", ["gauntlet", "reject", slug, "--notes"],
                   ["notes"], False,
-                  f'gauntlet reject {slug} --notes "<your reason>"')
+                  f'gauntlet reject {slug} --notes "<your reason>"',
+                  consequence=consequence)
 
 
 def _decide_resume_response(slug: str) -> Action:
@@ -352,7 +371,8 @@ def _decide_resume_response(slug: str) -> Action:
 
 
 def _actions_for(
-    state: str, slug: str, failure: "FailureDescriptor | None" = None
+    state: str, slug: str, failure: "FailureDescriptor | None" = None,
+    *, gate_cycle_id: str | None = None,
 ) -> list[Action]:
     """The §6.3 next-action column for a composite ``state`` (total)."""
     if state == STATE_IN_PROGRESS:
@@ -360,7 +380,12 @@ def _actions_for(
     if state == STATE_ORPHANED:
         return [_control_resume(slug)]
     if state == STATE_PARKED_GATE:
-        return [_decide_approve(slug), _decide_reject(slug)]
+        # FR-8.2: gate decisions carry a one-line consequence; a reject names the
+        # upstream cycle it re-runs (gate_cycle_id, resolved from the manifest).
+        return [
+            _decide_approve(slug, gate_cycle_id=gate_cycle_id),
+            _decide_reject(slug, gate_cycle_id=gate_cycle_id),
+        ]
     if state == STATE_PARKED_FOR_RESPONSE:
         return [_decide_resume_response(slug)]
     if state == STATE_PARKED_USAGE_LIMIT:
@@ -668,13 +693,25 @@ def _current_step(
 def compute_run_state(man: Manifest, liveness: str) -> RunState:
     """The single computed composite state both the footer and ``--json`` render."""
     state, parked, failure = _classify(man, liveness)
+    # FR-8.2: a gate's reject re-runs its upstream adversarial_cycle, so the reject
+    # action's consequence names that cycle. Resolved from manifest step order (the
+    # last cycle before the gate) — pure, no pipeline load.
+    gate_cycle_id: str | None = None
+    if state == STATE_PARKED_GATE and parked is not None:
+        gate_rec = next(
+            (r for r in man.steps if render_step_id(r) == parked.step_id), None
+        )
+        cyc = _upstream_cycle_record(man, gate_rec) if gate_rec is not None else None
+        gate_cycle_id = cyc.id if cyc is not None else None
     return RunState(
         state=state,
         slug=man.slug,
         current_step=_current_step(man, state, parked, failure),
         parked=parked,
         failure=failure,
-        next_actions=_actions_for(state, man.slug, failure),
+        next_actions=_actions_for(
+            state, man.slug, failure, gate_cycle_id=gate_cycle_id
+        ),
     )
 
 
@@ -781,7 +818,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -1031,8 +1068,77 @@ _STATUS_SCHEMA_JSON = r'''{
     },
     "gate": {
       "type": ["object", "null"],
-      "description": "Gate context block (PRD §6 / FR-8.1): always present, non-null only when parked at a human gate. The populated body (cycle convergence summary, prior human responses/rejections, per-escalated-finding triage reasoning) is a P8 deliverable; the current major version emits `null` only, so the object shape is intentionally left unconstrained here and tightened additively when P8 populates it. Consumers may rely on the field always being present.",
-      "additionalProperties": true
+      "additionalProperties": false,
+      "required": ["cycle_step_id", "convergence", "prior_responses", "escalated"],
+      "description": "Gate context block (PRD §6 / harness-efficiency FR-8.1): always present, non-null only when parked at a human gate. Assembled from the manifest + the upstream adversarial_cycle's persisted artifacts (no transcript read): the cycle's convergence summary, prior human `--response`/rejection decisions for this gate, and the per-escalated-finding triage reasoning. Content-bearing fields pass through the redaction path (PRD §7). null for every non-gate state.",
+      "properties": {
+        "cycle_step_id": {
+          "type": ["string", "null"],
+          "description": "Id of the adversarial_cycle this gate ratifies (the last cycle before the gate), or null when the gate has no upstream cycle."
+        },
+        "convergence": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["rounds", "findings_total", "accepted_total", "per_round"],
+          "description": "Cycle convergence summary from the upstream cycle's `metrics` (aggregate) plus its per-round sub-step checkpoints (FR-4). null when there is no upstream cycle. rounds/findings_total/accepted_total are null when the cycle recorded no metrics.",
+          "properties": {
+            "rounds": {"type": ["integer", "null"], "description": "Rounds the cycle ran."},
+            "findings_total": {"type": ["integer", "null"], "description": "Findings raised across all rounds."},
+            "accepted_total": {"type": ["integer", "null"], "description": "Findings triaged fix_now across all rounds."},
+            "per_round": {
+              "type": "array",
+              "description": "Per-round breakdown from the checkpointed round artifacts, in ascending round order. A count is null when the round's artifact is absent/unreadable.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["round", "raised", "fixed", "declined"],
+                "properties": {
+                  "round": {"type": "integer", "description": "1-based round number."},
+                  "raised": {"type": ["integer", "null"], "description": "Findings raised this round (from the round's findings.json)."},
+                  "fixed": {"type": ["integer", "null"], "description": "Findings triaged action=fix_now this round."},
+                  "declined": {"type": ["integer", "null"], "description": "Findings triaged action in {defer, reject} this round."}
+                }
+              }
+            }
+          }
+        },
+        "prior_responses": {
+          "type": "array",
+          "description": "Prior human `--response`/rejection decisions bearing on this gate (from the upstream cycle's and the gate's human_responses), in record order, with timestamps. response_text is redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["response_id", "response_text", "timestamp", "user", "state"],
+            "properties": {
+              "response_id": {"type": "string", "description": "Stable response handle (`<step>-resp-<n>`)."},
+              "response_text": {"type": "string", "description": "The decision text, redacted."},
+              "timestamp": {"type": "string", "description": "When the decision was recorded."},
+              "user": {"type": "string", "description": "Who recorded it."},
+              "state": {"type": "string", "enum": ["pending", "consumed"], "description": "Idempotent-recovery state."}
+            }
+          }
+        },
+        "escalated": {
+          "type": "array",
+          "description": "Per-escalated-finding triage reasoning: latest-round verdicts flagged `escalated` or `low_confidence`, merged with their finding. Empty when no verdict was flagged. Content fields (claim/reasoning) redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["finding_id", "severity", "category", "location", "claim", "verdict", "action", "confidence", "reasoning"],
+            "properties": {
+              "finding_id": {"type": "string"},
+              "severity": {"type": ["string", "null"]},
+              "category": {"type": ["string", "null"]},
+              "location": {"type": ["string", "null"]},
+              "claim": {"type": ["string", "null"]},
+              "verdict": {"type": ["string", "null"]},
+              "action": {"type": ["string", "null"]},
+              "confidence": {"type": ["string", "null"]},
+              "reasoning": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
     },
     "steps": {
       "type": "array",
@@ -1094,7 +1200,8 @@ _STATUS_SCHEMA_JSON = r'''{
           "argv",
           "required_inputs",
           "executable",
-          "command"
+          "command",
+          "consequence"
         ],
         "properties": {
           "label": {"type": "string", "description": "Short action label."},
@@ -1121,6 +1228,10 @@ _STATUS_SCHEMA_JSON = r'''{
           "command": {
             "type": "string",
             "description": "Rendered string for HUMAN DISPLAY ONLY, never for execution (may contain placeholder text)."
+          },
+          "consequence": {
+            "type": ["string", "null"],
+            "description": "One-line description of what this action does when taken (harness-efficiency FR-8.2): e.g. a gate approve says what proceeds, a gate reject names the adversarial_cycle it re-runs with the notes injected. null for actions with no distinct consequence to spell out."
           }
         }
       }
@@ -1284,6 +1395,201 @@ def _usage_totals_dict(u) -> dict:
     }
 
 
+# --- gate decision context (harness-efficiency FR-8.1) -----------------------
+def _upstream_cycle_record(man: Manifest, gate_rec: StepRecord) -> StepRecord | None:
+    """The ``adversarial_cycle`` a gate ratifies: the last cycle before it in
+    manifest step order (``prd-cycle`` for ``prd-approve`` etc.).
+
+    Pure over ``man.steps`` — the same relationship the orchestrator resolves from
+    the pipeline (``_upstream_cycle_for_gate``), but read from the manifest so both
+    the status contract and the web view can name the cycle without a pipeline
+    load. Matches ``gate_rec`` by identity first (it is normally an element of
+    ``man.steps``), falling back to ``(id, iteration)`` so a copy still resolves.
+    Returns ``None`` when no cycle precedes the gate (fail-soft — the caller then
+    renders a null convergence / a terminal-reject consequence)."""
+    cyc: StepRecord | None = None
+    for rec in man.steps:
+        if rec is gate_rec or (
+            rec.id == gate_rec.id and rec.iteration == gate_rec.iteration
+        ):
+            return cyc
+        if rec.type == "adversarial_cycle":
+            cyc = rec
+    return cyc
+
+
+def _read_json_under(base: Path, rel: str | None) -> object | None:
+    """Read+parse a run-relative JSON artifact, fail-soft, with containment.
+
+    ``rel`` is an engine-written run-dir-relative path (a checkpoint ``artifact``
+    or ``artifacts/<name>``); it is still resolved and asserted to stay under
+    ``base`` so a corrupt/hostile value can never read outside the run tree
+    (FR-10.1 posture). Any absence/parse/containment failure returns ``None`` — a
+    gate view must never crash on a missing round artifact."""
+    if not rel:
+        return None
+    try:
+        base_r = Path(base).resolve()
+        target = (base_r / rel).resolve()
+        target.relative_to(base_r)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        return json.loads(target.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _as_int(v: object) -> int | None:
+    """An int metric value, or None (bool excluded — it is an int subclass)."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _convergence_summary(
+    cycle_rec: StepRecord | None, run_instance_dir: Path
+) -> dict | None:
+    """The FR-8.1 convergence block: aggregate ``metrics`` + per-round breakdown.
+
+    Aggregate counts come from the cycle's ``metrics`` (the ``_CycleMetrics``
+    dict); the per-round raised/fixed/declined breakdown is read from the round's
+    checkpointed artifacts (FR-4: ``artifacts/r<N>/findings.json`` /
+    ``triage.json``). No transcript, no re-execution — pure rendering over
+    already-persisted data. ``None`` when the gate has no upstream cycle."""
+    if cycle_rec is None:
+        return None
+    metrics = cycle_rec.metrics or {}
+    per_round: list[dict] = []
+    for rnd in sorted({c.round for c in cycle_rec.checkpoints}):
+        cps = {c.sub_step: c for c in cycle_rec.checkpoints if c.round == rnd}
+        raised = fixed = declined = None
+        rev = cps.get("review")
+        if rev is not None:
+            data = _read_json_under(run_instance_dir, rev.artifact)
+            if isinstance(data, dict):
+                raised = len(data.get("findings") or [])
+        tri = cps.get("triage")
+        if tri is not None:
+            data = _read_json_under(run_instance_dir, tri.artifact)
+            if isinstance(data, dict):
+                verdicts = [v for v in (data.get("verdicts") or []) if isinstance(v, dict)]
+                fixed = sum(1 for v in verdicts if v.get("action") == "fix_now")
+                declined = sum(
+                    1 for v in verdicts if v.get("action") in ("defer", "reject")
+                )
+        per_round.append(
+            {"round": rnd, "raised": raised, "fixed": fixed, "declined": declined}
+        )
+    return {
+        "rounds": _as_int(metrics.get("rounds")),
+        "findings_total": _as_int(metrics.get("findings_total")),
+        "accepted_total": _as_int(metrics.get("accepted_total")),
+        "per_round": per_round,
+    }
+
+
+def _prior_responses(
+    cycle_rec: StepRecord | None, gate_rec: StepRecord, redact
+) -> list[dict]:
+    """Prior human ``--response``/rejection decisions bearing on this gate (FR-8.1).
+
+    A gate rejection is appended to the *upstream cycle's* ``human_responses``
+    (``orchestrator.reject_gate`` → ``_append_response``); a gate's own record may
+    also carry responses. Both are surfaced in record order with timestamps;
+    ``response_text`` is content-bearing and passed through ``redact`` (PRD §7)."""
+    out: list[dict] = []
+    for src in (cycle_rec, gate_rec):
+        if src is None:
+            continue
+        for hr in src.human_responses:
+            out.append(
+                {
+                    "response_id": hr.response_id,
+                    "response_text": redact(hr.response_text),
+                    "timestamp": hr.timestamp,
+                    "user": hr.user,
+                    "state": hr.state,
+                }
+            )
+    return out
+
+
+def _escalated_findings(run_instance_dir: Path, redact) -> list[dict]:
+    """Latest-round triage verdicts flagged ``escalated``/``low_confidence`` merged
+    with their finding (FR-8.1 per-escalated-finding reasoning).
+
+    Reads the cycle's latest-round-wins ``artifacts/triage.json`` +
+    ``findings.json`` (the same artifacts the gate ``show:`` lists), keeps only the
+    engine-flagged verdicts, and joins each to its finding. Content fields
+    (claim/reasoning) pass through ``redact`` (PRD §7). Empty when nothing is
+    flagged or the artifacts are absent."""
+    triage = _read_json_under(run_instance_dir, "artifacts/triage.json")
+    findings = _read_json_under(run_instance_dir, "artifacts/findings.json")
+    by_id: dict[str, dict] = {}
+    if isinstance(findings, dict):
+        for f in findings.get("findings") or []:
+            if isinstance(f, dict) and f.get("id"):
+                by_id[f["id"]] = f
+    out: list[dict] = []
+    verdicts = triage.get("verdicts") if isinstance(triage, dict) else None
+    for v in verdicts or []:
+        if not isinstance(v, dict):
+            continue
+        if not (v.get("escalated") or v.get("low_confidence")):
+            continue
+        fid = v.get("finding_id")
+        if not fid:
+            continue
+        f = by_id.get(fid, {})
+        out.append(
+            {
+                "finding_id": fid,
+                "severity": f.get("severity"),
+                "category": f.get("category"),
+                "location": f.get("location"),
+                "claim": redact(f.get("claim")),
+                "verdict": v.get("verdict"),
+                "action": v.get("action"),
+                "confidence": v.get("confidence"),
+                "reasoning": redact(v.get("reasoning")),
+            }
+        )
+    return out
+
+
+def compute_gate_context(
+    man: Manifest, run_instance_dir: Path, gate_rec: StepRecord
+) -> dict:
+    """Assemble the FR-8.1 gate decision context for a parked ``human_gate``.
+
+    A gate decision must be makeable from this block alone (PRD G6): the upstream
+    cycle's convergence summary, the prior human responses/rejections for the
+    gate, and the per-escalated-finding triage reasoning — all sourced from the
+    manifest + the cycle's persisted artifacts, never a transcript. The I/O
+    (round-artifact reads) lives here, not in the pure :func:`status_payload`; the
+    caller threads the result in, mirroring ``current_step_freshness`` /
+    ``suspension``. Content-bearing fields are redacted (PRD §7).
+
+    Always returns a dict (never ``None``) so a gate park always emits a shaped
+    block; a gate with no upstream cycle yields ``cycle_step_id``/``convergence``
+    null and empty lists (fail-soft, still schema-valid)."""
+    from gauntlet.logging.redact import build_redactor
+
+    redactor = build_redactor()
+
+    def redact(text: object) -> object:
+        if not isinstance(text, str):
+            return text
+        return redactor.redact(text)[0]
+
+    cycle_rec = _upstream_cycle_record(man, gate_rec)
+    return {
+        "cycle_step_id": cycle_rec.id if cycle_rec is not None else None,
+        "convergence": _convergence_summary(cycle_rec, run_instance_dir),
+        "prior_responses": _prior_responses(cycle_rec, gate_rec, redact),
+        "escalated": _escalated_findings(run_instance_dir, redact),
+    }
+
+
 def status_payload(
     man: Manifest,
     driver: DriverInfo,
@@ -1294,6 +1600,7 @@ def status_payload(
     run_instance_dir: Path,
     current_step_freshness: float | None = None,
     suspension: dict | None = None,
+    gate: dict | None = None,
     now: datetime | None = None,
     current_step_timeout_s: float | None = None,
 ) -> dict:
@@ -1315,6 +1622,12 @@ def status_payload(
     ``current_step_freshness: null``; a number renders as the nested object
     ``{ "last_event_age_s": <number> }`` — the **object** is the nullable unit,
     never a top-level ``last_event_age_s`` (§6.1).
+
+    ``gate`` is the FR-8.1 gate decision context, assembled by the I/O-bearing
+    :func:`compute_gate_context` in the caller and threaded in the same way (so
+    this serializer stays pure). It is ``None`` for every non-gate state and the
+    caller passes it only for a ``parked_gate`` — ``None`` renders as ``gate:
+    null``.
 
     The completed object is validated against the committed §6.1 schema before it
     is returned (F-003): unconstrained persisted inputs (e.g. an out-of-enum
@@ -1402,11 +1715,13 @@ def status_payload(
         # stall classification. Always present; null only when there is neither a
         # heartbeat nor any recorded interval (nothing to report).
         "suspension": suspension,
-        # Gate context block (PRD §6 / FR-8.1): always present, populated only when
-        # parked at a human gate. The BODY (convergence summary, prior responses,
-        # per-finding triage reasoning) is a P8 deliverable; P3 ships the stable
-        # contract slot always-`null` so consumers can rely on the additive field.
-        "gate": None,
+        # Gate context block (PRD §6 / FR-8.1): always present, non-null only when
+        # parked at a human gate. The body (convergence summary, prior responses,
+        # per-escalated-finding triage reasoning) is assembled by the I/O-bearing
+        # `compute_gate_context` in the caller and threaded in here (like
+        # `suspension`), so this serializer stays pure. `None` for every non-gate
+        # state — the caller passes it only for a `parked_gate`.
+        "gate": gate,
         "steps": [
             {
                 "id": rec.id,

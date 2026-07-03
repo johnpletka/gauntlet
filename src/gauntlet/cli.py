@@ -681,6 +681,22 @@ def status(
                         pstep, cur.agent, mgr.config
                     )
 
+        # Gate decision context (FR-8.1): assembled only when parked at a human
+        # gate, from the manifest + the upstream cycle's persisted artifacts (the
+        # I/O point), then threaded into the pure serializer below like the other
+        # sampled inputs. None for every other state → `gate: null`.
+        gate_ctx = None
+        if rstate.state == operator.STATE_PARKED_GATE and rstate.parked is not None:
+            gate_rec = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            if gate_rec is not None:
+                gate_ctx = operator.compute_gate_context(
+                    man, run_instance_dir, gate_rec
+                )
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -690,6 +706,7 @@ def status(
                 run_root=run_root, run_instance_dir=run_instance_dir,
                 current_step_freshness=freshness,
                 suspension=suspension,
+                gate=gate_ctx,
                 now=now,
                 current_step_timeout_s=current_step_timeout_s,
             )

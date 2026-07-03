@@ -234,11 +234,13 @@ def test_section_6_2_example_validates():
             {"label": "approve", "kind": "decide",
              "argv": ["gauntlet", "approve", "operator-aids"],
              "required_inputs": [], "executable": True,
-             "command": "gauntlet approve operator-aids"},
+             "command": "gauntlet approve operator-aids",
+             "consequence": "continues the run past this gate to the next stage"},
             {"label": "reject", "kind": "decide",
              "argv": ["gauntlet", "reject", "operator-aids", "--notes"],
              "required_inputs": ["notes"], "executable": False,
-             "command": 'gauntlet reject operator-aids --notes "<your reason>"'},
+             "command": 'gauntlet reject operator-aids --notes "<your reason>"',
+             "consequence": "terminally rejects the gate (no upstream cycle to re-run)"},
         ],
     }
     validate_schema(example, STATUS_SCHEMA)
@@ -416,11 +418,13 @@ def test_usage_limit_park_reports_resume_next_action():
     assert actions[0]["command"] == "gauntlet resume demo"
 
 
-def test_gate_block_always_present_and_null_until_p8():
-    # PRD §6 promises a top-level `gate {...} | null` in the P3 status contract.
-    # P3 ships the stable slot always-present and `null`; the populated body is a
-    # P8 deliverable. The field is required by the schema (a consumer can rely on
-    # it) and emitted for every state class, gate parks included.
+def test_gate_block_always_present_and_null_when_not_threaded():
+    # PRD §6 promises a top-level `gate {...} | null` in the status contract. The
+    # field is required by the schema (a consumer can rely on it) and emitted for
+    # every state class. The POPULATED body (P8/FR-8.1) is assembled by the
+    # I/O-bearing operator.compute_gate_context in the caller and threaded in; when
+    # it is NOT threaded (the pure serializer's default) the block is `null` even
+    # at a gate park — a valid degraded case (fail-soft, never a crash).
     assert "gate" in STATUS_SCHEMA["required"]
     for status, steps, liveness in [
         (M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)], op.LIVENESS_ALIVE),

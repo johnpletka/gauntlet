@@ -53,6 +53,67 @@
       <details open><summary>⚠ UPSTREAM CONFLICT (builder-signalled, FR-4.5)</summary>
         <pre class="conflict">{{ gate.upstream_conflict }}</pre></details>
     {% endif %}
+
+    {# --- FR-8.1 gate decision context: convergence + prior responses + escalated
+          triage reasoning, so the decision is makeable from this view alone. #}
+    {% set gc = gate.context %}
+    {% if gc %}
+      {% set conv = gc.convergence %}
+      {% if conv %}
+        <details open class="gate-convergence">
+          <summary>Cycle convergence
+            {% if gc.cycle_step_id %}<span class="muted">({{ gc.cycle_step_id }})</span>{% endif %}
+            — {{ conv.rounds if conv.rounds is not none else "?" }} round(s),
+            {{ conv.findings_total if conv.findings_total is not none else "?" }} raised,
+            {{ conv.accepted_total if conv.accepted_total is not none else "?" }} accepted
+          </summary>
+          {% if conv.per_round %}
+          <table class="findings">
+            <thead><tr><th>Round</th><th>Raised</th><th>Fixed</th><th>Declined</th></tr></thead>
+            <tbody>
+            {% for r in conv.per_round %}
+              <tr><td>{{ r.round }}</td>
+                <td>{{ r.raised if r.raised is not none else "—" }}</td>
+                <td>{{ r.fixed if r.fixed is not none else "—" }}</td>
+                <td>{{ r.declined if r.declined is not none else "—" }}</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% endif %}
+        </details>
+      {% endif %}
+
+      {% if gc.prior_responses %}
+        <details class="gate-responses">
+          <summary>Prior decisions on this gate ({{ gc.prior_responses | length }})</summary>
+          <table class="findings">
+            <thead><tr><th>When</th><th>Who</th><th>State</th><th>Decision</th></tr></thead>
+            <tbody>
+            {% for pr in gc.prior_responses %}
+              <tr><td>{{ pr.timestamp }}</td><td>{{ pr.user }}</td>
+                <td>{{ pr.state }}</td><td class="notes">{{ pr.response_text }}</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </details>
+      {% endif %}
+
+      {% if gc.escalated %}
+        <details open class="gate-escalated">
+          <summary>Escalated / low-confidence findings ({{ gc.escalated | length }})</summary>
+          <table class="findings">
+            <thead><tr><th>ID</th><th>Sev</th><th>Verdict</th><th>Action</th><th>Confidence</th><th>Reasoning</th></tr></thead>
+            <tbody>
+            {% for f in gc.escalated %}
+              <tr><td>{{ f.finding_id }}</td><td>{{ f.severity or "—" }}</td>
+                <td>{{ f.verdict or "—" }}</td><td>{{ f.action or "—" }}</td>
+                <td>{{ f.confidence or "—" }}</td><td class="notes">{{ f.reasoning or "—" }}</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </details>
+      {% endif %}
+    {% endif %}
     {% for a in gate.artifacts %}
       <details {% if loop.first %}open{% endif %}>
         <summary>{{ a.name }} <span class="muted">({{ a.kind }}{% if a.source %} · {{ a.source }}{% endif %})</span></summary>
@@ -145,16 +206,21 @@
         when gate evidence failed to assemble (review F-001, fail closed). --- #}
   {% if not external and not gate_error %}
   <div class="controls control-forms" data-slug="{{ slug }}">
+    {% set gate_cycle = gate.context.cycle_step_id if (gate and gate.context) else None %}
     {% if "approve" in controls %}
       <form data-approve>
         <input type="text" name="notes" placeholder="approval notes (optional)">
         <button type="submit">Approve</button>
+        {# FR-8.2 consequence #}
+        <span class="muted">→ continues the run past this gate</span>
       </form>
     {% endif %}
     {% if "reject" in controls %}
       <form data-reject>
         <input type="text" name="notes" placeholder="rejection notes (required)" required>
         <button type="submit" class="danger">Reject…</button>
+        {# FR-8.2 consequence: name the cycle a reject re-runs (else terminal). #}
+        <span class="muted">→ {% if gate_cycle %}re-runs the <strong>{{ gate_cycle }}</strong> cycle with your notes injected{% else %}terminally rejects the gate{% endif %}</span>
       </form>
     {% endif %}
     {% if "resume" in controls %}

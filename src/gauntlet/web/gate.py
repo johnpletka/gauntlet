@@ -32,6 +32,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from gauntlet.engine import gitops
+from gauntlet.engine import operator
 from gauntlet.engine.manifest import PARKED, Manifest
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.web.intel import extract_finding_ids
@@ -93,6 +94,12 @@ class GateView(BaseModel):
     # FR-4.5 upstream-conflict text from the transcript, when the gate notes
     # indicate the builder signalled one.
     upstream_conflict: str | None = None
+    # Gate decision context (harness-efficiency FR-8.1), populated for a human_gate:
+    # the upstream cycle's convergence summary, prior human responses/rejections,
+    # and per-escalated-finding triage reasoning — assembled from the manifest +
+    # persisted artifacts by :func:`operator.compute_gate_context`, so the gate is
+    # decidable from this view alone (no transcript). None for an escalation park.
+    context: dict | None = None
 
 
 class DiffView(BaseModel):
@@ -228,6 +235,11 @@ class GateResolver:
         upstream = None
         if "upstream conflict" in (rec.notes or "").lower():
             upstream = self._upstream_conflict_text(run_dir, rec.id)
+        # FR-8.1 gate context — convergence, prior responses, escalated reasoning —
+        # from the manifest + persisted artifacts (read-only, fail-soft). Shared
+        # with `status --json` (operator.compute_gate_context) so the two surfaces
+        # can never disagree.
+        context = operator.compute_gate_context(man, run_dir, rec)
         return GateView(
             slug=slug,
             run_id=rid,
@@ -237,6 +249,7 @@ class GateResolver:
             notes=rec.notes,
             artifacts=artifacts,
             upstream_conflict=upstream,
+            context=context,
         )
 
     def _escalation_view(self, slug, rid, run_dir, man, rec) -> GateView:
