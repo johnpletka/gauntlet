@@ -650,9 +650,15 @@ def status(
         # Timing/usage inputs (FR-7.1/FR-7.3), sampled once here (the clock is the
         # single non-pure input) and threaded into both the JSON serializer and the
         # human footer so the two never diverge. The current running step's
-        # effective timeout is best-effort from its profile (a per-step pipeline
-        # override is not visible here; the field is advisory + nullable).
+        # effective timeout is resolved from the persisted pipeline snapshot using
+        # the SAME precedence as execution (per-step `timeout_s` → profile
+        # `step_timeout_s`), so a per-step override or a shell step's own timeout is
+        # reported, not a profile-only guess (F-003). Fail closed to null (advisory
+        # field) when the snapshot or the step is unresolvable.
         from datetime import datetime as _dt, timezone as _tz
+
+        from gauntlet.engine.pipeline import load_pipeline
+        from gauntlet.engine.steptypes import resolve_step_timeout_s
 
         now = _dt.now(_tz.utc)
         current_step_timeout_s = None
@@ -662,11 +668,18 @@ def status(
                  if operator.render_step_id(r) == rstate.current_step),
                 None,
             )
-            if (
-                cur is not None and cur.status == "running"
-                and cur.agent and cur.agent in mgr.config.agents
-            ):
-                current_step_timeout_s = mgr.config.profile(cur.agent).step_timeout_s
+            if cur is not None and cur.status == "running":
+                try:
+                    pipeline, _ = load_pipeline(run_instance_dir / "pipeline.yaml")
+                except (OSError, ValueError):
+                    pipeline = None
+                pstep = next(
+                    (s for s in pipeline.all_steps() if s.id == cur.id), None
+                ) if pipeline is not None else None
+                if pstep is not None:
+                    current_step_timeout_s = resolve_step_timeout_s(
+                        pstep, cur.agent, mgr.config
+                    )
 
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
@@ -1066,7 +1079,18 @@ def report(
 
     mgr = _manager()
     man = mgr.status(slug)
-    typer.echo(render_report(man), nl=False)
+    # FR-7.4 cold-start metric needs to know which profiles support session
+    # resume; resolve it from config (adapter capabilities). Best-effort: an
+    # unresolvable/unregistered adapter simply drops out of the resume set, so a
+    # profile's cold-start column reads `—` rather than crashing the report.
+    resume_capable: set[str] = set()
+    for name in mgr.config.agents:
+        try:
+            if mgr.config.profile(name).adapter_class().capabilities.resume:
+                resume_capable.add(name)
+        except (KeyError, AttributeError):
+            continue
+    typer.echo(render_report(man, resume_capable=resume_capable), nl=False)
     if trend:
         typer.echo("")
         typer.echo(render_trend(mgr.trend(slug)), nl=False)

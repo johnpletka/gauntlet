@@ -13,7 +13,12 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
-from gauntlet.engine.steptypes import _marker_signalled, render_shell_command
+from gauntlet.engine.pipeline import Step
+from gauntlet.engine.steptypes import (
+    _marker_signalled,
+    render_shell_command,
+    resolve_step_timeout_s,
+)
 
 from conftest import FakeAdapter, git
 
@@ -31,6 +36,39 @@ def _orch(repo, text, *, config=None, adapters=None, extra_context=None):
         adapter_factory=(lambda n: adapters[n]) if adapters else None,
         extra_context=extra_context or {},
     )
+
+
+# --- effective-timeout precedence (F-003) -----------------------------------
+_TIMEOUT_CFG = RunConfig.model_validate(
+    {"agents": {"builder": {"adapter": "claude-code", "step_timeout_s": 600.0}}}
+)
+
+
+def test_per_step_timeout_overrides_profile():
+    # A per-step `timeout_s` wins over the profile's step_timeout_s (FR-3.3): the
+    # status path must report the real deadline, not the profile guess.
+    step = Step(id="impl", type="agent_task", agent="builder", timeout_s=120.0)
+    assert resolve_step_timeout_s(step, "builder", _TIMEOUT_CFG) == 120.0
+
+
+def test_profile_timeout_when_no_per_step_override():
+    step = Step(id="impl", type="agent_task", agent="builder")
+    assert resolve_step_timeout_s(step, "builder", _TIMEOUT_CFG) == 600.0
+
+
+def test_shell_step_reports_own_timeout_not_profile():
+    # A shell step has no agent, so it never picks up a profile fallback: its own
+    # `timeout_s` is the effective deadline (previously reported as null).
+    step = Step(id="lint", type="shell", timeout_s=45.0)
+    assert resolve_step_timeout_s(step, None, _TIMEOUT_CFG) == 45.0
+
+
+def test_no_timeout_anywhere_is_none():
+    step = Step(id="lint", type="shell")
+    assert resolve_step_timeout_s(step, None, _TIMEOUT_CFG) is None
+    # An agent with no per-step and no profile timeout is also unbounded.
+    cfg = RunConfig.model_validate({"agents": {"b": {"adapter": "claude-code"}}})
+    assert resolve_step_timeout_s(Step(id="s", type="agent_task", agent="b"), "b", cfg) is None
 
 
 # --- trust model (review F-001) ---------------------------------------------

@@ -798,6 +798,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "reconciliation",
     "current_step_freshness",
     "suspension",
+    "gate",
     "steps",
     "next_actions"
   ],
@@ -1007,6 +1008,11 @@ _STATUS_SCHEMA_JSON = r'''{
           }
         }
       }
+    },
+    "gate": {
+      "type": ["object", "null"],
+      "description": "Gate context block (PRD §6 / FR-8.1): always present, non-null only when parked at a human gate. The populated body (cycle convergence summary, prior human responses/rejections, per-escalated-finding triage reasoning) is a P8 deliverable; the current major version emits `null` only, so the object shape is intentionally left unconstrained here and tightened additively when P8 populates it. Consumers may rely on the field always being present.",
+      "additionalProperties": true
     },
     "steps": {
       "type": "array",
@@ -1376,6 +1382,11 @@ def status_payload(
         # stall classification. Always present; null only when there is neither a
         # heartbeat nor any recorded interval (nothing to report).
         "suspension": suspension,
+        # Gate context block (PRD §6 / FR-8.1): always present, populated only when
+        # parked at a human gate. The BODY (convergence summary, prior responses,
+        # per-finding triage reasoning) is a P8 deliverable; P3 ships the stable
+        # contract slot always-`null` so consumers can rely on the additive field.
+        "gate": None,
         "steps": [
             {
                 "id": rec.id,

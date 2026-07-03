@@ -803,12 +803,12 @@ class Orchestrator:
         # unexplainable state (`reason_fields_disjoint` holds afterward).
         if rec.status == M.PARKED:
             rec.halt_reason = None
-            # A human_gate park stamps `gate` (belt-and-suspenders; the handler
-            # already sets it). A non-canonical `halt_on:` marker park legitimately
-            # carries NO PRD reason (its plain-`resume`-re-runs semantics differ
-            # from every PRD park); it is left null and read back as null by
-            # `normalize_parked_reason`, exactly as before P3 — never coerced into
-            # `response`, which would wrongly demand a `--response` decision.
+            # Every PARKED step must carry a PRD reason (FR-7.2 / P3 park
+            # invariant): usage_limit / artifact_invalid parks stamp theirs at the
+            # handler, a halt_on park stamps `response` (see `_completion_signal`),
+            # and a human_gate park stamps `gate`. The human_gate backfill here is
+            # belt-and-suspenders (the handler already set it); no park is written
+            # with a null parked_reason, which would classify as `unknown`.
             if rec.parked_reason is None and rec.type == "human_gate":
                 rec.parked_reason = M.PARKED_REASON_GATE
         elif rec.status in (M.HALTED, M.FAILED, M.INTERRUPTED):

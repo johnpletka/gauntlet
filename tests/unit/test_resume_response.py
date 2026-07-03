@@ -380,10 +380,12 @@ stages:
     )
 
 
-def test_non_conflict_agent_park_resumes_without_response(tmp_path):
-    # FR-1.1: a generic (non-conflict) agent_task park keeps its existing
-    # response-less re-run behavior. A `halt_on` marker that is NOT the canonical
-    # UPSTREAM CONFLICT parks with parked_reason unset.
+def test_non_conflict_agent_park_requires_response(tmp_path):
+    # FR-7.2 park invariant (F-001): a `halt_on` park is a human-decision park
+    # even for a custom (non-UPSTREAM CONFLICT) marker, so it stamps the PRD
+    # `response` reason — never a null parked_reason. Because `response` is
+    # response-resolvable, a plain `resume` refuses to re-drive (it would only
+    # re-halt into the same wall) and directs the operator to `--response`.
     text = """
 name: respond
 version: 1
@@ -411,15 +413,17 @@ stages:
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason is None  # not a conflict park
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE  # human-decision park
+    assert rec.halt_reason is None  # disjoint (FR-7.2)
 
-    # Response-less resume re-runs the agent exactly as before this feature.
-    halt.behavior = "proceed"
-    status = mgr.resume("demo", use_judge=False, adapter_factory=lambda n: halt)
-    assert status == M.RUN_DONE
+    # A plain resume must NOT re-drive a response-resolvable park; it directs the
+    # operator to --response rather than re-running into the same halt.
+    with pytest.raises(ValueError, match="--response"):
+        mgr.resume("demo", use_judge=False, adapter_factory=lambda n: halt)
+    # The manifest is untouched: still parked on response, nothing re-executed.
     rec = mgr.status("demo").record("implement")
-    assert rec.status == M.DONE
-    assert rec.human_responses == []  # nothing recorded; not a conflict path
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
 
 
 # --- operator identity (FR-9) -----------------------------------------------

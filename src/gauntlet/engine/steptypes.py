@@ -118,6 +118,23 @@ def render_shell_command(template: str, config) -> str:
     return rendered
 
 
+def resolve_step_timeout_s(step: Step, agent_name: str | None, config) -> float | None:
+    """Effective step deadline (FR-3.3) — the single precedence rule.
+
+    Per-step ``timeout_s`` wins; else an agent step falls back to its profile's
+    ``step_timeout_s``; else ``None`` (unbounded). Shared by the ``agent_task``
+    handler (which arms the adapter with it) and the read-only status path (which
+    renders ``current_step_timeout_remaining_s`` from it), so the reported deadline
+    is the real one — not a profile-only guess that misses a per-step override or a
+    shell step's own ``timeout_s`` (F-003). A shell step has no agent, so it never
+    picks up the profile fallback: it reports its own ``timeout_s`` or null.
+    """
+    timeout = step.timeout_s
+    if timeout is None and agent_name and agent_name in config.agents:
+        timeout = config.profile(agent_name).step_timeout_s
+    return timeout
+
+
 def handle_shell(step: Step, ctx: StepContext) -> StepResult:
     template = step.get("run")
     if not template:
@@ -244,10 +261,9 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     )
     # Per-step timeout overrides the profile's step_timeout_s, which overrides
     # the adapter default (FR-3.3). A timeout raises AgentTimeoutError, which the
-    # orchestrator turns into a HALTED checkpoint.
-    timeout = step.timeout_s
-    if timeout is None and agent_name in ctx.config.agents:
-        timeout = ctx.config.profile(agent_name).step_timeout_s
+    # orchestrator turns into a HALTED checkpoint. The status path resolves the
+    # SAME value via `resolve_step_timeout_s` so the reported deadline matches.
+    timeout = resolve_step_timeout_s(step, agent_name, ctx.config)
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
@@ -460,10 +476,13 @@ def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     ``halt_reason``; the require_signal failure carries ``halt_reason`` and a null
     ``parked_reason``.
 
-    ``parked_reason`` is ``PARKED_REASON_RESPONSE`` only when the matched
-    ``halt_on`` marker is *exactly* the canonical :data:`UPSTREAM_CONFLICT_MARKER`
-    (FR-10.4) — a step parking on a *different* ``halt_on`` marker carries no
-    ``parked_reason`` (``_finalize`` then defaults it, keeping the invariant).
+    A ``halt_on`` park ALWAYS carries ``parked_reason=PARKED_REASON_RESPONSE``
+    (FR-7.2 park invariant): the agent deliberately halted for a human decision,
+    which is the PRD ``response`` park kind regardless of the marker text. The
+    canonical :data:`UPSTREAM_CONFLICT_MARKER` and any custom ``halt_on`` marker
+    alike route by step type (``RESPONDABLE_STEP_TYPES``), so a single reason
+    serves both and no park is ever written with a null ``parked_reason`` (a null
+    would classify as ``unknown`` — unexplainable from status JSON).
 
     ``check_halt=False`` suppresses only the ``halt_on`` check (review F-004): on a
     proceed-disposition `--response` resume the textual UPSTREAM CONFLICT marker is
@@ -472,15 +491,17 @@ def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     """
     halt_on = step.get("halt_on")
     if check_halt and halt_on and _marker_signalled(halt_on, text):
-        parked_reason = (
-            PARKED_REASON_RESPONSE
-            if halt_on == UPSTREAM_CONFLICT_MARKER
-            else None
-        )
+        # Every halt_on park is a human-decision park → PRD `response` reason
+        # (FR-7.2 park invariant, F-001): the agent halted for a human, and
+        # re-driving without a decision would only re-halt into the same wall.
+        # The builder-conflict vs cycle-escalation distinction is recovered from
+        # the step type (RESPONDABLE_STEP_TYPES), not this value, so one reason
+        # serves the canonical UPSTREAM CONFLICT marker and any custom marker
+        # alike. Never null (a null park classifies as `unknown`).
         return PARKED, (
             f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
             "parked for a human instead of marking the step done (#32)"
-        ), parked_reason, None
+        ), PARKED_REASON_RESPONSE, None
     require = step.get("require_signal")
     if require and not _marker_signalled(require, text):
         # The agent ran but did not satisfy the completion contract — a terminal

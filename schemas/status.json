@@ -39,6 +39,7 @@
     "reconciliation",
     "current_step_freshness",
     "suspension",
+    "gate",
     "steps",
     "next_actions"
   ],
@@ -248,6 +249,11 @@
           }
         }
       }
+    },
+    "gate": {
+      "type": ["object", "null"],
+      "description": "Gate context block (PRD §6 / FR-8.1): always present, non-null only when parked at a human gate. The populated body (cycle convergence summary, prior human responses/rejections, per-escalated-finding triage reasoning) is a P8 deliverable; the current major version emits `null` only, so the object shape is intentionally left unconstrained here and tightened additively when P8 populates it. Consumers may rely on the field always being present.",
+      "additionalProperties": true
     },
     "steps": {
       "type": "array",

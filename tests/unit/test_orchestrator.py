@@ -405,9 +405,11 @@ def test_upstream_conflict_sets_parked_reason(fixture_repo):
     assert rec.halt_reason is None  # disjoint (FR-7.2)
 
 
-def test_non_conflict_halt_marker_parks_without_reason(fixture_repo):
-    # Only the canonical UPSTREAM CONFLICT marker sets parked_reason; a step
-    # parking on a *different* halt_on marker leaves it unset (FR-2.1).
+def test_non_conflict_halt_marker_parks_with_response_reason(fixture_repo):
+    # Every halt_on park is a human-decision park, so it stamps the PRD
+    # `response` reason (FR-7.2 park invariant) — a custom (non-UPSTREAM CONFLICT)
+    # marker included. No park is left with a null parked_reason (which would
+    # classify as `unknown`); routing is by step type, not the marker text.
     text = """
 name: demo
 version: 1
@@ -422,7 +424,8 @@ stages:
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason is None
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
+    assert rec.halt_reason is None  # disjoint (FR-7.2)
 
 
 def test_human_gate_park_sets_gate_reason(fixture_repo):

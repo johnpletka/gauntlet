@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from gauntlet.adapters._structured import validate_schema
@@ -215,6 +216,8 @@ def test_section_6_2_example_validates():
         "current_step_freshness": None,
         # Additive FR-5.3 field: always present, null when nothing to report.
         "suspension": None,
+        # PRD §6 gate block: always present, body populated in P8; null for now.
+        "gate": None,
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done",
              "duration_s": 620.0, "notes": None,
@@ -272,6 +275,42 @@ def test_json_is_a_lone_parseable_object_exit_zero(
     payload = json.loads(result.stdout)  # parses as a single JSON value
     assert isinstance(payload, dict)
     assert payload["state"] == expected_state
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_status_json_resolves_shell_step_timeout_from_snapshot(tmp_path, monkeypatch):
+    # F-003: the status path resolves the effective timeout from the persisted
+    # pipeline.yaml snapshot with the same precedence as execution. A running
+    # SHELL step carries its own `timeout_s` and no agent, so the old profile-only
+    # path reported `current_step_timeout_remaining_s: null`; it now reports the
+    # real deadline.
+    (tmp_path / ".gauntlet").mkdir()
+    (tmp_path / ".gauntlet" / "config.yaml").write_text("{}\n")
+    run_dir = tmp_path / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    pipeline = {
+        "name": "p", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {"id": "lint", "type": "shell", "run": "echo hi", "timeout_s": 100000},
+        ]}],
+    }
+    (run_dir / "pipeline.yaml").write_text(yaml.dump(pipeline))
+    man = {
+        "run_id": "run-1", "slug": "demo", "branch": "gauntlet/demo",
+        "base_branch": "main", "pipeline": {"name": "p", "version": 1, "hash": "h"},
+        "status": "running",
+        "steps": [{"id": "lint", "type": "shell", "status": "running",
+                   "started": "2026-07-02T00:00:00+00:00"}],
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (tmp_path / "runs" / "demo" / "active-run.txt").write_text("run-1\n")
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status", "demo", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["current_step"] == "lint"
+    # A real deadline is reported (a number), not null as the profile-only path did.
+    assert payload["current_step_timeout_remaining_s"] is not None
     validate_schema(payload, STATUS_SCHEMA)
 
 
@@ -371,6 +410,30 @@ def test_usage_limit_park_reports_resume_next_action():
     assert actions[0]["kind"] == "control"
     assert actions[0]["executable"] is True
     assert actions[0]["command"] == "gauntlet resume demo"
+
+
+def test_gate_block_always_present_and_null_until_p8():
+    # PRD §6 promises a top-level `gate {...} | null` in the P3 status contract.
+    # P3 ships the stable slot always-present and `null`; the populated body is a
+    # P8 deliverable. The field is required by the schema (a consumer can rely on
+    # it) and emitted for every state class, gate parks included.
+    assert "gate" in STATUS_SCHEMA["required"]
+    for status, steps, liveness in [
+        (M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)], op.LIVENESS_ALIVE),
+        (M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)], op.LIVENESS_NONE),
+        (M.RUN_DONE, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE),
+    ]:
+        payload = _payload(_manifest(status, steps), liveness)
+        assert "gate" in payload and payload["gate"] is None
+        validate_schema(payload, STATUS_SCHEMA)
+    # The schema requires the field: dropping it fails validation.
+    payload = _payload(
+        _manifest(M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)]),
+        op.LIVENESS_NONE,
+    )
+    payload.pop("gate")
+    with pytest.raises(ValueError):
+        validate_schema(payload, STATUS_SCHEMA)
 
 
 def test_embedded_schema_matches_committed_file():
