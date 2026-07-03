@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/harness-efficiency` (base `chore/fable-review`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `implement`)
-- totals: 13121105in/1794347out $275.6848
+- status: **running** (at `phase-commit`)
+- totals: 13790319in/2028694out $316.4060
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -49,7 +49,9 @@
 | [tests.8](steps/tests.8/) | shell | done | 385s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.8 | commit | done | 47s | 19001in/3803out $0.0124 | committed 31c3d119ab |
 | [impl-cycle.8](steps/impl-cycle.8/) | adversarial_cycle | done | 1791s | 617768in/70737out $6.7984 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
-| implement.9 | agent_task | running | — | 0in/0out (tokens only) |  |
+| [implement.9](steps/implement.9/transcript.md) | agent_task | done | 2905s | 10435in/114049out $40.3159 | agent 'builder' completed |
+| [tests.9](steps/tests.9/) | shell | done | 394s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.9 | commit | pending | 31s | 429in/2660out $0.0054 | operator surgery: reset failed->pending — pre-P9 driver lacked the empty-marker commit path for an all-wip phase; fresh process has P9 handler; backup manifest.backup3.json |
 
 ## Commits
 

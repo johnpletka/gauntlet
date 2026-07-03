@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "implement",
+  "current_step": "phase-commit",
   "warnings": [],
   "steps": [
     {
@@ -64,7 +64,9 @@
         "confirm_counts": {
           "resolved": 9
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "prd-approve",
@@ -93,7 +95,9 @@
       },
       "notes": "approved",
       "iteration": null,
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "plan-author",
@@ -122,7 +126,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": null,
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "plan-cycle",
@@ -187,7 +193,9 @@
         "confirm_counts": {
           "resolved": 2
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "plan-lint",
@@ -216,7 +224,9 @@
       },
       "notes": "phase lint: 11 phase(s) valid (P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11)",
       "iteration": null,
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "plan-approve",
@@ -245,7 +255,9 @@
       },
       "notes": "approved",
       "iteration": null,
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -274,7 +286,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "0",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -303,7 +317,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "0",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -332,7 +348,9 @@
       },
       "notes": "committed 96f33bd960",
       "iteration": "0",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -373,7 +391,9 @@
           "partially_resolved": 1,
           "resolved": 2
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -402,7 +422,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "1",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -431,7 +453,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "1",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -460,7 +484,9 @@
       },
       "notes": "committed 7253c44790",
       "iteration": "1",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -500,7 +526,9 @@
         "confirm_counts": {
           "resolved": 5
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -529,7 +557,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "2",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -558,7 +588,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "2",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -587,7 +619,9 @@
       },
       "notes": "committed b8c642b88b",
       "iteration": "2",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -628,7 +662,9 @@
           "resolved": 3,
           "partially_resolved": 1
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -657,7 +693,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "3",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -686,7 +724,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "3",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -715,7 +755,9 @@
       },
       "notes": "committed 86a58c074a",
       "iteration": "3",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -755,7 +797,9 @@
         "confirm_counts": {
           "resolved": 5
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -784,7 +828,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "4",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -813,7 +859,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "4",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -842,7 +890,9 @@
       },
       "notes": "committed 3dbb1a3677",
       "iteration": "4",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -882,7 +932,9 @@
         "confirm_counts": {
           "resolved": 3
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -911,7 +963,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "5",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -940,7 +994,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "5",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -969,7 +1025,9 @@
       },
       "notes": "committed 4972ae5eef",
       "iteration": "5",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -1009,7 +1067,9 @@
         "confirm_counts": {
           "resolved": 2
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -1038,7 +1098,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "6",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -1067,7 +1129,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "6",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -1096,7 +1160,9 @@
       },
       "notes": "committed d8220a35e9",
       "iteration": "6",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -1136,7 +1202,9 @@
         "confirm_counts": {
           "resolved": 4
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -1165,7 +1233,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "7",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -1194,7 +1264,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "7",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -1223,7 +1295,9 @@
       },
       "notes": "committed efe412fcd2",
       "iteration": "7",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -1263,7 +1337,9 @@
         "confirm_counts": {
           "resolved": 3
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
@@ -1292,7 +1368,9 @@
       },
       "notes": "agent 'builder' completed",
       "iteration": "8",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "tests",
@@ -1321,7 +1399,9 @@
       },
       "notes": "`uv run pytest` exited 0",
       "iteration": "8",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "phase-commit",
@@ -1350,7 +1430,9 @@
       },
       "notes": "committed 31c3d119ab",
       "iteration": "8",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "impl-cycle",
@@ -1390,18 +1472,51 @@
         "confirm_counts": {
           "resolved": 2
         }
-      }
+      },
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     },
     {
       "id": "implement",
       "type": "agent_task",
-      "status": "running",
+      "status": "done",
       "agent": "builder",
-      "session_id": null,
+      "session_id": "3acd89f6-c975-47a7-8400-60ea7b790c2b",
       "started": "2026-07-03T07:49:20.412628+00:00",
-      "ended": null,
+      "ended": "2026-07-03T08:37:45.877406+00:00",
       "attempts": 0,
       "base_sha": "02370b34721df3916a498712ed4d382acb844617",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 10435,
+        "output_tokens": 114049,
+        "cached_input_tokens": 62390931,
+        "cost_usd": 40.3159385
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "9",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-03T08:37:45.886284+00:00",
+      "ended": "2026-07-03T08:44:19.644160+00:00",
+      "attempts": 0,
+      "base_sha": "ef6fd5b9d52aa1b486c59e5e03167d6d2657ff27",
       "parked_reason": null,
       "halt_reason": null,
       "failure_kind": null,
@@ -1417,9 +1532,42 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
-      "notes": null,
+      "notes": "`uv run pytest` exited 0",
       "iteration": "9",
-      "metrics": {}
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "pending",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-03T08:44:19.647236+00:00",
+      "ended": "2026-07-03T08:44:50.612070+00:00",
+      "attempts": 1,
+      "base_sha": "ef6fd5b9d52aa1b486c59e5e03167d6d2657ff27",
+      "parked_reason": null,
+      "halt_reason": "adapter_error",
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 429,
+        "output_tokens": 2660,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.00542725
+      },
+      "notes": "operator surgery: reset failed->pending — pre-P9 driver lacked the empty-marker commit path for an all-wip phase; fresh process has P9 handler; backup manifest.backup3.json",
+      "iteration": "9",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     }
   ],
   "suspensions": [],
@@ -1546,10 +1694,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 13121105,
-    "output_tokens": 1794347,
-    "cached_input_tokens": 325432855,
-    "cost_usd": 275.6847882
+    "input_tokens": 13790319,
+    "output_tokens": 2028694,
+    "cached_input_tokens": 387823786,
+    "cost_usd": 316.40601745000004
   },
   "agent_usage": {
     "reviewer": {
@@ -1559,10 +1707,10 @@
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 323319,
-      "output_tokens": 49346,
+      "input_tokens": 323748,
+      "output_tokens": 52006,
       "cached_input_tokens": 0,
-      "cost_usd": 0.17350254999999998
+      "cost_usd": 0.17892979999999997
     },
     "escalation": {
       "input_tokens": 24444,
@@ -1571,16 +1719,16 @@
       "cost_usd": 0.090701
     },
     "builder": {
-      "input_tokens": 246508,
-      "output_tokens": 1580725,
-      "cached_input_tokens": 315193367,
-      "cost_usd": 275.2064239999999
+      "input_tokens": 256943,
+      "output_tokens": 1694774,
+      "cached_input_tokens": 377584298,
+      "cost_usd": 315.52236249999993
     },
     "judge_llm": {
-      "input_tokens": 365977,
-      "output_tokens": 61650,
+      "input_tokens": 1024327,
+      "output_tokens": 179288,
       "cached_input_tokens": 0,
-      "cost_usd": 0.21416065000000004
+      "cost_usd": 0.6140241499999994
     }
   },
   "recoveries": [],
