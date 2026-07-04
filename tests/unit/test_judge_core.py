@@ -219,3 +219,121 @@ def test_audit_redacts_secret_in_command(tmp_path, monkeypatch):
     text = audit.read_text()
     assert secret not in text
     assert "[REDACTED:github-token]" in text
+
+
+# --- FR-12: per-run judge allow-decision cache -----------------------------------
+class CountingClassifier:
+    """An LLMClassifier stand-in that counts how many times it classified."""
+
+    def __init__(self, decision="allow", risk="package-install", rationale="ok",
+                 usage=None):
+        self._decision = decision
+        self._risk = risk
+        self._rationale = rationale
+        self._usage = usage
+        self.calls = 0
+
+    def classify(self, tool_name, tool_input):
+        from gauntlet.judge.decision import JudgeDecision
+
+        self.calls += 1
+        return JudgeDecision(
+            decision=self._decision, source="llm",
+            risk_category=self._risk, rationale=self._rationale,
+            usage=self._usage,
+        )
+
+
+def test_identical_allow_is_evaluated_once_then_cached(tmp_path):
+    # FR-12.1/12.2: two byte-identical allow calls → ONE classifier evaluation +
+    # one audited cache hit; the classifier is not consulted on the repeat.
+    clf = CountingClassifier(
+        decision="allow",
+        usage={"input_tokens": 20, "output_tokens": 4, "cost_usd": 0.003},
+    )
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), classifier=clf, audit_path=audit)
+    call = ("Bash", {"command": "pip install requests"})
+    d1 = core.decide(*call, repo_root=REPO_ROOT)
+    d2 = core.decide(*call, repo_root=REPO_ROOT)
+    assert d1.decision == "allow" and d2.decision == "allow"
+    assert clf.calls == 1  # FR-12.2: classifier NOT re-invoked on the cache hit
+    lines = [json.loads(x) for x in audit.read_text().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]["cached"] is False and lines[0]["cached_from"] is None
+    # the hit is audited with cached: true and the ORIGINAL decision id
+    assert lines[1]["cached"] is True
+    assert lines[1]["cached_from"] == lines[0]["decision_id"]
+    assert lines[1]["decision"] == "allow" and lines[1]["source"] == "llm"
+    # the eval line carries the LLM spend; the HIT line records NONE, so
+    # `_merge_judge_usage` (which sums this field) cannot double-count (FR-12.1).
+    assert lines[0]["usage"] == {
+        "input_tokens": 20, "output_tokens": 4, "cost_usd": 0.003,
+    }
+    assert lines[1]["usage"] is None
+
+
+def test_deny_is_never_cached(tmp_path):
+    # FR-12.1: a repeated denied call is evaluated every time — deny is never
+    # cached, so the cache can never fail open.
+    clf = CountingClassifier(decision="deny")
+    core = JudgeCore(engine(), classifier=clf)
+    call = ("Bash", {"command": "telnet bbs.example.org"})
+    assert core.decide(*call, repo_root=REPO_ROOT).decision == "deny"
+    assert core.decide(*call, repo_root=REPO_ROOT).decision == "deny"
+    assert clf.calls == 2  # two evaluations, no cache
+
+
+def test_ask_rung_allow_then_hit_but_deny_not_cached():
+    # A fast-path allow is also cached (no classifier), while a fast-path... deny
+    # repeated re-evaluates the policy every time.
+    core = JudgeCore(engine())
+    allow_call = ("Bash", {"command": "git status"})
+    d1 = core.decide(*allow_call, repo_root=REPO_ROOT)
+    assert d1.decision == "allow" and d1.source == "fast-path"
+    # cached fast-path allow returns the SAME decision object
+    assert core.decide(*allow_call, repo_root=REPO_ROOT) is d1
+
+
+def test_policy_change_rotates_the_cache_key(tmp_path):
+    # FR-12.1/§7: any policy change rotates the key, so an identical call after an
+    # edit is re-evaluated rather than served from the stale cache.
+    clf = CountingClassifier(decision="allow")
+    core = JudgeCore(engine(), classifier=clf)
+    call = ("Bash", {"command": "pip install requests"})
+    core.decide(*call, repo_root=REPO_ROOT)
+    assert clf.calls == 1
+    # mutate the in-effect policy → its content hash changes → key rotates
+    from gauntlet.judge.policy import PolicyRule
+
+    core.policy_engine.policy.deny.append(
+        PolicyRule(name="new-deny", command_patterns=["never-matches-xyz"])
+    )
+    core.decide(*call, repo_root=REPO_ROOT)
+    assert clf.calls == 2  # re-evaluated after the policy edit
+
+
+def test_pipeline_step_context_is_a_distinct_cache_key():
+    # Fail-closed: the decision depends on whether a pipeline step is active
+    # (pipeline_step_only rules), so an operator-session allow must NOT be served
+    # from cache to an in-pipeline call with the same payload.
+    clf = CountingClassifier(decision="allow")
+    core = JudgeCore(engine(), classifier=clf)
+    call = ("Bash", {"command": "pip install requests"})
+    core.decide(*call, repo_root=REPO_ROOT, step_id=None)       # operator session
+    core.decide(*call, repo_root=REPO_ROOT, step_id="implement")  # in-pipeline
+    assert clf.calls == 2  # distinct keys → not a cross-context cache hit
+
+
+def test_agent_profile_scopes_the_cache_key():
+    # FR-12.1: agent_profile is part of the key; the same call from two profiles
+    # is cached separately.
+    clf = CountingClassifier(decision="allow")
+    core = JudgeCore(engine(), classifier=clf)
+    call = ("Bash", {"command": "pip install requests"})
+    core.decide(*call, repo_root=REPO_ROOT, agent_profile="builder")
+    core.decide(*call, repo_root=REPO_ROOT, agent_profile="reviewer")
+    assert clf.calls == 2
+    # repeating the first profile's call is now a hit (no third evaluation)
+    core.decide(*call, repo_root=REPO_ROOT, agent_profile="builder")
+    assert clf.calls == 2

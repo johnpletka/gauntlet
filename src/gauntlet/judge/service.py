@@ -27,6 +27,9 @@ class DecideRequest(BaseModel):
     repo_root: str
     run_id: str | None = None
     step_id: str | None = None
+    # Optional agent-profile scoping for the allow-decision cache key (FR-12.1).
+    # Absent → None (the cache still functions, just not profile-discriminated).
+    agent_profile: str | None = None
 
 
 class DecideResponse(BaseModel):
@@ -80,6 +83,7 @@ def create_app(
             repo_root=Path(req.repo_root),
             run_id=req.run_id,
             step_id=req.step_id,
+            agent_profile=req.agent_profile,
         )
         return DecideResponse(
             decision=decision.decision,
