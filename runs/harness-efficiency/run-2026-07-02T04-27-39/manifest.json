@@ -1803,7 +1803,16 @@
       "parked_substep": null,
       "scheduled_resume": null,
       "revalidation": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "phase-commit-resp-1",
+          "response_text": "P11: add concurrent triage and judge decision cache\n\nFinal harness-efficiency phase (P11): fan out per-finding triage concurrently\nand cache judge decisions so repeated identical judge queries reuse a verdict.\nCommitted via operator `gauntlet resume --response` after the message drafter\ncould not produce an FR-9.2-legal (<=72 char) header; the phase work itself is\nthe reviewed builder checkpoints listed below.",
+          "timestamp": "2026-07-04T22:50:16.942772+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 36488,
         "output_tokens": 3851,
