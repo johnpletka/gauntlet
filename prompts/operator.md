@@ -147,7 +147,44 @@ defeats the safety the pipeline is built on.
   recovery meaningful. If something needs changing, it changes through a step, not
   your editor.
 
-## 7. Handoff
+## 7. Operating a `gauntlet review` run (the lightweight surface)
+
+`gauntlet review` runs the adversarial cycle *alone* against an
+already-implemented change — no PRD/plan/phase ceremony and **no routine gates**.
+Everything above is the heavyweight `gauntlet run` state machine; a review run is
+operated differently, and the difference matters before you reach for a familiar
+verb.
+
+- **The generic slug verbs do not see it.** `gauntlet status` / `logs` /
+  `resume` / `abort <slug>` resolve heavyweight run instances under the run root.
+  A review run's state lives *out-of-repo* under
+  `${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/<repo-id>/<slug>/` (`<slug>`
+  is the sanitized branch name, or `pr-<N>`), so those verbs will not find it. You
+  operate a review run only by re-invoking `gauntlet review` against the **same
+  target** — the same branch, or the same `--pr <N>` — which re-resolves the same
+  state dir. Its evidence lives in that state dir and is printed at run end, not
+  through `gauntlet logs`.
+- **Its routine outcome is a summary, not a gate.** With zero gates a review run
+  either **completes** — printing its `REVIEW.x` fix commits and a residual-risk /
+  declined-findings summary — or **parks** on an unresolved legitimate *blocking*
+  finding (the cycle's fail-closed escalation, preserved unchanged). A legitimate
+  *non-blocking* finding does **not** park: it completes and is surfaced as
+  residual risk in that summary. Read the summary — it is the run's whole result,
+  and there is no gate to approve.
+- **Resume a parked review by re-running it with the decision.** `gauntlet review
+  <same-target> --response "<decision>"` re-drives the parked cycle with your note
+  injected as authoritative reviewer/triager guidance (the same FR-10.4 mechanism
+  as `resume --response` on a heavyweight run). Re-invoking the same target
+  **without** `--response` also resumes an existing non-terminal run rather than
+  starting a fresh one — it never clobbers a parked run. `--response` with no
+  resumable run refuses ("nothing to resume") rather than silently starting one.
+- **The §6 guardrails hold unchanged.** A review run mints no branch and never
+  pushes; accepted fixes land as `REVIEW.x` commits in place on the branch under
+  review (or the PR's head branch) and the human pushes. The judge boundary is
+  unchanged. Nothing here relaxes §6 — you still never approve on a human's
+  behalf, never `--no-judge`, and never hand-edit what a step owns.
+
+## 8. Handoff
 
 When you have acted, say plainly what state the run is now in and what the next
 human decision is, if any. Leave the run in a state the next operator — or the
