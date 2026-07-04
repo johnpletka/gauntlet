@@ -109,7 +109,14 @@ def writer(rel, content, result):
 
 
 # --- harness ---------------------------------------------------------------------
+# `SeqAdapter` returns triage responses by CALL ORDER, which is only well-defined
+# when the per-finding triage calls run sequentially. P11 (FR-9.1) runs them
+# concurrently by default (triage_concurrency=4), scrambling that order for a
+# multi-finding round. These logic tests are pinned to concurrency 1 so their
+# positional fakes stay deterministic; the concurrency path is covered by the
+# dedicated finding-keyed tests in the "concurrent triage" section below.
 BASE_CONFIG = {
+    "triage_concurrency": 1,
     "agents": {
         "reviewer": {"adapter": "codex"},
         "triage": {"adapter": "api", "model": "h"},
@@ -1733,3 +1740,218 @@ def test_dirty_worktree_during_non_fixer_park_invalidates_reuse(cycle_repo):
     assert "clean-handoff" in rec.notes
     # the review checkpoint was NOT reused on the changed tree — reviewer not re-run
     assert len(reviewer.calls) == 1
+
+
+# --- P11 (FR-9.1/FR-9.2): concurrent triage + failure-path checkpoint fragment ---
+import re
+import threading
+
+
+def _fid_from_prompt(prompt: str) -> str:
+    """The finding id from a per-finding triage prompt (the finding is the only
+    ``"id":`` in the wrapped-as-data block)."""
+    m = re.search(r'"id":\s*"([^"]+)"', prompt)
+    return m.group(1) if m else "?"
+
+
+class KeyedTriage:
+    """A thread-safe triager fake keyed on the finding id in the prompt (not on
+    call order, so it is correct under concurrency, unlike ``SeqAdapter``).
+
+    Optional coordination: a ``barrier`` forces observable overlap (all parties
+    must be in-flight before any returns), and ``peak`` (a shared ``[cur, max]``)
+    records the high-water in-flight count so a test can assert the pool bound.
+    ``fail_first`` maps a finding id → an exception raised on its FIRST call only
+    (consumed after), so a resume of that finding succeeds."""
+
+    capabilities = FakeAdapter.capabilities
+
+    def __init__(self, verdicts, *, barrier=None, peak=None, fail_first=None):
+        self.verdicts = verdicts
+        self.barrier = barrier
+        self.peak = peak
+        self.fail_first = dict(fail_first or {})
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+        self.timeout_s = 600.0
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+        fid = _fid_from_prompt(prompt)
+        with self._lock:
+            self.calls.append(fid)
+            if self.peak is not None:
+                self.peak[0] += 1
+                self.peak[1] = max(self.peak[1], self.peak[0])
+        try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=5)
+            with self._lock:
+                exc = self.fail_first.pop(fid, None)
+            if exc is not None:
+                raise exc
+            v = dict(self.verdicts[fid])
+            return AgentResult(
+                text=json.dumps(v), structured=v,
+                usage=Usage(input_tokens=10, output_tokens=5), exit_code=0,
+            )
+        finally:
+            with self._lock:
+                if self.peak is not None:
+                    self.peak[0] -= 1
+
+
+def _five_findings():
+    return [F(f"F-00{i}") for i in range(1, 6)]
+
+
+def _expected_triage_bytes(findings, verdicts):
+    """The exact ``triage.json`` bytes the sequential path writes: verdicts in
+    findings order, ``json.dumps(..., indent=2, ensure_ascii=False)`` (matching
+    cycle._write_artifact)."""
+    ordered = [verdicts[f["id"]] for f in findings]
+    return json.dumps({"verdicts": ordered}, indent=2, ensure_ascii=False)
+
+
+def test_concurrent_triage_runs_all_in_flight_and_is_byte_identical(cycle_repo):
+    # FR-9.1: with a pool >= the finding count, a Barrier(N) only releases when all
+    # N per-finding calls are simultaneously in-flight — a deterministic proof of
+    # concurrency (no wall-clock ratio). The resulting triage.json is byte-identical
+    # to the sequential (findings-order) result.
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    barrier = threading.Barrier(5)
+    peak = [0, 0]
+    triage = KeyedTriage(verdicts, barrier=barrier, peak=peak)
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    status, _man, run_dir = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 5}
+    )
+    assert status == M.RUN_DONE
+    # all 5 were in-flight at once (barrier of 5 released) — concurrency observed
+    assert peak[1] == 5
+    assert sorted(triage.calls) == [f["id"] for f in findings]
+    # byte-identity to the sequential result (FR-9.1)
+    written = (run_dir / "artifacts" / "triage.json").read_text()
+    assert written == _expected_triage_bytes(findings, verdicts)
+
+
+def test_concurrent_triage_respects_the_pool_bound(cycle_repo):
+    # FR-9.1: with pool=2 and 4 findings, a Barrier(2) advances in waves of two;
+    # the high-water in-flight count is exactly 2 — the pool never exceeds its bound.
+    findings = [F(f"F-00{i}") for i in range(1, 5)]  # 4 findings
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    barrier = threading.Barrier(2)
+    peak = [0, 0]
+    triage = KeyedTriage(verdicts, barrier=barrier, peak=peak)
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    status, _man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 2}
+    )
+    assert status == M.RUN_DONE
+    assert peak[1] == 2  # bounded: at most 2 in flight despite 4 findings
+
+
+def test_concurrent_triage_failure_fragment_then_resume_one_call(cycle_repo):
+    # FR-9.2: one transient failure among five → the round parks (usage_limit), NO
+    # authoritative triage.json is written, and a deterministic fragment holds the
+    # four completed verdicts sorted by id with the fifth pending. A plain resume
+    # re-runs ONLY the pending finding and, on success, writes the final triage.json
+    # byte-identical to the sequential result.
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(
+        verdicts, fail_first={"F-003": _transient_exc(session="triage-sess")}
+    )
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 4}
+    )
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    # no authoritative triage.json on an incomplete round (fail closed, FR-9.2)
+    assert not (run_dir / "artifacts" / "triage.json").exists()
+    # deterministic fragment: completed verdicts sorted by id + the pending finding
+    frag = json.loads((run_dir / "artifacts" / "r1" / "triage-fragment.json").read_text())
+    assert [v["finding_id"] for v in frag["verdicts"]] == ["F-001", "F-002", "F-004", "F-005"]
+    assert frag["pending"] == ["F-003"]
+    calls_before = len(triage.calls)
+    # plain resume: re-run ONLY the incomplete finding (F-003)
+    assert orch.drive() == M.RUN_DONE
+    resume_calls = triage.calls[calls_before:]
+    assert resume_calls == ["F-003"]  # exactly one triage call, and it is F-003
+    # the resumed all-success round writes triage.json byte-identical to sequential
+    written = (run_dir / "artifacts" / "triage.json").read_text()
+    assert written == _expected_triage_bytes(findings, verdicts)
+    # the fragment is superseded once the round completed in full
+    assert not (run_dir / "artifacts" / "r1" / "triage-fragment.json").exists()
+
+
+def _terminal_exc():
+    # A non-transient adapter failure: _run_sub does NOT retry it (only malformed
+    # output is re-asked) and does NOT park it (failure_info is not transient), so
+    # it fails the step closed.
+    return AgentFailedError(
+        "terminal boom", partial=AgentResult(text="", exit_code=1)
+    )
+
+
+def test_concurrent_triage_terminal_failure_writes_fragment_no_triage_json(cycle_repo):
+    # FR-9.2: a TERMINAL (non-transient) failure fails the step closed — but the
+    # completed verdicts are still checkpointed to the fragment (sorted by id), and
+    # triage.json is not written. (Distinct from the transient park above.)
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(verdicts, fail_first={"F-002": _terminal_exc()})
+    reviewer = SeqAdapter(REVIEW(*findings))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 4}
+    )
+    assert status == M.RUN_FAILED
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    assert not (run_dir / "artifacts" / "triage.json").exists()
+    frag = json.loads((run_dir / "artifacts" / "r1" / "triage-fragment.json").read_text())
+    assert [v["finding_id"] for v in frag["verdicts"]] == ["F-001", "F-003", "F-004", "F-005"]
+    assert frag["pending"] == ["F-002"]
+
+
+def test_triage_concurrency_defaults_to_four():
+    assert RunConfig.model_validate({}).triage_concurrency == 4
+
+
+def test_triage_concurrency_rejects_non_positive():
+    with pytest.raises(ValueError, match="triage_concurrency must be >= 1"):
+        RunConfig.model_validate({"triage_concurrency": 0})
+
+
+def test_concurrent_triage_escalates_blocking_finding(cycle_repo):
+    # Escalation composes with concurrency: the triage→escalate decision is
+    # self-contained per finding (in _triage_one), so a blocking finding still
+    # escalates to the escalation agent even when the round runs concurrently.
+    findings = [F("F-001", "major"), F("F-002", "blocking"), F("F-003", "major")]
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(verdicts)
+    esc = KeyedTriage({"F-002": V("F-002")})  # escalation re-decides the blocker
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "esc": esc, "builder": builder}
+    status, _man, run_dir = run_cycle(
+        cycle_repo, adapters,
+        step_extra={"triage_concurrency": 3, "escalation_agent": "esc"},
+    )
+    assert status == M.RUN_DONE
+    # the blocking finding was escalated (F-009); majors with high confidence were not
+    assert esc.calls == ["F-002"]
+    # the escalated verdict is recorded escalated=True in the authoritative triage.json
+    written = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    by_id = {v["finding_id"]: v for v in written["verdicts"]}
+    assert by_id["F-002"].get("escalated") is True
+    assert by_id["F-001"].get("escalated") is None

@@ -31,6 +31,7 @@ to a park-at-gate instead of silently carrying them forward (FR-10.5).
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -630,9 +631,19 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             verdicts = list(tdata.get("verdicts") or [])
             park_reason = None
         else:
+            # FR-9.2 resume: a prior interrupted concurrent-triage round may have
+            # left a checkpoint fragment of the verdicts it did complete. Reuse it
+            # ONLY when this round's review was reused (findings identical to when
+            # the fragment was written); if review re-ran, the fragment is stale
+            # and ignored. `_triage` then re-runs exactly the still-incomplete
+            # findings.
+            completed = (
+                _load_triage_fragment(ctx, rnd, findings) if reuse_review else None
+            )
             try:
                 verdicts, park_reason = _triage(
-                    step, ctx, findings, usage, rnd, triager, effort=cycle_effort
+                    step, ctx, findings, usage, rnd, triager,
+                    effort=cycle_effort, completed=completed,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
@@ -1435,23 +1446,97 @@ class _MutationGuard:
         })
 
 
+def _triage_one(
+    ctx: StepContext, finding: dict[str, Any], i: int, rnd: int,
+    triager: str, escalation_agent: str | None, template: str, context: str,
+    schema: dict | None, effort: str | None, task_usage: Any,
+) -> dict[str, Any]:
+    """Triage ONE finding (triage + severity-gated escalation), the concurrency
+    unit (FR-9.1).
+
+    Runs on a worker thread, so it touches no shared mutable state: it writes to
+    a per-finding log dir (distinct path) and accumulates into its OWN
+    ``task_usage`` accumulator (merged back into the round total in a
+    deterministic finding order by the caller). The triage→escalate decision is
+    self-contained per finding (findings are independent by design — point-by-
+    point injection containment, PRD-gauntlet §8), so the verdict is byte-for-byte
+    what the sequential path produced. Returns ``{finding_id, verdict,
+    needs_human}``; raises (``_ParkCycle`` on a transient sub-agent failure, or a
+    schema/adapter error) exactly as the sequential path did — the caller
+    collects the outcome per finding.
+    """
+    from gauntlet.engine.steptypes import step_logger
+
+    logger = step_logger(ctx, f"r{rnd}-triage", finding.get("id", f"i{i}"))
+    prompt = triage_prompt(template, finding, context=context)
+    verdict = _run_sub(
+        ctx, triager, prompt, schema=schema, usage=task_usage,
+        logger=logger, structured_name="verdict.json",
+        substep=f"r{rnd}-triage", effort=effort,
+    ).structured
+    verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
+    severity = finding.get("severity", "")
+    needs_human = False
+    if needs_escalation(severity, verdict):
+        if escalation_agent:
+            esc_logger = step_logger(
+                ctx, f"r{rnd}-triage", f"{finding.get('id', f'i{i}')}-escalated"
+            )
+            verdict = _run_sub(
+                ctx, escalation_agent, prompt, schema=schema, usage=task_usage,
+                logger=esc_logger, structured_name="verdict.json",
+                substep=f"r{rnd}-triage", effort=effort,
+            ).structured
+            verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
+            verdict["escalated"] = True
+            if verdict.get("confidence") == "low":
+                needs_human = True
+        else:
+            verdict["escalated"] = True
+            needs_human = True
+    elif verdict.get("confidence") == "low":
+        # FR-6.2: a low-confidence verdict on a minor/nit finding does NOT
+        # escalate (the escalation profile is reserved for blocking/major
+        # doubt) — it is flagged so it carries to the human gate for eyes.
+        verdict["low_confidence"] = True
+    return {"finding_id": finding.get("id"), "verdict": verdict,
+            "needs_human": needs_human}
+
+
 def _triage(
     step: Step, ctx: StepContext, findings: list[dict[str, Any]],
     usage: Any, rnd: int, triager: str, *, effort: str | None = None,
+    completed: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Point-by-point triage with severity-aware escalation (F-009).
+    """Point-by-point triage with severity-aware escalation (F-009), run with
+    bounded concurrency (FR-9.1) and checkpoint-fragment resume (FR-9.2).
+
+    Per-finding calls run on a bounded worker pool (``triage_concurrency``,
+    default 4) because findings are independent by design (injection containment,
+    PRD-gauntlet §8); the pool spends the cheap unconstrained provider, never the
+    builder's window. Verdicts are assembled in the input ``findings`` order —
+    identical to the sequential path — so an all-success round's ``triage.json``
+    is byte-identical whatever order the calls finished in (FR-9.1).
+
+    ``completed`` seeds already-decided verdicts from a resume fragment (FR-9.2):
+    only findings NOT already in it are (re-)triaged, so a resumed round issues
+    exactly one call per still-incomplete finding. On ANY interruption before the
+    round completes — a transient ``_ParkCycle`` (park + resume) or a terminal
+    schema/adapter error (fail closed) — the completed verdicts so far are written
+    write-ahead to a deterministic checkpoint fragment (sorted by finding id) and
+    the original exception is re-raised; the authoritative ``triage.json`` is
+    NEVER written on an incomplete round. On full success the fragment is
+    superseded and the caller checkpoints the complete batch.
 
     Returns ``(verdicts, park_reason)``; a non-``None`` park reason means a
     finding needed escalation no configured agent could provide — the cycle
     parks at a human gate rather than resting on the cheap verdict.
     """
-    from gauntlet.engine.steptypes import step_logger
+    from gauntlet.engine.steptypes import _UsageAccumulator
 
     template = _template(ctx, step, "triage_prompt", "prompts/triage.md", _BUILTIN_TRIAGE)
     schema = _verdict_schema(_load_schema(ctx, step.get("triage_schema") or DEFAULT_TRIAGE_SCHEMA))
     escalation_agent = step.get("escalation_agent")
-    verdicts: list[dict[str, Any]] = []
-    needs_human: list[str] = []
     context = (
         f"artifact under review: {step.get('artifact')}"
         if step.get("artifact")
@@ -1476,39 +1561,75 @@ def _triage(
     # escalation agent, which reuses this prompt) reclassify per the operator's
     # ruling instead of re-deriving the park.
     context += _human_decision_block(ctx)
-    for i, finding in enumerate(findings):
-        logger = step_logger(ctx, f"r{rnd}-triage", finding.get("id", f"i{i}"))
-        prompt = triage_prompt(template, finding, context=context)
-        verdict = _run_sub(
-            ctx, triager, prompt, schema=schema, usage=usage,
-            logger=logger, structured_name="verdict.json",
-            substep=f"r{rnd}-triage", effort=effort,
-        ).structured
-        verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
-        severity = finding.get("severity", "")
-        if needs_escalation(severity, verdict):
-            if escalation_agent:
-                esc_logger = step_logger(
-                    ctx, f"r{rnd}-triage", f"{finding.get('id', f'i{i}')}-escalated"
-                )
-                verdict = _run_sub(
-                    ctx, escalation_agent, prompt, schema=schema, usage=usage,
-                    logger=esc_logger, structured_name="verdict.json",
-                    substep=f"r{rnd}-triage", effort=effort,
-                ).structured
-                verdict["finding_id"] = finding.get("id", verdict.get("finding_id"))
-                verdict["escalated"] = True
-                if verdict.get("confidence") == "low":
-                    needs_human.append(verdict["finding_id"])
-            else:
-                verdict["escalated"] = True
-                needs_human.append(verdict["finding_id"])
-        elif verdict.get("confidence") == "low":
-            # FR-6.2: a low-confidence verdict on a minor/nit finding does NOT
-            # escalate (the escalation profile is reserved for blocking/major
-            # doubt) — it is flagged so it carries to the human gate for eyes.
-            verdict["low_confidence"] = True
-        verdicts.append(verdict)
+
+    done: dict[str, dict[str, Any]] = dict(completed or {})  # finding_id -> verdict
+    needs_human_by_id: dict[str, bool] = {}
+    # Findings still needing a call this round: everything not already in the
+    # resume fragment. Preserves input order (FR-9.1 deterministic assembly).
+    pending = [f for f in findings if f.get("id") not in done]
+
+    if pending:
+        concurrency = min(
+            int(step.get("triage_concurrency", ctx.config.triage_concurrency)),
+            len(pending),
+        )
+        # A per-finding accumulator (`_UsageAccumulator.add` is not thread-safe);
+        # merged back into the round total in finding order after the pool drains,
+        # so the grand total is concurrency-independent and a FAILED task's partial
+        # spend still counts (F-008).
+        task_usages = [_UsageAccumulator() for _ in pending]
+        outcomes: dict[int, tuple[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(
+                    _triage_one, ctx, finding, i, rnd, triager, escalation_agent,
+                    template, context, schema, effort, task_usages[i],
+                ): i
+                for i, finding in enumerate(pending)
+            }
+            # Wait for EVERY submitted call before deciding: a failure must not
+            # abandon in-flight verdicts (they belong in the fragment). Collect
+            # each finding's outcome; never re-raise inside the pool.
+            for fut in futures:
+                i = futures[fut]
+                try:
+                    outcomes[i] = ("ok", fut.result())
+                except _ParkCycle as park:
+                    outcomes[i] = ("park", park)
+                except (MalformedOutputError, AdapterError) as exc:
+                    outcomes[i] = ("error", exc)
+        # Deterministic merge order (finding order), independent of completion
+        # order, so the round total matches the sequential run.
+        for acc in task_usages:
+            usage.merge(acc)
+        # Fold successful verdicts into `done`; keep the FIRST problematic outcome
+        # in finding order so a re-raise/park is deterministic across runs.
+        first_problem: Any = None
+        for i, finding in enumerate(pending):
+            kind, payload = outcomes[i]
+            if kind == "ok":
+                done[payload["finding_id"]] = payload["verdict"]
+                needs_human_by_id[payload["finding_id"]] = payload["needs_human"]
+            elif first_problem is None:
+                first_problem = payload
+        if first_problem is not None:
+            # FR-9.2: persist the completed verdicts (incl. any resume-seeded ones)
+            # write-ahead as a deterministic fragment, then re-raise. A transient
+            # _ParkCycle is resumable (plain resume re-enters here with `completed`);
+            # a terminal schema/adapter error fails the step closed. Either way
+            # triage.json is not written on an incomplete round.
+            _persist_triage_fragment(ctx, rnd, findings, done)
+            raise first_problem
+
+    # All findings decided — supersede any fragment (the caller checkpoints the
+    # complete batch next) and assemble verdicts in the input findings order so an
+    # all-success round is byte-identical to the sequential result (FR-9.1).
+    _delete_triage_fragment(ctx, rnd)
+    verdicts = [done[f["id"]] for f in findings if f.get("id") in done]
+    needs_human = [
+        v["finding_id"] for v in verdicts
+        if needs_human_by_id.get(v["finding_id"])
+    ]
     if needs_human:
         return verdicts, (
             "escalation (review F-009): blocking-severity or low-confidence "
@@ -1516,6 +1637,69 @@ def _triage(
             f"{', '.join(needs_human)}"
         )
     return verdicts, None
+
+
+def _triage_fragment_path(ctx: StepContext, rnd: int) -> Path:
+    return ctx.run_dir / "artifacts" / f"r{rnd}" / "triage-fragment.json"
+
+
+def _persist_triage_fragment(
+    ctx: StepContext, rnd: int, findings: list[dict[str, Any]],
+    done: dict[str, dict[str, Any]],
+) -> None:
+    """Write-ahead the completed per-finding verdicts of an INCOMPLETE concurrent
+    triage round (FR-9.2), so resume re-runs only the still-pending findings.
+
+    Deterministic regardless of completion order: verdicts sorted by finding id,
+    one record per completed finding, with the incomplete findings listed as
+    ``pending``. A SEPARATE artifact from the authoritative ``triage.json`` (which
+    is never written on a failed round); explicitly NOT claimed byte-identical
+    across runs — a concurrent and a sequential run may complete different subsets
+    before a failure, so only the ordering within the fragment and the final
+    all-success artifact are deterministic (FR-9.2)."""
+    verdicts_sorted = [done[fid] for fid in sorted(done, key=str)]
+    pending = [f.get("id") for f in findings if f.get("id") not in done]
+    frag = {"round": rnd, "verdicts": verdicts_sorted, "pending": pending}
+    ctx.writer.write_text(
+        _triage_fragment_path(ctx, rnd),
+        json.dumps(frag, indent=2, ensure_ascii=False),
+    )
+
+
+def _load_triage_fragment(
+    ctx: StepContext, rnd: int, findings: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]] | None:
+    """Load a round's completed-verdict fragment on resume (FR-9.2).
+
+    Returns ``{finding_id: verdict}`` for completed verdicts whose finding is
+    still in THIS round's findings (a defensive filter — the caller only loads
+    the fragment when the round's review was reused, so the finding set is
+    identical), or ``None`` when no usable fragment exists. Fail-closed on an
+    unreadable/corrupt fragment: return ``None`` so triage re-runs from scratch
+    rather than proceeding on partial data."""
+    path = _triage_fragment_path(ctx, rnd)
+    if not path.exists():
+        return None
+    try:
+        frag = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    ids = {f.get("id") for f in findings}
+    done = {
+        v.get("finding_id"): v
+        for v in (frag.get("verdicts") or [])
+        if v.get("finding_id") in ids
+    }
+    return done or None
+
+
+def _delete_triage_fragment(ctx: StepContext, rnd: int) -> None:
+    """Drop a superseded round fragment once triage completed in full (FR-9.2).
+
+    Idempotent; a missing file is a no-op. Ordered AFTER the completing call so a
+    crash before deletion only redoes cheap triage work, never loses correctness
+    (the complete ``triage.json`` checkpoint supersedes it on reuse)."""
+    _triage_fragment_path(ctx, rnd).unlink(missing_ok=True)
 
 
 def _triage_integrity_stray(

@@ -534,6 +534,16 @@ class RunConfig(BaseModel):
     #     higher fidelity, but oscillates on majors/minors.
     cycle_convergence: str = "blocking"
 
+    # --- concurrent triage (harness-efficiency FR-9.1) ----------------------
+    # Independent per-finding triage calls run on a bounded worker pool. Findings
+    # are independent by design (point-by-point triage with untrusted-data
+    # wrapping, PRD-gauntlet §8), so concurrency changes only latency and cost —
+    # never an artifact byte: an all-success round's `triage.json` is byte-
+    # identical to the sequential result (verdicts assembled in finding order).
+    # The triager runs on the cheap unconstrained provider, so this pool does not
+    # contend for the builder's constrained window. Default 4.
+    triage_concurrency: int = 4
+
     # Configurable redaction list (FR-4.4), default-on; the transcript logger
     # builds its Redactor from this.
     redaction: RedactionSettings = Field(default_factory=RedactionSettings)
@@ -591,6 +601,14 @@ class RunConfig(BaseModel):
                 f"{sorted(_CHECKPOINT_COMMIT_MODES)}; got {v!r}"
             )
         return name
+
+    @field_validator("triage_concurrency")
+    @classmethod
+    def _validate_triage_concurrency(cls, v: int) -> int:
+        """A pool of at least 1 worker; fail closed on a non-positive value (FR-9.1)."""
+        if v < 1:
+            raise ValueError(f"triage_concurrency must be >= 1; got {v!r}")
+        return v
 
     @model_validator(mode="after")
     def _warn_auto_resume_needs_survival(self) -> RunConfig:

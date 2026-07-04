@@ -1478,6 +1478,27 @@ class _UsageAccumulator:
             cost_usd=self._cost,
         )
 
+    def merge(self, other: "_UsageAccumulator") -> None:
+        """Fold another accumulator's totals + per-agent split into this one.
+
+        Concurrent triage (FR-9.1) gives each per-finding call its OWN
+        accumulator (``_UsageAccumulator.add`` is not thread-safe), then merges
+        them back into the round accumulator in a deterministic finding order —
+        so the grand total and per-profile split are identical whether triage ran
+        sequentially or concurrently. A failed call's partial spend is merged too
+        (its accumulator carries the partial usage `_run_sub` recorded), keeping
+        the F-008 "failed attempts still count" property under concurrency."""
+        if not other._seen:
+            return
+        self._seen = True
+        self._in += other._in
+        self._out += other._out
+        self._cached += other._cached
+        if other._cost is not None:
+            self._cost = (self._cost or 0.0) + other._cost
+        for name, acc in other._by_agent.items():
+            self._by_agent.setdefault(name, _UsageAccumulator()).merge(acc)
+
     def by_agent(self) -> dict:
         """Per-agent-profile Usage (FR-3.2); empty when no agent was tagged."""
         out = {}
