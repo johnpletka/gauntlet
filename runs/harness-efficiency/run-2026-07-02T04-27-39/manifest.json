@@ -1617,14 +1617,14 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "parked",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-03T08:46:12.649315+00:00",
-      "ended": "2026-07-03T08:49:20.939342+00:00",
+      "ended": "2026-07-04T18:36:39.925660+00:00",
       "attempts": 0,
       "base_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
-      "parked_reason": "response",
+      "parked_reason": null,
       "halt_reason": null,
       "failure_kind": null,
       "retry_after_s": null,
@@ -1639,27 +1639,48 @@
           "timestamp": "2026-07-04T18:11:52.808866+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 1191261,
-        "output_tokens": 9483,
-        "cached_input_tokens": 1079936,
-        "cost_usd": 0.016222
+        "input_tokens": 2484391,
+        "output_tokens": 71980,
+        "cached_input_tokens": 10841375,
+        "cost_usd": 7.2324867500000005
       },
-      "agent_usage": {},
-      "notes": "escalation: finding(s) whose fix lands in an upstream artifact (FR-10.4 upstream invalidation): F-001",
+      "agent_usage": {
+        "reviewer": {
+          "input_tokens": 1280820,
+          "output_tokens": 8145,
+          "cached_input_tokens": 981376,
+          "cost_usd": null
+        },
+        "triage": {
+          "input_tokens": 6549,
+          "output_tokens": 1368,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.00437325
+        },
+        "builder": {
+          "input_tokens": 5761,
+          "output_tokens": 52984,
+          "cached_input_tokens": 8780063,
+          "cost_usd": 7.2118915
+        }
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "9",
       "metrics": {
         "rounds": 1,
         "findings_total": 3,
         "accepted_total": 3,
-        "accepted_resolved_total": 0,
+        "accepted_resolved_total": 3,
         "verdict_counts": {
           "legitimate": 3
         },
-        "confirm_counts": {}
+        "confirm_counts": {
+          "resolved": 3
+        }
       },
       "checkpoints": [
         {
@@ -1674,6 +1695,20 @@
           "round": 1,
           "handoff_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
           "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "fix",
+          "round": 1,
+          "handoff_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
+          "artifact": null,
+          "result_sha": "f974bc9a24f8a65fa03d0021cd5c56d19b227af0"
+        },
+        {
+          "sub_step": "confirm",
+          "round": 1,
+          "handoff_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
+          "artifact": "artifacts/r1/confirm.json",
           "result_sha": null
         }
       ],
@@ -1806,26 +1841,31 @@
       "step_id": "phase-commit",
       "phase": "P10",
       "sha": "f9d3f9acda228001db670cdb929385e248e051cd"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P10.1",
+      "sha": "f974bc9a24f8a65fa03d0021cd5c56d19b227af0"
     }
   ],
   "totals": {
-    "input_tokens": 15001256,
-    "output_tokens": 2039602,
-    "cached_input_tokens": 388903722,
-    "cost_usd": 316.43000845000006
+    "input_tokens": 16294386,
+    "output_tokens": 2102099,
+    "cached_input_tokens": 398665161,
+    "cost_usd": 323.64627320000005
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 13344558,
-      "output_tokens": 102952,
-      "cached_input_tokens": 11319424,
+      "input_tokens": 14625378,
+      "output_tokens": 111097,
+      "cached_input_tokens": 12300800,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 349092,
-      "output_tokens": 54976,
+      "input_tokens": 355641,
+      "output_tokens": 56344,
       "cached_input_tokens": 0,
-      "cost_usd": 0.19120579999999998
+      "cost_usd": 0.19557904999999998
     },
     "escalation": {
       "input_tokens": 26336,
@@ -1834,10 +1874,10 @@
       "cost_usd": 0.10241600000000001
     },
     "builder": {
-      "input_tokens": 256943,
-      "output_tokens": 1694774,
-      "cached_input_tokens": 377584298,
-      "cost_usd": 315.52236249999993
+      "input_tokens": 262704,
+      "output_tokens": 1747758,
+      "cached_input_tokens": 386364361,
+      "cost_usd": 322.7342539999999
     },
     "judge_llm": {
       "input_tokens": 1024327,
