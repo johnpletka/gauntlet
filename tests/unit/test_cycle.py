@@ -31,6 +31,7 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import (
     DATA_BEGIN,
     DATA_END,
+    _code_review_base,
     _only_artifact_dirty,
     _persist_round_triage,
     _triage_integrity_stray,
@@ -662,6 +663,79 @@ def test_code_review_mode_reviews_commit_range(cycle_repo):
     prompt = reviewer.calls[0]["prompt"]
     assert "PHASE-WORK-SENTINEL" in prompt  # the phase diff, derived from manifest
     assert "commit-range diff under review" in prompt
+
+
+def test_code_review_base_spans_phase_including_checkpoints():
+    """`_code_review_base` returns the PREVIOUS recorded phase commit, not
+    `handoff^`, so the round-1 diff spans a phase's intra-phase checkpoint commits
+    even when the phase-marker commit itself is empty (FR-11.2 regression)."""
+    def cr(sha):
+        return M.CommitRecord(step_id="c", phase="P", sha=sha)
+
+    # Two recorded phase markers; handoff is the latest. Base must be the prior
+    # marker (the phase's starting tip), NOT `handoff^` (which, once a phase spans
+    # `P<N> wip:` checkpoint commits + an empty marker, points INSIDE the phase).
+    ctx = SimpleNamespace(manifest=SimpleNamespace(commits=[cr("prevmarker"), cr("phasemarker")]))
+    assert _code_review_base(ctx, "phasemarker") == "prevmarker"
+    # First recorded commit: no predecessor → fall back to `handoff^`.
+    assert _code_review_base(ctx, "prevmarker") == "prevmarker^"
+    # Handoff not among recorded commits (empty manifest / lightweight first
+    # review): fall back to `handoff^`, the historical single-commit behaviour.
+    assert _code_review_base(ctx, "detached") == "detached^"
+    empty = SimpleNamespace(manifest=SimpleNamespace(commits=[]))
+    assert _code_review_base(empty, "x") == "x^"
+
+
+def test_code_review_reviews_full_phase_when_marker_is_empty(cycle_repo):
+    """Regression: a phase whose work landed entirely in intra-phase checkpoint
+    commits leaves an EMPTY `P<N>:` marker. The round-1 review must still see the
+    phase's real diff (spanning the checkpoints), not an empty range — the failure
+    that parked the harness-efficiency run's final phase on an empty review."""
+    # Previous phase marker P4 — this is what the review base must resolve to.
+    (cycle_repo / "prior.py").write_text("PRIOR-PHASE\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "P4: prior"], check=True)
+    prev_marker_sha = gitops.head_sha(cycle_repo)
+
+    # P5's work lands as an intra-phase CHECKPOINT commit (NOT recorded in
+    # manifest.commits — only markers/fixes are), ...
+    (cycle_repo / "feature.py").write_text("PHASE-WORK-SENTINEL\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "P5 wip: checkpoint"], check=True)
+    # ... then the phase-marker commit is EMPTY (all work already checkpointed).
+    subprocess.run(
+        ["git", "-C", str(cycle_repo), "commit", "-q", "--allow-empty", "-m", "P5: marker"],
+        check=True,
+    )
+    empty_marker_sha = gitops.head_sha(cycle_repo)
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {k: v for k, v in cycle_step(mode="code_review").items()
+             if k not in ("artifact", "phase")},
+        ]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    # Only markers/fixes are recorded — never the `P5 wip:` checkpoint.
+    man.commits.append(M.CommitRecord(step_id="commit", phase="P4", sha=prev_marker_sha))
+    man.commits.append(M.CommitRecord(step_id="commit", phase="P5", sha=empty_marker_sha))
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    assert orch.drive() == M.RUN_DONE
+    prompt = reviewer.calls[0]["prompt"]
+    # The reviewer sees the phase's real work despite the empty marker (pre-fix
+    # this range was `checkpoint..empty-marker` == empty, and this assertion failed).
+    assert "PHASE-WORK-SENTINEL" in prompt
+    # The diff is based on the previous phase marker, not the empty marker's parent.
+    assert f"{prev_marker_sha}.." in prompt
 
 
 # --- §8: prompt-injection containment -------------------------------------------------

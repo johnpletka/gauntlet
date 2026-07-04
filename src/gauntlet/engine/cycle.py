@@ -1059,6 +1059,31 @@ def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
     return explicit, head
 
 
+def _code_review_base(ctx: StepContext, handoff: str) -> str:
+    """Round-1 code_review base: the phase's starting tip, so the review diff
+    spans the WHOLE phase.
+
+    ``manifest.commits`` records only phase-marker and fix commits (never the
+    intra-phase ``P<N> wip:`` checkpoint commits, FR-11.2), so the entry recorded
+    *before* ``handoff`` is exactly this phase's starting tip — the previous
+    phase's marker/last-fix. Diffing from there spans every checkpoint commit of
+    this phase plus its final marker, so a phase whose work landed entirely in
+    checkpoints (leaving an EMPTY marker commit) still presents its full diff for
+    review instead of an empty range.
+
+    Falls back to ``<handoff>^`` when ``handoff`` is the first recorded commit or
+    is not a recorded commit at all (an empty manifest / a lightweight first
+    review). This is identical to the previous ``handoff^`` behaviour whenever a
+    phase was a single commit (the pre-checkpoint invariant: ``handoff^`` then WAS
+    the previous marker), so it is a strict generalisation, not a behaviour change
+    for the single-commit case."""
+    commits = ctx.manifest.commits
+    for i in range(len(commits) - 1, -1, -1):
+        if commits[i].sha == handoff:
+            return commits[i - 1].sha if i > 0 else f"{handoff}^"
+    return f"{handoff}^"
+
+
 def _human_decision_block(ctx: StepContext) -> str:
     """Render operator `--response` decisions for injection into the cycle (FR-10.4).
 
@@ -1247,7 +1272,20 @@ def _review_prompt(
     parts = [template]
     mode = step.get("mode", "artifact")
     if mode == "code_review":
-        base = step.get("review_base") or f"{handoff}^"
+        review_base = step.get("review_base")
+        if review_base:
+            # A lightweight review run pins the base explicitly (the merge-base it
+            # resolved at entry, FR-5.2); honour it for every round. `step` is a
+            # `Step` (mapping-like, `.get()` only — never subscript it).
+            base = review_base
+        elif rnd == 1:
+            # Round 1 reviews the whole phase: span its full commit range so an
+            # empty phase-marker over intra-phase checkpoints is not an empty diff.
+            base = _code_review_base(ctx, handoff)
+        else:
+            # Rounds 2+ are regression-scoped (see the round-1 vs 2+ note above):
+            # the handoff is the fix commit, so `handoff^` diffs only that fix.
+            base = f"{handoff}^"
         diff = gitops.range_diff(ctx.repo_root, base, handoff)
         parts.append(f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}")
         # A lightweight review run injects the originating problem statement here
