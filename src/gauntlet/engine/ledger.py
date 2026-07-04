@@ -317,9 +317,14 @@ def append_unique(
 
     Returns ``(added, skipped)``. Skips a row already in the ledger AND a
     duplicate within ``rows`` itself, so a caller that hands the same row twice
-    (or backfill over overlapping manifests) can never double-count. The append
-    is a single ``write`` under append mode, which POSIX makes atomic for a small
-    payload, so concurrent runs' appends interleave line-cleanly.
+    (or backfill over overlapping manifests) can never double-count. The fresh
+    rows are concatenated and written in a single ``O_APPEND`` write; on common
+    local filesystems a small single-row live append lands atomically, so
+    concurrent runs interleave line-cleanly. POSIX does NOT guarantee this for an
+    arbitrary payload, so a large multi-row backfill write can tear or interleave
+    — that is TOLERATED, not prevented: :func:`load_rows` skips blank/torn lines
+    and the ledger is advisory, so at worst a torn append drops a row from an
+    estimate, never corrupts a run.
     """
     if not rows:
         return (0, 0)
