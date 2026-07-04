@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "phase-commit",
+  "current_step": "impl-cycle",
   "warnings": [],
   "steps": [
     {
@@ -51,6 +51,7 @@
         "cached_input_tokens": 2379881,
         "cost_usd": 2.76531375
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 9 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": null,
       "metrics": {
@@ -93,6 +94,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "approved",
       "iteration": null,
       "metrics": {},
@@ -124,6 +126,7 @@
         "cached_input_tokens": 89661,
         "cost_usd": 1.3110235000000001
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": null,
       "metrics": {},
@@ -180,6 +183,7 @@
         "cached_input_tokens": 5551354,
         "cost_usd": 6.102183899999999
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": null,
       "metrics": {
@@ -222,6 +226,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "phase lint: 11 phase(s) valid (P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11)",
       "iteration": null,
       "metrics": {},
@@ -253,6 +258,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "approved",
       "iteration": null,
       "metrics": {},
@@ -284,6 +290,7 @@
         "cached_input_tokens": 35030048,
         "cost_usd": 26.624949000000008
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "0",
       "metrics": {},
@@ -315,6 +322,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "0",
       "metrics": {},
@@ -346,6 +354,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.00614225
       },
+      "agent_usage": {},
       "notes": "committed 96f33bd960",
       "iteration": "0",
       "metrics": {},
@@ -377,6 +386,7 @@
         "cached_input_tokens": 12175625,
         "cost_usd": 10.464547000000001
       },
+      "agent_usage": {},
       "notes": "converged in round 2 (blocking policy): no open blocking; 1 fixed, 1 non-blocking item(s) surfaced for the gate: NEW",
       "iteration": "0",
       "metrics": {
@@ -420,6 +430,7 @@
         "cached_input_tokens": 30569445,
         "cost_usd": 24.352478499999986
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "1",
       "metrics": {},
@@ -451,6 +462,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "1",
       "metrics": {},
@@ -482,6 +494,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.03218264999999999
       },
+      "agent_usage": {},
       "notes": "committed 7253c44790",
       "iteration": "1",
       "metrics": {},
@@ -513,6 +526,7 @@
         "cached_input_tokens": 4433938,
         "cost_usd": 4.4252815000000005
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 5 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "1",
       "metrics": {
@@ -555,6 +569,7 @@
         "cached_input_tokens": 39184477,
         "cost_usd": 27.805785500000006
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "2",
       "metrics": {},
@@ -586,6 +601,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "2",
       "metrics": {},
@@ -617,6 +633,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.019893249999999998
       },
+      "agent_usage": {},
       "notes": "committed b8c642b88b",
       "iteration": "2",
       "metrics": {},
@@ -648,6 +665,7 @@
         "cached_input_tokens": 14240462,
         "cost_usd": 10.180483250000002
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 4 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "2",
       "metrics": {
@@ -691,6 +709,7 @@
         "cached_input_tokens": 23735015,
         "cost_usd": 16.72095549999999
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "3",
       "metrics": {},
@@ -722,6 +741,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "3",
       "metrics": {},
@@ -753,6 +773,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.00523025
       },
+      "agent_usage": {},
       "notes": "committed 86a58c074a",
       "iteration": "3",
       "metrics": {},
@@ -784,6 +805,7 @@
         "cached_input_tokens": 5569270,
         "cost_usd": 4.31342875
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 5 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "3",
       "metrics": {
@@ -826,6 +848,7 @@
         "cached_input_tokens": 17072010,
         "cost_usd": 16.483972999999995
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "4",
       "metrics": {},
@@ -857,6 +880,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "4",
       "metrics": {},
@@ -888,6 +912,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.006984249999999999
       },
+      "agent_usage": {},
       "notes": "committed 3dbb1a3677",
       "iteration": "4",
       "metrics": {},
@@ -919,6 +944,7 @@
         "cached_input_tokens": 7805338,
         "cost_usd": 7.244064499999999
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "4",
       "metrics": {
@@ -961,6 +987,7 @@
         "cached_input_tokens": 18847961,
         "cost_usd": 15.9652755
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "5",
       "metrics": {},
@@ -992,6 +1019,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "5",
       "metrics": {},
@@ -1023,6 +1051,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.0057680000000000006
       },
+      "agent_usage": {},
       "notes": "committed 4972ae5eef",
       "iteration": "5",
       "metrics": {},
@@ -1054,6 +1083,7 @@
         "cached_input_tokens": 6660740,
         "cost_usd": 4.676102749999998
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "5",
       "metrics": {
@@ -1096,6 +1126,7 @@
         "cached_input_tokens": 40699621,
         "cost_usd": 29.670055500000004
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "6",
       "metrics": {},
@@ -1127,6 +1158,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "6",
       "metrics": {},
@@ -1158,6 +1190,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.0079855
       },
+      "agent_usage": {},
       "notes": "committed d8220a35e9",
       "iteration": "6",
       "metrics": {},
@@ -1189,6 +1222,7 @@
         "cached_input_tokens": 20335320,
         "cost_usd": 17.342183249999998
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 4 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "6",
       "metrics": {
@@ -1231,6 +1265,7 @@
         "cached_input_tokens": 21554656,
         "cost_usd": 17.019551999999997
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "7",
       "metrics": {},
@@ -1262,6 +1297,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "7",
       "metrics": {},
@@ -1293,6 +1329,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.0060177500000000005
       },
+      "agent_usage": {},
       "notes": "committed efe412fcd2",
       "iteration": "7",
       "metrics": {},
@@ -1324,6 +1361,7 @@
         "cached_input_tokens": 11068006,
         "cost_usd": 8.5781215
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "7",
       "metrics": {
@@ -1366,6 +1404,7 @@
         "cached_input_tokens": 261965,
         "cost_usd": 16.523877
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "8",
       "metrics": {},
@@ -1397,6 +1436,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "8",
       "metrics": {},
@@ -1428,6 +1468,7 @@
         "cached_input_tokens": 0,
         "cost_usd": 0.01235625
       },
+      "agent_usage": {},
       "notes": "committed 31c3d119ab",
       "iteration": "8",
       "metrics": {},
@@ -1459,6 +1500,7 @@
         "cached_input_tokens": 8168062,
         "cost_usd": 6.798432249999998
       },
+      "agent_usage": {},
       "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "8",
       "metrics": {
@@ -1501,6 +1543,7 @@
         "cached_input_tokens": 62390931,
         "cost_usd": 40.3159385
       },
+      "agent_usage": {},
       "notes": "agent 'builder' completed",
       "iteration": "9",
       "metrics": {},
@@ -1532,6 +1575,7 @@
         "cached_input_tokens": 0,
         "cost_usd": null
       },
+      "agent_usage": {},
       "notes": "`uv run pytest` exited 0",
       "iteration": "9",
       "metrics": {},
@@ -1541,15 +1585,15 @@
     {
       "id": "phase-commit",
       "type": "commit",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-03T08:44:19.647236+00:00",
-      "ended": "2026-07-03T08:44:50.612070+00:00",
+      "ended": "2026-07-03T08:46:12.645566+00:00",
       "attempts": 1,
       "base_sha": "ef6fd5b9d52aa1b486c59e5e03167d6d2657ff27",
       "parked_reason": null,
-      "halt_reason": "adapter_error",
+      "halt_reason": null,
       "failure_kind": null,
       "retry_after_s": null,
       "quota_reset_at": null,
@@ -1558,15 +1602,72 @@
       "revalidation": null,
       "human_responses": [],
       "usage": {
-        "input_tokens": 429,
-        "output_tokens": 2660,
+        "input_tokens": 20105,
+        "output_tokens": 4085,
         "cached_input_tokens": 0,
-        "cost_usd": 0.00542725
+        "cost_usd": 0.01319625
       },
-      "notes": "operator surgery: reset failed->pending — pre-P9 driver lacked the empty-marker commit path for an all-wip phase; fresh process has P9 handler; backup manifest.backup3.json",
+      "agent_usage": {},
+      "notes": "empty P<N>: marker over 2 checkpoint(s): f9d3f9acda",
       "iteration": "9",
       "metrics": {},
       "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "parked",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-03T08:46:12.649315+00:00",
+      "ended": "2026-07-03T08:49:20.939342+00:00",
+      "attempts": 0,
+      "base_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
+      "parked_reason": "response",
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 1191261,
+        "output_tokens": 9483,
+        "cached_input_tokens": 1079936,
+        "cost_usd": 0.016222
+      },
+      "agent_usage": {},
+      "notes": "escalation: finding(s) whose fix lands in an upstream artifact (FR-10.4 upstream invalidation): F-001",
+      "iteration": "9",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 3,
+        "accepted_total": 3,
+        "accepted_resolved_total": 0,
+        "verdict_counts": {
+          "legitimate": 3
+        },
+        "confirm_counts": {}
+      },
+      "checkpoints": [
+        {
+          "sub_step": "review",
+          "round": 1,
+          "handoff_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
+          "artifact": "artifacts/r1/findings.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "triage",
+          "round": 1,
+          "handoff_sha": "f9d3f9acda228001db670cdb929385e248e051cd",
+          "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        }
+      ],
       "resumed_from_checkpoint": null
     }
   ],
@@ -1691,32 +1792,37 @@
       "step_id": "impl-cycle",
       "phase": "P9.1",
       "sha": "02370b34721df3916a498712ed4d382acb844617"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P10",
+      "sha": "f9d3f9acda228001db670cdb929385e248e051cd"
     }
   ],
   "totals": {
-    "input_tokens": 13790319,
-    "output_tokens": 2028694,
-    "cached_input_tokens": 387823786,
-    "cost_usd": 316.40601745000004
+    "input_tokens": 15001256,
+    "output_tokens": 2039602,
+    "cached_input_tokens": 388903722,
+    "cost_usd": 316.43000845000006
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 12160857,
-      "output_tokens": 95949,
-      "cached_input_tokens": 10239488,
+      "input_tokens": 13344558,
+      "output_tokens": 102952,
+      "cached_input_tokens": 11319424,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 323748,
-      "output_tokens": 52006,
+      "input_tokens": 349092,
+      "output_tokens": 54976,
       "cached_input_tokens": 0,
-      "cost_usd": 0.17892979999999997
+      "cost_usd": 0.19120579999999998
     },
     "escalation": {
-      "input_tokens": 24444,
-      "output_tokens": 6677,
+      "input_tokens": 26336,
+      "output_tokens": 7612,
       "cached_input_tokens": 0,
-      "cost_usd": 0.090701
+      "cost_usd": 0.10241600000000001
     },
     "builder": {
       "input_tokens": 256943,

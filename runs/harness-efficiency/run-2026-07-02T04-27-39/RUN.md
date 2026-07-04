@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/harness-efficiency` (base `chore/fable-review`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `phase-commit`)
-- totals: 13790319in/2028694out $316.4060
+- status: **running** (at `impl-cycle`)
+- totals: 15001256in/2039602out $316.4300
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -51,7 +51,8 @@
 | [impl-cycle.8](steps/impl-cycle.8/) | adversarial_cycle | done | 1791s | 617768in/70737out $6.7984 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
 | [implement.9](steps/implement.9/transcript.md) | agent_task | done | 2905s | 10435in/114049out $40.3159 | agent 'builder' completed |
 | [tests.9](steps/tests.9/) | shell | done | 394s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
-| phase-commit.9 | commit | pending | 31s | 429in/2660out $0.0054 | operator surgery: reset failed->pending — pre-P9 driver lacked the empty-marker commit path for an all-wip phase; fresh process has P9 handler; backup manifest.backup3.json |
+| phase-commit.9 | commit | done | 113s | 20105in/4085out $0.0132 | empty P<N>: marker over 2 checkpoint(s): f9d3f9acda |
+| [impl-cycle.9](steps/impl-cycle.9/) | adversarial_cycle | parked | 188s | 1191261in/9483out $0.0162 | escalation: finding(s) whose fix lands in an upstream artifact (FR-10.4 upstream invalidation): F-001 |
 
 ## Commits
 
@@ -79,3 +80,4 @@
 - `0eff3f5067` P8.1 (step `impl-cycle`)
 - `31c3d119ab` P9 (step `phase-commit`)
 - `02370b3472` P9.1 (step `impl-cycle`)
+- `f9d3f9acda` P10 (step `phase-commit`)
