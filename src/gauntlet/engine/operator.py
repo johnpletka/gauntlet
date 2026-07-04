@@ -863,7 +863,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -892,6 +892,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "run_elapsed_s",
     "totals",
     "agent_usage",
+    "warnings",
     "quota",
     "driver",
     "parked",
@@ -966,6 +967,11 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": "object",
       "additionalProperties": {"$ref": "#/$defs/usage_totals"},
       "description": "Per-agent-profile usage totals keyed by profile name (harness-efficiency FR-7.1). Always present; an empty object when no per-profile usage was recorded."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Non-fatal run anomalies surfaced rather than swallowed (harness-efficiency FR-10.3): each an already-redacted human-readable string. Includes advisory usage-window shortfalls (`[<step>] usage-window admission (FR-10.3): …`, the warn-don't-park default) so a live shortfall is visible without opening the manifest, plus any other recorded warning (e.g. an unrenderable final-gate artifact). Always present; an empty array when none."
     },
     "quota": {
       "type": ["object", "null"],
@@ -1764,6 +1770,10 @@ def status_payload(
         "agent_usage": {
             name: _usage_totals_dict(u) for name, u in man.agent_usage.items()
         },
+        # FR-10.3 advisory channel: non-fatal run anomalies surfaced rather than
+        # swallowed — including advisory usage-window shortfalls (the
+        # warn-don't-park default). Always present; an empty array when none.
+        "warnings": list(man.warnings),
         "quota": quota,
         "driver": {
             "state": driver.state,

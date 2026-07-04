@@ -14,6 +14,8 @@ from gauntlet.adapters.base import Usage
 from gauntlet.engine import ledger as L, manifest as M
 from gauntlet.engine import operator
 
+from gauntlet.engine.manifest import StepRecord
+
 from conftest import FakeAdapter
 from test_orchestrator import _build
 
@@ -25,6 +27,37 @@ stages:
     steps:
       - {id: implement, type: agent_task, agent: builder, output: out.txt, prompt_text: go}
 """
+
+# A standard adversarial_cycle carries role fields (reviewer/triager/fixer/
+# escalation_agent), NOT `agent:` — the case F-002 is about.
+CYCLE = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-code.md}
+"""
+
+
+def _cycle_cfg(*, budget: float, enforce: bool, fallback: float | None):
+    window = {"window_hours": 5, "window_budget": budget, "enforce": enforce}
+    if fallback is not None:
+        window["fallback_estimate"] = fallback
+    # Every cycle role bills claude-code → anthropic, so the anthropic window
+    # constrains the reviewer/triager/fixer/escalation profiles.
+    return {
+        "agents": {
+            "builder": {"adapter": "claude-code"},
+            "reviewer": {"adapter": "claude-code"},
+            "triage": {"adapter": "claude-code"},
+            "escalation": {"adapter": "claude-code"},
+        },
+        "providers": {"anthropic": window},
+    }
 
 
 def _window_cfg(*, budget: float, enforce: bool, fallback: float | None):
@@ -93,6 +126,84 @@ def test_advisory_short_headroom_warns_but_launches(fixture_repo):
     assert adapter.calls, "advisory mode must still launch the step"
     warnings = orch.manifest.warnings
     assert any("usage-window admission" in w and "implement" in w for w in warnings)
+
+
+def test_advisory_warning_surfaces_in_status_payload(fixture_repo):
+    # FR-10.3 obligation beyond the manifest: the advisory shortfall must also be
+    # visible through `gauntlet status` so an operator sees it without opening the
+    # manifest (F-001). Drive advisory mode, then render the status payload.
+    cfg = _window_cfg(budget=100, enforce=False, fallback=1000)
+    adapter = FakeAdapter(text="done", usage=Usage(input_tokens=10, output_tokens=0))
+    orch = _build(fixture_repo, STEP, config=cfg, adapters={"builder": adapter})
+    assert orch.drive() == M.RUN_DONE
+
+    rstate = operator.compute_run_state(orch.manifest, operator.LIVENESS_NONE)
+    payload = operator.status_payload(
+        orch.manifest,
+        operator.DriverInfo(operator.LIVENESS_NONE, None, None, None),
+        rstate,
+        None,
+        run_root=fixture_repo / "runs",
+        run_instance_dir=fixture_repo / "runs" / "demo" / "run-1",
+    )
+    assert any(
+        "usage-window admission" in w and "implement" in w for w in payload["warnings"]
+    )
+
+
+# --- adversarial_cycle admission per role (F-002) ----------------------------
+
+
+def test_cycle_enforce_parks_before_launch_on_role_profile(fixture_repo):
+    # A cycle carries reviewer/triager/fixer/escalation_agent, NOT `agent:`. The
+    # old admission bailed on `not step.agent` and never checked a constrained
+    # role, so the cycle launched into a reactive usage-limit park. Now each role
+    # profile is admission-checked: an enforce window with no headroom parks the
+    # cycle pre-launch (F-002).
+    cfg = _cycle_cfg(budget=100, enforce=True, fallback=1000)
+    orch = _build(fixture_repo, CYCLE, config=cfg)
+    assert orch.drive() == M.RUN_PARKED
+
+    rec = orch.manifest.record("impl-cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_WINDOW
+    assert rec.halt_reason is None
+    assert rec.quota_reset_at is not None
+    assert "usage-window admission" in (rec.notes or "")
+
+
+def test_cycle_advisory_warns_per_constrained_role(fixture_repo):
+    # Advisory mode over a cycle records a manifest warning for the constrained
+    # roles and returns None (launch as usual). Driven at the admission seam so
+    # the assertion does not need the full cycle machinery.
+    cfg = _cycle_cfg(budget=100, enforce=False, fallback=1000)
+    orch = _build(fixture_repo, CYCLE, config=cfg)
+    step = orch.pipeline.all_steps()[0]
+    rec = StepRecord(id=step.id, type=step.type, status=M.PENDING)
+
+    result = orch._window_admission(step, rec)
+    assert result is None  # advisory never blocks the launch
+    assert any(
+        "usage-window admission" in w and "impl-cycle" in w
+        for w in orch.manifest.warnings
+    )
+
+
+def test_cycle_with_no_window_provider_is_admitted(fixture_repo):
+    # No providers block ⇒ no role is window-constrained ⇒ admission is a no-op.
+    cfg = {
+        "agents": {
+            "builder": {"adapter": "claude-code"},
+            "reviewer": {"adapter": "claude-code"},
+            "triage": {"adapter": "claude-code"},
+            "escalation": {"adapter": "claude-code"},
+        }
+    }
+    orch = _build(fixture_repo, CYCLE, config=cfg)
+    step = orch.pipeline.all_steps()[0]
+    rec = StepRecord(id=step.id, type=step.type, status=M.PENDING)
+    assert orch._window_admission(step, rec) is None
+    assert orch.manifest.warnings == []
 
 
 # --- enforce admission (FR-10.3) ---------------------------------------------

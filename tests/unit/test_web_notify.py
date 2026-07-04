@@ -35,12 +35,14 @@ from gauntlet.web.notify import (
     KIND_ESCALATION,
     KIND_FAILED,
     KIND_GATE,
+    KIND_WARNING,
     Notification,
     Notifier,
     SlackChannel,
     SlackDeliveryError,
     build_notifier,
     classify_kind,
+    usage_window_warnings,
 )
 from gauntlet.web.store import RunStore
 from gauntlet.web.watcher import WatchEvent, Watcher
@@ -58,6 +60,7 @@ def _event(
     current_step_status: str | None = None,
     current_step_type: str | None = None,
     current_step_notes: str | None = None,
+    warnings: list[str] | None = None,
     revision: int | None = 1,
 ) -> WatchEvent:
     return WatchEvent(
@@ -68,7 +71,21 @@ def _event(
         current_step_status=current_step_status,
         current_step_type=current_step_type,
         current_step_notes=current_step_notes,
+        warnings=warnings or [],
         revision=revision,
+    )
+
+
+_WINDOW_WARN = "[implement] usage-window admission (FR-10.3): provider 'anthropic' …"
+
+
+def _running_with_warnings(warnings: list[str], *, run_id: str = "run-1") -> WatchEvent:
+    return _event(
+        run_id=run_id,
+        run_status="running",
+        current_step="implement",
+        current_step_status="running",
+        warnings=warnings,
     )
 
 
@@ -226,6 +243,77 @@ def test_prime_of_non_kind_is_noop():
     # Later parking at a gate still fires (running was no kind to prime).
     n.notify(_gate("gate"))
     assert len(rec.sent) == 1
+
+
+# --- FR-10.3: advisory usage-window warning notifications --------------------
+
+
+def test_usage_window_warnings_filters_by_marker():
+    other = "final-gate artifact PR.md could not be rendered"
+    ev = _running_with_warnings([_WINDOW_WARN, other])
+    # Only the usage-window warning is a push kind; other manifest warnings are
+    # surfaced by `status` but not pushed.
+    assert usage_window_warnings(ev) == [_WINDOW_WARN]
+
+
+def test_new_usage_window_warning_notifies_once():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings([_WINDOW_WARN]))
+    assert len(rec.sent) == 1
+    assert rec.sent[0].kind == KIND_WARNING
+    assert _WINDOW_WARN in (rec.sent[0].note or "")
+    # A later transition still carrying the SAME warning does not re-fire (deduped
+    # by warning text, not current_step — even as the run moves to a new step).
+    later = _running_with_warnings([_WINDOW_WARN])
+    later.current_step = "next-step"
+    n.notify(later)
+    assert len(rec.sent) == 1
+
+
+def test_distinct_usage_window_warnings_each_notify():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings([_WINDOW_WARN]))
+    second = "[review] usage-window admission (FR-10.3): provider 'openai' …"
+    n.notify(_running_with_warnings([_WINDOW_WARN, second]))
+    notes = [note.note for note in rec.sent]
+    assert notes == [_WINDOW_WARN, second]
+
+
+def test_prime_suppresses_pre_existing_usage_window_warning():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    # A warning already present at first observation is primed (startup), so the
+    # same warning on a later transition does not flood the operator.
+    n.prime(_running_with_warnings([_WINDOW_WARN]))
+    n.notify(_running_with_warnings([_WINDOW_WARN]))
+    assert rec.sent == []
+
+
+def test_non_window_warning_is_not_pushed():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings(["final-gate artifact PR.md unrenderable"]))
+    assert rec.sent == []
+
+
+def test_warning_and_gate_on_same_event_both_fire():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    # An advisory shortfall recorded on the same tick the run reaches a gate: the
+    # warning stream and the gate transition are independent, so both fire.
+    ev = _gate("gate")
+    ev.warnings = [_WINDOW_WARN]
+    n.notify(ev)
+    kinds = sorted(note.kind for note in rec.sent)
+    assert kinds == sorted([KIND_WARNING, KIND_GATE])
+
+
+def test_classify_kind_ignores_warnings():
+    # A warning is NOT a classify_kind transition kind — it is handled as its own
+    # notifier stream. A plain running event with a warning classifies to None.
+    assert classify_kind(_running_with_warnings([_WINDOW_WARN])) is None
 
 
 # --- fail-soft ---------------------------------------------------------------
@@ -518,6 +606,36 @@ def test_watcher_notifies_run_first_seen_done_after_startup(tmp_path: Path):
                          current_step="impl"))
     w.poll_once()
     assert len(rec.sent) == 1 and rec.sent[0].kind == KIND_COMPLETED
+
+
+def test_watcher_pushes_usage_window_warning(tmp_path: Path):
+    """A newly-stamped advisory usage-window warning (manifest.warnings) is
+    carried on the WatchEvent and pushed as a KIND_WARNING notification — the
+    FR-10.3 obligation, end to end through poll_once (F-001)."""
+    repo = tmp_path / "repo"
+    (repo / "runs").mkdir(parents=True)
+    store = RunStore(repo, RunConfig())
+    rec = RecordingChannel()
+    w = Watcher(store, notifier=Notifier([rec]))
+
+    rd = repo / "runs" / "alpha" / "run-1"
+    # First observation with no warning → primed, no send.
+    _write(rd, _manifest("alpha", "run-1", status="running",
+                         steps=[StepRecord(id="implement", type="agent_task",
+                                           status="running")],
+                         current_step="implement"))
+    w.poll_once()
+    assert rec.sent == []
+
+    # The engine stamps an advisory shortfall → manifest rewrite → notification.
+    man = _manifest("alpha", "run-1", status="running",
+                    steps=[StepRecord(id="implement", type="agent_task",
+                                      status="running")],
+                    current_step="implement")
+    man.warnings.append(_WINDOW_WARN)
+    _write(rd, man)
+    w.poll_once()
+    assert len(rec.sent) == 1 and rec.sent[0].kind == KIND_WARNING
 
 
 def test_watcher_unchanged_manifest_no_notify(tmp_path: Path):

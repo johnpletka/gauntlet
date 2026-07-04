@@ -312,6 +312,23 @@ class ProviderWindow(BaseModel):
             )
         return v
 
+    @field_validator("fallback_estimate")
+    @classmethod
+    def _validate_fallback_estimate(cls, v: float | None) -> float | None:
+        """A fallback estimate must be null or non-negative (FR-10.2).
+
+        Admission treats a KNOWN estimate as sufficient whenever
+        ``estimate <= headroom`` (:func:`ledger.admit_step`). A NEGATIVE fallback
+        would therefore make an over-budget provider with no history read as
+        sufficient — a fail-OPEN on a safety gate. Reject it at load so a bad
+        config fails closed instead (fail-closed posture, §2)."""
+        if v is not None and v < 0:
+            raise ValueError(
+                f"providers.*.fallback_estimate must be null or non-negative; "
+                f"got {v!r} (FR-10.2)"
+            )
+        return v
+
 
 class IssueTrackerConfig(BaseModel):
     """The optional `issue_tracker:` config block (§6, FR-6.1/FR-6.2/FR-6.4).

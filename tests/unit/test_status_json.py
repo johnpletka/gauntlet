@@ -211,6 +211,8 @@ def test_section_6_2_example_validates():
             "builder": {"input_tokens": 41200, "output_tokens": 9800,
                         "cached_input_tokens": 12000, "cost_usd": 1.87}
         },
+        # Additive FR-10.3 advisory channel: always present, empty when none.
+        "warnings": [],
         "quota": None,
         "driver": {"state": "none", "pid": None, "since": None, "host": None},
         # FR-7.2: a human_gate park now stamps/emits the normalized `gate` reason.
@@ -440,6 +442,31 @@ def test_gate_block_always_present_and_null_when_not_threaded():
         op.LIVENESS_NONE,
     )
     payload.pop("gate")
+    with pytest.raises(ValueError):
+        validate_schema(payload, STATUS_SCHEMA)
+
+
+# --- FR-10.3: advisory warnings surface in the status contract ---------------
+def test_manifest_warnings_surface_in_status_payload():
+    # FR-10.3: an advisory usage-window shortfall stamped into manifest.warnings
+    # is surfaced by `status` (not only the manifest), so an operator does not
+    # have to open the manifest to see it (F-001).
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    warn = "[implement] usage-window admission (FR-10.3): provider 'anthropic' …"
+    man.warnings.append(warn)
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    assert payload["warnings"] == [warn]
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_warnings_always_present_empty_when_none():
+    # Always present, empty array when no warning was recorded (never omitted).
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    assert payload["warnings"] == []
+    validate_schema(payload, STATUS_SCHEMA)
+    # The schema requires the field: dropping it fails validation.
+    payload.pop("warnings")
     with pytest.raises(ValueError):
         validate_schema(payload, STATUS_SCHEMA)
 

@@ -756,52 +756,101 @@ class Orchestrator:
             return datetime.now(timezone.utc)
         return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
+    # The cycle roles that each launch agent calls billing their own provider
+    # (FR-10.2). A standard ``adversarial_cycle`` carries these instead of a
+    # single ``agent:``, so admission must check each declared role — not bail
+    # because ``step.agent`` is unset (F-002). ``confirmer`` defaults to the
+    # reviewer profile (already covered by ``reviewer``); listing it still
+    # correctly checks a distinct confirmer profile when one is configured.
+    _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
+
+    def _admission_profiles(self, step: Step) -> list[str]:
+        """The agent profiles whose provider window this step must clear (FR-10.2).
+
+        An ``agent_task`` bills one profile (``step.agent``); an
+        ``adversarial_cycle`` bills one PER declared role — each can drive a
+        constrained provider into a reactive usage-limit park, so each is
+        admission-checked before the cycle launches (F-002). De-duplicated (roles
+        may share a profile) with first-seen order preserved so the check is
+        deterministic.
+        """
+        if step.type == "agent_task":
+            return [step.agent] if step.agent else []
+        if step.type == "adversarial_cycle":
+            profiles: list[str] = []
+            for role in self._CYCLE_ROLES:
+                profile = step.get(role)
+                if profile and profile not in profiles:
+                    profiles.append(profile)
+            return profiles
+        return []
+
     def _window_admission(self, step: Step, rec: StepRecord) -> StepResult | None:
         """Pre-step provider-window admission (FR-10.2/10.3).
 
-        Returns a PARKED ``usage_window`` StepResult when the step's provider is
-        window-constrained, ``enforce: true``, and the estimated usage exceeds
-        remaining headroom — a clean-boundary park before any adapter call. In
-        advisory mode (default) the same short-fall records a manifest warning and
-        returns ``None`` (launch as usual). Returns ``None`` for a non-agent step,
-        a provider with no configured window, sufficient headroom, or any ledger
-        error (advisory — a ledger fault never blocks a run, PRD §4.2).
+        For each agent profile the step bills (one for an ``agent_task``; one per
+        declared role for an ``adversarial_cycle``, F-002), estimates the step's
+        provider usage and compares it to remaining window headroom. Returns a
+        PARKED ``usage_window`` StepResult when a window-constrained,
+        ``enforce: true`` profile lacks headroom — a clean-boundary park before any
+        adapter call. In advisory mode (default) the same short-fall records a
+        manifest warning — also surfaced through ``gauntlet status`` and a
+        notification (FR-10.3) — and admission keeps scanning the other profiles
+        (launch as usual). Returns ``None`` for a step with no window-constrained
+        profile, sufficient headroom everywhere, or any ledger error (advisory — a
+        ledger fault never blocks a run, PRD §4.2).
         """
-        if step.type not in ("agent_task", "adversarial_cycle") or not step.agent:
-            return None
-        provider = L.profile_provider(self.config, step.agent)
-        if provider is None:
-            return None
-        window = self.config.providers.get(provider)
-        if window is None:
+        profiles = self._admission_profiles(step)
+        if not profiles:
             return None
         try:
             rows = L.load_rows(self.ledger_path)
-            decision = L.admit_step(
-                rows, window, provider=provider, step_type=step.type,
-                profile=step.agent, now=self._now_dt(),
-            )
         except Exception:
             return None  # advisory: never block a launch on a ledger error
-        if decision.sufficient:
-            return None
-        note = f"usage-window admission (FR-10.3): {decision.summary()}"
-        if window.enforce:
-            return StepResult(
-                status=PARKED,
-                parked_reason=M.PARKED_REASON_USAGE_WINDOW,
-                # Reuse the quota reset field for the projected replenishment time
-                # (the datum status surfaces for a usage_window park, mirroring a
-                # usage_limit park's reset time).
-                quota_reset_at=decision.replenish_at,
-                notes=note,
-            )
-        # Advisory: stamp the warning into the manifest (its non-fatal-anomaly
-        # channel) so it is recorded and surfaced without blocking the launch.
+        now = self._now_dt()
+        for profile in profiles:
+            provider = L.profile_provider(self.config, profile)
+            if provider is None:
+                continue
+            window = self.config.providers.get(provider)
+            if window is None:
+                continue
+            try:
+                decision = L.admit_step(
+                    rows, window, provider=provider, step_type=step.type,
+                    profile=profile, now=now,
+                )
+            except Exception:
+                continue  # advisory: an estimate fault never blocks a launch
+            if decision.sufficient:
+                continue
+            note = f"usage-window admission (FR-10.3): {decision.summary()}"
+            if window.enforce:
+                return StepResult(
+                    status=PARKED,
+                    parked_reason=M.PARKED_REASON_USAGE_WINDOW,
+                    # Reuse the quota reset field for the projected replenishment
+                    # time (the datum status surfaces for a usage_window park,
+                    # mirroring a usage_limit park's reset time).
+                    quota_reset_at=decision.replenish_at,
+                    notes=note,
+                )
+            # Advisory: record the warning; keep scanning so every constrained
+            # profile's short-fall lands, not just the first.
+            self._record_window_warning(step, note)
+        return None
+
+    def _record_window_warning(self, step: Step, note: str) -> None:
+        """Stamp a de-duplicated advisory usage-window warning into the manifest.
+
+        ``manifest.warnings`` is the FR-10.3 advisory channel: rendered by
+        ``gauntlet status`` (its ``warnings`` block) and pushed as a
+        ``usage-window-warning`` notification by the web notifier, so a live
+        short-fall is visible without opening the manifest.
+        """
         warning = f"[{step.id}] {note}"
         if warning not in self.manifest.warnings:
             self.manifest.warnings.append(warning)
-        return None
 
     def _append_ledger_row(self, rec: StepRecord) -> None:
         """Append this step's content-free usage to the machine-global ledger.

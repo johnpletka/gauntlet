@@ -259,6 +259,31 @@ def test_provider_window_rejects_nonpositive_hours() -> None:
         ProviderWindow(window_hours=0, window_budget=1)
 
 
+def test_provider_window_rejects_negative_fallback_estimate() -> None:
+    # A negative fallback would make an over-budget provider with no history read
+    # as sufficient (estimate <= headroom trivially holds) — a fail-OPEN on a
+    # safety gate. It must fail closed at load (F-003).
+    with pytest.raises(ValueError, match="fallback_estimate"):
+        ProviderWindow(window_hours=5, window_budget=1, fallback_estimate=-1)
+
+
+def test_provider_window_accepts_null_or_nonnegative_fallback() -> None:
+    # The two valid shapes: absent (None ⇒ unknown ⇒ admit) and non-negative.
+    assert ProviderWindow(window_hours=5, window_budget=1).fallback_estimate is None
+    assert (
+        ProviderWindow(window_hours=5, window_budget=1, fallback_estimate=0)
+        .fallback_estimate == 0
+    )
+
+
+def test_negative_fallback_cannot_fail_open_admission() -> None:
+    # The safety property behind F-003: even if a negative fallback reached
+    # admission, it would admit an already-over-budget provider. Assert the config
+    # gate is what prevents that (construction raises before admit_step sees it).
+    with pytest.raises(ValueError, match="fallback_estimate"):
+        ProviderWindow(window_hours=5, window_budget=100, fallback_estimate=-50)
+
+
 def test_run_config_loads_providers_block() -> None:
     cfg = RunConfig.model_validate(
         {
