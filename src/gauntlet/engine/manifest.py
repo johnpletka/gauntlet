@@ -119,11 +119,16 @@ def normalize_parked_reason(
 # to the single PRD value ``response``; the two legacy values are accepted only
 # on read (through :func:`normalize_parked_reason`), never compared directly.
 RESPONSE_RESOLVABLE_PARK_REASONS = frozenset({PARKED_REASON_RESPONSE})
-# Step types that accept a `--response` decision when parked. An `agent_task`
-# (the builder halting on UPSTREAM CONFLICT) re-runs with the decision injected
-# into its prompt; an `adversarial_cycle` re-drives with it injected into the
-# reviewer/triager so they re-evaluate the parked finding.
-RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle"})
+# Step types that accept a `--response` decision when parked OR failed. An
+# `agent_task` (the builder halting on UPSTREAM CONFLICT) re-runs with the
+# decision injected into its prompt; an `adversarial_cycle` re-drives with it
+# injected into the reviewer/triager so they re-evaluate the parked finding. A
+# `commit` step whose message-drafting failed the FR-9.2 format check (a benign,
+# otherwise-unrecoverable terminal failure) re-runs consuming the decision: a
+# response that is itself a valid commit message is used verbatim (a
+# deterministic operator override for a drafter that could not produce a legal
+# header), else it steers the redraft.
+RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle", "commit"})
 
 # --- halt reasons (terminal HALTED/FAILED/INTERRUPTED discriminator) ---------
 # The disjoint sibling of ``parked_reason`` (harness-efficiency FR-7.2, PRD §6):

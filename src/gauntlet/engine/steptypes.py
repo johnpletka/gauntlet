@@ -1376,7 +1376,32 @@ def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
+    # Operator commit-recovery (FR-9.2 recovery): a commit step whose drafter
+    # could not produce a legal header fails terminally with no re-draft lever.
+    # `gauntlet resume --response` re-runs it with the human decision pending on
+    # THIS step's record (not yet in `consumed`, which is prior-step CONSUMED
+    # only). If that decision is itself a valid commit message, use it verbatim —
+    # a deterministic override; otherwise fold it into the redraft as guidance.
+    pending = _pending_response(ctx)
+    if pending is not None:
+        text = (pending.response_text or "").strip()
+        if text and validate_commit_message(text) is None:
+            return text, None, None, None
+        consumed = list(consumed) + [pending]
     return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
+
+
+def _pending_response(ctx: StepContext):
+    """This step's own still-`pending` `--response` decision, if any (else None).
+
+    The commit-recovery override reads it directly from the step record because
+    :func:`_consumed_responses` returns CONSUMED entries only, and the decision
+    being applied to a just-resumed commit step is still `pending` while the
+    handler runs (finalize flips it to `consumed` on the terminal outcome)."""
+    responses = ctx.record.human_responses
+    if responses and responses[-1].state == RESPONSE_PENDING:
+        return responses[-1]
+    return None
 
 
 def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):

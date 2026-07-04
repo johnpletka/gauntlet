@@ -123,6 +123,61 @@ stages:
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: drafted"
 
 
+def test_commit_is_respondable_for_recovery():
+    # FR-9.2 recovery: a commit step's message-format terminal failure is
+    # operator-recoverable via `resume --response` (previously a dead-end).
+    assert "commit" in M.RESPONDABLE_STEP_TYPES
+
+
+def _pending(text):
+    return M.HumanResponse(
+        response_id="commit-resp-1", response_text=text,
+        timestamp="2026-07-04T00:00:00+00:00", user="op",
+        response_attempt=1, state="pending",
+    )
+
+
+def test_commit_message_uses_valid_response_as_literal_override():
+    # A `--response` that is ITSELF a valid commit message is used verbatim — a
+    # deterministic override for a drafter that could not produce a legal header,
+    # with no model call (usage/session/drafter all None).
+    from types import SimpleNamespace
+
+    from gauntlet.engine.steptypes import _commit_message
+
+    ctx = SimpleNamespace(record=SimpleNamespace(
+        human_responses=[_pending("P11: concurrent triage + judge decision cache\n\nBody.")]
+    ))
+    step = Step.model_validate({"id": "commit", "type": "commit"})
+    message, usage, session, drafter = _commit_message(step, ctx)
+    assert message.startswith("P11: concurrent triage + judge decision cache")
+    assert usage is None and session is None and drafter is None
+
+
+def test_commit_message_folds_nonmessage_response_into_redraft(monkeypatch):
+    # A `--response` that is NOT a valid commit message is not used literally; it
+    # is folded into the redraft as guidance (the drafter still runs).
+    from types import SimpleNamespace
+
+    import gauntlet.engine.steptypes as S
+
+    captured = {}
+
+    def fake_draft(step, ctx, consumed=(), *, diff_base=None):
+        captured["consumed"] = list(consumed)
+        return "P1: drafted", None, None, "triage"
+
+    monkeypatch.setattr(S, "_draft_commit_message", fake_draft)
+    ctx = SimpleNamespace(record=SimpleNamespace(
+        human_responses=[_pending("please keep the header under 72 chars")]
+    ))
+    step = Step.model_validate({"id": "commit", "type": "commit"})
+    message, _u, _s, drafter = S._commit_message(step, ctx)
+    assert message == "P1: drafted" and drafter == "triage"
+    # the non-message response reached the drafter as guidance
+    assert captured["consumed"] and captured["consumed"][0].response_id == "commit-resp-1"
+
+
 class RecordingDrafter:
     """Captures the draft prompt and reports usage (F-008)."""
 
