@@ -1792,8 +1792,8 @@
       "agent": null,
       "session_id": null,
       "started": "2026-07-04T19:31:57.726669+00:00",
-      "ended": "2026-07-04T19:32:37.114236+00:00",
-      "attempts": 1,
+      "ended": "2026-07-04T22:50:17.047689+00:00",
+      "attempts": 2,
       "base_sha": "50a13bfec216e5fe541bebcf759a74dd0625a652",
       "parked_reason": null,
       "halt_reason": "adapter_error",
@@ -1810,7 +1810,7 @@
           "timestamp": "2026-07-04T22:50:16.942772+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
@@ -1827,7 +1827,7 @@
           "cost_usd": 0.014116799999999999
         }
       },
-      "notes": "commit message invalid: header is 76 chars; must be ≤ 72 (FR-9.2)",
+      "notes": "commit step found a clean worktree with nothing to commit",
       "iteration": "10",
       "metrics": {},
       "checkpoints": [],

@@ -55,7 +55,7 @@
 | [impl-cycle.9](steps/impl-cycle.9/) | adversarial_cycle | done | 121827s | 2484391in/71980out $7.2325 | converged in round 1 (blocking policy): no open blocking; 3 fixed, 0 non-blocking item(s) surfaced for the gate |
 | [implement.10](steps/implement.10/transcript.md) | agent_task | done | 2966s | 9239in/123802out $18.2490 | agent 'builder' completed |
 | [tests.10](steps/tests.10/) | shell | done | 351s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
-| phase-commit.10 | commit | failed | 39s | 36488in/3851out $0.0141 | commit message invalid: header is 76 chars; must be ≤ 72 (FR-9.2) |
+| phase-commit.10 | commit | failed | 11899s | 36488in/3851out $0.0141 | commit step found a clean worktree with nothing to commit |
 
 ## Commits
 
