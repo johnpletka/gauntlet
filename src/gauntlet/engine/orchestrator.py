@@ -806,20 +806,21 @@ class Orchestrator:
     def _append_ledger_row(self, rec: StepRecord) -> None:
         """Append this step's content-free usage to the machine-global ledger.
 
-        Best-effort and idempotent (FR-10.1): a step with no agent/usage yields no
-        row; the ``run_id::step_id`` de-dup key means a re-finalized (resumed) step
-        never double-counts — the first execution's spend wins. Any error is
+        Best-effort and idempotent (FR-10.1). A single-agent step yields one row;
+        a compound step (adversarial_cycle) yields one row PER ROLE from
+        ``rec.agent_usage``, each attributed to that role's own provider — so a
+        cycle's spend (the bulk of a run's usage) is recorded, not dropped. The
+        ``run_id::step_id[::profile]`` de-dup key means a re-finalized (resumed)
+        step never double-counts — the first execution's spend wins. Any error is
         swallowed: the ledger is advisory, never a correctness dependency (§4.2).
         """
         try:
-            provider = L.profile_provider(self.config, rec.agent)
-            model = L.profile_model(self.config, rec.agent)
-            row = L.row_from_step(
+            rows = L.rows_from_step(
                 rec, run_id=self.manifest.run_id, repo_hash=self._repo_hash,
-                provider=provider, model=model,
+                config=self.config,
             )
-            if row is not None:
-                L.append_unique([row], path=self.ledger_path)
+            if rows:
+                L.append_unique(rows, path=self.ledger_path)
         except Exception:
             pass
 
@@ -1018,6 +1019,13 @@ class Orchestrator:
             self.manifest.agent_usage.setdefault(
                 agent_name, M.UsageTotals()
             ).add(agent_usage)
+            # Also record the per-role split ON THE STEP (FR-3.2 / FR-10.1): the
+            # step-level `agent_usage` is what the ledger reads to attribute a
+            # compound step's spend (an adversarial_cycle's reviewer/triager/fixer)
+            # to each role's OWN provider — a cycle's roles can bill different
+            # providers, so a single lumped row would misattribute. Accumulated
+            # (like `rec.usage`) so a re-finalized/resumed step stays consistent.
+            rec.agent_usage.setdefault(agent_name, M.UsageTotals()).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
         if result.metrics:

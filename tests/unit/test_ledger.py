@@ -101,7 +101,11 @@ def test_append_unique_dedups_within_batch_and_across_calls(tmp_path: Path) -> N
     # Re-appending the same rows adds nothing (idempotent across calls).
     added2, skipped2 = L.append_unique(rows, path=path)
     assert (added2, skipped2) == (0, 3)
-    assert {r.key for r in L.load_rows(path)} == {"run-a::s1", "run-a::s2"}
+    # The de-dup key is per-role (`run::step::profile`) so a compound step's roles
+    # do not collide; these single-role rows carry the default `builder` profile.
+    assert {r.key for r in L.load_rows(path)} == {
+        "run-a::s1::builder", "run-a::s2::builder",
+    }
     # The FIRST write of a key wins — the 999-token duplicate never landed.
     s1 = next(r for r in L.load_rows(path) if r.step_id == "s1")
     assert s1.input_tokens == 100
@@ -410,3 +414,131 @@ def test_backfill_unknown_profile_records_null_provider(tmp_path: Path) -> None:
     res = L.backfill_from_manifests([man], repo_root=repo, config=cfg, path=path)
     assert res.rows_added == 1
     assert L.load_rows(path)[0].provider is None
+
+
+# --- per-role rows for compound (adversarial_cycle) steps (FR-10.1) ----------
+
+
+def _multi_provider_config() -> RunConfig:
+    """A config whose cycle roles bill DIFFERENT providers (codex→openai,
+    claude-code→anthropic) — the case a single lumped cycle row can't attribute."""
+    return RunConfig.model_validate(
+        {
+            "agents": {
+                "reviewer": {"adapter": "codex", "model": "gpt5"},
+                "fixer": {"adapter": "claude-code", "model": "opus"},
+            }
+        }
+    )
+
+
+def _cycle_step(step_id: str, agent_usage: dict[str, UsageTotals], *, ts: str) -> StepRecord:
+    """An adversarial_cycle record: agent=None (no single profile), with a
+    per-role usage split — exactly what the orchestrator now persists."""
+    return StepRecord(
+        id=step_id,
+        type="adversarial_cycle",
+        agent=None,
+        started=ts,
+        ended=ts,
+        usage=UsageTotals(
+            input_tokens=sum(u.input_tokens for u in agent_usage.values()),
+            output_tokens=sum(u.output_tokens for u in agent_usage.values()),
+        ),
+        agent_usage=agent_usage,
+    )
+
+
+def test_rows_from_step_splits_cycle_into_per_role_rows() -> None:
+    """A compound step yields one row PER ROLE, each attributed to that role's own
+    provider — not one lumped (and, before this, dropped) row (FR-10.1)."""
+    cfg = _multi_provider_config()
+    ts = _iso(_now())
+    rec = _cycle_step(
+        "impl-cycle.0",
+        {
+            "reviewer": UsageTotals(input_tokens=100, output_tokens=20),
+            "fixer": UsageTotals(input_tokens=300, output_tokens=50),
+        },
+        ts=ts,
+    )
+    rows = L.rows_from_step(rec, run_id="run-1", repo_hash="h", config=cfg)
+    by_profile = {r.profile: r for r in rows}
+    assert set(by_profile) == {"reviewer", "fixer"}
+    # Each role attributed to ITS provider — the whole point of the split.
+    assert by_profile["reviewer"].provider == "openai"
+    assert by_profile["fixer"].provider == "anthropic"
+    # Per-role de-dup keys so the two roles of one step never collide.
+    assert {r.key for r in rows} == {
+        "run-1::impl-cycle.0::reviewer",
+        "run-1::impl-cycle.0::fixer",
+    }
+    # A role contributing no spend is dropped.
+    rec2 = _cycle_step(
+        "impl-cycle.1",
+        {
+            "reviewer": UsageTotals(input_tokens=10, output_tokens=1),
+            "fixer": UsageTotals(),  # ran nothing this cycle
+        },
+        ts=ts,
+    )
+    assert {r.profile for r in L.rows_from_step(rec2, run_id="r", repo_hash="h", config=cfg)} == {
+        "reviewer"
+    }
+
+
+def test_rows_from_step_single_agent_unchanged() -> None:
+    """A single-agent step (no agent_usage split) still yields exactly one row
+    from `agent` + `usage`, keyed `run::step` (no regression)."""
+    cfg = RunConfig.model_validate(
+        {"agents": {"builder": {"adapter": "claude-code", "model": "opus"}}}
+    )
+    ts = _iso(_now())
+    rec = _step("impl", "builder", 100, 40, started=ts, ended=ts)
+    rows = L.rows_from_step(rec, run_id="run-1", repo_hash="h", config=cfg)
+    assert len(rows) == 1
+    assert rows[0].profile == "builder" and rows[0].provider == "anthropic"
+    assert rows[0].key == "run-1::impl::builder"
+
+
+def test_backfill_attributes_cycle_usage_per_provider(tmp_path: Path) -> None:
+    """Regression: a run's adversarial_cycle usage — the bulk of its spend — is
+    charged to each role's provider window instead of being dropped (the P10
+    ledger-blindness finding). Also idempotent across a second backfill."""
+    path = tmp_path / "ledger.jsonl"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _multi_provider_config()
+    now = _now()
+    ts = _iso(now - timedelta(hours=1))
+    man = _manifest_with_steps(
+        "run-1",
+        [
+            _cycle_step(
+                "impl-cycle.0",
+                {
+                    "reviewer": UsageTotals(input_tokens=1000, output_tokens=100),
+                    "fixer": UsageTotals(input_tokens=4000, output_tokens=400),
+                },
+                ts=ts,
+            )
+        ],
+    )
+    res = L.backfill_from_manifests([man], repo_root=repo, config=cfg, path=path)
+    assert res.rows_added == 2  # one row per role — cycle usage no longer dropped
+
+    rows = L.load_rows(path)
+    anthropic = L.window_usage(
+        rows, provider="anthropic", window_hours=5, unit="tokens", now=now
+    )
+    openai = L.window_usage(
+        rows, provider="openai", window_hours=5, unit="tokens", now=now
+    )
+    assert anthropic == 4000 + 400  # fixer (claude-code)
+    assert openai == 1000 + 100  # reviewer (codex)
+
+    # Idempotent: re-backfill adds nothing, sums unchanged.
+    before = path.read_bytes()
+    res2 = L.backfill_from_manifests([man], repo_root=repo, config=cfg, path=path)
+    assert res2.rows_added == 0 and res2.rows_skipped == 2
+    assert path.read_bytes() == before

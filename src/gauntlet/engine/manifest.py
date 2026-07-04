@@ -403,6 +403,13 @@ class StepRecord(BaseModel):
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)
     usage: UsageTotals = Field(default_factory=UsageTotals)
+    # Per-role usage split for a COMPOUND step (adversarial_cycle): profile → its
+    # own usage, mirroring the run-level `Manifest.agent_usage` but scoped to this
+    # step (FR-3.2). Empty for a single-agent step (its one profile is `agent` +
+    # `usage`). The usage-ledger reads this to attribute a cycle's spend to each
+    # role's own provider (FR-10.1); without it a cycle's usage — the bulk of a
+    # run's — has no per-provider attribution.
+    agent_usage: dict[str, UsageTotals] = Field(default_factory=dict)
     notes: str | None = None
     # foreach binding key, when this record is one iteration of a fan-out step
     iteration: str | None = None

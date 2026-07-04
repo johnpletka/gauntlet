@@ -84,13 +84,19 @@ def repo_root_hash(repo_root: Path) -> str:
     return hashlib.sha256(str(repo_root.resolve()).encode("utf-8")).hexdigest()
 
 
-def dedup_key(run_id: str, step_id: str) -> str:
-    """The stable per-row de-dup key ``run_id ‖ step_id`` (FR-10.1).
+def dedup_key(run_id: str, step_id: str, profile: str | None = None) -> str:
+    """The stable per-row de-dup key (FR-10.1).
 
-    A ``::`` separator is unambiguous because neither a run id (``run-<ts>``) nor
-    a rendered step id (``<id>`` / ``<id>.<iteration>``) contains it.
+    ``run_id ‖ step_id`` for a single-agent step; ``run_id ‖ step_id ‖ profile``
+    for a compound step's per-role row. An adversarial_cycle emits one row per
+    role (reviewer/triager/fixer/…), so the role MUST be part of the row identity
+    — otherwise the roles collide on one key and all but the first are dropped as
+    duplicates. A ``::`` separator is unambiguous because neither a run id
+    (``run-<ts>``), a rendered step id (``<id>`` / ``<id>.<iteration>``), nor a
+    profile name contains it.
     """
-    return f"{run_id}::{step_id}"
+    base = f"{run_id}::{step_id}"
+    return f"{base}::{profile}" if profile else base
 
 
 def _render_step_id(rec: "StepRecord") -> str:
@@ -130,7 +136,7 @@ class LedgerRow(BaseModel):
 
     @property
     def key(self) -> str:
-        return dedup_key(self.run_id, self.step_id)
+        return dedup_key(self.run_id, self.step_id, self.profile)
 
     def value(self, unit: str) -> float | None:
         """The row's contribution in ``unit`` (FR-10.2): input+output tokens, or
@@ -163,6 +169,46 @@ def _duration_s(started: str | None, ended: str | None) -> float | None:
     return max(0.0, (b - a).total_seconds())
 
 
+def _has_spend(usage: Any) -> bool:
+    return bool(usage.input_tokens or usage.output_tokens or usage.cost_usd)
+
+
+def _build_row(
+    *,
+    rec: "StepRecord",
+    run_id: str,
+    repo_hash: str,
+    profile: str | None,
+    provider: str | None,
+    model: str | None,
+    usage: Any,
+    ts: str,
+) -> LedgerRow:
+    """Assemble one content-free ledger row for a (step, profile, usage) triple.
+
+    Shared by the single-agent path (:func:`row_from_step`) and the per-role
+    compound-step path (:func:`rows_from_step`), so a live-written row and a
+    backfilled row are byte-shaped identically for the same work.
+    """
+    return LedgerRow(
+        ts=ts,
+        provider=provider,
+        model=model,
+        profile=profile,
+        step_type=rec.type,
+        repo=repo_hash,
+        run_id=run_id,
+        step_id=_render_step_id(rec),
+        input_tokens=usage.input_tokens or 0,
+        output_tokens=usage.output_tokens or 0,
+        cached_input_tokens=usage.cached_input_tokens or 0,
+        cost_usd=usage.cost_usd,
+        started=rec.started,
+        ended=rec.ended,
+        duration_s=_duration_s(rec.started, rec.ended),
+    )
+
+
 def row_from_step(
     rec: "StepRecord",
     *,
@@ -171,38 +217,69 @@ def row_from_step(
     provider: str | None,
     model: str | None,
 ) -> LedgerRow | None:
-    """Build a ledger row from a manifest step, or ``None`` if it recorded no spend.
+    """One ledger row for a SINGLE-agent step, or ``None`` if it recorded no spend.
 
-    The SAME conversion feeds both the live per-step append and the backfill from
-    existing manifests, so a backfilled ledger is byte-shaped exactly like a
-    live-written one for the same step. A step with no agent, or with zero tokens
-    and no cost, contributes nothing (a human_gate, a skipped step) and is
-    skipped — it would only add noise the estimator has to ignore anyway.
+    A step with no agent, or with zero tokens and no cost, contributes nothing (a
+    human_gate, a skipped step) — it would only add noise the estimator ignores.
+    Compound steps (adversarial_cycle) go through :func:`rows_from_step`, which
+    splits per role; this remains the single-agent primitive it composes.
     """
-    u = rec.usage
-    has_spend = bool(u.input_tokens or u.output_tokens or u.cost_usd)
-    if rec.agent is None or not has_spend:
+    if rec.agent is None or not _has_spend(rec.usage):
         return None
     ts = rec.ended or rec.started
     if ts is None:
         return None
-    return LedgerRow(
-        ts=ts,
-        provider=provider,
-        model=model,
-        profile=rec.agent,
-        step_type=rec.type,
-        repo=repo_hash,
-        run_id=run_id,
-        step_id=_render_step_id(rec),
-        input_tokens=u.input_tokens or 0,
-        output_tokens=u.output_tokens or 0,
-        cached_input_tokens=u.cached_input_tokens or 0,
-        cost_usd=u.cost_usd,
-        started=rec.started,
-        ended=rec.ended,
-        duration_s=_duration_s(rec.started, rec.ended),
+    return _build_row(
+        rec=rec, run_id=run_id, repo_hash=repo_hash, profile=rec.agent,
+        provider=provider, model=model, usage=rec.usage, ts=ts,
     )
+
+
+def rows_from_step(
+    rec: "StepRecord",
+    *,
+    run_id: str,
+    repo_hash: str,
+    config: "RunConfig",
+) -> list[LedgerRow]:
+    """Every content-free ledger row a manifest step yields (FR-10.1).
+
+    A compound step (adversarial_cycle) carries a per-role usage split in
+    ``rec.agent_usage``: each role becomes its OWN row attributed to that role's
+    provider, so a cycle whose reviewer and fixer bill different providers is
+    charged to each provider's window correctly (the aggregate ``rec.usage``, with
+    no single profile, could not be — and was previously dropped entirely,
+    hiding the bulk of a run's spend from the ledger). A single-agent step
+    (agent_task) yields one row from ``rec.agent`` + ``rec.usage``. A step with no
+    spend yields nothing.
+
+    Feeds BOTH the live per-step append and the backfill from existing manifests,
+    so a backfilled ledger is shaped exactly like a live-written one. Provider and
+    model are resolved from the CURRENT config; a profile absent from it resolves
+    to ``None`` (recorded honestly, matching no window).
+    """
+    if rec.agent_usage:
+        ts = rec.ended or rec.started
+        if ts is None:
+            return []
+        rows: list[LedgerRow] = []
+        for profile, usage in rec.agent_usage.items():
+            if not _has_spend(usage):
+                continue
+            rows.append(
+                _build_row(
+                    rec=rec, run_id=run_id, repo_hash=repo_hash, profile=profile,
+                    provider=profile_provider(config, profile),
+                    model=profile_model(config, profile), usage=usage, ts=ts,
+                )
+            )
+        return rows
+    row = row_from_step(
+        rec, run_id=run_id, repo_hash=repo_hash,
+        provider=profile_provider(config, rec.agent),
+        model=profile_model(config, rec.agent),
+    )
+    return [row] if row is not None else []
 
 
 def load_rows(path: Path | None = None) -> list[LedgerRow]:
@@ -487,14 +564,11 @@ def rows_from_manifest(
     """
     out: list[LedgerRow] = []
     for rec in man.steps:
-        provider = profile_provider(config, rec.agent)
-        model = profile_model(config, rec.agent)
-        row = row_from_step(
-            rec, run_id=man.run_id, repo_hash=repo_hash,
-            provider=provider, model=model,
+        out.extend(
+            rows_from_step(
+                rec, run_id=man.run_id, repo_hash=repo_hash, config=config,
+            )
         )
-        if row is not None:
-            out.append(row)
     return out
 
 
