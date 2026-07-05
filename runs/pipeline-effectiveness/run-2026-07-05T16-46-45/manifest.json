@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "prd-approve",
+  "current_step": "plan-cycle",
   "warnings": [],
   "steps": [
     {
@@ -165,6 +165,223 @@
       "metrics": {},
       "checkpoints": [],
       "resumed_from_checkpoint": null
+    },
+    {
+      "id": "plan-author",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "1d1713ce-ce60-4ad1-b940-0bfb081a0d80",
+      "started": "2026-07-05T18:57:49.883397+00:00",
+      "ended": "2026-07-05T19:01:57.168598+00:00",
+      "attempts": 0,
+      "base_sha": "5ea2d36696927193f9d4de70656c305fda89a349",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 3228,
+        "output_tokens": 19232,
+        "cached_input_tokens": 16641,
+        "cost_usd": 0.7923465
+      },
+      "agent_usage": {
+        "builder": {
+          "input_tokens": 3228,
+          "output_tokens": 19232,
+          "cached_input_tokens": 16641,
+          "cost_usd": 0.7923465
+        }
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": null,
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "plan-cycle",
+      "type": "adversarial_cycle",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-05T19:01:57.171197+00:00",
+      "ended": "2026-07-05T21:28:31.950674+00:00",
+      "attempts": 0,
+      "base_sha": "74a2861b68f04dc5d83c4a90dab983e4c4105945",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [
+        {
+          "response_id": "plan-cycle-resp-1",
+          "response_text": "Six additions, no restructuring: (1) §9's v1 proposal-mode enforcement is unplaced — add to P6 the retro 'shrink the panel' proposal (ensemble yield <25% for two runs) and the 'revert verifier to opt-in' proposal (behavioral-signal miss), add metrics.verifier.legit_findings emission to P5, and rename P6's metric to §9's metrics.registry.rematched. (2) P2's acceptance_gate runs pytest --collect-only, which imports conftest/test modules — engine-executed branch code outside judge hooks and before P5's sandbox exists; make an explicit decision (run enumeration under the P5 backend once it lands; document or mitigate the P2-P4 interim exposure). (3) Define panel-member failure semantics in P1: a member error/usage-limit parks the cycle fail-closed, completed members' findings persist for resume, and window admission scales its estimate by panel size. (4) Pin P6 version provenance: prompt/lens/schema version = content hash (PRD example triage@4d3722e), 'in force' = matches the file in the current tree; name where the ratified version registry lives. (5) Add the Q2-mandated gauntlet doctor probe of the Gemini model id to P1 with a test. (6) Add a P9 fixture asserting the PRD §8 FR-6/FR-4 interaction: a final round holding a carried remainder fails the clean predicate and auto_when_clean parks.",
+          "timestamp": "2026-07-05T20:40:27.411660+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "consumed"
+        },
+        {
+          "response_id": "plan-cycle-resp-2",
+          "response_text": "Two items from the previous rejection were NOT applied — triage wrongly declined the matching reviewer findings (F-003, F-006) as 'already committed by the operator'. Nothing was committed; the items are absent from plan.md (verify: no panel-member failure semantics text exists in P1, and P9 has no auto-approval fixture). Treat both as unfulfilled obligations and add them now: (a) P1 must define panel-member failure semantics — a member error or usage-limit park fails the cycle closed (parks, never proceeds with a silently reduced panel), completed members' persisted findings artifacts are reused on resume rather than re-paid, and the pre-step window-admission estimate scales by panel size; with tests. (b) P9 must add the PRD §8 FR-6/FR-4 interaction fixture: a cycle whose final round holds a carried remainder fails the auto_when_clean clean predicate and the gate parks; with a matching P9 acceptance clause.",
+          "timestamp": "2026-07-05T21:18:38.641398+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 2,
+          "state": "consumed"
+        }
+      ],
+      "usage": {
+        "input_tokens": 219384,
+        "output_tokens": 78660,
+        "cached_input_tokens": 6880746,
+        "cost_usd": 10.3060023
+      },
+      "agent_usage": {
+        "reviewer": {
+          "input_tokens": 161731,
+          "output_tokens": 6251,
+          "cached_input_tokens": 14592,
+          "cost_usd": null
+        },
+        "triage": {
+          "input_tokens": 40727,
+          "output_tokens": 8452,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.02682655
+        },
+        "escalation": {
+          "input_tokens": 6581,
+          "output_tokens": 1477,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.021124250000000004
+        },
+        "builder": {
+          "input_tokens": 10345,
+          "output_tokens": 62480,
+          "cached_input_tokens": 6866154,
+          "cost_usd": 10.258051499999999
+        }
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate\nresume: reset round-1 worktree to the handoff (backed up at refs/gauntlet/backup/run-2026-07-05T16-46-45/plan-cycle-r1-fix-resume) before re-running the fix sub-step (FR-4.1)",
+      "iteration": null,
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 2,
+        "accepted_total": 2,
+        "accepted_resolved_total": 2,
+        "verdict_counts": {
+          "legitimate": 2
+        },
+        "confirm_counts": {
+          "resolved": 2
+        }
+      },
+      "checkpoints": [
+        {
+          "sub_step": "review",
+          "round": 1,
+          "handoff_sha": "1519cb43dee67f75401e244b41c3c9458c730613",
+          "artifact": "artifacts/r1/findings.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "triage",
+          "round": 1,
+          "handoff_sha": "1519cb43dee67f75401e244b41c3c9458c730613",
+          "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "fix",
+          "round": 1,
+          "handoff_sha": "1519cb43dee67f75401e244b41c3c9458c730613",
+          "artifact": null,
+          "result_sha": "2c19a59a56b4488787ded18824f726816a3ebdba"
+        },
+        {
+          "sub_step": "confirm",
+          "round": 1,
+          "handoff_sha": "1519cb43dee67f75401e244b41c3c9458c730613",
+          "artifact": "artifacts/r1/confirm.json",
+          "result_sha": null
+        }
+      ],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "plan-lint",
+      "type": "phase_lint",
+      "status": "pending",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-05T19:11:54.621728+00:00",
+      "ended": null,
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "agent_usage": {},
+      "notes": "phase lint: 9 phase(s) valid (P1, P2, P3, P4, P5, P6, P7, P8, P9)",
+      "iteration": null,
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "plan-approve",
+      "type": "human_gate",
+      "status": "pending",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-05T19:11:54.636035+00:00",
+      "ended": null,
+      "attempts": 0,
+      "base_sha": null,
+      "parked_reason": "gate",
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "agent_usage": {},
+      "notes": "awaiting human decision; review: plan.md, findings.json, triage.json, confirm.json",
+      "iteration": null,
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     }
   ],
   "suspensions": [],
@@ -173,44 +390,54 @@
       "step_id": "prd-cycle",
       "phase": "PRD.1",
       "sha": "10ddfd19b4ad5ff81256bba117aabf604d285581"
+    },
+    {
+      "step_id": "plan-author",
+      "phase": "PLAN",
+      "sha": "74a2861b68f04dc5d83c4a90dab983e4c4105945"
+    },
+    {
+      "step_id": "plan-cycle",
+      "phase": "PLAN.1",
+      "sha": "2c19a59a56b4488787ded18824f726816a3ebdba"
     }
   ],
   "totals": {
-    "input_tokens": 186835,
-    "output_tokens": 68670,
-    "cached_input_tokens": 4314044,
-    "cost_usd": 5.617620099999998
+    "input_tokens": 449965,
+    "output_tokens": 173060,
+    "cached_input_tokens": 11211431,
+    "cost_usd": 16.739094399999995
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 108919,
-      "output_tokens": 5654,
-      "cached_input_tokens": 9728,
+      "input_tokens": 270650,
+      "output_tokens": 11905,
+      "cached_input_tokens": 24320,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 32822,
-      "output_tokens": 7223,
+      "input_tokens": 73549,
+      "output_tokens": 15675,
       "cached_input_tokens": 0,
-      "cost_usd": 0.021701099999999997
+      "cost_usd": 0.04852765
     },
     "escalation": {
-      "input_tokens": 6022,
-      "output_tokens": 2631,
+      "input_tokens": 12603,
+      "output_tokens": 4108,
       "cached_input_tokens": 0,
-      "cost_usd": 0.0325415
+      "cost_usd": 0.053665750000000005
     },
     "builder": {
-      "input_tokens": 9050,
-      "output_tokens": 47804,
-      "cached_input_tokens": 4304316,
-      "cost_usd": 5.545155999999999
+      "input_tokens": 22623,
+      "output_tokens": 129516,
+      "cached_input_tokens": 11187111,
+      "cost_usd": 16.595554
     },
     "judge_llm": {
-      "input_tokens": 30022,
-      "output_tokens": 5358,
+      "input_tokens": 70540,
+      "output_tokens": 11856,
       "cached_input_tokens": 0,
-      "cost_usd": 0.018221500000000005
+      "cost_usd": 0.041346999999999995
     }
   },
   "recoveries": [],
