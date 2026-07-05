@@ -86,3 +86,16 @@ so a partial fix accepted at a gate is tracked, not forgotten.
   prd-authoring-aids run was the first real consumer of that mechanism. No
   follow-up remains; entry kept as the provenance trail for why the feature
   exists.
+
+**From the harness-efficiency run (0.5.0) — recorded 2026-07-05:**
+
+**Self-hosting driver staleness** — when a run's phases modify
+`src/gauntlet/` (the engine's own source), the long-lived driver keeps its
+stale imported module graph and fails on the next lazy import or behavior
+seam (~once per driver lifetime; see BOOTSTRAP-NOTES 2026-07-02..03). 0.5.0
+made every *consequence* recoverable (usage parks, respondable commit steps,
+checkpoints) but the hazard itself needs one of: phase-boundary driver
+restarts when target repo == engine repo; running the driver from an
+installed snapshot; or a source-tree-hash park as a detection floor.
+Candidate for a small PRD or a `pipeline-effectiveness` follow-up — an engine
+lifecycle change, so it wants adversarial review, not a quick patch.
