@@ -2,7 +2,7 @@
 
 - branch: `gauntlet/harness-efficiency` (base `chore/fable-review`)
 - pipeline: `standard` v1 (`sha256:9faabc476ba4…`)
-- status: **running** (at `phase-commit`)
+- status: **failed** (at `phase-commit`)
 - totals: 16425719in/2244061out $341.9594
 
 | step | type | status | duration | usage | notes |
