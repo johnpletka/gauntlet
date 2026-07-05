@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"type": "thread.started", "thread_id": "th_ghi789"},
+    {"type": "turn.failed", "error": {"type": "overloaded_error", "message": "upstream busy"}}
+  ]
+}

@@ -23,7 +23,12 @@ from gauntlet.adapters.base import (
     AgentResult,
     AgentTimeoutError,
     MalformedOutputError,
+    SessionNotFoundError,
     Usage,
+)
+from gauntlet.adapters.failure_markers import (
+    classify_codex_failure,
+    looks_like_session_not_found,
 )
 from gauntlet.adapters.process import ProcessOutput, run_with_timeout
 from gauntlet.config import lint_flags
@@ -48,7 +53,8 @@ class CodexAdapter:
     # (deferred) would otherwise be needed to catch.
     supports_line_streaming = False
     capabilities = AdapterCapabilities(
-        repo_write=True, structured_output="native", resume=True
+        repo_write=True, structured_output="native", resume=True,
+        reads_repo=True,  # FR-1.3: `codex exec` runs in the repo and can read files
     )
 
     def __init__(
@@ -118,7 +124,9 @@ class CodexAdapter:
                 f"codex killed after {self.timeout_s}s timeout",
                 partial=self._partial_result(out),
             )
-        return self._parse(out, schema=schema, last_message=last_message)
+        return self._parse(
+            out, schema=schema, last_message=last_message, session=session
+        )
 
     # -- command construction -------------------------------------------------
 
@@ -155,15 +163,39 @@ class CodexAdapter:
     # -- output parsing --------------------------------------------------------
 
     def _parse(
-        self, out: ProcessOutput, *, schema: dict | None, last_message: str | None
+        self,
+        out: ProcessOutput,
+        *,
+        schema: dict | None,
+        last_message: str | None,
+        session: str | None = None,
     ) -> AgentResult:
         events = self._decode_events(out.stdout, strict=True, out=out)
         # Fail closed on reported failure, even when output parses (F-001).
         failure = self._failure_marker(out, events)
         if failure:
+            # FR-3.1 classification + FR-3.3 session-not-found fallback, mirroring
+            # the claude adapter: a transient usage-limit/overload parks-and-
+            # resumes; a resume against a session codex no longer knows falls back
+            # to a full re-run (only when a session was requested and the failure
+            # is not itself transient).
+            failure_info = classify_codex_failure(events, out.exit_code)
+            failed_event = next(
+                (e for e in events if e.get("type") in ("turn.failed", "error")), None
+            )
+            err = (failed_event or {}).get("error")
+            err_msg = err.get("message") if isinstance(err, dict) else (
+                err if isinstance(err, str) else (failed_event or {}).get("message")
+            )
+            if not failure_info.is_transient and session and looks_like_session_not_found(err_msg):
+                raise SessionNotFoundError(
+                    f"codex could not resume session {session}: {failure}",
+                    partial=self._partial_result(out),
+                )
             raise AgentFailedError(
                 f"codex reported failure: {failure}; stderr: {out.stderr[:500]}",
                 partial=self._partial_result(out),
+                failure_info=failure_info,
             )
         text = last_message if last_message is not None else self._last_agent_message(events)
         if text is None:
@@ -205,7 +237,7 @@ class CodexAdapter:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 # Fail closed (F-002): with --json, codex logs go to stderr,
                 # so a non-JSON stdout line means the event contract broke.
@@ -218,6 +250,22 @@ class CodexAdapter:
                         else None,
                     ) from exc
                 events.append({"type": "gauntlet.unparsed_line", "line": line})
+                continue
+            if not isinstance(obj, dict):
+                # Valid JSON but not an event object (a bare string/number/null
+                # line): the event contract is just as broken as non-JSON, and
+                # downstream consumers (.get() everywhere) require dicts.
+                if strict:
+                    raise MalformedOutputError(
+                        f"non-object JSON line in codex --json output: "
+                        f"{line[:200]!r}",
+                        partial=self._partial_result(out)
+                        if out is not None
+                        else None,
+                    )
+                events.append({"type": "gauntlet.unparsed_line", "line": line})
+                continue
+            events.append(obj)
         return events
 
     @staticmethod

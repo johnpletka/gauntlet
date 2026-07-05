@@ -43,6 +43,59 @@ class AdapterCapabilities(BaseModel):
     repo_write: bool
     structured_output: Literal["native", "best_effort", "none"]
     resume: bool
+    # harness-efficiency FR-1.3: can this adapter READ the repo working tree?
+    # Reference/`phase` context modes (FR-1.1) inject a repo-relative *path* the
+    # agent must open itself, so they are valid only on a repo-reading profile.
+    # Fail closed: default False, so an adapter that has not declared the
+    # capability can never be handed an unreadable-path prompt. The CLI agents
+    # (claude-code, codex) set it True; the in-process `api` adapter leaves it
+    # False (it has no repo access). This is the adapter-class declaration; a
+    # profile's *effective* capability is this value under that profile's actual
+    # sandbox, verified by `gauntlet doctor`'s read probe (FR-6.4, P7).
+    reads_repo: bool = False
+
+
+# --- failure classification (harness-efficiency FR-3.1) ----------------------
+# Every nonzero-exit / reported-failure outcome is classified into one of these
+# kinds. The two ``transient_*`` kinds are recoverable interruptions the engine
+# PARKS on (worktree + session preserved) and continues by resuming the CLI
+# session; ``terminal`` halts the run for a human. Fail closed: anything that
+# does not match the pinned per-adapter marker allowlist (§6) is ``terminal`` —
+# the harness never auto-continues past an unrecognized error.
+FAILURE_TRANSIENT_USAGE_LIMIT = "transient_usage_limit"
+FAILURE_TRANSIENT_OVERLOAD = "transient_overload"
+FAILURE_TERMINAL = "terminal"
+
+# The transient kinds, as a set, for the "is this a park-and-resume condition?"
+# test the orchestrator and cycle make.
+TRANSIENT_FAILURE_KINDS = frozenset(
+    {FAILURE_TRANSIENT_USAGE_LIMIT, FAILURE_TRANSIENT_OVERLOAD}
+)
+
+
+class FailureInfo(BaseModel):
+    """Adapter → engine classification of one failed invocation (FR-3.1, §6).
+
+    Built by the adapter's ``classify_failure`` from the pinned marker allowlist
+    and carried on :class:`AgentFailedError`. ``kind`` is one of the three
+    ``FAILURE_*`` values above; ``retry_after_s`` is populated ONLY from a
+    structured field on the error envelope (a typed ``retry_after`` / a
+    ``Retry-After`` header), never scraped from prose (§7), and is ``None`` when
+    absent. ``marker`` names the matched allowlist entry (or ``"unmatched"``) for
+    the audit trail; ``raw_excerpt`` is ≤500 chars of the structured error field
+    that drove the decision.
+    """
+
+    kind: Literal[
+        "transient_usage_limit", "transient_overload", "terminal"
+    ] = FAILURE_TERMINAL
+    retry_after_s: int | None = None
+    marker: str = "unmatched"
+    raw_excerpt: str = ""
+
+    @property
+    def is_transient(self) -> bool:
+        return self.kind in TRANSIENT_FAILURE_KINDS
 
 
 @runtime_checkable
@@ -94,11 +147,37 @@ class AgentTimeoutError(AdapterError):
 class AgentFailedError(AdapterError):
     """The CLI ran and produced parseable output, but reported failure
     (nonzero exit, is_error, turn.failed). Fail closed: a failed call never
-    surfaces as a normal AgentResult (review P1 F-001)."""
+    surfaces as a normal AgentResult (review P1 F-001).
+
+    ``failure_info`` (harness-efficiency FR-3.1) is the adapter's classification
+    of the failure. A ``transient_*`` kind tells the engine to PARK-and-resume
+    (worktree + session preserved) instead of failing the step; a ``terminal``
+    kind (the fail-closed default) halts for a human. ``None`` when an older
+    adapter raised the error without classifying — the engine treats an absent
+    ``failure_info`` as terminal, so the fail-closed property holds either way.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial: AgentResult | None = None,
+        failure_info: "FailureInfo | None" = None,
+    ) -> None:
+        super().__init__(message, partial=partial)
+        self.failure_info = failure_info
 
 
 class MalformedOutputError(AdapterError):
     """Adapter output could not be parsed (or failed schema validation)."""
+
+
+class SessionNotFoundError(AdapterError):
+    """A ``--resume``/``resume`` invocation named a session the CLI no longer
+    knows (unknown/expired). Distinct from a normal failure so a usage-limit
+    continuation resume (FR-3.3) can fall back to a full re-run with no session
+    instead of surfacing an error — resuming a dead session is recoverable, not
+    a run-halting fault."""
 
 
 class UnsupportedFeatureError(AdapterError):

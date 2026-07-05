@@ -3,9 +3,23 @@
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "usage_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"],
+      "description": "Aggregated provider usage (harness-efficiency FR-7.1). cost_usd is null on the degraded tokens-only path (a subscription-auth CLI may not report cost); the token counts are always integers.",
+      "properties": {
+        "input_tokens": {"type": "integer", "description": "Fresh (uncached) input tokens."},
+        "output_tokens": {"type": "integer", "description": "Output tokens."},
+        "cached_input_tokens": {"type": "integer", "description": "Cache-read input tokens."},
+        "cost_usd": {"type": ["number", "null"], "description": "Cost in USD, or null when unpriced."}
+      }
+    }
+  },
   "required": [
     "schema_version",
     "slug",
@@ -13,11 +27,20 @@
     "run_status",
     "state",
     "current_step",
+    "current_step_elapsed_s",
+    "current_step_timeout_remaining_s",
+    "run_elapsed_s",
+    "totals",
+    "agent_usage",
+    "warnings",
+    "quota",
     "driver",
     "parked",
     "failure",
     "reconciliation",
     "current_step_freshness",
+    "suspension",
+    "gate",
     "steps",
     "next_actions"
   ],
@@ -48,6 +71,9 @@
         "indeterminate",
         "parked_gate",
         "parked_for_response",
+        "parked_usage_limit",
+        "parked_usage_window",
+        "parked_artifact_invalid",
         "failed",
         "halted",
         "interrupted",
@@ -60,6 +86,44 @@
     "current_step": {
       "type": ["string", "null"],
       "description": "Rendered id of the active/most-recent non-terminal step, or null. When non-null it MUST equal the rendered id of exactly one steps[] entry (`<id>` or `<id>.<iteration>`). Derived convenience; steps[] is authoritative."
+    },
+    "current_step_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds the current step has been running (harness-efficiency FR-7.1): now - started for a running step, or ended - started for a finished one. null when there is no current step or its timestamps are absent/unparseable."
+    },
+    "current_step_timeout_remaining_s": {
+      "type": ["number", "null"],
+      "description": "Best-effort seconds remaining before the current running step's deadline (harness-efficiency FR-7.1), computed as the resolved effective timeout minus elapsed and clamped to 0 (never negative). null when there is no running step or no resolvable timeout. Advisory — suspend credit (FR-5.2) is not folded in here."
+    },
+    "run_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds from the first step start to now (a live run) or to the last step end (a finished run) (harness-efficiency FR-7.1). null when no step has started."
+    },
+    "totals": {
+      "$ref": "#/$defs/usage_totals",
+      "description": "Run-level aggregated provider usage incl. cost (harness-efficiency FR-7.1). Always present."
+    },
+    "agent_usage": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/usage_totals"},
+      "description": "Per-agent-profile usage totals keyed by profile name (harness-efficiency FR-7.1). Always present; an empty object when no per-profile usage was recorded."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Non-fatal run anomalies surfaced rather than swallowed (harness-efficiency FR-10.3): each an already-redacted human-readable string. Includes advisory usage-window shortfalls (`[<step>] usage-window admission (FR-10.3): …`, the warn-don't-park default) so a live shortfall is visible without opening the manifest, plus any other recorded warning (e.g. an unrenderable final-gate artifact). Always present; an empty array when none."
+    },
+    "quota": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["reset_at"],
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
+      "properties": {
+        "reset_at": {
+          "type": ["string", "null"],
+          "description": "Absolute UTC reset time (ISO-8601): a usage_limit park's provider reset (null when no structured retry hint), or a usage_window park's projected window-replenishment time."
+        }
+      }
     },
     "driver": {
       "type": "object",
@@ -91,7 +155,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -103,9 +167,9 @@
           "description": "The parked step's type."
         },
         "reason": {
-          "type": ["string", "null"],
-          "enum": ["upstream_conflict", "cycle_escalation", null],
-          "description": "Park reason; null for a plain human_gate."
+          "type": "string",
+          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate"],
+          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
         }
       }
     },
@@ -163,13 +227,118 @@
         }
       }
     },
+    "suspension": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
+      "properties": {
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["host_suspended", "driver_orphaned", "agent_silent", null],
+          "description": "The stalled-run classification: host_suspended (a detected sleep gap on a live driver), driver_orphaned (heartbeat stale, driver process dead), agent_silent (live driver, no agent output / a live-but-stale heartbeat with no clock evidence — fail closed to hung, never sleep), or null (healthy / not applicable)."
+        },
+        "last_heartbeat_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "intervals": {
+          "type": "array",
+          "description": "Detected host-suspension intervals (manifest.suspensions), in detection order.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "gap_s"],
+            "properties": {
+              "start": {"type": "string", "description": "Wallclock of the heartbeat before the gap."},
+              "end": {"type": "string", "description": "Wallclock of the heartbeat after the gap."},
+              "gap_s": {"type": "integer", "description": "Wallclock width of the suspension in seconds."}
+            }
+          }
+        }
+      }
+    },
+    "gate": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["cycle_step_id", "convergence", "prior_responses", "escalated"],
+      "description": "Gate context block (PRD §6 / harness-efficiency FR-8.1): always present, non-null only when parked at a human gate. Assembled from the manifest + the upstream adversarial_cycle's persisted artifacts (no transcript read): the cycle's convergence summary, prior human `--response`/rejection decisions for this gate, and the per-escalated-finding triage reasoning. Content-bearing fields pass through the redaction path (PRD §7). null for every non-gate state.",
+      "properties": {
+        "cycle_step_id": {
+          "type": ["string", "null"],
+          "description": "Id of the adversarial_cycle this gate ratifies (the last cycle before the gate), or null when the gate has no upstream cycle."
+        },
+        "convergence": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["rounds", "findings_total", "accepted_total", "per_round"],
+          "description": "Cycle convergence summary from the upstream cycle's `metrics` (aggregate) plus its per-round sub-step checkpoints (FR-4). null when there is no upstream cycle. rounds/findings_total/accepted_total are null when the cycle recorded no metrics.",
+          "properties": {
+            "rounds": {"type": ["integer", "null"], "description": "Rounds the cycle ran."},
+            "findings_total": {"type": ["integer", "null"], "description": "Findings raised across all rounds."},
+            "accepted_total": {"type": ["integer", "null"], "description": "Findings triaged fix_now across all rounds."},
+            "per_round": {
+              "type": "array",
+              "description": "Per-round breakdown from the checkpointed round artifacts, in ascending round order. A count is null when the round's artifact is absent/unreadable.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["round", "raised", "fixed", "declined"],
+                "properties": {
+                  "round": {"type": "integer", "description": "1-based round number."},
+                  "raised": {"type": ["integer", "null"], "description": "Findings raised this round (from the round's findings.json)."},
+                  "fixed": {"type": ["integer", "null"], "description": "Findings triaged action=fix_now this round."},
+                  "declined": {"type": ["integer", "null"], "description": "Findings triaged action in {defer, reject} this round."}
+                }
+              }
+            }
+          }
+        },
+        "prior_responses": {
+          "type": "array",
+          "description": "Prior human `--response`/rejection decisions bearing on this gate (from the upstream cycle's and the gate's human_responses), in record order, with timestamps. response_text is redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["response_id", "response_text", "timestamp", "user", "state"],
+            "properties": {
+              "response_id": {"type": "string", "description": "Stable response handle (`<step>-resp-<n>`)."},
+              "response_text": {"type": "string", "description": "The decision text, redacted."},
+              "timestamp": {"type": "string", "description": "When the decision was recorded."},
+              "user": {"type": "string", "description": "Who recorded it."},
+              "state": {"type": "string", "enum": ["pending", "consumed"], "description": "Idempotent-recovery state."}
+            }
+          }
+        },
+        "escalated": {
+          "type": "array",
+          "description": "Per-escalated-finding triage reasoning: latest-round verdicts flagged `escalated` or `low_confidence`, merged with their finding. Empty when no verdict was flagged. Content fields (claim/reasoning) redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["finding_id", "severity", "category", "location", "claim", "verdict", "action", "confidence", "reasoning"],
+            "properties": {
+              "finding_id": {"type": "string"},
+              "severity": {"type": ["string", "null"]},
+              "category": {"type": ["string", "null"]},
+              "location": {"type": ["string", "null"]},
+              "claim": {"type": ["string", "null"]},
+              "verdict": {"type": ["string", "null"]},
+              "action": {"type": ["string", "null"]},
+              "confidence": {"type": ["string", "null"]},
+              "reasoning": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
     "steps": {
       "type": "array",
       "description": "Authoritative ordered step list.",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -189,6 +358,24 @@
               "skipped"
             ],
             "description": "Step status."
+          },
+          "duration_s": {
+            "type": ["number", "null"],
+            "description": "Wall-clock seconds the step ran (harness-efficiency FR-7.1): ended - started, or now - started while running. null when the step has no start timestamp or its timestamps are unparseable."
+          },
+          "notes": {
+            "type": ["string", "null"],
+            "description": "The step's engine/human notes verbatim (harness-efficiency FR-7.1), or null when none. Content-bearing; already redacted on write."
+          },
+          "halt_reason": {
+            "type": ["string", "null"],
+            "enum": ["timeout", "budget", "judge_deny", "signal_kill", "adapter_error", "precondition", "operator_recover", null],
+            "description": "Terminal halt reason (harness-efficiency FR-7.2) on a HALTED/FAILED/INTERRUPTED step; null otherwise. DISJOINT from parked_reason — never both set. null on steps predating P3."
+          },
+          "parked_reason": {
+            "type": ["string", "null"],
+            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", null],
+            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim."
           }
         }
       }
@@ -205,7 +392,8 @@
           "argv",
           "required_inputs",
           "executable",
-          "command"
+          "command",
+          "consequence"
         ],
         "properties": {
           "label": {"type": "string", "description": "Short action label."},
@@ -232,6 +420,10 @@
           "command": {
             "type": "string",
             "description": "Rendered string for HUMAN DISPLAY ONLY, never for execution (may contain placeholder text)."
+          },
+          "consequence": {
+            "type": ["string", "null"],
+            "description": "One-line description of what this action does when taken (harness-efficiency FR-8.2): e.g. a gate approve says what proceeds, a gate reject names the adversarial_cycle it re-runs with the notes injected. null for actions with no distinct consequence to spell out."
           }
         }
       }
@@ -242,7 +434,7 @@
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

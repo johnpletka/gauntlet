@@ -16,14 +16,15 @@ and per-step budget halts (FR-3.3).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from gauntlet.adapters.base import AgentTimeoutError
-from gauntlet.engine import gitops, manifest as M
-from gauntlet.engine.config import RunConfig
+from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
+from gauntlet.engine import gitops, ledger as L, manifest as M
+from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
     FAILED,
@@ -39,7 +40,12 @@ from gauntlet.engine.execution import (
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.planphases import PlanPhasesError
-from gauntlet.engine.pipeline import Pipeline, Stage, Step
+from gauntlet.engine.pipeline import (
+    Pipeline,
+    Stage,
+    Step,
+    upstream_cycle_for_gate,
+)
 from gauntlet.logging.redact import RedactingWriter
 from gauntlet.logging.transcript import write_run_index
 
@@ -54,6 +60,11 @@ def _utcnow() -> str:
 # engine identity so bookkeeping commits are attributable to the engine, never
 # mislabelled as a human's work.
 ENGINE_IDENTITY = gitops.Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
+
+# A numeric phase prefix (P1, P2…). Only these carry intra-phase `P<N> wip:`
+# checkpoints, so checkpoint discovery/recovery scopes to a matching prefix and
+# stays unscoped for non-numeric stage labels (PRD/PLAN/REVIEW).
+_NUMERIC_PHASE_RE = re.compile(r"P\d+")
 
 
 @dataclass
@@ -128,6 +139,7 @@ class Orchestrator:
         extra_context: dict[str, Any] | None = None,
         clock: Callable[[], str] = _utcnow,
         response_action: "ResponseAction | None" = None,
+        ledger_path: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.run_dir = run_dir
@@ -141,6 +153,10 @@ class Orchestrator:
         self.extra_context = extra_context or {}
         self.clock = clock
         self.response_action = response_action
+        # Machine-global usage ledger (FR-10.1): resolved once (honors
+        # GAUNTLET_LEDGER_PATH) so the append/admission paths agree on one file.
+        self.ledger_path = ledger_path or L.default_ledger_path()
+        self._repo_hash = L.repo_root_hash(repo_root)
         self.manifest_path = run_dir / "manifest.json"
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
@@ -244,6 +260,9 @@ class Orchestrator:
             rec.status = M.FAILED
             rec.ended = self.clock()
             rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
+            # FR-7.2: a terminal reject has no re-runnable path (no upstream cycle
+            # to iterate) — the precondition to proceed past the gate is unmet.
+            rec.halt_reason = M.HALT_REASON_PRECONDITION
             why = (
                 "no upstream adversarial_cycle to iterate"
                 if cycle_step is None
@@ -265,23 +284,13 @@ class Orchestrator:
     def _upstream_cycle_for_gate(self, gate_id: str):
         """The ``adversarial_cycle`` step a gate ratifies, and its stage.
 
-        The cycle is the last ``adversarial_cycle`` before ``gate_id`` in the same
-        (non-``foreach``) stage — ``prd-cycle`` for ``prd-approve``, ``plan-cycle``
-        for ``plan-approve`` in ``standard.yaml``. Returns ``(None, None)`` when
-        there is none to iterate (so reject falls back to a terminal reject).
+        Delegates to the shared
+        :func:`~gauntlet.engine.pipeline.upstream_cycle_for_gate` so the cycle the
+        reject path re-drives is resolved by the *same* rule the status/web
+        surfaces name in the reject consequence and gate context (F-001) — one
+        definition, no drift.
         """
-        for stage in self.pipeline.stages:
-            ids = [s.id for s in stage.steps]
-            if gate_id not in ids:
-                continue
-            if stage.foreach is not None:
-                return None, None  # iteration re-arming is out of scope
-            gate_idx = ids.index(gate_id)
-            for step in reversed(stage.steps[:gate_idx]):
-                if step.type == "adversarial_cycle":
-                    return step, stage
-            return None, None
-        return None, None
+        return upstream_cycle_for_gate(self.pipeline, gate_id)
 
     # ---- stage / step walk ---------------------------------------------------
     def _run_stage(self, stage: Stage) -> str:
@@ -433,7 +442,7 @@ class Orchestrator:
             self.manifest.upsert(rec)
 
         if resuming:
-            short = self._resume_disposition(step, spec, rec)
+            short = self._resume_disposition(step, spec, rec, item)
             if short is not None:
                 self._finalize(rec, short)
                 return short
@@ -474,17 +483,40 @@ class Orchestrator:
 
         try:
             ctx = self._make_context(step, rec, iteration, item)
-            try:
-                result = spec.handler(step, ctx)
-            except AgentTimeoutError as exc:
-                result = StepResult(
-                    status=HALTED,
-                    usage=exc.partial.usage if exc.partial else None,
-                    session_id=exc.partial.session_id if exc.partial else None,
-                    notes=f"timeout halt (FR-3.3): {exc}",
-                )
-            except Exception as exc:  # fail closed: a handler fault halts the step
-                result = StepResult(status=FAILED, notes=f"handler error: {exc}")
+            # FR-10.3: window admission runs BEFORE the handler, so an enforce
+            # park lands at a clean boundary with zero work in flight (in
+            # contrast to FR-3's reactive mid-step usage_limit park). An advisory
+            # short-fall records a manifest warning and returns None (launch as
+            # usual); a `sufficient`/unconstrained step returns None too.
+            admission = self._window_admission(step, rec)
+            if admission is not None:
+                result = admission
+            else:
+                try:
+                    result = spec.handler(step, ctx)
+                except AgentTimeoutError as exc:
+                    result = StepResult(
+                        status=HALTED,
+                        halt_reason=M.HALT_REASON_TIMEOUT,
+                        usage=exc.partial.usage if exc.partial else None,
+                        session_id=exc.partial.session_id if exc.partial else None,
+                        notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
+                    )
+                except AgentFailedError as exc:
+                    # FR-3.2: a TRANSIENT failure (usage limit / overload) is not
+                    # a step failure — park (not FAILED) with
+                    # parked_reason=usage_limit, preserving the worktree (no reset
+                    # on this park kind) and the CLI session so a plain `gauntlet
+                    # resume` continues it (FR-3.3). A TERMINAL or unclassified
+                    # failure fails closed → FAILED (a human decides), exactly as
+                    # an unclassified handler fault would.
+                    result = self._agent_failure_result(exc)
+                except Exception as exc:  # fail closed: a handler fault halts it
+                    result = StepResult(
+                        status=FAILED,
+                        halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+                        notes=f"handler error: {exc}",
+                    )
 
             result = self._apply_budget_guard(step, rec, result)
             # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
@@ -518,7 +550,7 @@ class Orchestrator:
                 os.environ["GAUNTLET_STEP_ID"] = prior_step_id
 
     def _resume_disposition(
-        self, step: Step, spec, rec: StepRecord
+        self, step: Step, spec, rec: StepRecord, item: Any = None
     ) -> StepResult | None:
         """Decide how to re-enter a step that was interrupted (review F-003).
 
@@ -529,9 +561,33 @@ class Orchestrator:
         """
         if rec.base_sha is None or not spec.step_touches_worktree(step):
             return None
-        # agent_task killed mid-edit AND adversarial_cycle killed mid-round are
-        # both non-idempotent worktree writers: park (or reset) on a dirty base
-        # rather than re-running over partial fixer edits / unmanifested
+        # F-005: an artifact_invalid park interrupted mid-revalidation must
+        # re-enter the validator-only path, NOT the generic dirty-mid-edit
+        # recovery. A plain resume of such a park sets the record RUNNING and
+        # write-ahead-persists BEFORE `_revalidate_on_resume` runs; a crash in
+        # that gap leaves a RUNNING record that still carries
+        # `parked_reason=artifact_invalid`. The on-disk artifact is INTENTIONALLY
+        # dirty vs base_sha (the sanctioned hand-edit awaiting revalidation), so
+        # the dirty-base check below would wrongly park it INTERRUPTED / rewind
+        # the hand-edit. `handle_agent_task` re-runs only the validator against
+        # the current bytes (no adapter call), which is idempotent and safe to
+        # re-enter — proceed.
+        if rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID:
+            return None
+        # F-002: an adversarial_cycle that recorded sub-step checkpoints owns its
+        # OWN checkpoint-aware recovery (cycle.py `_Resume` + the SHA/worktree
+        # guards). A kill after the fix sub-step commits+checkpoints but before
+        # finalization leaves HEAD ahead of base_sha with the commit still absent
+        # from the manifest; the generic dirty-base recovery below would then park
+        # INTERRUPTED (or, under reset_to_base, rewind past — and orphan — that fix
+        # commit) instead of letting the cycle adopt its fix checkpoint. Defer to
+        # the handler: it reuses the completed prefix, re-records the fix commit,
+        # and resets a genuinely dirty mid-fixer-edit tree from the round handoff.
+        if step.type == "adversarial_cycle" and rec.checkpoints:
+            return None
+        # agent_task killed mid-edit AND a checkpoint-less adversarial_cycle killed
+        # mid-round are both non-idempotent worktree writers: park (or reset) on a
+        # dirty base rather than re-running over partial fixer edits / unmanifested
         # fix-round commits. shell and commit re-enter safely on their own.
         is_agent_write = (
             step.type == "agent_task" and spec.step_requires_repo_write(step)
@@ -555,31 +611,44 @@ class Orchestrator:
             # rewind, so the bookkeeping the rewind preserves carries the latest
             # response state (e.g. a still-`pending` entry the re-run consumes).
             self._persist()
-            # F-001: base_sha predates the engine bookkeeping commits stacked on
-            # top of it — notably the pending-response checkpoint (FR-2.2/FR-7.1).
-            # A plain `reset --hard base_sha` would delete the force-committed
-            # manifest from disk AND orphan that checkpoint, so a kill in the gap
-            # before it was re-persisted would lose the human response. Instead,
-            # rewind the implementation to base_sha in a single reset whose target
-            # commit still carries the manifest — the response is never, even for
-            # an instant, absent from both disk and reachable history. Label that
-            # commit with the canonical response-checkpoint subject so it stands in
-            # as the pending checkpoint itself (the post-rewind reconcile below is
-            # then a no-op rather than stacking a duplicate).
+            # FR-11.2: rewind to the latest intra-phase checkpoint commit that is
+            # a descendant of base_sha (a `P<N> wip:` milestone) rather than all
+            # the way to base_sha, so completed milestones survive the rewind and
+            # the worst-case repeated work is one milestone, not one phase. Falls
+            # back to base_sha (today's behavior) when the phase landed none. The
+            # subject is recorded so the re-run prompt can name the checkpoint it
+            # resumes from.
+            target, checkpoint_subject = self._checkpoint_rewind_target(
+                rec, self._expected_phase(step, item)
+            )
+            rec.resumed_from_checkpoint = checkpoint_subject
+            # F-001: the rewind target predates the engine bookkeeping commits
+            # stacked on top of it — notably the pending-response checkpoint
+            # (FR-2.2/FR-7.1). A plain `reset --hard target` would delete the
+            # force-committed manifest from disk AND orphan that checkpoint, so a
+            # kill in the gap before it was re-persisted would lose the human
+            # response. Instead, rewind the implementation to the target in a
+            # single reset whose target commit still carries the manifest — the
+            # response is never, even for an instant, absent from both disk and
+            # reachable history. Label that commit with the canonical
+            # response-checkpoint subject so it stands in as the pending
+            # checkpoint itself (the post-rewind reconcile below is then a no-op
+            # rather than stacking a duplicate).
             paths = self._bookkeeping_paths()
-            if paths and gitops.head_sha(self.repo_root) != rec.base_sha:
+            if paths and gitops.head_sha(self.repo_root) != target:
                 message = (
                     self._response_checkpoint_message()
-                    or f"gauntlet: rewind implementation to base for re-run ({rec.id})"
+                    or f"gauntlet: rewind implementation to {target[:10]} "
+                    f"for re-run ({rec.id})"
                 )
                 gitops.rewind_impl_preserving_bookkeeping(
-                    self.repo_root, rec.base_sha, paths, message,
+                    self.repo_root, target, paths, message,
                     identity=ENGINE_IDENTITY,
                 )
             else:
-                # No checkpoint sits above base_sha (HEAD == base_sha, or no
+                # Nothing to preserve above the target (HEAD == target, or no
                 # bookkeeping on disk): the plain rewind is already crash-safe.
-                gitops.reset_hard(self.repo_root, rec.base_sha)
+                gitops.reset_hard(self.repo_root, target)
             # `clean` is broader than the dirty check on purpose: it spares the
             # whole run root so the reset never wipes the run pointer, manifests,
             # the authored prd.md, or prior declared artifacts — the re-run
@@ -594,6 +663,9 @@ class Orchestrator:
             return None  # tree restored to base; checkpoints preserved; re-run cleanly
         return StepResult(
             status=INTERRUPTED,
+            # FR-7.2: a dirty worktree vs base means the prior attempt was killed
+            # mid-edit by a signal / crash — attribute the interruption to that.
+            halt_reason=M.HALT_REASON_SIGNAL_KILL,
             notes=(
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
@@ -606,8 +678,8 @@ class Orchestrator:
     ) -> StepResult:
         """Restore the clean-worktree invariant on a conflict park (review F-001).
 
-        A conflict park (``parked_reason == upstream_conflict``) returns control
-        to a human, so the worktree must be clean (CLAUDE.md §1). But the builder
+        A builder conflict park (an ``agent_task`` parked ``response``) returns
+        control to a human, so the worktree must be clean (CLAUDE.md §1). But the builder
         ran with repo-write access and may have written implementation edits
         before deciding to signal the conflict; those edits are uncommitted (the
         checkpoint commits stage ONLY bookkeeping, never the implementation
@@ -628,9 +700,15 @@ class Orchestrator:
         checkpoint (the rewind-past-checkpoint hazard ``_resume_disposition``
         guards against does not arise here).
         """
+        # A `response` park on an ``agent_task`` is the builder UPSTREAM CONFLICT;
+        # the SAME `response` value on an ``adversarial_cycle`` is a cycle
+        # escalation whose commits the cycle already manages — the step type
+        # disambiguates the two now that both collapse to ``response`` (FR-7.2).
+        # Restore clean ONLY for the builder-conflict case.
         if (
             result.status != PARKED
-            or result.parked_reason != M.PARKED_REASON_UPSTREAM_CONFLICT
+            or result.parked_reason != M.PARKED_REASON_RESPONSE
+            or step.type != "agent_task"
             or rec.base_sha is None
             or not spec.step_touches_worktree(step)
         ):
@@ -666,6 +744,190 @@ class Orchestrator:
         result.notes = f"{result.notes}\n{note}" if result.notes else note
         return result
 
+    def _now_dt(self) -> datetime:
+        """The orchestrator clock as an aware UTC datetime (for window math).
+
+        Parses the injectable ISO clock so admission is deterministic under a
+        stubbed clock in tests; an unparseable clock falls back to wall-clock UTC.
+        """
+        try:
+            dt = datetime.fromisoformat(self.clock())
+        except (ValueError, TypeError):
+            return datetime.now(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+    # The cycle roles that each launch agent calls billing their own provider
+    # (FR-10.2). A standard ``adversarial_cycle`` carries these instead of a
+    # single ``agent:``, so admission must check each declared role — not bail
+    # because ``step.agent`` is unset (F-002). ``confirmer`` defaults to the
+    # reviewer profile (already covered by ``reviewer``); listing it still
+    # correctly checks a distinct confirmer profile when one is configured.
+    _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
+
+    def _admission_profiles(self, step: Step) -> list[str]:
+        """The agent profiles whose provider window this step must clear (FR-10.2).
+
+        An ``agent_task`` bills one profile (``step.agent``); an
+        ``adversarial_cycle`` bills one PER declared role — each can drive a
+        constrained provider into a reactive usage-limit park, so each is
+        admission-checked before the cycle launches (F-002). De-duplicated (roles
+        may share a profile) with first-seen order preserved so the check is
+        deterministic.
+        """
+        if step.type == "agent_task":
+            return [step.agent] if step.agent else []
+        if step.type == "adversarial_cycle":
+            profiles: list[str] = []
+            for role in self._CYCLE_ROLES:
+                profile = step.get(role)
+                if profile and profile not in profiles:
+                    profiles.append(profile)
+            return profiles
+        return []
+
+    def _window_admission(self, step: Step, rec: StepRecord) -> StepResult | None:
+        """Pre-step provider-window admission (FR-10.2/10.3).
+
+        For each agent profile the step bills (one for an ``agent_task``; one per
+        declared role for an ``adversarial_cycle``, F-002), estimates the step's
+        provider usage and compares it to remaining window headroom. Returns a
+        PARKED ``usage_window`` StepResult when a window-constrained,
+        ``enforce: true`` profile lacks headroom — a clean-boundary park before any
+        adapter call. In advisory mode (default) the same short-fall records a
+        manifest warning — also surfaced through ``gauntlet status`` and a
+        notification (FR-10.3) — and admission keeps scanning the other profiles
+        (launch as usual). Returns ``None`` for a step with no window-constrained
+        profile, sufficient headroom everywhere, or any ledger error (advisory — a
+        ledger fault never blocks a run, PRD §4.2).
+        """
+        profiles = self._admission_profiles(step)
+        if not profiles:
+            return None
+        try:
+            rows = L.load_rows(self.ledger_path)
+        except Exception:
+            return None  # advisory: never block a launch on a ledger error
+        now = self._now_dt()
+        for profile in profiles:
+            provider = L.profile_provider(self.config, profile)
+            if provider is None:
+                continue
+            window = self.config.providers.get(provider)
+            if window is None:
+                continue
+            try:
+                decision = L.admit_step(
+                    rows, window, provider=provider, step_type=step.type,
+                    profile=profile, now=now,
+                )
+            except Exception:
+                continue  # advisory: an estimate fault never blocks a launch
+            if decision.sufficient:
+                continue
+            note = f"usage-window admission (FR-10.3): {decision.summary()}"
+            if window.enforce:
+                return StepResult(
+                    status=PARKED,
+                    parked_reason=M.PARKED_REASON_USAGE_WINDOW,
+                    # Reuse the quota reset field for the projected replenishment
+                    # time (the datum status surfaces for a usage_window park,
+                    # mirroring a usage_limit park's reset time).
+                    quota_reset_at=decision.replenish_at,
+                    notes=note,
+                )
+            # Advisory: record the warning; keep scanning so every constrained
+            # profile's short-fall lands, not just the first.
+            self._record_window_warning(step, note)
+        return None
+
+    def _record_window_warning(self, step: Step, note: str) -> None:
+        """Stamp a de-duplicated advisory usage-window warning into the manifest.
+
+        ``manifest.warnings`` is the FR-10.3 advisory channel: rendered by
+        ``gauntlet status`` (its ``warnings`` block) and pushed as a
+        ``usage-window-warning`` notification by the web notifier, so a live
+        short-fall is visible without opening the manifest.
+        """
+        warning = f"[{step.id}] {note}"
+        if warning not in self.manifest.warnings:
+            self.manifest.warnings.append(warning)
+
+    def _append_ledger_row(self, rec: StepRecord) -> None:
+        """Append this step's content-free usage to the machine-global ledger.
+
+        Best-effort and idempotent (FR-10.1). A single-agent step yields one row;
+        a compound step (adversarial_cycle) yields one row PER ROLE from
+        ``rec.agent_usage``, each attributed to that role's own provider — so a
+        cycle's spend (the bulk of a run's usage) is recorded, not dropped. The
+        ``run_id::step_id[::profile]`` de-dup key means a re-finalized (resumed)
+        step never double-counts — the first execution's spend wins. Any error is
+        swallowed: the ledger is advisory, never a correctness dependency (§4.2).
+        """
+        try:
+            rows = L.rows_from_step(
+                rec, run_id=self.manifest.run_id, repo_hash=self._repo_hash,
+                config=self.config,
+            )
+            if rows:
+                L.append_unique(rows, path=self.ledger_path)
+        except Exception:
+            pass
+
+    def _agent_failure_result(self, exc: AgentFailedError) -> StepResult:
+        """Turn a classified adapter failure into a park (transient) or FAILED.
+
+        FR-3.2: a ``transient_*`` classification parks the step with
+        ``parked_reason=usage_limit``, the failing call's ``session_id`` preserved
+        (so a plain ``gauntlet resume`` continues it, FR-3.3) and its usage
+        accounted (the failed call still cost tokens). The worktree is left
+        untouched — this park kind bypasses the reset/conflict-restore paths (both
+        key on other reasons). An absent/terminal ``failure_info`` fails closed to
+        FAILED (never auto-continued past an unknown error, §7).
+        """
+        info = exc.failure_info
+        partial = exc.partial
+        if info is not None and info.is_transient:
+            after = (
+                f"; provider retry hint ~{info.retry_after_s}s"
+                if info.retry_after_s else ""
+            )
+            return StepResult(
+                status=PARKED,
+                parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                session_id=partial.session_id if partial else None,
+                usage=partial.usage if partial else None,
+                retry_after_s=info.retry_after_s,
+                notes=(
+                    f"usage-limit park (FR-3.2): {info.kind} [{info.marker}]; "
+                    "worktree and CLI session preserved — `gauntlet resume` "
+                    "continues the session" + after
+                ),
+            )
+        return StepResult(
+            status=FAILED,
+            halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+            usage=partial.usage if partial else None,
+            session_id=partial.session_id if partial else None,
+            notes=f"agent failed (terminal, FR-3.1): {exc}",
+        )
+
+    def _quota_reset_at(self, retry_after_s: int | None) -> str | None:
+        """Absolute UTC reset time = now + ``retry_after_s`` (FR-3.2 "when reported").
+
+        Derived from the orchestrator clock so tests are deterministic; ``None``
+        when no structured retry hint was reported, or when the clock string is
+        not ISO-parseable (fail-safe — an un-parseable reset is simply omitted).
+        ``retry_after_s=0`` is a real hint (RFC 7231: retry immediately), not an
+        absent one — it must yield "now", or auto-resume never fires.
+        """
+        if retry_after_s is None:
+            return None
+        try:
+            base = datetime.fromisoformat(self.clock())
+        except ValueError:
+            return None
+        return (base + timedelta(seconds=retry_after_s)).isoformat()
+
     def _apply_budget_guard(
         self, step: Step, rec: StepRecord, result: StepResult
     ) -> StepResult:
@@ -690,6 +952,7 @@ class Orchestrator:
                 f"budget ${budget:.4f}; halting at checkpoint"
             )
             result.status = HALTED
+            result.halt_reason = M.HALT_REASON_BUDGET  # FR-7.2
             result.notes = (
                 f"{result.notes}\n{halt_note}" if result.notes else halt_note
             )
@@ -706,16 +969,94 @@ class Orchestrator:
             INTERRUPTED: M.INTERRUPTED,
         }[result.status]
         rec.ended = self.clock()
-        # Conflict-park discriminator is CURRENT-STATE, not a latch (FR-2.1):
-        # copy the just-finished execution's parked_reason onto the record. It is
-        # PARKED_REASON_UPSTREAM_CONFLICT only when this run halted on an UPSTREAM
-        # CONFLICT, and None for every other outcome — so a conflict park later
-        # resumed to done/failed/non-conflict-park clears the stale value here.
+        # Reason discriminators are CURRENT-STATE, not a latch: copy the just-
+        # finished execution's values so a step later resumed to a different
+        # outcome never carries a stale reason.
         rec.parked_reason = result.parked_reason
+        rec.halt_reason = result.halt_reason
         # Failure kind is CURRENT-STATE too (FR-9.3 recovery): copy the just-
         # finished execution's value so a precondition failure is re-runnable on
         # resume, and any later non-precondition finalization clears a stale value.
         rec.failure_kind = result.failure_kind
+        # FR-7.2 disjoint-reason invariant, enforced in one place for every
+        # terminal/parked outcome: a PARKED step carries exactly a `parked_reason`
+        # (halt_reason null); a HALTED/FAILED/INTERRUPTED step carries exactly a
+        # `halt_reason` (parked_reason null); a DONE/SKIPPED step carries neither.
+        # The applicable field is MANDATORY, so a handler that returned a terminal
+        # status without one is defaulted here rather than persisting an
+        # unexplainable state (`reason_fields_disjoint` holds afterward).
+        if rec.status == M.PARKED:
+            rec.halt_reason = None
+            # Every PARKED step must carry a PRD reason (FR-7.2 / P3 park
+            # invariant): usage_limit / artifact_invalid parks stamp theirs at the
+            # handler, a halt_on park stamps `response` (see `_completion_signal`),
+            # and a human_gate park stamps `gate`. The human_gate backfill here is
+            # belt-and-suspenders (the handler already set it); no park is written
+            # with a null parked_reason, which would classify as `unknown`.
+            if rec.parked_reason is None and rec.type == "human_gate":
+                rec.parked_reason = M.PARKED_REASON_GATE
+        elif rec.status in (M.HALTED, M.FAILED, M.INTERRUPTED):
+            rec.parked_reason = None
+            if rec.halt_reason is None:
+                # A precondition guard fired before any adapter call (carries a
+                # failure_kind); everything else is a terminal adapter/execution
+                # failure.
+                rec.halt_reason = (
+                    M.HALT_REASON_PRECONDITION if rec.failure_kind
+                    else M.HALT_REASON_ADAPTER_ERROR
+                )
+        else:  # DONE / SKIPPED carry neither reason
+            rec.parked_reason = None
+            rec.halt_reason = None
+        # Usage-limit park stamps are CURRENT-STATE as well (FR-3.2): set on a
+        # usage_limit park, cleared (back to None) on any other finalization —
+        # so a step later resumed to DONE never carries a stale reset time. The
+        # absolute reset time is derived here (from the retry hint + the engine
+        # clock) so both the agent_task and cycle park paths get it uniformly;
+        # an explicit ``quota_reset_at`` on the result (rare) still wins.
+        rec.retry_after_s = result.retry_after_s
+        rec.quota_reset_at = result.quota_reset_at or self._quota_reset_at(
+            result.retry_after_s
+        )
+        # The parked sub-step is current-state alongside the usage-limit stamps
+        # (FR-3.3): set on a usage-limit cycle park so resume continues the
+        # preserved session in the matching sub-step, cleared on any other
+        # finalization so a step resumed to DONE never carries a stale value.
+        rec.parked_substep = result.parked_substep
+        # The revalidation content-hash pair is current-state too (FR-2.2/§6): set
+        # on an artifact_invalid park (hash_at_park) and on the resume that
+        # revalidates the hand-edited artifact (the full pair + passed_on_resume),
+        # cleared on any other finalization so a step later resumed to a clean DONE
+        # never carries a stale hand-edit record.
+        rec.revalidation = result.revalidation
+        # Auto-resume schedule (FR-3.4) is current-state and armed at park time so
+        # a usage-limit park under `resume_on_quota: auto` carries its schedule the
+        # instant `_drive` returns (before any wait), and a process death loses
+        # nothing. Preserve the prior attempts count across re-parks (the
+        # RunManager increments it around each in-process resume). Cleared on any
+        # non-usage-limit-park finalization so a step resumed to DONE never carries
+        # a stale schedule. `notify` mode never arms one.
+        if (
+            result.status == PARKED
+            and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+            and self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
+            # Arm ONLY with a structured reset time (FR-3.4): a park with no
+            # reported reset has ``quota_reset_at is None``; falling back to
+            # ``self.clock()`` would make the schedule due immediately, and the
+            # auto-resume loop would burn every attempt in an unspaced hot loop.
+            # With no reset time, leave a plain usage-limit park for a human.
+            and rec.quota_reset_at is not None
+        ):
+            prior_attempts = (
+                rec.scheduled_resume.attempts if rec.scheduled_resume else 0
+            )
+            rec.scheduled_resume = M.ScheduledResume(
+                attempt_at=rec.quota_reset_at,
+                attempts=prior_attempts,
+                max_attempts=self.config.max_auto_resume_attempts,
+            )
+        else:
+            rec.scheduled_resume = None
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:
@@ -729,6 +1070,13 @@ class Orchestrator:
             self.manifest.agent_usage.setdefault(
                 agent_name, M.UsageTotals()
             ).add(agent_usage)
+            # Also record the per-role split ON THE STEP (FR-3.2 / FR-10.1): the
+            # step-level `agent_usage` is what the ledger reads to attribute a
+            # compound step's spend (an adversarial_cycle's reviewer/triager/fixer)
+            # to each role's OWN provider — a cycle's roles can bill different
+            # providers, so a single lumped row would misattribute. Accumulated
+            # (like `rec.usage`) so a re-finalized/resumed step stays consistent.
+            rec.agent_usage.setdefault(agent_name, M.UsageTotals()).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
         if result.metrics:
@@ -748,6 +1096,10 @@ class Orchestrator:
         if result.status == DONE:
             for name, path in result.artifact_writes.items():
                 self.artifacts[name] = path
+        # FR-10.1: append this step's content-free usage to the machine-global
+        # ledger the instant its usage is recorded, so later runs (and window
+        # admission on the next step) see it. Best-effort + idempotent inside.
+        self._append_ledger_row(rec)
         # Failure-only attempt increment (FR-6): the audit retry counter advances
         # ONLY when a run ends in failure — relocated here from `_execute`'s old
         # unconditional top-of-run bump. DONE / PARKED / HALTED / INTERRUPTED do
@@ -792,6 +1144,7 @@ class Orchestrator:
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
+            persist=self._persist,  # FR-4.1: cycle sub-step write-ahead flush
         )
 
     def _context(self, item: Any = None, iteration: str | None = None) -> dict[str, Any]:
@@ -864,6 +1217,39 @@ class Orchestrator:
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
+
+    def _expected_phase(self, step: Step, item: Any) -> str | None:
+        """The numeric phase prefix (P1, P2…) a step belongs to, or ``None``.
+
+        An explicit ``phase:`` wins; otherwise the ``foreach: plan.phases`` item
+        id supplies it. Non-numeric stage labels (PRD/PLAN/REVIEW) never carry
+        intra-phase checkpoints, so they scope to ``None`` (unscoped discovery).
+        """
+        candidate = step.get("phase")
+        if not candidate and isinstance(item, dict):
+            candidate = item.get("id")
+        candidate = str(candidate or "")
+        return candidate if _NUMERIC_PHASE_RE.fullmatch(candidate) else None
+
+    def _checkpoint_rewind_target(
+        self, rec: StepRecord, phase: str | None = None
+    ) -> tuple[str, str | None]:
+        """Rewind target + checkpoint subject for a dirty re-run (FR-11.2).
+
+        Returns ``(target_sha, subject)``: the newest ``P<N> wip:`` checkpoint
+        commit reachable from HEAD and descended from ``rec.base_sha`` (so
+        completed milestones survive the rewind), with its subject for the re-run
+        prompt / audit trail. Discovery is SCOPED to ``phase`` when known (review
+        F-001), so a wrong-phase checkpoint is never chosen as the rewind target.
+        Falls back to ``(base_sha, None)`` when the phase landed no checkpoint —
+        today's reset-to-base behavior. Only reached with a non-null ``base_sha``
+        (the caller guards it).
+        """
+        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha, phase=phase)
+        if wips:
+            sha, subject = wips[0]  # newest first
+            return sha, subject
+        return rec.base_sha, None
 
     def _set_run_status(self, step_status: str) -> str:
         self.manifest.status = {

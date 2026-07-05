@@ -228,3 +228,73 @@ def test_timeout_raises_checkpointable(monkeypatch):
     partial = excinfo.value.partial
     assert partial.session_id == THREAD_ID
     assert partial.text == "partial answer"
+
+
+# --- FR-3.1 failure classification on AgentFailedError ------------------------
+def _failed_events(error):
+    return [
+        {"type": "thread.started", "thread_id": THREAD_ID},
+        {"type": "turn.started"},
+        {"type": "turn.failed", "error": error},
+    ]
+
+
+def test_usage_limit_message_classified_transient(monkeypatch):
+    events = _failed_events(
+        {"message": "You've hit your usage limit. Try again at 2:57 AM."}
+    )
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    info = excinfo.value.failure_info
+    assert info is not None and info.kind == "transient_usage_limit"
+    assert info.retry_after_s is None  # "2:57 AM" is prose, never scraped (§7)
+
+
+def test_overload_message_classified_transient(monkeypatch):
+    events = _failed_events({"message": "stream error: the model is Overloaded"})
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    assert excinfo.value.failure_info.kind == "transient_overload"
+
+
+def test_unlisted_error_classified_terminal(monkeypatch):
+    events = _failed_events({"message": "disk full writing scratch file"})
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    assert excinfo.value.failure_info.kind == "terminal"
+
+
+def test_non_object_json_line_fails_closed(monkeypatch):
+    # A valid-JSON-but-not-object stdout line ("oops", 42, null) breaks the
+    # event contract exactly like a non-JSON line: strict decode must refuse
+    # with MalformedOutputError — never surface as an AttributeError from a
+    # downstream `.get()` consumer.
+    events = ["not an event object"] + _failed_events({"message": "x"})
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(MalformedOutputError):
+        CodexAdapter().run("hi")
+
+
+def test_classifier_tolerates_non_dict_events():
+    # classify_codex_failure is a public entry point that can be handed a
+    # malformed list directly; non-dict elements are skipped so it fails
+    # closed to `terminal` instead of crashing (§7: classifier never raises
+    # on malformed input).
+    from gauntlet.adapters.failure_markers import classify_codex_failure
+
+    events = ["bare string", 42, None,
+              {"type": "turn.failed", "error": {"message": "disk full"}}]
+    info = classify_codex_failure(events, 1)
+    assert info.kind == "terminal"
+
+
+def test_session_not_found_on_resume(monkeypatch):
+    from gauntlet.adapters.base import SessionNotFoundError
+
+    events = _failed_events({"message": "session th_gone not found"})
+    patch_run(monkeypatch, fake_output(events, exit_code=1))
+    with pytest.raises(SessionNotFoundError):
+        CodexAdapter().run("continue", session="th_gone")

@@ -63,6 +63,10 @@ class WatchEvent(BaseModel):
     current_step_status: str | None = None
     current_step_type: str | None = None  # step `type` (gate vs cycle) for FR-9.1
     current_step_notes: str | None = None
+    # Run-level non-fatal anomalies (manifest.warnings). Carried so the notifier
+    # can push a newly-recorded advisory usage-window shortfall (FR-10.3); NOT part
+    # of `identity` (a manifest rewrite already re-fires via its revision/mtime).
+    warnings: list[str] = []
     updated: str | None = None  # manifest mtime as ISO (display)
     revision: int | None = None  # manifest mtime in ns: the FR-8.1 manifest_revision
 
@@ -185,6 +189,7 @@ class Watcher:
             current_step_status=cur.status if cur else None,
             current_step_type=cur.type if cur else None,
             current_step_notes=cur.notes if cur else None,
+            warnings=list(man.warnings),
             updated=_mtime_iso(manifest_path),
             revision=mtime_ns,
         )

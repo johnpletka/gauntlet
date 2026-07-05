@@ -6,6 +6,132 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-05
+
+**Harness efficiency & resilience** (PRD `runs/harness-efficiency/prd.md`,
+P1–P11; PR #52). The organizing principle: a run's scarce resource is the
+builder's provider window, so this release makes interruptions survivable
+instead of destructive, spends each step more deliberately, and makes an
+in-flight run explainable from `status` alone. Built by a `gauntlet run`
+dogfood on this repo — and battle-tested by it: the run survived a live codex
+usage-limit hit, host sleep, and a malformed plan block using the machinery it
+was building. All new knobs default to prior behavior.
+
+### Added — resilience (protect the window)
+
+- **Usage-limit parks with session-preserving resume (FR-3).** Adapters
+  classify failures transient-vs-terminal against a pinned, fixture-backed
+  marker allowlist (`adapters/failure_markers.py`); a quota/429/overload hit —
+  including inside an adversarial cycle's reviewer/triager/fixer/confirmer
+  sub-agents — parks the run (`parked_usage_limit`) with the worktree untouched
+  and the agent session preserved. Plain `gauntlet resume` continues the same
+  session with a short continuation prompt; an expired session falls back to a
+  full re-run with an audit note. Unrecognized errors stay `terminal`
+  (fail-closed). Opt-in `resume_on_quota: auto` self-resumes at the provider's
+  hinted reset time with bounded, restart-safe attempts.
+- **Suspend/sleep resilience (FR-5).** A driver heartbeat
+  (`engine/heartbeat.py`) detects host suspension (dual detectors, pinned by a
+  darwin contract test) and credits slept time back to the running step's
+  deadline up to `suspend_credit_cap_s`; stalls classify as `host_suspended` /
+  `driver_orphaned` / `agent_silent`. Opt-in `keep_awake: true` wraps the
+  driver in `caffeinate -i` on darwin.
+- **In-step artifact validation with self-repair (FR-2).** `agent_task`
+  supports `validate:` (e.g. `plan_phases`): the authoring agent gets its own
+  parse error back for a bounded repair loop; exhaustion parks
+  (`parked_artifact_invalid`) for a sanctioned hand-edit — `resume` re-runs
+  only the validator and records a content-hash audit of the edit.
+- **Adversarial-cycle sub-step checkpointing (FR-4).** Review/triage/fix/
+  confirm checkpoint write-ahead per round; a killed cycle re-enters at the
+  first incomplete sub-step, guarded by the round handoff SHA and fail-closed
+  reloading of corrupt fragments.
+- **Intra-phase checkpoint commits (FR-11).** Builders commit `P<N> wip:`
+  milestones (`checkpoint_commits: keep | squash`); the phase always terminates
+  in a `PN:` commit (empty marker if needed) that is the review handoff, and
+  reviewers always see the cumulative range diff. Interrupted-step recovery
+  rewinds to the latest checkpoint instead of the phase base, bounding lost
+  work to one milestone.
+
+### Added — efficiency (sharpen the spend)
+
+- **Scoped context input modes (FR-1).** Per-input `mode: inline | reference |
+  phase` lets large artifacts travel by path (agents read them in-session,
+  where turns hit the provider prompt cache) or as the current phase's plan
+  excerpt; artifact-mode re-review rounds get a diff since the last reviewed
+  snapshot instead of the full document. Gated on a probe-verified `reads_repo`
+  capability; pipeline load and `doctor` both fail closed on a blind profile.
+- **Effort tiering plumbing (FR-6).** Canonical `effort: minimal | low |
+  medium | high` on any profile or step, mapped per adapter (unsupported value
+  = config-load error); triage escalation is severity-gated (blocking/major
+  only); mechanical emissions (commit messages, resume dispositions) run on a
+  cheap `mechanic` profile; `doctor` probes every profile's model resolution
+  and effort-flag acceptance.
+- **Machine-global usage ledger + window admission (FR-10).**
+  `~/.gauntlet/usage-ledger.jsonl` accumulates content-free per-step usage
+  across runs (`gauntlet ledger backfill` seeds it from existing manifests,
+  idempotently); a configured `providers.<name>` window warns — or with
+  `enforce: true` parks pre-step (`parked_usage_window`) — before launching a
+  step predicted not to fit. Advisory by design.
+- **Concurrent triage + judge decision cache (FR-9, FR-12).** Per-finding
+  triage calls run in a bounded pool (`triage_concurrency`, byte-identical
+  `triage.json` on all-success rounds; deterministic checkpoint fragment on
+  failure); the judge caches **allow** decisions per run keyed on canonical
+  payload + policy content hash (deny/ask never cached), eliminating repeated
+  LLM-rung evaluations of identical tool calls.
+
+### Added — observability (explain the run)
+
+- **Engine-stamped reason enums (FR-7).** Disjoint `halt_reason` (timeout /
+  budget / judge_deny / signal_kill / adapter_error / precondition /
+  operator_recover) and `parked_reason` (usage_limit / usage_window /
+  artifact_invalid / response / gate) on every non-DONE step; legacy manifests
+  normalize read-side (`upstream_conflict`/`cycle_escalation` → `response`),
+  never rewritten.
+- **Enriched `status --json` (additive; `schema_version` stays 1):** run
+  elapsed, token/cost totals and per-profile `agent_usage`, per-step
+  duration/notes/reasons, heartbeat age + suspension intervals, quota reset
+  time, and a `gate` context block (convergence summary, prior responses,
+  per-finding triage reasoning — FR-8). `gauntlet report` gains
+  cache-effectiveness columns. Consumers pinning an older strict schema copy
+  must re-pin on upgrade.
+
+### Changed
+
+- **Custom `halt_on` marker parks now stamp `parked_reason=response`** and
+  receive the same clean-tree restoration as the canonical UPSTREAM CONFLICT
+  marker (the dirty tree is snapshotted to a backup ref first — nothing is
+  lost, but edits no longer remain in the worktree for in-place inspection).
+- **Failed `commit` steps are `--response`-recoverable** (`commit` joined
+  `RESPONDABLE_STEP_TYPES`), closing an operator deadlock where neither plain
+  `resume` nor `--response` could advance a crashed commit step.
+- **Code-review base spans the whole phase**: cycle review diffs cover
+  `base_sha..PN:` (the cumulative phase range), not the final commit alone —
+  required for multi-commit (`wip:`) phases and empty marker commits.
+
+### Fixed (post-review hardening, from the PR-52 adversarial review)
+
+- Codex NDJSON decode and `classify_codex_failure` now fail closed on
+  valid-JSON-but-non-object event lines instead of crashing the classifier
+  with `AttributeError`.
+- `Retry-After: 0` is treated as a real "retry now" hint (reset time = now),
+  not an absent one — auto-resume can fire immediately.
+- The post-disposition session-expiry fallback now writes the same
+  `session-expired` audit record as the quota-resume path (FR-3.3 parity).
+- Ledger appends no longer re-parse the entire machine-global ledger per step:
+  de-dup keys are cached per process and refreshed by scanning only new tail
+  bytes (truncation/rotation triggers a full reload).
+- Cycle-role usage is recorded in the ledger per-role (previously dropped
+  ~92% of a cycle's tokens from admission estimates); `StepRecord` gains
+  `agent_usage`.
+
+### Docs
+
+- Operator playbook (+ scaffold twin): the three new park states and their
+  recovery verbs, the sanctioned hand-edit exception, suspend-aware stall
+  classification. README: run-lifecycle resilience, the enriched status
+  contract, `ledger backfill`, corrected canonical `effort` reference, and a
+  full resilience/window/scoped-context configuration section. Scaffold
+  `config.yaml`: commented opt-in reference block for every new knob.
+
 ## [0.4.0] — 2026-07-01
 
 A new **lightweight review** surface. `gauntlet review` brings the adversarial

@@ -274,7 +274,7 @@ def test_amendment_required_reparks_no_implementation(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
     assert not (repo / "feature.py").exists()  # nothing implemented
     # the response is consumed (terminal outcome), audit trail intact
@@ -315,7 +315,7 @@ def test_new_conflict_reparks_with_requested_input(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert disp["conflict"]["requested_input"] == "which of option 1 or 2 to take"
     assert disp["responses_considered"] == ["implement-resp-1"]
 
@@ -579,6 +579,135 @@ def test_resume_disposition_schema_bound_invocation_locally(tmp_path):
     assert implement.get("findings_schema") is None
 
 
+# --- FR-6.3: disposition emission routed to a cheap `disposition_agent` -------
+# A pipeline whose implement step routes the MECHANICAL resume-disposition
+# emission to a cheap `mechanic` profile instead of the builder. The re-park
+# classification never touches the builder; only a proceed re-drives it.
+DISPOSITION_PIPELINE = """
+name: respond
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder,
+         disposition_agent: mechanic, prompt_text: go,
+         halt_on: "UPSTREAM CONFLICT"}
+      - {id: commit, type: commit, message: "P1: implement phase\\n\\nthe body."}
+"""
+
+DISPOSITION_CONFIG = """
+base_branch: main
+run_root: runs
+agents:
+  builder: {adapter: claude-code}
+  mechanic: {adapter: api, model: gpt-5-mini}
+"""
+
+
+class _ByNameFactory:
+    """adapter_factory that dispatches by profile name and records the order of
+    profiles the engine asked to build — so a test can prove which agent emitted
+    the disposition (and whether the builder was invoked at all)."""
+
+    def __init__(self, by_name: dict) -> None:
+        self.by_name = by_name
+        self.built: list[str] = []
+
+    def __call__(self, name: str):
+        self.built.append(name)
+        return self.by_name[name]
+
+
+def test_routed_repark_classifies_on_mechanic_without_invoking_builder(tmp_path):
+    # FR-6.3: a re-park classification (new_conflict) is drafted by the cheap
+    # `mechanic` profile; the builder is NEVER built — zero builder window spent.
+    repo, mgr = _build_repo(
+        tmp_path / "repo", DISPOSITION_PIPELINE, config=DISPOSITION_CONFIG
+    )
+    _drive_to_conflict(repo, mgr, DISPOSITION_PIPELINE)
+    mechanic = DispositionAdapter(_disposition("new_conflict"), write=False)
+    factory = _ByNameFactory({"mechanic": mechanic, "builder": _fail_if_built()})
+    status = mgr.resume(
+        "demo", response="ambiguous", use_judge=False,
+        adapter_factory=factory, clock=_clock(),
+    )
+    assert status == M.RUN_PARKED
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.PARKED and rec.parked_reason == M.PARKED_REASON_RESPONSE
+    # the mechanic classified; the builder was never built (window saved)
+    assert factory.built == ["mechanic"]
+    # the mechanic-drafted disposition passed the schema + fail-closed check
+    assert mechanic.schemas[-1]["$id"] == "gauntlet/schemas/resume-disposition.json"
+
+
+def test_routed_proceed_classifies_on_mechanic_then_implements_on_builder(tmp_path):
+    # FR-6.3: a proceed classification by the mechanic re-drives the primary agent
+    # to do the actual implementation (a cheap non-writing profile cannot).
+    repo, mgr = _build_repo(
+        tmp_path / "repo", DISPOSITION_PIPELINE, config=DISPOSITION_CONFIG
+    )
+    _drive_to_conflict(repo, mgr, DISPOSITION_PIPELINE)
+    mechanic = DispositionAdapter(_disposition("proceed_in_place"), write=False)
+    builder = DispositionAdapter(_disposition("proceed_in_place"), write=True)
+    factory = _ByNameFactory({"mechanic": mechanic, "builder": builder})
+    status = mgr.resume(
+        "demo", response="Ratify option 1; no contradiction remains.",
+        use_judge=False, adapter_factory=factory, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    assert mgr.status("demo").record("implement").status == M.DONE
+    # mechanic classified first, THEN the builder was re-driven to implement
+    assert factory.built == ["mechanic", "builder"]
+    assert (repo / "feature.py").read_text() == "implemented\n"  # builder's work
+    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+
+
+def test_routed_malformed_mechanic_disposition_fails_without_builder(tmp_path):
+    # A mechanic that emits no valid disposition fails closed — the builder is
+    # never invoked on an unparseable classification (fail closed, CLAUDE.md §2).
+    repo, mgr = _build_repo(
+        tmp_path / "repo", DISPOSITION_PIPELINE, config=DISPOSITION_CONFIG
+    )
+    _drive_to_conflict(repo, mgr, DISPOSITION_PIPELINE)
+    mechanic = DispositionAdapter(None, write=False)  # no structured disposition
+    factory = _ByNameFactory({"mechanic": mechanic, "builder": _fail_if_built()})
+    status = mgr.resume(
+        "demo", response="proceed", use_judge=False,
+        adapter_factory=factory, clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    assert factory.built == ["mechanic"]  # builder untouched
+
+
+def test_unset_disposition_agent_uses_primary_agent(tmp_path):
+    # With no `disposition_agent`, the disposition is emitted by the step's own
+    # agent (today's behavior) — the builder is the only profile built.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    builder = DispositionAdapter(_disposition("proceed_in_place"), write=True)
+    factory = _ByNameFactory({"builder": builder})
+    status = mgr.resume(
+        "demo", response="Ratify option 1.", use_judge=False,
+        adapter_factory=factory, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    assert factory.built == ["builder"]  # no mechanic routing
+
+
+class _FailIfBuilt:
+    """A stand-in that fails the test if the engine ever tries to run it."""
+
+    name = "scripted"
+    capabilities = DispositionAdapter.capabilities
+
+    def run(self, *a, **k):  # pragma: no cover - asserted never called
+        raise AssertionError("the builder must not be invoked on a routed re-park")
+
+
+def _fail_if_built() -> _FailIfBuilt:
+    return _FailIfBuilt()
+
+
 # --- F-001: a conflict re-park must hand off a CLEAN worktree ----------------
 def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
     # Review F-001 / clean-handoff invariant (CLAUDE.md §1): the builder runs with
@@ -598,7 +727,7 @@ def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
     assert status == M.RUN_PARKED
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.PARKED
-    assert rec.parked_reason == M.PARKED_REASON_UPSTREAM_CONFLICT
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     # The builder's uncommitted edit was discarded; no implementation change
     # survives to the handoff (the only residual dirt is engine bookkeeping,
     # which the clean-handoff invariant deliberately excludes).

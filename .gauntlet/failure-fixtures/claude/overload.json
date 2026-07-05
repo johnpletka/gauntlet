@@ -1,0 +1,7 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "result": "API Error: Overloaded",
+  "total_cost_usd": 1.2698975
+}

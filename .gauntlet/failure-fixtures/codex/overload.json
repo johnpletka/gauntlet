@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"type": "thread.started", "thread_id": "th_jkl012"},
+    {"type": "turn.failed", "error": {"message": "stream disconnected: the upstream model is Overloaded, please retry"}}
+  ]
+}

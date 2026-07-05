@@ -1,0 +1,6 @@
+{
+  "type": "result",
+  "subtype": "usage_limit",
+  "is_error": true,
+  "result": "the model stopped early"
+}

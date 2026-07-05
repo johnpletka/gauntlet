@@ -20,7 +20,7 @@ from typing import Any
 
 from gauntlet.adapters.base import AgentResult, Usage
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.manifest import Manifest, RevalidationRecord, StepRecord
 from gauntlet.engine.pipeline import Pipeline, Step
 from gauntlet.logging.redact import RedactingWriter
 
@@ -52,6 +52,26 @@ class StepResult:
     # park on a *different* ``halt_on`` marker, a human_gate, or a budget halt).
     # ``_finalize`` copies this onto the record so the field stays current-state.
     parked_reason: str | None = None
+    # Terminal halt discriminator (harness-efficiency FR-7.2), DISJOINT from
+    # ``parked_reason``. P2 sets only ``manifest.HALT_REASON_TIMEOUT`` on the
+    # suspend-cap timeout halt (FR-5.2); P3 completes the enum. ``_finalize``
+    # copies it onto the record so it stays current-state. ``None`` for every
+    # non-terminal or non-timeout outcome.
+    halt_reason: str | None = None
+    # Usage-limit park stamps (harness-efficiency FR-3.2), carried onto the
+    # StepRecord by ``_finalize`` when a transient failure parks the step.
+    # ``retry_after_s`` is the provider's structured retry hint (``None`` when
+    # none); ``quota_reset_at`` is its derived absolute UTC reset time (``None``
+    # when unreported). Both ``None`` for every non-usage-limit outcome.
+    retry_after_s: int | None = None
+    quota_reset_at: str | None = None
+    # Which cycle sub-step produced the preserved ``session_id`` on a usage-limit
+    # park (harness-efficiency FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``,
+    # ``"r2-triage"``. Carried onto the StepRecord by ``_finalize`` so a resume
+    # continues the preserved session only in the matching sub-step and never
+    # misroutes a fixer/triager session into the round-1 reviewer. ``None`` for
+    # every non-usage-limit outcome (current-state, like ``parked_reason``).
+    parked_substep: str | None = None
     # Failure-kind discriminator (current-state, like ``parked_reason``): set to a
     # ``manifest.FAILURE_KIND_*`` value ONLY when this step failed a re-runnable
     # PRECONDITION guard (no adapter invoked, no cost — e.g. the FR-9.3 round-1
@@ -59,6 +79,13 @@ class StepResult:
     # it onto the record so ``_is_terminal_failure`` can let a plain ``resume``
     # re-run such a step once the operator fixes the precondition.
     failure_kind: str | None = None
+    # Content-hash pair for an ``artifact_invalid`` park / its resume-revalidate
+    # (harness-efficiency FR-2.2/§6). Set ONLY on an ``artifact_invalid`` park
+    # (``hash_at_park`` populated) and on the plain-resume revalidation that
+    # resolves it (``hash_at_resume``/``changed_while_parked``/``passed_on_resume``
+    # filled). ``None`` for every other outcome; ``_finalize`` copies it onto the
+    # record as current-state so the audit trail lands on the resolving step.
+    revalidation: RevalidationRecord | None = None
     # artifacts this step produced (artifact name -> path), merged into context
     artifact_writes: dict[str, Path] = field(default_factory=dict)
     # Per-agent-profile usage breakdown for this step (FR-3.2). Single-agent
@@ -94,12 +121,23 @@ class StepContext:
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
+    # Write-ahead persist hook (FR-4.1): the orchestrator wires this to its own
+    # atomic manifest+RUN.md flush so a long-running handler (the adversarial
+    # cycle) can checkpoint sub-step progress to disk mid-step, surviving a
+    # kill/park between sub-steps. ``None`` for a standalone handler invocation
+    # (no orchestrator); such callers fall back to writing the manifest directly.
+    persist: Callable[[], None] | None = None
 
-    def build_adapter(self, agent_name: str) -> Any:
-        """Resolve an agent profile to an adapter instance (override in tests)."""
+    def build_adapter(self, agent_name: str, *, effort: str | None = None) -> Any:
+        """Resolve an agent profile to an adapter instance (override in tests).
+
+        ``effort`` (FR-6.1) is a step-level canonical-effort override that wins
+        over the profile's own ``effort``; ``None`` uses the profile's value. An
+        injected ``adapter_factory`` (test double) ignores it — effort mapping is
+        exercised against real profiles/adapters, not fakes."""
         if self.adapter_factory is not None:
             return self.adapter_factory(agent_name)
-        return self.config.profile(agent_name).build_adapter()
+        return self.config.profile(agent_name).build_adapter(effort=effort)
 
     def steps_dir(self) -> Path:
         return self.run_dir / "steps"

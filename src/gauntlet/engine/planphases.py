@@ -30,6 +30,12 @@ _BLOCK_RE = re.compile(
 
 _PHASE_ID_RE = re.compile(r"^P\d+$")
 
+# An ATX markdown heading: 1–6 leading `#`, the heading text, optional trailing
+# `#` decoration. Used to slice a single phase's prose section out of plan.md
+# for `phase`-mode context (harness-efficiency FR-1.1).
+_ATX_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
+_FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+
 
 class PlanPhasesError(ValueError):
     """The plan's ``gauntlet-phases`` block is present but malformed."""
@@ -85,6 +91,83 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
             )
         phases.append(item)
     return phases
+
+
+def _heading_is_phase(heading: str, phase_id: str) -> bool:
+    """True when an ATX heading text names ``phase_id`` at a word boundary.
+
+    ``'P6 — Scoped context'`` and ``'P6:'`` match ``P6``; ``'P60 — …'`` and
+    ``'P6X'`` do not (a longer alphanumeric run is a different phase / word).
+    """
+    if not heading.startswith(phase_id):
+        return False
+    rest = heading[len(phase_id):]
+    return rest == "" or not rest[0].isalnum()
+
+
+def phase_section(plan_text: str, phase_id: str) -> str | None:
+    """Return the plan.md prose section for ``phase_id`` (e.g. ``'P6'``), or None.
+
+    Deterministic slicing (§2) for `phase`-mode context (FR-1.1): a *phase
+    heading* is an ATX heading (``## P6 — …``) whose text names the phase at a
+    word boundary. The section runs from that heading to the next heading at the
+    same-or-higher level, so a sibling phase (``## P7``) and a following
+    top-level section (``## Sequencing notes``) both terminate it while deeper
+    subheadings stay inside. Headings inside fenced code blocks (e.g. the
+    ``gauntlet-phases`` YAML) are ignored. Returns ``None`` when no phase heading
+    is found — the caller falls back to the full-document path (never a guess).
+    """
+    lines = plan_text.splitlines()
+    fenced = False
+    start = start_level = None
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        m = _ATX_HEADING_RE.match(line)
+        if m and _heading_is_phase(m.group(2).strip(), phase_id):
+            start, start_level = i, len(m.group(1))
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    fenced = False
+    for j in range(start + 1, len(lines)):
+        if _FENCE_RE.match(lines[j]):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        m = _ATX_HEADING_RE.match(lines[j])
+        if m and len(m.group(1)) <= start_level:
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def missing_phase_sections(
+    plan_text: str, phases: list[dict[str, Any]]
+) -> list[str]:
+    """Phase ids from *phases* with no locatable ``## <id>`` prose section.
+
+    `phase`-mode context (FR-1.1) slices each phase's prose out of plan.md by its
+    ATX heading (:func:`phase_section`). A phase present in the machine-readable
+    ``gauntlet-phases`` list but with no matching prose heading would silently
+    lose its excerpt at render time — the exact fail-open this closes. Returning
+    the offending ids lets the plan validators (``plan_phases`` / ``phase_lint``)
+    fail closed *before* human approval rather than after, and lets the renderer
+    assert the section exists at slice time. Order-preserving, deduped is
+    unnecessary (``extract_phases`` already rejects duplicate ids).
+    """
+    return [
+        p["id"]
+        for p in phases
+        if isinstance(p, dict)
+        and isinstance(p.get("id"), str)
+        and phase_section(plan_text, p["id"]) is None
+    ]
 
 
 def load_plan_phases(plan_path: Path) -> list[dict[str, Any]] | None:

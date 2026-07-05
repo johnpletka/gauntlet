@@ -43,8 +43,28 @@ behind that output. Drive every decision off the reported state class:
 - **`parked_for_response`** — the run is awaiting `resume --response`: a builder
   `UPSTREAM CONFLICT` or a review-cycle escalation its own loop could not settle.
   Action: `gauntlet resume <slug> --response "<decision>"`.
+- **`parked_usage_limit`** — a provider usage limit interrupted an agent (or a
+  cycle sub-agent) mid-step. This is a pause, not a failure: the worktree is
+  untouched and the agent's session id is preserved. Action: plain `gauntlet
+  resume <slug>` once the window replenishes — it **continues the same session**
+  with a short continuation prompt (FR-3.3); resuming too early harmlessly
+  re-parks. `status` prints the reset time when the provider reported one. With
+  `resume_on_quota: auto` configured, the live driver self-resumes at the hinted
+  time (bounded attempts) — check `status` before assuming you must act.
+- **`parked_usage_window`** — the pre-step admission check (a configured
+  `providers.<name>` window with `enforce: true`) parked *before* launching a
+  step predicted not to fit the remaining window. Nothing is in flight; zero
+  work is lost. Action: `gauntlet resume <slug>` when headroom returns.
+- **`parked_artifact_invalid`** — an agent-authored structured artifact (e.g.
+  the plan's `gauntlet-phases` block) failed validation after bounded in-session
+  repair attempts; the exact validator error is in the step `notes`. Action:
+  this is the **one sanctioned hand-edit** in the whole state space — fix the
+  named artifact file directly, then plain `gauntlet resume <slug>` re-runs
+  **only the validator** (no agent re-run). The edit is audited: content hashes
+  at park and at resume are recorded in the manifest.
 - **`failed`** — a step failed. Action: read the evidence with `gauntlet logs
-  <slug>` (and the failed step's `notes`), then recover by failure kind:
+  <slug>` (and the failed step's `notes` + engine-stamped `halt_reason`), then
+  recover by failure kind:
   - **A re-runnable precondition failure** (e.g. the FR-9.3 clean-handoff guard:
     "worktree dirty at round-1 review handoff") fired *before* any agent ran. The
     step `notes` name the offending uncommitted paths. Commit or stash them, then
@@ -54,8 +74,14 @@ behind that output. Drive every decision off the reported state class:
     cannot be advanced by a plain `resume` — it would only repeat. If a human
     decision can unblock it, inject one: `gauntlet resume <slug> --response
     "<decision>"`; otherwise `gauntlet abort`. A plain `resume` here refuses with
-    that guidance instead of silently no-op'ing.
-- **`halted`** — the budget/timeout guard tripped. Action: `logs`, then `resume`.
+    that guidance instead of silently no-op'ing. A `commit` step that failed on
+    the enforced message format is `--response`-recoverable too: the response
+    text guides the redraft.
+- **`halted`** — a guard tripped; the step record's `halt_reason` names which
+  (`timeout`, `budget`, …). Note that deadlines are suspend-aware: time the host
+  spent asleep is credited back (up to `suspend_credit_cap_s`), so a `timeout`
+  halt means the *agent* genuinely exceeded its budget, not that the laptop lid
+  closed. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
@@ -78,7 +104,14 @@ Work top-down; stop at the first branch that matches.
 3. **Did it fail?** `failed` / `halted` / `interrupted` → `gauntlet logs <slug>`
    to see the failing step's transcript and dir, diagnose, then `resume`.
 4. **Does the manifest say running?** Then trust *liveness*, not the manifest:
-   - `in_progress` → it is genuinely working; wait and observe.
+   - `in_progress` → it is genuinely working; wait and observe. If it looks
+     stalled, read the stall classification before acting: the driver heartbeat
+     distinguishes **`host_suspended`** (the machine slept — the run resumes
+     itself on wake; deadlines are credited, do nothing) from
+     **`driver_orphaned`** (process dead → `resume`) from **`agent_silent`**
+     (driver alive, no recent step events → keep watching; `recover` only per
+     §4). `status` prints the heartbeat age and any detected suspension
+     intervals.
    - `orphaned` → the driver is gone; `gauntlet resume <slug>` reclaims it.
    - `indeterminate` → you cannot prove it is alive *or* dead. Inspect
      read-only (`logs`, `status --json`) and escalate; **never** a mutating verb
@@ -127,6 +160,13 @@ tells you what is absent instead. Reach for it before every `resume` of a
 `failed`/`halted`/`interrupted` run: resume blind and you may just re-hit the
 same wall.
 
+`gauntlet status` is itself evidence-rich now: run elapsed time, cost so far,
+per-step `halt_reason`/`parked_reason`, heartbeat age, detected suspensions,
+and the quota reset time on a usage-limit park all render without opening a
+transcript. `gauntlet report <slug>` adds the per-profile cost split and
+cache-effectiveness columns (cache-read share per step type) for judging where
+a run's budget actually went.
+
 ## 6. Guardrails — the lines you do not cross
 
 These hold regardless of how stuck the run is. Each exists because crossing it
@@ -145,7 +185,10 @@ defeats the safety the pipeline is built on.
   drives verbs. Editing the worktree, the transcripts, the manifest, or a review
   artifact by hand breaks the clean-worktree invariant that makes review diffs and
   recovery meaningful. If something needs changing, it changes through a step, not
-  your editor.
+  your editor. **The one sanctioned exception:** a `parked_artifact_invalid` park
+  explicitly invites you to hand-fix the named artifact — that path is designed
+  for it, and the resume revalidates and records the edit (content-hash audit)
+  rather than trusting it blindly. No other state licenses an edit.
 
 ## 7. Handoff
 

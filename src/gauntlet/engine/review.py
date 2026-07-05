@@ -1947,7 +1947,9 @@ def _plan_review_response(
         for rec in man.steps:
             if (
                 rec.status == M.PARKED
-                and rec.parked_reason in M.RESPONSE_RESOLVABLE_PARK_REASONS
+                and M.normalize_parked_reason(
+                    rec.parked_reason, rec.type, rec.status
+                ) in M.RESPONSE_RESOLVABLE_PARK_REASONS
             ):
                 raise ReviewFailClosed(
                     f"review step {rec.id!r} parked on a cycle escalation its own "

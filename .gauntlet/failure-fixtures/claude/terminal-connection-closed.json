@@ -1,0 +1,7 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "result": "API Error: Connection closed mid-response. The response above may be incomplete.",
+  "total_cost_usd": 7.053689000000001
+}

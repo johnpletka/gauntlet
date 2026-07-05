@@ -623,7 +623,42 @@ def status(
     # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty
     # rather than a contract-breaking object (operator F-001/F-002/F-003).
     try:
+        from gauntlet.engine.pipeline import (
+            load_pipeline,
+            upstream_cycle_id_for_gate,
+        )
+
+        # The run's own pipeline snapshot (FR-5.6), loaded once and reused for the
+        # gate→cycle resolution, the effective-timeout lookup, and the gate context
+        # below. Fail-soft to None (a corrupt/absent snapshot degrades an advisory
+        # field, never crashes status).
+        try:
+            pipeline, _ = load_pipeline(run_instance_dir / "pipeline.yaml")
+        except (OSError, ValueError):
+            pipeline = None
+
         rstate = operator.compute_run_state(man, driver.state)
+        # FR-8.2 / F-001: when parked at a gate, name the cycle a reject would
+        # ACTUALLY re-drive — resolved from the pipeline snapshot with the same
+        # rule as the reject path (same non-foreach stage), not the manifest-order
+        # heuristic which can name a cross-stage/foreach cycle a reject never
+        # touches. Recompute the actions with the pipeline-resolved id (fail-soft
+        # to the pure default when the snapshot is unavailable).
+        if (
+            pipeline is not None
+            and rstate.state == operator.STATE_PARKED_GATE
+            and rstate.parked is not None
+        ):
+            gate_rec0 = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            if gate_rec0 is not None:
+                rstate = operator.compute_run_state(
+                    man, driver.state,
+                    gate_cycle_id=upstream_cycle_id_for_gate(pipeline, gate_rec0.id),
+                )
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
         # Advisory freshness (live-run-observability FR-5): the single I/O point
@@ -636,6 +671,65 @@ def status(
             streaming=bool(getattr(mgr.config, "stream_step_output", False)),
         )
 
+        # Suspend/sleep view (FR-5.3): heartbeat age, detected intervals, and the
+        # stall classification, sampled from disk here and threaded into the pure
+        # renderers so the JSON contract and human footer report the same value.
+        suspension = operator.compute_suspension_view(
+            man, run_instance_dir, driver.state,
+            agent_silence_s=getattr(mgr.config, "agent_silence_s",
+                                    operator.HB.DEFAULT_AGENT_SILENCE_S),
+            interval_s=getattr(mgr.config, "heartbeat_interval_s",
+                               operator.HB.DEFAULT_HEARTBEAT_INTERVAL_S),
+        )
+
+        # Timing/usage inputs (FR-7.1/FR-7.3), sampled once here (the clock is the
+        # single non-pure input) and threaded into both the JSON serializer and the
+        # human footer so the two never diverge. The current running step's
+        # effective timeout is resolved from the persisted pipeline snapshot using
+        # the SAME precedence as execution (per-step `timeout_s` → profile
+        # `step_timeout_s`), so a per-step override or a shell step's own timeout is
+        # reported, not a profile-only guess (F-003). Fail closed to null (advisory
+        # field) when the snapshot or the step is unresolvable.
+        from datetime import datetime as _dt, timezone as _tz
+
+        from gauntlet.engine.steptypes import resolve_step_timeout_s
+
+        now = _dt.now(_tz.utc)
+        current_step_timeout_s = None
+        if rstate.current_step:
+            cur = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.current_step),
+                None,
+            )
+            if cur is not None and cur.status == "running":
+                pstep = next(
+                    (s for s in pipeline.all_steps() if s.id == cur.id), None
+                ) if pipeline is not None else None
+                if pstep is not None:
+                    current_step_timeout_s = resolve_step_timeout_s(
+                        pstep, cur.agent, mgr.config
+                    )
+
+        # Gate decision context (FR-8.1): assembled only when parked at a human
+        # gate, from the manifest + the upstream cycle's persisted artifacts (the
+        # I/O point), then threaded into the pure serializer below like the other
+        # sampled inputs. None for every other state → `gate: null`. The pipeline
+        # snapshot resolves the upstream cycle (F-001) and the configured redaction
+        # list masks configured secrets (F-002); both are threaded through.
+        gate_ctx = None
+        if rstate.state == operator.STATE_PARKED_GATE and rstate.parked is not None:
+            gate_rec = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            if gate_rec is not None:
+                gate_ctx = operator.compute_gate_context(
+                    man, run_instance_dir, gate_rec,
+                    pipeline=pipeline, redaction=mgr.config.redaction,
+                )
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -644,6 +738,10 @@ def status(
                 man, driver, rstate, recon,
                 run_root=run_root, run_instance_dir=run_instance_dir,
                 current_step_freshness=freshness,
+                suspension=suspension,
+                gate=gate_ctx,
+                now=now,
+                current_step_timeout_s=current_step_timeout_s,
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -656,9 +754,25 @@ def status(
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
 
+    # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
+    # usage limit — the reset time, all sourced from the manifest so no parked
+    # state requires reading a transcript to identify the next command.
+    quota_reset_at = None
+    if rstate.state in (
+        operator.STATE_PARKED_USAGE_LIMIT, operator.STATE_PARKED_USAGE_WINDOW
+    ) and rstate.parked is not None:
+        pr = next(
+            (r for r in man.steps
+             if operator.render_step_id(r) == rstate.parked.step_id),
+            None,
+        )
+        quota_reset_at = pr.quota_reset_at if pr is not None else None
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
-        current_step_freshness=freshness,
+        current_step_freshness=freshness, suspension=suspension,
+        run_elapsed_s=operator._run_elapsed_s(man, now),
+        cost_usd=man.totals.cost_usd,
+        quota_reset_at=quota_reset_at,
     ):
         typer.echo(line)
 
@@ -1017,7 +1131,18 @@ def report(
 
     mgr = _manager()
     man = mgr.status(slug)
-    typer.echo(render_report(man), nl=False)
+    # FR-7.4 cold-start metric needs to know which profiles support session
+    # resume; resolve it from config (adapter capabilities). Best-effort: an
+    # unresolvable/unregistered adapter simply drops out of the resume set, so a
+    # profile's cold-start column reads `—` rather than crashing the report.
+    resume_capable: set[str] = set()
+    for name in mgr.config.agents:
+        try:
+            if mgr.config.profile(name).adapter_class().capabilities.resume:
+                resume_capable.add(name)
+        except (KeyError, AttributeError):
+            continue
+    typer.echo(render_report(man, resume_capable=resume_capable), nl=False)
     if trend:
         typer.echo("")
         typer.echo(render_trend(mgr.trend(slug)), nl=False)
@@ -1113,6 +1238,30 @@ def rollback(
     """Reset the branch + manifest to a phase boundary (FR-9.9, guarded)."""
     target = _manager().rollback(slug, phase)
     typer.echo(f"rolled back to {target[:10]}")
+
+
+ledger_app = typer.Typer(
+    no_args_is_help=True, help="Machine-global usage ledger (FR-10)."
+)
+app.add_typer(ledger_app, name="ledger")
+
+
+@ledger_app.command("backfill")
+def ledger_backfill() -> None:
+    """Reconstruct the usage ledger from this repo's existing run manifests (FR-10.1).
+
+    One-shot and idempotent: gives the window estimator history from the first
+    enforced run instead of a cold start. Re-running appends nothing (de-dup by
+    run_id::step_id).
+    """
+    from gauntlet.engine.ledger import default_ledger_path
+
+    res = _manager().backfill_ledger()
+    typer.echo(
+        f"ledger backfill: scanned {res.manifests} manifest(s), "
+        f"added {res.rows_added} row(s), skipped {res.rows_skipped} duplicate(s) "
+        f"→ {default_ledger_path()}"
+    )
 
 
 @app.command()

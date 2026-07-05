@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,102 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
 from gauntlet.engine.gitops import Identity
+from gauntlet.engine.heartbeat import (
+    DEFAULT_AGENT_SILENCE_S,
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_SUSPEND_CREDIT_CAP_S,
+)
 from gauntlet.logging.redact import RedactionSettings
 
+# Auto-resume modes (FR-3.4). ``notify`` (default) parks + notifies with the
+# reset time and never self-resumes; ``auto`` arms an in-process wait that
+# performs the FR-3.3 continuation resume when the quota window replenishes.
+RESUME_ON_QUOTA_NOTIFY = "notify"
+RESUME_ON_QUOTA_AUTO = "auto"
+_RESUME_ON_QUOTA_MODES = frozenset({RESUME_ON_QUOTA_NOTIFY, RESUME_ON_QUOTA_AUTO})
+
+# Intra-phase checkpoint-commit disposition (harness-efficiency FR-11.1).
+# ``keep`` (default) leaves ``PN wip:`` milestone commits in history; ``squash``
+# collapses them into the phase-end ``PN:`` commit.
+CHECKPOINT_COMMITS_KEEP = "keep"
+CHECKPOINT_COMMITS_SQUASH = "squash"
+_CHECKPOINT_COMMIT_MODES = frozenset(
+    {CHECKPOINT_COMMITS_KEEP, CHECKPOINT_COMMITS_SQUASH}
+)
+
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
+
+# --- effort tiering (harness-efficiency FR-6.1) ------------------------------
+# The NORMATIVE canonical effort enum. A profile/step `effort:` is drawn from
+# this set; anything else is a config-load error (never a silent drop). The
+# per-adapter *surface* below maps each canonical value onto the flag the
+# adapter actually accepts — a static, pinned fact (the flags are live-verified
+# in `.gauntlet/pins.yaml`), independent of the not-yet-ratified default effort
+# *values* (Q2). P7 ships the plumbing; the shipped defaults are a later,
+# measurement-gated config change.
+CANONICAL_EFFORTS = ("minimal", "low", "medium", "high")
+
+# adapter name -> {kwarg, accepted, remap}. ``kwarg`` is the adapter constructor
+# parameter the mapped value lands on; ``accepted`` are the canonical values the
+# adapter passes straight through; ``remap`` names a canonical value the adapter
+# cannot express directly and the substitute it maps to (with a load warning).
+# claude `--effort` accepts {low, medium, high} (pins.yaml), so canonical
+# ``minimal`` maps to ``low``; codex `-c model_reasoning_effort=` and the api
+# `reasoning_effort` param accept the full canonical set.
+_EFFORT_SURFACE: dict[str, dict[str, Any]] = {
+    "claude-code": {
+        "kwarg": "effort",
+        "accepted": frozenset({"low", "medium", "high"}),
+        "remap": {"minimal": "low"},
+    },
+    "codex": {
+        "kwarg": "reasoning_effort",
+        "accepted": frozenset({"minimal", "low", "medium", "high"}),
+        "remap": {},
+    },
+    "api": {
+        "kwarg": "reasoning_effort",
+        "accepted": frozenset({"minimal", "low", "medium", "high"}),
+        "remap": {},
+    },
+}
+
+
+def map_effort(adapter: str, canonical: str) -> tuple[str, str, str | None]:
+    """Map a canonical effort onto an adapter's ``(kwarg, value, warning)`` (FR-6.1).
+
+    Fail closed: raises :class:`ValueError` — a config-/pipeline-load error — when
+    ``canonical`` is not a canonical value, the adapter has no known effort
+    surface, or the adapter cannot express the value. The value is never silently
+    dropped. Returns a non-``None`` ``warning`` when the canonical value had to be
+    remapped to an adapter substitute (claude ``minimal`` → ``low``); callers
+    surface it at load time.
+    """
+    if canonical not in CANONICAL_EFFORTS:
+        raise ValueError(
+            f"effort {canonical!r} is not a canonical effort value; use one of "
+            f"{list(CANONICAL_EFFORTS)} (FR-6.1)"
+        )
+    surface = _EFFORT_SURFACE.get(adapter)
+    if surface is None:
+        raise ValueError(
+            f"adapter {adapter!r} has no effort surface; `effort:` is supported "
+            f"only for adapters {sorted(_EFFORT_SURFACE)} (FR-6.1)"
+        )
+    kwarg = surface["kwarg"]
+    if canonical in surface["accepted"]:
+        return kwarg, canonical, None
+    remap = surface["remap"].get(canonical)
+    if remap is not None:
+        return kwarg, remap, (
+            f"effort {canonical!r} is not accepted by the {adapter!r} adapter; "
+            f"mapping it to {remap!r} (FR-6.1)"
+        )
+    raise ValueError(
+        f"adapter {adapter!r} does not accept effort {canonical!r} "
+        f"(accepted: {sorted(surface['accepted'])}); it is a canonical value the "
+        "adapter cannot express — a config-load error, not a silent drop (FR-6.1)"
+    )
 
 # A POSIX environment-variable identifier. ``issue_tracker.api_key_env`` must
 # match this — it names the env var holding the token, never the token (§7).
@@ -66,23 +160,63 @@ class AgentProfile(BaseModel):
     adapter: str
     model: str | None = None
 
+    # Canonical reasoning-effort tier (FR-6.1), drawn from CANONICAL_EFFORTS.
+    # Mapped to the adapter's accepted flag at build time (claude `--effort`,
+    # codex `-c model_reasoning_effort=`, api `reasoning_effort`); an unsupported
+    # value fails at config load, never silently drops. Engine-level: stripped
+    # from the generic kwargs and re-injected as the adapter's mapped parameter.
+    effort: str | None = None
+
     # --- engine-level guards (FR-3.3); not passed to the adapter ---
     max_turns: int | None = None
     budget_usd: float | None = None
     step_timeout_s: float | None = None
 
+    @field_validator("effort")
+    @classmethod
+    def _validate_effort_enum(cls, v: str | None) -> str | None:
+        """`effort` must be a canonical value (FR-6.1); anything else fails at load."""
+        if v is None:
+            return None
+        name = str(v).strip().lower()
+        if name not in CANONICAL_EFFORTS:
+            raise ValueError(
+                f"effort must be one of {list(CANONICAL_EFFORTS)} (canonical enum, "
+                f"FR-6.1); got {v!r}"
+            )
+        return name
+
+    @model_validator(mode="after")
+    def _validate_effort_surface(self) -> AgentProfile:
+        """Reject an effort the profile's adapter cannot express, at load (FR-6.1).
+
+        The canonical enum is checked by the field validator; this cross-field
+        check confirms the adapter accepts the value and warns on a remap (claude
+        ``minimal`` → ``low``) so the substitution is visible, not silent."""
+        if self.effort is not None:
+            _kwarg, _value, warning = map_effort(self.adapter, self.effort)
+            if warning:
+                warnings.warn(warning, stacklevel=2)
+        return self
+
     def adapter_class(self) -> type:
         return get_adapter_class(self.adapter)
 
-    def _adapter_kwargs(self) -> dict[str, Any]:
-        guard_fields = {"max_turns", "budget_usd", "step_timeout_s"}
+    def _adapter_kwargs(self, effort_override: str | None = None) -> dict[str, Any]:
+        guard_fields = {"max_turns", "budget_usd", "step_timeout_s", "effort"}
         data = self.model_dump(exclude_none=True)
         data.pop("adapter", None)
         for f in guard_fields:
             data.pop(f, None)
+        # FR-6.1: map the canonical effort onto the adapter's accepted parameter
+        # (an override — e.g. a step-level `effort:` — wins over the profile's).
+        effort = effort_override if effort_override is not None else self.effort
+        if effort is not None:
+            kwarg, value, _warning = map_effort(self.adapter, effort)
+            data[kwarg] = value
         return data
 
-    def build_adapter(self) -> Any:
+    def build_adapter(self, *, effort: str | None = None) -> Any:
         """Construct the adapter, filtering kwargs to its constructor signature.
 
         Unknown profile keys (e.g. an adapter-specific flag the engine has never
@@ -91,7 +225,7 @@ class AgentProfile(BaseModel):
         ``__init__``; ``base_flags`` is linted here regardless of adapter.
         """
         cls = self.adapter_class()
-        kwargs = self._adapter_kwargs()
+        kwargs = self._adapter_kwargs(effort)
         base_flags = kwargs.get("base_flags")
         if isinstance(base_flags, list):
             lint_flags(base_flags)
@@ -113,6 +247,87 @@ class AgentProfile(BaseModel):
     def capabilities(self) -> Any:
         """Declared adapter capabilities (FR-2.3 load-time validation)."""
         return self.adapter_class().capabilities
+
+
+class ProviderWindow(BaseModel):
+    """One provider's usage-window budget (harness-efficiency FR-10.2).
+
+    Declares the sliding window (``window_hours``) and the budget within it
+    (``window_budget``, denominated in ``budget_unit`` — ``tokens`` sums
+    input+output, ``cost`` sums cost_usd). Before an agent step billing this
+    provider launches, the engine estimates the step's usage (median of historical
+    same-type/same-profile steps from the ledger, else ``fallback_estimate``) and
+    compares it to remaining headroom. With ``enforce: false`` (default) an
+    insufficient-headroom check is a WARNING (advisory: the ledger cannot see
+    non-gauntlet usage, so it under-counts); with ``enforce: true`` the run parks
+    ``usage_window`` before the step starts. All defaults are opt-in — an absent
+    ``providers:`` block leaves the run behaving exactly as before (FR-10.3).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    window_hours: float
+    window_budget: float
+    # Unit of ``window_budget`` and the per-step estimate; must agree with the
+    # ledger's canonical set (imported so config and estimator never drift).
+    budget_unit: str = "tokens"
+    # Advisory by default: warn, don't park (FR-10.3). ``true`` parks pre-step.
+    enforce: bool = False
+    # Per-step estimate used when the ledger has no same-type/same-profile
+    # history (FR-10.2 "configured fallback"). ``None`` ⇒ unknown ⇒ admit (a
+    # missing estimate never blocks a run — fail toward the run, PRD §4.2).
+    fallback_estimate: float | None = None
+
+    @field_validator("budget_unit")
+    @classmethod
+    def _validate_budget_unit(cls, v: str) -> str:
+        """``budget_unit`` must be a canonical ledger unit; else fail closed."""
+        from gauntlet.engine.ledger import BUDGET_UNITS
+
+        name = (v or "").strip().lower()
+        if name not in BUDGET_UNITS:
+            raise ValueError(
+                f"providers.*.budget_unit must be one of {sorted(BUDGET_UNITS)}; "
+                f"got {v!r} (FR-10.2)"
+            )
+        return name
+
+    @field_validator("window_hours")
+    @classmethod
+    def _validate_window_hours(cls, v: float) -> float:
+        """A window must span a positive number of hours (FR-10.2)."""
+        if v <= 0:
+            raise ValueError(
+                f"providers.*.window_hours must be positive; got {v!r}"
+            )
+        return v
+
+    @field_validator("window_budget")
+    @classmethod
+    def _validate_window_budget(cls, v: float) -> float:
+        """A window budget must be non-negative (FR-10.2)."""
+        if v < 0:
+            raise ValueError(
+                f"providers.*.window_budget must be non-negative; got {v!r}"
+            )
+        return v
+
+    @field_validator("fallback_estimate")
+    @classmethod
+    def _validate_fallback_estimate(cls, v: float | None) -> float | None:
+        """A fallback estimate must be null or non-negative (FR-10.2).
+
+        Admission treats a KNOWN estimate as sufficient whenever
+        ``estimate <= headroom`` (:func:`ledger.admit_step`). A NEGATIVE fallback
+        would therefore make an over-budget provider with no history read as
+        sufficient — a fail-OPEN on a safety gate. Reject it at load so a bad
+        config fails closed instead (fail-closed posture, §2)."""
+        if v is not None and v < 0:
+            raise ValueError(
+                f"providers.*.fallback_estimate must be null or non-negative; "
+                f"got {v!r} (FR-10.2)"
+            )
+        return v
 
 
 class IssueTrackerConfig(BaseModel):
@@ -249,11 +464,57 @@ class RunConfig(BaseModel):
     agents: dict[str, AgentProfile] = Field(default_factory=dict)
     identities: dict[str, Identity] = Field(default_factory=dict)
 
+    # --- usage-window admission (harness-efficiency FR-10.2/10.3) ------------
+    # Optional per-provider window budgets keyed by provider name (e.g.
+    # ``anthropic``). Empty by default → no admission check, so a run behaves
+    # exactly as before. A step billing a window-constrained provider is estimated
+    # against remaining headroom (from the machine-global ledger) before it
+    # launches; short headroom warns (advisory) or, with ``enforce: true``, parks
+    # the run ``usage_window`` at a clean boundary before any work is in flight.
+    providers: dict[str, ProviderWindow] = Field(default_factory=dict)
+
     # Transaction-boundary policy on resume of a dirty interrupted step (F-003).
     interrupted_step: str = "park"  # park | reset_to_base
 
     # Reviewer-mutation policy (FR-9.6): commit | revert | halt.
     reviewer_mutation: str = "commit"
+
+    # --- intra-phase checkpoint commits (harness-efficiency FR-11.1) ---------
+    # How the phase-end `PN:` commit treats the builder's `PN wip:` milestone
+    # commits: `keep` (default — the milestones are audit data, left in history;
+    # if they already committed all of the phase's work, the `PN:` commit is an
+    # empty marker so the reviewer handoff always lands on a `PN:` commit) or
+    # `squash` (collapse the `wip:` commits into one non-empty `PN:` commit). The
+    # reviewed range diff `base..<PN:>` is identical either way.
+    checkpoint_commits: str = "keep"
+
+    # --- suspend/sleep resilience (harness-efficiency FR-5) ------------------
+    # The driver's heartbeat cadence (FR-5.1). Detection threshold is a fixed 2×
+    # this in engine/heartbeat.py, so lengthening the cadence loosens detection.
+    heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
+    # Max detected host-suspension credited back to a step deadline (FR-5.2);
+    # past it the step halts with halt_reason=timeout. Default 12h.
+    suspend_credit_cap_s: float = DEFAULT_SUSPEND_CREDIT_CAP_S
+    # `agent_silent` threshold (FR-5.3): a healthy driver whose adapter child has
+    # produced no output for longer than this is classified hung, not asleep.
+    agent_silence_s: float = DEFAULT_AGENT_SILENCE_S
+    # Keep the host awake for the driver's lifetime via `caffeinate -i` on darwin
+    # (FR-5.4). Default false — changing host power behavior is an explicit human
+    # choice (CLAUDE.md machine-state rule). Ignored (with a warning) off darwin.
+    keep_awake: bool = False
+
+    # --- usage-limit auto-resume (harness-efficiency FR-3.4) -----------------
+    # `notify` (default): park on a usage limit + notify with the reset time; the
+    # operator resumes. `auto`: the live driver waits until the projected reset
+    # and performs the FR-3.3 continuation resume itself. `auto` needs the driver
+    # to survive the wait — `keep_awake: true` or an external scheduler
+    # (`external_scheduler: true` declares the operator re-invokes `gauntlet
+    # resume` via cron/launchd); enabling `auto` with neither is a load warning.
+    resume_on_quota: str = RESUME_ON_QUOTA_NOTIFY
+    external_scheduler: bool = False
+    # Spaced auto-resume attempts before falling back to a plain usage_limit park
+    # with an exhaustion note (FR-3.4) — a persistent limit is not a hot loop.
+    max_auto_resume_attempts: int = 3
 
     # Live run observability (live-run-observability PRD, FR-6.1): stream each
     # CLI agent's NDJSON stdout to events.jsonl incrementally as it arrives,
@@ -272,6 +533,16 @@ class RunConfig(BaseModel):
     #   "strict" — any accepted-but-unresolved finding loops (the P4 original);
     #     higher fidelity, but oscillates on majors/minors.
     cycle_convergence: str = "blocking"
+
+    # --- concurrent triage (harness-efficiency FR-9.1) ----------------------
+    # Independent per-finding triage calls run on a bounded worker pool. Findings
+    # are independent by design (point-by-point triage with untrusted-data
+    # wrapping, PRD-gauntlet §8), so concurrency changes only latency and cost —
+    # never an artifact byte: an all-success round's `triage.json` is byte-
+    # identical to the sequential result (verdicts assembled in finding order).
+    # The triager runs on the cheap unconstrained provider, so this pool does not
+    # contend for the builder's constrained window. Default 4.
+    triage_concurrency: int = 4
 
     # Configurable redaction list (FR-4.4), default-on; the transcript logger
     # builds its Redactor from this.
@@ -306,6 +577,62 @@ class RunConfig(BaseModel):
         value would let ``gauntlet serve`` browse files outside the repo (review
         F-001). Same repo-relative containment as asset_root."""
         return _validate_repo_relative("run_root", v)
+
+    @field_validator("resume_on_quota")
+    @classmethod
+    def _validate_resume_on_quota(cls, v: str) -> str:
+        """Only ``notify``/``auto`` are valid; anything else fails closed (FR-3.4)."""
+        name = (v or "").strip().lower()
+        if name not in _RESUME_ON_QUOTA_MODES:
+            raise ValueError(
+                f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
+                f"got {v!r}"
+            )
+        return name
+
+    @field_validator("checkpoint_commits")
+    @classmethod
+    def _validate_checkpoint_commits(cls, v: str) -> str:
+        """Only ``keep``/``squash`` are valid; anything else fails closed (FR-11.1)."""
+        name = (v or "").strip().lower()
+        if name not in _CHECKPOINT_COMMIT_MODES:
+            raise ValueError(
+                f"checkpoint_commits must be one of "
+                f"{sorted(_CHECKPOINT_COMMIT_MODES)}; got {v!r}"
+            )
+        return name
+
+    @field_validator("triage_concurrency")
+    @classmethod
+    def _validate_triage_concurrency(cls, v: int) -> int:
+        """A pool of at least 1 worker; fail closed on a non-positive value (FR-9.1)."""
+        if v < 1:
+            raise ValueError(f"triage_concurrency must be >= 1; got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _warn_auto_resume_needs_survival(self) -> RunConfig:
+        """Warn when ``auto`` cannot keep the driver alive across the wait (FR-3.4).
+
+        ``auto`` performs an in-process wait, so the driver must survive it —
+        either via ``keep_awake: true`` (caffeinate) or a declared external
+        scheduler that re-invokes ``gauntlet resume``. With neither, ``auto`` will
+        still reconcile a due schedule on the next manual resume, but its
+        promise (self-resume without operator action) does not hold — surface
+        that at load rather than silently."""
+        if (
+            self.resume_on_quota == RESUME_ON_QUOTA_AUTO
+            and not self.keep_awake
+            and not self.external_scheduler
+        ):
+            warnings.warn(
+                "resume_on_quota: auto without keep_awake or an external "
+                "scheduler — the driver may not survive the quota wait, so "
+                "auto-resume falls back to reconciliation on the next manual "
+                "`gauntlet resume` (FR-3.4).",
+                stacklevel=2,
+            )
+        return self
 
     @model_validator(mode="after")
     def _redact_tracker_token(self) -> RunConfig:

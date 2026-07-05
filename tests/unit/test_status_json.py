@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from gauntlet.adapters._structured import validate_schema
@@ -77,6 +78,13 @@ def _payload(
         (M.RUN_PARKED,
          [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_UPSTREAM_CONFLICT)],
          op.LIVENESS_NONE, op.STATE_PARKED_FOR_RESPONSE),
+        (M.RUN_PARKED,
+         [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+         op.LIVENESS_NONE, op.STATE_PARKED_USAGE_LIMIT),
+        (M.RUN_PARKED,
+         [_step("plan-author", "agent_task", M.PARKED,
+                reason=M.PARKED_REASON_ARTIFACT_INVALID)],
+         op.LIVENESS_NONE, op.STATE_PARKED_ARTIFACT_INVALID),
         (M.RUN_FAILED, [_step("s", "agent_task", M.FAILED)], op.LIVENESS_NONE,
          op.STATE_FAILED),
         (M.RUN_FAILED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
@@ -193,24 +201,48 @@ def test_section_6_2_example_validates():
         "run_status": "parked",
         "state": "parked_gate",
         "current_step": "impl-cycle.0",
+        # Additive FR-7.1 timing/usage fields: always present, null when N/A.
+        "current_step_elapsed_s": None,
+        "current_step_timeout_remaining_s": None,
+        "run_elapsed_s": 1820.0,
+        "totals": {"input_tokens": 41200, "output_tokens": 9800,
+                   "cached_input_tokens": 12000, "cost_usd": 1.87},
+        "agent_usage": {
+            "builder": {"input_tokens": 41200, "output_tokens": 9800,
+                        "cached_input_tokens": 12000, "cost_usd": 1.87}
+        },
+        # Additive FR-10.3 advisory channel: always present, empty when none.
+        "warnings": [],
+        "quota": None,
         "driver": {"state": "none", "pid": None, "since": None, "host": None},
-        "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": None},
+        # FR-7.2: a human_gate park now stamps/emits the normalized `gate` reason.
+        "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": "gate"},
         "failure": None,
         "reconciliation": None,
         "current_step_freshness": None,
+        # Additive FR-5.3 field: always present, null when nothing to report.
+        "suspension": None,
+        # PRD §6 gate block: always present, body populated in P8; null for now.
+        "gate": None,
         "steps": [
-            {"id": "prd-cycle", "iteration": None, "status": "done"},
-            {"id": "impl-cycle", "iteration": 0, "status": "parked"},
+            {"id": "prd-cycle", "iteration": None, "status": "done",
+             "duration_s": 620.0, "notes": None,
+             "halt_reason": None, "parked_reason": None},
+            {"id": "impl-cycle", "iteration": 0, "status": "parked",
+             "duration_s": None, "notes": "awaiting human decision",
+             "halt_reason": None, "parked_reason": "gate"},
         ],
         "next_actions": [
             {"label": "approve", "kind": "decide",
              "argv": ["gauntlet", "approve", "operator-aids"],
              "required_inputs": [], "executable": True,
-             "command": "gauntlet approve operator-aids"},
+             "command": "gauntlet approve operator-aids",
+             "consequence": "continues the run past this gate to the next stage"},
             {"label": "reject", "kind": "decide",
              "argv": ["gauntlet", "reject", "operator-aids", "--notes"],
              "required_inputs": ["notes"], "executable": False,
-             "command": 'gauntlet reject operator-aids --notes "<your reason>"'},
+             "command": 'gauntlet reject operator-aids --notes "<your reason>"',
+             "consequence": "terminally rejects the gate (no upstream cycle to re-run)"},
         ],
     }
     validate_schema(example, STATUS_SCHEMA)
@@ -251,6 +283,42 @@ def test_json_is_a_lone_parseable_object_exit_zero(
     payload = json.loads(result.stdout)  # parses as a single JSON value
     assert isinstance(payload, dict)
     assert payload["state"] == expected_state
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_status_json_resolves_shell_step_timeout_from_snapshot(tmp_path, monkeypatch):
+    # F-003: the status path resolves the effective timeout from the persisted
+    # pipeline.yaml snapshot with the same precedence as execution. A running
+    # SHELL step carries its own `timeout_s` and no agent, so the old profile-only
+    # path reported `current_step_timeout_remaining_s: null`; it now reports the
+    # real deadline.
+    (tmp_path / ".gauntlet").mkdir()
+    (tmp_path / ".gauntlet" / "config.yaml").write_text("{}\n")
+    run_dir = tmp_path / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    pipeline = {
+        "name": "p", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {"id": "lint", "type": "shell", "run": "echo hi", "timeout_s": 100000},
+        ]}],
+    }
+    (run_dir / "pipeline.yaml").write_text(yaml.dump(pipeline))
+    man = {
+        "run_id": "run-1", "slug": "demo", "branch": "gauntlet/demo",
+        "base_branch": "main", "pipeline": {"name": "p", "version": 1, "hash": "h"},
+        "status": "running",
+        "steps": [{"id": "lint", "type": "shell", "status": "running",
+                   "started": "2026-07-02T00:00:00+00:00"}],
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (tmp_path / "runs" / "demo" / "active-run.txt").write_text("run-1\n")
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status", "demo", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["current_step"] == "lint"
+    # A real deadline is reported (a number), not null as the profile-only path did.
+    assert payload["current_step_timeout_remaining_s"] is not None
     validate_schema(payload, STATUS_SCHEMA)
 
 
@@ -333,10 +401,213 @@ def test_malformed_driver_since_fails_closed():
         _payload(man, op.LIVENESS_ALIVE, driver=bad_driver)
 
 
+def test_usage_limit_park_reports_resume_next_action():
+    # FR-3.2: a usage_limit park surfaces as the distinct `parked_usage_limit`
+    # state whose ONLY next action is a plain `resume` (no --response decision).
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("implement", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["state"] == "parked_usage_limit"
+    assert payload["parked"]["reason"] == "usage_limit"
+    assert payload["parked"]["step_id"] == "implement"
+    validate_schema(payload, STATUS_SCHEMA)
+    actions = payload["next_actions"]
+    assert [a["label"] for a in actions] == ["resume"]
+    assert actions[0]["kind"] == "control"
+    assert actions[0]["executable"] is True
+    assert actions[0]["command"] == "gauntlet resume demo"
+
+
+def test_gate_block_always_present_and_null_when_not_threaded():
+    # PRD §6 promises a top-level `gate {...} | null` in the status contract. The
+    # field is required by the schema (a consumer can rely on it) and emitted for
+    # every state class. The POPULATED body (P8/FR-8.1) is assembled by the
+    # I/O-bearing operator.compute_gate_context in the caller and threaded in; when
+    # it is NOT threaded (the pure serializer's default) the block is `null` even
+    # at a gate park — a valid degraded case (fail-soft, never a crash).
+    assert "gate" in STATUS_SCHEMA["required"]
+    for status, steps, liveness in [
+        (M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)], op.LIVENESS_ALIVE),
+        (M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)], op.LIVENESS_NONE),
+        (M.RUN_DONE, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE),
+    ]:
+        payload = _payload(_manifest(status, steps), liveness)
+        assert "gate" in payload and payload["gate"] is None
+        validate_schema(payload, STATUS_SCHEMA)
+    # The schema requires the field: dropping it fails validation.
+    payload = _payload(
+        _manifest(M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)]),
+        op.LIVENESS_NONE,
+    )
+    payload.pop("gate")
+    with pytest.raises(ValueError):
+        validate_schema(payload, STATUS_SCHEMA)
+
+
+# --- FR-10.3: advisory warnings surface in the status contract ---------------
+def test_manifest_warnings_surface_in_status_payload():
+    # FR-10.3: an advisory usage-window shortfall stamped into manifest.warnings
+    # is surfaced by `status` (not only the manifest), so an operator does not
+    # have to open the manifest to see it (F-001).
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    warn = "[implement] usage-window admission (FR-10.3): provider 'anthropic' …"
+    man.warnings.append(warn)
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    assert payload["warnings"] == [warn]
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_warnings_always_present_empty_when_none():
+    # Always present, empty array when no warning was recorded (never omitted).
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    assert payload["warnings"] == []
+    validate_schema(payload, STATUS_SCHEMA)
+    # The schema requires the field: dropping it fails validation.
+    payload.pop("warnings")
+    with pytest.raises(ValueError):
+        validate_schema(payload, STATUS_SCHEMA)
+
+
 def test_embedded_schema_matches_committed_file():
     # operator validates against an EMBEDDED copy of the schema (the committed
     # file is not packaged in the wheel); guard the two against drift (F-003).
     assert op.STATUS_SCHEMA == STATUS_SCHEMA
+
+
+# --- FR-7.1: additive status fields (timing, usage, quota, per-step) ----------
+from datetime import datetime, timezone  # noqa: E402
+
+_V0_SCHEMA = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "status_schema_v0.json").read_text()
+)
+
+
+def test_new_fields_present_and_valid():
+    # Every FR-7.1 field is always present (nullable, never omitted) and the
+    # payload validates against the shipped schema.
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    for key in ("current_step_elapsed_s", "current_step_timeout_remaining_s",
+                "run_elapsed_s", "totals", "agent_usage", "quota"):
+        assert key in payload, key
+    for key in ("duration_s", "notes", "halt_reason", "parked_reason"):
+        assert key in payload["steps"][0], key
+    assert set(payload["totals"]) == {
+        "input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"
+    }
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_timing_and_usage_values_from_manifest():
+    # Deterministic timing with a fixed `now`; totals/agent_usage from the manifest.
+    man = _manifest(M.RUN_RUNNING, [
+        StepRecord(id="s", type="agent_task", status=M.RUNNING,
+                   started="2026-07-02T04:00:00+00:00"),
+    ])
+    man.totals = M.UsageTotals(input_tokens=100, output_tokens=20,
+                               cached_input_tokens=40, cost_usd=1.25)
+    man.agent_usage["builder"] = M.UsageTotals(input_tokens=100, output_tokens=20,
+                                               cached_input_tokens=40, cost_usd=1.25)
+    now = datetime(2026, 7, 2, 4, 5, 0, tzinfo=timezone.utc)  # +300s
+    rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
+    payload = op.status_payload(
+        man, op.DriverInfo(op.LIVENESS_ALIVE, None, None, None), rstate, None,
+        run_root=Path("/runs"), run_instance_dir=Path("/runs/demo/run-x"),
+        now=now, current_step_timeout_s=600.0,
+    )
+    assert payload["current_step_elapsed_s"] == 300.0
+    assert payload["current_step_timeout_remaining_s"] == 300.0  # 600 - 300
+    assert payload["run_elapsed_s"] == 300.0
+    assert payload["steps"][0]["duration_s"] == 300.0
+    assert payload["totals"]["cost_usd"] == 1.25
+    assert payload["agent_usage"]["builder"]["cached_input_tokens"] == 40
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_quota_block_present_only_on_usage_limit_park():
+    man = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                   quota_reset_at="2026-07-02T09:00:00+00:00"),
+    ])
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["state"] == "parked_usage_limit"
+    assert payload["quota"] == {"reset_at": "2026-07-02T09:00:00+00:00"}
+    validate_schema(payload, STATUS_SCHEMA)
+    # A gate park has no quota block.
+    gate = _manifest(M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)])
+    assert _payload(gate, op.LIVENESS_NONE)["quota"] is None
+
+
+def test_per_step_reason_fields_are_disjoint_and_normalized():
+    man = _manifest(M.RUN_FAILED, [
+        StepRecord(id="a", type="agent_task", status=M.HALTED,
+                   halt_reason=M.HALT_REASON_TIMEOUT),
+        StepRecord(id="b", type="adversarial_cycle", status=M.PARKED,
+                   parked_reason="cycle_escalation"),  # legacy → response
+    ])
+    payload = _payload(man, op.LIVENESS_NONE)
+    a, b = payload["steps"]
+    assert a["halt_reason"] == "timeout" and a["parked_reason"] is None
+    assert b["parked_reason"] == "response" and b["halt_reason"] is None
+
+
+def test_new_output_fails_against_captured_v0_schema():
+    # FR-7.1 re-pin cost, documented not hidden: a consumer validating the new
+    # output against a PINNED pre-PRD schema copy (additionalProperties:false)
+    # rejects the additive fields. This asserts the break surfaces at upgrade.
+    assert _V0_SCHEMA.get("additionalProperties") is False
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    with pytest.raises(ValueError):
+        validate_schema(payload, _V0_SCHEMA)
+
+
+# --- P3 exit criterion: every reachable state is explainable from --json alone
+@pytest.mark.parametrize(
+    "status, steps, liveness, expect_state, expect_cause_field",
+    [
+        (M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)], op.LIVENESS_NONE,
+         "parked_gate", ("parked", "reason", "gate")),
+        (M.RUN_PARKED,
+         [StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                     parked_reason=M.PARKED_REASON_RESPONSE)],
+         op.LIVENESS_NONE, "parked_for_response", ("parked", "reason", "response")),
+        (M.RUN_PARKED,
+         [StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                     parked_reason=M.PARKED_REASON_USAGE_LIMIT)],
+         op.LIVENESS_NONE, "parked_usage_limit", ("parked", "reason", "usage_limit")),
+        (M.RUN_PARKED,
+         [StepRecord(id="s", type="agent_task", status=M.HALTED,
+                     halt_reason=M.HALT_REASON_TIMEOUT)],
+         op.LIVENESS_NONE, "halted", ("steps", 0, "halt_reason", "timeout")),
+        (M.RUN_FAILED,
+         [StepRecord(id="s", type="agent_task", status=M.FAILED,
+                     halt_reason=M.HALT_REASON_ADAPTER_ERROR)],
+         op.LIVENESS_NONE, "failed", ("steps", 0, "halt_reason", "adapter_error")),
+        (M.RUN_PARKED,
+         [StepRecord(id="s", type="agent_task", status=M.INTERRUPTED,
+                     halt_reason=M.HALT_REASON_SIGNAL_KILL)],
+         op.LIVENESS_NONE, "interrupted", ("steps", 0, "halt_reason", "signal_kill")),
+    ],
+)
+def test_every_state_explainable_from_json(
+    status, steps, liveness, expect_state, expect_cause_field
+):
+    payload = _payload(_manifest(status, steps), liveness)
+    assert payload["state"] == expect_state
+    # The identifying cause is present in the JSON, and a next action is offered.
+    if expect_cause_field[0] == "parked":
+        _, key, val = expect_cause_field
+        assert payload["parked"][key] == val
+    else:
+        _, idx, key, val = expect_cause_field
+        assert payload["steps"][idx][key] == val
+    assert payload["next_actions"]  # a concrete next command is always offered
+    validate_schema(payload, STATUS_SCHEMA)
 
 
 # --- F-004: the schema enforces the normative §6.1 timestamp for driver.since -

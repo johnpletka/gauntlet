@@ -18,35 +18,161 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# --- park reasons (FR-2.1) ---------------------------------------------------
-# Single enum-valued discriminator that tells an UPSTREAM CONFLICT park from
-# every other park (human_gate, budget/timeout halt, generic agent re-run). It
-# is the ONLY signal `gauntlet resume --response` uses to decide whether a
-# parked step is a conflict park; it carries no conflict content (the rich
-# conflict metadata is deferred, PRD §7). v1 has exactly one value.
-PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"
-# A parked ``adversarial_cycle`` whose own loop cannot resolve a finding without
-# a human: an FR-10.4 upstream invalidation, an FR-10.5 max_rounds exhaustion
-# with open blockers, or a triage escalation no configured agent could settle.
-# Unlike the builder's UPSTREAM CONFLICT (an ``agent_task`` park), this is
-# surfaced by the reviewer/triager, so it gets its own discriminator — and like
-# the conflict park it is human-decision-resolvable via ``gauntlet resume
-# --response`` (the decision is injected into the cycle's reviewer/triager on the
-# next re-drive). It is current-state, not a latch, cleared like every other
-# parked_reason on any non-cycle-escalation finalization.
-PARKED_REASON_CYCLE_ESCALATION = "cycle_escalation"
+# --- park reasons (PRD FR-7.2 enum) ------------------------------------------
+# The canonical ``parked_reason`` enum a PARKED step carries (harness-efficiency
+# FR-7.2, PRD §6). Exactly one is stamped per park; it is DISJOINT from
+# ``halt_reason`` (never both set) and CURRENT-STATE (cleared on any non-park
+# finalization). ``status --json`` and ``schemas/status.json`` emit/accept only
+# these five values (never a legacy value or a null-reason on a park).
+
+# A step (agent_task or adversarial_cycle) interrupted by a provider usage limit
+# / rate limit / overload (FR-3.2). Needs NO human decision — the worktree and
+# CLI session are preserved and a PLAIN `gauntlet resume` continues the persisted
+# session with a short continuation prompt (FR-3.3). Deliberately NOT in
+# RESPONSE_RESOLVABLE_PARK_REASONS.
+PARKED_REASON_USAGE_LIMIT = "usage_limit"
+# A pre-step park because the provider usage window has insufficient headroom for
+# the next step (FR-10.3, ``enforce: true``). P3 defines the value; P10 wires the
+# admission behavior. A plain `gauntlet resume` retries once the window replenishes.
+PARKED_REASON_USAGE_WINDOW = "usage_window"
+# A park because an agent-authored structured artifact failed validation after the
+# bounded in-session repair loop (FR-2.2). P3 defines the value; P4 wires the
+# validator/repair/park behavior. A plain `gauntlet resume` re-runs ONLY the
+# validator against the (possibly hand-edited) artifact.
+PARKED_REASON_ARTIFACT_INVALID = "artifact_invalid"
+# A human-decision park: the builder halted on an UPSTREAM CONFLICT (an
+# ``agent_task`` park) OR a reviewer/triager escalated an ``adversarial_cycle``
+# finding no configured agent could settle. Both are resolved by ``gauntlet
+# resume --response`` (FR-10.4); the agent_task-vs-cycle distinction that governs
+# HOW the decision is re-driven is recovered from the step ``type``
+# (RESPONDABLE_STEP_TYPES), so one value suffices for BOTH.
+PARKED_REASON_RESPONSE = "response"
+# A park at a human ratification gate (``human_gate``): awaiting approve/reject.
+PARKED_REASON_GATE = "gate"
+
+# The complete PRD parked_reason enum (the only values written / emitted).
+PARKED_REASONS = frozenset(
+    {
+        PARKED_REASON_USAGE_LIMIT,
+        PARKED_REASON_USAGE_WINDOW,
+        PARKED_REASON_ARTIFACT_INVALID,
+        PARKED_REASON_RESPONSE,
+        PARKED_REASON_GATE,
+    }
+)
+
+# --- legacy parked_reason values (READ-SIDE ONLY, FR-7.2 legacy contract) -----
+# Pre-P3 runs persisted two current-state discriminators absent from the PRD
+# enum, and stamped a null parked_reason on a ``human_gate`` park. They are never
+# WRITTEN or EMITTED again; they enter only through :func:`normalize_parked_reason`
+# on read, which maps both to ``response`` (their agent_task-vs-cycle distinction
+# is recovered from the step type). Kept as named constants so a test can build a
+# legacy fixture and so the mapper is self-documenting.
+PARKED_REASON_UPSTREAM_CONFLICT = "upstream_conflict"  # legacy → response
+PARKED_REASON_CYCLE_ESCALATION = "cycle_escalation"  # legacy → response
+_LEGACY_PARKED_REASON_MAP = {
+    PARKED_REASON_UPSTREAM_CONFLICT: PARKED_REASON_RESPONSE,
+    PARKED_REASON_CYCLE_ESCALATION: PARKED_REASON_RESPONSE,
+}
+
+
+def normalize_parked_reason(
+    reason: str | None, step_type: str | None, status: str | None = None
+) -> str | None:
+    """Map any persisted ``parked_reason`` to the PRD FR-7.2 enum (read-side).
+
+    The single normalization point (FR-7.2 legacy contract, point 2): every read
+    surface — the status classifier, `--response` resume routing, status/schema
+    rendering — passes a persisted value through here so all operate on the PRD
+    enum set. Legacy manifests on disk are read through this mapper, never
+    rewritten in place.
+
+    * A PRD value passes through unchanged.
+    * A legacy value (``upstream_conflict`` / ``cycle_escalation``) maps to
+      ``response`` — the two collapse because the resume-routing distinction they
+      carried is recovered from the step ``type``.
+    * A ``None`` reason on a PARKED ``human_gate`` step (the pre-P3 gate shape)
+      maps to ``gate``. ``None`` on any other step (a non-park / cleared record)
+      stays ``None``. ``status`` is optional so a caller that has already
+      established the step is parked (the classifier, which only reaches here for
+      the unique PARKED step) can omit it and still get the gate mapping.
+    * An unrecognized non-null value is returned UNCHANGED, so it fails closed
+      downstream (the classifier maps it to ``unknown``; the schema enum rejects
+      it at emission) rather than being silently coerced into a PRD value — the
+      complete set of engine-produced current-state values is verified to map
+      1:1, so a non-mapping value can only be a corrupt manifest (legacy-contract
+      point 5).
+    """
+    if reason in PARKED_REASONS:
+        return reason
+    if reason in _LEGACY_PARKED_REASON_MAP:
+        return _LEGACY_PARKED_REASON_MAP[reason]
+    if reason is None:
+        gate_shape = step_type == "human_gate" and (status in (None, PARKED))
+        return PARKED_REASON_GATE if gate_shape else None
+    return reason  # unrecognized → fail closed downstream, never coerced
+
 
 # Park reasons a human resolves by supplying a `gauntlet resume --response`
 # decision (FR-1.1 / FR-10.4): resuming such a park WITHOUT `--response` errors
-# and asks for one, instead of silently re-running into the same wall.
-RESPONSE_RESOLVABLE_PARK_REASONS = frozenset(
-    {PARKED_REASON_UPSTREAM_CONFLICT, PARKED_REASON_CYCLE_ESCALATION}
+# and asks for one, instead of silently re-running into the same wall. Collapsed
+# to the single PRD value ``response``; the two legacy values are accepted only
+# on read (through :func:`normalize_parked_reason`), never compared directly.
+RESPONSE_RESOLVABLE_PARK_REASONS = frozenset({PARKED_REASON_RESPONSE})
+# Step types that accept a `--response` decision when parked OR failed. An
+# `agent_task` (the builder halting on UPSTREAM CONFLICT) re-runs with the
+# decision injected into its prompt; an `adversarial_cycle` re-drives with it
+# injected into the reviewer/triager so they re-evaluate the parked finding. A
+# `commit` step whose message-drafting failed the FR-9.2 format check (a benign,
+# otherwise-unrecoverable terminal failure) re-runs consuming the decision: a
+# response that is itself a valid commit message is used verbatim (a
+# deterministic operator override for a drafter that could not produce a legal
+# header), else it steers the redraft.
+RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle", "commit"})
+
+# --- halt reasons (terminal HALTED/FAILED/INTERRUPTED discriminator) ---------
+# The disjoint sibling of ``parked_reason`` (harness-efficiency FR-7.2, PRD §6):
+# a terminal step carries a ``halt_reason`` while ``parked_reason`` is null, and
+# a PARKED step the reverse — the two are never both set. P2 introduced the field
+# with the single value it needed — ``timeout`` — for the suspend-cap timeout
+# halt (FR-5.2); P3 completes the enum and the full disjointness invariant.
+# Current-state like ``parked_reason``: set on the just-finished execution and
+# cleared on any finalization that does not re-set it. The applicable value is
+# mandatory on every engine-written non-DONE terminal step (older manifests
+# predating P3 carry ``None``, which the schema tolerates as nullable).
+HALT_REASON_TIMEOUT = "timeout"  # step/adapter deadline (incl. suspend-cap, FR-5.2)
+HALT_REASON_BUDGET = "budget"  # per-step/profile cost budget guard (FR-3.3)
+HALT_REASON_JUDGE_DENY = "judge_deny"  # a judge deny terminated the step
+HALT_REASON_SIGNAL_KILL = "signal_kill"  # killed mid-step by a signal / crash
+HALT_REASON_ADAPTER_ERROR = "adapter_error"  # a terminal adapter/handler failure
+HALT_REASON_PRECONDITION = "precondition"  # a fail-closed guard fired (nothing ran)
+HALT_REASON_OPERATOR_RECOVER = "operator_recover"  # `gauntlet recover` ended it
+
+# The complete PRD halt_reason enum.
+HALT_REASONS = frozenset(
+    {
+        HALT_REASON_TIMEOUT,
+        HALT_REASON_BUDGET,
+        HALT_REASON_JUDGE_DENY,
+        HALT_REASON_SIGNAL_KILL,
+        HALT_REASON_ADAPTER_ERROR,
+        HALT_REASON_PRECONDITION,
+        HALT_REASON_OPERATOR_RECOVER,
+    }
 )
-# Step types that accept a `--response` decision when parked. An `agent_task`
-# (the builder halting on UPSTREAM CONFLICT) re-runs with the decision injected
-# into its prompt; an `adversarial_cycle` re-drives with it injected into the
-# reviewer/triager so they re-evaluate the parked finding.
-RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle"})
+
+
+def reason_fields_disjoint(
+    halt_reason: str | None, parked_reason: str | None
+) -> bool:
+    """The FR-7.2 disjointness invariant: never both reason fields set at once.
+
+    A single pure predicate (the plan's "validator asserting disjointness"): a
+    non-DONE step is EITHER terminal (``halt_reason`` set, ``parked_reason`` null)
+    OR parked (``parked_reason`` set, ``halt_reason`` null). Both-set is a
+    contract violation the engine must never persist.
+    """
+    return not (halt_reason is not None and parked_reason is not None)
 
 # --- failure kinds (current-state discriminator on a FAILED step) ------------
 # Most FAILED steps are TERMINAL: re-running them only re-invokes the adapter and
@@ -134,6 +260,89 @@ class HumanResponse(BaseModel):
     state: Literal["pending", "consumed"]
 
 
+class ScheduledResume(BaseModel):
+    """An armed auto-resume schedule on a usage-limit park (FR-3.4).
+
+    Persisted on the parked step BEFORE the run parks, so a process death
+    between scheduling and ``attempt_at`` loses nothing — the next driver start
+    or ``gauntlet resume`` reconciles from disk. ``attempt_at`` is the absolute
+    UTC time to resume (``now + retry_after_s``, else the quota reset time);
+    ``attempts`` counts spaced attempts made; once ``attempts >= max_attempts``
+    the step re-parks plain (no schedule) with an exhaustion note.
+    """
+
+    attempt_at: str
+    attempts: int = 0
+    max_attempts: int = 3
+
+
+class RevalidationRecord(BaseModel):
+    """The content-hash pair recorded on an ``artifact_invalid`` park (FR-7.2/§6).
+
+    P3 defines the shape; P4 populates it. ``hash_at_park`` is the SHA-256 of the
+    invalid artifact at park time; on a plain ``gauntlet resume`` the validator
+    re-runs against the (possibly hand-edited) on-disk bytes and P4 records
+    ``hash_at_resume``, whether it ``changed_while_parked``, and whether it
+    ``passed_on_resume`` — so a sanctioned hand-edit is auditable rather than
+    off-book file surgery (PRD §7). Additive/nullable: absent on every park that
+    is not an ``artifact_invalid`` park, so older manifests load unchanged.
+    """
+
+    artifact: str
+    hash_at_park: str
+    hash_at_resume: str | None = None
+    changed_while_parked: bool = False
+    passed_on_resume: bool = False
+
+
+class Suspension(BaseModel):
+    """A detected host-suspension interval (FR-5.1), appended to the manifest.
+
+    ``gap_s`` is the wallclock width of the interval; ``start``/``end`` are the
+    straddling heartbeats' wallclock stamps. Additive/append-only — older
+    manifests load with an empty list.
+    """
+
+    start: str
+    end: str
+    gap_s: int
+
+
+# --- adversarial-cycle sub-step checkpoints (FR-4.1) -------------------------
+# Named sub-steps of one cycle round, in execution order. The per-finding triage
+# batch is checkpointed as ONE ``triage`` sub-step in P5; P11 refines it to a
+# per-finding failure-path fragment.
+CHECKPOINT_SUBSTEPS = ("review", "triage", "fix", "confirm")
+
+
+class Checkpoint(BaseModel):
+    """A completed adversarial-cycle sub-step, recorded write-ahead (FR-4.1).
+
+    Each cycle sub-step (review, per-finding triage batch, fix, confirm) appends
+    one of these the instant it finishes AND flushes the manifest, so a
+    ``kill -9`` or usage-limit park mid-round leaves a durable record of exactly
+    which sub-steps completed. On a plain ``gauntlet resume`` the cycle loads the
+    completed sub-steps from ``artifact`` (a round-scoped copy under the run dir)
+    instead of re-invoking the agent, re-entering the round at the first sub-step
+    with no checkpoint — re-running zero completed work (PRD G1).
+
+    ``handoff_sha`` is the round's review-handoff SHA and the FR-4.2 guard key:
+    if the worktree/handoff moved since the checkpoint (e.g. manual commits during
+    a park), reuse is invalidated and the round restarts. ``artifact`` is the
+    run-dir-relative path of the sub-step's persisted output
+    (``artifacts/r1/findings.json`` etc.); it is ``None`` for the ``fix``
+    sub-step, whose product is a commit — that commit's SHA is ``result_sha``
+    (also the next round's handoff), so a reused fix advances the loop without
+    re-committing. Additive/append-only — older manifests load with an empty list.
+    """
+
+    sub_step: str  # one of CHECKPOINT_SUBSTEPS
+    round: int
+    handoff_sha: str
+    artifact: str | None = None
+    result_sha: str | None = None
+
+
 class StepRecord(BaseModel):
     id: str
     type: str
@@ -145,12 +354,22 @@ class StepRecord(BaseModel):
     attempts: int = 0
     # Transaction boundary (F-003): HEAD before the step touched the worktree.
     base_sha: str | None = None
-    # Conflict-park discriminator (FR-2.1). CURRENT-STATE, not a latch: the
-    # orchestrator clears it (back to None) on every non-conflict finalization of
-    # the step and re-sets PARKED_REASON_UPSTREAM_CONFLICT only when that
-    # execution halted on an UPSTREAM CONFLICT. A stale value therefore can never
-    # cause a later generic park to be misclassified as a conflict park.
+    # Park discriminator (FR-7.2), one of ``PARKED_REASONS``. CURRENT-STATE, not a
+    # latch: ``_finalize`` copies the just-finished execution's value and clears it
+    # (back to None) on any non-park finalization, so a stale value can never cause
+    # a later terminal/DONE step to be misclassified as a park. DISJOINT from
+    # ``halt_reason`` (never both set — :func:`reason_fields_disjoint`). Only PRD
+    # enum values are written; legacy on-disk values are mapped on read by
+    # :func:`normalize_parked_reason`, never rewritten in place.
     parked_reason: str | None = None
+    # Terminal halt discriminator (harness-efficiency FR-7.2), one of
+    # ``HALT_REASONS`` and DISJOINT from ``parked_reason``: a HALTED/FAILED/
+    # INTERRUPTED step carries ``halt_reason`` with ``parked_reason=None``, and a
+    # PARKED step the reverse. Current-state: set on the just-finished execution,
+    # cleared on any finalization that does not re-set it. Mandatory on every
+    # engine-written non-DONE terminal step; additive/nullable so manifests
+    # predating P3 (which carry ``None``) still load and validate.
+    halt_reason: str | None = None
     # Failure-kind discriminator on a FAILED step (current-state, like
     # ``parked_reason``): ``FAILURE_KIND_CLEAN_HANDOFF`` when this execution failed
     # a re-runnable PRECONDITION guard (no adapter invoked, no cost) rather than
@@ -159,10 +378,43 @@ class StepRecord(BaseModel):
     # terminal. ``None`` for every other outcome; cleared on any finalization that
     # does not re-set it (so a stale value can never mislabel a later failure).
     failure_kind: str | None = None
+    # Usage-limit park stamps (harness-efficiency FR-3.2). Set only when this step
+    # parked with ``parked_reason == PARKED_REASON_USAGE_LIMIT``: ``retry_after_s``
+    # is the provider's structured retry hint (never scraped from prose; ``None``
+    # when the envelope carried no structured field), and ``quota_reset_at`` is the
+    # absolute UTC reset time derived from it (``None`` when no hint was reported).
+    # Additive/nullable, so older manifests load unchanged; full status surfacing
+    # of these is P3.
+    retry_after_s: int | None = None
+    quota_reset_at: str | None = None
+    # Which adversarial_cycle sub-step produced the preserved ``session_id`` on a
+    # usage-limit park (FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``. Current-state
+    # like ``parked_reason`` — set on a usage-limit park, cleared on any other
+    # finalization. The cycle resume continues the preserved session only when it
+    # re-reaches this exact sub-step, so a fixer/triager session is never
+    # misrouted into the round-1 reviewer. Additive/nullable: older manifests load
+    # unchanged.
+    parked_substep: str | None = None
+    # Armed auto-resume schedule on a usage-limit park (FR-3.4). Set only when
+    # ``resume_on_quota: auto`` parked this step; ``None`` otherwise and after a
+    # successful resume. Additive/nullable — older manifests load unchanged.
+    scheduled_resume: ScheduledResume | None = None
+    # Content-hash pair recorded on an ``artifact_invalid`` park (FR-7.2/§6). P3
+    # defines the shape here; P4 populates it on the validator-repair park path.
+    # Additive/nullable — ``None`` on every other outcome, so older manifests load
+    # unchanged.
+    revalidation: RevalidationRecord | None = None
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)
     usage: UsageTotals = Field(default_factory=UsageTotals)
+    # Per-role usage split for a COMPOUND step (adversarial_cycle): profile → its
+    # own usage, mirroring the run-level `Manifest.agent_usage` but scoped to this
+    # step (FR-3.2). Empty for a single-agent step (its one profile is `agent` +
+    # `usage`). The usage-ledger reads this to attribute a cycle's spend to each
+    # role's own provider (FR-10.1); without it a cycle's usage — the bulk of a
+    # run's — has no per-provider attribution.
+    agent_usage: dict[str, UsageTotals] = Field(default_factory=dict)
     notes: str | None = None
     # foreach binding key, when this record is one iteration of a fan-out step
     iteration: str | None = None
@@ -171,6 +423,23 @@ class StepRecord(BaseModel):
     # tallies here so trend math reads the manifest, never the log dirs (the
     # plan's P7 test strategy is "trend-metric math from fixture manifests").
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Write-ahead adversarial-cycle sub-step checkpoints (harness-efficiency
+    # FR-4.1). Appended (and the manifest flushed) as each round sub-step
+    # completes, so a mid-round interruption — a usage-limit park (P1) or a kill —
+    # resumes at the first INCOMPLETE sub-step instead of re-deriving the whole
+    # round (PRD G1). A fresh (non-reuse) drive rebuilds them from empty; the SHA
+    # guard (FR-4.2) invalidates and clears them when the handoff moved. Left in
+    # place on a converged/terminal cycle as a truthful record of the rounds it
+    # ran. Additive/append-only — older manifests load with an empty list.
+    checkpoints: list[Checkpoint] = Field(default_factory=list)
+    # The intra-phase checkpoint commit a reset_to_base recovery rewound to
+    # (harness-efficiency FR-11.2): the ``P<N> wip:`` subject the re-run resumes
+    # from, so the re-run prompt can name it and the audit trail records that
+    # completed milestones were preserved (not discarded to base_sha). ``None``
+    # when recovery fell back to ``base_sha`` (no checkpoint existed) or the step
+    # was never checkpoint-recovered. Additive/nullable — older manifests load
+    # unchanged.
+    resumed_from_checkpoint: str | None = None
 
 
 class CommitRecord(BaseModel):
@@ -326,6 +595,10 @@ class Manifest(BaseModel):
     # deliverable (review F-005).
     warnings: list[str] = Field(default_factory=list)
     steps: list[StepRecord] = Field(default_factory=list)
+    # Detected host-suspension intervals (FR-5.1), drained from the driver's
+    # heartbeat writer at safe points. Append-only; additive, so older manifests
+    # load with an empty list.
+    suspensions: list[Suspension] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
     totals: UsageTotals = Field(default_factory=UsageTotals)
     # Per-agent-profile usage (FR-3.2): `gauntlet report` needs the spend split

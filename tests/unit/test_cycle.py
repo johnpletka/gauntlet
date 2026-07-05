@@ -17,12 +17,21 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from gauntlet.adapters.base import AgentResult, MalformedOutputError, Usage
+from gauntlet.adapters.base import (
+    FAILURE_TRANSIENT_USAGE_LIMIT,
+    AgentFailedError,
+    AgentResult,
+    FailureInfo,
+    MalformedOutputError,
+    SessionNotFoundError,
+    Usage,
+)
 from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import (
     DATA_BEGIN,
     DATA_END,
+    _code_review_base,
     _only_artifact_dirty,
     _persist_round_triage,
     _triage_integrity_stray,
@@ -49,7 +58,7 @@ class SeqAdapter:
         self.timeout_s = 600.0
 
     def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
-        self.calls.append({"prompt": prompt, "schema": schema})
+        self.calls.append({"prompt": prompt, "schema": schema, "session": session})
         if not self.responses:
             raise AssertionError("SeqAdapter exhausted; unexpected extra call")
         r = self.responses.pop(0)
@@ -100,7 +109,14 @@ def writer(rel, content, result):
 
 
 # --- harness ---------------------------------------------------------------------
+# `SeqAdapter` returns triage responses by CALL ORDER, which is only well-defined
+# when the per-finding triage calls run sequentially. P11 (FR-9.1) runs them
+# concurrently by default (triage_concurrency=4), scrambling that order for a
+# multi-finding round. These logic tests are pinned to concurrency 1 so their
+# positional fakes stay deterministic; the concurrency path is covered by the
+# dedicated finding-keyed tests in the "concurrent triage" section below.
 BASE_CONFIG = {
+    "triage_concurrency": 1,
     "agents": {
         "reviewer": {"adapter": "codex"},
         "triage": {"adapter": "api", "model": "h"},
@@ -582,6 +598,49 @@ def test_review_prompt_embeds_artifact_in_artifact_mode(cycle_repo):
     assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[0]["prompt"]
 
 
+def test_rereview_artifact_mode_sends_diff_not_full_body(cycle_repo):
+    # FR-1.2: round 1 embeds the full artifact; round 2+ sends only the diff
+    # since the last-reviewed version (round-1 snapshot) + carried findings + the
+    # path, NOT the full document body.
+    top = "TOP-SENTINEL-UNCHANGED"
+    filler = "\n".join(f"body-line-{i}" for i in range(1, 40))
+    original = f"{top}\n{filler}\nBOTTOM-ORIGINAL\n"
+    (cycle_repo / "prd.md").write_text(original)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qam", "big artifact"],
+                   check=True)
+    # The round-1 fix edits ONLY the bottom of the artifact, far from TOP-SENTINEL.
+    fixed = f"{top}\n{filler}\nBOTTOM-FIXED-BY-ROUND-1\n"
+
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1 loops
+        REVIEW(),                                                            # r2 converges
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "esc": SeqAdapter(V("F-001")),          # blocking escalates (F-009)
+        "builder": SeqAdapter(writer("prd.md", fixed, {})),
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_DONE
+
+    r2_review_prompt = reviewer.calls[2]["prompt"]
+    # the diff of the artifact since round 1 is present (both the -/+ lines)...
+    assert "diff since round 1" in r2_review_prompt
+    assert "BOTTOM-FIXED-BY-ROUND-1" in r2_review_prompt
+    assert "BOTTOM-ORIGINAL" in r2_review_prompt
+    # ...the carried finding and the artifact path are there...
+    assert "F-001" in r2_review_prompt
+    assert "prd.md" in r2_review_prompt
+    # ...and the full document body is NOT: the far-away unchanged line (well
+    # outside the diff's context window) never enters the round-2 prompt.
+    assert "TOP-SENTINEL-UNCHANGED" not in r2_review_prompt
+    # round 1 still saw the FULL artifact, including the sentinel (snapshot base).
+    assert "TOP-SENTINEL-UNCHANGED" in reviewer.calls[0]["prompt"]
+
+
 def test_code_review_mode_reviews_commit_range(cycle_repo):
     # seed a "phase commit" the cycle picks up from the manifest
     (cycle_repo / "feature.py").write_text("PHASE-WORK-SENTINEL\n")
@@ -611,6 +670,79 @@ def test_code_review_mode_reviews_commit_range(cycle_repo):
     prompt = reviewer.calls[0]["prompt"]
     assert "PHASE-WORK-SENTINEL" in prompt  # the phase diff, derived from manifest
     assert "commit-range diff under review" in prompt
+
+
+def test_code_review_base_spans_phase_including_checkpoints():
+    """`_code_review_base` returns the PREVIOUS recorded phase commit, not
+    `handoff^`, so the round-1 diff spans a phase's intra-phase checkpoint commits
+    even when the phase-marker commit itself is empty (FR-11.2 regression)."""
+    def cr(sha):
+        return M.CommitRecord(step_id="c", phase="P", sha=sha)
+
+    # Two recorded phase markers; handoff is the latest. Base must be the prior
+    # marker (the phase's starting tip), NOT `handoff^` (which, once a phase spans
+    # `P<N> wip:` checkpoint commits + an empty marker, points INSIDE the phase).
+    ctx = SimpleNamespace(manifest=SimpleNamespace(commits=[cr("prevmarker"), cr("phasemarker")]))
+    assert _code_review_base(ctx, "phasemarker") == "prevmarker"
+    # First recorded commit: no predecessor → fall back to `handoff^`.
+    assert _code_review_base(ctx, "prevmarker") == "prevmarker^"
+    # Handoff not among recorded commits (empty manifest / lightweight first
+    # review): fall back to `handoff^`, the historical single-commit behaviour.
+    assert _code_review_base(ctx, "detached") == "detached^"
+    empty = SimpleNamespace(manifest=SimpleNamespace(commits=[]))
+    assert _code_review_base(empty, "x") == "x^"
+
+
+def test_code_review_reviews_full_phase_when_marker_is_empty(cycle_repo):
+    """Regression: a phase whose work landed entirely in intra-phase checkpoint
+    commits leaves an EMPTY `P<N>:` marker. The round-1 review must still see the
+    phase's real diff (spanning the checkpoints), not an empty range — the failure
+    that parked the harness-efficiency run's final phase on an empty review."""
+    # Previous phase marker P4 — this is what the review base must resolve to.
+    (cycle_repo / "prior.py").write_text("PRIOR-PHASE\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "P4: prior"], check=True)
+    prev_marker_sha = gitops.head_sha(cycle_repo)
+
+    # P5's work lands as an intra-phase CHECKPOINT commit (NOT recorded in
+    # manifest.commits — only markers/fixes are), ...
+    (cycle_repo / "feature.py").write_text("PHASE-WORK-SENTINEL\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "P5 wip: checkpoint"], check=True)
+    # ... then the phase-marker commit is EMPTY (all work already checkpointed).
+    subprocess.run(
+        ["git", "-C", str(cycle_repo), "commit", "-q", "--allow-empty", "-m", "P5: marker"],
+        check=True,
+    )
+    empty_marker_sha = gitops.head_sha(cycle_repo)
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {k: v for k, v in cycle_step(mode="code_review").items()
+             if k not in ("artifact", "phase")},
+        ]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    # Only markers/fixes are recorded — never the `P5 wip:` checkpoint.
+    man.commits.append(M.CommitRecord(step_id="commit", phase="P4", sha=prev_marker_sha))
+    man.commits.append(M.CommitRecord(step_id="commit", phase="P5", sha=empty_marker_sha))
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    assert orch.drive() == M.RUN_DONE
+    prompt = reviewer.calls[0]["prompt"]
+    # The reviewer sees the phase's real work despite the empty marker (pre-fix
+    # this range was `checkpoint..empty-marker` == empty, and this assertion failed).
+    assert "PHASE-WORK-SENTINEL" in prompt
+    # The diff is based on the previous phase marker, not the empty marker's parent.
+    assert f"{prev_marker_sha}.." in prompt
 
 
 # --- §8: prompt-injection containment -------------------------------------------------
@@ -648,10 +780,12 @@ def test_blocking_finding_escalates_to_stronger_model(cycle_repo):
     assert triage["verdicts"][0]["action"] == "fix_now"  # strong model overrode
 
 
-def test_low_confidence_verdict_escalates(cycle_repo):
+def test_low_confidence_major_verdict_escalates(cycle_repo):
+    # FR-6.2: a low-confidence verdict on a MAJOR finding is consequential enough
+    # to escalate (severity-gated). The escalation resolves it to reject.
     esc = SeqAdapter(V("F-001", "bikeshedding", "reject"))
     adapters = {
-        "reviewer": SeqAdapter(REVIEW(F("F-001", "minor"))),
+        "reviewer": SeqAdapter(REVIEW(F("F-001", "major"))),
         "triage": SeqAdapter(V("F-001", confidence="low")),
         "builder": SeqAdapter(),
         "esc": esc,
@@ -661,6 +795,49 @@ def test_low_confidence_verdict_escalates(cycle_repo):
     )
     assert status == M.RUN_DONE
     assert len(esc.calls) == 1
+
+
+def test_low_confidence_minor_nit_carry_flagged_without_escalation(cycle_repo):
+    # FR-6.2 acceptance: mixed-severity low-confidence verdicts escalate ONLY the
+    # blocking/major ones; a low-confidence minor/nit does NOT invoke the
+    # escalation profile — it carries to the gate flagged `low_confidence`.
+    esc = SeqAdapter(
+        V("F-001", "legitimate", "fix_now"),   # blocking low-conf -> escalated
+        V("F-002", "legitimate", "fix_now"),   # major low-conf    -> escalated
+    )
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(
+                F("F-001", "blocking"), F("F-002", "major"),
+                F("F-003", "minor"), F("F-004", "nit"),
+            ),
+            CONFIRM(CV("F-001"), CV("F-002")),  # only the fixed findings confirm
+        ),
+        "triage": SeqAdapter(
+            V("F-001", confidence="low"), V("F-002", confidence="low"),
+            V("F-003", "bikeshedding", "reject", confidence="low"),
+            V("F-004", "bikeshedding", "reject", confidence="low"),
+        ),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+        "esc": esc,
+    }
+    status, _, run_dir = run_cycle(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert status == M.RUN_DONE
+    # exactly the two blocking/major low-confidence findings escalated
+    assert len(esc.calls) == 2
+    verdicts = {
+        v["finding_id"]: v
+        for v in json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]
+    }
+    assert verdicts["F-001"].get("escalated") is True
+    assert verdicts["F-002"].get("escalated") is True
+    # minor/nit did NOT escalate and carry the low_confidence flag for the gate
+    assert not verdicts["F-003"].get("escalated")
+    assert not verdicts["F-004"].get("escalated")
+    assert verdicts["F-003"].get("low_confidence") is True
+    assert verdicts["F-004"].get("low_confidence") is True
 
 
 def test_blocking_without_escalation_agent_parks_for_human(cycle_repo):
@@ -675,10 +852,42 @@ def test_blocking_without_escalation_agent_parks_for_human(cycle_repo):
     assert "F-009" in rec.notes and "F-001" in rec.notes
 
 
+def test_cycle_step_effort_passed_to_every_role_build(cycle_repo, monkeypatch):
+    # Regression (review F-004): a step-level `effort:` on an adversarial_cycle is
+    # applied to EVERY cycle sub-agent build (step wins over each role profile).
+    # Asserted on the effort the engine hands `build_adapter` for each role — the
+    # test double ignores it, so we capture at the StepContext boundary instead.
+    from gauntlet.engine.execution import StepContext
+
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001"))),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    built: list[tuple[str, str | None]] = []
+
+    def _recording_build(self, agent_name, *, effort=None):
+        built.append((agent_name, effort))
+        return adapters[agent_name]
+
+    monkeypatch.setattr(StepContext, "build_adapter", _recording_build)
+    status, man, _ = run_cycle(cycle_repo, adapters, step_extra={"effort": "low"})
+    assert status == M.RUN_DONE
+    # reviewer + triager + fixer (+ confirmer, which defaults to reviewer) all built
+    assert {name for name, _ in built} >= {"reviewer", "triage", "builder"}
+    # every cycle sub-agent build carried the step-level override, not the profile's
+    assert built and all(effort == "low" for _name, effort in built), built
+
+
 def test_needs_escalation_rule():
+    # FR-6.2 severity-gated rule: blocking always escalates; low-confidence
+    # escalates only for blocking/major; low-confidence minor/nit does not.
     assert needs_escalation("blocking", {"confidence": "high"})
-    assert needs_escalation("nit", {"confidence": "low"})
+    assert needs_escalation("blocking", {"confidence": "low"})
+    assert needs_escalation("major", {"confidence": "low"})
     assert not needs_escalation("major", {"confidence": "high"})
+    assert not needs_escalation("minor", {"confidence": "low"})
+    assert not needs_escalation("nit", {"confidence": "low"})
 
 
 # --- schema-violation retry --------------------------------------------------------
@@ -1111,3 +1320,638 @@ def test_cycle_writes_substep_transcripts(cycle_repo):
     assert (steps / "r1-review" / "findings.json").exists()
     assert (steps / "r1-triage" / "F-001" / "verdict.json").exists()
     assert (steps / "r1-confirm" / "confirm.json").exists()
+
+
+# --- FR-3.2: a transient sub-agent failure parks the whole cycle -------------
+def _transient_exc(session="rev-sess"):
+    return AgentFailedError(
+        "usage limit hit mid-cycle",
+        partial=AgentResult(text="", session_id=session, exit_code=1),
+        failure_info=FailureInfo(
+            kind=FAILURE_TRANSIENT_USAGE_LIMIT, marker="codex_usage_limit_message",
+            retry_after_s=600,
+        ),
+    )
+
+
+def _build_cycle_orch(repo, adapters, *, man=None, step_extra=None, config=None):
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [cycle_step(**(step_extra or {}))]}],
+    })
+    cfg = RunConfig.model_validate(config or BASE_CONFIG)
+    man = man or Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                          pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    orch = Orchestrator(
+        repo_root=repo, run_dir=repo / "runs" / "demo" / "run-1",
+        artifact_root=repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+    )
+    return orch, man
+
+
+def test_transient_reviewer_failure_parks_cycle_usage_limit(cycle_repo):
+    adapters = {
+        "reviewer": SeqAdapter(_transient_exc()),  # reviewer hits a usage limit
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.status == M.PARKED
+    # a usage_limit park — NOT a terminal failure, NOT a cycle_escalation
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "rev-sess"  # failing sub-agent session preserved
+    assert rec.retry_after_s == 600 and rec.quota_reset_at is not None
+    # worktree untouched: no fix-round commit, tree still clean
+    assert man.commits == []
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+
+
+def test_transient_failure_on_schema_retry_inside_run_sub_parks(cycle_repo):
+    # A transient failure raised on the schema-retry re-invocation inside
+    # _run_sub (attempt 2, after a malformed attempt 1) still parks usage_limit.
+    adapters = {
+        "reviewer": SeqAdapter(
+            MalformedOutputError("not json"),  # attempt 1: retry
+            _transient_exc(),                    # attempt 2: usage limit
+        ),
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+
+
+def test_transient_triage_failure_parks_cycle_usage_limit(cycle_repo):
+    # The park is uniform across sub-roles: a triager usage limit parks too
+    # (the triage call site is wrapped just like the reviewer's).
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(_transient_exc(session="triage-sess")),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "triage-sess"
+
+
+def test_plain_resume_redrives_parked_cycle(cycle_repo):
+    # A usage_limit cycle park is re-driven by a PLAIN resume (no --response).
+    # P1 re-enters the round at its start (round-loss deferred to P5); here the
+    # re-driven reviewer converges, so the cycle completes DONE.
+    reviewer = SeqAdapter(_transient_exc(), REVIEW())  # park, then converge on resume
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    # the round-1 reviewer owns the preserved session (F-001).
+    assert man.record("cycle").parked_substep == "r1-review"
+    # plain resume: re-drive (no --response); the cycle re-runs round 1 and converges
+    assert orch.drive() == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None  # cleared on DONE (current-state)
+    # FR-3.3: the re-driven reviewer call CONTINUED the persisted session (the
+    # first drive's call carried no session; the resume call carried "rev-sess").
+    assert reviewer.calls[0]["session"] is None
+    assert reviewer.calls[-1]["session"] == "rev-sess"
+    # the continuation call sends the SHORT continuation prompt, not the full
+    # review prompt (budget conservation) — the artifact body is not re-sent.
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    assert reviewer.calls[-1]["prompt"] == _CONTINUATION_PROMPT
+    assert "ARTIFACT-BODY-SENTINEL" not in reviewer.calls[-1]["prompt"]
+
+
+# --- P5 (FR-4.1/FR-4.2): sub-step checkpointing + mid-round resume -----------
+# These supersede the P1 "round-loss on resume" behavior: P1 parked and preserved
+# the session but re-drove the whole round from its start; P5 reuses the completed
+# sub-step checkpoints and re-enters at the first INCOMPLETE sub-step.
+def _substep_rounds(rec):
+    return {(c.sub_step, c.round) for c in rec.checkpoints}
+
+
+def test_triager_park_resume_reuses_review_and_reruns_triage(cycle_repo):
+    # FR-4.1: the review completed (its findings.json is checkpointed) before the
+    # triager parked, so a plain resume REUSES the review — the reviewer is NOT
+    # re-invoked — and re-enters at triage, which re-runs fresh (sessionless: a
+    # per-finding batch session is not coherently continuable, P1 F-001).
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))  # review, then confirm on resume
+    triage = SeqAdapter(_transient_exc(session="triage-sess"), V("F-001"))  # park, then verdict
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "triage-sess" and rec.parked_substep == "r1-triage"
+    # only the review sub-step was checkpointed before triage parked
+    assert _substep_rounds(rec) == {("review", 1)}
+    # plain resume → converge to DONE
+    assert orch.drive() == M.RUN_DONE
+    assert man.record("cycle").status == M.DONE
+    # the reviewer ran ONCE for review (drive 1); its only resume call was the
+    # confirm pass — it was never re-invoked for a re-review (FR-4.1).
+    assert len(reviewer.calls) == 2
+    assert reviewer.calls[0]["prompt"] != _CONTINUATION_PROMPT
+    assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[0]["prompt"]
+    # the re-run triage call ran fresh — the triager session is not continued
+    assert triage.calls[-1]["session"] is None
+
+
+def test_fixer_park_resume_reuses_review_triage_reenters_at_fix(cycle_repo):
+    # FR-4.1: review + triage completed (both checkpointed) before the fixer hit a
+    # usage limit mid-edit, leaving the worktree dirty. A plain resume REUSES
+    # review + triage (neither re-invoked), resets the partial fixer edits to the
+    # handoff (FR-4.2 clean re-run), and re-enters at the fix sub-step.
+    def dirty_then_transient(cwd):
+        (Path(cwd) / "partial.py").write_text("half-done\n")
+        raise _transient_exc(session="builder-sess")
+
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))  # review, then confirm on resume
+    triage = SeqAdapter(V("F-001"))  # one verdict; reused on resume (not re-run)
+    builder = SeqAdapter(dirty_then_transient, writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "builder-sess" and rec.parked_substep == "r1-fix"
+    # review AND triage were checkpointed before the fixer parked
+    assert _substep_rounds(rec) == {("review", 1), ("triage", 1)}
+    # park leaves the worktree untouched: the partial fixer edit survives
+    assert (cycle_repo / "partial.py").exists()
+    # plain resume: reuse review+triage, reset the partial edits, re-enter at fix
+    assert orch.drive() == M.RUN_DONE
+    assert man.record("cycle").status == M.DONE
+    # neither reviewer (re-review) nor triager was re-invoked (FR-4.1): the
+    # reviewer's second call was the confirm pass, the triager ran once total.
+    assert len(reviewer.calls) == 2 and len(triage.calls) == 1
+    # the discarded partial work is gone; only the real fix committed; tree clean
+    assert not (cycle_repo / "partial.py").exists()
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    assert man.record("cycle").parked_substep is None  # cleared on DONE
+
+
+def test_review_checkpoint_and_artifact_are_written_ahead_to_disk(cycle_repo):
+    # FR-4.1 write-ahead: the checkpoint record AND its round-scoped artifact copy
+    # are on DISK the instant the sub-step completes — so a kill/park loses nothing.
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+    triage = SeqAdapter(_transient_exc(session="triage-sess"), V("F-001"))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    # the manifest on disk (not just in memory) carries the review checkpoint
+    on_disk = Manifest.load(run_dir / "manifest.json")
+    cps = on_disk.record("cycle").checkpoints
+    assert [(c.sub_step, c.round) for c in cps] == [("review", 1)]
+    assert cps[0].artifact == "artifacts/r1/findings.json"
+    # the round-scoped artifact copy exists and parses to the round's findings
+    copy = run_dir / cps[0].artifact
+    assert copy.exists()
+    assert [f["id"] for f in json.loads(copy.read_text())["findings"]] == ["F-001"]
+
+
+def test_multiround_resume_reuses_round1_and_continues_r2_review_session(cycle_repo):
+    # FR-4.1/FR-3.3: round 1 completes and loops (blocking finding unresolved),
+    # then round 2's reviewer parks on a usage limit. A plain resume REUSES all of
+    # round 1 (no reviewer/triager/fixer re-invocation) and re-enters at round-2
+    # review, CONTINUING the preserved reviewer session (short continuation prompt).
+    from gauntlet.engine.steptypes import _CONTINUATION_PROMPT
+
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")),        # r1 review
+        CONFIRM(CV("F-001", "unresolved")),    # r1 confirm → loop to r2
+        _transient_exc(session="rev2-sess"),   # r2 review parks
+        REVIEW(),                              # resume: r2 review continues → converge
+    )
+    # blocking findings escalate (F-009); the escalation resolves it fix_now so the
+    # round loops rather than parking for a human.
+    triage = SeqAdapter(V("F-001"))            # r1 triage; reused on resume
+    esc = SeqAdapter(V("F-001"))               # r1 escalation; reused on resume
+    builder = SeqAdapter(writer("src.py", "fix1\n", {}))  # r1 fix; reused on resume
+    adapters = {"reviewer": reviewer, "triage": triage, "esc": esc, "builder": builder}
+    orch, man = _build_cycle_orch(
+        cycle_repo, adapters, step_extra={"escalation_agent": "esc"}
+    )
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.session_id == "rev2-sess" and rec.parked_substep == "r2-review"
+    # all four round-1 sub-steps checkpointed before round 2's reviewer parked
+    assert _substep_rounds(rec) == {
+        ("review", 1), ("triage", 1), ("fix", 1), ("confirm", 1)}
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    # plain resume: round 1 reused, round 2 review continues the session, converge
+    assert orch.drive() == M.RUN_DONE
+    assert man.record("cycle").status == M.DONE
+    # round-1 triager/escalation/fixer were NOT re-invoked (FR-4.1)
+    assert len(triage.calls) == 1 and len(esc.calls) == 1 and len(builder.calls) == 1
+    # the resumed round-2 review CONTINUED the parked reviewer session (FR-3.3)
+    assert reviewer.calls[-1]["session"] == "rev2-sess"
+    assert reviewer.calls[-1]["prompt"] == _CONTINUATION_PROMPT
+    # no duplicate commit recorded on resume (the reused round-1 fix is not re-added)
+    assert [c.phase for c in man.commits] == ["P5.1"]
+
+
+def test_moved_handoff_sha_invalidates_checkpoints_and_reruns(cycle_repo):
+    # FR-4.2: a manual commit during the park moves HEAD off the checkpoint's
+    # handoff SHA, so reuse would build on a stale base. The SHA guard invalidates
+    # every checkpoint, the cycle re-runs from a clean handoff, and the
+    # invalidation reason is recorded in the step notes.
+    reviewer = SeqAdapter(REVIEW(F("F-001")), REVIEW())  # drive1 finds; resume re-review converges
+    triage = SeqAdapter(_transient_exc(session="triage-sess"))  # parks after review checkpoint
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert _substep_rounds(man.record("cycle")) == {("review", 1)}
+    # a manual commit during the park moves HEAD off the review handoff
+    (cycle_repo / "manual.txt").write_text("hand edit during park\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "manual.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(cycle_repo), "commit", "-qm", "manual commit during park"],
+        check=True,
+    )
+    # resume: SHA guard invalidates checkpoints; the cycle re-runs the review fresh
+    assert orch.drive() == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    assert "invalidated (FR-4.2)" in rec.notes
+    # the reviewer was RE-INVOKED (full re-run), not reused
+    assert len(reviewer.calls) == 2
+
+
+def test_cycle_resume_falls_back_to_full_review_when_session_expired(cycle_repo):
+    # F-001 / FR-3.3: if the preserved session is unknown/expired on resume, the
+    # cycle falls back to a full, sessionless re-review rather than failing.
+    reviewer = SeqAdapter(
+        _transient_exc(),                                # drive 1: park
+        SessionNotFoundError("no conversation found"),   # resume: session gone
+        REVIEW(),                                        # fallback: full re-run converges
+    )
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.drive() == M.RUN_DONE
+    # the resume first tried the stored session (continuation prompt), then fell
+    # back to a full review with NO session and the full artifact body.
+    assert reviewer.calls[-2]["session"] == "rev-sess"
+    assert reviewer.calls[-1]["session"] is None
+    assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[-1]["prompt"]
+    assert man.record("cycle").status == M.DONE
+
+
+def _kill(cwd):
+    # A SeqAdapter callable that simulates a process kill (SIGINT) mid-sub-step:
+    # BaseException propagates uncaught through the handler and `_execute`, so the
+    # step never finalizes — the on-disk manifest keeps the write-ahead checkpoints
+    # but no finalized commit record (mirrors a real kill before finalization).
+    raise KeyboardInterrupt("simulated kill before finalize")
+
+
+def test_ordered_prefix_missing_triage_reruns_fix_not_stale_reuse(cycle_repo):
+    # review F-001: checkpoint reuse must be limited to the CONTIGUOUS completed
+    # prefix. A cycle parks during round-1 confirm with review/triage/fix all
+    # checkpointed; the operator then loses artifacts/r1/triage.json. On resume the
+    # review is reused, but triage is absent — so triage AND every LATER sub-step
+    # (fix, confirm) must re-run, never reuse the now-stale fix commit.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),                  # r1 review (reused on resume)
+        _transient_exc(session="conf-sess"), # r1 confirm parks (usage limit)
+        CONFIRM(CV("F-001")),                # resume: re-run confirm → converge
+    )
+    triage = SeqAdapter(V("F-001"), V("F-001"))   # drive1 + resume re-run
+    builder = SeqAdapter(
+        writer("src.py", "fixed\n", {"done": True}),   # r1 fix (drive 1)
+        writer("src.py", "fixed2\n", {"done": True}),  # r1 fix RE-RUN on resume
+    )
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.parked_substep == "r1-confirm"
+    # review, triage AND fix were all checkpointed before the confirm parked
+    assert _substep_rounds(rec) == {("review", 1), ("triage", 1), ("fix", 1)}
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    stale_fix_sha = man.commits[0].sha
+    # the operator loses the round-1 triage artifact during the park
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    (run_dir / "artifacts" / "r1" / "triage.json").unlink()
+    # resume: the ordered prefix truncates at the missing triage; triage and the
+    # fixer BOTH re-run (the stale fix commit is not reused), then confirm converges
+    assert orch.drive() == M.RUN_DONE
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    # triager re-invoked (prefix broke at triage) and — the F-001 fix — the FIXER
+    # re-invoked too rather than adopting the stale fix checkpoint
+    assert len(triage.calls) == 2
+    assert len(builder.calls) == 2
+    # exactly ONE round-1 fix commit is recorded (the stale one was discarded and
+    # its manifest record purged, not left double-recorded)
+    assert [c.phase for c in man.commits] == ["P5.1"]
+    assert man.commits[0].sha != stale_fix_sha  # HEAD is the freshly re-run fix
+    assert gitops.head_sha(cycle_repo) == man.commits[0].sha
+    assert (cycle_repo / "src.py").read_text() == "fixed2\n"
+    assert gitops.is_clean(cycle_repo, exclude=["runs"])
+    # the truncation is recorded in the audit trail (a genuine out-of-order gap:
+    # fix survived while the earlier triage did not)
+    assert "ordered prefix" in rec.notes
+
+
+def test_kill_after_fix_checkpoint_resumes_and_adopts_fix_commit(cycle_repo):
+    # review F-002: a real kill AFTER the fix sub-step commits+checkpoints but
+    # BEFORE finalization leaves the commit on HEAD yet absent from the manifest.
+    # The generic interrupted-step recovery must NOT intercept (park INTERRUPTED /
+    # rewind past the fix); the cycle handler owns recovery — it adopts the fix
+    # checkpoint, records the commit, and re-runs only the confirm sub-step.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001")),   # r1 review
+        _kill,                # r1 confirm: simulated kill before finalize
+        CONFIRM(CV("F-001")), # resume: re-run confirm → converge
+    )
+    triage = SeqAdapter(V("F-001"))                       # r1 triage (reused)
+    builder = SeqAdapter(writer("src.py", "fixed\n", {})) # r1 fix (reused, not re-run)
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    with pytest.raises(KeyboardInterrupt):
+        orch.drive()
+    # on-disk state: the fix sub-step checkpointed its result_sha, but finalization
+    # never ran, so the commit is on HEAD yet NOT recorded in the manifest.
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    on_disk = Manifest.load(run_dir / "manifest.json")
+    dead = on_disk.record("cycle")
+    assert dead.status == M.RUNNING  # never finalized
+    assert _substep_rounds(dead) == {("review", 1), ("triage", 1), ("fix", 1)}
+    assert [c.phase for c in on_disk.commits] == []  # fix commit NOT yet recorded
+    fix_cp = next(c for c in dead.checkpoints if c.sub_step == "fix")
+    committed_sha = fix_cp.result_sha
+    assert gitops.head_sha(cycle_repo) == committed_sha  # the commit is on HEAD
+
+    # resume from the reloaded (killed) manifest with the same adapters
+    orch2, man2 = _build_cycle_orch(cycle_repo, adapters, man=on_disk)
+    assert orch2.drive() == M.RUN_DONE
+    rec = man2.record("cycle")
+    assert rec.status == M.DONE
+    # the fix checkpoint was ADOPTED (fixer NOT re-invoked) and its commit recorded
+    # exactly once — never lost, never double-counted
+    assert len(builder.calls) == 1
+    assert [(c.phase, c.sha) for c in man2.commits] == [("P5.1", committed_sha)]
+    assert gitops.head_sha(cycle_repo) == committed_sha
+    # only the confirm sub-step re-ran (reviewer: review + killed-confirm + confirm)
+    assert len(reviewer.calls) == 3
+    assert "adopted fix checkpoint commit" in rec.notes
+
+
+def test_dirty_worktree_during_non_fixer_park_invalidates_reuse(cycle_repo):
+    # review F-003: a hand-edit to a tracked NON-artifact file during a triage park
+    # leaves HEAD unchanged but the worktree dirty. A HEAD-only guard would reuse
+    # the review checkpoint on the changed tree; the worktree-cleanliness guard
+    # invalidates reuse instead, and a dirty round-1 handoff then fails the
+    # clean-handoff invariant (FR-9.3) rather than reviewing a dirty tree.
+    reviewer = SeqAdapter(REVIEW(F("F-001")))  # drive 1 review; never re-invoked
+    triage = SeqAdapter(_transient_exc(session="triage-sess"))  # parks after review checkpoint
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    orch, man = _build_cycle_orch(cycle_repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    assert _substep_rounds(man.record("cycle")) == {("review", 1)}
+    # hand-edit a tracked file that is NOT the artifact (so the artifact-baseline
+    # commit does not fire and HEAD stays put): worktree dirty, HEAD unchanged.
+    (cycle_repo / "README.md").write_text("HAND-EDITED DURING PARK\n")
+    status = orch.drive()
+    rec = man.record("cycle")
+    # reuse was discarded (dirty, and not the sanctioned fixer re-entry) and the
+    # dirty handoff then failed the clean-handoff precondition
+    assert status == M.RUN_FAILED
+    assert rec.status == M.FAILED
+    assert "worktree is dirty" in rec.notes
+    assert "clean-handoff" in rec.notes
+    # the review checkpoint was NOT reused on the changed tree — reviewer not re-run
+    assert len(reviewer.calls) == 1
+
+
+# --- P11 (FR-9.1/FR-9.2): concurrent triage + failure-path checkpoint fragment ---
+import re
+import threading
+
+
+def _fid_from_prompt(prompt: str) -> str:
+    """The finding id from a per-finding triage prompt (the finding is the only
+    ``"id":`` in the wrapped-as-data block)."""
+    m = re.search(r'"id":\s*"([^"]+)"', prompt)
+    return m.group(1) if m else "?"
+
+
+class KeyedTriage:
+    """A thread-safe triager fake keyed on the finding id in the prompt (not on
+    call order, so it is correct under concurrency, unlike ``SeqAdapter``).
+
+    Optional coordination: a ``barrier`` forces observable overlap (all parties
+    must be in-flight before any returns), and ``peak`` (a shared ``[cur, max]``)
+    records the high-water in-flight count so a test can assert the pool bound.
+    ``fail_first`` maps a finding id → an exception raised on its FIRST call only
+    (consumed after), so a resume of that finding succeeds."""
+
+    capabilities = FakeAdapter.capabilities
+
+    def __init__(self, verdicts, *, barrier=None, peak=None, fail_first=None):
+        self.verdicts = verdicts
+        self.barrier = barrier
+        self.peak = peak
+        self.fail_first = dict(fail_first or {})
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+        self.timeout_s = 600.0
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+        fid = _fid_from_prompt(prompt)
+        with self._lock:
+            self.calls.append(fid)
+            if self.peak is not None:
+                self.peak[0] += 1
+                self.peak[1] = max(self.peak[1], self.peak[0])
+        try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=5)
+            with self._lock:
+                exc = self.fail_first.pop(fid, None)
+            if exc is not None:
+                raise exc
+            v = dict(self.verdicts[fid])
+            return AgentResult(
+                text=json.dumps(v), structured=v,
+                usage=Usage(input_tokens=10, output_tokens=5), exit_code=0,
+            )
+        finally:
+            with self._lock:
+                if self.peak is not None:
+                    self.peak[0] -= 1
+
+
+def _five_findings():
+    return [F(f"F-00{i}") for i in range(1, 6)]
+
+
+def _expected_triage_bytes(findings, verdicts):
+    """The exact ``triage.json`` bytes the sequential path writes: verdicts in
+    findings order, ``json.dumps(..., indent=2, ensure_ascii=False)`` (matching
+    cycle._write_artifact)."""
+    ordered = [verdicts[f["id"]] for f in findings]
+    return json.dumps({"verdicts": ordered}, indent=2, ensure_ascii=False)
+
+
+def test_concurrent_triage_runs_all_in_flight_and_is_byte_identical(cycle_repo):
+    # FR-9.1: with a pool >= the finding count, a Barrier(N) only releases when all
+    # N per-finding calls are simultaneously in-flight — a deterministic proof of
+    # concurrency (no wall-clock ratio). The resulting triage.json is byte-identical
+    # to the sequential (findings-order) result.
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    barrier = threading.Barrier(5)
+    peak = [0, 0]
+    triage = KeyedTriage(verdicts, barrier=barrier, peak=peak)
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    status, _man, run_dir = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 5}
+    )
+    assert status == M.RUN_DONE
+    # all 5 were in-flight at once (barrier of 5 released) — concurrency observed
+    assert peak[1] == 5
+    assert sorted(triage.calls) == [f["id"] for f in findings]
+    # byte-identity to the sequential result (FR-9.1)
+    written = (run_dir / "artifacts" / "triage.json").read_text()
+    assert written == _expected_triage_bytes(findings, verdicts)
+
+
+def test_concurrent_triage_respects_the_pool_bound(cycle_repo):
+    # FR-9.1: with pool=2 and 4 findings, a Barrier(2) advances in waves of two;
+    # the high-water in-flight count is exactly 2 — the pool never exceeds its bound.
+    findings = [F(f"F-00{i}") for i in range(1, 5)]  # 4 findings
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    barrier = threading.Barrier(2)
+    peak = [0, 0]
+    triage = KeyedTriage(verdicts, barrier=barrier, peak=peak)
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    status, _man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 2}
+    )
+    assert status == M.RUN_DONE
+    assert peak[1] == 2  # bounded: at most 2 in flight despite 4 findings
+
+
+def test_concurrent_triage_failure_fragment_then_resume_one_call(cycle_repo):
+    # FR-9.2: one transient failure among five → the round parks (usage_limit), NO
+    # authoritative triage.json is written, and a deterministic fragment holds the
+    # four completed verdicts sorted by id with the fifth pending. A plain resume
+    # re-runs ONLY the pending finding and, on success, writes the final triage.json
+    # byte-identical to the sequential result.
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(
+        verdicts, fail_first={"F-003": _transient_exc(session="triage-sess")}
+    )
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": builder}
+    orch, man = _build_cycle_orch(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 4}
+    )
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    # no authoritative triage.json on an incomplete round (fail closed, FR-9.2)
+    assert not (run_dir / "artifacts" / "triage.json").exists()
+    # deterministic fragment: completed verdicts sorted by id + the pending finding
+    frag = json.loads((run_dir / "artifacts" / "r1" / "triage-fragment.json").read_text())
+    assert [v["finding_id"] for v in frag["verdicts"]] == ["F-001", "F-002", "F-004", "F-005"]
+    assert frag["pending"] == ["F-003"]
+    calls_before = len(triage.calls)
+    # plain resume: re-run ONLY the incomplete finding (F-003)
+    assert orch.drive() == M.RUN_DONE
+    resume_calls = triage.calls[calls_before:]
+    assert resume_calls == ["F-003"]  # exactly one triage call, and it is F-003
+    # the resumed all-success round writes triage.json byte-identical to sequential
+    written = (run_dir / "artifacts" / "triage.json").read_text()
+    assert written == _expected_triage_bytes(findings, verdicts)
+    # the fragment is superseded once the round completed in full
+    assert not (run_dir / "artifacts" / "r1" / "triage-fragment.json").exists()
+
+
+def _terminal_exc():
+    # A non-transient adapter failure: _run_sub does NOT retry it (only malformed
+    # output is re-asked) and does NOT park it (failure_info is not transient), so
+    # it fails the step closed.
+    return AgentFailedError(
+        "terminal boom", partial=AgentResult(text="", exit_code=1)
+    )
+
+
+def test_concurrent_triage_terminal_failure_writes_fragment_no_triage_json(cycle_repo):
+    # FR-9.2: a TERMINAL (non-transient) failure fails the step closed — but the
+    # completed verdicts are still checkpointed to the fragment (sorted by id), and
+    # triage.json is not written. (Distinct from the transient park above.)
+    findings = _five_findings()
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(verdicts, fail_first={"F-002": _terminal_exc()})
+    reviewer = SeqAdapter(REVIEW(*findings))
+    adapters = {"reviewer": reviewer, "triage": triage, "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"triage_concurrency": 4}
+    )
+    assert status == M.RUN_FAILED
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    assert not (run_dir / "artifacts" / "triage.json").exists()
+    frag = json.loads((run_dir / "artifacts" / "r1" / "triage-fragment.json").read_text())
+    assert [v["finding_id"] for v in frag["verdicts"]] == ["F-001", "F-003", "F-004", "F-005"]
+    assert frag["pending"] == ["F-002"]
+
+
+def test_triage_concurrency_defaults_to_four():
+    assert RunConfig.model_validate({}).triage_concurrency == 4
+
+
+def test_triage_concurrency_rejects_non_positive():
+    with pytest.raises(ValueError, match="triage_concurrency must be >= 1"):
+        RunConfig.model_validate({"triage_concurrency": 0})
+
+
+def test_concurrent_triage_escalates_blocking_finding(cycle_repo):
+    # Escalation composes with concurrency: the triage→escalate decision is
+    # self-contained per finding (in _triage_one), so a blocking finding still
+    # escalates to the escalation agent even when the round runs concurrently.
+    findings = [F("F-001", "major"), F("F-002", "blocking"), F("F-003", "major")]
+    verdicts = {f["id"]: V(f["id"]) for f in findings}
+    triage = KeyedTriage(verdicts)
+    esc = KeyedTriage({"F-002": V("F-002")})  # escalation re-decides the blocker
+    reviewer = SeqAdapter(REVIEW(*findings), CONFIRM(*[CV(f["id"]) for f in findings]))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "triage": triage, "esc": esc, "builder": builder}
+    status, _man, run_dir = run_cycle(
+        cycle_repo, adapters,
+        step_extra={"triage_concurrency": 3, "escalation_agent": "esc"},
+    )
+    assert status == M.RUN_DONE
+    # the blocking finding was escalated (F-009); majors with high confidence were not
+    assert esc.calls == ["F-002"]
+    # the escalated verdict is recorded escalated=True in the authoritative triage.json
+    written = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    by_id = {v["finding_id"]: v for v in written["verdicts"]}
+    assert by_id["F-002"].get("escalated") is True
+    assert by_id["F-001"].get("escalated") is None

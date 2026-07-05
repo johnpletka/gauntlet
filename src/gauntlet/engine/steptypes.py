@@ -13,13 +13,15 @@ can never be substituted into a command line.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 from pathlib import Path
 
-from gauntlet.adapters.base import AdapterError
+from gauntlet.adapters.base import AdapterError, SessionNotFoundError
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
+from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
     DONE,
     FAILED,
@@ -31,13 +33,37 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
-    PARKED_REASON_UPSTREAM_CONFLICT,
+    HALT_REASON_ADAPTER_ERROR,
+    HALT_REASON_PRECONDITION,
+    HALT_REASON_TIMEOUT,
+    PARKED_REASON_ARTIFACT_INVALID,
+    PARKED_REASON_GATE,
+    PARKED_REASON_RESPONSE,
+    PARKED_REASON_USAGE_LIMIT,
     RESPONSE_CONSUMED,
     RESPONSE_PENDING,
+    RevalidationRecord,
 )
-from gauntlet.engine.pipeline import Step
-from gauntlet.engine.planphases import PlanPhasesError, extract_phases
+from gauntlet.engine.pipeline import (
+    INPUT_MODE_PHASE,
+    INPUT_MODE_REFERENCE,
+    InputRef,
+    Step,
+    iter_inputs,
+)
+from gauntlet.engine.planphases import (
+    PlanPhasesError,
+    extract_phases,
+    missing_phase_sections,
+    phase_section,
+)
+from gauntlet.engine.validators import validate_artifact
 from gauntlet.logging.transcript import StepLogger
+
+# FR-2.1: how many in-session repair attempts an invalid `output:` artifact gets
+# before the step parks `artifact_invalid` (FR-2.2). Two, per the PRD acceptance
+# ("succeeds on attempt 2") and §9 metric (≥80% repaired within 2 attempts).
+_MAX_ARTIFACT_REPAIRS = 2
 
 _CONFIG_TOKEN_RE = re.compile(r"\{\{\s*config\.([a-zA-Z0-9_]+)\s*\}\}")
 _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
@@ -47,6 +73,17 @@ _ANY_TOKEN_RE = re.compile(r"\{\{.*?\}\}")
 # different `halt_on:` marker parks with `parked_reason` unset. Pipelines use
 # this string verbatim (pipelines/standard.yaml `halt_on: "UPSTREAM CONFLICT"`).
 UPSTREAM_CONFLICT_MARKER = "UPSTREAM CONFLICT"
+
+# FR-3.3 continuation prompt: sent (instead of the full original prompt) when a
+# usage-limit park is resumed against a preserved CLI session. Short by design —
+# the session already holds the task context; re-sending the full prompt would
+# waste the very usage budget the resume exists to conserve.
+_CONTINUATION_PROMPT = (
+    "You were interrupted by a provider usage limit before finishing this task. "
+    "Continue from where you left off and complete it. The worktree is exactly "
+    "as you left it — your prior edits are intact. Do not restart from scratch "
+    "or redo work you already completed."
+)
 
 # FR-4: the single, fixed-name synthetic artifact that carries the full
 # chronological human-decision history into a `--response` resume. There is
@@ -64,15 +101,15 @@ RESUME_DISPOSITION_SCHEMA = "schemas/resume-disposition.json"
 # FR-3 / FR-5 / FR-10: how a builder's structured `disposition` drives the step
 # outcome on a `--response` resume. The enum maps 1:1 to the FR-3 categories —
 # proceed_* completes the step (DONE → commit); amendment_required / new_conflict
-# re-park it for a human (parked_reason=upstream_conflict, the FR-10.4 gate). This
+# re-park it for a human (parked_reason=response, the FR-10.4 gate). This
 # structured signal — not the textual UPSTREAM CONFLICT marker — is authoritative
 # once a response is being consumed (the marker is only the FIRST-conflict signal,
 # before any response exists).
 _DISPOSITION_OUTCOMES: dict[str, tuple[str, str | None]] = {
     "proceed_in_place": (DONE, None),
     "proceed_with_deviation": (DONE, None),
-    "amendment_required": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
-    "new_conflict": (PARKED, PARKED_REASON_UPSTREAM_CONFLICT),
+    "amendment_required": (PARKED, PARKED_REASON_RESPONSE),
+    "new_conflict": (PARKED, PARKED_REASON_RESPONSE),
 }
 
 
@@ -102,10 +139,31 @@ def render_shell_command(template: str, config) -> str:
     return rendered
 
 
+def resolve_step_timeout_s(step: Step, agent_name: str | None, config) -> float | None:
+    """Effective step deadline (FR-3.3) — the single precedence rule.
+
+    Per-step ``timeout_s`` wins; else an agent step falls back to its profile's
+    ``step_timeout_s``; else ``None`` (unbounded). Shared by the ``agent_task``
+    handler (which arms the adapter with it) and the read-only status path (which
+    renders ``current_step_timeout_remaining_s`` from it), so the reported deadline
+    is the real one — not a profile-only guess that misses a per-step override or a
+    shell step's own ``timeout_s`` (F-003). A shell step has no agent, so it never
+    picks up the profile fallback: it reports its own ``timeout_s`` or null.
+    """
+    timeout = step.timeout_s
+    if timeout is None and agent_name and agent_name in config.agents:
+        timeout = config.profile(agent_name).step_timeout_s
+    return timeout
+
+
 def handle_shell(step: Step, ctx: StepContext) -> StepResult:
     template = step.get("run")
     if not template:
-        return StepResult(status=FAILED, notes="shell step has no `run:` command")
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes="shell step has no `run:` command",
+        )
     command = render_shell_command(template, ctx.config)
     timeout = step.timeout_s  # per-step guard (FR-3.3); None => unbounded
     try:
@@ -122,12 +180,16 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
         # Halt at a checkpoint rather than letting a stuck command burn on.
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_TIMEOUT,
             notes=f"shell timeout halt (FR-3.3): `{command}` exceeded {timeout}s",
         )
     _write_step_log(ctx, "output.txt", _proc_log(command, proc))
     if proc.returncode != 0:
+        # The command ran and reported failure (e.g. a failing test suite): a
+        # terminal execution failure, not a fail-closed precondition guard (FR-7.2).
         return StepResult(
             status=FAILED,
+            halt_reason=HALT_REASON_ADAPTER_ERROR,
             notes=f"`{command}` exited {proc.returncode}",
         )
     return StepResult(status=DONE, notes=f"`{command}` exited 0")
@@ -138,6 +200,7 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
     show = step.get("show", []) or []
     return StepResult(
         status=PARKED,
+        parked_reason=PARKED_REASON_GATE,  # FR-7.2: a gate park stamps `gate`
         notes=f"awaiting human decision; review: {', '.join(show) or '(nothing listed)'}",
     )
 
@@ -163,21 +226,43 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     if not path.exists():
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=f"phase lint: {artifact} is missing at the plan gate",
         )
+    text = path.read_text()
     try:
-        phases = extract_phases(path.read_text())
+        phases = extract_phases(text)
     except PlanPhasesError as exc:
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=f"phase lint: {artifact} gauntlet-phases block is invalid — {exc}",
         )
     if not phases:
         return StepResult(
             status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
             notes=(
                 f"phase lint: {artifact} declares no gauntlet-phases block; the "
                 "phases stage would have nothing to fan out over (FR-5.1)"
+            ),
+        )
+    # FR-1.1: the implement step slices each phase's prose section out of plan.md
+    # by its ATX heading (`phase`-mode context). A phase declared in the list but
+    # lacking a locatable `## <id> …` heading would silently lose its excerpt at
+    # render time — a fail-open on scoped-context quality. Halt at the gate (same
+    # fail-closed path as a malformed block) so an unrunnable-for-phase-mode plan
+    # never reaches human approval.
+    missing = missing_phase_sections(text, phases)
+    if missing:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: {artifact} has no locatable prose section for "
+                f"phase(s) {', '.join(missing)}; every phase in the "
+                "gauntlet-phases list needs a matching '## <id> …' heading so "
+                "`phase`-mode context can slice it (FR-1.1)"
             ),
         )
     ids = ", ".join(p["id"] for p in phases)
@@ -190,68 +275,190 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
 def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     agent_name = step.agent
     if not agent_name:
-        return StepResult(status=FAILED, notes="agent_task step has no `agent:`")
-    adapter = ctx.build_adapter(agent_name)
-    prompt = _render_prompt(step, ctx)
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes="agent_task step has no `agent:`",
+        )
+    # FR-2.1 (review F-003): `validate:` runs against the step's `output:`
+    # artifact, so a `validate:` with no `output:` would silently validate
+    # nothing — a fail-OPEN skip. The loader rejects this shape at load time
+    # (engine/validate.py); this runtime precondition is defense in depth for a
+    # hand-built / bypassed pipeline, failing closed before the adapter is built.
+    if step.get("validate") and not step.get("output"):
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                "agent_task declares `validate:` without `output:`; the validator "
+                "would be silently skipped — failing closed (FR-2.1 / review F-003)"
+            ),
+        )
+    # FR-2.2: a plain `gauntlet resume` of an artifact_invalid park re-runs ONLY
+    # the validator against the (possibly hand-edited) on-disk artifact — no
+    # adapter invocation. Done here, before the adapter is even built, so a
+    # hand-edit-then-resume never re-runs the author. `parked_reason` is still the
+    # park's value at handler time (the orchestrator clears it only in _finalize),
+    # exactly like the usage-limit resume discriminator below.
+    if ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID:
+        return _revalidate_on_resume(step, ctx, agent_name)
     # FR-10: while this invocation is consuming a pending `--response`, bind the
     # resume-disposition schema invocation-locally and let the structured
     # disposition drive the outcome — without touching the approved pipeline.
     consuming_response = _consuming_response(ctx)
+    # FR-6.3: the resume-disposition emission is a mechanical structured
+    # classification (schema-bound + fail-closed engine checks), so a shipped
+    # pipeline can route it to a cheap `disposition_agent` profile instead of
+    # spending the builder's constrained window on it. Only on a `--response`
+    # resume; a different emitter runs a fresh sessionless call (a cheap `api`
+    # profile has no session to continue). The primary `agent` still owns every
+    # non-disposition invocation.
+    emit_agent = agent_name
+    disposition_agent = step.get("disposition_agent")
+    if consuming_response and disposition_agent and disposition_agent != agent_name:
+        emit_agent = disposition_agent
+    # FR-6.1: a step-level `effort:` overrides the profile's effort — but only for
+    # the step's own agent, never a substituted disposition emitter (which uses
+    # its own profile's effort).
+    effort_override = step.get("effort") if emit_agent == agent_name else None
+    adapter = ctx.build_adapter(emit_agent, effort=effort_override)
+    # FR-3.3: a usage-limit resume continues the persisted CLI session with a
+    # SHORT continuation prompt instead of re-sending the full original prompt.
+    # The record still carries parked_reason=usage_limit (the orchestrator clears
+    # it only when this run finalizes), so it uniquely identifies the resume; it
+    # is never a `--response` resume (a usage_limit park needs no decision).
+    is_quota_resume = bool(
+        ctx.record.parked_reason == PARKED_REASON_USAGE_LIMIT and ctx.record.session_id
+    )
+    prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
     schema = (
         _resume_disposition_schema(ctx)
         if consuming_response
         else _load_schema(step, ctx)
     )
+    # A substituted disposition emitter (emit_agent != agent_name) has no session
+    # to continue — the persisted session_id belongs to the primary agent — so it
+    # runs a fresh call. The primary agent (disposition or quota resume) continues
+    # its own session as before.
+    emit_session = ctx.record.session_id if emit_agent == agent_name else None
     # Per-step timeout overrides the profile's step_timeout_s, which overrides
     # the adapter default (FR-3.3). A timeout raises AgentTimeoutError, which the
-    # orchestrator turns into a HALTED checkpoint.
-    timeout = step.timeout_s
-    if timeout is None and agent_name in ctx.config.agents:
-        timeout = ctx.config.profile(agent_name).step_timeout_s
+    # orchestrator turns into a HALTED checkpoint. The status path resolves the
+    # SAME value via `resolve_step_timeout_s` so the reported deadline matches.
+    timeout = resolve_step_timeout_s(step, agent_name, ctx.config)
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
     logger = step_logger(ctx)
-    logger.log_prompt(prompt)  # before the call: the prompt survives a crash
-    # Live-observability streaming (live-run-observability FR-2): when enabled and
-    # the adapter is line-streamable, thread a per-line sink so events.jsonl grows
-    # during the step. sink is passed ONLY when streaming — the buffered path's
-    # call shape (and existing fakes) stay untouched (FR-6.1).
-    stream = open_step_stream(ctx, adapter, logger)
-    run_kwargs: dict = {
-        "session": ctx.record.session_id,
-        "schema": schema,
-        "cwd": ctx.repo_root,
-    }
-    if stream is not None:
-        run_kwargs["sink"] = stream.append_line
-    try:
-        result = adapter.run(prompt, **run_kwargs)
-    except AdapterError as exc:
-        # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
-        # partial evidence the adapter salvaged before the orchestrator
-        # classifies the error.
-        if exc.partial is not None:
-            logger.log_result(exc.partial, suffix="-failed")
-        logger.log_text("failure.txt", str(exc))
-        raise
-    finally:
-        # A streaming sink fault surfaces as a StreamSinkError (not an
-        # AdapterError) that propagates past the except above; the orchestrator
-        # records the step FAILED (fail closed, FR-6.2). Close the stream either
-        # way so it is never left half-open.
-        if stream is not None:
-            stream.close()
-    logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
-    usage_by_agent = {agent_name: result.usage} if result.usage else {}
 
-    # FR-3/FR-5/FR-10: on a `--response` resume the builder's STRUCTURED
-    # disposition is authoritative for the outcome, not the textual `halt_on`
-    # marker (which only signals the FIRST conflict, before any response). Map it
-    # to the step status here so a schema-valid `new_conflict` re-parks instead of
-    # being marked DONE; the FR-3.0 classification itself lives in the prompt.
+    def _invoke(call_prompt: str, session: str | None, *, log_suffix: str = ""):
+        """One adapter call with FR-4 lossless logging + FR-6 streaming.
+
+        Factored so a usage-limit resume can fall back to a second, full-prompt
+        call when the stored session is gone (FR-3.3), and so an FR-2.1 repair
+        re-invocation gets its OWN evidence files. The prompt is persisted before
+        the call (survives a crash); a per-attempt stream is opened/closed here so
+        the events file reflects the current attempt. ``log_suffix`` names a
+        distinct attempt (e.g. ``-repair1``) so a repair never overwrites the
+        initial attempt's prompt/events (lossless, FR-4).
+        """
+        logger.log_text(f"prompt{log_suffix}.md", call_prompt)
+        # Live-observability streaming (live-run-observability FR-2): when enabled
+        # and the adapter is line-streamable, thread a per-line sink so the events
+        # file grows during the step. sink is passed ONLY when streaming — the
+        # buffered path's call shape (and existing fakes) stay untouched. The
+        # suffix keeps a repair attempt's stream off the initial attempt's file.
+        stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
+        kwargs: dict = {"session": session, "schema": schema, "cwd": ctx.repo_root}
+        if stream is not None:
+            kwargs["sink"] = stream.append_line
+        try:
+            return adapter.run(call_prompt, **kwargs)
+        except AdapterError as exc:
+            # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
+            # partial evidence the adapter salvaged before it is re-raised (the
+            # orchestrator classifies transient-vs-terminal, FR-3.1).
+            if exc.partial is not None:
+                logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
+            logger.log_text(f"failure{log_suffix}.txt", str(exc))
+            raise
+        finally:
+            # A streaming sink fault surfaces as a StreamSinkError (not an
+            # AdapterError) that propagates past the except above; the
+            # orchestrator records the step FAILED (fail closed, FR-6.2). Close
+            # the stream either way so it is never left half-open.
+            if stream is not None:
+                stream.close()
+
+    fallback_note = ""
+    try:
+        result = _invoke(prompt, emit_session)
+    except SessionNotFoundError as exc:
+        # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
+        # to a full re-run with no session (recoverable, not a run-halting fault)
+        # and record the fallback. Off the quota-resume path a SessionNotFoundError
+        # is unexpected, so re-raise it to fail closed like any other adapter error.
+        if not is_quota_resume:
+            raise
+        logger.log_text("session-expired.txt", str(exc))
+        fallback_note = (
+            "usage-limit resume: stored session was unknown/expired; fell back "
+            "to a full re-run with no session (FR-3.3)"
+        )
+        prompt = _render_prompt(step, ctx)
+        result = _invoke(prompt, None)
+    logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
+    # Attribute usage to the agent that actually ran (the disposition emitter on a
+    # routed `--response` resume, else the step's agent) so `agent_usage` reflects
+    # the cheap profile's spend, not the builder's (FR-3.2/FR-6.3).
+    usage_by_agent = {emit_agent: result.usage} if result.usage else {}
+
+    if consuming_response and emit_agent != agent_name:
+        # FR-6.3 two-phase resume: the cheap `disposition_agent` CLASSIFIED the
+        # response, but it cannot do the step's work. Its verdict gates whether the
+        # primary agent runs at all:
+        #   * a re-park (amendment_required/new_conflict) or a fail-closed
+        #     disposition lands nothing — return it now, so the builder's
+        #     constrained window is never touched for a conflict that resolves to
+        #     "amend the artifact" or "still ambiguous" (the common case).
+        #   * a proceed means the conflict is resolved and the phase must actually
+        #     be implemented, which only the primary agent can do — re-drive it
+        #     exactly like an unrouted resume (full prompt + disposition schema +
+        #     its preserved session), and let ITS authoritative disposition drive
+        #     the outcome below.
+        classified = _resume_disposition_result(
+            emit_agent, result, usage_by_agent, ctx.record.human_responses
+        )
+        if classified.status != DONE:
+            return classified
+        # proceed: re-drive the primary agent to implement. Account BOTH the cheap
+        # classification and the builder's implementation as real spend (FR-3.2),
+        # split per profile — the classification is not free just because it was
+        # cheap.
+        spend = _UsageAccumulator()
+        spend.add(result.usage, agent=emit_agent)  # the disposition_agent's spend
+        adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
+        try:
+            result = _invoke(prompt, ctx.record.session_id, log_suffix="-implement")
+        except SessionNotFoundError as exc:
+            # Same audit contract as the quota-resume fallback (FR-3.3): the
+            # session loss and the sessionless re-drive must be visible in the
+            # step evidence, not silent.
+            logger.log_text("session-expired-implement.txt", str(exc))
+            result = _invoke(prompt, None, log_suffix="-implement")
+        logger.log_result(result, suffix="-implement")
+        spend.add(result.usage, agent=agent_name)
+        emit_agent = agent_name
+        result = result.model_copy(update={"usage": spend.result()})
+        usage_by_agent = spend.by_agent()
+
+    # FR-3/FR-5/FR-10: on a `--response` resume the STRUCTURED disposition is
+    # authoritative for the outcome, not the textual `halt_on` marker (which only
+    # signals the FIRST conflict, before any response). Map it to the step status
+    # here so a schema-valid `new_conflict` re-parks instead of being marked DONE;
+    # the FR-3.0 classification itself lives in the prompt.
     if consuming_response:
         outcome = _resume_disposition_result(
-            agent_name, result, usage_by_agent, ctx.record.human_responses
+            emit_agent, result, usage_by_agent, ctx.record.human_responses
         )
         # A re-park (amendment_required/new_conflict) or a fail-closed disposition
         # lands nothing: return immediately, skipping completion-signal handling
@@ -278,19 +485,36 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # disposition already governed the conflict) while require_signal still binds.
     signal = _completion_signal(step, result.text, check_halt=not consuming_response)
     if signal is not None:
-        status, note, parked_reason = signal
+        status, note, parked_reason, halt_reason = signal
         return StepResult(
             status=status, session_id=result.session_id, usage=result.usage,
             usage_by_agent=usage_by_agent, notes=note,
-            parked_reason=parked_reason,
+            parked_reason=parked_reason, halt_reason=halt_reason,
         )
 
     artifact_writes: dict[str, Path] = {}
     output = step.get("output")
+    validate_name = step.get("validate")
+    final_usage = result.usage
     commit_sha = commit_phase = None
     if output:
         out_path = ctx.artifact_root / output
         ctx.writer.write_text(out_path, result.text)
+        # FR-2.1: validate the freshly written artifact in-step, with a bounded
+        # in-session repair loop; on exhaustion park artifact_invalid (FR-2.2).
+        # Runs BEFORE any commit_output below, so an invalid artifact is never
+        # committed — it stays on disk (dirty) for the sanctioned hand-edit path.
+        if validate_name:
+            park, result, summed = _validate_output(
+                step, ctx, _invoke, logger, validate_name, output, out_path, result,
+            )
+            final_usage = summed
+            usage_by_agent = {agent_name: summed} if summed else {}
+            if park is not None:
+                park.session_id = result.session_id
+                park.usage = summed
+                park.usage_by_agent = usage_by_agent
+                return park
         artifact_writes[output] = out_path
         # Prevent-at-source (report #3): a producer that opts in commits its own
         # declared deliverable as it finalizes, so HEAD advances at production
@@ -308,12 +532,185 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     return StepResult(
         status=DONE,
         session_id=result.session_id,
-        usage=result.usage,
+        usage=final_usage,
         usage_by_agent=usage_by_agent,
         artifact_writes=artifact_writes,
         commit_sha=commit_sha,
         commit_phase=commit_phase,
-        notes=f"agent {agent_name!r} completed",
+        notes=(
+            f"agent {agent_name!r} completed\n{fallback_note}"
+            if fallback_note else f"agent {agent_name!r} completed"
+        ),
+    )
+
+
+# --- in-step artifact validation + repair (FR-2.1/2.2) -----------------------
+def _sha256(text: str) -> str:
+    """Content hash of an artifact's bytes for the revalidation pair (§6)."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _repair_prompt(output: str, error: str, attempt: int) -> str:
+    """The in-session correction prompt fed to the same agent on a repair (FR-2.1).
+
+    Short and directive — the session already holds the authoring context; this
+    just names the concrete validation failure and asks for a full rewrite of the
+    one artifact, mirroring the proven schema-retry re-ask in ``cycle.py``.
+    """
+    return (
+        f"The `{output}` artifact you just wrote failed validation "
+        f"(repair attempt {attempt} of {_MAX_ARTIFACT_REPAIRS}):\n\n{error}\n\n"
+        f"Rewrite `{output}` so it passes this check. Return only the full "
+        "corrected artifact as your response — no commentary, no code fences "
+        "around it unless the artifact itself requires them."
+    )
+
+
+def _validate_output(step, ctx, invoke, logger, validate_name, output, out_path, result):
+    """Validate ``output`` in-step with a bounded in-session repair loop (FR-2.1).
+
+    ``invoke(prompt, session)`` is ``handle_agent_task``'s per-call closure (it
+    logs the prompt, streams, and persists partial-failure evidence). Returns
+    ``(park_or_none, result, summed_usage)``:
+
+    * ``(None, valid_result, usage)`` — the artifact validated immediately or
+      after ≤``_MAX_ARTIFACT_REPAIRS`` repairs; ``valid_result`` is the
+      authoritative :class:`AgentResult` and ``out_path`` holds the valid bytes.
+    * ``(park_result, last_result, usage)`` — repairs exhausted → a PARKED
+      ``artifact_invalid`` :class:`StepResult` carrying the verbatim validator
+      error (FR-2.2) and the ``hash_at_park`` content hash; the caller stamps its
+      session/usage.
+
+    ``usage`` sums the initial call and every repair attempt — each is real spend
+    (FR-3.2) — or ``None`` when no attempt reported usage. Each repair result is
+    logged with a ``-repair<n>`` suffix so both attempts survive in the transcript.
+    An :class:`UnknownValidatorError` from a misconfigured ``validate:`` name
+    propagates (fail closed → the step FAILs), never a repairable park.
+    """
+    total = _UsageAccumulator()
+    total.add(result.usage)
+    error = validate_artifact(
+        validate_name, out_path.read_text(),
+        repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
+    )
+    attempt = 0
+    while error is not None and attempt < _MAX_ARTIFACT_REPAIRS:
+        attempt += 1
+        suffix = f"-repair{attempt}"
+        result = invoke(
+            _repair_prompt(output, error, attempt), result.session_id,
+            log_suffix=suffix,
+        )
+        logger.log_result(result, suffix=suffix)
+        total.add(result.usage)
+        ctx.writer.write_text(out_path, result.text)
+        error = validate_artifact(
+            validate_name, out_path.read_text(),
+            repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
+        )
+    summed = total.result()
+    if error is None:
+        return None, result, summed
+    park = StepResult(
+        status=PARKED,
+        parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+        revalidation=RevalidationRecord(
+            artifact=output, hash_at_park=_sha256(out_path.read_text())
+        ),
+        notes=(
+            f"artifact {output!r} failed validation ({validate_name}) after "
+            f"{_MAX_ARTIFACT_REPAIRS} in-session repair attempts (FR-2.2); parked "
+            f"for a hand-edit-then-`gauntlet resume`. Validator error:\n{error}"
+        ),
+    )
+    return park, result, summed
+
+
+def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> StepResult:
+    """Re-run ONLY the validator on a plain resume of an ``artifact_invalid`` park.
+
+    No adapter invocation (FR-2.2): validate the on-disk artifact — which a human
+    may have hand-edited while the run was parked — and record the revalidation
+    content-hash pair so the hand-edit is auditable rather than off-book file
+    surgery (PRD §7). On pass → DONE (committing the now-valid ``output`` when the
+    step opted into ``commit_output``, since the normal path commits only on
+    validity); still invalid → re-park ``artifact_invalid`` with refreshed hashes.
+    """
+    output = step.get("output")
+    validate_name = step.get("validate")
+    # An artifact_invalid park is only ever written for a step with both `output`
+    # and `validate` (see _validate_output). Missing either → inconsistent
+    # manifest; fail closed rather than silently completing (CLAUDE.md §2).
+    if not output or not validate_name:
+        return StepResult(
+            status=FAILED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                "artifact_invalid resume on a step with no `output`/`validate` "
+                "(inconsistent manifest); failing closed (FR-2.2)"
+            ),
+        )
+    out_path = ctx.artifact_root / output
+    text = out_path.read_text() if out_path.exists() else ""
+    hash_at_resume = _sha256(text)
+    prior = ctx.record.revalidation
+    hash_at_park = prior.hash_at_park if prior is not None else hash_at_resume
+    changed = hash_at_resume != hash_at_park
+    error = validate_artifact(
+        validate_name, text, repo_root=ctx.repo_root, asset_root=ctx.config.asset_root
+    )
+    if error is not None:
+        # Re-park on the CURRENT (still-invalid) on-disk bytes (review F-001): the
+        # new park pair must baseline against `hash_at_resume` — what is actually
+        # parked now — NOT the original `hash_at_park`. Reusing the prior park hash
+        # would keep comparing every later resume against stale bytes, so an invalid
+        # hand-edit (A→B) followed by a resume with no further edit would wrongly
+        # report `changed_while_parked=True` against B, contradicting the P4 audit
+        # contract. Resume-side fields reset to their park defaults; the note below
+        # still describes THIS resume's transition for the transcript.
+        return StepResult(
+            status=PARKED,
+            parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=RevalidationRecord(
+                artifact=output, hash_at_park=hash_at_resume
+            ),
+            notes=(
+                f"artifact {output!r} still fails validation ({validate_name}) on "
+                f"resume ({'edited' if changed else 'unchanged'} while parked); "
+                f"hand-edit it and `gauntlet resume` again (FR-2.2). Validator "
+                f"error:\n{error}"
+            ),
+        )
+    # Passed: the full audit pair documents the sanctioned hand-edit (park bytes
+    # → resume bytes → changed? → passed) that resolved the park.
+    reval = RevalidationRecord(
+        artifact=output,
+        hash_at_park=hash_at_park,
+        hash_at_resume=hash_at_resume,
+        changed_while_parked=changed,
+        passed_on_resume=True,
+    )
+    # Valid on resume — complete the step with no adapter call. Commit the
+    # now-valid deliverable if the step opted into commit_output (the normal path
+    # committed only on validity; the resume path must too, to keep the
+    # clean-handoff invariant for the downstream cycle).
+    commit_sha = commit_phase = None
+    if step.get("commit_output"):
+        outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
+        if isinstance(outcome, StepResult):  # fail-closed format/commit error
+            return outcome
+        commit_sha, commit_phase = outcome
+    edited = "hand-edited while parked" if changed else "unchanged since park"
+    return StepResult(
+        status=DONE,
+        revalidation=reval,
+        artifact_writes={output: out_path},
+        commit_sha=commit_sha,
+        commit_phase=commit_phase,
+        notes=(
+            f"artifact {output!r} passed validation ({validate_name}) on resume "
+            f"({edited}); step completed with no agent re-invocation (FR-2.2)"
+        ),
     )
 
 
@@ -386,15 +783,21 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
 def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     """Read an agent_task's final output for a halt/completion contract (#32).
 
-    Returns ``None`` to proceed normally, or ``(status, note, parked_reason)`` to
-    short-circuit. Both checks are opt-in (absent keys → no contract), so
-    existing steps and the document-authoring tasks keep their plain exit-code
-    semantics.
+    Returns ``None`` to proceed normally, or ``(status, note, parked_reason,
+    halt_reason)`` to short-circuit. Both checks are opt-in (absent keys → no
+    contract), so existing steps and the document-authoring tasks keep their plain
+    exit-code semantics. Exactly one of ``parked_reason`` / ``halt_reason`` is set
+    (FR-7.2 disjointness): the halt_on park carries ``parked_reason`` and a null
+    ``halt_reason``; the require_signal failure carries ``halt_reason`` and a null
+    ``parked_reason``.
 
-    ``parked_reason`` is ``PARKED_REASON_UPSTREAM_CONFLICT`` only when the matched
-    ``halt_on`` marker is *exactly* the canonical :data:`UPSTREAM_CONFLICT_MARKER`
-    (FR-2.1) — a step parking on a *different* ``halt_on`` marker, or failing on a
-    missing ``require_signal``, carries no ``parked_reason``.
+    A ``halt_on`` park ALWAYS carries ``parked_reason=PARKED_REASON_RESPONSE``
+    (FR-7.2 park invariant): the agent deliberately halted for a human decision,
+    which is the PRD ``response`` park kind regardless of the marker text. The
+    canonical :data:`UPSTREAM_CONFLICT_MARKER` and any custom ``halt_on`` marker
+    alike route by step type (``RESPONDABLE_STEP_TYPES``), so a single reason
+    serves both and no park is ever written with a null ``parked_reason`` (a null
+    would classify as ``unknown`` — unexplainable from status JSON).
 
     ``check_halt=False`` suppresses only the ``halt_on`` check (review F-004): on a
     proceed-disposition `--response` resume the textual UPSTREAM CONFLICT marker is
@@ -403,21 +806,25 @@ def _completion_signal(step: Step, text: str, *, check_halt: bool = True):
     """
     halt_on = step.get("halt_on")
     if check_halt and halt_on and _marker_signalled(halt_on, text):
-        parked_reason = (
-            PARKED_REASON_UPSTREAM_CONFLICT
-            if halt_on == UPSTREAM_CONFLICT_MARKER
-            else None
-        )
+        # Every halt_on park is a human-decision park → PRD `response` reason
+        # (FR-7.2 park invariant, F-001): the agent halted for a human, and
+        # re-driving without a decision would only re-halt into the same wall.
+        # The builder-conflict vs cycle-escalation distinction is recovered from
+        # the step type (RESPONDABLE_STEP_TYPES), not this value, so one reason
+        # serves the canonical UPSTREAM CONFLICT marker and any custom marker
+        # alike. Never null (a null park classifies as `unknown`).
         return PARKED, (
             f"agent signalled {halt_on!r} (FR-10.4 upstream conflict / halt); "
             "parked for a human instead of marking the step done (#32)"
-        ), parked_reason
+        ), PARKED_REASON_RESPONSE, None
     require = step.get("require_signal")
     if require and not _marker_signalled(require, text):
+        # The agent ran but did not satisfy the completion contract — a terminal
+        # adapter/output failure (FR-7.2), not a fail-closed precondition guard.
         return FAILED, (
             f"agent did not emit the required completion signal {require!r}; "
             "failing closed rather than advancing on a silent non-completion (#32)"
-        ), None
+        ), None, HALT_REASON_ADAPTER_ERROR
     return None
 
 
@@ -465,33 +872,120 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
     # definition, and manifest.json are never mutated (FR-4.1). The artifact is
     # rebuilt fresh from `human_responses` on every render (chronological), so
     # repeated resumes regenerate one file rather than accumulating files.
-    inputs = list(step.get("inputs", []) or [])
+    # FR-1.1: each input carries a mode — `inline` (default; embed the body),
+    # `reference` (inject the repo-relative path, the agent reads it), or `phase`
+    # (plan.md only; inject the current phase's section + the full-doc path). The
+    # modes were fail-closed-validated at load (engine/validate.py) — an unknown
+    # mode / non-reading profile / escaping path never reaches here.
+    input_refs = iter_inputs(step)
     artifacts = dict(ctx.artifacts)
+    parts = [base]
+    # FR-11.2: a reset_to_base recovery that rewound to an intra-phase checkpoint
+    # names it here, so the re-run knows its completed milestones were preserved
+    # and it is continuing from that checkpoint, not restarting the phase.
+    checkpoint = ctx.record.resumed_from_checkpoint
+    if checkpoint:
+        parts.append(
+            "\n\n--- recovery: resuming from an intra-phase checkpoint ---\n"
+            "The previous attempt was interrupted and the worktree was rewound to "
+            f"your last passing-test checkpoint commit: {checkpoint!r}. That "
+            "milestone's work is committed and preserved; only the uncommitted "
+            "edits after it were discarded. Continue the phase from that "
+            "checkpoint — do not redo the committed milestones.\n"
+        )
+    for ref in input_refs:
+        parts.append(_render_input(ref, ctx, artifacts))
     # FR-1 verbatim requirement (review F-001): the builder must receive the
     # human-decision history EXACTLY as recorded. The on-disk copy is written
     # through the RedactingWriter (credential-shaped substrings become
     # placeholders), so re-reading it for the prompt would feed the adapter a
     # non-verbatim, redacted version that also diverges from the manifest record.
     # Inject the unmodified rendered text directly; the redacted copy stays on
-    # disk only for the audit trail.
+    # disk only for the audit trail. The history artifact is always inline (it is
+    # never committed to the repo, so it has no readable path to reference).
     history_text = _write_human_response_artifact(ctx)
-    verbatim: dict[str, str] = {}
     if history_text is not None:
-        inputs.append(HUMAN_RESPONSE_ARTIFACT)
-        verbatim[HUMAN_RESPONSE_ARTIFACT] = history_text
-    parts = [base]
-    for name in inputs:
-        if name in verbatim:
-            content = verbatim[name]
-        else:
-            path = artifacts.get(name) or (ctx.artifact_root / name)
-            content = Path(path).read_text() if Path(path).exists() else ""
-        parts.append(f"\n\n--- input artifact: {name} ---\n{content}")
+        parts.append(
+            f"\n\n--- input artifact: {HUMAN_RESPONSE_ARTIFACT} ---\n{history_text}"
+        )
     if ctx.iteration_item is not None:
         item = ctx.iteration_item
         rendered = item if isinstance(item, str) else json.dumps(item, indent=2)
         parts.append(f"\n\n--- foreach item [{ctx.iteration_index}] ---\n{rendered}")
     return "".join(parts)
+
+
+def _artifact_path(name: str, ctx: StepContext, artifacts: dict) -> Path:
+    """Resolve an input artifact to its on-disk path (produced path or default)."""
+    return Path(artifacts.get(name) or (ctx.artifact_root / name))
+
+
+def _repo_relative(path: Path, repo_root: Path) -> str:
+    """The artifact's repo-relative POSIX path for a `reference` prompt (FR-1.1).
+
+    Reference/phase paths are containment-validated at load, so the artifact is
+    under the repo root; fall back to the bare name only for defensiveness.
+    """
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _render_input(ref: InputRef, ctx: StepContext, artifacts: dict) -> str:
+    """Render one input per its mode (FR-1.1): inline / reference / phase.
+
+    * ``reference`` — inject the repo-relative path + a read-it instruction; the
+      body never enters the prompt (the agent reads the file itself, FR-1.3).
+    * ``phase`` — inject the current `foreach` phase's section of plan.md plus
+      the full-document path; anything outside the phase is read on demand.
+    * ``inline`` — today's behavior: embed the whole document body.
+    """
+    name = ref.name
+    path = _artifact_path(name, ctx, artifacts)
+    if ref.mode == INPUT_MODE_REFERENCE:
+        rel = _repo_relative(path, ctx.repo_root)
+        return (
+            f"\n\n--- input artifact (by reference): {name} ---\n"
+            f"Read this file yourself from the repository — it is provided by path, "
+            f"not inlined, to keep this prompt small.\nPath: {rel}\n"
+        )
+    if ref.mode == INPUT_MODE_PHASE:
+        rel = _repo_relative(path, ctx.repo_root)
+        excerpt = _phase_excerpt(name, path, ctx)
+        return (
+            f"\n\n--- input artifact (current-phase excerpt): {name} ---\n"
+            f"Below is only THIS phase's section of {name}. Read the full document "
+            f"at the path for anything outside this phase.\nPath: {rel}\n\n{excerpt}\n"
+        )
+    content = path.read_text() if path.exists() else ""
+    return f"\n\n--- input artifact: {name} ---\n{content}"
+
+
+def _phase_excerpt(name: str, path: Path, ctx: StepContext) -> str:
+    """The current `foreach` phase's section of plan.md — or fail closed.
+
+    Fail closed (§2): P6 requires the implement prompt to carry THIS phase's plan
+    section (FR-1.1), so a missing locatable section is a defect, not a
+    degrade-and-continue. The plan validators (``plan_phases`` / ``phase_lint``)
+    reject a plan whose phases lack locatable `## <id> …` headings before
+    approval, so this raise is the last-ditch guard for a hand-built / bypassed
+    plan; it halts the step rather than shipping an implement prompt that quietly
+    omits its scoped context. Determinism: the slice is a pure heading scan
+    (:func:`phase_section`), never a summary.
+    """
+    phase_id = _iteration_phase(ctx)
+    text = path.read_text() if path.exists() else ""
+    if phase_id and text:
+        section = phase_section(text, phase_id)
+        if section:
+            return section
+    raise ValueError(
+        f"`phase`-mode context for {name}: no locatable section for phase "
+        f"{phase_id or '?'} — the plan must carry a '## {phase_id or '<id>'} …' "
+        "heading so this phase's excerpt can be sliced (FR-1.1). Fail closed "
+        "rather than ship an implement prompt missing its scoped context."
+    )
 
 
 def render_human_responses(responses) -> str:
@@ -574,7 +1068,7 @@ def _resume_disposition_result(
     """Map a builder's structured `disposition` to the step outcome (FR-3/FR-5).
 
     proceed_* → DONE (the run proceeds to commit); amendment_required /
-    new_conflict → PARKED with ``parked_reason=upstream_conflict`` so P1's
+    new_conflict → PARKED with ``parked_reason=response`` so P1's
     current-state ``_finalize`` records the re-park and the human is asked for the
     next decision (FR-3(b)/FR-10.4 gate). Fail closed (CLAUDE.md §2): a missing or
     unrecognized disposition is NEVER read as success — it fails the step rather
@@ -638,9 +1132,15 @@ def _resume_disposition_result(
 
 
 def _resume_failure(result, usage_by_agent, note: str) -> StepResult:
-    """A fail-closed resume outcome (FR-10): FAILED, carrying the agent's cost."""
+    """A fail-closed resume outcome (FR-10): FAILED, carrying the agent's cost.
+
+    Stamps ``halt_reason=adapter_error`` (FR-7.2): the agent ran but emitted a
+    missing/unrecognized/malformed disposition — a terminal output-contract
+    failure, not a fail-closed precondition guard.
+    """
     return StepResult(
         status=FAILED,
+        halt_reason=HALT_REASON_ADAPTER_ERROR,
         session_id=result.session_id,
         usage=result.usage,
         usage_by_agent=usage_by_agent,
@@ -734,9 +1234,45 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # them) AND an audit trailer is appended deterministically below — data over
     # inference: the linkage never depends on the drafter remembering to add it.
     consumed = _consumed_responses(step, ctx)
-    message, draft_usage, draft_session, drafter = _commit_message(step, ctx, consumed)
+    # FR-11.1: the builder commits at each passing-test milestone as `P<N> wip:`.
+    # Discover the trailing run of such checkpoint commits at the branch tip —
+    # the set this phase commit collapses (squash) or lists in an empty marker
+    # (keep). Empty when the builder made none (today's single-commit phase).
+    #
+    # Discovery is SCOPED to THIS phase's prefix (review F-001): an explicit
+    # `phase:` wins, else the `foreach: plan.phases` iteration id (P1, P2…). The
+    # scope keeps a wrong-phase `P<N> wip:` from being squashed into this phase
+    # and fails closed if one sits in the trailing run. Only a numeric `P<N>`
+    # prefix scopes; stage labels (PRD/PLAN/REVIEW) carry no checkpoints, so they
+    # discover unscoped (matching nothing, as before). The walk is transparent to
+    # engine bookkeeping commits so checkpoints preserved beneath a recovery
+    # rewind are still found (review F-002).
+    phase_prefix = step.get("phase") or _iteration_phase(ctx)
+    wip_scope = (
+        phase_prefix if phase_prefix and re.fullmatch(r"P\d+", phase_prefix) else None
+    )
+    try:
+        wips = gitops.wip_checkpoints(repo, phase=wip_scope)
+    except gitops.WrongPhaseCheckpointError as exc:
+        return StepResult(status=FAILED, notes=f"checkpoint discovery failed closed: {exc}")
+    squash = (
+        ctx.config.checkpoint_commits == CHECKPOINT_COMMITS_SQUASH and bool(wips)
+    )
+    # The squash base is the parent of the OLDEST checkpoint: where the collapsed
+    # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
+    # so the drafter sees the cumulative phase diff, not an empty residual tree.
+    squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
+    message, draft_usage, draft_session, drafter = _commit_message(
+        step, ctx, consumed, diff_base=(squash_base if wips else None)
+    )
     if consumed:
         message = _append_response_trailer(message, [r.response_id for r in consumed])
+    if wips:
+        # Chronological (oldest first) milestone list in the body — engine-
+        # appended (data over inference) so the milestones are always recorded,
+        # whether the drafter mentioned them or not.
+        subjects = [subject for _sha, subject in reversed(wips)]
+        message = _append_checkpoint_trailer(message, subjects, squashed=squash)
     usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
     if err is not None:
@@ -751,9 +1287,42 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         )
     prefix = header_prefix(message)
 
+    # Commit AUTHORSHIP is the implementer's, never the message drafter's
+    # (FR-9.7, review F-003): a phase commit records the builder's work, so the
+    # message_agent (typically `triage`) drafting the text must not bleed into
+    # the commit identity — that mislabels implementation work as triage-
+    # authored and breaks the builder/triage provenance split. An explicit
+    # `agent:` on the commit step overrides; otherwise the builder authors it.
+    agent_name = step.agent or "builder"
+    identity = ctx.config.identity(agent_name)
+
+    # SQUASH (FR-11.1): soft-reset to the squash base so every `wip:` change (and
+    # any residual) stages together, then commit once. The reviewer handoff SHA
+    # is a single non-empty `P<N>:` commit; the reviewed range diff base..<PN:>
+    # is unchanged from the keep case (same base, same final tree).
+    if squash:
+        gitops.reset_soft(repo, squash_base)
+        # The soft reset re-stages every commit in squash_base..old-HEAD, which
+        # can include an engine bookkeeping commit swept in by a checkpoint-
+        # preserving recovery (FR-11.2). Unstage the run-bookkeeping paths so the
+        # collapsed `P<N>:` commit carries only implementation, never manifest/
+        # RUN.md state (review F-002). `commit_all`'s own `--exclude` then leaves
+        # them unstaged rather than re-adding them from the worktree.
+        gitops.unstage(repo, exclude)
+        sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
+        return StepResult(
+            status=DONE, commit_sha=sha, commit_phase=prefix,
+            usage=draft_usage, usage_by_agent=usage_by_agent,
+            session_id=draft_session,
+            notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
+        )
+
     # Mid-commit resume reconciliation (review F-003): if a prior attempt
     # already created the commit (HEAD moved off the recorded base) but died
     # before recording the SHA, adopt that commit rather than double-committing.
+    # A `wip:` commit is never adopted here — `header_prefix` returns None for a
+    # `P<N> wip:` subject (no `:` immediately after the prefix), so only a real
+    # `P<N>:` phase commit matches.
     base = ctx.record.base_sha
     if base and gitops.head_sha(repo) != base and gitops.is_clean(repo, exclude=exclude):
         existing = gitops.head_sha(repo)
@@ -769,6 +1338,24 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             )
 
     if gitops.is_clean(repo, exclude=exclude):
+        if wips:
+            # KEEP, no residual: the `wip:` commits already carry all of the
+            # phase's work. The reviewer handoff must STILL land on a `P<N>:`
+            # commit (git-history contract, CLAUDE.md §1), so record an explicit
+            # empty marker (`--allow-empty`) whose body lists the milestones. The
+            # range diff base..<marker> equals the cumulative `wip:` diff.
+            sha = gitops.commit_all(
+                repo, message, identity=identity, allow_empty=True, exclude=exclude
+            )
+            return StepResult(
+                status=DONE, commit_sha=sha, commit_phase=prefix,
+                usage=draft_usage, usage_by_agent=usage_by_agent,
+                session_id=draft_session,
+                notes=(
+                    f"empty P<N>: marker over {len(wips)} checkpoint(s): "
+                    f"{sha[:10]}"
+                ),
+            )
         return StepResult(
             status=FAILED,
             usage=draft_usage,
@@ -777,14 +1364,8 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             notes="commit step found a clean worktree with nothing to commit",
         )
 
-    # Commit AUTHORSHIP is the implementer's, never the message drafter's
-    # (FR-9.7, review F-003): a phase commit records the builder's work, so the
-    # message_agent (typically `triage`) drafting the text must not bleed into
-    # the commit identity — that mislabels implementation work as triage-
-    # authored and breaks the builder/triage provenance split. An explicit
-    # `agent:` on the commit step overrides; otherwise the builder authors it.
-    agent_name = step.agent or "builder"
-    identity = ctx.config.identity(agent_name)
+    # KEEP with residual (or no checkpoints at all): commit the remaining work as
+    # the `P<N>:` phase commit on top of any `wip:` commits.
     sha = gitops.commit_all(repo, message, identity=identity, exclude=exclude)
     return StepResult(
         status=DONE, commit_sha=sha, commit_phase=prefix,
@@ -793,16 +1374,41 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     )
 
 
-def _commit_message(step: Step, ctx: StepContext, consumed=()):
+def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
     """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
     are None for a literal message (no model call)."""
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
-    return _draft_commit_message(step, ctx, consumed)
+    # Operator commit-recovery (FR-9.2 recovery): a commit step whose drafter
+    # could not produce a legal header fails terminally with no re-draft lever.
+    # `gauntlet resume --response` re-runs it with the human decision pending on
+    # THIS step's record (not yet in `consumed`, which is prior-step CONSUMED
+    # only). If that decision is itself a valid commit message, use it verbatim —
+    # a deterministic override; otherwise fold it into the redraft as guidance.
+    pending = _pending_response(ctx)
+    if pending is not None:
+        text = (pending.response_text or "").strip()
+        if text and validate_commit_message(text) is None:
+            return text, None, None, None
+        consumed = list(consumed) + [pending]
+    return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
 
 
-def _draft_commit_message(step: Step, ctx: StepContext, consumed=()):
+def _pending_response(ctx: StepContext):
+    """This step's own still-`pending` `--response` decision, if any (else None).
+
+    The commit-recovery override reads it directly from the step record because
+    :func:`_consumed_responses` returns CONSUMED entries only, and the decision
+    being applied to a just-resumed commit step is still `pending` while the
+    handler runs (finalize flips it to `consumed` on the terminal outcome)."""
+    responses = ctx.record.human_responses
+    if responses and responses[-1].state == RESPONSE_PENDING:
+        return responses[-1]
+    return None
+
+
+def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
     """Draft a commit message via the message_agent with bounded redraft.
 
     The agent sees the change as data — both the tracked diff AND the untracked
@@ -817,7 +1423,7 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=()):
     if not agent_name:
         raise ValueError("commit step needs either `message:` or `message_agent:`")
     adapter = ctx.build_adapter(agent_name)
-    change = _change_context(ctx)
+    change = _change_context(ctx, diff_base=diff_base)
     base_prompt = (
         (ctx.repo_root / ctx.config.asset_root / step.get("prompt")).read_text()
         if step.get("prompt")
@@ -901,6 +1507,27 @@ class _UsageAccumulator:
             cost_usd=self._cost,
         )
 
+    def merge(self, other: "_UsageAccumulator") -> None:
+        """Fold another accumulator's totals + per-agent split into this one.
+
+        Concurrent triage (FR-9.1) gives each per-finding call its OWN
+        accumulator (``_UsageAccumulator.add`` is not thread-safe), then merges
+        them back into the round accumulator in a deterministic finding order —
+        so the grand total and per-profile split are identical whether triage ran
+        sequentially or concurrently. A failed call's partial spend is merged too
+        (its accumulator carries the partial usage `_run_sub` recorded), keeping
+        the F-008 "failed attempts still count" property under concurrency."""
+        if not other._seen:
+            return
+        self._seen = True
+        self._in += other._in
+        self._out += other._out
+        self._cached += other._cached
+        if other._cost is not None:
+            self._cost = (self._cost or 0.0) + other._cost
+        for name, acc in other._by_agent.items():
+            self._by_agent.setdefault(name, _UsageAccumulator()).merge(acc)
+
     def by_agent(self) -> dict:
         """Per-agent-profile Usage (FR-3.2); empty when no agent was tagged."""
         out = {}
@@ -911,14 +1538,26 @@ class _UsageAccumulator:
         return out
 
 
-def _change_context(ctx: StepContext) -> str:
-    """The diff vs HEAD plus the untracked files staging will add (F-008)."""
+def _change_context(ctx: StepContext, *, diff_base=None) -> str:
+    """The change a commit is about to record, as data for the drafter (F-008).
+
+    Normally the tracked diff vs HEAD plus the untracked files staging will add.
+    When the phase already landed `P<N> wip:` checkpoint commits (FR-11.1), the
+    tip may be clean while the real change is the cumulative diff since the phase
+    base — pass ``diff_base`` (the squash base) so the drafted message reflects
+    the whole phase, not an empty residual tree.
+    """
     repo = ctx.repo_root
-    diff = gitops.diff_head(repo, exclude=ctx.excludes)
+    if diff_base:
+        diff = gitops.diff_worktree_vs(repo, diff_base, exclude=ctx.excludes)
+        label = f"diff (tracked, vs phase base {diff_base[:10]})"
+    else:
+        diff = gitops.diff_head(repo, exclude=ctx.excludes)
+        label = "diff (tracked, vs HEAD)"
     status = gitops.status_porcelain(repo, exclude=ctx.excludes)
     return (
         f"--- git status (incl. untracked) ---\n{status}\n"
-        f"\n--- diff (tracked, vs HEAD) ---\n{diff}"
+        f"\n--- {label} ---\n{diff}"
     )
 
 
@@ -958,6 +1597,28 @@ def _append_response_trailer(message: str, response_ids: list[str]) -> str:
     """
     body = message.rstrip("\n")
     return f"{body}\n\nGauntlet-Response: {', '.join(response_ids)}\n"
+
+
+def _append_checkpoint_trailer(
+    message: str, wip_subjects: list[str], *, squashed: bool
+) -> str:
+    """List the intra-phase checkpoint milestones in the phase commit body (FR-11.1).
+
+    Engine-appended (not left to the message drafter), so the milestones a phase
+    was built from are always recorded — in the squash case where the `wip:`
+    commits are collapsed and their subjects would otherwise be lost, and in the
+    keep/empty-marker case where the marker commit summarizes the phase. Data
+    over inference; keeps the git-history contract auditable from the `P<N>:`
+    commit alone.
+    """
+    body = message.rstrip("\n")
+    label = (
+        "Squashed checkpoint milestones:"
+        if squashed
+        else "Checkpoint milestones:"
+    )
+    lines = "\n".join(f"- {subject}" for subject in wip_subjects)
+    return f"{body}\n\n{label}\n{lines}\n"
 
 
 def _response_section(consumed) -> str:
@@ -1017,9 +1678,12 @@ def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
     return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
 
 
-def open_step_stream(ctx: StepContext, adapter, logger: StepLogger):
-    """Open a live ``events.jsonl`` stream, or return ``None`` for the buffered
-    path (live-run-observability FR-2/FR-6.1).
+def open_step_stream(ctx: StepContext, adapter, logger: StepLogger, *, suffix: str = ""):
+    """Open a live ``events<suffix>.jsonl`` stream, or return ``None`` for the
+    buffered path (live-run-observability FR-2/FR-6.1).
+
+    ``suffix`` isolates a repair re-invocation's stream (FR-2.1) so it never
+    truncates the initial attempt's events file.
 
     Returns a :class:`StepStream` (whose ``append_line`` is threaded into
     ``adapter.run`` as the per-line sink) only when **both** the run-level flag
@@ -1034,7 +1698,7 @@ def open_step_stream(ctx: StepContext, adapter, logger: StepLogger):
     streams = getattr(adapter, "streams_to_sink", None)
     if not callable(streams) or not streams():
         return None
-    return logger.open_stream()
+    return logger.open_stream(suffix=suffix)
 
 
 def _write_step_log(ctx: StepContext, name: str, text: str) -> None:

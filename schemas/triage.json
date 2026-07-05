@@ -48,6 +48,10 @@
         "escalated": {
           "type": "boolean",
           "description": "Engine-recorded: this verdict was re-issued by the escalation agent (or flagged for the human gate). Not produced by the cheap triager itself."
+        },
+        "low_confidence": {
+          "type": "boolean",
+          "description": "Engine-recorded (FR-6.2): a low-confidence verdict on a minor/nit finding that was NOT escalated (severity-gated escalation reserves the escalation profile for blocking/major). Flagged so it carries to the human gate for eyes. Not produced by the cheap triager itself."
         }
       }
     }

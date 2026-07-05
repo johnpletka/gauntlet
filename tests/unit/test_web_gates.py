@@ -27,7 +27,9 @@ from gauntlet.engine.manifest import (
     RUN_FAILED,
     RUN_PARKED,
     RUN_RUNNING,
+    Checkpoint,
     CommitRecord,
+    HumanResponse,
     Manifest,
     PipelineRef,
     StepRecord,
@@ -601,6 +603,116 @@ def test_detail_page_fails_closed_on_unsafe_show(fixture_repo):
     html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
     assert "controls are disabled" in html
     assert "data-approve" not in html and "data-reject" not in html
+
+
+# --------------------------------------------------------------------------- #
+# FR-8.1 — gate decision context on the GateView + detail page
+# --------------------------------------------------------------------------- #
+def _gate_run_with_context(repo: Path) -> Path:
+    """A run parked at ``plan-approve`` behind a converged ``plan-cycle`` (metrics
+    + one round checkpointed + one rejection), so the GateView carries the FR-8.1
+    convergence / prior-responses / escalated context."""
+    (repo / "runs").mkdir(exist_ok=True)
+    cycle = StepRecord(
+        id="plan-cycle", type="adversarial_cycle", status="done",
+        metrics={"rounds": 1, "findings_total": 2, "accepted_total": 1},
+        checkpoints=[
+            Checkpoint(sub_step="review", round=1, handoff_sha="s1",
+                       artifact="artifacts/r1/findings.json"),
+            Checkpoint(sub_step="triage", round=1, handoff_sha="s1",
+                       artifact="artifacts/r1/triage.json"),
+        ],
+        human_responses=[HumanResponse(
+            response_id="plan-cycle-resp-1", response_text="tighten FR-3",
+            timestamp="2026-07-03T10-00-00Z", user="john",
+            response_attempt=1, state="consumed")],
+    )
+    gate = _step("plan-approve", "human_gate", "parked",
+                 notes="awaiting human decision")
+    man = _man("demo", "run-1", status=RUN_PARKED, current_step="plan-approve",
+               steps=[cycle, gate])
+    run_dir = _write_run(repo, "demo", "run-1", man)
+    (run_dir / "pipeline.yaml").write_text(
+        "name: standard\nversion: 1\nstages:\n"
+        "  - id: plan\n    steps:\n"
+        "      - {id: plan-cycle, type: adversarial_cycle}\n"
+        "      - {id: plan-approve, type: human_gate, show: [findings.json]}\n"
+    )
+    arts = run_dir / "artifacts"
+    (arts / "r1").mkdir(parents=True)
+    (arts / "r1" / "findings.json").write_text(json.dumps({
+        "findings": [{"id": "F-001"}, {"id": "F-002"}]}))
+    (arts / "r1" / "triage.json").write_text(json.dumps({"verdicts": [
+        {"finding_id": "F-001", "action": "fix_now"},
+        {"finding_id": "F-002", "action": "reject"}]}))
+    (arts / "findings.json").write_text(json.dumps({"findings": [
+        {"id": "F-001", "severity": "blocking", "claim": "still broken"}]}))
+    (arts / "triage.json").write_text(json.dumps({"verdicts": [
+        {"finding_id": "F-001", "verdict": "legitimate", "action": "fix_now",
+         "confidence": "low", "reasoning": "blocking; human must decide",
+         "escalated": True}]}))
+    return run_dir
+
+
+def test_gate_view_carries_context(fixture_repo):
+    _gate_run_with_context(fixture_repo)
+    view = GateResolver(_store(fixture_repo)).gate("demo")
+    ctx = view.context
+    assert ctx is not None
+    assert ctx["cycle_step_id"] == "plan-cycle"
+    assert ctx["convergence"]["per_round"] == [
+        {"round": 1, "raised": 2, "fixed": 1, "declined": 1}]
+    assert ctx["prior_responses"][0]["response_text"] == "tighten FR-3"
+    assert ctx["escalated"][0]["finding_id"] == "F-001"
+
+
+def test_detail_page_renders_gate_context(fixture_repo):
+    _gate_run_with_context(fixture_repo)
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "Cycle convergence" in html
+    assert "plan-cycle" in html  # named in convergence + reject consequence
+    assert "tighten FR-3" in html  # prior decision surfaced
+    assert "blocking; human must decide" in html  # escalated reasoning
+    # FR-8.2: the reject control spells out which cycle it re-runs.
+    assert "re-runs the" in html
+
+
+def test_reject_form_carries_resolved_consequence(fixture_repo):
+    # F-003: the reject form exposes the resolved consequence (data-reject-
+    # consequence) so the JS confirm states the SAME thing the control shows —
+    # for an upstream-cycle gate that is the re-drive, never "The run fails."
+    _gate_run_with_context(fixture_repo)
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    # The attribute value is HTML-escaped ('→&#39;); getAttribute() decodes it
+    # back for the confirm prompt at runtime.
+    assert (
+        "data-reject-consequence=\"re-runs the &#39;plan-cycle&#39; cycle with "
+        "your notes injected as a new round\"" in html
+    )
+
+
+def test_reject_form_consequence_terminal_without_cycle(fixture_repo):
+    # F-003: a gate with no upstream cycle carries the terminal consequence — the
+    # confirm reflects that a reject there really is terminal.
+    _gate_run_with_artifacts(fixture_repo)  # impl-gate, no preceding cycle
+    client = _client(fixture_repo)
+    html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert (
+        'data-reject-consequence="terminally rejects the gate '
+        '(no upstream cycle to re-run)"' in html
+    )
+
+
+def test_control_js_confirm_is_not_stale_run_fails():
+    # F-003 regression guard: the reject confirm must not hardcode the false
+    # "The run fails." copy; it reads the resolved consequence instead.
+    from gauntlet import web as _web
+
+    js = (Path(_web.__file__).parent / "static" / "control.js").read_text()
+    assert "The run fails." not in js
+    assert "data-reject-consequence" in js
 
 
 def _gate_run_all_artifacts(repo: Path) -> Path:

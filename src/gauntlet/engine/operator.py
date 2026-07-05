@@ -34,9 +34,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from datetime import datetime, timezone
+
+from gauntlet.engine import heartbeat as HB
 from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest, StepRecord
+from gauntlet.engine.pipeline import Pipeline, upstream_cycle_id_for_gate
 from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
     RECOVERY_INTENT_NAME,
@@ -46,6 +51,9 @@ from gauntlet.engine.run import (
 )
 from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
 from gauntlet.procident import ProcessIdentity, read_process_identity
+
+if TYPE_CHECKING:
+    from gauntlet.logging.redact import RedactionSettings
 
 # --- liveness values (FR-2.4) ------------------------------------------------
 LIVENESS_ALIVE = "alive"
@@ -59,6 +67,22 @@ STATE_ORPHANED = "orphaned"
 STATE_INDETERMINATE = "indeterminate"
 STATE_PARKED_GATE = "parked_gate"
 STATE_PARKED_FOR_RESPONSE = "parked_for_response"
+# A step parked by a provider usage limit / overload (harness-efficiency FR-3.2).
+# Distinct from parked_for_response: it needs NO human decision — a plain
+# `gauntlet resume` continues the preserved session (FR-3.3).
+STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
+# A step parked pre-launch because the provider usage window had insufficient
+# headroom for the next step (harness-efficiency FR-10.3, ``enforce: true``).
+# Like the usage-limit park it needs NO human decision — a plain `gauntlet
+# resume` retries once the window replenishes (the projected time is surfaced in
+# the quota block).
+STATE_PARKED_USAGE_WINDOW = "parked_usage_window"
+# A step parked because an agent-authored structured artifact failed validation
+# after the bounded in-session repair loop (harness-efficiency FR-2.2). Like the
+# usage-limit park it needs NO human decision in the `--response` sense — a plain
+# `gauntlet resume` re-runs ONLY the validator against the (possibly hand-edited)
+# artifact and completes the step if it now passes (FR-2.2).
+STATE_PARKED_ARTIFACT_INVALID = "parked_artifact_invalid"
 STATE_FAILED = "failed"
 STATE_HALTED = "halted"
 STATE_INTERRUPTED = "interrupted"
@@ -71,12 +95,10 @@ STATE_UNKNOWN = "unknown"
 # composite states (failed→failed, halted→halted, interrupted→interrupted).
 _FAILURE_STATUSES = (M.FAILED, M.HALTED, M.INTERRUPTED)
 
-# Park reasons that classify a parked step as `parked_for_response` regardless
-# of the parked step's `type` (§6.3a — the *reason* defines the response).
-_RESPONSE_REASONS = (
-    M.PARKED_REASON_UPSTREAM_CONFLICT,
-    M.PARKED_REASON_CYCLE_ESCALATION,
-)
+# The normalized (PRD FR-7.2) park reason that classifies a parked step as
+# `parked_for_response` (§6.3a — the *reason* defines the response). Legacy
+# on-disk values map to it through `manifest.normalize_parked_reason`.
+_RESPONSE_REASON = M.PARKED_REASON_RESPONSE
 
 # Composite step types whose evidence lives in role sub-directories, not a
 # direct ``steps/<leaf>/transcript.md`` (FR-3.1a). Mirrors the cycle/retro
@@ -92,6 +114,9 @@ _MEANING: dict[str, str] = {
     STATE_INDETERMINATE: "cannot prove the driver is alive or dead — inspect read-only before acting",
     STATE_PARKED_GATE: "awaiting a human decision at a gate",
     STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision",
+    STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
+    STATE_PARKED_USAGE_WINDOW: "parked before a step to stay within the provider usage window — `resume` retries once it replenishes",
+    STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
     STATE_FAILED: "a step failed",
     STATE_HALTED: "the budget/timeout guard tripped",
     STATE_INTERRUPTED: "the run was killed mid-step",
@@ -136,6 +161,10 @@ class Action:
     required_inputs: list[str]
     executable: bool
     command: str
+    # One-line "what this does when taken" (FR-8.2). Populated for gate decisions
+    # (approve → what proceeds; reject → which cycle re-runs with the notes
+    # injected); None for actions with no distinct consequence to spell out.
+    consequence: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -145,6 +174,7 @@ class Action:
             "required_inputs": list(self.required_inputs),
             "executable": self.executable,
             "command": self.command,
+            "consequence": self.consequence,
         }
 
 
@@ -319,17 +349,31 @@ def _control_resume(slug: str) -> Action:
                   f"gauntlet resume {slug}")
 
 
-def _decide_approve(slug: str) -> Action:
+def _decide_approve(slug: str, *, gate_cycle_id: str | None = None) -> Action:
+    # FR-8.2 consequence: approving ratifies the artifact and the run proceeds
+    # past the gate to the next stage/phase.
+    consequence = "continues the run past this gate to the next stage"
     return Action("approve", "decide", ["gauntlet", "approve", slug], [], True,
-                  f"gauntlet approve {slug}")
+                  f"gauntlet approve {slug}", consequence=consequence)
 
 
-def _decide_reject(slug: str) -> Action:
+def _decide_reject(slug: str, *, gate_cycle_id: str | None = None) -> Action:
     # `--notes` is a flag with no value here; the operator supplies the reason,
     # so the action is non-executable and `command` carries a placeholder.
+    # FR-8.2 consequence: a reject downstream of an adversarial_cycle injects the
+    # notes into that cycle and re-runs it (reject_gate); with no upstream cycle to
+    # iterate it is a terminal reject.
+    if gate_cycle_id:
+        consequence = (
+            f"re-runs the '{gate_cycle_id}' adversarial cycle with your notes "
+            "injected as a new round"
+        )
+    else:
+        consequence = "terminally rejects the gate (no upstream cycle to re-run)"
     return Action("reject", "decide", ["gauntlet", "reject", slug, "--notes"],
                   ["notes"], False,
-                  f'gauntlet reject {slug} --notes "<your reason>"')
+                  f'gauntlet reject {slug} --notes "<your reason>"',
+                  consequence=consequence)
 
 
 def _decide_resume_response(slug: str) -> Action:
@@ -339,7 +383,8 @@ def _decide_resume_response(slug: str) -> Action:
 
 
 def _actions_for(
-    state: str, slug: str, failure: "FailureDescriptor | None" = None
+    state: str, slug: str, failure: "FailureDescriptor | None" = None,
+    *, gate_cycle_id: str | None = None,
 ) -> list[Action]:
     """The §6.3 next-action column for a composite ``state`` (total)."""
     if state == STATE_IN_PROGRESS:
@@ -347,9 +392,25 @@ def _actions_for(
     if state == STATE_ORPHANED:
         return [_control_resume(slug)]
     if state == STATE_PARKED_GATE:
-        return [_decide_approve(slug), _decide_reject(slug)]
+        # FR-8.2: gate decisions carry a one-line consequence; a reject names the
+        # upstream cycle it re-runs (gate_cycle_id, resolved from the manifest).
+        return [
+            _decide_approve(slug, gate_cycle_id=gate_cycle_id),
+            _decide_reject(slug, gate_cycle_id=gate_cycle_id),
+        ]
     if state == STATE_PARKED_FOR_RESPONSE:
         return [_decide_resume_response(slug)]
+    if state == STATE_PARKED_USAGE_LIMIT:
+        # FR-3.3: a plain `resume` continues the preserved session — no decision.
+        return [_control_resume(slug)]
+    if state == STATE_PARKED_USAGE_WINDOW:
+        # FR-10.3: parked pre-step to stay within the window — a plain `resume`
+        # retries once it replenishes (no human decision, no session to continue).
+        return [_control_resume(slug)]
+    if state == STATE_PARKED_ARTIFACT_INVALID:
+        # FR-2.2: a plain `resume` re-runs only the validator against the
+        # (possibly hand-edited) artifact — inspect the error, then resume.
+        return [_observe_logs(slug), _control_resume(slug)]
     if state == STATE_FAILED:
         # A re-runnable PRECONDITION failure (FR-9.3 clean-handoff): plain
         # `resume` re-runs the guard once the operator fixes the named
@@ -575,20 +636,50 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
         if len(parked_steps) != 1 or halt_steps:
             return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
         ps = parked_steps[0]
-        if ps.parked_reason in _RESPONSE_REASONS:
+        # Normalize any legacy on-disk parked_reason to the PRD enum (FR-7.2): a
+        # pre-P3 `upstream_conflict`/`cycle_escalation` reads as `response`, and a
+        # pre-P3 gate (null reason) reads as `gate`. The descriptor carries the
+        # NORMALIZED value so `status --json` never emits a legacy value.
+        reason = M.normalize_parked_reason(ps.parked_reason, ps.type, ps.status)
+        if reason == _RESPONSE_REASON:
             return (
                 STATE_PARKED_FOR_RESPONSE,
-                ParkedDescriptor(render_step_id(ps), ps.type, ps.parked_reason),
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        if ps.parked_reason is None and ps.type == "human_gate":
+        if reason == M.PARKED_REASON_USAGE_LIMIT:
+            # FR-3.2: a usage-limit park — a plain `resume` continues the session,
+            # no human decision required (distinct from the response parks above).
+            return (
+                STATE_PARKED_USAGE_LIMIT,
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
+                None,
+            )
+        if reason == M.PARKED_REASON_ARTIFACT_INVALID:
+            # FR-2.2: an in-step validation failure that exhausted its repair loop
+            # — a plain `resume` re-runs only the validator (hand-edit sanctioned).
+            return (
+                STATE_PARKED_ARTIFACT_INVALID,
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
+                None,
+            )
+        if reason == M.PARKED_REASON_USAGE_WINDOW:
+            # FR-10.3: an enforce-mode pre-step park for insufficient window
+            # headroom — a plain `resume` retries once the window replenishes.
+            return (
+                STATE_PARKED_USAGE_WINDOW,
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
+                None,
+            )
+        if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
             return (
                 STATE_PARKED_GATE,
-                ParkedDescriptor(render_step_id(ps), ps.type, None),
+                ParkedDescriptor(render_step_id(ps), ps.type, reason),
                 None,
             )
-        # A non-gate step parked with no reason, or an unknown reason value, has
-        # no defined operator response → contradiction.
+        # A non-gate step parked with no reason or an unknown reason value has no
+        # defined operator response → contradiction (fail closed, read-only
+        # inspection). Every PRD park reason is handled above.
         return STATE_UNKNOWN, None, None
 
     # P2: failed — the last failure step in manifest order is authoritative (§6.3a).
@@ -622,16 +713,50 @@ def _current_step(
     return None
 
 
-def compute_run_state(man: Manifest, liveness: str) -> RunState:
-    """The single computed composite state both the footer and ``--json`` render."""
+# Sentinel distinguishing "caller resolved the gate cycle from the pipeline (use
+# it, even if None → terminal reject)" from "caller did not resolve; fall back to
+# the pure manifest heuristic". A plain None default cannot express both (F-001).
+_UNRESOLVED: Any = object()
+
+
+def compute_run_state(
+    man: Manifest, liveness: str, *, gate_cycle_id: str | None = _UNRESOLVED
+) -> RunState:
+    """The single computed composite state both the footer and ``--json`` render.
+
+    ``gate_cycle_id`` (FR-8.2) is the ``adversarial_cycle`` a reject of the parked
+    gate would re-drive, which the reject action's consequence names. The
+    authoritative resolution is over the run's *pipeline snapshot* (same rule as
+    ``Orchestrator._upstream_cycle_for_gate``), so the I/O-bearing caller resolves
+    it via :func:`gauntlet.engine.pipeline.upstream_cycle_id_for_gate` and threads
+    it in — passing ``None`` when a reject is terminal (a foreach gate, or a gate
+    with no same-stage cycle). Left unset, this function falls back to a pure
+    manifest-order heuristic (``_upstream_cycle_record``) so pure/no-pipeline
+    callers still get a shaped consequence; the CLI/web always resolve from the
+    pipeline so their surfaces name the cycle a reject *actually* re-runs (F-001).
+    """
     state, parked, failure = _classify(man, liveness)
+    if state == STATE_PARKED_GATE and parked is not None:
+        if gate_cycle_id is _UNRESOLVED:
+            gate_rec = next(
+                (r for r in man.steps if render_step_id(r) == parked.step_id), None
+            )
+            cyc = (
+                _upstream_cycle_record(man, gate_rec)
+                if gate_rec is not None else None
+            )
+            gate_cycle_id = cyc.id if cyc is not None else None
+    else:
+        gate_cycle_id = None
     return RunState(
         state=state,
         slug=man.slug,
         current_step=_current_step(man, state, parked, failure),
         parked=parked,
         failure=failure,
-        next_actions=_actions_for(state, man.slug, failure),
+        next_actions=_actions_for(
+            state, man.slug, failure, gate_cycle_id=gate_cycle_id
+        ),
     )
 
 
@@ -738,9 +863,23 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "usage_totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"],
+      "description": "Aggregated provider usage (harness-efficiency FR-7.1). cost_usd is null on the degraded tokens-only path (a subscription-auth CLI may not report cost); the token counts are always integers.",
+      "properties": {
+        "input_tokens": {"type": "integer", "description": "Fresh (uncached) input tokens."},
+        "output_tokens": {"type": "integer", "description": "Output tokens."},
+        "cached_input_tokens": {"type": "integer", "description": "Cache-read input tokens."},
+        "cost_usd": {"type": ["number", "null"], "description": "Cost in USD, or null when unpriced."}
+      }
+    }
+  },
   "required": [
     "schema_version",
     "slug",
@@ -748,11 +887,20 @@ _STATUS_SCHEMA_JSON = r'''{
     "run_status",
     "state",
     "current_step",
+    "current_step_elapsed_s",
+    "current_step_timeout_remaining_s",
+    "run_elapsed_s",
+    "totals",
+    "agent_usage",
+    "warnings",
+    "quota",
     "driver",
     "parked",
     "failure",
     "reconciliation",
     "current_step_freshness",
+    "suspension",
+    "gate",
     "steps",
     "next_actions"
   ],
@@ -783,6 +931,9 @@ _STATUS_SCHEMA_JSON = r'''{
         "indeterminate",
         "parked_gate",
         "parked_for_response",
+        "parked_usage_limit",
+        "parked_usage_window",
+        "parked_artifact_invalid",
         "failed",
         "halted",
         "interrupted",
@@ -795,6 +946,44 @@ _STATUS_SCHEMA_JSON = r'''{
     "current_step": {
       "type": ["string", "null"],
       "description": "Rendered id of the active/most-recent non-terminal step, or null. When non-null it MUST equal the rendered id of exactly one steps[] entry (`<id>` or `<id>.<iteration>`). Derived convenience; steps[] is authoritative."
+    },
+    "current_step_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds the current step has been running (harness-efficiency FR-7.1): now - started for a running step, or ended - started for a finished one. null when there is no current step or its timestamps are absent/unparseable."
+    },
+    "current_step_timeout_remaining_s": {
+      "type": ["number", "null"],
+      "description": "Best-effort seconds remaining before the current running step's deadline (harness-efficiency FR-7.1), computed as the resolved effective timeout minus elapsed and clamped to 0 (never negative). null when there is no running step or no resolvable timeout. Advisory — suspend credit (FR-5.2) is not folded in here."
+    },
+    "run_elapsed_s": {
+      "type": ["number", "null"],
+      "description": "Wall-clock seconds from the first step start to now (a live run) or to the last step end (a finished run) (harness-efficiency FR-7.1). null when no step has started."
+    },
+    "totals": {
+      "$ref": "#/$defs/usage_totals",
+      "description": "Run-level aggregated provider usage incl. cost (harness-efficiency FR-7.1). Always present."
+    },
+    "agent_usage": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/usage_totals"},
+      "description": "Per-agent-profile usage totals keyed by profile name (harness-efficiency FR-7.1). Always present; an empty object when no per-profile usage was recorded."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Non-fatal run anomalies surfaced rather than swallowed (harness-efficiency FR-10.3): each an already-redacted human-readable string. Includes advisory usage-window shortfalls (`[<step>] usage-window admission (FR-10.3): …`, the warn-don't-park default) so a live shortfall is visible without opening the manifest, plus any other recorded warning (e.g. an unrenderable final-gate artifact). Always present; an empty array when none."
+    },
+    "quota": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["reset_at"],
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
+      "properties": {
+        "reset_at": {
+          "type": ["string", "null"],
+          "description": "Absolute UTC reset time (ISO-8601): a usage_limit park's provider reset (null when no structured retry hint), or a usage_window park's projected window-replenishment time."
+        }
+      }
     },
     "driver": {
       "type": "object",
@@ -826,7 +1015,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -838,9 +1027,9 @@ _STATUS_SCHEMA_JSON = r'''{
           "description": "The parked step's type."
         },
         "reason": {
-          "type": ["string", "null"],
-          "enum": ["upstream_conflict", "cycle_escalation", null],
-          "description": "Park reason; null for a plain human_gate."
+          "type": "string",
+          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate"],
+          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
         }
       }
     },
@@ -898,13 +1087,118 @@ _STATUS_SCHEMA_JSON = r'''{
         }
       }
     },
+    "suspension": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
+      "properties": {
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["host_suspended", "driver_orphaned", "agent_silent", null],
+          "description": "The stalled-run classification: host_suspended (a detected sleep gap on a live driver), driver_orphaned (heartbeat stale, driver process dead), agent_silent (live driver, no agent output / a live-but-stale heartbeat with no clock evidence — fail closed to hung, never sleep), or null (healthy / not applicable)."
+        },
+        "last_heartbeat_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "intervals": {
+          "type": "array",
+          "description": "Detected host-suspension intervals (manifest.suspensions), in detection order.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "gap_s"],
+            "properties": {
+              "start": {"type": "string", "description": "Wallclock of the heartbeat before the gap."},
+              "end": {"type": "string", "description": "Wallclock of the heartbeat after the gap."},
+              "gap_s": {"type": "integer", "description": "Wallclock width of the suspension in seconds."}
+            }
+          }
+        }
+      }
+    },
+    "gate": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["cycle_step_id", "convergence", "prior_responses", "escalated"],
+      "description": "Gate context block (PRD §6 / harness-efficiency FR-8.1): always present, non-null only when parked at a human gate. Assembled from the manifest + the upstream adversarial_cycle's persisted artifacts (no transcript read): the cycle's convergence summary, prior human `--response`/rejection decisions for this gate, and the per-escalated-finding triage reasoning. Content-bearing fields pass through the redaction path (PRD §7). null for every non-gate state.",
+      "properties": {
+        "cycle_step_id": {
+          "type": ["string", "null"],
+          "description": "Id of the adversarial_cycle this gate ratifies (the last cycle before the gate), or null when the gate has no upstream cycle."
+        },
+        "convergence": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["rounds", "findings_total", "accepted_total", "per_round"],
+          "description": "Cycle convergence summary from the upstream cycle's `metrics` (aggregate) plus its per-round sub-step checkpoints (FR-4). null when there is no upstream cycle. rounds/findings_total/accepted_total are null when the cycle recorded no metrics.",
+          "properties": {
+            "rounds": {"type": ["integer", "null"], "description": "Rounds the cycle ran."},
+            "findings_total": {"type": ["integer", "null"], "description": "Findings raised across all rounds."},
+            "accepted_total": {"type": ["integer", "null"], "description": "Findings triaged fix_now across all rounds."},
+            "per_round": {
+              "type": "array",
+              "description": "Per-round breakdown from the checkpointed round artifacts, in ascending round order. A count is null when the round's artifact is absent/unreadable.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["round", "raised", "fixed", "declined"],
+                "properties": {
+                  "round": {"type": "integer", "description": "1-based round number."},
+                  "raised": {"type": ["integer", "null"], "description": "Findings raised this round (from the round's findings.json)."},
+                  "fixed": {"type": ["integer", "null"], "description": "Findings triaged action=fix_now this round."},
+                  "declined": {"type": ["integer", "null"], "description": "Findings triaged action in {defer, reject} this round."}
+                }
+              }
+            }
+          }
+        },
+        "prior_responses": {
+          "type": "array",
+          "description": "Prior human `--response`/rejection decisions bearing on this gate (from the upstream cycle's and the gate's human_responses), in record order, with timestamps. response_text is redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["response_id", "response_text", "timestamp", "user", "state"],
+            "properties": {
+              "response_id": {"type": "string", "description": "Stable response handle (`<step>-resp-<n>`)."},
+              "response_text": {"type": "string", "description": "The decision text, redacted."},
+              "timestamp": {"type": "string", "description": "When the decision was recorded."},
+              "user": {"type": "string", "description": "Who recorded it."},
+              "state": {"type": "string", "enum": ["pending", "consumed"], "description": "Idempotent-recovery state."}
+            }
+          }
+        },
+        "escalated": {
+          "type": "array",
+          "description": "Per-escalated-finding triage reasoning: latest-round verdicts flagged `escalated` or `low_confidence`, merged with their finding. Empty when no verdict was flagged. Content fields (claim/reasoning) redacted.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["finding_id", "severity", "category", "location", "claim", "verdict", "action", "confidence", "reasoning"],
+            "properties": {
+              "finding_id": {"type": "string"},
+              "severity": {"type": ["string", "null"]},
+              "category": {"type": ["string", "null"]},
+              "location": {"type": ["string", "null"]},
+              "claim": {"type": ["string", "null"]},
+              "verdict": {"type": ["string", "null"]},
+              "action": {"type": ["string", "null"]},
+              "confidence": {"type": ["string", "null"]},
+              "reasoning": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
     "steps": {
       "type": "array",
       "description": "Authoritative ordered step list.",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -924,6 +1218,24 @@ _STATUS_SCHEMA_JSON = r'''{
               "skipped"
             ],
             "description": "Step status."
+          },
+          "duration_s": {
+            "type": ["number", "null"],
+            "description": "Wall-clock seconds the step ran (harness-efficiency FR-7.1): ended - started, or now - started while running. null when the step has no start timestamp or its timestamps are unparseable."
+          },
+          "notes": {
+            "type": ["string", "null"],
+            "description": "The step's engine/human notes verbatim (harness-efficiency FR-7.1), or null when none. Content-bearing; already redacted on write."
+          },
+          "halt_reason": {
+            "type": ["string", "null"],
+            "enum": ["timeout", "budget", "judge_deny", "signal_kill", "adapter_error", "precondition", "operator_recover", null],
+            "description": "Terminal halt reason (harness-efficiency FR-7.2) on a HALTED/FAILED/INTERRUPTED step; null otherwise. DISJOINT from parked_reason — never both set. null on steps predating P3."
+          },
+          "parked_reason": {
+            "type": ["string", "null"],
+            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", null],
+            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim."
           }
         }
       }
@@ -940,7 +1252,8 @@ _STATUS_SCHEMA_JSON = r'''{
           "argv",
           "required_inputs",
           "executable",
-          "command"
+          "command",
+          "consequence"
         ],
         "properties": {
           "label": {"type": "string", "description": "Short action label."},
@@ -967,6 +1280,10 @@ _STATUS_SCHEMA_JSON = r'''{
           "command": {
             "type": "string",
             "description": "Rendered string for HUMAN DISPLAY ONLY, never for execution (may contain placeholder text)."
+          },
+          "consequence": {
+            "type": ["string", "null"],
+            "description": "One-line description of what this action does when taken (harness-efficiency FR-8.2): e.g. a gate approve says what proceeds, a gate reject names the adversarial_cycle it re-runs with the notes injected. null for actions with no distinct consequence to spell out."
           }
         }
       }
@@ -977,7 +1294,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},
@@ -1066,6 +1383,302 @@ def _evidence_path(
     return posix
 
 
+# --- timing / usage rendering (harness-efficiency FR-7.1) --------------------
+def _parse_iso(ts: str | None) -> datetime | None:
+    """Parse an ISO-8601 manifest timestamp (``started``/``ended``); None on any
+    failure, so a malformed/absent timestamp yields a null duration rather than
+    an exception."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _elapsed_between(start: datetime | None, end: datetime | None) -> float | None:
+    """``(end - start)`` in seconds, clamped to ≥0; None if either is missing or
+    the subtraction is not well-defined (e.g. mixed naive/aware timestamps)."""
+    if start is None or end is None:
+        return None
+    try:
+        return max(0.0, (end - start).total_seconds())
+    except TypeError:
+        return None
+
+
+def _step_duration_s(rec: StepRecord, now: datetime) -> float | None:
+    """Wall-clock seconds a step ran (FR-7.1): ``ended - started`` for a finished
+    step, ``now - started`` while running, else None (no start, or a started step
+    with no end that is not currently running)."""
+    start = _parse_iso(rec.started)
+    if start is None:
+        return None
+    if rec.ended:
+        end = _parse_iso(rec.ended)
+    elif rec.status == M.RUNNING:
+        end = now
+    else:
+        end = None
+    return _elapsed_between(start, end)
+
+
+def _run_elapsed_s(man: Manifest, now: datetime) -> float | None:
+    """Wall-clock seconds from the earliest step start to now (a running run) or
+    to the latest step end (a finished run) (FR-7.1); None if no step started."""
+    starts = [t for t in (_parse_iso(s.started) for s in man.steps) if t is not None]
+    if not starts:
+        return None
+    if man.status == M.RUN_RUNNING:
+        end: datetime | None = now
+    else:
+        ends = [t for t in (_parse_iso(s.ended) for s in man.steps) if t is not None]
+        end = max(ends) if ends else now
+    return _elapsed_between(min(starts), end)
+
+
+def _usage_totals_dict(u) -> dict:
+    """A UsageTotals rendered as the §6.1 ``usage_totals`` object (FR-7.1)."""
+    return {
+        "input_tokens": u.input_tokens or 0,
+        "output_tokens": u.output_tokens or 0,
+        "cached_input_tokens": u.cached_input_tokens or 0,
+        "cost_usd": u.cost_usd,
+    }
+
+
+# --- gate decision context (harness-efficiency FR-8.1) -----------------------
+def _upstream_cycle_record(man: Manifest, gate_rec: StepRecord) -> StepRecord | None:
+    """The ``adversarial_cycle`` a gate ratifies: the last cycle before it in
+    manifest step order (``prd-cycle`` for ``prd-approve`` etc.).
+
+    Pure over ``man.steps`` — the same relationship the orchestrator resolves from
+    the pipeline (``_upstream_cycle_for_gate``), but read from the manifest so both
+    the status contract and the web view can name the cycle without a pipeline
+    load. Matches ``gate_rec`` by identity first (it is normally an element of
+    ``man.steps``), falling back to ``(id, iteration)`` so a copy still resolves.
+    Returns ``None`` when no cycle precedes the gate (fail-soft — the caller then
+    renders a null convergence / a terminal-reject consequence)."""
+    cyc: StepRecord | None = None
+    for rec in man.steps:
+        if rec is gate_rec or (
+            rec.id == gate_rec.id and rec.iteration == gate_rec.iteration
+        ):
+            return cyc
+        if rec.type == "adversarial_cycle":
+            cyc = rec
+    return cyc
+
+
+def _resolve_upstream_cycle(
+    man: Manifest, gate_rec: StepRecord, pipeline: "Pipeline | None"
+) -> StepRecord | None:
+    """The cycle record a gate ratifies, resolved for a content-bearing surface.
+
+    With a ``pipeline`` snapshot, resolve the cycle *id* by the same rule the
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
+    stage) and return that manifest record, so the gate context names exactly the
+    cycle a reject re-runs (F-001). A foreach gate / a gate with no same-stage
+    cycle resolves to ``None`` (terminal reject, no convergence to show). Without
+    a snapshot, fall back to the pure manifest-order heuristic (fail-soft)."""
+    if pipeline is None:
+        return _upstream_cycle_record(man, gate_rec)
+    cyc_id = upstream_cycle_id_for_gate(pipeline, gate_rec.id)
+    if cyc_id is None:
+        return None
+    return next((r for r in man.steps if r.id == cyc_id), None)
+
+
+def _read_json_under(base: Path, rel: str | None) -> object | None:
+    """Read+parse a run-relative JSON artifact, fail-soft, with containment.
+
+    ``rel`` is an engine-written run-dir-relative path (a checkpoint ``artifact``
+    or ``artifacts/<name>``); it is still resolved and asserted to stay under
+    ``base`` so a corrupt/hostile value can never read outside the run tree
+    (FR-10.1 posture). Any absence/parse/containment failure returns ``None`` — a
+    gate view must never crash on a missing round artifact."""
+    if not rel:
+        return None
+    try:
+        base_r = Path(base).resolve()
+        target = (base_r / rel).resolve()
+        target.relative_to(base_r)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    try:
+        return json.loads(target.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _as_int(v: object) -> int | None:
+    """An int metric value, or None (bool excluded — it is an int subclass)."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _convergence_summary(
+    cycle_rec: StepRecord | None, run_instance_dir: Path
+) -> dict | None:
+    """The FR-8.1 convergence block: aggregate ``metrics`` + per-round breakdown.
+
+    Aggregate counts come from the cycle's ``metrics`` (the ``_CycleMetrics``
+    dict); the per-round raised/fixed/declined breakdown is read from the round's
+    checkpointed artifacts (FR-4: ``artifacts/r<N>/findings.json`` /
+    ``triage.json``). No transcript, no re-execution — pure rendering over
+    already-persisted data. ``None`` when the gate has no upstream cycle."""
+    if cycle_rec is None:
+        return None
+    metrics = cycle_rec.metrics or {}
+    per_round: list[dict] = []
+    for rnd in sorted({c.round for c in cycle_rec.checkpoints}):
+        cps = {c.sub_step: c for c in cycle_rec.checkpoints if c.round == rnd}
+        raised = fixed = declined = None
+        rev = cps.get("review")
+        if rev is not None:
+            data = _read_json_under(run_instance_dir, rev.artifact)
+            if isinstance(data, dict):
+                raised = len(data.get("findings") or [])
+        tri = cps.get("triage")
+        if tri is not None:
+            data = _read_json_under(run_instance_dir, tri.artifact)
+            if isinstance(data, dict):
+                verdicts = [v for v in (data.get("verdicts") or []) if isinstance(v, dict)]
+                fixed = sum(1 for v in verdicts if v.get("action") == "fix_now")
+                declined = sum(
+                    1 for v in verdicts if v.get("action") in ("defer", "reject")
+                )
+        per_round.append(
+            {"round": rnd, "raised": raised, "fixed": fixed, "declined": declined}
+        )
+    return {
+        "rounds": _as_int(metrics.get("rounds")),
+        "findings_total": _as_int(metrics.get("findings_total")),
+        "accepted_total": _as_int(metrics.get("accepted_total")),
+        "per_round": per_round,
+    }
+
+
+def _prior_responses(
+    cycle_rec: StepRecord | None, gate_rec: StepRecord, redact
+) -> list[dict]:
+    """Prior human ``--response``/rejection decisions bearing on this gate (FR-8.1).
+
+    A gate rejection is appended to the *upstream cycle's* ``human_responses``
+    (``orchestrator.reject_gate`` → ``_append_response``); a gate's own record may
+    also carry responses. Both are surfaced in record order with timestamps;
+    ``response_text`` is content-bearing and passed through ``redact`` (PRD §7)."""
+    out: list[dict] = []
+    for src in (cycle_rec, gate_rec):
+        if src is None:
+            continue
+        for hr in src.human_responses:
+            out.append(
+                {
+                    "response_id": hr.response_id,
+                    "response_text": redact(hr.response_text),
+                    "timestamp": hr.timestamp,
+                    "user": hr.user,
+                    "state": hr.state,
+                }
+            )
+    return out
+
+
+def _escalated_findings(run_instance_dir: Path, redact) -> list[dict]:
+    """Latest-round triage verdicts flagged ``escalated``/``low_confidence`` merged
+    with their finding (FR-8.1 per-escalated-finding reasoning).
+
+    Reads the cycle's latest-round-wins ``artifacts/triage.json`` +
+    ``findings.json`` (the same artifacts the gate ``show:`` lists), keeps only the
+    engine-flagged verdicts, and joins each to its finding. Content fields
+    (claim/reasoning) pass through ``redact`` (PRD §7). Empty when nothing is
+    flagged or the artifacts are absent."""
+    triage = _read_json_under(run_instance_dir, "artifacts/triage.json")
+    findings = _read_json_under(run_instance_dir, "artifacts/findings.json")
+    by_id: dict[str, dict] = {}
+    if isinstance(findings, dict):
+        for f in findings.get("findings") or []:
+            if isinstance(f, dict) and f.get("id"):
+                by_id[f["id"]] = f
+    out: list[dict] = []
+    verdicts = triage.get("verdicts") if isinstance(triage, dict) else None
+    for v in verdicts or []:
+        if not isinstance(v, dict):
+            continue
+        if not (v.get("escalated") or v.get("low_confidence")):
+            continue
+        fid = v.get("finding_id")
+        if not fid:
+            continue
+        f = by_id.get(fid, {})
+        out.append(
+            {
+                "finding_id": fid,
+                "severity": f.get("severity"),
+                "category": f.get("category"),
+                "location": f.get("location"),
+                "claim": redact(f.get("claim")),
+                "verdict": v.get("verdict"),
+                "action": v.get("action"),
+                "confidence": v.get("confidence"),
+                "reasoning": redact(v.get("reasoning")),
+            }
+        )
+    return out
+
+
+def compute_gate_context(
+    man: Manifest,
+    run_instance_dir: Path,
+    gate_rec: StepRecord,
+    *,
+    pipeline: "Pipeline | None" = None,
+    redaction: "RedactionSettings | None" = None,
+) -> dict:
+    """Assemble the FR-8.1 gate decision context for a parked ``human_gate``.
+
+    A gate decision must be makeable from this block alone (PRD G6): the upstream
+    cycle's convergence summary, the prior human responses/rejections for the
+    gate, and the per-escalated-finding triage reasoning — all sourced from the
+    manifest + the cycle's persisted artifacts, never a transcript. The I/O
+    (round-artifact reads) lives here, not in the pure :func:`status_payload`; the
+    caller threads the result in, mirroring ``current_step_freshness`` /
+    ``suspension``. Content-bearing fields are redacted (PRD §7).
+
+    ``pipeline`` is the run's pipeline snapshot (loaded by the I/O-bearing
+    caller). When given, the upstream cycle is resolved by the *same* rule the
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
+    stage), so ``cycle_step_id`` names the cycle a reject actually re-runs and
+    never a cross-stage/foreach cycle it does not (F-001). Absent a snapshot it
+    falls back to the pure manifest-order heuristic (fail-soft).
+
+    ``redaction`` is the run's configured redaction list (``RunConfig.redaction``).
+    It must be threaded through: with it omitted, a secret whose env-var name
+    misses the default KEY/TOKEN heuristic but is configured under
+    ``extra_env_vars`` would leak verbatim into this block via ``status --json`` /
+    the web gate view (F-002). ``None`` falls back to default settings.
+
+    Always returns a dict (never ``None``) so a gate park always emits a shaped
+    block; a gate with no upstream cycle yields ``cycle_step_id``/``convergence``
+    null and empty lists (fail-soft, still schema-valid)."""
+    from gauntlet.logging.redact import build_redactor
+
+    redactor = build_redactor(redaction)
+
+    def redact(text: object) -> object:
+        if not isinstance(text, str):
+            return text
+        return redactor.redact(text)[0]
+
+    cycle_rec = _resolve_upstream_cycle(man, gate_rec, pipeline)
+    return {
+        "cycle_step_id": cycle_rec.id if cycle_rec is not None else None,
+        "convergence": _convergence_summary(cycle_rec, run_instance_dir),
+        "prior_responses": _prior_responses(cycle_rec, gate_rec, redact),
+        "escalated": _escalated_findings(run_instance_dir, redact),
+    }
+
+
 def status_payload(
     man: Manifest,
     driver: DriverInfo,
@@ -1075,6 +1688,10 @@ def status_payload(
     run_root: Path,
     run_instance_dir: Path,
     current_step_freshness: float | None = None,
+    suspension: dict | None = None,
+    gate: dict | None = None,
+    now: datetime | None = None,
+    current_step_timeout_s: float | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -1095,6 +1712,12 @@ def status_payload(
     ``{ "last_event_age_s": <number> }`` — the **object** is the nullable unit,
     never a top-level ``last_event_age_s`` (§6.1).
 
+    ``gate`` is the FR-8.1 gate decision context, assembled by the I/O-bearing
+    :func:`compute_gate_context` in the caller and threaded in the same way (so
+    this serializer stays pure). It is ``None`` for every non-gate state and the
+    caller passes it only for a ``parked_gate`` — ``None`` renders as ``gate:
+    null``.
+
     The completed object is validated against the committed §6.1 schema before it
     is returned (F-003): unconstrained persisted inputs (e.g. an out-of-enum
     ``StepRecord.status`` or a non-string lock field) can otherwise reach a
@@ -1102,6 +1725,36 @@ def status_payload(
     :class:`StatusContractError`, so emission fails closed rather than printing a
     contract-breaking object.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    # FR-7.1 timing: current-step elapsed is the current step's own duration; the
+    # timeout remaining is best-effort from a caller-resolved effective timeout
+    # (null when there is no running current step or no resolvable timeout).
+    by_rendered = {render_step_id(rec): rec for rec in man.steps}
+    current_rec = (
+        by_rendered.get(rstate.current_step) if rstate.current_step else None
+    )
+    current_elapsed = (
+        _step_duration_s(current_rec, now) if current_rec is not None else None
+    )
+    timeout_remaining: float | None = None
+    if (
+        current_rec is not None
+        and current_rec.status == M.RUNNING
+        and current_step_timeout_s is not None
+        and current_elapsed is not None
+    ):
+        timeout_remaining = max(0.0, current_step_timeout_s - current_elapsed)
+    # FR-7.1/FR-10.3 quota: the reset time of a usage_limit park, OR the projected
+    # replenishment time of a usage_window park (both stored on quota_reset_at);
+    # else null.
+    quota = None
+    if (
+        rstate.state in (STATE_PARKED_USAGE_LIMIT, STATE_PARKED_USAGE_WINDOW)
+        and rstate.parked is not None
+    ):
+        parked_rec = by_rendered.get(rstate.parked.step_id)
+        quota = {"reset_at": parked_rec.quota_reset_at if parked_rec else None}
     payload = {
         "schema_version": SCHEMA_VERSION,
         "slug": man.slug,
@@ -1109,6 +1762,19 @@ def status_payload(
         "run_status": man.status,
         "state": rstate.state,
         "current_step": rstate.current_step,
+        "current_step_elapsed_s": current_elapsed,
+        "current_step_timeout_remaining_s": timeout_remaining,
+        "run_elapsed_s": _run_elapsed_s(man, now),
+        # FR-7.1 usage: run-level totals + per-profile split (empty {} when none).
+        "totals": _usage_totals_dict(man.totals),
+        "agent_usage": {
+            name: _usage_totals_dict(u) for name, u in man.agent_usage.items()
+        },
+        # FR-10.3 advisory channel: non-fatal run anomalies surfaced rather than
+        # swallowed — including advisory usage-window shortfalls (the
+        # warn-don't-park default). Always present; an empty array when none.
+        "warnings": list(man.warnings),
+        "quota": quota,
         "driver": {
             "state": driver.state,
             "pid": driver.pid,
@@ -1143,11 +1809,32 @@ def status_payload(
             if current_step_freshness is not None
             else None
         ),
+        # Suspend/sleep view (FR-5.3): heartbeat age, detected intervals, and the
+        # stall classification. Always present; null only when there is neither a
+        # heartbeat nor any recorded interval (nothing to report).
+        "suspension": suspension,
+        # Gate context block (PRD §6 / FR-8.1): always present, non-null only when
+        # parked at a human gate. The body (convergence summary, prior responses,
+        # per-escalated-finding triage reasoning) is assembled by the I/O-bearing
+        # `compute_gate_context` in the caller and threaded in here (like
+        # `suspension`), so this serializer stays pure. `None` for every non-gate
+        # state — the caller passes it only for a `parked_gate`.
+        "gate": gate,
         "steps": [
             {
                 "id": rec.id,
                 "iteration": _iteration_for_json(rec),
                 "status": rec.status,
+                # FR-7.1/FR-7.2 per-step explainers: duration, notes, and the
+                # disjoint reason fields. parked_reason is normalized to the PRD
+                # enum (a legacy on-disk value / pre-P3 gate is never emitted
+                # verbatim); halt_reason is engine-written PRD values (or null).
+                "duration_s": _step_duration_s(rec, now),
+                "notes": rec.notes,
+                "halt_reason": rec.halt_reason,
+                "parked_reason": M.normalize_parked_reason(
+                    rec.parked_reason, rec.type, rec.status
+                ),
             }
             for rec in man.steps
         ],
@@ -1256,6 +1943,128 @@ def compute_current_step_freshness(
     if now is None:
         now = time.time()
     return max(0.0, now - st.st_mtime)
+
+
+# --- suspend/sleep view (harness-efficiency FR-5.3) --------------------------
+def _agent_output_age_s(
+    man: Manifest, run_instance_dir: Path, now: datetime
+) -> float | None:
+    """Age (s) since the current running step's adapter child last wrote output.
+
+    Best-effort and advisory (the ``agent_silent`` signal for
+    :func:`compute_suspension_view`): the ``now − mtime`` of the running step's
+    ``events.jsonl``, regardless of streaming. Any resolution/stat failure (no
+    running step, absent file, corrupt id) is ``None`` — never an exception, so
+    the classification simply omits the agent-silence input rather than failing.
+    """
+    if man.status != M.RUN_RUNNING:
+        return None
+    rec = select_default_step(man)
+    if rec is None:
+        return None
+    try:
+        safe_run_segment(render_step_id(rec), kind="step id")
+        events_path = resolve_transcript_dir(run_instance_dir, rec) / _EVENTS_NAME
+        st = events_path.stat()
+    except (UnsafeRunSegment, StatusContractError, OSError, ValueError):
+        return None
+    return max(0.0, now.timestamp() - st.st_mtime)
+
+
+def compute_suspension_view(
+    man: Manifest,
+    run_instance_dir: Path,
+    liveness: str,
+    *,
+    now: datetime | None = None,
+    agent_silence_s: float = HB.DEFAULT_AGENT_SILENCE_S,
+    interval_s: float = HB.DEFAULT_HEARTBEAT_INTERVAL_S,
+    threshold_s: float = HB.SUSPEND_THRESHOLD_S,
+) -> dict | None:
+    """The §6 ``suspension`` block for ``status --json`` (FR-5.3).
+
+    Surfaces the driver heartbeat age, the detected suspension intervals
+    (``manifest.suspensions``), and the fail-closed stall classification
+    (``host_suspended`` / ``driver_orphaned`` / ``agent_silent`` / null). All
+    inputs are sampled from disk here (the I/O point) and fed to the pure
+    :func:`heartbeat.classify_stall`, so the serializer stays pure. Returns
+    ``None`` (→ ``suspension: null``) only when there is neither a heartbeat nor
+    any recorded interval — nothing to say.
+
+    Classification inputs:
+
+    * ``pid_alive`` — the driver is proven alive only when liveness is ``alive``;
+      an ``orphaned`` (proven-dead/reused) driver with a stale heartbeat is the
+      ``driver_orphaned`` shape. ``indeterminate``/``none`` never assert
+      ``host_suspended`` (fail closed) and never credit.
+    * the *current* skew pair — the latest recorded interval counts as the pair
+      straddling the current heartbeat gap only when its ``end`` equals the live
+      heartbeat's wallclock (i.e. the driver detected the suspend on its most
+      recent write). Once the driver writes a later, non-suspend heartbeat the
+      match lapses and the run reads as working again, not perpetually suspended.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    hb = HB.HeartbeatSample.read(run_instance_dir / HB.HEARTBEAT_FILENAME)
+    hb_age_s: float | None = None
+    if hb is not None:
+        hb_wall = HB.parse_wallclock(hb.wallclock_utc)
+        if hb_wall is not None:
+            hb_age_s = max(0.0, (now - hb_wall).total_seconds())
+    # Union the manifest's drained intervals with the heartbeat writer's live,
+    # still-un-drained ``suspensions.jsonl`` (FR-5.1/5.3): a run that just woke
+    # but is still driving, and a crash before the drive drained, both surface.
+    intervals = _merge_suspension_intervals(
+        man.suspensions, HB.read_persisted_suspensions(run_instance_dir)
+    )
+    if hb is None and not intervals:
+        return None
+
+    # The current skew pair is the interval whose end equals the live heartbeat's
+    # wallclock (the driver detected the suspend on its most recent write); once a
+    # later non-suspend heartbeat lands the match lapses and the run reads working.
+    current = None
+    if hb is not None:
+        current = next(
+            (iv for iv in intervals if iv["end"] == hb.wallclock_utc), None
+        )
+    classification = HB.classify_stall(
+        pid_alive=(liveness == LIVENESS_ALIVE),
+        pair_gap_s=(current["gap_s"] if current is not None else None),
+        clock_skew=current is not None,
+        hb_age_s=hb_age_s,
+        agent_output_age_s=_agent_output_age_s(man, run_instance_dir, now),
+        interval_s=interval_s,
+        threshold_s=threshold_s,
+        agent_silence_s=agent_silence_s,
+    )
+    return {
+        "classification": classification,
+        "last_heartbeat_age_s": hb_age_s,
+        "intervals": intervals,
+    }
+
+
+def _merge_suspension_intervals(manifest_intervals, persisted) -> list[dict]:
+    """Union manifest + live-persisted intervals, deduped, manifest order first.
+
+    A drained interval is in the manifest AND still in the append-only log, so
+    dedup by (start, end, gap_s) keeps `status` from double-reporting one sleep.
+    """
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for s in manifest_intervals:
+        d = s.model_dump()
+        key = (d["start"], d["end"], d["gap_s"])
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    for s in persisted:
+        key = (s.start, s.end, s.gap_s)
+        if key not in seen:
+            seen.add(key)
+            out.append(s.to_dict())
+    return out
 
 
 class LogsError(RuntimeError):
@@ -1703,6 +2512,10 @@ def render_footer(
     reconciliation: Reconciliation | None = None,
     anomaly: str | None = None,
     current_step_freshness: float | None = None,
+    suspension: dict | None = None,
+    run_elapsed_s: float | None = None,
+    cost_usd: float | None = None,
+    quota_reset_at: str | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -1713,6 +2526,12 @@ def render_footer(
     ≥1 streamed event), a single advisory line reports the age of the newest
     event (live-run-observability FR-5). ``None`` (a non-streamed/not-applicable
     step) adds no line, so the footer is unchanged for every existing run.
+
+    When ``suspension`` is present (the :func:`compute_suspension_view` block),
+    the footer surfaces the stall classification, the heartbeat age, and each
+    detected suspension interval — FR-5.3 requires the human ``status`` to show
+    the same heartbeat age + intervals as ``--json``, not just the JSON path.
+    ``None`` (no heartbeat and no interval) adds no line.
     """
     lines: list[str] = []
     if driver.state == LIVENESS_NONE:
@@ -1730,11 +2549,50 @@ def render_footer(
 
     lines.append(f"state: {rstate.state} — {_MEANING.get(rstate.state, '')}")
 
+    # FR-7.3: elapsed + cost-so-far, so a parked/running state is legible without
+    # opening a transcript. Each line is added only when its datum is available,
+    # so an existing run with no timing/cost recorded renders unchanged.
+    if run_elapsed_s is not None:
+        lines.append(f"elapsed: {run_elapsed_s:.0f}s")
+    if cost_usd is not None:
+        lines.append(f"cost so far: ${cost_usd:.4f}")
+    # When parked on a provider usage limit, name the reset time (the datum the
+    # operator needs to know when a plain `resume` will get past the wall).
+    if rstate.state == STATE_PARKED_USAGE_LIMIT:
+        lines.append(
+            f"quota reset: {quota_reset_at}" if quota_reset_at
+            else "quota reset: unknown (no provider retry hint reported)"
+        )
+    # A usage_window park (FR-10.3) names the projected window-replenishment time,
+    # so the operator knows when a plain `resume` will fit the next step.
+    if rstate.state == STATE_PARKED_USAGE_WINDOW:
+        lines.append(
+            f"window replenishes: {quota_reset_at}" if quota_reset_at
+            else "window replenishes: unknown"
+        )
+
     if current_step_freshness is not None:
         lines.append(
             f"freshness: last streamed event {current_step_freshness:.1f}s ago "
             "(advisory — drives no action)"
         )
+
+    if suspension is not None:
+        classification = suspension.get("classification")
+        lines.append(
+            f"suspension: {classification if classification else 'none'} "
+            "(stall classification, FR-5.3)"
+        )
+        age = suspension.get("last_heartbeat_age_s")
+        if age is not None:
+            lines.append(f"heartbeat: last written {age:.1f}s ago")
+        intervals = suspension.get("intervals") or []
+        if intervals:
+            lines.append(f"detected suspensions: {len(intervals)}")
+            for iv in intervals:
+                lines.append(
+                    f"  - {iv['start']} → {iv['end']} ({iv['gap_s']}s)"
+                )
 
     # A lingering lock under a terminal/parked run is harmless residue (§6.3 P2).
     if (

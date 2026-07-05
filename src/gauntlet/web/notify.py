@@ -59,6 +59,12 @@ KIND_GATE = "gate-reached"
 KIND_ESCALATION = "escalation-parked"
 KIND_FAILED = "run-failed"
 KIND_COMPLETED = "run-completed"
+# FR-10.3 advisory usage-window shortfall. Distinct from the four state-machine
+# transition kinds above: a warning is a run-level advisory record (stamped in
+# manifest.warnings), not a run/step state change, so the notifier handles it as
+# its own per-warning stream (deduped by warning text), separate from
+# classify_kind. Fires while the run keeps going — the warn-don't-park default.
+KIND_WARNING = "usage-window-warning"
 
 # Human labels for the notification title, by kind.
 _LABELS = {
@@ -66,7 +72,13 @@ _LABELS = {
     KIND_ESCALATION: "Escalation — reconcile, then resume",
     KIND_FAILED: "Run failed",
     KIND_COMPLETED: "Run completed",
+    KIND_WARNING: "Usage-window warning",
 }
+
+# The engine-grounded marker an advisory usage-window warning carries (the
+# orchestrator stamps "[<step>] usage-window admission (FR-10.3): …" into
+# manifest.warnings). Kept LLM-free — a closed, table-tested substring (D8).
+_WINDOW_WARNING_MARK = "usage-window admission"
 
 # The engine-grounded marker a cycle-escalation note begins with (engine/cycle.py
 # always writes "escalation: …" / "escalation (…): …" on a parked
@@ -104,6 +116,17 @@ def classify_kind(event: WatchEvent) -> str | None:
     return None
 
 
+def usage_window_warnings(event: WatchEvent) -> list[str]:
+    """The advisory usage-window shortfalls carried by this event (FR-10.3).
+
+    Filters the run's ``manifest.warnings`` (carried on the event) to the
+    usage-window ones by their engine-stamped marker — the notifier pushes one
+    per distinct warning, deduped by text. Other manifest warnings (e.g. an
+    unrenderable final-gate artifact) are surfaced by ``gauntlet status`` but not
+    pushed as this kind."""
+    return [w for w in (event.warnings or []) if _WINDOW_WARNING_MARK in w]
+
+
 class Notification(BaseModel):
     """A ready-to-deliver notification (the in-tab/SSE payload + channel text).
 
@@ -133,10 +156,19 @@ class Notification(BaseModel):
     body: str
 
     @classmethod
-    def build(cls, event: WatchEvent, kind: str, *, base_url: str = "") -> "Notification":
+    def build(
+        cls,
+        event: WatchEvent,
+        kind: str,
+        *,
+        base_url: str = "",
+        note: str | None = None,
+    ) -> "Notification":
         label = _LABELS.get(kind, kind)
         where = event.current_step or "-"
-        note = (event.current_step_notes or "").strip() or None
+        # An explicit `note` (a usage-window warning string) wins; otherwise fall
+        # back to the current step's note (the gate/escalation case).
+        note = (note or "").strip() or (event.current_step_notes or "").strip() or None
         body = f"{event.slug}/{event.run_id} — {where}"
         if note:
             body = f"{body}: {note}"
@@ -287,14 +319,42 @@ class Notifier:
     def _key(event: WatchEvent, kind: str) -> tuple[str, str, str | None]:
         return (event.run_id, kind, event.current_step)
 
+    @staticmethod
+    def _warning_key(event: WatchEvent, warning: str) -> tuple[str, str, str | None]:
+        """De-dup key for a usage-window warning — keyed on the warning TEXT, not
+        ``current_step``, so a distinct warning notifies exactly once and an
+        unchanged warning riding later transitions does not re-fire (FR-10.3)."""
+        return (event.run_id, KIND_WARNING, warning)
+
     def prime(self, event: WatchEvent) -> None:
-        """Record the current state's de-dup key without notifying (FR-9.1)."""
+        """Record the current state's de-dup keys without notifying (FR-9.1).
+
+        Primes the classified transition kind AND every usage-window warning
+        already present at first observation — so a run whose warnings predate the
+        server does not flood the operator on startup."""
+        for warning in usage_window_warnings(event):
+            self._fired.add(self._warning_key(event, warning))
         kind = classify_kind(event)
         if kind is not None:
             self._fired.add(self._key(event, kind))
 
     def notify(self, event: WatchEvent) -> None:
-        """Fan out a transition iff its ``(run_id, kind, current_step)`` is new."""
+        """Fan out this event's new notifications (FR-9.1/10.3).
+
+        Two independent streams: each newly-recorded advisory usage-window warning
+        (deduped by text), and the classified transition kind (deduped by
+        ``(run_id, kind, current_step)``). A single event can carry both — an
+        advisory shortfall recorded on the same tick the run reaches a gate."""
+        for warning in usage_window_warnings(event):
+            key = self._warning_key(event, warning)
+            if key in self._fired:
+                continue
+            self._fired.add(key)
+            self._fanout(
+                Notification.build(
+                    event, KIND_WARNING, base_url=self.base_url, note=warning
+                )
+            )
         kind = classify_kind(event)
         if kind is None:
             return
@@ -302,7 +362,10 @@ class Notifier:
         if key in self._fired:
             return
         self._fired.add(key)
-        note = Notification.build(event, kind, base_url=self.base_url)
+        self._fanout(Notification.build(event, kind, base_url=self.base_url))
+
+    def _fanout(self, note: Notification) -> None:
+        """Dispatch a built notification over every channel (fail-soft)."""
         for channel in self.channels:
             self._dispatch(channel, note)
 
@@ -355,6 +418,7 @@ __all__ = [
     "Notifier",
     "Notification",
     "classify_kind",
+    "usage_window_warnings",
     "build_notifier",
     "DesktopChannel",
     "SlackChannel",
@@ -364,5 +428,6 @@ __all__ = [
     "KIND_ESCALATION",
     "KIND_FAILED",
     "KIND_COMPLETED",
+    "KIND_WARNING",
     "GAUNTLET_SLACK_WEBHOOK_ENV",
 ]

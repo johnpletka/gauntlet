@@ -13,7 +13,12 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
-from gauntlet.engine.steptypes import _marker_signalled, render_shell_command
+from gauntlet.engine.pipeline import Step
+from gauntlet.engine.steptypes import (
+    _marker_signalled,
+    render_shell_command,
+    resolve_step_timeout_s,
+)
 
 from conftest import FakeAdapter, git
 
@@ -31,6 +36,39 @@ def _orch(repo, text, *, config=None, adapters=None, extra_context=None):
         adapter_factory=(lambda n: adapters[n]) if adapters else None,
         extra_context=extra_context or {},
     )
+
+
+# --- effective-timeout precedence (F-003) -----------------------------------
+_TIMEOUT_CFG = RunConfig.model_validate(
+    {"agents": {"builder": {"adapter": "claude-code", "step_timeout_s": 600.0}}}
+)
+
+
+def test_per_step_timeout_overrides_profile():
+    # A per-step `timeout_s` wins over the profile's step_timeout_s (FR-3.3): the
+    # status path must report the real deadline, not the profile guess.
+    step = Step(id="impl", type="agent_task", agent="builder", timeout_s=120.0)
+    assert resolve_step_timeout_s(step, "builder", _TIMEOUT_CFG) == 120.0
+
+
+def test_profile_timeout_when_no_per_step_override():
+    step = Step(id="impl", type="agent_task", agent="builder")
+    assert resolve_step_timeout_s(step, "builder", _TIMEOUT_CFG) == 600.0
+
+
+def test_shell_step_reports_own_timeout_not_profile():
+    # A shell step has no agent, so it never picks up a profile fallback: its own
+    # `timeout_s` is the effective deadline (previously reported as null).
+    step = Step(id="lint", type="shell", timeout_s=45.0)
+    assert resolve_step_timeout_s(step, None, _TIMEOUT_CFG) == 45.0
+
+
+def test_no_timeout_anywhere_is_none():
+    step = Step(id="lint", type="shell")
+    assert resolve_step_timeout_s(step, None, _TIMEOUT_CFG) is None
+    # An agent with no per-step and no profile timeout is also unbounded.
+    cfg = RunConfig.model_validate({"agents": {"b": {"adapter": "claude-code"}}})
+    assert resolve_step_timeout_s(Step(id="s", type="agent_task", agent="b"), "b", cfg) is None
 
 
 # --- trust model (review F-001) ---------------------------------------------
@@ -83,6 +121,61 @@ stages:
     assert drafter.n == 2
     from gauntlet.engine import gitops
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: drafted"
+
+
+def test_commit_is_respondable_for_recovery():
+    # FR-9.2 recovery: a commit step's message-format terminal failure is
+    # operator-recoverable via `resume --response` (previously a dead-end).
+    assert "commit" in M.RESPONDABLE_STEP_TYPES
+
+
+def _pending(text):
+    return M.HumanResponse(
+        response_id="commit-resp-1", response_text=text,
+        timestamp="2026-07-04T00:00:00+00:00", user="op",
+        response_attempt=1, state="pending",
+    )
+
+
+def test_commit_message_uses_valid_response_as_literal_override():
+    # A `--response` that is ITSELF a valid commit message is used verbatim — a
+    # deterministic override for a drafter that could not produce a legal header,
+    # with no model call (usage/session/drafter all None).
+    from types import SimpleNamespace
+
+    from gauntlet.engine.steptypes import _commit_message
+
+    ctx = SimpleNamespace(record=SimpleNamespace(
+        human_responses=[_pending("P11: concurrent triage + judge decision cache\n\nBody.")]
+    ))
+    step = Step.model_validate({"id": "commit", "type": "commit"})
+    message, usage, session, drafter = _commit_message(step, ctx)
+    assert message.startswith("P11: concurrent triage + judge decision cache")
+    assert usage is None and session is None and drafter is None
+
+
+def test_commit_message_folds_nonmessage_response_into_redraft(monkeypatch):
+    # A `--response` that is NOT a valid commit message is not used literally; it
+    # is folded into the redraft as guidance (the drafter still runs).
+    from types import SimpleNamespace
+
+    import gauntlet.engine.steptypes as S
+
+    captured = {}
+
+    def fake_draft(step, ctx, consumed=(), *, diff_base=None):
+        captured["consumed"] = list(consumed)
+        return "P1: drafted", None, None, "triage"
+
+    monkeypatch.setattr(S, "_draft_commit_message", fake_draft)
+    ctx = SimpleNamespace(record=SimpleNamespace(
+        human_responses=[_pending("please keep the header under 72 chars")]
+    ))
+    step = Step.model_validate({"id": "commit", "type": "commit"})
+    message, _u, _s, drafter = S._commit_message(step, ctx)
+    assert message == "P1: drafted" and drafter == "triage"
+    # the non-message response reached the drafter as guidance
+    assert captured["consumed"] and captured["consumed"][0].response_id == "commit-resp-1"
 
 
 class RecordingDrafter:
@@ -462,7 +555,9 @@ stages:
 """
 
 _VALID_PLAN = (
-    "# Plan\n\n```gauntlet-phases\n"
+    "# Plan\n\n"
+    "## P1 — Build it\nImplement the widget end-to-end.\n\n"
+    "```gauntlet-phases\n"
     "- id: P1\n  title: Build it\n  goal: Implement the widget end-to-end.\n"
     "```\n"
 )
@@ -500,3 +595,19 @@ def test_phase_lint_halts_when_block_absent(fixture_repo):
     rec = orch.manifest.record("plan-lint")
     assert rec.status == M.HALTED
     assert "no gauntlet-phases block" in rec.notes
+
+
+def test_phase_lint_halts_when_phase_has_no_prose_section(fixture_repo):
+    # F-001: a well-formed block whose P2 has no locatable `## P2 …` heading
+    # would silently lose its `phase`-mode excerpt; the gate parks before approval.
+    orch = _orch(fixture_repo, _PHASE_LINT_PIPELINE)
+    (orch.artifact_root / "plan.md").write_text(
+        "# Plan\n\n## P1 — Build it\nImplement the widget.\n\n"
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: Build it\n  goal: Implement the widget.\n"
+        "- id: P2\n  title: Ship it\n  goal: Ship the widget.\n```\n"
+    )
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("plan-lint")
+    assert rec.status == M.HALTED
+    assert "no locatable prose section" in rec.notes and "P2" in rec.notes

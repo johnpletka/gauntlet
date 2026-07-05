@@ -26,6 +26,20 @@ def git(repo: Path, *args: str, message: str | None = None) -> str:
     return proc.stdout
 
 
+@pytest.fixture(autouse=True)
+def _isolated_usage_ledger(tmp_path, monkeypatch):
+    """Redirect the machine-global usage ledger (FR-10) to a per-test temp path.
+
+    The engine appends a content-free per-step usage row to
+    ``~/.gauntlet/usage-ledger.jsonl`` on every step (P10). Autouse so no unit
+    test — including the many that drive a full run — ever writes to the real
+    machine-global ledger; each test gets an isolated, throwaway file.
+    """
+    from gauntlet.engine.ledger import LEDGER_PATH_ENV
+
+    monkeypatch.setenv(LEDGER_PATH_ENV, str(tmp_path / "usage-ledger.jsonl"))
+
+
 @pytest.fixture
 def fixture_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"

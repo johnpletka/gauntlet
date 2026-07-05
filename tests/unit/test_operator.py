@@ -392,6 +392,44 @@ def test_footer_driver_line_shows_pid_host_since():
                and "since 2026-06-25T16-41-22" in ln for ln in lines)
 
 
+def test_footer_renders_elapsed_and_cost(host):
+    # FR-7.3: the footer shows elapsed + cost-so-far so a state is legible without
+    # opening a transcript.
+    driver = op.DriverInfo(op.LIVENESS_ALIVE, 4242, "h1", "2026-06-25T16-41-22")
+    man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
+    lines = op.render_footer(driver, rstate, run_elapsed_s=1820.0, cost_usd=1.87)
+    assert any(ln == "elapsed: 1820s" for ln in lines)
+    assert any(ln == "cost so far: $1.8700" for ln in lines)
+
+
+def test_footer_usage_limit_park_shows_quota_reset(host):
+    # FR-7.3: a usage-limit park names the reset time and the next command.
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    lines = op.render_footer(
+        driver, rstate, quota_reset_at="2026-07-02T09:00:00+00:00"
+    )
+    assert any("quota reset: 2026-07-02T09:00:00+00:00" in ln for ln in lines)
+    footer_cmds = [ln.strip()[2:] for ln in lines if ln.strip().startswith("$ ")]
+    assert footer_cmds == ["gauntlet resume demo"]
+
+
+def test_footer_usage_limit_park_without_reset_says_unknown(host):
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    lines = op.render_footer(driver, rstate, quota_reset_at=None)
+    assert any("quota reset: unknown" in ln for ln in lines)
+
+
 def test_footer_reconciliation_matching_nonce_says_finalize():
     driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
     man = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])

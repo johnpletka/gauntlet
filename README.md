@@ -269,6 +269,25 @@ gauntlet report myfeat           # per-step / per-agent cost + token breakdown
 - **Interrupted runs are resumable.** State lives in the run's `manifest.json`;
   `gauntlet resume` re-enters at the last incomplete step. A step that wrote a
   dirty tree before dying is parked or reset rather than re-run blindly.
+- **Provider usage limits pause, they don't destroy.** A quota/429/usage-limit
+  hit mid-step — including inside a review cycle's sub-agents — **parks** the run
+  (`parked_usage_limit`) with the worktree untouched and the agent session
+  preserved; `gauntlet resume` continues the *same session* with a short
+  continuation prompt instead of re-running the step. Cycle sub-steps checkpoint
+  as they complete, so a resumed cycle re-enters at the first incomplete
+  sub-step. Builders also commit `P<N> wip:` milestones inside a phase, bounding
+  worst-case lost work to one milestone. Opt-in `resume_on_quota: auto`
+  self-resumes at the provider's hinted reset time.
+- **Laptop sleep is survivable.** A driver heartbeat detects host suspension and
+  credits the slept time back to the running step's deadline (capped), so
+  closing the lid neither silently stalls the run nor spuriously kills a healthy
+  step; `status` reports detected suspensions. Opt-in `keep_awake: true` wraps
+  the driver in `caffeinate -i` on macOS.
+- **Malformed structured artifacts self-repair.** Agent-authored artifacts (like
+  the plan's `gauntlet-phases` block) are validated in-step; the agent gets its
+  own parse error back for a bounded repair loop, and if that fails the run
+  parks (`parked_artifact_invalid`) for a sanctioned hand-edit — `resume`
+  re-runs only the validator and audits the edit via content hashes.
 - **Approved artifacts are immutable.** A later phase that finds an approved
   PRD/plan incomplete *halts and surfaces the conflict* rather than amending it.
   You resolve that conflict with `gauntlet resume <slug> --response "…"` (see
@@ -326,7 +345,14 @@ gauntlet run myfeat --interactive   # detach the run, foreground a monitor agent
 
 - **`status`** reports driver liveness, the computed run-state, and the next
   action / recovery hint; `--json` emits the same payload (schema
-  `schemas/status.json`) for scripts and CI.
+  `schemas/status.json`) for scripts and CI. The payload carries run elapsed
+  time, token/cost totals (run-level and per agent profile), per-step
+  `duration_s`/`notes` and engine-stamped `halt_reason`/`parked_reason` enums,
+  heartbeat age with detected suspension intervals, and the quota reset time on
+  a usage-limit park — every parked/halted/failed state is explainable from
+  `status` alone, no transcript required. Additions are strictly additive
+  (`schema_version` stays 1); a consumer pinning an older strict schema copy
+  must re-pin on upgrade.
 - **`logs`** is strictly read-only evidence-on-demand; `--follow` streams a
   step's events as they're written (paired with opt-in live step streaming).
 - **`recover`** terminates a driver only after verifying it is genuinely wedged,
@@ -401,7 +427,8 @@ Notes:
 | `gauntlet abort <slug>` | Abort a run. |
 | `gauntlet finish <slug>` | Merge a completed run into its base, then delete the branch + pointer. |
 | `gauntlet clean <slug>` | Delete a merged run branch + clear its pointer; keep the run record. |
-| `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown. |
+| `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown, incl. cache-read share per step type/profile. |
+| `gauntlet ledger backfill` | One-shot, idempotent import of existing run manifests into the machine-global usage ledger (`~/.gauntlet/usage-ledger.jsonl`) so window-admission estimates have history. |
 | `gauntlet feedback <slug>` | Capture human feedback + triage corrections (FR-6.1). |
 | `gauntlet rollback <slug> --phase N` | Reset the branch + manifest to a phase boundary (guarded). |
 | `gauntlet judge serve [...]` | Run the localhost judge service (normally engine-managed). |
@@ -436,19 +463,83 @@ and `model` in `.gauntlet/config.yaml` and set that provider's key in your
 environment (e.g. `ANTHROPIC_API_KEY` for an `anthropic/*` model). LiteLLM
 model naming applies to `api` adapter profiles.
 
-**Per-agent reasoning effort.** A `claude-code` profile accepts an optional
-`effort` (`low` / `medium` / `high` / `xhigh` / `max`, passed to `claude` as
-`--effort`), and a `codex` profile accepts `reasoning_effort` (passed as
-`-c model_reasoning_effort=…`). Both are optional and no-op when absent, so
-existing configs are unaffected. A natural use is a cheaper `fixer:` role for
-review-fix rounds while the initial `builder` runs at higher effort:
+**Per-agent reasoning effort.** Any profile (and any pipeline step, which wins
+over its profile) accepts an optional `effort` drawn from the **canonical enum
+`minimal` / `low` / `medium` / `high`**. The engine maps the canonical value to
+each adapter's real surface: `claude-code` → `--effort` (which accepts
+`low`/`medium`/`high`; canonical `minimal` remaps to `low` with a load-time
+warning), `codex` → `-c model_reasoning_effort=…`, `api` → the
+`reasoning_effort` param. A value an adapter/model cannot accept is a
+**config-load error**, never a silent drop. Optional and no-op when absent. A
+natural use is a cheaper fixer role for review-fix rounds while the initial
+builder runs at higher effort:
 
 ```yaml
 agents:
   builder:   { adapter: claude-code, model: opus,   effort: high }
   impl_fixer:{ adapter: claude-code, model: sonnet, effort: medium }
-  reviewer:  { adapter: codex,       model: gpt-5.5, reasoning_effort: xhigh }
+  reviewer:  { adapter: codex,       model: gpt-5.5, effort: high }
 ```
+
+Mechanical emissions — commit-message drafting and resume-disposition output —
+run on a designated cheap `mechanic:` profile in the shipped config, so the
+builder's constrained provider window is spent on building.
+
+**Resilience & window knobs** (all default to today's behavior; opt in per
+knob):
+
+```yaml
+resume_on_quota: notify      # notify (default) | auto — self-resume a
+                             #   usage-limit park at the provider's hinted reset
+                             #   time (in-process; wants keep_awake or an
+                             #   external scheduler re-invoking `resume`)
+keep_awake: false            # true wraps the driver in `caffeinate -i` (darwin)
+heartbeat_interval_s: 15     # driver heartbeat cadence (suspend detection)
+suspend_credit_cap_s: 43200  # max slept time credited back to a step deadline
+checkpoint_commits: keep     # keep | squash — builders' intra-phase `PN wip:`
+                             #   milestone commits; the phase always ends in a
+                             #   `PN:` commit and reviewers always see the
+                             #   cumulative range diff either way
+triage_concurrency: 4        # bounded pool for per-finding triage calls;
+                             #   final triage.json is byte-identical to a
+                             #   sequential run on all-success rounds
+providers:                   # pre-step window admission (FR-10); absent = off
+  anthropic:
+    window_hours: 5
+    window_budget: 1500000   # in budget_unit
+    budget_unit: tokens      # tokens | cost
+    enforce: false           # false = advisory warning; true = park pre-step
+                             #   (`parked_usage_window`) with zero work in flight
+    # fallback_estimate: 50000   # used when the ledger has no history yet
+```
+
+Admission estimates come from the machine-global usage ledger
+(`~/.gauntlet/usage-ledger.jsonl`, content-free counts only) that every run
+appends to; seed it from past runs with `gauntlet ledger backfill`. The ledger
+cannot see non-gauntlet usage, so admission is advisory by design — a wrong
+*continue* is survivable via the reactive usage-limit park.
+
+**Scoped context (pipeline-level).** `agent_task` inputs accept a per-input
+mode so large artifacts travel by reference instead of being inlined into every
+prompt — the CLI agents read them in-session, where subsequent turns hit the
+provider prompt cache:
+
+```yaml
+- id: implement
+  type: agent_task
+  agent: builder
+  inputs:
+    - { name: prd.md,  mode: reference }   # inject the path, agent reads it
+    - { name: plan.md, mode: phase }       # inject only the current phase's
+                                           #   plan section + the full-doc path
+  # (bare `- prd.md` still means mode: inline, today's behavior)
+```
+
+`reference`/`phase` require a profile whose adapter can read the repo (`api`
+profiles can't; pipeline load fails closed, and `doctor` probes that a
+reference-capable profile's sandbox can actually read a repo file). Agent-task
+steps also accept `validate: <name>` (e.g. `plan_phases`) to check their output
+artifact in-step with a bounded self-repair loop.
 
 ---
 

@@ -92,8 +92,13 @@
       verb = "reject";
       var notes = (form.notes && form.notes.value.trim()) || "";
       if (!notes) { window.alert("Reject requires notes."); return; }
-      // FR-10.7 destructive-verb confirm for reject.
-      if (!window.confirm("Reject this gate? The run fails.")) return;
+      // FR-10.7 destructive-verb confirm for reject. State the SAME consequence
+      // the rendered control shows (data-reject-consequence) — a reject now
+      // re-drives the upstream cycle when one exists, so a hardcoded run-fails
+      // message would be false on the standard gates (F-003).
+      var conseq = form.getAttribute("data-reject-consequence")
+        || "this cannot be undone";
+      if (!window.confirm("Reject this gate? It " + conseq + ".")) return;
       body = { notes: notes, confirm: true };
     }
     post(runUrl(slug, verb), token, body)

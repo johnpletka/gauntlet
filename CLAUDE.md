@@ -226,10 +226,15 @@ reviewer is a process violation and will be detected.
 
 ```
 src/gauntlet/
-  cli.py          # typer CLI entrypoint
-  engine/         # pipeline state machine, step types, manifest
-  adapters/       # ClaudeCodeAdapter, CodexAdapter, ApiAdapter (LiteLLM)
-  judge/          # FastAPI judge service, policy engine
+  cli.py          # typer CLI entrypoint (incl. `gauntlet ledger backfill`)
+  engine/         # pipeline state machine, step types, manifest; plus
+                  #   heartbeat.py (suspend detection / deadline credit),
+                  #   ledger.py (machine-global usage ledger + window admission),
+                  #   validators.py (in-step artifact validation + repair)
+  adapters/       # ClaudeCodeAdapter, CodexAdapter, ApiAdapter (LiteLLM);
+                  #   failure_markers.py (pinned transient-vs-terminal
+                  #   classification: usage-limit/overload parks, FR-3.1)
+  judge/          # FastAPI judge service, policy engine, per-run allow cache
   logging/        # transcript logger (md + jsonl)
   config.py       # pydantic config/schema models
 pipelines/        # YAML pipeline definitions

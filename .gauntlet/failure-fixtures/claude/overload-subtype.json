@@ -1,0 +1,6 @@
+{
+  "type": "result",
+  "subtype": "overloaded",
+  "is_error": true,
+  "result": "the model stopped early"
+}

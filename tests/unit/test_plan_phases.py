@@ -8,6 +8,7 @@ from gauntlet.engine.planphases import (
     PlanPhasesError,
     extract_phases,
     load_plan_phases,
+    missing_phase_sections,
 )
 
 PLAN = """\
@@ -115,3 +116,41 @@ def test_invalid_yaml_rejected():
     text = "```gauntlet-phases\n- id: P1\n   : broken\n  title: x\n```\n"
     with pytest.raises(PlanPhasesError):
         extract_phases(text)
+
+
+# --- locatable prose sections (F-001, FR-1.1) -------------------------------
+_HEADED_PLAN = """\
+# Plan
+
+## P1 — First
+p1 prose
+
+## P2 — Second
+p2 prose
+
+```gauntlet-phases
+- id: P1
+  title: First
+  goal: do p1
+- id: P2
+  title: Second
+  goal: do p2
+```
+"""
+
+
+def test_missing_phase_sections_empty_when_all_locatable():
+    phases = extract_phases(_HEADED_PLAN)
+    assert missing_phase_sections(_HEADED_PLAN, phases) == []
+
+
+def test_missing_phase_sections_reports_phases_without_headings():
+    # Same phase list, but the prose only carries a P1 heading — P2 is missing.
+    text = (
+        "# Plan\n\n## P1 — First\np1 prose\n\n"
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: First\n  goal: do p1\n"
+        "- id: P2\n  title: Second\n  goal: do p2\n```\n"
+    )
+    phases = extract_phases(text)
+    assert missing_phase_sections(text, phases) == ["P2"]
