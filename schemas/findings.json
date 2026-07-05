@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/findings.json",
   "title": "Reviewer findings (PRD §7, FR-5.2)",
-  "description": "Structured output of an adversarial review step. The `findings` array is normative per PRD §7. `open_questions` and `summary` are P4 schema additions (BOOTSTRAP-NOTES #5): reviewers naturally emit questions that are not claims, and forcing them through the verdict enum is wrong — they get their own slot and the triager handles them first-class. The PRD §7 excerpt itself is unchanged. Strict-mode note (pinned, codex 0.139.0): native structured output requires EVERY property in `required`, so §7-optional fields are spelled required-but-nullable; `suggested_fix: null` means 'none offered'.",
+  "description": "Structured output of an adversarial review step. The `findings` array is normative per PRD §7. `open_questions` and `summary` are P4 schema additions (BOOTSTRAP-NOTES #5): reviewers naturally emit questions that are not claims, and forcing them through the verdict enum is wrong — they get their own slot and the triager handles them first-class. The PRD §7 excerpt itself is unchanged. Strict-mode note (pinned, codex 0.139.0): native structured output requires EVERY property in `required`, so §7-optional fields are spelled required-but-nullable; `suggested_fix: null` means 'none offered'. Ensemble note (pipeline-effectiveness FR-1.2 / review F-007): this file is the PERSISTED findings-record validation schema. `source`/`lens`/`duplicate_of`/`sources` are engine/merge-annotated — NEVER emitted by a reviewer agent's strict structured output (the engine stamps source/lens per panel member and the deterministic merge writes duplicate_of/sources). They are therefore OPTIONAL here (a legacy or single-reviewer artifact that omits them validates), and are stripped out of the strict per-member output schema handed to the reviewer adapter (see `cycle._reviewer_output_schema`), so the reviewer's pinned strict-mode shape is unchanged and a one-member artifact is byte-identical to pre-ensemble output.",
   "type": "object",
   "additionalProperties": false,
   "required": ["findings", "open_questions", "summary"],
@@ -48,6 +48,23 @@
           "suggested_fix": {
             "type": ["string", "null"],
             "description": "Optional per §7 — null when the reviewer offers none."
+          },
+          "source": {
+            "type": "string",
+            "description": "Engine-stamped ensemble annotation (FR-1.2): the panel member's profile that raised this finding. Absent on a single-reviewer / legacy artifact."
+          },
+          "lens": {
+            "type": "string",
+            "description": "Engine-stamped ensemble annotation (FR-1.2): the lens fragment id assigned to the member that raised this finding. Absent on a single-reviewer / legacy artifact."
+          },
+          "duplicate_of": {
+            "type": ["string", "null"],
+            "description": "Merge annotation (FR-1.2): the primary finding id this finding deduplicated into, or null/absent for a primary. Only primaries reach triage."
+          },
+          "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Merge annotation (FR-1.2, on a merged primary): every panel-member profile whose finding merged into this primary (including the primary's own)."
           }
         }
       }

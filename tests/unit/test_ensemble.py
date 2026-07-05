@@ -11,7 +11,82 @@ tie-break with panel-order then lexicographic-id tie-breaks.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import jsonschema
+import pytest
+
 from gauntlet.engine import ensemble as E
+
+_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "findings.json"
+
+
+def _findings_schema():
+    return json.loads(_SCHEMA_PATH.read_text())
+
+
+def _record(finding):
+    return {"findings": [finding], "open_questions": [], "summary": ""}
+
+
+def test_legacy_findings_record_without_new_fields_validates():
+    # A pre-ensemble / single-reviewer artifact omits source/lens/duplicate_of/
+    # sources entirely; the extended schema must still accept it (FR-1.2 / F-007).
+    legacy = {
+        "id": "F-001", "severity": "major", "category": "correctness",
+        "location": "src/x.py:10", "claim": "c", "evidence": "e",
+        "suggested_fix": None,
+    }
+    jsonschema.validate(instance=_record(legacy), schema=_findings_schema())
+
+
+def test_ensemble_primary_and_duplicate_records_validate():
+    schema = _findings_schema()
+    primary = {
+        "id": "codex:F-001", "severity": "major", "category": "correctness",
+        "location": "src/x.py:10", "claim": "c", "evidence": "e",
+        "suggested_fix": None, "source": "codex", "lens": "correctness",
+        "sources": ["codex", "gemini"],
+    }
+    duplicate = {
+        "id": "gemini:F-001", "severity": "minor", "category": "correctness",
+        "location": "src/x.py:12", "claim": "c", "evidence": "e",
+        "suggested_fix": None, "source": "gemini", "lens": "spec-coverage",
+        "duplicate_of": "codex:F-001",
+    }
+    jsonschema.validate(
+        instance={"findings": [primary, duplicate], "open_questions": [], "summary": ""},
+        schema=schema,
+    )
+
+
+def test_reviewer_output_schema_strips_ensemble_fields():
+    # The strict per-member schema handed to the reviewer adapter must recover the
+    # pre-ensemble finding shape: every property in `required`, none of the four
+    # engine-annotated fields present (F-007 / byte-identical single-reviewer).
+    from gauntlet.engine.cycle import _reviewer_output_schema
+
+    strict = _reviewer_output_schema(_findings_schema())
+    item = strict["properties"]["findings"]["items"]
+    props = set(item["properties"])
+    assert props == {"id", "severity", "category", "location", "claim", "evidence", "suggested_fix"}
+    for field in E.ENSEMBLE_FIELDS:
+        assert field not in props
+    # strict-mode convention preserved: every property is required, no extras.
+    assert set(item["required"]) == props
+    assert item["additionalProperties"] is False
+
+
+def test_unknown_finding_field_still_rejected():
+    # additionalProperties:false is preserved — an unknown field fails closed.
+    bad = {
+        "id": "F-001", "severity": "major", "category": "correctness",
+        "location": "x", "claim": "c", "evidence": "e", "suggested_fix": None,
+        "bogus": "nope",
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=_record(bad), schema=_findings_schema())
 
 
 # --- location parsing (each grammar form) ------------------------------------

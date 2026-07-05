@@ -41,6 +41,7 @@ from gauntlet.adapters.base import (
     MalformedOutputError,
     SessionNotFoundError,
 )
+from gauntlet.engine import ensemble
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine.commit_format import validate_commit_message
@@ -466,6 +467,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         )
 
     findings_schema = _load_schema(ctx, step.get("findings_schema") or DEFAULT_FINDINGS_SCHEMA)
+    # The strict per-member output schema (FR-1.2 / F-007): the ensemble-annotated
+    # fields in schemas/findings.json are engine-stamped, never agent-emitted, so
+    # the reviewer adapter gets today's byte-equivalent finding shape.
+    reviewer_schema = _reviewer_output_schema(findings_schema)
     triage_schema = _load_schema(ctx, step.get("triage_schema") or DEFAULT_TRIAGE_SCHEMA)
     confirm_schema = _load_schema(ctx, step.get("confirm_schema") or DEFAULT_CONFIRM_SCHEMA)
 
@@ -621,14 +626,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     # call; consume it so later calls run fresh.
                     review = _resume_review(
                         ctx, reviewer, cont_session, review_prompt,
-                        findings_schema, usage, review_logger, guard,
+                        reviewer_schema, usage, review_logger, guard,
                         substep=f"r{rnd}-review", effort=cycle_effort,
                     )
                     resume_session = None
                 else:
                     review = _run_sub(
                         ctx, reviewer, review_prompt,
-                        schema=findings_schema, usage=usage,
+                        schema=reviewer_schema, usage=usage,
                         logger=review_logger,
                         structured_name="findings.json",
                         after_attempt=guard.check,
@@ -2166,6 +2171,29 @@ def _persist_round_triage(
 
 def _load_schema(ctx: StepContext, ref: str) -> dict:
     return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
+
+
+def _reviewer_output_schema(findings_schema: dict) -> dict:
+    """The STRICT per-member output schema handed to a reviewer adapter (FR-1.2 /
+    review F-007).
+
+    ``schemas/findings.json`` is the *persisted findings-record* validation schema:
+    it declares the engine/merge-annotated ensemble fields
+    (``source``/``lens``/``duplicate_of``/``sources``) as optional so a merged
+    artifact validates. A reviewer agent never emits those — the engine stamps
+    them — so they are stripped here to recover the repo's pinned strict-mode shape
+    (every property in ``required``, ``additionalProperties: false``). This
+    derivation is byte-equivalent to the pre-ensemble schema for the finding item,
+    so a single member still emits exactly today's finding shape (P1-A4). No-op
+    when the finding item declares none of the ensemble fields (defensive)."""
+    schema = json.loads(json.dumps(findings_schema))
+    try:
+        props = schema["properties"]["findings"]["items"]["properties"]
+    except (KeyError, TypeError):
+        return schema
+    for field in ensemble.ENSEMBLE_FIELDS:
+        props.pop(field, None)
+    return schema
 
 
 def _verdict_schema(triage_schema: dict) -> dict:
