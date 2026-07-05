@@ -30,8 +30,11 @@ to a park-at-gate instead of silently carrying them forward (FR-10.5).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -438,6 +441,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     if isinstance(roles, StepResult):
         return roles
     reviewer, triager, fixer, confirmer = roles
+    panel = _panel(step)
+    panel_err = _validate_panel(panel, step, ctx)
+    if isinstance(panel_err, StepResult):
+        return panel_err
+    # FR-1.1: an ensemble panel (≥2 members) runs the merge/dedup path; a
+    # one-member panel is the unchanged single-reviewer path (byte-identical).
+    is_ensemble = len(panel) >= 2
+    dedup_threshold = float(
+        step.get("dedup_jaccard_threshold", ensemble.DEFAULT_JACCARD_THRESHOLD)
+    )
     if step.get("commit_each_fix_round") is False:
         return StepResult(
             status=FAILED,
@@ -603,16 +616,33 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if not reuse_review and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
             return finish(_clean_handoff_failure(ctx, rnd))
 
-        # ---- 1. review, FR-9.6 guard applied after EVERY attempt (F-004) ------
-        # A reviewer can mutate the tree and THEN fail schema validation; the
-        # guard therefore runs between attempts (so a retry never re-enters on
-        # a dirty tree) and on the failure path (so the policy always applies).
+        # ---- 1. review (single reviewer OR ensemble panel) --------------------
+        # `findings` is the PERSISTED record: for a single reviewer, exactly the
+        # reviewer's findings (+ synthetic mutation findings); for an ensemble,
+        # the merged set (primaries + marked duplicates, each engine-annotated).
+        # `triage_findings` is what reaches triage — the PRIMARIES only, so a
+        # deduplicated defect is never re-litigated N times (FR-1.2). The FR-9.6
+        # mutation guard runs after EVERY reviewer attempt (F-004): a reviewer can
+        # mutate the tree and THEN fail validation, so the guard runs between
+        # attempts and on the failure path.
         if reuse_review:
-            # FR-4.1 reuse: the reviewer already ran (its findings, incl. any
-            # synthetic mutation findings, are in the checkpoint); do not re-invoke.
+            # FR-4.1 reuse: review already ran (findings incl. synthetic mutation
+            # findings and any ensemble annotations are in the checkpoint).
             findings = list(rdata.get("findings") or [])
             open_questions = rdata.get("open_questions") or []
             review_summary = rdata.get("summary", "")
+        elif is_ensemble:
+            # FR-1.1/FR-1.2: run/reuse each panel member, then deterministically
+            # merge. Fail-closed park on any member error/usage-limit is raised as
+            # a _ParkCycle from inside (plan-cycle-resp-2a).
+            try:
+                findings, open_questions, review_summary = _ensemble_review(
+                    step, ctx, panel, rnd, handoff, policy, phase, commits,
+                    reviewer_schema, usage, carried, prev_review_handoff,
+                    dedup_threshold, cycle_effort,
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
         else:
             review_prompt = _review_prompt(
                 step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
@@ -646,7 +676,15 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             open_questions = (review.structured or {}).get("open_questions") or []
             review_summary = (review.structured or {}).get("summary", "")
 
-        metrics.record_round(findings)  # counted on reuse too, so trend math matches
+        # Triage set = primaries only. A merged duplicate carries `duplicate_of`
+        # and never reaches triage (FR-1.2); single-reviewer findings carry none,
+        # so this is identical to `findings` for the single path (unchanged).
+        triage_findings = [f for f in findings if not f.get("duplicate_of")]
+        metrics.record_round(triage_findings)  # counted on reuse too (trend math)
+        if is_ensemble:  # per-(profile, lens) yield metrics (FR-1.3)
+            metrics.record_ensemble(
+                _ensemble_member_stats(ctx, panel, rnd, triage_findings)
+            )
         review_out = {"findings": findings, "open_questions": open_questions,
                       "summary": review_summary}
         artifact_writes["findings.json"] = _write_artifact(ctx, "findings.json", review_out)
@@ -659,7 +697,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         _invalidate_artifact(ctx, "triage.json", artifact_writes)
         if not reuse_review:  # write-ahead checkpoint (FR-4.1); reuse never re-records
             _checkpoint(ctx, "review", rnd, handoff, data=review_out)
-        if not findings:
+        if not triage_findings:
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
@@ -680,16 +718,20 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # and ignored. `_triage` then re-runs exactly the still-incomplete
             # findings.
             completed = (
-                _load_triage_fragment(ctx, rnd, findings) if reuse_review else None
+                _load_triage_fragment(ctx, rnd, triage_findings) if reuse_review else None
             )
             try:
                 verdicts, park_reason = _triage(
-                    step, ctx, findings, usage, rnd, triager,
+                    step, ctx, triage_findings, usage, rnd, triager,
                     effort=cycle_effort, completed=completed,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
         metrics.record_verdicts(verdicts)
+        if is_ensemble:  # post-triage-legitimate per member (FR-1.3)
+            metrics.record_ensemble_legit(
+                _ensemble_legit_by_member(triage_findings, verdicts)
+            )
         # Integrity backstop BEFORE the authoritative write (data over inference):
         # every verdict must map to a finding in THIS round. The triager forces
         # finding_id = finding['id'] and the schema requires an id, so a stray id
@@ -698,7 +740,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # writes mismatched verdicts to a diagnostic file and leaves triage.json
         # absent; aligned verdicts are written and registered.
         stray = _persist_round_triage(
-            ctx, findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
+            ctx, triage_findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
         )
         if stray:
             return finish(StepResult(status=PARKED, notes=(
@@ -712,7 +754,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if not reuse_triage:  # checkpoint the completed, integrity-checked batch
             _checkpoint(ctx, "triage", rnd, handoff, data={"verdicts": verdicts})
 
-        by_id = {f["id"]: f for f in findings}
+        by_id = {f["id"]: f for f in triage_findings}
 
         # ---- closure guards (P4.r1 F-002): never converge past these ----------
         # A legitimate blocking finding that is not being fixed this round is
@@ -800,7 +842,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
                     f"{len(accepted)} accepted finding(s); failing closed"))
-            message = _fix_commit_message(phase, rnd, findings, verdicts)
+            message = _fix_commit_message(phase, rnd, triage_findings, verdicts)
             err = validate_commit_message(message)
             if err is not None:  # engine-composed; a violation here is a bug
                 return finish(StepResult(
@@ -830,7 +872,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             cdata = {k: v for k, v in stored.items()
                      if k not in ("engine_reconciliation", "surfaced_for_gate")}
         else:
-            confirm_prompt = _confirm_prompt(step, ctx, handoff, fix_sha, findings, verdicts)
+            confirm_prompt = _confirm_prompt(step, ctx, handoff, fix_sha, triage_findings, verdicts)
             try:
                 confirm = _run_sub(
                     ctx, confirmer, confirm_prompt,
@@ -1092,15 +1134,291 @@ def _log_partial(
 # --- round pieces ----------------------------------------------------------------
 def _roles(step: Step):
     reviewer = step.get("reviewer")
+    panel = _panel(step)
+    # FR-1.1: an ensemble config declares `reviewers: [...]` instead of a single
+    # `reviewer:`. The first panel member stands in for the singular reviewer role
+    # (and the confirmer default) so the rest of the cycle contract is unchanged.
+    if reviewer is None and panel:
+        reviewer = panel[0].profile
     triager = step.get("triager")
     fixer = step.get("fixer")
     if not (reviewer and triager and fixer):
         return StepResult(
             status=FAILED,
-            notes="adversarial_cycle requires `reviewer:`, `triager:` and "
-            "`fixer:` agent references (FR-5.2)",
+            notes="adversarial_cycle requires a reviewer (`reviewer:` or "
+            "`reviewers:`), `triager:` and `fixer:` agent references (FR-5.2)",
         )
     return reviewer, triager, fixer, (step.get("confirmer") or reviewer)
+
+
+@dataclass
+class PanelMember:
+    """One member of an ensemble review panel (FR-1.1): a reviewer ``profile``
+    paired with an assigned ``lens`` fragment, in panel-config ``index`` order."""
+
+    profile: str
+    lens: str | None
+    index: int
+
+    @property
+    def key(self) -> str:
+        """Filesystem-safe, collision-free per-member artifact/log key."""
+        return f"{self.index}-{_slug(self.profile)}-{_slug(self.lens or 'nolens')}"
+
+    @property
+    def metric_key(self) -> str:
+        """Stable per-(profile, lens) key for the yield metrics (FR-1.3)."""
+        return f"{self.profile}::{self.lens or 'nolens'}"
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(value))
+
+
+def _panel(step: Step) -> list[PanelMember]:
+    """Resolve the review panel (FR-1.1).
+
+    ``reviewers:`` is a list of members — each either a bare profile string or a
+    ``{profile, lens}`` mapping. With no ``reviewers:``, the singular ``reviewer:``
+    is the one-member panel (today's default). A one-member panel takes the
+    unchanged single-reviewer path (no dedup, no engine-annotated fields)."""
+    revs = step.get("reviewers")
+    if revs:
+        out: list[PanelMember] = []
+        for i, r in enumerate(revs):
+            if isinstance(r, str):
+                out.append(PanelMember(profile=r, lens=None, index=i))
+            elif isinstance(r, dict):
+                out.append(PanelMember(
+                    profile=r.get("profile") or r.get("reviewer"),
+                    lens=r.get("lens"), index=i,
+                ))
+        return out
+    reviewer = step.get("reviewer")
+    return [PanelMember(profile=reviewer, lens=None, index=0)] if reviewer else []
+
+
+def _validate_panel(panel: list[PanelMember], step: Step, ctx: StepContext):
+    """Fail closed at cycle start on a malformed panel (FR-1.1): 1–3 members,
+    each with a profile, and every declared lens fragment present on disk (a
+    missing lens is caught here, not silently reviewed without a lens)."""
+    if step.get("reviewers") is None:
+        return None  # single-reviewer default: nothing extra to validate
+    n = len(panel)
+    if not 1 <= n <= 3:
+        return StepResult(
+            status=FAILED,
+            notes=f"adversarial_cycle `reviewers:` panel must have 1–3 members "
+            f"(FR-1.1); got {n}",
+        )
+    for m in panel:
+        if not m.profile:
+            return StepResult(
+                status=FAILED,
+                notes="adversarial_cycle `reviewers:` entry is missing a profile "
+                "(FR-1.1)",
+            )
+        if m.lens is not None and not _lens_path(ctx, m.lens).exists():
+            return StepResult(
+                status=FAILED,
+                notes=f"adversarial_cycle reviewer lens fragment not found: "
+                f"prompts/lenses/{m.lens}.md (FR-1.1); failing closed rather "
+                "than reviewing with no lens",
+            )
+    return None
+
+
+def _lens_path(ctx: StepContext, lens: str) -> Path:
+    return ctx.repo_root / ctx.config.asset_root / "prompts" / "lenses" / f"{lens}.md"
+
+
+def _lens_fragment(ctx: StepContext, lens: str | None) -> str:
+    """The lens fragment appended to a panel member's review prompt (FR-1.1).
+    Empty for a lens-less member. Existence is validated at cycle start."""
+    if not lens:
+        return ""
+    body = _lens_path(ctx, lens).read_text()
+    return f"\n\n--- your review lens: {lens} (apply it on top of the review above) ---\n{body}"
+
+
+# --- ensemble review (FR-1.1/FR-1.2/FR-1.3) --------------------------------------
+def _member_artifact_path(ctx: StepContext, rnd: int, member: PanelMember) -> Path:
+    return ctx.run_dir / "artifacts" / f"r{rnd}" / "members" / f"{member.key}.json"
+
+
+def _member_artifact_reuse(
+    ctx: StepContext, rnd: int, member: PanelMember, handoff: str, scope_hash: str
+) -> dict[str, Any] | None:
+    """A persisted member artifact, iff it is content-addressed to the current
+    ``(handoff, review-scope)`` (plan-cycle-resp-2a). Returns None — so the member
+    (re-)runs — when the artifact is absent, unreadable, or from a different
+    scope. This is what lets a resumed panel re-pay ONLY the not-yet-completed
+    members: a completed member's artifact matches and is read back; an incomplete
+    member has no matching artifact and runs."""
+    path = _member_artifact_path(ctx, rnd, member)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if data.get("handoff") != handoff or data.get("scope_hash") != scope_hash:
+        return None
+    return data
+
+
+def _stamp_member_finding(finding: dict[str, Any], member: PanelMember) -> dict[str, Any]:
+    """Namespace a member finding's id (so ids are unique across the panel) and
+    stamp its ``source``/``lens`` (FR-1.2). These are engine annotations, never
+    agent-emitted."""
+    out = {**finding, "id": f"{member.profile}:{finding.get('id')}"}
+    out["source"] = member.profile
+    if member.lens is not None:
+        out["lens"] = member.lens
+    return out
+
+
+def _stamp_member_oqs(oqs: list[dict[str, Any]], member: PanelMember) -> list[dict[str, Any]]:
+    return [{**oq, "id": f"{member.profile}:{oq.get('id')}"} for oq in oqs]
+
+
+def _run_member(
+    step: Step, ctx: StepContext, member: PanelMember, base_prompt: str,
+    rnd: int, handoff: str, scope_hash: str, policy: str, phase: str,
+    commits: list[tuple[str, str]], reviewer_schema: dict | None, usage: Any,
+    effort: str | None,
+) -> dict[str, Any]:
+    """Run ONE panel member and persist its per-member findings artifact the
+    moment it completes (before the ensemble step as a whole finishes, so a later
+    member's failure never loses this one — plan-cycle-resp-2a). FAIL CLOSED: a
+    transient failure propagates as the usage-limit _ParkCycle (resumable); any
+    other member error is converted to a _ParkCycle that parks the whole ensemble
+    step for a human — it never proceeds to dedup/triage on a reduced panel."""
+    from gauntlet.engine.steptypes import step_logger
+
+    member_prompt = base_prompt + _lens_fragment(ctx, member.lens)
+    guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, member.profile, commits)
+    logger = step_logger(ctx, f"r{rnd}-review", member.key)
+    try:
+        review = _run_sub(
+            ctx, member.profile, member_prompt, schema=reviewer_schema, usage=usage,
+            logger=logger, structured_name="findings.json",
+            after_attempt=guard.check, substep=f"r{rnd}-review-{member.key}",
+            effort=effort,
+        )
+    except _ParkCycle:
+        raise  # transient usage-limit/overload: the cycle parks resumably
+    except (AdapterError, MalformedOutputError) as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "ensemble review parks fail-closed (plan-cycle-resp-2a): panel "
+                f"member {member.profile}/{member.lens or 'nolens'} failed in "
+                f"round {rnd} ({exc}); the panel is not reduced and the missing "
+                "member is not treated as clean — a human must resolve"
+            ),
+        )) from exc
+    raw = list((review.structured or {}).get("findings") or [])
+    raw.extend(guard.synthetic_findings)
+    data = {
+        "member": {"profile": member.profile, "lens": member.lens, "index": member.index},
+        "handoff": handoff,
+        "scope_hash": scope_hash,
+        "findings": [_stamp_member_finding(f, member) for f in raw],
+        "open_questions": _stamp_member_oqs(
+            (review.structured or {}).get("open_questions") or [], member
+        ),
+        "summary": (review.structured or {}).get("summary", ""),
+    }
+    ctx.writer.write_text(
+        _member_artifact_path(ctx, rnd, member),
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
+    return data
+
+
+def _ensemble_review(
+    step: Step, ctx: StepContext, panel: list[PanelMember], rnd: int, handoff: str,
+    policy: str, phase: str, commits: list[tuple[str, str]],
+    reviewer_schema: dict | None, usage: Any, carried: list[dict[str, Any]],
+    prev_review_handoff: str | None, threshold: float, effort: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Run/reuse every panel member independently, then deterministically merge
+    (FR-1.1/FR-1.2). Members run sequentially in panel order — deliberately, not
+    concurrently: they share one worktree and each is followed by the FR-9.6
+    mutation guard, so serial execution keeps git state coherent (determinism
+    over cleverness). Members are content-addressed to ``(handoff, review-scope)``
+    so a resumed panel re-pays only the not-yet-completed ones. Fail-closed park
+    on any member error is raised as a _ParkCycle from :func:`_run_member`.
+
+    Returns ``(merged_findings, merged_open_questions, merged_summary)`` — the
+    merged set is primaries + marked duplicates; only primaries reach triage."""
+    base_prompt = _review_prompt(
+        step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
+    )
+    scope_hash = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
+    stamped: list[dict[str, Any]] = []
+    open_questions: list[dict[str, Any]] = []
+    summaries: list[str] = []
+    for member in panel:
+        data = _member_artifact_reuse(ctx, rnd, member, handoff, scope_hash)
+        if data is None:
+            data = _run_member(
+                step, ctx, member, base_prompt, rnd, handoff, scope_hash,
+                policy, phase, commits, reviewer_schema, usage, effort,
+            )
+        stamped.extend(data.get("findings") or [])
+        open_questions.extend(data.get("open_questions") or [])
+        if data.get("summary"):
+            summaries.append(
+                f"[{member.profile}/{member.lens or 'nolens'}] {data['summary']}"
+            )
+    panel_order = {m.profile: m.index for m in panel}
+    merged = ensemble.merge_findings(stamped, panel_order=panel_order, threshold=threshold)
+    return merged.findings, open_questions, "\n\n".join(summaries)
+
+
+def _ensemble_member_stats(
+    ctx: StepContext, panel: list[PanelMember], rnd: int,
+    primaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Per-member raised (from the persisted member artifact) + unique-after-dedup
+    (primaries this member owns) for a round (FR-1.3). Works identically on a
+    fresh merge and a reused merged review — both leave the member artifacts on
+    disk."""
+    stats: list[dict[str, Any]] = []
+    for member in panel:
+        raised = 0
+        path = _member_artifact_path(ctx, rnd, member)
+        if path.exists():
+            try:
+                raised = len(json.loads(path.read_text()).get("findings") or [])
+            except (OSError, ValueError):
+                raised = 0
+        unique = sum(
+            1 for p in primaries
+            if p.get("source") == member.profile and p.get("lens") == member.lens
+        )
+        stats.append({
+            "key": member.metric_key, "profile": member.profile,
+            "lens": member.lens, "raised": raised, "unique_after_dedup": unique,
+        })
+    return stats
+
+
+def _ensemble_legit_by_member(
+    primaries: list[dict[str, Any]], verdicts: list[dict[str, Any]]
+) -> dict[str, int]:
+    """Per-(profile, lens) count of primaries this member owns that triage judged
+    ``legitimate`` — the post-triage-legitimate yield (FR-1.3 / §9)."""
+    verdict_by_id = {v.get("finding_id"): v for v in verdicts}
+    legit: dict[str, int] = {}
+    for p in primaries:
+        v = verdict_by_id.get(p.get("id"))
+        if v and v.get("verdict") == "legitimate":
+            key = f"{p.get('source')}::{p.get('lens') or 'nolens'}"
+            legit[key] = legit.get(key, 0) + 1
+    return legit
 
 
 def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
@@ -2065,6 +2383,12 @@ class _CycleMetrics:
         self.verdict_counts: dict[str, int] = {}
         self.confirm_counts: dict[str, int] = {}
         self._round_accepted_ids: set[str] = set()
+        # Per-(profile, lens) ensemble yield (FR-1.3), accumulated across rounds:
+        # findings raised, unique-after-dedup (primaries owned), and
+        # post-triage-legitimate. Read from the manifest without transcript access
+        # (metrics.ensemble.unique_legit_by_member). Empty for a single-reviewer
+        # cycle, so the `ensemble` key is omitted entirely (byte-compatible trend).
+        self.ensemble_by_member: dict[str, dict[str, Any]] = {}
 
     def record_round(self, findings: list[dict[str, Any]]) -> None:
         self.rounds += 1
@@ -2082,6 +2406,31 @@ class _CycleMetrics:
                 if fid:
                     self._round_accepted_ids.add(fid)
 
+    def _member(self, key: str, profile: str | None, lens: str | None) -> dict[str, Any]:
+        entry = self.ensemble_by_member.get(key)
+        if entry is None:
+            entry = {
+                "profile": profile, "lens": lens,
+                "raised": 0, "unique_after_dedup": 0, "unique_legit": 0,
+            }
+            self.ensemble_by_member[key] = entry
+        return entry
+
+    def record_ensemble(self, member_stats: list[dict[str, Any]]) -> None:
+        """Accumulate a round's per-member raised + unique-after-dedup (FR-1.3)."""
+        for m in member_stats:
+            entry = self._member(m["key"], m.get("profile"), m.get("lens"))
+            entry["raised"] += int(m.get("raised", 0))
+            entry["unique_after_dedup"] += int(m.get("unique_after_dedup", 0))
+
+    def record_ensemble_legit(self, legit_by_key: dict[str, int]) -> None:
+        """Accumulate a round's per-member post-triage-legitimate yield (FR-1.3).
+
+        Keys are the same ``<profile>::<lens>`` as :meth:`record_ensemble`, which
+        runs first each round, so every legit key already has an entry."""
+        for key, count in legit_by_key.items():
+            self._member(key, None, None)["unique_legit"] += int(count)
+
     def record_confirm(self, cdata: dict[str, Any]) -> None:
         # The confirm pass that follows immediately confirms THIS round's fixes,
         # so its verdicts are scoped to the round's findings — join against the
@@ -2094,7 +2443,7 @@ class _CycleMetrics:
                 self.accepted_resolved_total += 1
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "rounds": self.rounds,
             "findings_total": self.findings_total,
             "accepted_total": self.accepted_total,
@@ -2102,6 +2451,13 @@ class _CycleMetrics:
             "verdict_counts": dict(self.verdict_counts),
             "confirm_counts": dict(self.confirm_counts),
         }
+        if self.ensemble_by_member:  # FR-1.3; omitted for a single-reviewer cycle
+            out["ensemble"] = {
+                "unique_legit_by_member": {
+                    k: dict(v) for k, v in self.ensemble_by_member.items()
+                }
+            }
+        return out
 
 
 def _write_artifact(

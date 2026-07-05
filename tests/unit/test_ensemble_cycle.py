@@ -1,0 +1,255 @@
+"""Ensemble review inside adversarial_cycle (FR-1.1/1.2/1.3, P1).
+
+Drives the real handler through the orchestrator on scripted fakes (reusing the
+test_cycle harness): a two-member panel persists one findings artifact per member
+(P1-A1), the deterministic dedup merges the shared defect and triages each
+primary once while keeping a divergent claim distinct (P1-A2), per-(profile,lens)
+yield lands in the manifest metrics (P1-A3), a one-member config is byte-identical
+to the single-reviewer output (P1-A4), a member error/usage-limit parks the step
+fail-closed (P1-A6), and a resume re-invokes only the not-yet-completed member
+(P1-A7).
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+from gauntlet.engine import gitops, manifest as M
+
+from conftest import git
+from test_cycle import (
+    CONFIRM,
+    CV,
+    F,
+    REVIEW,
+    SeqAdapter,
+    V,
+    _build_cycle_orch,
+    _transient_exc,
+    run_cycle,
+    writer,
+)
+
+REPO = Path(__file__).resolve().parents[2]
+
+ENS_CONFIG = {
+    "triage_concurrency": 1,  # positional triage fakes stay deterministic
+    "agents": {
+        "reviewer": {"adapter": "codex"},
+        "gemini": {"adapter": "api", "model": "g"},
+        "triage": {"adapter": "api", "model": "h"},
+        "builder": {"adapter": "claude-code"},
+        "esc": {"adapter": "api", "model": "strong"},
+    },
+    "identities": {
+        "reviewer": {"name": "Gauntlet Reviewer (codex)", "email": "reviewer@gauntlet.local"},
+        "builder": {"name": "Gauntlet Builder (claude)", "email": "builder@gauntlet.local"},
+    },
+}
+
+PANEL = {"reviewers": [
+    {"profile": "reviewer", "lens": "correctness"},
+    {"profile": "gemini", "lens": "spec-coverage"},
+]}
+
+
+def _init_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    git(path, "init", "-q")
+    git(path, "config", "user.name", "Fixture")
+    git(path, "config", "user.email", "fixture@gauntlet.local")
+    git(path, "config", "commit.gpgsign", "false")
+    (path / "README.md").write_text("fixture\n")
+    git(path, "add", "-A")
+    git(path, "commit", "-qm", "init")
+    git(path, "branch", "-M", "main")
+    return path
+
+
+def _ens_repo(repo):
+    """A git repo carrying the real schemas AND prompts (lens fragments) + seed.
+
+    Accepts either the ``fixture_repo`` (already initialized) or a bare path,
+    which is initialized first."""
+    if not (repo / ".git").exists():
+        _init_repo(repo)
+    shutil.copytree(REPO / "schemas", repo / "schemas")
+    shutil.copytree(REPO / "prompts", repo / "prompts")
+    (repo / "prd.md").write_text("ARTIFACT-BODY-SENTINEL\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "seed")
+    return repo
+
+
+def _fx(fid, sev, cat, loc, claim):
+    return {"id": fid, "severity": sev, "category": cat, "location": loc,
+            "claim": claim, "evidence": "seen", "suggested_fix": None}
+
+
+def _members_dir(run_dir):
+    return run_dir / "artifacts" / "r1" / "members"
+
+
+# ===========================================================================
+# P1-A1/A2/A3 — panel persists per-member artifacts, dedup merges, metrics
+# ===========================================================================
+def test_two_member_panel_persists_merges_and_yields_metrics(fixture_repo):
+    repo = _ens_repo(fixture_repo)
+    # reviewer and gemini both raise the SAME defect (src.py:1, overlapping,
+    # compatible claim) → merge to one primary; gemini also raises a DISTINCT
+    # finding elsewhere → kept as its own primary.
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "correctness", "src.py:1",
+                   "the counter overflows the window budget")),
+        CONFIRM(CV("reviewer:F-001", "resolved"), CV("gemini:F-002", "resolved")),
+    )
+    gemini = SeqAdapter(REVIEW(
+        _fx("F-001", "major", "correctness", "src.py:1",
+            "counter overflows the window budget silently"),
+        _fx("F-002", "major", "correctness", "other.py:5",
+            "a distinct unrelated defect in another file"),
+    ))
+    adapters = {
+        "reviewer": reviewer, "gemini": gemini,
+        "triage": SeqAdapter(V("x"), V("y")),  # ids overwritten to the primaries'
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+        "esc": SeqAdapter(),
+    }
+    orch, man = _build_cycle_orch(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+    assert orch.drive() == M.RUN_DONE
+    run_dir = repo / "runs" / "demo" / "run-1"
+
+    # P1-A1: one persisted findings artifact per member.
+    member_files = sorted(p.name for p in _members_dir(run_dir).glob("*.json"))
+    assert len(member_files) == 2
+
+    # P1-A2: the merged findings.json marks the duplicate + aggregates sources;
+    # only the two primaries were triaged (dup never reaches triage).
+    merged = json.loads((run_dir / "artifacts" / "findings.json").read_text())
+    ids = {f["id"]: f for f in merged["findings"]}
+    assert ids["reviewer:F-001"]["sources"] == ["reviewer", "gemini"]
+    assert "duplicate_of" not in ids["reviewer:F-001"]
+    assert ids["gemini:F-001"]["duplicate_of"] == "reviewer:F-001"
+    assert "duplicate_of" not in ids["gemini:F-002"]  # distinct primary
+    triage_targets = {v["finding_id"] for v in
+                      json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]}
+    assert triage_targets == {"reviewer:F-001", "gemini:F-002"}  # once per primary
+    assert len(adapters["triage"].calls) == 2
+
+    # P1-A3: per-(profile, lens) yield readable straight from the manifest.
+    ens = man.record("cycle").metrics["ensemble"]["unique_legit_by_member"]
+    assert ens["reviewer::correctness"] == {
+        "profile": "reviewer", "lens": "correctness",
+        "raised": 1, "unique_after_dedup": 1, "unique_legit": 1,
+    }
+    assert ens["gemini::spec-coverage"] == {
+        "profile": "gemini", "lens": "spec-coverage",
+        "raised": 2, "unique_after_dedup": 1, "unique_legit": 1,
+    }
+
+
+def test_lens_fragment_reaches_member_prompt(fixture_repo):
+    repo = _ens_repo(fixture_repo)
+    reviewer = SeqAdapter(REVIEW())  # converge immediately
+    gemini = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "gemini": gemini,
+                "triage": SeqAdapter(), "builder": SeqAdapter(), "esc": SeqAdapter()}
+    orch, _man = _build_cycle_orch(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+    assert orch.drive() == M.RUN_DONE
+    # each member's own lens fragment is appended to the shared review scope.
+    assert "review lens: correctness" in reviewer.calls[0]["prompt"]
+    assert "review lens: spec-coverage" in gemini.calls[0]["prompt"]
+    assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[0]["prompt"]  # same scope
+
+
+# ===========================================================================
+# P1-A4 — a one-member config is byte-identical to the single-reviewer output
+# ===========================================================================
+def test_one_member_config_is_byte_identical_to_single_reviewer(fixture_repo, tmp_path):
+    def _run(repo, step_extra):
+        reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+        adapters = {"reviewer": reviewer, "gemini": SeqAdapter(),
+                    "triage": SeqAdapter(V("F-001")),
+                    "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+                    "esc": SeqAdapter()}
+        orch, _man = _build_cycle_orch(repo, adapters, step_extra=step_extra, config=ENS_CONFIG)
+        assert orch.drive() == M.RUN_DONE
+        return (repo / "runs" / "demo" / "run-1" / "artifacts" / "findings.json").read_bytes()
+
+    single = _run(_ens_repo(fixture_repo), {})
+    one_member = _run(_ens_repo(tmp_path / "repo2"), {"reviewers": ["reviewer"]})
+    assert single == one_member
+    # and the single-reviewer artifact carries none of the ensemble fields
+    obj = json.loads(single)
+    for f in obj["findings"]:
+        assert not (set(f) & {"source", "lens", "duplicate_of", "sources"})
+
+
+# ===========================================================================
+# P1-A6 — a member error / usage-limit parks the ensemble step FAIL CLOSED
+# ===========================================================================
+def test_member_terminal_error_parks_fail_closed_no_triage(fixture_repo):
+    repo = _ens_repo(fixture_repo)
+    from gauntlet.adapters.base import AgentFailedError
+
+    reviewer = SeqAdapter(REVIEW(F("F-001")))  # member 1 completes
+    gemini = SeqAdapter(AgentFailedError("terminal boom"))  # member 2 dies (terminal)
+    triage = SeqAdapter()  # must NEVER be called
+    adapters = {"reviewer": reviewer, "gemini": gemini,
+                "triage": triage, "builder": SeqAdapter(), "esc": SeqAdapter()}
+    status, man, run_dir = run_cycle(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+
+    assert status == M.RUN_PARKED  # never proceeds on a reduced panel
+    assert len(triage.calls) == 0  # dedup/triage never ran
+    assert "fail-closed" in man.record("cycle").notes
+    # member 1's artifact persisted; member 2's absent (not treated as clean).
+    files = {p.name for p in _members_dir(run_dir).glob("*.json")}
+    assert any("reviewer" in n for n in files)
+    assert not any("gemini" in n for n in files)
+
+
+def test_member_usage_limit_parks_resumably(fixture_repo):
+    repo = _ens_repo(fixture_repo)
+    reviewer = SeqAdapter(REVIEW(F("F-001")))
+    gemini = SeqAdapter(_transient_exc(session="gemini-sess"))
+    adapters = {"reviewer": reviewer, "gemini": gemini,
+                "triage": SeqAdapter(), "builder": SeqAdapter(), "esc": SeqAdapter()}
+    status, man, _ = run_cycle(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+    assert status == M.RUN_PARKED
+    assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+
+
+# ===========================================================================
+# P1-A7 — resume re-invokes ONLY the not-yet-completed member
+# ===========================================================================
+def test_resume_reuses_completed_member_and_reruns_only_incomplete(fixture_repo):
+    repo = _ens_repo(fixture_repo)
+    # Member 1 (reviewer) completes; member 2 (gemini) hits a usage limit → park.
+    # reviewer gets EXACTLY two responses: its round-1 review (drive 1) and the
+    # confirm pass (resume). If the resume re-invoked member 1, the adapter would
+    # exhaust — so a passing run proves the completed member was NOT re-paid.
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "correctness", "src.py:1", "shared defect here")),
+        CONFIRM(CV("reviewer:F-001", "resolved")),
+    )
+    gemini = SeqAdapter(
+        _transient_exc(session="gemini-sess"),                      # drive 1: park
+        REVIEW(),                                                    # resume: no findings
+    )
+    triage = SeqAdapter(V("reviewer:F-001"))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    adapters = {"reviewer": reviewer, "gemini": gemini,
+                "triage": triage, "builder": builder, "esc": SeqAdapter()}
+    orch, man = _build_cycle_orch(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert len(reviewer.calls) == 1  # only the review ran on drive 1
+
+    assert orch.drive() == M.RUN_DONE
+    # reviewer was NOT re-invoked for review on resume (reused): its only new call
+    # is the confirm pass. gemini re-ran (the incomplete member).
+    assert len(reviewer.calls) == 2
+    assert len(gemini.calls) == 2
