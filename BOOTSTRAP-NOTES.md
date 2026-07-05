@@ -1002,3 +1002,58 @@ process, and what it suggests for Gauntlet's design.
         review context so they can't evaporate.
       - **Bound FRs-per-phase.** Flag a phase bundling many independent FRs for a
         split, so a partial delivery can't masquerade as a whole phase.
+
+## 2026-07-02..03 — harness-efficiency: the engine's own source mutates under the live driver (self-hosting hazard)
+
+- **What happened, three times in one run.** The `gauntlet run harness-efficiency`
+  dogfood modified `src/gauntlet/` in every phase — and the long-lived driver
+  process kept executing the module graph it had imported at start:
+  1. **Import poisoning (P1):** `phase-commit[0]` crashed with
+     `cannot import name 'FAILURE_TERMINAL' from gauntlet.adapters.base` — P1
+     had rewritten `adapters/base.py` on disk; a later lazy import loaded a
+     P1-modified module that referenced the new constant, but
+     `gauntlet.adapters.base` was already in `sys.modules` as the *old* copy.
+     Tests were green: `uv run pytest` is a fresh subprocess with the
+     consistent new tree. Only the driver was inconsistent.
+  2. **Behavior staleness (P10):** `phase-commit[9]` failed with "clean
+     worktree, nothing to commit" — the P10 builder had followed P9's
+     freshly-landed wip-commit discipline (all work in `P10 wip:` commits),
+     and P9's commit handler creates the empty `P10:` marker commit for
+     exactly that case — but the running driver predated P9 and executed the
+     *old* handler. New contract on disk, old code in memory.
+  3. **The general shape:** roughly one stale-driver incident per driver
+     lifetime — each fresh resume imports a consistent tree and survives until
+     the next phase mutates the engine under it again.
+- **Why the guardrails don't catch it:** the failure surfaces as a generic
+  handler error (`FAILED`, no structured reason at the time), the test suite
+  proves the *tree* is consistent (subprocess), and nothing compares the
+  driver's loaded code against the tree it is executing from.
+- **Recoveries used (operator):** fresh-process `resume` clears import
+  poisoning; the commit-step instances additionally required manifest surgery
+  (`failed`→`pending`, run→`running`) because a failed `commit` step was
+  unreachable by both plain `resume` and `--response` — that deadlock is since
+  fixed (0.5.0: `commit` ∈ `RESPONDABLE_STEP_TYPES`), but the *staleness*
+  hazard itself is untouched: 0.5.0's resilience machinery cannot fix from
+  inside a process the property of being that stale process.
+- **Durable mitigation candidates (recorded in FUTURE.md; would go through the
+  normal PRD/retro process, not a unilateral change):**
+  1. **Restart the driver at phase boundaries when the run's target repo is
+     the engine's own source repo** — bounds staleness to a single phase and
+     is exactly what the manual resume-per-phase cadence did by accident.
+  2. **Run the driver from an installed snapshot** (venv/`uv tool install`
+     pinned at run start) so worktree mutation never touches the executing
+     engine; the new code takes effect on the next run, not mid-run.
+  3. **Detection floor:** the driver records a source-tree hash of the engine
+     package at start and, at each step boundary, parks with a named reason
+     when the tree changed under it — turning a mystery crash into a
+     one-line, resumable state.
+
+## 2026-07-05 — `gauntlet clean` checks merged-ness against the recorded base, which can be stale
+
+Small operability note: `clean harness-efficiency` refused with "not fully
+merged into base 'chore/fable-review'" although the branch had merged to
+`main` via PR #52 — the run's manifest recorded `base_branch: current` as the
+branch the run *launched from*, and that branch later diverged. The guard is
+right to fail closed, but the operator's proof (`git merge-base --is-ancestor
+<run-branch> main`) suggests the check could also accept containment in the
+repo's default branch before demanding `--force`.
