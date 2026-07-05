@@ -1,10 +1,10 @@
 # PRD: Pipeline Effectiveness — catch more, gate smarter, learn across runs
 
-**Status:** Draft v0.2
-**Author:** John Pletka (drafted with Claude from a goals-first analysis of the pipeline, 2026-07-02; v0.2 resolves Q1/Q2/Q5)
-**Date:** 2026-07-02
+**Status:** Draft v0.3
+**Author:** John Pletka (drafted with Claude from a goals-first analysis of the pipeline, 2026-07-02; v0.2 resolves Q1/Q2/Q5; v0.3 folds in issue #49's convergence-honesty cluster as FR-6/P7, 2026-07-05)
+**Date:** 2026-07-05
 **Working name:** pipeline-effectiveness
-**Relationship to existing artifacts:** Does **not** amend `PRD-gauntlet.md` or any approved artifact. FR-4 (evidence-tiered gates) was checked against the spec's gate requirements: phase-gate policy is pipeline configuration, not spec mandate (evidence recorded at §11 Q1); PRD/plan gates and blocker escalations stay unconditionally human. Builds on: the adversarial cycle (`engine/cycle.py`), plan phase machinery (`engine/planphases.py`, `phase_lint`), the retro/proposals loop (FR-6 machinery, `prompts/retro.md`, `gauntlet proposals`), `gauntlet trend` data, and the manifest metrics. Companion to `runs/harness-efficiency/prd.md` (plumbing hardening); this PRD changes what the pipeline *does*, that one changes how reliably it runs. Neither depends on the other.
+**Relationship to existing artifacts:** Does **not** amend `PRD-gauntlet.md` or any approved artifact. FR-4 (evidence-tiered gates) was checked against the spec's gate requirements: phase-gate policy is pipeline configuration, not spec mandate (evidence recorded at §11 Q1); PRD/plan gates and blocker escalations stay unconditionally human. FR-6 adopts the four upstreaming requests of [issue #49](https://github.com/johnpletka/gauntlet/issues/49) (convergence + confirm-pass semantics, surfaced by a real adopting-repo run). Builds on: the adversarial cycle (`engine/cycle.py`), plan phase machinery (`engine/planphases.py`, `phase_lint`), the retro/proposals loop (the spec's FR-6 machinery: `prompts/retro.md`, `gauntlet proposals`), `gauntlet trend` data, and the manifest metrics. Companion to `runs/harness-efficiency/prd.md` (plumbing hardening); this PRD changes what the pipeline *does*, that one changes how reliably it runs. Neither depends on the other.
 
 ## §1 Overview
 
@@ -18,9 +18,11 @@ Gauntlet's pitch is *adversarial multi-model review*, but each cycle runs exactl
 
 3. **The pipeline learns nothing between runs.** Retro produces proposals, `gauntlet trend` aggregates stats, manifests record every finding and verdict — and none of it feeds forward. The reviewer re-discovers the same project-specific failure patterns (the judge path-boundary bugs took four rounds across runs, #29–#32); triage re-litigates finding types a human already declined with recorded reasoning; the plan-author sizes phases with no cost model, producing the oversized phases that both hide incompleteness (#54 cause 4) and blow the provider window (harness-efficiency §1.1).
 
+4. **Convergence can close accepted-but-unfinished work silently** (issue #49, from a real adopting-repo run, `quote-source-badges`). The convergence predicate treats a `partially_resolved` confirm verdict as forcing another round only when the *finding* is blocking severity (`engine/cycle.py`: `verdict == "partially_resolved" and severity == "blocking"`); a `fix_now` partial on a major finding converges as effectively closed. Three prompt-level gaps compound it: fixers close enumerated obligations on the headline rather than the full list (the run's FR-5.1 case shipped *no-write* while silently dropping *no-read*/*no-payload*); an untestable acceptance oracle is triaged as a quality nit rather than a blocker; and artifact-mode confirms never check that a fix left the document internally consistent (the run's F-006 fix corrected the strategy section while the deliverable section still asserted the opposite). The harness-efficiency run itself demonstrated the escape live: its P1 cycle converged with `confirm_counts: {partially_resolved: 1}` surfaced-but-not-carried.
+
 ### 1.2 Solution summary
 
-Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensemble review**: an adversarial cycle accepts multiple reviewers, each with a distinct lens (correctness, spec-coverage, security), findings merged and deduplicated before triage — spending unconstrained-provider budget on diversity, the tool's founding premise. (b) **Behavioral verification**: a sandboxed verifier sub-step that *executes* the phase deliverable against the plan's acceptance criteria in a disposable worktree copy and reports observations as findings — a signal class no diff reader produces. (c) **Phase-completeness machinery** (the #54 preventions): acceptance-clause→test mapping validated deterministically at the phase gate, deferral-reference reconciliation against real phases, and a phase-size lint. (d) **Evidence-tiered gates**: a per-gate policy allowing auto-approval only when a strict clean-signal predicate holds, every auto-approval stamped with its evidence snapshot — contingent on the upstream spec check. (e) **Cross-run learning**: reviewer lens files and a declined-findings registry maintained through the existing ratified-proposal governance, and trend-derived cost/size stats injected into plan authoring.
+Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensemble review**: an adversarial cycle accepts multiple reviewers, each with a distinct lens (correctness, spec-coverage, security), findings merged and deduplicated before triage — spending unconstrained-provider budget on diversity, the tool's founding premise. (b) **Behavioral verification**: a sandboxed verifier sub-step that *executes* the phase deliverable against the plan's acceptance criteria in a disposable worktree copy and reports observations as findings — a signal class no diff reader produces. (c) **Phase-completeness machinery** (the #54 preventions): acceptance-clause→test mapping validated deterministically at the phase gate, deferral-reference reconciliation against real phases, and a phase-size lint. (d) **Evidence-tiered gates**: a per-gate policy allowing auto-approval only when a strict clean-signal predicate holds, every auto-approval stamped with its evidence snapshot — contingent on the upstream spec check. (e) **Cross-run learning**: reviewer lens files and a declined-findings registry maintained through the existing ratified-proposal governance, and trend-derived cost/size stats injected into plan authoring. (f) **Convergence honesty** (issue #49): an accepted finding confirmed `partially_resolved` is non-converged by definition — the engine predicate says so and the confirm pass emits the concrete remainder as a carryable finding; fixers treat enumerated obligations as checklists; untestable acceptance oracles triage as blocking; artifact-mode confirms check intra-document consistency.
 
 ### 1.3 The assumption this validates
 
@@ -37,6 +39,7 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 | G3 | The deliverable is executed, not just read, before a phase gate | Behavioral defects surface pre-merge |
 | G4 | Human attention concentrates on gates where the evidence is ambiguous; clean-signal gates clear without a human when policy allows | Gate latency stops dominating multi-phase wall-clock; attention isn't trained into rubber-stamping |
 | G5 | Every run makes the next run better: recurring findings become lenses, declined findings stop recurring, phase sizing uses measured costs | The corpus of manifests becomes an asset instead of an archive |
+| G6 | An accepted (`fix_now`) finding cannot close while a material remainder is unresolved: partials force another round or park, enumerated obligations close item-by-item, and a fix cannot leave the document contradicting itself | Issue #49's silent-closure class is structurally shut |
 
 ### 2.2 Non-Goals (v1)
 
@@ -46,6 +49,7 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 - **CI-side review integration** (GitHub PR review bots). The PR remains the human audit boundary.
 - **More than three reviewers per cycle.** v1 caps the panel; diminishing-returns measurement (§9) decides any expansion.
 - **Auto-approving PRD or plan gates.** FR-4 applies to per-phase code gates only; document ratification stays human unconditionally.
+- **Issue #49's secondary observation** (the retro proposal-diff generator emitting non-applying diffs). A real bug, but in the proposals machinery, not the cycle — tracked separately, not absorbed here.
 
 ## §3 Users and Personas
 
@@ -67,7 +71,9 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 | `src/gauntlet/engine/orchestrator.py`, `manifest.py` | Gate `policy: always \| auto_when_clean`; auto-approval record with evidence snapshot | Touched |
 | `src/gauntlet/engine/registry.py` | Declined-findings registry (fingerprint → verdict, reasoning, run id), injected into triage context | **New** |
 | `prompts/plan-author.md`, trend plumbing | Inject measured per-phase cost/duration stats and the FRs-per-phase bound into plan authoring input | Touched |
-| `.gauntlet/config.yaml`, `pipelines/standard.yaml` | Panel definitions, gate policies, verifier profile | Touched |
+| `.gauntlet/config.yaml`, `pipelines/standard.yaml` | Panel definitions, gate policies, verifier profile; `max_rounds` 2 → 3 on `plan-cycle`/`impl-cycle` so a carried remainder has a round to land (FR-6.1) | Touched |
+| `src/gauntlet/engine/cycle.py` (convergence) | `_forcing_open`: an accepted `fix_now` finding whose confirm verdict is `partially_resolved` is a forcing open regardless of severity (FR-6.1 engine variant) | Touched |
+| `prompts/cycle-confirm.md`, `cycle-fix.md`, `triage.md`, `review-document.md`, `review-code.md` (+ scaffold twins) | Remainder-capture, enumerated-obligation checklists, untestable-oracle severity rule, intra-document consistency check (FR-6) | Touched |
 
 ### 4.2 Key design decisions
 
@@ -79,6 +85,7 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 | Completeness check mechanism | Deterministic gate (mapping file ↔ `pytest --collect-only` ids), not another LLM review | #54's lesson is that judgment-based review misses absence; absence is checkable mechanically. The reviewer panel's spec-coverage lens complements, not substitutes. |
 | Auto-approval predicate | Strict conjunction: converged in round 1 · zero blocking/major legitimate findings · acceptance gate passed · tests green · zero escalations · zero reviewer mutations · verifier ran clean | Any single ambiguous signal parks for a human. The predicate is evidence the pipeline already records — no new judgment call, just a policy over existing facts. |
 | Learning governance | Lenses and registry entries change only via ratified retro proposals; registry injection is advisory context, never auto-dismissal | "Approved artifacts change only through their own loop and gate" applied to prompts; a declined precedent informs triage, it does not decide it. |
+| Partial-closure fix depth | **Both** the engine predicate (an accepted `fix_now` partial is non-converged, period) **and** the confirm-prompt remainder capture — not prompt-only | Issue #49 offers the prompt-level path as sufficient, but a prompt instruction is probabilistic; the convergence guarantee belongs in the deterministic predicate (determinism over cleverness). The prompt half is still required: the predicate can force a round, but only a *concrete carried remainder* gives that round something actionable. Oscillation is bounded: the rule touches only accepted-and-attempted findings, never re-litigates declines, and `max_rounds` still escalates to a human. |
 
 ## §5 Functional Requirements
 
@@ -127,6 +134,17 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 - **FR-5.3** Plan authoring receives measured history: per-phase cost/duration distributions by step type from `gauntlet trend` data, plus the `max_frs_per_phase` bound, injected into the plan-author input so phase sizing is grounded in observed costs (and in the window budget, where harness-efficiency FR-10 config exists).
   *Acceptance:* prompt-render test: a repo with ≥ 1 completed run produces a stats block in the plan-author prompt; an empty history renders a stated "no history" block, not silence.
 
+### FR-6 — Convergence honesty (issue #49)
+
+- **FR-6.1** An accepted (`fix_now`) finding whose confirm verdict is `partially_resolved` is **non-converged by definition**: the convergence predicate treats it as a forcing open regardless of the finding's severity, and the confirm pass additionally emits a `new_findings` entry naming the *specific unresolved remainder* (with `carried_from: <finding-id>`) so the next round has a concrete target. Remainder severity is set by what it guards: `blocking` for a privacy/security leakage boundary or a golden/parity oracle guarding a behavior-changing refactor; `major` otherwise. `max_rounds` on the shipped `plan-cycle`/`impl-cycle` rises 2 → 3 so a carried remainder has a round to land before max-rounds escalation parks for a human — the fail-closed terminus is unchanged.
+  *Acceptance:* unit test: a `fix_now` finding confirmed `partially_resolved` at `major` severity forces round N+1 (today it converges — the regression fixture is issue #49's escape); prompt-content test on `cycle-confirm.md` for the remainder-capture instruction and severity rule; fixture cycle: the carried remainder appears in round N+1's review scope with `carried_from` intact; exhausting `max_rounds` with an open remainder parks (`cycle_escalation` semantics unchanged).
+- **FR-6.2** Enumerated obligations close item-by-item, not on the headline. `cycle-fix.md` instructs the fixer to treat a finding that names several discrete obligations as an acceptance checklist: restate each item, map each to the specific change or assertion satisfying it, and state any deferral explicitly rather than silently dropping it. `cycle-confirm.md` mirrors the check: any uncovered enumerated item ⇒ `partially_resolved` with the uncovered items named (feeding FR-6.1's carry).
+  *Acceptance:* prompt-content tests on both templates; fixture cycle with a three-obligation finding whose fix covers two: confirm returns `partially_resolved` naming the third, and the carried remainder targets exactly it.
+- **FR-6.3** An untestable acceptance oracle is a blocker, not a nit. The reviewer severity rubrics (`review-document.md`, `review-code.md`) and the triage guidance (`triage.md`) state: a finding that an acceptance criterion, parity oracle, or golden test is not deterministic enough to judge a behavior-changing refactor classifies as `blocking`, unless the finding itself supplies the exact fixture matrix and expected outcomes that make it deterministic.
+  *Acceptance:* prompt-content tests; a labeled entry in `prompts/triage-corpus.jsonl` encoding the rule (the PLAN F-006 case from issue #49) so triage-accuracy evaluation covers it.
+- **FR-6.4** Artifact-mode confirm passes verify intra-document consistency: the fix must not introduce *or leave* a contradiction between sections of the same document (strategy vs. deliverable, requirement vs. open questions). A remaining contradiction ⇒ `partially_resolved`/`unresolved` citing both conflicting sections.
+  *Acceptance:* prompt-content test; fixture: an artifact fix that corrects one section while a second section still asserts the opposite yields a non-`resolved` verdict citing both sections.
+
 ## §6 Data & Schemas (normative excerpts)
 
 **Finding additions (findings.json):** `source: <profile>`, `lens: <lens-id>`, `duplicate_of: <finding-id> | null`, `sources: [<profile>...]` (on primaries), `category` gains `behavioral`.
@@ -147,6 +165,8 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
                 "verifier": "clean", "tests": "142 passed, 0 failed" },
   "at": "2026-07-02T18-00-00Z" }
 ```
+
+**Confirm remainder carry (confirm.json `new_findings` entries, FR-6.1):** entries gain optional `carried_from: <finding-id>` marking a remainder split off a `partially_resolved` accepted finding; severity per the FR-6.1 rule. Schema change is additive to `schemas/confirm.json`/`findings.json`.
 
 **Declined-findings registry (`<asset_root>/registry/declined.jsonl`, append-only):**
 ```json
@@ -171,9 +191,12 @@ Widen detection, then use the widened evidence to narrow ceremony. (a) **Ensembl
 | P3 | Behavioral verifier (FR-2) | Executing the deliverable in a disposable copy finds defect classes diff review missed, at acceptable sandbox complexity. |
 | P4 | Declined-findings registry + lens plumbing under proposal governance (FR-5.1, FR-5.2) | Precedent context measurably reduces re-litigated findings without suppressing legitimate ones. |
 | P5 | Trend-informed plan authoring (FR-5.3) | Measured phase-cost history changes plan-author sizing behavior (observable in emitted phase counts/scopes). |
-| P6 | Evidence-tiered gates (FR-4) — last because P1–P3 produce the evidence signals the predicate consumes | The clean-signal predicate identifies exactly the gates humans were rubber-stamping (measured: zero post-hoc reversals of auto-approved gates). |
+| P6 | Evidence-tiered gates (FR-4) — last of the trust chain because P1–P3 produce the evidence signals the predicate consumes | The clean-signal predicate identifies exactly the gates humans were rubber-stamping (measured: zero post-hoc reversals of auto-approved gates). |
+| P7 | Convergence honesty (FR-6): engine predicate + the four prompt changes + `max_rounds` 3 + regression fixtures from issue #49's real escapes | Forcing accepted partials to carry converges within the round budget instead of oscillating (measured on the fixtures and the next real run); the silent-closure class is reproducibly shut. |
 
-No forward dependencies: P6 consumes P1–P3's signals, hence last; P1–P5 are independent of each other. Riskiest first: P1 tests the premise the rest of the review-widening spends money on.
+No forward dependencies: P6 consumes P1–P3's signals; P7 is independent of every other phase (it changes cycle semantics, not detection breadth) and is sequenced last only because its risk is lowest — fixture-testable prompt/predicate changes; it can be pulled earlier or even executed first without violating ordering. P1–P5 are independent of each other. Riskiest first: P1 tests the premise the rest of the review-widening spends money on.
+
+FR-6's evidence-tiered-gates interaction is deliberate: FR-4's clean predicate requires "zero blocking/major *legitimate* findings," and FR-6.1 makes an unfinished accepted fix exactly such a finding — so convergence honesty tightens auto-approval rather than fighting it.
 
 ## §9 Success Metrics
 
@@ -182,6 +205,7 @@ No forward dependencies: P6 consumes P1–P3's signals, hence last; P1–P5 are 
 - **Behavioral signal:** ≥ 1 triage-legitimate behavioral finding per run on average across the first three verifier-enabled runs, at verifier cost ≤ 10% of run cost — otherwise the verifier reverts to opt-in.
 - **Gate economics:** with `auto_when_clean` enabled on a multi-phase run, human gate interactions drop ≥ 40% with **zero** auto-approved gates later reversed (rollback or post-merge fix traced to that phase); one reversal disables the policy pending retro.
 - **Learning:** re-litigated findings (fingerprint-matching a recorded decline, again triaged) drop ≥ 50% run-over-run; plan-author phase-size variance vs measured costs narrows (qualitative check at plan gates).
+- **Convergence honesty:** **zero** silent closures — every `fix_now` finding confirmed `partially_resolved` either carries a remainder into a later round, resolves, or parks at max-rounds escalation (manifest-verifiable: no converged cycle whose final round holds an accepted partial with no `carried_from` successor); issue #49's two escape fixtures (the FR-5.1 enumerated-obligation case, the F-006 intra-document contradiction) are caught 100% deterministically; average rounds-per-cycle rises by < 1 (the honesty tax stays affordable).
 
 ## §10 Risks & Mitigations
 
@@ -193,6 +217,8 @@ No forward dependencies: P6 consumes P1–P3's signals, hence last; P1–P5 are 
 | Auto-approval predicate too loose (rubber-stamps a bad phase) | Strict conjunction, evidence snapshot, PR-level collective ratification, one-reversal-disables rule (§9) |
 | Registry suppresses a legitimate finding that resembles a declined one | Advisory-only injection; triager retains authority; precedent includes reasoning so mismatches are visible |
 | Lens files drift into prompt bloat | Ratification-gated changes only; lenses are per-member fragments, not additions to every prompt |
+| Forcing partials to carry makes cycles oscillate or never converge | The rule touches only accepted-and-attempted findings (declines and non-`fix_now` verdicts are untouched); the remainder must be *specific*, not a re-review; `max_rounds` (now 3) still escalates to a human as the fail-closed terminus; §9's rounds-per-cycle metric watches the tax |
+| The blocking-vs-major remainder rule (FR-6.1) is gamed or misjudged by the confirm agent | The severity rule is stated in the prompt with the two blocking categories named concretely (leakage boundaries, parity oracles); a mis-set severity still carries — it only changes whether the round is forced now or surfaces at the gate |
 
 ## §11 Open Questions
 
