@@ -7,6 +7,7 @@ P3 adds the run lifecycle (`new`, `run`, `status`, `approve`, `reject`,
 
 from __future__ import annotations
 
+import functools
 import sys
 from pathlib import Path
 
@@ -19,7 +20,71 @@ app = typer.Typer(
     name="gauntlet",
     no_args_is_help=True,
     help="Adversarial multi-agent development harness.",
+    # A genuinely unexpected traceback stays loud (it is a bug), but it must
+    # not dump local variables — locals can carry tokens/paths the redaction
+    # layer never sees (issue #21 hygiene).
+    pretty_exceptions_show_locals=False,
 )
+
+
+def _known_user_errors() -> tuple[type[BaseException], ...]:
+    """The operational-failure types the CLI reports as one line (issue #21).
+
+    These are conditions a user can act on — a missing/malformed config, a
+    guard that refused a verb, an unresolvable run — not bugs. Anything outside
+    this tuple keeps its traceback: fail closed means a real defect stays
+    loud, never laundered into a polite message. Imported lazily so the happy
+    path keeps the CLI's deferred-import startup profile.
+    """
+    from gauntlet.engine.config import ConfigLoadError, ConfigNotFoundError
+    from gauntlet.engine.operator import RunResolutionError, StatusContractError
+    from gauntlet.engine.planphases import PlanPhasesError
+    from gauntlet.engine.review import ReviewFailClosed
+    from gauntlet.engine.run import (
+        AbortGuardError,
+        EntryContractError,
+        RecoverError,
+        RollbackGuardError,
+        UnsafeRunSegment,
+    )
+
+    return (
+        ConfigNotFoundError,
+        ConfigLoadError,
+        EntryContractError,
+        RollbackGuardError,
+        AbortGuardError,
+        RecoverError,
+        UnsafeRunSegment,
+        RunResolutionError,
+        StatusContractError,
+        PlanPhasesError,
+        ReviewFailClosed,
+    )
+
+
+def _friendly_errors(fn):
+    """CLI error boundary (issue #21): known operational failures print
+    ``error: <message>`` and exit 1 instead of a traceback.
+
+    Commands that already map specific errors to specific exit codes keep
+    doing so — their inner handlers run first; this boundary only catches what
+    escapes them. Everything not in :func:`_known_user_errors` re-raises
+    untouched (including ``typer.Exit``), so unexpected exceptions remain
+    visibly a bug.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if isinstance(exc, _known_user_errors()):
+                typer.echo(f"error: {exc}", err=True)
+                raise typer.Exit(1) from exc
+            raise
+
+    return wrapper
 
 # Bare `--interactive` selects this monitor agent (FR-7.1). Mirrors
 # interactive.DEFAULT_MONITOR_AGENT; a drift guard test pins them equal so the
@@ -71,12 +136,14 @@ def main() -> None:
 
 
 @app.command()
+@_friendly_errors
 def version() -> None:
     """Print the installed gauntlet version."""
     typer.echo(f"gauntlet {__version__}")
 
 
 @app.command()
+@_friendly_errors
 def init(
     from_repo: bool = typer.Option(
         False, "--from-repo",
@@ -100,6 +167,7 @@ def init(
 
 
 @app.command()
+@_friendly_errors
 def doctor() -> None:
     """Validate the environment: CLIs, auth, hooks, judge, keys (FR-1.3, FR-1.5)."""
     from gauntlet.engine.doctor import FAIL, OK, WARN, has_failure, run_doctor
@@ -180,6 +248,7 @@ def _default_policy_path() -> Path:
 
 
 @app.command()
+@_friendly_errors
 def new(slug: str) -> None:
     """Scaffold the run dir (run_root/<slug>/, default .gauntlet/runs/) with a human-authored PRD stub (FR-8.1, FR-10.1)."""
     manager = _manager()
@@ -199,6 +268,7 @@ def new(slug: str) -> None:
 
 
 @app.command(cls=_InteractiveCommand)
+@_friendly_errors
 def run(
     slug: str,
     pipeline: str = typer.Option("standard", help="Pipeline name under pipelines/."),
@@ -283,6 +353,7 @@ def run(
 
 
 @app.command()
+@_friendly_errors
 def review(
     branch: str = typer.Argument(
         None, help="Local branch to review (default: the current branch)."
@@ -550,6 +621,7 @@ def _ensure_watch_console(mgr, *, host: str, port: int, no_browser: bool = False
 
 
 @app.command(cls=_InteractiveCommand)
+@_friendly_errors
 def status(
     slug: str,
     json_output: bool = typer.Option(
@@ -847,6 +919,7 @@ def _status_interactive(mgr, slug: str, *, agent: str) -> None:
 
 
 @app.command()
+@_friendly_errors
 def logs(
     slug: str,
     step: str = typer.Option(
@@ -923,6 +996,7 @@ def logs(
 
 
 @app.command()
+@_friendly_errors
 def approve(
     slug: str,
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
@@ -934,6 +1008,7 @@ def approve(
 
 
 @app.command()
+@_friendly_errors
 def reject(
     slug: str,
     notes: str = typer.Option(..., help="Why the gate was rejected."),
@@ -1011,6 +1086,7 @@ def _resume_review_cli(mgr, state_dir: Path, *, response: str | None, no_judge: 
 
 
 @app.command()
+@_friendly_errors
 def resume(
     slug: str,
     response: str = typer.Option(
@@ -1053,12 +1129,14 @@ def resume(
 
 
 @app.command()
+@_friendly_errors
 def abort(slug: str) -> None:
     """Abort a run (FR-8.1)."""
     typer.echo(f"run status: {_manager().abort(slug)}")
 
 
 @app.command()
+@_friendly_errors
 def recover(
     slug: str,
     reason: str = typer.Option(
@@ -1089,6 +1167,7 @@ def recover(
 
 
 @app.command()
+@_friendly_errors
 def clean(
     slug: str,
     force: bool = typer.Option(
@@ -1105,6 +1184,7 @@ def clean(
 
 
 @app.command()
+@_friendly_errors
 def finish(slug: str) -> None:
     """Merge a completed run into its base, then delete the branch + pointer.
 
@@ -1115,6 +1195,7 @@ def finish(slug: str) -> None:
 
 
 @app.command()
+@_friendly_errors
 def report(
     slug: str,
     trend: bool = typer.Option(
@@ -1149,6 +1230,7 @@ def report(
 
 
 @app.command()
+@_friendly_errors
 def feedback(slug: str) -> None:
     """Capture human feedback for a run into retro/feedback.md (FR-6.1)."""
     from gauntlet.engine.feedback import FeedbackData, TriageCorrection, VERDICTS
@@ -1198,6 +1280,7 @@ app.add_typer(proposals_app, name="proposals")
 
 
 @proposals_app.command("review")
+@_friendly_errors
 def proposals_review(
     slug: str = typer.Option(None, "--slug", help="Limit to one run slug (default: all)."),
 ) -> None:
@@ -1231,6 +1314,7 @@ def proposals_review(
 
 
 @app.command()
+@_friendly_errors
 def rollback(
     slug: str,
     phase: int = typer.Option(..., "--phase", help="Roll the branch back to phase N."),
@@ -1247,6 +1331,7 @@ app.add_typer(ledger_app, name="ledger")
 
 
 @ledger_app.command("backfill")
+@_friendly_errors
 def ledger_backfill() -> None:
     """Reconstruct the usage ledger from this repo's existing run manifests (FR-10.1).
 
@@ -1265,6 +1350,7 @@ def ledger_backfill() -> None:
 
 
 @app.command()
+@_friendly_errors
 def serve(
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8765, help="Bind port."),
@@ -1343,6 +1429,7 @@ def _serve_resume(*, host: str, port: int, no_browser: bool) -> None:
 
 
 @judge_app.command("serve")
+@_friendly_errors
 def judge_serve(
     policy: Path = typer.Option(
         None, help="Fast-path policy file (default: <asset_root>/policy.yaml from "
