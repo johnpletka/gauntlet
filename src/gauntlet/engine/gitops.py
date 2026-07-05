@@ -239,6 +239,13 @@ class Identity:
     email: str
 
 
+# Author/committer for engine-owned bookkeeping commits (FR-2.2): response
+# checkpoints, recovery rewinds, and the cycle's fix-rerun rewind. Defined here
+# (not in the orchestrator) so the cycle can label its bookkeeping commits with
+# the same identity without importing the orchestrator.
+ENGINE_IDENTITY = Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
+
+
 def commit_all(
     repo: Path,
     message: str,
@@ -405,6 +412,19 @@ def commit_message(repo: Path, sha: str) -> str:
 def range_diff(repo: Path, base: str, head: str) -> str:
     """Diff for the confirm pass / review handoff (`base..head`)."""
     return _run(repo, "diff", f"{base}..{head}")
+
+
+def any_tracked_at(repo: Path, sha: str, paths: list[str]) -> bool:
+    """True iff any of ``paths`` exists in ``sha``'s tree.
+
+    The guard for the bookkeeping-preserving rewind: a plain ``reset --hard``
+    deletes a file from disk only when it is *tracked* at HEAD but absent from
+    the target tree — untracked-on-both-sides files are never touched, so the
+    plain reset stays the right (and cheaper) verb for them.
+    """
+    if not paths:
+        return False
+    return bool(_run(repo, "ls-tree", "--name-only", sha, "--", *paths).strip())
 
 
 def range_diff_path(repo: Path, base: str, head: str, relpath: str) -> str:

@@ -237,3 +237,26 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     except ValueError:
         pass
     return excludes
+
+
+def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
+    """Repo-relative paths of the two on-disk run-bookkeeping files.
+
+    The manifest is authoritative; RUN.md is its derived index. Returns only
+    the files that currently exist, repo-root-relative and POSIX-formatted —
+    the exact set every engine bookkeeping commit (and the bookkeeping-
+    preserving rewinds) force-stages. Shared by the orchestrator's checkpoint
+    commits and the cycle's fix-rerun rewind so the two can never disagree on
+    what counts as bookkeeping.
+    """
+    root = repo_root.resolve()
+    paths: list[str] = []
+    for name in ("manifest.json", "RUN.md"):
+        p = run_dir / name
+        if not p.exists():
+            continue
+        try:
+            paths.append(p.resolve().relative_to(root).as_posix())
+        except ValueError:
+            pass
+    return paths

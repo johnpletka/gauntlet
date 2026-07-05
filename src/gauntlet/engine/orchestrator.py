@@ -36,6 +36,7 @@ from gauntlet.engine.execution import (
     StepResult,
     get_spec,
     run_bookkeeping_excludes,
+    run_bookkeeping_paths,
 )
 from gauntlet.engine.expr import eval_when, resolve_list
 from gauntlet.engine.manifest import Manifest, StepRecord
@@ -58,8 +59,10 @@ def _utcnow() -> str:
 # A response's *operator* identity (FR-9) is recorded IN the manifest entry's
 # ``user`` field — it is deliberately NOT the commit author, which is the fixed
 # engine identity so bookkeeping commits are attributable to the engine, never
-# mislabelled as a human's work.
-ENGINE_IDENTITY = gitops.Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
+# mislabelled as a human's work. Canonically defined in gitops (the cycle's
+# fix-rerun rewind labels its bookkeeping commit with the same identity);
+# re-exported here for existing importers.
+ENGINE_IDENTITY = gitops.ENGINE_IDENTITY
 
 # A numeric phase prefix (P1, P2…). Only these carry intra-phase `P<N> wip:`
 # checkpoints, so checkpoint discovery/recovery scopes to a matching prefix and
@@ -1366,22 +1369,11 @@ class Orchestrator:
     def _bookkeeping_paths(self) -> list[str]:
         """Repo-relative paths of the two on-disk run-bookkeeping files.
 
-        The manifest is authoritative; RUN.md is its derived index. Returns only
-        the files that currently exist, repo-root-relative and POSIX-formatted —
-        the exact set every engine bookkeeping commit (and the F-001 rewind)
-        force-stages.
+        Delegates to the shared :func:`run_bookkeeping_paths` — the single
+        definition of what every engine bookkeeping commit (and the F-001 /
+        fix-rerun rewinds) force-stages.
         """
-        root = self.repo_root.resolve()
-        paths: list[str] = []
-        for name in ("manifest.json", "RUN.md"):
-            p = self.run_dir / name
-            if not p.exists():
-                continue
-            try:
-                paths.append(p.resolve().relative_to(root).as_posix())
-            except ValueError:
-                pass
-        return paths
+        return run_bookkeeping_paths(self.repo_root, self.run_dir)
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)
