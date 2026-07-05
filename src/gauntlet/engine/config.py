@@ -63,6 +63,18 @@ class ConfigNotFoundError(FileNotFoundError):
     """
 
 
+def _format_validation_errors(errors: list[dict[str, Any]]) -> str:
+    """Compact field-named rendering of pydantic errors for one-line CLI output
+    (issue #21). An empty ``loc`` — a model-level/root error — renders as
+    ``<config>`` rather than a bare leading colon (PR-54 review)."""
+    lines = "; ".join(
+        f"{'.'.join(str(p) for p in err['loc']) or '<config>'}: {err['msg']}"
+        for err in errors[:5]
+    )
+    more = "" if len(errors) <= 5 else f" (+{len(errors) - 5} more)"
+    return f"{lines}{more}"
+
+
 class ConfigLoadError(ValueError):
     """The run config exists but cannot be parsed/validated — operational.
 
@@ -698,7 +710,15 @@ class RunConfig(BaseModel):
                 f"run config not found at {path}; `gauntlet init` scaffolds it (P6)"
             )
         try:
-            data = yaml.safe_load(path.read_text()) or {}
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            # PR-54 review: unreadable bytes (a mis-encoded file) or a
+            # permission failure are operational config failures too — they
+            # must reach the CLI boundary as one line, not escape as
+            # UnicodeDecodeError/OSError.
+            raise ConfigLoadError(f"{path} is not readable: {exc}") from exc
+        try:
+            data = yaml.safe_load(text) or {}
         except yaml.YAMLError as exc:
             raise ConfigLoadError(f"{path} is not valid YAML: {exc}") from exc
         if not isinstance(data, dict):
@@ -710,9 +730,7 @@ class RunConfig(BaseModel):
         except ValidationError as exc:
             # Operational, not a bug: name the offending fields so the operator
             # can fix the file, without a pydantic wall (issue #21).
-            lines = "; ".join(
-                f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
-                for err in exc.errors()[:5]
-            )
-            more = "" if len(exc.errors()) <= 5 else f" (+{len(exc.errors()) - 5} more)"
-            raise ConfigLoadError(f"invalid run config at {path}: {lines}{more}") from exc
+            raise ConfigLoadError(
+                f"invalid run config at {path}: "
+                f"{_format_validation_errors(exc.errors())}"
+            ) from exc

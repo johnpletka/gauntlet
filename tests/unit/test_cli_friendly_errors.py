@@ -99,6 +99,42 @@ def test_invalid_yaml_config_is_config_load_error(tmp_path):
     assert "not valid YAML" in str(exc.value)
 
 
+def test_non_utf8_config_is_one_line(tmp_path, monkeypatch):
+    # PR-54 review comment 1: a mis-encoded config raised UnicodeDecodeError
+    # from read_text(), escaping the boundary back to a traceback.
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".gauntlet" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_bytes(b"agents:\n  # caf\xe9 \xff\xfe\n")
+    result = runner.invoke(app, ["status", "anything"])
+    assert result.exit_code == 1
+    assert "error:" in result.output and "not readable" in result.output
+    assert "Traceback" not in result.output
+    assert "UnicodeDecodeError" not in result.output
+
+
+def test_root_level_validation_error_renders_placeholder():
+    # PR-54 review comment 2: an empty pydantic `loc` (model-level error)
+    # rendered as a bare leading colon (": <msg>"); it names <config> now.
+    from gauntlet.engine.config import _format_validation_errors
+
+    out = _format_validation_errors(
+        [
+            {"loc": (), "msg": "Value error, root-level failure"},
+            {"loc": ("agents", "builder"), "msg": "field-level failure"},
+        ]
+    )
+    assert out.startswith("<config>: Value error, root-level failure")
+    assert "agents.builder: field-level failure" in out
+
+
+def test_validation_error_overflow_is_counted():
+    from gauntlet.engine.config import _format_validation_errors
+
+    errors = [{"loc": (f"f{i}",), "msg": "bad"} for i in range(7)]
+    assert _format_validation_errors(errors).endswith("(+2 more)")
+
+
 # --- the boundary itself ------------------------------------------------------
 
 
