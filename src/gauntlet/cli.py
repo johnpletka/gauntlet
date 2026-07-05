@@ -237,12 +237,17 @@ def _resolve_run_instance_dir(mgr, slug: str) -> Path:
 def _default_policy_path() -> Path:
     """`<asset_root>/policy.yaml` from the repo config (review F-005): a fresh
     adopter keeps the policy under `.gauntlet/`, so the bare `policy.yaml` default
-    would not load. Falls back to the bare name when no config is present."""
-    from gauntlet.engine.config import RunConfig
+    would not load. Falls back to the bare name when no config is present.
+
+    Only the no-config case falls back (F-001): a *malformed* config raises
+    ``ConfigLoadError``, which propagates to the ``_friendly_errors`` boundary so
+    ``gauntlet judge serve`` surfaces it as a one-line ``error: invalid run
+    config …`` instead of silently ignoring it and serving a bad policy path."""
+    from gauntlet.engine.config import ConfigNotFoundError, RunConfig
 
     try:
         asset_root = RunConfig.load(Path.cwd() / ".gauntlet/config.yaml").asset_root
-    except Exception:
+    except (ConfigNotFoundError, FileNotFoundError):
         asset_root = "."
     return Path.cwd() / asset_root / "policy.yaml"
 

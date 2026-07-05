@@ -50,6 +50,21 @@ def test_malformed_config_is_one_line(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_judge_serve_malformed_config_is_one_line(tmp_path, monkeypatch):
+    # F-001: `judge serve` resolves the default policy via _default_policy_path,
+    # which must let a malformed .gauntlet/config.yaml propagate to the friendly
+    # boundary instead of silently falling back to asset_root="." and serving a
+    # bad policy path. The load error is raised before serve() is reached.
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / ".gauntlet" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("agents:\n  builder:\n    adapter: 42\n")
+    result = runner.invoke(app, ["judge", "serve"])
+    assert result.exit_code == 1
+    assert "error: invalid run config at" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_non_mapping_config_is_one_line(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = tmp_path / ".gauntlet" / "config.yaml"
