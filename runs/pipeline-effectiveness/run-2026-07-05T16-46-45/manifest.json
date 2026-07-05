@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-cycle",
+  "current_step": "plan-approve",
   "warnings": [],
   "steps": [
     {
@@ -322,11 +322,11 @@
     {
       "id": "plan-lint",
       "type": "phase_lint",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-05T19:11:54.621728+00:00",
-      "ended": null,
+      "ended": "2026-07-05T21:28:32.072748+00:00",
       "attempts": 0,
       "base_sha": null,
       "parked_reason": null,
@@ -354,14 +354,14 @@
     {
       "id": "plan-approve",
       "type": "human_gate",
-      "status": "pending",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-05T19:11:54.636035+00:00",
-      "ended": null,
+      "ended": "2026-07-05T21:40:50.727608+00:00",
       "attempts": 0,
       "base_sha": null,
-      "parked_reason": "gate",
+      "parked_reason": null,
       "halt_reason": null,
       "failure_kind": null,
       "retry_after_s": null,
@@ -377,7 +377,7 @@
         "cost_usd": null
       },
       "agent_usage": {},
-      "notes": "awaiting human decision; review: plan.md, findings.json, triage.json, confirm.json",
+      "notes": "approved",
       "iteration": null,
       "metrics": {},
       "checkpoints": [],
@@ -403,10 +403,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 449965,
-    "output_tokens": 173060,
+    "input_tokens": 459508,
+    "output_tokens": 174771,
     "cached_input_tokens": 11211431,
-    "cost_usd": 16.739094399999995
+    "cost_usd": 16.744902149999994
   },
   "agent_usage": {
     "reviewer": {
@@ -434,10 +434,10 @@
       "cost_usd": 16.595554
     },
     "judge_llm": {
-      "input_tokens": 70540,
-      "output_tokens": 11856,
+      "input_tokens": 80083,
+      "output_tokens": 13567,
       "cached_input_tokens": 0,
-      "cost_usd": 0.041346999999999995
+      "cost_usd": 0.04715474999999998
     }
   },
   "recoveries": [],
