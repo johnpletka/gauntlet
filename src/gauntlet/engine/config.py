@@ -16,7 +16,14 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from gauntlet.adapters import get_adapter_class
 from gauntlet.config import lint_flags
@@ -45,6 +52,35 @@ _CHECKPOINT_COMMIT_MODES = frozenset(
 )
 
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
+
+
+class ConfigNotFoundError(FileNotFoundError):
+    """No run config where one is required — operational, not a bug (issue #21).
+
+    Subclasses ``FileNotFoundError`` so every existing ``except
+    FileNotFoundError`` caller keeps working; the CLI error boundary catches
+    the subclass to print a one-line remedy instead of a traceback.
+    """
+
+
+def _format_validation_errors(errors: list[dict[str, Any]]) -> str:
+    """Compact field-named rendering of pydantic errors for one-line CLI output
+    (issue #21). An empty ``loc`` — a model-level/root error — renders as
+    ``<config>`` rather than a bare leading colon (PR-54 review)."""
+    lines = "; ".join(
+        f"{'.'.join(str(p) for p in err['loc']) or '<config>'}: {err['msg']}"
+        for err in errors[:5]
+    )
+    more = "" if len(errors) <= 5 else f" (+{len(errors) - 5} more)"
+    return f"{lines}{more}"
+
+
+class ConfigLoadError(ValueError):
+    """The run config exists but cannot be parsed/validated — operational.
+
+    Subclasses ``ValueError`` for the same compatibility reason as
+    :class:`ConfigNotFoundError`.
+    """
 
 # --- effort tiering (harness-efficiency FR-6.1) ------------------------------
 # The NORMATIVE canonical effort enum. A profile/step `effort:` is drawn from
@@ -670,10 +706,31 @@ class RunConfig(BaseModel):
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG_PATH) -> RunConfig:
         if not path.exists():
-            raise FileNotFoundError(
+            raise ConfigNotFoundError(
                 f"run config not found at {path}; `gauntlet init` scaffolds it (P6)"
             )
-        data = yaml.safe_load(path.read_text()) or {}
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            # PR-54 review: unreadable bytes (a mis-encoded file) or a
+            # permission failure are operational config failures too — they
+            # must reach the CLI boundary as one line, not escape as
+            # UnicodeDecodeError/OSError.
+            raise ConfigLoadError(f"{path} is not readable: {exc}") from exc
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            raise ConfigLoadError(f"{path} is not valid YAML: {exc}") from exc
         if not isinstance(data, dict):
-            raise ValueError(f"{path} must be a YAML mapping, got {type(data).__name__}")
-        return cls.model_validate(data)
+            raise ConfigLoadError(
+                f"{path} must be a YAML mapping, got {type(data).__name__}"
+            )
+        try:
+            return cls.model_validate(data)
+        except ValidationError as exc:
+            # Operational, not a bug: name the offending fields so the operator
+            # can fix the file, without a pydantic wall (issue #21).
+            raise ConfigLoadError(
+                f"invalid run config at {path}: "
+                f"{_format_validation_errors(exc.errors())}"
+            ) from exc
