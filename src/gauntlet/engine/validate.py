@@ -244,7 +244,22 @@ def _validate_step(
     # repo (FR-2.3); the REVIEWER is intended read-only (FR-9.6), so a
     # repo-write check on it would be exactly backwards.
     if step.type == "adversarial_cycle":
-        for role in ("reviewer", "triager", "fixer"):
+        from gauntlet.engine.cycle import _panel
+
+        # FR-1.1: the reviewer role is satisfied by a singular `reviewer:` OR a
+        # `reviewers:` panel (1–3 members, each a profile). The panel members are
+        # resolved/capability-checked as agent refs below.
+        panel = _panel(step)
+        if not panel or not all(m.profile for m in panel):
+            report.errors.append(
+                f"step {step.id!r} (adversarial_cycle) is missing required role "
+                "'reviewer' (a `reviewer:` or a `reviewers:` panel, FR-5.2/FR-1.1)"
+            )
+        if step.get("reviewers") is not None and not 1 <= len(panel) <= 3:
+            report.errors.append(
+                f"step {step.id!r} `reviewers:` panel must have 1–3 members (FR-1.1)"
+            )
+        for role in ("triager", "fixer"):
             if not step.get(role):
                 report.errors.append(
                     f"step {step.id!r} (adversarial_cycle) is missing required "
@@ -400,7 +415,12 @@ def _effort_target_agents(step: Step) -> list[str]:
     which is already covered)."""
     if step.type == "adversarial_cycle":
         roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
-        return [a for a in (step.get(r) for r in roles) if a]
+        agents = [a for a in (step.get(r) for r in roles) if a]
+        if step.get("reviewers"):  # ensemble panel members (FR-1.1)
+            from gauntlet.engine.cycle import _panel
+
+            agents.extend(m.profile for m in _panel(step) if m.profile)
+        return agents
     return [step.agent] if step.agent else []
 
 
@@ -417,6 +437,14 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     # (FR-6.2); each must resolve to a profile like any other agent reference.
     for ref in step.get("agents", []) or []:
         refs.append(ref)
+    # Ensemble review panel members (FR-1.1) must resolve to a profile too, so an
+    # undefined/misconfigured panel profile is caught at load, not at runtime.
+    if step.type == "adversarial_cycle" and step.get("reviewers"):
+        from gauntlet.engine.cycle import _panel
+
+        for m in _panel(step):
+            if m.profile:
+                refs.append(m.profile)
     return refs
 
 

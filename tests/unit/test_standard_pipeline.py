@@ -63,11 +63,26 @@ def test_cycles_bind_all_roles_and_escalation():
     pipeline, _, _ = _load()
     for cid in ("prd-cycle", "plan-cycle", "impl-cycle"):
         step = next(s for s in pipeline.all_steps() if s.id == cid)
-        assert step.get("reviewer") == "reviewer"
         assert step.get("triager") == "triage"
         assert step.get("fixer") == "builder"
         assert step.get("escalation_agent") == "escalation"
         assert step.get("max_rounds") == 2
+
+
+def test_cycles_use_the_v1_ensemble_panel():
+    # pipeline-effectiveness FR-1.1 / Q2: the shipped cycles run the ratified
+    # two-member panel — the codex reviewer (correctness lens) plus the Gemini
+    # api profile (spec-coverage lens) — instead of a single reviewer.
+    pipeline, _, _ = _load()
+    for cid in ("prd-cycle", "plan-cycle", "impl-cycle"):
+        step = next(s for s in pipeline.all_steps() if s.id == cid)
+        panel = step.get("reviewers")
+        assert panel == [
+            {"profile": "reviewer", "lens": "correctness"},
+            {"profile": "gemini", "lens": "spec-coverage"},
+        ], cid
+        # the singular reviewer role is subsumed by the panel
+        assert step.get("reviewer") is None
 
 
 def test_referenced_prompt_templates_exist():

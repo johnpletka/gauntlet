@@ -27,7 +27,9 @@ stages:
       # The human-authored prd.md is already committed (it is the run's seed);
       # the cycle reviews it as a document and applies accepted fixes.
       - {id: prd-cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
-         phase: PRD, reviewer: reviewer, triager: triage, fixer: builder,
+         phase: PRD, triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-document.md}
       - {id: prd-approve, type: human_gate,
@@ -55,7 +57,9 @@ stages:
       # artifact-mode cycle's baseline commit remains a fallback for producers
       # that do not set commit_output).
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
-         phase: PLAN, reviewer: reviewer, triager: triage, fixer: builder,
+         phase: PLAN, triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-document.md}
       # Deterministic structural gate (FR-5.1): the prose reviewer above never
@@ -97,7 +101,9 @@ stages:
       - {id: phase-commit, type: commit, message_agent: mechanic,
          prompt: prompts/commit-message.md}
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
-         reviewer: reviewer, triager: triage, fixer: builder,
+         triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-code.md}
 
