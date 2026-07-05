@@ -210,6 +210,32 @@ def test_estimate_step_is_median_of_same_type_same_profile(tmp_path: Path) -> No
     assert est == 200  # median(100, 200, 300)
 
 
+def test_estimate_step_scales_by_panel_count(tmp_path: Path) -> None:
+    # pipeline-effectiveness FR-1.1 / plan-cycle-resp-2a: an ensemble review runs
+    # `count` members on one profile, so its projected usage is count× a single
+    # member's — a two- and three-member panel must estimate 2× and 3× a single
+    # reviewer, asserted straight against the ledger admission estimate (P1-A8).
+    now = _now()
+    rows = [
+        _row(run_id="r1", step_id="a", profile="reviewer",
+             step_type="adversarial_cycle", ts=_iso(now), input_tokens=100),
+        _row(run_id="r2", step_id="b", profile="reviewer",
+             step_type="adversarial_cycle", ts=_iso(now), input_tokens=300),
+    ]
+    kw = dict(step_type="adversarial_cycle", profile="reviewer",
+              unit="tokens", fallback=None)
+    base = L.estimate_step(rows, **kw)
+    assert base == 200  # median(100, 300)
+    assert L.estimate_step(rows, count=2, **kw) == 400
+    assert L.estimate_step(rows, count=3, **kw) == 600
+    # scaling also applies to the fallback estimate (no history path)
+    assert L.estimate_step([], step_type="adversarial_cycle", profile="reviewer",
+                           unit="tokens", fallback=50.0, count=2) == 100.0
+    # an unknown estimate stays unknown — scaling never manufactures a guess
+    assert L.estimate_step([], step_type="adversarial_cycle", profile="reviewer",
+                           unit="tokens", fallback=None, count=3) is None
+
+
 def test_estimate_step_uses_fallback_when_no_history() -> None:
     est = L.estimate_step(
         [], step_type="agent_task", profile="builder", unit="tokens",

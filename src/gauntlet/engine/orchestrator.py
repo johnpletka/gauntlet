@@ -767,26 +767,37 @@ class Orchestrator:
     # correctly checks a distinct confirmer profile when one is configured.
     _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
 
-    def _admission_profiles(self, step: Step) -> list[str]:
-        """The agent profiles whose provider window this step must clear (FR-10.2).
+    def _admission_profiles(self, step: Step) -> dict[str, int]:
+        """The agent profiles whose provider window this step must clear, mapped to
+        the admission SCALE FACTOR for each (FR-10.2; pipeline-effectiveness FR-1.1).
 
-        An ``agent_task`` bills one profile (``step.agent``); an
+        An ``agent_task`` bills one profile (``step.agent``) once; an
         ``adversarial_cycle`` bills one PER declared role — each can drive a
         constrained provider into a reactive usage-limit park, so each is
-        admission-checked before the cycle launches (F-002). De-duplicated (roles
-        may share a profile) with first-seen order preserved so the check is
-        deterministic.
+        admission-checked before the cycle launches (F-002). The reviewer role
+        expands to the review panel (``reviewers:``): a member profile used by N
+        lenses is counted N times, so window admission scales its estimate by panel
+        size rather than a single-reviewer one (plan-cycle-resp-2a). Other roles
+        contribute their profile once, de-duplicated with the panel (first-seen),
+        so a single-reviewer cycle is exactly today's one-per-profile check.
         """
+        from gauntlet.engine.cycle import _panel
+
+        counts: dict[str, int] = {}
         if step.type == "agent_task":
-            return [step.agent] if step.agent else []
+            if step.agent:
+                counts[step.agent] = 1
+            return counts
         if step.type == "adversarial_cycle":
-            profiles: list[str] = []
-            for role in self._CYCLE_ROLES:
+            for member in _panel(step):  # reviewer / panel members, N per profile
+                if member.profile:
+                    counts[member.profile] = counts.get(member.profile, 0) + 1
+            for role in ("triager", "fixer", "confirmer", "escalation_agent"):
                 profile = step.get(role)
-                if profile and profile not in profiles:
-                    profiles.append(profile)
-            return profiles
-        return []
+                if profile and profile not in counts:  # dedup vs the panel
+                    counts[profile] = 1
+            return counts
+        return {}
 
     def _window_admission(self, step: Step, rec: StepRecord) -> StepResult | None:
         """Pre-step provider-window admission (FR-10.2/10.3).
@@ -811,7 +822,7 @@ class Orchestrator:
         except Exception:
             return None  # advisory: never block a launch on a ledger error
         now = self._now_dt()
-        for profile in profiles:
+        for profile, count in profiles.items():
             provider = L.profile_provider(self.config, profile)
             if provider is None:
                 continue
@@ -821,7 +832,7 @@ class Orchestrator:
             try:
                 decision = L.admit_step(
                     rows, window, provider=provider, step_type=step.type,
-                    profile=profile, now=now,
+                    profile=profile, now=now, count=count,
                 )
             except Exception:
                 continue  # advisory: an estimate fault never blocks a launch
