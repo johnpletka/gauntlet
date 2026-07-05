@@ -108,7 +108,9 @@ def _set_judge_llm(repo: Path, model: str | None, *, adapter: str = "api") -> No
 
 
 _GOOD_VERSIONS = {"claude": "2.1.172", "codex": "codex-cli 0.139.0"}
-_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y"}
+# The scaffolded default config now includes the Gemini ensemble-panel member
+# (pipeline-effectiveness FR-1.1), so a healthy environment carries its key too.
+_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y", "GEMINI_API_KEY": "z"}
 
 
 def _by_name(results) -> dict:
@@ -306,7 +308,11 @@ def test_unused_profile_missing_key_warns(tmp_path):
     data = yaml.safe_load(p.read_text())
     data["agents"]["spare"] = {"adapter": "api", "model": "anthropic/claude-x"}
     p.write_text(yaml.safe_dump(data))
-    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x"}))
+    # GEMINI_API_KEY is present because the default panel references the gemini
+    # profile; the only missing key is the genuinely-unused "spare" profile's.
+    results = run_doctor(
+        repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x", "GEMINI_API_KEY": "z"})
+    )
     keys = _by_name(results)["api-keys"]
     assert keys.status == WARN
     assert "spare" in keys.detail
