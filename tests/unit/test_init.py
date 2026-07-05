@@ -350,8 +350,11 @@ def test_shipped_scaffold_matches_repo_canonical_assets():
         "findings.json", "triage.json", "confirm.json", "resume-disposition.json",
     ):
         checks[SCAFFOLD_DIR / "schemas" / schema] = REPO / "schemas" / schema
-    for prompt in (SCAFFOLD_DIR / "prompts").glob("*"):
-        checks[prompt] = REPO / "prompts" / prompt.name
+    # Recurse so nested prompt assets (e.g. prompts/lenses/*.md) are covered too,
+    # matched by path relative to the prompts root; directories are skipped.
+    for prompt in (SCAFFOLD_DIR / "prompts").rglob("*"):
+        if prompt.is_file():
+            checks[prompt] = REPO / "prompts" / prompt.relative_to(SCAFFOLD_DIR / "prompts")
     for bundled, canonical in checks.items():
         assert bundled.read_bytes() == canonical.read_bytes(), f"drift: {bundled.name}"
 

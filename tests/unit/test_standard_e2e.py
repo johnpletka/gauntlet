@@ -58,6 +58,7 @@ test_command: "true"
 agents:
   builder: {adapter: claude-code, permission_mode: acceptEdits}
   reviewer: {adapter: codex, sandbox: read-only}
+  gemini: {adapter: api, model: gemini/gemini-2.5-pro}
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
   mechanic: {adapter: api, model: gpt-5-mini}
@@ -147,6 +148,9 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
             review_empty(), review_empty(), review_empty(),
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
+        # Ensemble panel member 2 (FR-1.1): the three cycles each run it; it
+        # converges empty like the reviewer so each round finds nothing.
+        "gemini": Script(review_empty(), review_empty(), review_empty()),
         "builder": Script(
             text_result(PLAN_MD),                              # plan-author
             text_result("implemented P1", {"widget.py": "def widget(): return 'widget'\n"}),
@@ -240,6 +244,9 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
             *[review_empty() for _ in range(4)],
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
+        # Panel member 2 runs on the three panel cycles (prd/plan/impl); the added
+        # impl-cycle-2 is a single-reviewer step, so gemini is called 3× not 4×.
+        "gemini": Script(*[review_empty() for _ in range(3)]),
         "builder": Script(
             text_result(PLAN_MD),
             text_result("did P1", {"widget.py": "def widget(): return 'widget'\n"}),
