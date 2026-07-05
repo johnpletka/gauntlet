@@ -1955,3 +1955,112 @@ def test_concurrent_triage_escalates_blocking_finding(cycle_repo):
     by_id = {v["finding_id"]: v for v in written["verdicts"]}
     assert by_id["F-002"].get("escalated") is True
     assert by_id["F-001"].get("escalated") is None
+
+
+# --- fix-rerun reset vs engine bookkeeping checkpoints (reject re-drive) --------
+# A `gauntlet reject` re-drive stacks a pending-response checkpoint — the
+# force-committed manifest.json/RUN.md (FR-2.2/FR-7.1) — on HEAD above the round
+# handoff. The fix-rerun reset must rewind the implementation WITHOUT deleting
+# the tracked bookkeeping from disk or moving the branch off the checkpoint
+# (observed live: `status` ENOENT on the missing manifest mid-re-drive).
+
+def _git_out(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _reset_ctx(repo, run_dir, *, responses=()):
+    from gauntlet.engine.execution import StepContext, run_bookkeeping_excludes
+    from gauntlet.logging.redact import RedactingWriter
+
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    rec = M.StepRecord(id="cycle", type="adversarial_cycle")
+    rec.human_responses = list(responses)
+    man.upsert(rec)
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [cycle_step()]}],
+    })
+    return StepContext(
+        repo_root=repo, run_dir=run_dir, artifact_root=repo,
+        config=RunConfig.model_validate(BASE_CONFIG), pipeline=pipeline,
+        manifest=man, record=rec, writer=RedactingWriter(),
+        excludes=run_bookkeeping_excludes(repo, run_dir, repo),
+    )
+
+
+def _seed_run_dir_with_stale_fix(repo):
+    """Handoff at HEAD, then a stale fix commit, then live bookkeeping on disk."""
+    from gauntlet.engine.cycle import _reset_dirty_to_handoff  # noqa: F401 (import check)
+
+    handoff = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "prd.md").write_text("STALE-FIX-BODY\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-aqm", "PRD.1: stale fix"],
+                   check=True)
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".gitignore").write_text("*\n")  # run dirs self-ignore (real layout)
+    (run_dir / "manifest.json").write_text('{"run_id": "r"}\n')
+    (run_dir / "RUN.md").write_text("# run index\n")
+    return handoff, run_dir
+
+
+def test_fix_rerun_reset_preserves_tracked_bookkeeping(cycle_repo):
+    # The reject re-drive scenario: a pending-response checkpoint (tracked
+    # manifest.json/RUN.md) sits on HEAD above the handoff. The reset must keep
+    # the bookkeeping on disk AND reachable, while rewinding the implementation.
+    from gauntlet.engine.cycle import _reset_dirty_to_handoff
+    from gauntlet.engine.execution import run_bookkeeping_paths
+
+    repo = cycle_repo
+    handoff, run_dir = _seed_run_dir_with_stale_fix(repo)
+    paths = run_bookkeeping_paths(repo, run_dir)
+    assert gitops.commit_run_bookkeeping(
+        repo, "gauntlet: response cycle-resp-1 pending", paths,
+        identity=gitops.ENGINE_IDENTITY,
+    )
+    entry = M.HumanResponse(
+        response_id="cycle-resp-1", response_text="do it over", timestamp="t",
+        user="operator", response_attempt=1, state="pending",
+    )
+    ctx = _reset_ctx(repo, run_dir, responses=[entry])
+
+    note = _reset_dirty_to_handoff(ctx, handoff, 1, force=True)
+
+    assert note is not None
+    # THE regression: the live bookkeeping never leaves the disk.
+    assert (run_dir / "manifest.json").exists()
+    assert (run_dir / "RUN.md").exists()
+    head = _git_out(repo, "rev-parse", "HEAD")
+    # The implementation is rewound onto the handoff…
+    assert head != handoff
+    assert _git_out(repo, "rev-parse", "HEAD^") == handoff
+    assert _git_out(repo, "show", f"{head}:prd.md") == "ARTIFACT-BODY-SENTINEL"
+    # …in a commit that still carries the bookkeeping (reachable, not reflog-only),
+    # labelled with the canonical response-checkpoint subject so it stands in for
+    # the checkpoint it preserves.
+    assert gitops.any_tracked_at(repo, "HEAD", paths)
+    assert _git_out(repo, "log", "-1", "--format=%s") == (
+        "gauntlet: response cycle-resp-1 pending"
+    )
+
+
+def test_fix_rerun_reset_plain_when_bookkeeping_untracked(cycle_repo):
+    # No response checkpoint on HEAD (the everyday stale-fix rerun): behavior is
+    # unchanged — a plain reset back to the handoff, no minted engine commit,
+    # and the untracked on-disk bookkeeping is untouched.
+    from gauntlet.engine.cycle import _reset_dirty_to_handoff
+
+    repo = cycle_repo
+    handoff, run_dir = _seed_run_dir_with_stale_fix(repo)
+    ctx = _reset_ctx(repo, run_dir)
+
+    note = _reset_dirty_to_handoff(ctx, handoff, 1, force=True)
+
+    assert note is not None
+    assert _git_out(repo, "rev-parse", "HEAD") == handoff
+    assert (run_dir / "manifest.json").exists()
+    assert (run_dir / "RUN.md").exists()

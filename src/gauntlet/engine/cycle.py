@@ -51,6 +51,7 @@ from gauntlet.engine.execution import (
     StepContext,
     StepResult,
     StepSpec,
+    run_bookkeeping_paths,
 )
 from gauntlet.engine.pipeline import Step
 
@@ -371,6 +372,16 @@ def _reset_dirty_to_handoff(
     legitimate same-round reviewer-mutation commit (which advances HEAD past the
     handoff) is preserved for the fixer to build on. Returns an audit note when it
     reset, else ``None``.
+
+    When engine bookkeeping (a force-committed ``manifest.json``/``RUN.md``
+    response checkpoint, FR-2.2/FR-7.1 — e.g. a `reject` re-drive) is tracked at
+    HEAD but absent from the handoff's tree, a plain ``reset --hard`` would
+    delete the live bookkeeping from disk (``status`` then fails on the missing
+    manifest until the next flush) and move the branch off the pending-response
+    checkpoint, stranding the recorded response in reflog-only history. That
+    case rewinds implementation files only, via a reset whose target commit
+    still carries the on-disk bookkeeping — the same mechanism as the
+    orchestrator's F-001 dirty-base rewind.
     """
     if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not force:
         return None
@@ -384,7 +395,33 @@ def _reset_dirty_to_handoff(
         f"round {rnd} (P5 re-enter at fix)",
         exclude=ctx.excludes,
     )
-    gitops.reset_hard(ctx.repo_root, handoff)
+    paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
+    if (
+        paths
+        and gitops.head_sha(ctx.repo_root) != handoff
+        and gitops.any_tracked_at(ctx.repo_root, "HEAD", paths)
+    ):
+        # Flush first so the overlaid bookkeeping carries the latest state.
+        _persist_manifest(ctx)
+        paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
+        entry = (
+            ctx.record.human_responses[-1] if ctx.record.human_responses else None
+        )
+        # Label with the canonical response-checkpoint subject when one exists,
+        # so the rewind commit stands in for the checkpoint it preserves (the
+        # orchestrator's later reconcile is then a no-op, not a duplicate).
+        message = (
+            f"gauntlet: response {entry.response_id} {entry.state}"
+            if entry is not None
+            else f"gauntlet: rewind implementation to {handoff[:10]} "
+            f"for fix re-run ({ctx.record.id})"
+        )
+        gitops.rewind_impl_preserving_bookkeeping(
+            ctx.repo_root, handoff, paths, message,
+            identity=gitops.ENGINE_IDENTITY,
+        )
+    else:
+        gitops.reset_hard(ctx.repo_root, handoff)
     gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
     return (
         f"resume: reset round-{rnd} worktree to the handoff "
