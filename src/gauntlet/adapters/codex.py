@@ -237,7 +237,7 @@ class CodexAdapter:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 # Fail closed (F-002): with --json, codex logs go to stderr,
                 # so a non-JSON stdout line means the event contract broke.
@@ -250,6 +250,22 @@ class CodexAdapter:
                         else None,
                     ) from exc
                 events.append({"type": "gauntlet.unparsed_line", "line": line})
+                continue
+            if not isinstance(obj, dict):
+                # Valid JSON but not an event object (a bare string/number/null
+                # line): the event contract is just as broken as non-JSON, and
+                # downstream consumers (.get() everywhere) require dicts.
+                if strict:
+                    raise MalformedOutputError(
+                        f"non-object JSON line in codex --json output: "
+                        f"{line[:200]!r}",
+                        partial=self._partial_result(out)
+                        if out is not None
+                        else None,
+                    )
+                events.append({"type": "gauntlet.unparsed_line", "line": line})
+                continue
+            events.append(obj)
         return events
 
     @staticmethod

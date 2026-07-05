@@ -917,8 +917,10 @@ class Orchestrator:
         Derived from the orchestrator clock so tests are deterministic; ``None``
         when no structured retry hint was reported, or when the clock string is
         not ISO-parseable (fail-safe — an un-parseable reset is simply omitted).
+        ``retry_after_s=0`` is a real hint (RFC 7231: retry immediately), not an
+        absent one — it must yield "now", or auto-resume never fires.
         """
-        if not retry_after_s:
+        if retry_after_s is None:
             return None
         try:
             base = datetime.fromisoformat(self.clock())

@@ -310,6 +310,52 @@ def existing_keys(path: Path | None = None) -> set[str]:
     return {r.key for r in load_rows(path)}
 
 
+# Incrementally-maintained de-dup keys per ledger path, so a per-step append is
+# O(bytes written since the last look) instead of O(entire ledger) — the
+# machine-global file grows across every run forever, and re-parsing all of it
+# on each step append was the review's confirmed hot spot. Maps resolved path
+# -> (consumed byte offset, keys seen up to that offset). Only ever consulted
+# by `append_unique` (the orchestrator appends from a single thread); the
+# public `existing_keys` keeps its full-read contract.
+_KEY_CACHE: dict[Path, tuple[int, set[str]]] = {}
+
+
+def _cached_keys(path: Path) -> set[str]:
+    """De-dup keys for ``path``, refreshed by reading only the new tail bytes.
+
+    Handles external growth (another run appending) by scanning the delta, and
+    truncation/rotation (size shrank) by a full reload. A rewrite that keeps
+    the byte size identical is not detected — tolerable for an advisory ledger
+    whose rows are append-only by contract. Only complete lines are consumed;
+    a torn trailing line is left for the next refresh, mirroring
+    :func:`load_rows`'s tolerance.
+    """
+    resolved = path.resolve()
+    offset, keys = _KEY_CACHE.get(resolved, (0, set()))
+    if not path.exists():
+        _KEY_CACHE[resolved] = (0, set())
+        return _KEY_CACHE[resolved][1]
+    size = path.stat().st_size
+    if size < offset:
+        offset, keys = 0, set()
+    if size > offset:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+        consumed = data.rfind(b"\n") + 1
+        for line in data[:consumed].decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                keys.add(LedgerRow.model_validate_json(line).key)
+            except (ValueError, TypeError):
+                continue
+        offset += consumed
+    _KEY_CACHE[resolved] = (offset, keys)
+    return keys
+
+
 def append_unique(
     rows: list[LedgerRow], *, path: Path | None = None
 ) -> tuple[int, int]:
@@ -329,7 +375,12 @@ def append_unique(
     if not rows:
         return (0, 0)
     path = path or default_ledger_path()
-    seen = existing_keys(path)
+    # Incremental cache invariant: the cached set is EXACTLY the keys parsed
+    # from file[0:offset] — so we dedup against a local COPY here and never
+    # mutate the cache for our own writes; the bytes we append are picked up
+    # by the next call's delta scan. Keeping the cache derivable from file
+    # bytes is what makes truncation/rotation detection sound.
+    seen = set(_cached_keys(path))
     fresh: list[LedgerRow] = []
     for row in rows:
         if row.key in seen:

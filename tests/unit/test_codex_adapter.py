@@ -267,6 +267,30 @@ def test_unlisted_error_classified_terminal(monkeypatch):
     assert excinfo.value.failure_info.kind == "terminal"
 
 
+def test_non_object_json_line_fails_closed(monkeypatch):
+    # A valid-JSON-but-not-object stdout line ("oops", 42, null) breaks the
+    # event contract exactly like a non-JSON line: strict decode must refuse
+    # with MalformedOutputError — never surface as an AttributeError from a
+    # downstream `.get()` consumer.
+    events = ["not an event object"] + _failed_events({"message": "x"})
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(MalformedOutputError):
+        CodexAdapter().run("hi")
+
+
+def test_classifier_tolerates_non_dict_events():
+    # classify_codex_failure is a public entry point that can be handed a
+    # malformed list directly; non-dict elements are skipped so it fails
+    # closed to `terminal` instead of crashing (§7: classifier never raises
+    # on malformed input).
+    from gauntlet.adapters.failure_markers import classify_codex_failure
+
+    events = ["bare string", 42, None,
+              {"type": "turn.failed", "error": {"message": "disk full"}}]
+    info = classify_codex_failure(events, 1)
+    assert info.kind == "terminal"
+
+
 def test_session_not_found_on_resume(monkeypatch):
     from gauntlet.adapters.base import SessionNotFoundError
 

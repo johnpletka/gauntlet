@@ -229,7 +229,10 @@ def classify_claude_failure(
 
 def _codex_failure_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
     for event in events:
-        if event.get("type") in ("turn.failed", "error"):
+        # Fail closed, don't crash: a classifier handed a malformed event list
+        # (non-dict elements) must still classify — skipping the element leaves
+        # the unmatched default (`terminal`) rather than an AttributeError.
+        if isinstance(event, dict) and event.get("type") in ("turn.failed", "error"):
             return event
     return None
 

@@ -111,6 +111,37 @@ def test_append_unique_dedups_within_batch_and_across_calls(tmp_path: Path) -> N
     assert s1.input_tokens == 100
 
 
+def test_append_unique_sees_external_appends(tmp_path: Path) -> None:
+    # The incremental key cache scans only the new tail bytes, so rows another
+    # process appended between our calls must still dedup (delta scan), while a
+    # genuinely fresh row still lands.
+    path = tmp_path / "ledger.jsonl"
+    now = _now()
+    L.append_unique([_row(run_id="run-a", step_id="s1", ts=_iso(now))], path=path)
+    external = _row(run_id="run-b", step_id="s9", ts=_iso(now))
+    with open(path, "a", encoding="utf-8") as fh:  # simulate another process
+        fh.write(external.model_dump_json() + "\n")
+    added, skipped = L.append_unique(
+        [external, _row(run_id="run-a", step_id="s2", ts=_iso(now))], path=path
+    )
+    assert (added, skipped) == (1, 1)  # external row deduped; fresh row added
+    assert {r.key for r in L.load_rows(path)} == {
+        "run-a::s1::builder", "run-b::s9::builder", "run-a::s2::builder",
+    }
+
+
+def test_append_unique_reloads_after_truncation(tmp_path: Path) -> None:
+    # size < consumed-offset means the file was rotated/truncated: the cache
+    # must fully reload, so a re-appended key is NOT falsely deduped against
+    # pre-truncation state.
+    path = tmp_path / "ledger.jsonl"
+    row = _row(run_id="run-a", step_id="s1", ts=_iso(_now()))
+    L.append_unique([row], path=path)
+    path.write_text("")  # rotate/truncate
+    assert L.append_unique([row], path=path) == (1, 0)
+    assert {r.key for r in L.load_rows(path)} == {"run-a::s1::builder"}
+
+
 def test_load_rows_skips_torn_and_blank_lines(tmp_path: Path) -> None:
     path = tmp_path / "ledger.jsonl"
     good = _row(run_id="run-a", step_id="s1", ts=_iso(_now()), input_tokens=10)

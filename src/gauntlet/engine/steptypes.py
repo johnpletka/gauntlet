@@ -439,7 +439,11 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
         try:
             result = _invoke(prompt, ctx.record.session_id, log_suffix="-implement")
-        except SessionNotFoundError:
+        except SessionNotFoundError as exc:
+            # Same audit contract as the quota-resume fallback (FR-3.3): the
+            # session loss and the sessionless re-drive must be visible in the
+            # step evidence, not silent.
+            logger.log_text("session-expired-implement.txt", str(exc))
             result = _invoke(prompt, None, log_suffix="-implement")
         logger.log_result(result, suffix="-implement")
         spend.add(result.usage, agent=agent_name)

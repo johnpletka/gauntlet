@@ -112,6 +112,19 @@ def test_transient_failure_parks_preserving_worktree_and_session(fixture_repo):
     assert (fixture_repo / "scratch.txt").read_text() == "partial work\n"
 
 
+def test_zero_retry_after_is_a_real_hint_not_missing(fixture_repo):
+    # RFC 7231 allows `Retry-After: 0` ("retry now"); a falsy-but-present hint
+    # must still derive a reset time (= now) so auto-resume can fire — it is
+    # not the same as an absent hint.
+    man = _manifest()
+    adapter = ScriptedAdapter([("raise", _transient(retry_after_s=0))])
+    orch = _build(fixture_repo, PIPE, adapters={"builder": adapter}, manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.retry_after_s == 0
+    assert rec.quota_reset_at is not None  # reset = now, not omitted
+
+
 def test_plain_resume_continues_session_with_continuation_prompt(fixture_repo):
     man = _manifest()
     adapter = ScriptedAdapter([("raise", _transient()), ("ok", "finished")])
