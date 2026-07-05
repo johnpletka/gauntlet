@@ -170,7 +170,12 @@ verb.
   finding (the cycle's fail-closed escalation, preserved unchanged). A legitimate
   *non-blocking* finding does **not** park: it completes and is surfaced as
   residual risk in that summary. Read the summary — it is the run's whole result,
-  and there is no gate to approve.
+  and there is no gate to approve. A review run can also pause on a provider
+  **usage limit** (or a configured provider window's pre-step admission park):
+  that is a pause, not a finding — re-invoke the same target **without**
+  `--response` once the window replenishes, and the cycle resumes its preserved
+  sub-agent session at the first incomplete sub-step. Do not inject a
+  `--response` for a usage pause; there is no decision to record.
 - **Resume a parked review by re-running it with the decision.** `gauntlet review
   <same-target> --response "<decision>"` re-drives the parked cycle with your note
   injected as authoritative reviewer/triager guidance (the same FR-10.4 mechanism
@@ -178,11 +183,13 @@ verb.
   **without** `--response` also resumes an existing non-terminal run rather than
   starting a fresh one — it never clobbers a parked run. `--response` with no
   resumable run refuses ("nothing to resume") rather than silently starting one.
-- **The §6 guardrails hold unchanged.** A review run mints no branch and never
+- **The §6 guardrails hold.** A review run mints no branch and never
   pushes; accepted fixes land as `REVIEW.x` commits in place on the branch under
   review (or the PR's head branch) and the human pushes. The judge boundary is
   unchanged. Nothing here relaxes §6 — you still never approve on a human's
-  behalf, never `--no-judge`, and never hand-edit what a step owns.
+  behalf, never `--no-judge`, and never hand-edit what a step owns (§6's one
+  sanctioned hand-edit exception, `parked_artifact_invalid`, cannot arise in a
+  review run — its pipeline has no artifact-validation steps).
 
 ## 8. Handoff
 
