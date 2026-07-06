@@ -427,6 +427,22 @@ def any_tracked_at(repo: Path, sha: str, paths: list[str]) -> bool:
     return bool(_run(repo, "ls-tree", "--name-only", sha, "--", *paths).strip())
 
 
+def file_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
+    """The contents of ``relpath`` as of ``sha``, or ``None`` if absent there.
+
+    Reads a committed artifact out of history (``git show <sha>:<path>``) without
+    touching the worktree — used to recover a prior phase's committed
+    ``acceptance-map.json`` for deferral injection (FR-3.3), since the live file
+    on disk is the *current* phase's map (each phase overwrites it). A path that
+    does not exist at that commit is not an error: ``git show`` exits non-zero and
+    this returns ``None`` so the caller simply has no map to read there.
+    """
+    try:
+        return _run(repo, "show", f"{sha}:{relpath}")
+    except GitError:
+        return None
+
+
 def range_diff_path(repo: Path, base: str, head: str, relpath: str) -> str:
     """`base..head` diff scoped to a single path (harness-efficiency FR-1.2).
 

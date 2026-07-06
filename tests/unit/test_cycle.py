@@ -1932,6 +1932,16 @@ def test_triage_concurrency_rejects_non_positive():
         RunConfig.model_validate({"triage_concurrency": 0})
 
 
+def test_max_frs_per_phase_defaults_to_three():
+    assert RunConfig.model_validate({}).max_frs_per_phase == 3
+
+
+def test_max_frs_per_phase_rejects_non_positive():
+    # FR-3.4: a non-positive bound would flag every phase — fail closed at load.
+    with pytest.raises(ValueError, match="max_frs_per_phase must be >= 1"):
+        RunConfig.model_validate({"max_frs_per_phase": 0})
+
+
 def test_concurrent_triage_escalates_blocking_finding(cycle_repo):
     # Escalation composes with concurrency: the triage→escalate decision is
     # self-contained per finding (in _triage_one), so a blocking finding still

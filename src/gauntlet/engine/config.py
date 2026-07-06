@@ -570,6 +570,14 @@ class RunConfig(BaseModel):
     #     higher fidelity, but oscillates on majors/minors.
     cycle_convergence: str = "blocking"
 
+    # --- phase-size lint (FR-3.4) -------------------------------------------
+    # The distinct-FR-reference budget a single plan phase may carry before the
+    # `phase_lint` size lint fires (default 3). Oversized phases are where partial
+    # delivery hides (#54 cause 4). The lint's disposition (warn vs park) is the
+    # `phase_lint` step's own `size_lint:` option; this bound is a project-wide
+    # config value because plan authoring is also handed it (FR-5.3, P7).
+    max_frs_per_phase: int = 3
+
     # --- concurrent triage (harness-efficiency FR-9.1) ----------------------
     # Independent per-finding triage calls run on a bounded worker pool. Findings
     # are independent by design (point-by-point triage with untrusted-data
@@ -644,6 +652,18 @@ class RunConfig(BaseModel):
         """A pool of at least 1 worker; fail closed on a non-positive value (FR-9.1)."""
         if v < 1:
             raise ValueError(f"triage_concurrency must be >= 1; got {v!r}")
+        return v
+
+    @field_validator("max_frs_per_phase")
+    @classmethod
+    def _validate_max_frs_per_phase(cls, v: int) -> int:
+        """The size-lint bound must admit at least one FR per phase (FR-3.4).
+
+        A non-positive bound would flag every phase (a phase with zero FR refs is
+        already degenerate); reject it at load so a mis-set bound fails closed
+        rather than turning the advisory lint into a blanket park."""
+        if v < 1:
+            raise ValueError(f"max_frs_per_phase must be >= 1; got {v!r}")
         return v
 
     @model_validator(mode="after")

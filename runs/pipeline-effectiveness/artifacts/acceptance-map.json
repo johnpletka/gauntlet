@@ -1,59 +1,31 @@
 {
-  "phase": "P2",
+  "phase": "P3",
   "clauses": [
     {
-      "id": "P2-A1",
-      "text": "phase_lint fails closed on a plan phase carrying no acceptance list.",
+      "id": "P3-A1",
+      "text": "A deferral referencing a nonexistent phase parks.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_phase_lint_parks_on_clause_less_phase"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_acceptance_clause_errors_flags_missing_and_malformed"}
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_gate_parks_on_phantom_deferral_in_map"},
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_gate_parks_on_phantom_deferral_in_commit_body"},
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_phantom_deferrals_flags_only_unknown_targets"}
       ]
     },
     {
-      "id": "P2-A2",
-      "text": "acceptance_gate parks when a clause is unmapped, naming the unmapped clause in notes.",
+      "id": "P3-A2",
+      "text": "A valid open deferral appears verbatim in the target phase's rendered implement prompt.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_parks_on_unmapped_clause"}
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_open_deferral_appears_verbatim_in_implement_prompt"},
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_open_deferral_from_committed_map_injected"}
       ]
     },
     {
-      "id": "P2-A3",
-      "text": "acceptance_gate parks when a cited pytest node id is absent from the side-effect-free collector enumeration.",
+      "id": "P3-A3",
+      "text": "The phase-size lint fires at the boundary (>max_frs_per_phase distinct FR refs); park-mode parks.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_parks_on_nonexistent_node_id"}
-      ]
-    },
-    {
-      "id": "P2-A4",
-      "text": "A complete pytest mapping clears the gate (citation + existence proven; sufficiency not asserted).",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_passes_on_complete_mapping"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_pytest_collector_parses_real_node_ids"}
-      ]
-    },
-    {
-      "id": "P2-A5",
-      "text": "A phase whose acceptance evidence declares a collector kind other than the v1 pytest collector is rejected at pipeline load, not at runtime.",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_pipeline_load_rejects_unregistered_collector"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_parks_on_schema_invalid_kind"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_acceptance_map_schema_closed_kind_enum"}
-      ]
-    },
-    {
-      "id": "P2-A6",
-      "text": "Collector enumeration (which executes branch-authored conftest/test code at import) runs under the P2-P4 fail-closed interim posture - a bounded subprocess under the active judge hooks scoped to the run worktree - and parks the gate closed on a non-zero/timed-out/unparseable enumeration; migration of enumeration into the P5 sandbox backend is a P5 obligation.",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumeration_runs_under_bounded_judge_hooked_subprocess"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumeration_failure_parks_closed"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_run_bounded_enumeration_timeout_fails_closed"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_empty_enumeration_fails_closed"}
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_warns_above_bound"},
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_parks_above_bound_in_park_mode"},
+        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_passes_at_bound"}
       ]
     }
-  ],
-  "deferrals": [
-    {"text": "non-pytest collectors (shell, golden, integration)", "to_phase": "post-v1"},
-    {"text": "migration of acceptance_gate collector enumeration into the P5 verifier sandbox backend", "to_phase": "P5"},
-    {"text": "deferral reconciliation and phase-size lint", "to_phase": "P3"}
   ]
 }

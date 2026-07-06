@@ -56,10 +56,22 @@ from gauntlet.engine.collectors import (
     get_collector,
     is_registered,
 )
+from gauntlet.engine.deferrals import (
+    SIZE_LINT_MODES,
+    SIZE_LINT_PARK,
+    SIZE_LINT_WARN,
+    Deferral,
+    deferrals_from_map,
+    distinct_fr_refs,
+    open_deferrals_for,
+    parse_body_deferrals,
+    phantom_deferrals,
+)
 from gauntlet.engine.planphases import (
     PlanPhasesError,
     acceptance_clause_errors,
     extract_phases,
+    load_plan_phases,
     missing_phase_sections,
     phase_section,
 )
@@ -286,7 +298,53 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
                 + " (FR-3.1)"
             ),
         )
+    # FR-3.4: the phase-size lint. A phase carrying more than `max_frs_per_phase`
+    # (default 3) distinct FR references is oversized — the scope where partial
+    # delivery hides (#54 cause 4). Counted from each phase's PROSE section (where
+    # the "Deliverables (FR-…)" refs live), not the machine-readable block. The
+    # disposition is the step's `size_lint:` option — warn (default; surface, do
+    # not block) or park (fail closed at the plan gate).
+    size_mode = step.get("size_lint", SIZE_LINT_WARN)
+    if size_mode not in SIZE_LINT_MODES:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: unknown size_lint mode {size_mode!r}; must be one of "
+                f"{sorted(SIZE_LINT_MODES)} (FR-3.4)"
+            ),
+        )
+    bound = ctx.config.max_frs_per_phase
+    oversized: list[str] = []
+    for phase in phases:
+        section = phase_section(text, phase["id"]) or ""
+        refs = distinct_fr_refs(section)
+        if len(refs) > bound:
+            oversized.append(
+                f"{phase['id']} carries {len(refs)} distinct FR refs "
+                f"({', '.join(sorted(refs))})"
+            )
     ids = ", ".join(p["id"] for p in phases)
+    if oversized:
+        detail = (
+            f"{len(oversized)} phase(s) exceed max_frs_per_phase={bound}: "
+            + "; ".join(oversized)
+            + " — oversized phases hide partial delivery (FR-3.4)"
+        )
+        if size_mode == SIZE_LINT_PARK:
+            return StepResult(
+                status=HALTED, halt_reason=HALT_REASON_PRECONDITION,
+                notes=f"phase lint: {detail}",
+            )
+        # warn mode: not a blocker — surface the finding in the notes so it lands
+        # in RUN.md / status without stopping the plan gate.
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"phase lint: {len(phases)} phase(s) valid ({ids}); "
+                f"WARNING — {detail}"
+            ),
+        )
     return StepResult(
         status=DONE, notes=f"phase lint: {len(phases)} phase(s) valid ({ids})"
     )
@@ -416,6 +474,43 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             "closed, FR-3.2)"
         )
 
+    # 1d. FR-3.3 deferral reconciliation: a deferral (in this phase's acceptance
+    # map `deferrals[]` or in its commit body — the CLAUDE.md §7 "Deferred to
+    # P<N>" convention) that points to a phase the plan does not contain lands the
+    # deferred work nowhere. Reconciled HERE, at the phase that authored the
+    # deferral, against the plan's actual phase ids — a phantom target parks the
+    # phase closed (a deferral that points nowhere is silently-dropped work). Open
+    # deferrals themselves are injected into the target phase's implement prompt at
+    # render time (`_render_prompt`); this gate is the fail-closed existence check.
+    deferrals = deferrals_from_map(mapping, source=f"acceptance-map:{phase_id}")
+    for rec in ctx.manifest.commits:
+        if rec.phase == phase_id or rec.phase.startswith(f"{phase_id}."):
+            try:
+                body = gitops.commit_message(ctx.repo_root, rec.sha)
+            except gitops.GitError:
+                continue
+            deferrals.extend(
+                parse_body_deferrals(body, source=f"commit:{rec.sha[:10]}")
+            )
+    # Only touch the plan when there is something to reconcile: a phase with no
+    # deferral needs no phase-list load (and must not fail closed for lack of one).
+    if deferrals:
+        known_ids = _plan_phase_ids(ctx)
+        if known_ids is None:
+            return _acceptance_gate_halt(
+                f"acceptance gate: phase {phase_id} declares deferral(s) but the "
+                "plan's phase list cannot be loaded from plan.md to reconcile them "
+                "(fail closed, FR-3.3)"
+            )
+        phantom = phantom_deferrals(deferrals, known_ids)
+        if phantom:
+            named = "; ".join(f"{d.to_phase} ({d.source})" for d in phantom)
+            return _acceptance_gate_halt(
+                f"acceptance gate: phase {phase_id} defers work to nonexistent "
+                f"phase(s): {named} — a deferral must target a real plan phase "
+                "(fail closed, FR-3.3)"
+            )
+
     # 2. Mapping completeness: every phase clause must have >=1 evidence entry.
     mapped_ids = {c["id"] for c in mapping["clauses"] if c.get("evidence")}
     unmapped = [cid for cid in clause_ids if cid not in mapped_ids]
@@ -472,6 +567,99 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             f"{len(clause_ids)} clause(s) mapped, {len(cited)} cited id(s) exist "
             "(citation + existence proven; sufficiency is the review lens's job)"
         ),
+    )
+
+
+def _plan_phase_ids(ctx: StepContext) -> set[str] | None:
+    """The plan's actual phase ids (P1, P2…) for deferral reconciliation (FR-3.3).
+
+    Returns ``None`` when plan.md is absent or its ``gauntlet-phases`` block is
+    unparseable — the caller fails closed (a deferral cannot be reconciled without
+    the phase list). ``phase_lint`` already rejects a malformed plan at the plan
+    gate, so this is the last-ditch guard for a bypassed plan.
+    """
+    try:
+        phases = load_plan_phases(ctx.artifact_root / "plan.md")
+    except PlanPhasesError:
+        return None
+    if not phases:
+        return None
+    return {p["id"] for p in phases if isinstance(p, dict) and p.get("id")}
+
+
+def _acceptance_map_relpath(ctx: StepContext) -> str | None:
+    """Repo-relative POSIX path of the default acceptance map, for `git show`.
+
+    Deferral injection (FR-3.3) reads each prior phase's committed
+    ``acceptance-map.json`` out of history (the live on-disk file is the *current*
+    phase's map), which needs the path relative to the repo root. ``None`` when it
+    resolves outside the repo (defensive; the map lives under the artifact root).
+    """
+    path = (ctx.artifact_root / _ACCEPTANCE_MAP_DEFAULT).resolve()
+    try:
+        return path.relative_to(ctx.repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _collect_run_deferrals(ctx: StepContext, *, map_relpath: str | None) -> list[Deferral]:
+    """All deferrals recorded across this run's phase commits (FR-3.3).
+
+    Two durable sources per recorded commit: the commit BODY ("Deferred to P<N>:"
+    prose, CLAUDE.md §7) and the ``acceptance-map.json`` committed at that sha (its
+    structured ``deferrals[]``, read out of history because the live file on disk
+    is the current phase's map). Best-effort per commit — a git read failure or an
+    unparseable committed map skips that source rather than failing collection, so
+    a single bad commit never blocks the injection of the others.
+    """
+    out: list[Deferral] = []
+    seen: set[str] = set()
+    for rec in ctx.manifest.commits:
+        sha = rec.sha
+        if not sha or sha in seen:
+            continue
+        seen.add(sha)
+        try:
+            body = gitops.commit_message(ctx.repo_root, sha)
+        except gitops.GitError:
+            body = ""
+        out.extend(parse_body_deferrals(body, source=f"commit:{sha[:10]}"))
+        if map_relpath:
+            raw = gitops.file_at_commit(ctx.repo_root, sha, map_relpath)
+            if raw:
+                try:
+                    mapping = json.loads(raw)
+                except json.JSONDecodeError:
+                    mapping = None
+                if mapping is not None:
+                    out.extend(
+                        deferrals_from_map(mapping, source=f"acceptance-map@{sha[:10]}")
+                    )
+    return out
+
+
+def _render_open_deferrals(ctx: StepContext) -> str | None:
+    """The verbatim open-deferral block for the current phase's prompt (FR-3.3).
+
+    A prior phase that explicitly deferred work to THIS phase must not have the
+    obligation silently dropped: the builder receives each deferral's text
+    verbatim so it implements or explicitly re-defers it. Returns ``None`` when
+    there is no current phase or no open deferral targeting it (the ordinary
+    first-phase / no-deferral case, where no block is injected).
+    """
+    phase_id = _iteration_phase(ctx)
+    if not phase_id:
+        return None
+    all_deferrals = _collect_run_deferrals(ctx, map_relpath=_acceptance_map_relpath(ctx))
+    open_ = open_deferrals_for(phase_id, all_deferrals)
+    if not open_:
+        return None
+    lines = "\n".join(d.render() for d in open_)
+    return (
+        f"\n\n--- open deferrals targeting {phase_id} (FR-3.3) ---\n"
+        "A prior phase explicitly deferred the following work to THIS phase. "
+        "Implement each, or re-defer it explicitly (do not silently drop it):\n"
+        f"{lines}\n"
     )
 
 
@@ -1126,6 +1314,13 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
         )
     for ref in input_refs:
         parts.append(_render_input(ref, ctx, artifacts))
+    # FR-3.3: inject any open deferrals a prior phase pushed to THIS phase, so the
+    # builder cannot silently drop the obligation. Placed after the plan-phase
+    # excerpt (near the scoped context it relates to) and before the human-decision
+    # history. No-op for a phase with no incoming deferral (the ordinary case).
+    deferral_block = _render_open_deferrals(ctx)
+    if deferral_block is not None:
+        parts.append(deferral_block)
     # FR-1 verbatim requirement (review F-001): the builder must receive the
     # human-decision history EXACTLY as recorded. The on-disk copy is written
     # through the RedactingWriter (credential-shaped substrings become

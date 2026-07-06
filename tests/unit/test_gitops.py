@@ -50,6 +50,20 @@ def test_path_is_untracked_distinguishes_tracked_states(fixture_repo):
     assert not gitops.path_is_untracked(fixture_repo, "note.md")
 
 
+def test_file_at_commit_reads_history_and_none_when_absent(fixture_repo):
+    """file_at_commit reads a path's committed bytes (FR-3.3 deferral injection
+    reads a prior phase's committed acceptance-map out of history), and returns
+    None — not an error — for a path absent at that commit."""
+    (fixture_repo / "a.json").write_text('{"phase": "P2"}')
+    gitops._run(fixture_repo, "add", "a.json")
+    sha = gitops.commit_all(
+        fixture_repo, "P2: add a\n\nbody", identity=Identity("B", "b@g.local")
+    )
+    assert gitops.file_at_commit(fixture_repo, sha, "a.json") == '{"phase": "P2"}'
+    # a path that does not exist at that commit -> None (git show exits non-zero)
+    assert gitops.file_at_commit(fixture_repo, sha, "nope.json") is None
+
+
 def test_commit_all_uses_identity(fixture_repo):
     (fixture_repo / "f.py").write_text("code")
     sha = gitops.commit_all(
