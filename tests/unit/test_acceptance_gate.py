@@ -205,6 +205,47 @@ def test_gate_passes_on_complete_mapping(fixture_repo, monkeypatch):
     assert "citation + existence" in result.notes
 
 
+def test_gate_parks_on_wrong_phase_map(fixture_repo, monkeypatch):
+    """Review F-001: a map declaring a different phase (a stale/wrong-phase
+    acceptance-map.json) is rejected even when it reuses this phase's clause ids —
+    the map must declare it covers THIS phase (fail closed)."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
+    # a P1 map that happens to reuse the clause id P2-A1
+    d = ctx.artifact_root / "artifacts"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "acceptance-map.json").write_text(json.dumps({
+        "phase": "P1",
+        "clauses": [{"id": "P2-A1", "text": "c",
+                     "evidence": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]}],
+    }))
+    # enumeration must never run — the phase-scope check fails first
+    monkeypatch.setattr(collectors, "run_bounded_enumeration",
+                        lambda *a, **k: pytest.fail("enumeration must not run"))
+    result = handle_acceptance_gate(_gate_step(), ctx)
+    assert result.status == HALTED
+    assert result.halt_reason == HALT_REASON_PRECONDITION
+    assert "'P1'" in result.notes and "P2" in result.notes
+
+
+def test_gate_parks_on_extra_unplanned_clause(fixture_repo, monkeypatch):
+    """Review F-002: a map carrying a clause id that is not in the current plan
+    phase is rejected — the artifact must be an exact map of the phase's
+    acceptance list, not a superset carrying stale evidence."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
+    # every plan clause is mapped, but the map also carries an unplanned P2-A9
+    _write_map(ctx, {
+        "P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::a"}],
+        "P2-A9": [{"kind": "pytest", "id": "tests/unit/x.py::stale"}],
+    })
+    monkeypatch.setattr(collectors, "run_bounded_enumeration",
+                        lambda *a, **k: pytest.fail("enumeration must not run"))
+    result = handle_acceptance_gate(_gate_step(), ctx)
+    assert result.status == HALTED
+    assert result.halt_reason == HALT_REASON_PRECONDITION
+    assert "P2-A9" in result.notes and "not in the plan phase" in result.notes
+    assert "P2-A1" not in result.notes  # only the unplanned id is named
+
+
 def test_gate_parks_on_missing_map(fixture_repo):
     """Fail closed: an absent acceptance map is never 'all clauses mapped'."""
     ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))

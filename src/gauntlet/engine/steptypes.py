@@ -384,6 +384,38 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             f"{schema_err} (rejected at load, FR-3.2)"
         )
 
+    # 1b. Phase scoping: the acceptance map is a phase-scoped artifact (schema
+    # `phase`). A map whose `phase` is not this phase's id — a stale or
+    # wrong-phase acceptance-map.json — is rejected here (review F-001). Reusing
+    # clause ids such as `A1` across phases must NOT let a prior phase's map
+    # satisfy this gate; the map must declare it covers THIS phase (fail closed,
+    # FR-3.2).
+    map_phase = mapping.get("phase")
+    if map_phase != phase_id:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} covers phase "
+            f"{map_phase!r}, not the current phase {phase_id} — a stale or "
+            "wrong-phase map is not this phase's completion artifact (fail "
+            "closed, FR-3.2)"
+        )
+
+    # 1c. Exact map: the artifact must map exactly this phase's clauses — no
+    # extras. A clause id in the map but absent from the plan phase is a
+    # stale/unrelated entry that would let incorrect evidence ride in the audit
+    # artifact consumed by P3 deferral reconciliation; reject it (review F-002,
+    # FR-3.2).
+    clause_id_set = set(clause_ids)
+    extra_ids = sorted(
+        {c["id"] for c in mapping["clauses"] if c["id"] not in clause_id_set}
+    )
+    if extra_ids:
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} acceptance map {map_name} carries "
+            f"clause id(s) not in the plan phase: {', '.join(extra_ids)} — the map "
+            "must be an exact map of the current phase's acceptance list (fail "
+            "closed, FR-3.2)"
+        )
+
     # 2. Mapping completeness: every phase clause must have >=1 evidence entry.
     mapped_ids = {c["id"] for c in mapping["clauses"] if c.get("evidence")}
     unmapped = [cid for cid in clause_ids if cid not in mapped_ids]
