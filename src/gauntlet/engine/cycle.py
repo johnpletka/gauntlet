@@ -1270,8 +1270,15 @@ def _member_artifact_reuse(
 def _stamp_member_finding(finding: dict[str, Any], member: PanelMember) -> dict[str, Any]:
     """Namespace a member finding's id (so ids are unique across the panel) and
     stamp its ``source``/``lens`` (FR-1.2). These are engine annotations, never
-    agent-emitted."""
-    out = {**finding, "id": f"{member.profile}:{finding.get('id')}"}
+    agent-emitted.
+
+    The id is namespaced with the collision-free ``member.key`` (which carries
+    the panel ``index``), NOT the profile alone: a panel may run the same profile
+    under two different lenses (e.g. ``reviewer/correctness`` + ``reviewer/security``),
+    and two same-profile members that both emit ``F-001`` must stay two distinct
+    stable ids — triage and confirm reference findings by id, so a profile-only
+    namespace would collapse them into one ambiguous target (FR-1.2)."""
+    out = {**finding, "id": f"{member.key}:{finding.get('id')}"}
     out["source"] = member.profile
     if member.lens is not None:
         out["lens"] = member.lens
@@ -1279,7 +1286,7 @@ def _stamp_member_finding(finding: dict[str, Any], member: PanelMember) -> dict[
 
 
 def _stamp_member_oqs(oqs: list[dict[str, Any]], member: PanelMember) -> list[dict[str, Any]]:
-    return [{**oq, "id": f"{member.profile}:{oq.get('id')}"} for oq in oqs]
+    return [{**oq, "id": f"{member.key}:{oq.get('id')}"} for oq in oqs]
 
 
 def _run_member(
@@ -1373,7 +1380,15 @@ def _ensemble_review(
             summaries.append(
                 f"[{member.profile}/{member.lens or 'nolens'}] {data['summary']}"
             )
-    panel_order = {m.profile: m.index for m in panel}
+    # Panel order for the merge tie-break, keyed by profile (the finding's
+    # ``source``). A profile that appears under multiple lenses maps to its FIRST
+    # member's index (setdefault over index-ordered panel) so cross-profile
+    # ordering is first-appearance-stable; two same-profile members then share
+    # that slot and are ordered against each other by their id — which carries
+    # the panel index (``member.key``), keeping the tie-break member-faithful.
+    panel_order: dict[str, int] = {}
+    for m in panel:
+        panel_order.setdefault(m.profile, m.index)
     merged = ensemble.merge_findings(stamped, panel_order=panel_order, threshold=threshold)
     return merged.findings, open_questions, "\n\n".join(summaries)
 

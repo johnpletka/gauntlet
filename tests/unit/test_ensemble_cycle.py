@@ -103,7 +103,8 @@ def test_two_member_panel_persists_merges_and_yields_metrics(fixture_repo):
     reviewer = SeqAdapter(
         REVIEW(_fx("F-001", "major", "correctness", "src.py:1",
                    "the counter overflows the window budget")),
-        CONFIRM(CV("reviewer:F-001", "resolved"), CV("gemini:F-002", "resolved")),
+        CONFIRM(CV("0-reviewer-correctness:F-001", "resolved"),
+                CV("1-gemini-spec-coverage:F-002", "resolved")),
     )
     gemini = SeqAdapter(REVIEW(
         _fx("F-001", "major", "correctness", "src.py:1",
@@ -129,13 +130,15 @@ def test_two_member_panel_persists_merges_and_yields_metrics(fixture_repo):
     # only the two primaries were triaged (dup never reaches triage).
     merged = json.loads((run_dir / "artifacts" / "findings.json").read_text())
     ids = {f["id"]: f for f in merged["findings"]}
-    assert ids["reviewer:F-001"]["sources"] == ["reviewer", "gemini"]
-    assert "duplicate_of" not in ids["reviewer:F-001"]
-    assert ids["gemini:F-001"]["duplicate_of"] == "reviewer:F-001"
-    assert "duplicate_of" not in ids["gemini:F-002"]  # distinct primary
+    # ids are namespaced with the collision-free member key (index+profile+lens).
+    assert ids["0-reviewer-correctness:F-001"]["sources"] == ["reviewer", "gemini"]
+    assert "duplicate_of" not in ids["0-reviewer-correctness:F-001"]
+    assert ids["1-gemini-spec-coverage:F-001"]["duplicate_of"] == "0-reviewer-correctness:F-001"
+    assert "duplicate_of" not in ids["1-gemini-spec-coverage:F-002"]  # distinct primary
     triage_targets = {v["finding_id"] for v in
                       json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]}
-    assert triage_targets == {"reviewer:F-001", "gemini:F-002"}  # once per primary
+    assert triage_targets == {"0-reviewer-correctness:F-001",
+                              "1-gemini-spec-coverage:F-002"}  # once per primary
     assert len(adapters["triage"].calls) == 2
 
     # P1-A3: per-(profile, lens) yield readable straight from the manifest.
@@ -148,6 +151,60 @@ def test_two_member_panel_persists_merges_and_yields_metrics(fixture_repo):
         "profile": "gemini", "lens": "spec-coverage",
         "raised": 2, "unique_after_dedup": 1, "unique_legit": 1,
     }
+
+
+SAME_PROFILE_PANEL = {"reviewers": [
+    {"profile": "reviewer", "lens": "correctness"},
+    {"profile": "reviewer", "lens": "security"},
+]}
+
+
+def test_same_profile_multilens_panel_yields_two_distinct_triage_targets(fixture_repo):
+    # Two lenses on the SAME profile both emit `F-001` for DISTINCT defects. The
+    # profile-only namespace would collapse both persisted findings to
+    # `reviewer:F-001` (one ambiguous triage target); the collision-free member
+    # key keeps them two stable ids, so both reach triage separately (FR-1.2).
+    repo = _ens_repo(fixture_repo)
+    # Same profile => one shared adapter; member reviews run in panel order
+    # (correctness then security), then the confirm pass (confirmer = panel[0]).
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "correctness", "src.py:1",
+                   "the loop bound is off by one on the final iteration")),
+        REVIEW(_fx("F-001", "major", "security", "auth.py:5",
+                   "the session token is written to the log in plaintext")),
+        CONFIRM(CV("0-reviewer-correctness:F-001", "resolved"),
+                CV("1-reviewer-security:F-001", "resolved")),
+    )
+    adapters = {
+        "reviewer": reviewer, "gemini": SeqAdapter(),
+        "triage": SeqAdapter(V("x"), V("y")),  # ids overwritten to the primaries'
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+        "esc": SeqAdapter(),
+    }
+    orch, _man = _build_cycle_orch(
+        repo, adapters, step_extra=SAME_PROFILE_PANEL, config=ENS_CONFIG)
+    assert orch.drive() == M.RUN_DONE
+    run_dir = repo / "runs" / "demo" / "run-1"
+
+    # Two persisted member artifacts (one per member, keyed by member.key).
+    member_files = sorted(p.name for p in _members_dir(run_dir).glob("*.json"))
+    assert len(member_files) == 2
+
+    # Distinct claims => no merge => two primaries with distinct, member-keyed ids.
+    merged = json.loads((run_dir / "artifacts" / "findings.json").read_text())
+    ids = {f["id"] for f in merged["findings"]}
+    assert ids == {"0-reviewer-correctness:F-001", "1-reviewer-security:F-001"}
+    assert all("duplicate_of" not in f for f in merged["findings"])
+    # both share the profile but carry their own lens (metrics stay separable).
+    by_id = {f["id"]: f for f in merged["findings"]}
+    assert by_id["0-reviewer-correctness:F-001"]["lens"] == "correctness"
+    assert by_id["1-reviewer-security:F-001"]["lens"] == "security"
+
+    # Two unique triage targets — the collision would have produced one.
+    triage_targets = {v["finding_id"] for v in
+                      json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]}
+    assert triage_targets == {"0-reviewer-correctness:F-001", "1-reviewer-security:F-001"}
+    assert len(adapters["triage"].calls) == 2
 
 
 def test_lens_fragment_reaches_member_prompt(fixture_repo):
@@ -232,13 +289,13 @@ def test_resume_reuses_completed_member_and_reruns_only_incomplete(fixture_repo)
     # exhaust — so a passing run proves the completed member was NOT re-paid.
     reviewer = SeqAdapter(
         REVIEW(_fx("F-001", "major", "correctness", "src.py:1", "shared defect here")),
-        CONFIRM(CV("reviewer:F-001", "resolved")),
+        CONFIRM(CV("0-reviewer-correctness:F-001", "resolved")),
     )
     gemini = SeqAdapter(
         _transient_exc(session="gemini-sess"),                      # drive 1: park
         REVIEW(),                                                    # resume: no findings
     )
-    triage = SeqAdapter(V("reviewer:F-001"))
+    triage = SeqAdapter(V("0-reviewer-correctness:F-001"))
     builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
     adapters = {"reviewer": reviewer, "gemini": gemini,
                 "triage": triage, "builder": builder, "esc": SeqAdapter()}
