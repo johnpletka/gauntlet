@@ -613,8 +613,28 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # round's review is reused we re-enter PAST that handoff (the guard held
         # when it first ran), so skip it — and never fail a reused round on the
         # partial fixer edits we reset just before the fix sub-step.
-        if not reuse_review and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            return finish(_clean_handoff_failure(ctx, rnd))
+        if not reuse_review:
+            # RAW-worktree clean handoff (review F-001): once a run has hit an
+            # FR-2.2 response checkpoint its manifest.json/RUN.md are TRACKED, so
+            # the engine's live updates dirty a bare `git status` (the reviewer's
+            # view) at this handoff — even though the `--exclude`-scoped guard just
+            # below stays green. Re-commit that tracked bookkeeping so both views
+            # agree and control passes to the reviewer on a genuinely clean tree. A
+            # no-op when bookkeeping is still untracked (the run-dir self-ignore
+            # already hides it) — this never force-adds. It may land a bookkeeping
+            # commit on HEAD above `handoff`; a later usage-limit park then re-runs
+            # the round fresh (the SHA guard's sanctioned fail-closed path, §2)
+            # rather than reusing — correct, if slightly less efficient.
+            _persist_manifest(ctx)  # commit the CURRENT state, not a stale flush
+            gitops.commit_tracked_bookkeeping(
+                ctx.repo_root,
+                f"gauntlet: flush run bookkeeping before "
+                f"{phase or ctx.record.id} round-{rnd} review handoff",
+                run_bookkeeping_paths(ctx.repo_root, ctx.run_dir),
+                identity=gitops.ENGINE_IDENTITY,
+            )
+            if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+                return finish(_clean_handoff_failure(ctx, rnd))
 
         # ---- 1. review (single reviewer OR ensemble panel) --------------------
         # `findings` is the PERSISTED record: for a single reviewer, exactly the

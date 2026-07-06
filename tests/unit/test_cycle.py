@@ -2074,3 +2074,79 @@ def test_fix_rerun_reset_plain_when_bookkeeping_untracked(cycle_repo):
     assert _git_out(repo, "rev-parse", "HEAD") == handoff
     assert (run_dir / "manifest.json").exists()
     assert (run_dir / "RUN.md").exists()
+
+
+def _snapshot_review(seen, key, *findings):
+    """A SeqAdapter review response that records the RAW worktree state (no
+    exclude — the reviewer's own view) at the instant control reached it."""
+    def _run(cwd):
+        seen[key] = gitops.is_clean(Path(cwd))  # bare git status, run-dir NOT excluded
+        return REVIEW(*findings)
+    return _run
+
+
+def _track_run_bookkeeping(repo, run_dir):
+    """Force-track the run-dir manifest/RUN.md past its ``*`` self-ignore, as an
+    FR-2.2 response checkpoint would — the state that later dirties raw handoffs."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ".gitignore").write_text("*\n")
+    (run_dir / "manifest.json").write_text('{"seed": true}\n')
+    (run_dir / "RUN.md").write_text("# run index\n")
+    rel = run_dir.relative_to(repo).as_posix()
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-f", "--",
+         f"{rel}/manifest.json", f"{rel}/RUN.md"], check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "track bookkeeping"], check=True,
+    )
+
+
+def test_review_handoff_is_raw_clean_when_bookkeeping_tracked(cycle_repo):
+    # F-001: a run that hit a response checkpoint has TRACKED manifest.json/RUN.md,
+    # so the engine's live persist dirties a bare `git status` at the review
+    # handoff — the reviewer's own view — even though the `--exclude`-scoped guard
+    # stays green. The cycle re-commits that tracked bookkeeping first, so control
+    # reaches the reviewer on a genuinely clean tree (CLAUDE.md §1).
+    repo = cycle_repo
+    _track_run_bookkeeping(repo, repo / "runs" / "demo" / "run-1")
+    seen: dict = {}
+    adapters = {
+        "reviewer": SeqAdapter(_snapshot_review(seen, "clean")),  # converge, no findings
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(repo, adapters)
+
+    assert status == M.RUN_DONE
+    assert seen["clean"] is True  # the reviewer saw a clean raw worktree
+    # A flush commit was minted (engine-attributed) to land the tracked bookkeeping.
+    subjects = _git_out(repo, "log", "--format=%s|%an").splitlines()
+    assert any(
+        s.startswith("gauntlet: flush run bookkeeping") and s.endswith("|Gauntlet Engine")
+        for s in subjects
+    ), subjects
+
+
+def test_review_handoff_flush_is_noop_when_bookkeeping_untracked(cycle_repo):
+    # The everyday run: bookkeeping is still untracked+ignored (no response
+    # checkpoint), so the run-dir self-ignore already keeps a raw `git status`
+    # clean. The flush must be a NO-OP — never force-track it (which would defeat
+    # the self-ignore and add commit noise) and never trip the #33 ignore clash.
+    repo = cycle_repo
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ".gitignore").write_text("*\n")  # ignored, never force-added
+    seen: dict = {}
+    adapters = {
+        "reviewer": SeqAdapter(_snapshot_review(seen, "clean")),
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(repo, adapters)
+
+    assert status == M.RUN_DONE
+    assert seen["clean"] is True  # clean via the self-ignore, not via a commit
+    assert not gitops.is_tracked(repo, "runs/demo/run-1/manifest.json")
+    subjects = _git_out(repo, "log", "--format=%s").splitlines()
+    assert not any(s.startswith("gauntlet: flush run bookkeeping") for s in subjects)

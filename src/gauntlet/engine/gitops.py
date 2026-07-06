@@ -333,6 +333,60 @@ def commit_run_bookkeeping(
     return head_sha(repo)
 
 
+def is_tracked(repo: Path, relpath: str) -> bool:
+    """True iff git tracks ``relpath`` (it is in the index / a HEAD tree).
+
+    Unlike :func:`path_is_untracked`, this is reliable for a **gitignored** path:
+    a gitignored-but-untracked file yields no ``??`` porcelain line (ignored
+    entries are hidden), so a "not untracked" test would misread it as tracked and
+    then ``git add`` it without ``-f`` — the #33 pathspec clash. ``ls-files``
+    reports only tracked paths, so an ignored-untracked run-dir file correctly
+    returns False here.
+    """
+    return bool(_run(repo, "ls-files", "--", relpath).strip())
+
+
+def commit_tracked_bookkeeping(
+    repo: Path, message: str, paths: list[str], *, identity: Identity
+) -> str | None:
+    """Commit already-tracked, dirty run bookkeeping so the RAW worktree is clean
+    when control passes to a reviewer (review F-001).
+
+    A run that ever hit an FR-2.2 response checkpoint has its manifest.json/RUN.md
+    force-committed (:func:`commit_run_bookkeeping`'s ``add -f``) and therefore
+    TRACKED from then on — after which the run-dir ``*`` self-ignore no longer
+    hides the engine's live updates, so every later review handoff shows them as
+    uncommitted dirt in a bare ``git status`` (the reviewer's view), even though
+    the engine's own ``--exclude``-scoped clean check stays green. Re-committing
+    that tracked bookkeeping makes the two views agree so the handoff is genuinely
+    clean (CLAUDE.md §1).
+
+    NEVER force-adds (contrast :func:`commit_run_bookkeeping`): a run whose
+    bookkeeping is still untracked is already invisible to ``git status`` via the
+    self-ignore, so tracking it here would only defeat that, add commit noise, and
+    collide with the ignore rule (#33). Commits ONLY the subset of ``paths`` git
+    already tracks, and only when they are dirty. **Idempotent:** returns ``None``
+    (no commit) when nothing tracked is dirty. The message is passed on stdin
+    (``-F -``); no agent-authored text reaches argv. Returns the new SHA, or
+    ``None``.
+    """
+    tracked = [p for p in paths if is_tracked(repo, p)]
+    if not tracked:
+        return None
+    _run(repo, "add", "--", *tracked)  # tracked → no `-f`, no #33 clash
+    # Scope the change check to OUR paths so unrelated staged/worktree state never
+    # makes this look "dirty" (or get swept into the commit below).
+    if not _run(repo, "diff", "--cached", "--name-only", "--", *tracked).strip():
+        return None
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit", "-F", "-", "--", *tracked,
+    ]
+    _run(repo, *args, stdin=message)
+    return head_sha(repo)
+
+
 def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
