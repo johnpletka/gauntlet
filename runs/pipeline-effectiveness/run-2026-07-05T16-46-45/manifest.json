@@ -23,7 +23,7 @@
     "prompts/proposal-synthesis.md": "sha256:7e4c893cf08ca824dabbfc93f1758d2a699259ee06e60d45abd651573857b17b"
   },
   "status": "running",
-  "current_step": "plan-approve",
+  "current_step": "impl-cycle",
   "warnings": [],
   "steps": [
     {
@@ -382,6 +382,148 @@
       "metrics": {},
       "checkpoints": [],
       "resumed_from_checkpoint": null
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "6da26696-475f-40a2-a054-aea8dd22fed7",
+      "started": "2026-07-05T21:40:50.775929+00:00",
+      "ended": "2026-07-05T23:05:25.067010+00:00",
+      "attempts": 0,
+      "base_sha": "111bfcd38960bed796333559313ebb85929e16be",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 42563,
+        "output_tokens": 197473,
+        "cached_input_tokens": 51492390,
+        "cost_usd": 45.508373500000005
+      },
+      "agent_usage": {
+        "builder": {
+          "input_tokens": 42563,
+          "output_tokens": 197473,
+          "cached_input_tokens": 51492390,
+          "cost_usd": 45.508373500000005
+        }
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "0",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-05T22:27:32.800817+00:00",
+      "ended": "2026-07-05T23:11:09.729725+00:00",
+      "attempts": 2,
+      "base_sha": "552b5ea5498cdbf854fd6e82e69f517fa6278119",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "agent_usage": {},
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "0",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-05T23:11:09.731939+00:00",
+      "ended": "2026-07-05T23:11:30.518758+00:00",
+      "attempts": 0,
+      "base_sha": "ff716da2f7fbca43826a276fec9979c80655b9c5",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 32023,
+        "output_tokens": 1655,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.01131575
+      },
+      "agent_usage": {
+        "mechanic": {
+          "input_tokens": 32023,
+          "output_tokens": 1655,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.01131575
+        }
+      },
+      "notes": "empty P<N>: marker over 7 checkpoint(s): e435467880",
+      "iteration": "0",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "failed",
+      "agent": null,
+      "session_id": "019f348d-1b62-7e21-a18b-4d1108d6a9a8",
+      "started": "2026-07-05T23:11:30.521789+00:00",
+      "ended": "2026-07-05T23:11:32.233761+00:00",
+      "attempts": 1,
+      "base_sha": "e4354678800112de11d2cf7cd6f0f6c8c584b8c5",
+      "parked_reason": null,
+      "halt_reason": "adapter_error",
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "agent_usage": {},
+      "notes": "agent failed (terminal, FR-3.1): codex reported failure: exit code 1; stderr: ",
+      "iteration": "0",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
     }
   ],
   "suspensions": [],
@@ -400,13 +542,18 @@
       "step_id": "plan-cycle",
       "phase": "PLAN.1",
       "sha": "2c19a59a56b4488787ded18824f726816a3ebdba"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P1",
+      "sha": "e4354678800112de11d2cf7cd6f0f6c8c584b8c5"
     }
   ],
   "totals": {
-    "input_tokens": 459508,
-    "output_tokens": 174771,
-    "cached_input_tokens": 11211431,
-    "cost_usd": 16.744902149999994
+    "input_tokens": 641117,
+    "output_tokens": 392123,
+    "cached_input_tokens": 62703821,
+    "cost_usd": 62.32779515000001
   },
   "agent_usage": {
     "reviewer": {
@@ -428,16 +575,22 @@
       "cost_usd": 0.053665750000000005
     },
     "builder": {
-      "input_tokens": 22623,
-      "output_tokens": 129516,
-      "cached_input_tokens": 11187111,
-      "cost_usd": 16.595554
+      "input_tokens": 65186,
+      "output_tokens": 326989,
+      "cached_input_tokens": 62679501,
+      "cost_usd": 62.10392750000001
     },
     "judge_llm": {
-      "input_tokens": 80083,
-      "output_tokens": 13567,
+      "input_tokens": 187106,
+      "output_tokens": 31791,
       "cached_input_tokens": 0,
-      "cost_usd": 0.04715474999999998
+      "cost_usd": 0.11035850000000003
+    },
+    "mechanic": {
+      "input_tokens": 32023,
+      "output_tokens": 1655,
+      "cached_input_tokens": 0,
+      "cost_usd": 0.01131575
     }
   },
   "recoveries": [],
