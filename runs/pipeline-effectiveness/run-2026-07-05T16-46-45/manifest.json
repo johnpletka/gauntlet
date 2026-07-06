@@ -1220,7 +1220,16 @@
       "parked_substep": null,
       "scheduled_resume": null,
       "revalidation": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "implement-resp-1",
+          "response_text": "RATIFIED — resolve the P5 UPSTREAM CONFLICT via path (a): switch the verifier's sandbox backend from codex to claude-code. This is the Q3-listed alternative and stays WITHIN the approved plan section 7. Do NOT amend the PRD or the plan; implement to the mechanism the plan already states.\n\nBoth conflict clauses are resolved by the same backend choice:\n\n1. Read-denial (P5-A3, section 7 items 1 and 4): claude-code fires PreToolUse hooks, so implement the read-denial mechanism exactly as the plan states it — the judge session that hooks the verifier denies any tool call whose resolved path (symlink-resolved, dotdot-normalized) escapes the disposable-copy root. Keep the disposable copy as the verifier's only readable/writable root, keep env-stripping by allowlist, keep network default-deny, and keep every fail-closed park intact (backend-absent probe, copy-creation failure, worktree tree-hash mutation).\n\n2. Enumeration migration (P5-A7): run the migrated acceptance_gate collector enumeration INSIDE this same claude-code hook-enforced backend — pytest --collect-only as a judge-hooked Bash tool call, read-confined to the run-worktree copy, network default-deny, resource-bounded, fail-closed park on failure. Do NOT use the codex `codex sandbox` / `[permissions]` path; the pinned codex CLI cannot provision it and it would park every real run. This removes the every-run-park you identified.\n\nBackend probe / unsupported-host detection: the probe now checks for a usable claude-code verifier backend (hooks fire under --setting-sources project) instead of the codex OS jail. If absent, park closed — never run the verifier unsandboxed.\n\nAccepted tradeoff for v1: enforcement is now hook-level (tool-call path denial) rather than codex's OS-level jail. That is a deliberate, ratified choice. Codex remains the reviewer and stays a viable FUTURE verifier backend — provisioning a codex [permissions] profile is a post-v1 config option, not this phase's work. OpenAI-API roles (triage/escalation/judge/mechanic) are unchanged.\n\nConcretely: update the verifier profile in .gauntlet/config.yaml and pipelines/standard.yaml to the claude-code backend; update prompts/cycle-verify.md and the P5 acceptance map + tests to the claude-code (judge-hook) enforcement mechanism rather than the codex OS-jail mechanism; keep verifier metrics emission (metrics.verifier.legit_findings and agent_usage) unchanged. Re-run unit + local integration green before signaling PHASE COMPLETE.",
+          "timestamp": "2026-07-06T20:42:07.029975+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 7742,
         "output_tokens": 171129,
