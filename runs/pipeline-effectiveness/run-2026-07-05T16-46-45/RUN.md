@@ -3,7 +3,7 @@
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
 - status: **running** (at `implement`)
-- totals: 2215570in/995586out $152.5690
+- totals: 2221382in/996711out $152.5727
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -29,7 +29,7 @@
 | [tests.3](steps/tests.3/) | shell | done | 370s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.3 | commit | done | 22s | 4059in/1497out $0.0040 | committed 6c41d626d4 |
 | [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 2098s | 639583in/78267out $7.4395 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.4](steps/implement.4/transcript.md) | agent_task | parked | 3506s | 7742in/171129out $29.6221 | agent signalled 'UPSTREAM CONFLICT' (FR-10.4 upstream conflict / halt); parked for a human instead of marking the step done (#32) conflict park left an uncommitted worktree; backed up to refs/gauntlet/backup/run-2026-07-05T16-46-45/implement-conflict-2026-07-06T16-59-30.468647+00-00 and restored the clean tree before handoff (F-001) |
+| [implement.4](steps/implement.4/transcript.md) | agent_task | parked | 16879s | 13554in/172254out $29.6258 | resume disposition: amendment_required (FR-3/FR-5/FR-10) |
 
 ## Commits
 

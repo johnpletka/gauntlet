@@ -1209,7 +1209,7 @@
       "agent": "builder",
       "session_id": "b906d520-1037-43a3-a608-90ab0933f4b4",
       "started": "2026-07-06T16:01:04.148359+00:00",
-      "ended": "2026-07-06T16:59:30.597352+00:00",
+      "ended": "2026-07-06T20:42:23.137977+00:00",
       "attempts": 0,
       "base_sha": "bc13ee46e072aa7fa54f3972f71144d5bf7f5066",
       "parked_reason": "response",
@@ -1227,14 +1227,14 @@
           "timestamp": "2026-07-06T20:42:07.029975+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 7742,
-        "output_tokens": 171129,
+        "input_tokens": 13554,
+        "output_tokens": 172254,
         "cached_input_tokens": 43399209,
-        "cost_usd": 29.622124500000005
+        "cost_usd": 29.625827500000007
       },
       "agent_usage": {
         "builder": {
@@ -1242,9 +1242,15 @@
           "output_tokens": 171129,
           "cached_input_tokens": 43399209,
           "cost_usd": 29.622124500000005
+        },
+        "mechanic": {
+          "input_tokens": 5812,
+          "output_tokens": 1125,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.0037029999999999997
         }
       },
-      "notes": "agent signalled 'UPSTREAM CONFLICT' (FR-10.4 upstream conflict / halt); parked for a human instead of marking the step done (#32)\nconflict park left an uncommitted worktree; backed up to refs/gauntlet/backup/run-2026-07-05T16-46-45/implement-conflict-2026-07-06T16-59-30.468647+00-00 and restored the clean tree before handoff (F-001)",
+      "notes": "resume disposition: amendment_required (FR-3/FR-5/FR-10)",
       "iteration": "4",
       "metrics": {},
       "checkpoints": [],
@@ -1310,10 +1316,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 2215570,
-    "output_tokens": 995586,
+    "input_tokens": 2221382,
+    "output_tokens": 996711,
     "cached_input_tokens": 178901431,
-    "cost_usd": 152.56897869999997
+    "cost_usd": 152.57268169999998
   },
   "agent_usage": {
     "reviewer": {
@@ -1347,10 +1353,10 @@
       "cost_usd": 0.2893634999999997
     },
     "mechanic": {
-      "input_tokens": 50455,
-      "output_tokens": 6795,
+      "input_tokens": 56267,
+      "output_tokens": 7920,
       "cached_input_tokens": 0,
-      "cost_usd": 0.026203749999999998
+      "cost_usd": 0.029906749999999996
     }
   },
   "recoveries": [],
