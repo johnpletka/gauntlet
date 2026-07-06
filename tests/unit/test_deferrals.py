@@ -15,6 +15,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.deferrals import (
     Deferral,
@@ -34,6 +36,9 @@ from gauntlet.engine.manifest import (
 )
 from gauntlet.engine.pipeline import Pipeline, Step
 from gauntlet.engine.steptypes import (
+    DeferralCollectionError,
+    _collect_run_deferrals,
+    _acceptance_map_relpath,
     _render_prompt,
     handle_acceptance_gate,
     handle_phase_lint,
@@ -312,6 +317,55 @@ def test_no_deferral_block_when_none_target_phase(fixture_repo):
          "prompt_text": "Implement."})
     rendered = _render_prompt(step, ctx)
     assert "open deferrals" not in rendered
+
+
+# --- FR-3.3: committed-map recovery fails closed (review F-001) --------------
+def _commit_map_content(fixture_repo: Path, content: str) -> str:
+    """Commit ``content`` as the run's acceptance-map.json; return the commit sha."""
+    map_dir = fixture_repo / "runs" / "demo" / "artifacts"
+    map_dir.mkdir(parents=True, exist_ok=True)
+    (map_dir / "acceptance-map.json").write_text(content)
+    _git(fixture_repo, "add", "-A")
+    _git(fixture_repo, "commit", "-q", "-m", "P2: map\n\nbody")
+    return _git(fixture_repo, "rev-parse", "HEAD").strip()
+
+
+def test_collect_run_deferrals_fails_closed_on_unparseable_committed_map(fixture_repo):
+    """A commit that TRACKS the acceptance map but whose committed content is not
+    valid JSON raises instead of degrading to 'no deferrals' — recovering the
+    committed deferrals[] must fail closed, never silently drop the obligation."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase("P5", ["P5-A1"]))
+    sha = _commit_map_content(fixture_repo, "{not valid json")
+    ctx.manifest.commits.append(CommitRecord(step_id="phase-commit", phase="P2", sha=sha))
+    with pytest.raises(DeferralCollectionError) as exc:
+        _collect_run_deferrals(ctx, map_relpath=_acceptance_map_relpath(ctx))
+    assert sha[:10] in str(exc.value)
+
+
+def test_render_prompt_halts_on_unparseable_committed_map(fixture_repo):
+    """The target phase's prompt render halts (raises) rather than omitting the
+    open-deferral block when a prior committed map cannot be parsed — the omitted
+    block would be indistinguishable from 'no deferral' (review F-001)."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase("P5", ["P5-A1"]))
+    sha = _commit_map_content(fixture_repo, "{not valid json")
+    ctx.manifest.commits.append(CommitRecord(step_id="phase-commit", phase="P2", sha=sha))
+    step = Step.model_validate(
+        {"id": "implement", "type": "agent_task", "agent": "builder",
+         "prompt_text": "Implement."})
+    with pytest.raises(DeferralCollectionError):
+        _render_prompt(step, ctx)
+
+
+def test_collect_run_deferrals_skips_commit_without_map(fixture_repo):
+    """A commit that does not carry the acceptance map (the ordinary non-phase
+    commit) is skipped, not failed — only a body deferral is collected there."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase("P3", ["P3-A1"]))
+    _git(fixture_repo, "commit", "--allow-empty", "-q",
+         "-m", "P2: earlier\n\nBody.\nDeferred to P3: retry logic")
+    sha = _git(fixture_repo, "rev-parse", "HEAD").strip()
+    ctx.manifest.commits.append(CommitRecord(step_id="phase-commit", phase="P2", sha=sha))
+    out = _collect_run_deferrals(ctx, map_relpath=_acceptance_map_relpath(ctx))
+    assert [(d.to_phase, d.text) for d in out] == [("P3", "retry logic")]
 
 
 # --- FR-3.4: phase-size lint at the boundary (P3-A3) -------------------------

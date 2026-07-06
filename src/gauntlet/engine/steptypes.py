@@ -602,15 +602,36 @@ def _acceptance_map_relpath(ctx: StepContext) -> str | None:
         return None
 
 
+class DeferralCollectionError(Exception):
+    """A prior phase's committed deferral data could not be recovered (FR-3.3).
+
+    Raised when a commit that *tracks* the acceptance map cannot have its
+    structured ``deferrals[]`` read/parsed. It fails the prompt render closed so
+    the phase is never built with an open deferral silently dropped (review
+    F-001); the handler turns it into a precondition halt for a human to resolve.
+    """
+
+
 def _collect_run_deferrals(ctx: StepContext, *, map_relpath: str | None) -> list[Deferral]:
     """All deferrals recorded across this run's phase commits (FR-3.3).
 
     Two durable sources per recorded commit: the commit BODY ("Deferred to P<N>:"
     prose, CLAUDE.md §7) and the ``acceptance-map.json`` committed at that sha (its
     structured ``deferrals[]``, read out of history because the live file on disk
-    is the current phase's map). Best-effort per commit — a git read failure or an
-    unparseable committed map skips that source rather than failing collection, so
-    a single bad commit never blocks the injection of the others.
+    is the current phase's map).
+
+    The structured source fails CLOSED (review F-001): a commit that *tracks* the
+    acceptance map must have its ``deferrals[]`` recovered, so a git read failure
+    or an unparseable committed map on such a commit raises
+    :class:`DeferralCollectionError` rather than degrading to "no deferrals here".
+    Silently reducing an unrecoverable committed map to absent data would drop the
+    obligation a prior phase handed forward — the exact silently-lost-work failure
+    FR-3.3 exists to prevent, and a violation of the fail-closed / data-over-
+    inference principles (CLAUDE.md §2). A commit that simply does not carry the
+    map (the ordinary case for every non-phase commit) is not an error and is
+    skipped. Commit-body prose stays best-effort: it is a convention, not a
+    committed structured artifact, so an unreadable message yields no prose
+    deferrals without halting.
     """
     out: list[Deferral] = []
     seen: set[str] = set()
@@ -624,17 +645,34 @@ def _collect_run_deferrals(ctx: StepContext, *, map_relpath: str | None) -> list
         except gitops.GitError:
             body = ""
         out.extend(parse_body_deferrals(body, source=f"commit:{sha[:10]}"))
-        if map_relpath:
-            raw = gitops.file_at_commit(ctx.repo_root, sha, map_relpath)
-            if raw:
-                try:
-                    mapping = json.loads(raw)
-                except json.JSONDecodeError:
-                    mapping = None
-                if mapping is not None:
-                    out.extend(
-                        deferrals_from_map(mapping, source=f"acceptance-map@{sha[:10]}")
-                    )
+        if not map_relpath:
+            continue
+        # Distinguish "this commit has no map" (fine — skip) from "the map is there
+        # but unrecoverable" (fail closed). `git show <sha>:<path>` collapses both
+        # to a non-zero exit, so a tracked-ness probe is what separates them.
+        try:
+            carries_map = gitops.any_tracked_at(ctx.repo_root, sha, [map_relpath])
+        except gitops.GitError as exc:
+            raise DeferralCollectionError(
+                f"cannot determine whether commit {sha[:10]} carries {map_relpath} "
+                f"for open-deferral reconciliation: {exc}"
+            ) from exc
+        if not carries_map:
+            continue
+        raw = gitops.file_at_commit(ctx.repo_root, sha, map_relpath)
+        if raw is None:
+            raise DeferralCollectionError(
+                f"acceptance map {map_relpath} is committed at {sha[:10]} but could "
+                "not be read out of history for open-deferral reconciliation"
+            )
+        try:
+            mapping = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise DeferralCollectionError(
+                f"acceptance map {map_relpath} committed at {sha[:10]} is not valid "
+                f"JSON, so its structured deferrals cannot be recovered: {exc}"
+            ) from exc
+        out.extend(deferrals_from_map(mapping, source=f"acceptance-map@{sha[:10]}"))
     return out
 
 
@@ -646,6 +684,11 @@ def _render_open_deferrals(ctx: StepContext) -> str | None:
     verbatim so it implements or explicitly re-defers it. Returns ``None`` when
     there is no current phase or no open deferral targeting it (the ordinary
     first-phase / no-deferral case, where no block is injected).
+
+    Raises :class:`DeferralCollectionError` (via :func:`_collect_run_deferrals`)
+    when a prior phase's committed acceptance map cannot be recovered — the render
+    fails closed rather than omit a block whose absence is indistinguishable from
+    "no deferral" (review F-001).
     """
     phase_id = _iteration_phase(ctx)
     if not phase_id:
@@ -660,6 +703,24 @@ def _render_open_deferrals(ctx: StepContext) -> str | None:
         "A prior phase explicitly deferred the following work to THIS phase. "
         "Implement each, or re-defer it explicitly (do not silently drop it):\n"
         f"{lines}\n"
+    )
+
+
+def _deferral_collection_halt(exc: DeferralCollectionError) -> StepResult:
+    """Fail-closed halt when open-deferral injection cannot recover committed data.
+
+    A dropped open deferral is silently-lost work (FR-3.3), so we do not render the
+    phase prompt without it — we halt for a human, exactly like any other
+    unsatisfied precondition (review F-001).
+    """
+    return StepResult(
+        status=FAILED,
+        halt_reason=HALT_REASON_PRECONDITION,
+        notes=(
+            "open-deferral injection failed closed: a prior phase's committed "
+            f"acceptance map could not be recovered — {exc}. The phase prompt is "
+            "not rendered without its open deferrals (FR-3.3 / review F-001)."
+        ),
     )
 
 
@@ -749,7 +810,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     is_quota_resume = bool(
         ctx.record.parked_reason == PARKED_REASON_USAGE_LIMIT and ctx.record.session_id
     )
-    prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
+    try:
+        prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
+    except DeferralCollectionError as exc:
+        return _deferral_collection_halt(exc)
     schema = (
         _resume_disposition_schema(ctx)
         if consuming_response
@@ -823,7 +887,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             "usage-limit resume: stored session was unknown/expired; fell back "
             "to a full re-run with no session (FR-3.3)"
         )
-        prompt = _render_prompt(step, ctx)
+        try:
+            prompt = _render_prompt(step, ctx)
+        except DeferralCollectionError as exc:
+            return _deferral_collection_halt(exc)
         result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     # Attribute usage to the agent that actually ran (the disposition emitter on a
