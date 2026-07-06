@@ -24,13 +24,15 @@
           },
           "category": {
             "type": "string",
+            "description": "Finding category. `behavioral` (pipeline-effectiveness FR-2.4, P4) is an ADDITIVE enum member for findings a verifier raises by *executing* the deliverable (a signal class no diff reader produces); it migrates in with every category-enforcing consumer (cycle merge, triage, confirm, metrics) at once so a behavioral finding can never reach an unmigrated consumer. Pre-migration findings using only the original categories still validate; a `category` outside this enum fails validation closed (never coerced or dropped).",
             "enum": [
               "correctness",
               "spec-gap",
               "security",
               "performance",
               "principle-violation",
-              "style"
+              "style",
+              "behavioral"
             ]
           },
           "location": {

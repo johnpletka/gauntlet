@@ -1,30 +1,28 @@
 {
-  "phase": "P3",
+  "phase": "P4",
   "clauses": [
     {
-      "id": "P3-A1",
-      "text": "A deferral referencing a nonexistent phase parks.",
+      "id": "P4-A1",
+      "text": "A pre-migration findings fixture (no behavioral value) validates against the migrated schema.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_gate_parks_on_phantom_deferral_in_map"},
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_gate_parks_on_phantom_deferral_in_commit_body"},
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_phantom_deferrals_flags_only_unknown_targets"}
+        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_findings_fixture_validates_against_migrated_schema"},
+        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_categories_still_validate[correctness]"},
+        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_categories_still_validate[style]"}
       ]
     },
     {
-      "id": "P3-A2",
-      "text": "A valid open deferral appears verbatim in the target phase's rendered implement prompt.",
+      "id": "P4-A2",
+      "text": "A finding with category behavioral validates and survives merge → triage → confirm.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_open_deferral_appears_verbatim_in_implement_prompt"},
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_open_deferral_from_committed_map_injected"}
+        {"kind": "pytest", "id": "tests/unit/test_ensemble_cycle.py::test_behavioral_finding_survives_merge_triage_confirm"},
+        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_behavioral_category_validates_after_migration"}
       ]
     },
     {
-      "id": "P3-A3",
-      "text": "The phase-size lint fires at the boundary (>max_frs_per_phase distinct FR refs); park-mode parks.",
+      "id": "P4-A3",
+      "text": "A finding whose category is absent from the enum is rejected at validation (fail closed; never coerced or dropped).",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_warns_above_bound"},
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_parks_above_bound_in_park_mode"},
-        {"kind": "pytest", "id": "tests/unit/test_deferrals.py::test_size_lint_passes_at_bound"}
+        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_findings_schema_rejects_unknown_category_fail_closed"}
       ]
     }
   ]

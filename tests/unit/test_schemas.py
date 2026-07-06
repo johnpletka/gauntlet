@@ -11,6 +11,7 @@ from gauntlet.adapters._structured import validate_schema
 
 REPO = Path(__file__).resolve().parents[2]
 SCHEMAS = REPO / "schemas"
+SCAFFOLD_SCHEMAS = REPO / "src" / "gauntlet" / "scaffold" / "schemas"
 MANUAL = REPO / "runs" / "gauntlet-bootstrap" / "manual"
 
 
@@ -18,13 +19,24 @@ def _load(name: str) -> dict:
     return json.loads((SCHEMAS / name).read_text())
 
 
+def _finding(category: str) -> dict:
+    """A full findings payload, valid but for the given `category`."""
+    return {"findings": [{
+        "id": "F-001", "severity": "major", "category": category,
+        "location": "src.py:1", "claim": "c", "evidence": "e",
+        "suggested_fix": None,
+    }], "open_questions": [], "summary": "s"}
+
+
 def test_findings_schema_enums_match_prd_section_7():
     schema = _load("findings.json")
     props = schema["properties"]["findings"]["items"]["properties"]
     assert props["severity"]["enum"] == ["blocking", "major", "minor", "nit"]
+    # `behavioral` is the additive P4 migration (FR-2.4): appended, not
+    # reordered, so pre-migration outputs stay valid.
     assert props["category"]["enum"] == [
         "correctness", "spec-gap", "security", "performance",
-        "principle-violation", "style",
+        "principle-violation", "style", "behavioral",
     ]
     # §7-optional is spelled required-but-nullable: codex native structured
     # output (strict mode) demands every property in `required` (pinned, P4).
@@ -69,3 +81,60 @@ def test_findings_schema_rejects_bad_severity():
     }]}
     with pytest.raises(ValueError):
         validate_schema(bad, _load("findings.json"))
+
+
+# --- P4: behavioral-category schema migration (FR-2.4) -----------------------
+# The `behavioral` category is added additively across the schema and every
+# category-enforcing consumer at once; these tests prove the schema half of the
+# migration. Consumer flow (merge -> triage -> confirm) is exercised end-to-end
+# in test_ensemble_cycle.py (P4-A2).
+
+
+@pytest.mark.parametrize("category", [
+    "correctness", "spec-gap", "security", "performance",
+    "principle-violation", "style",
+])
+def test_pre_migration_categories_still_validate(category):
+    # P4-A1: every pre-`behavioral` category still validates against the
+    # migrated schema — the migration is additive, nothing pre-existing breaks.
+    validate_schema(_finding(category), _load("findings.json"))
+
+
+def test_pre_migration_findings_fixture_validates_against_migrated_schema():
+    # P4-A1: a whole findings artifact authored before the migration (using only
+    # the original categories, no `behavioral` value anywhere) still validates.
+    pre_migration = {"findings": [
+        {"id": "F-001", "severity": "blocking", "category": "correctness",
+         "location": "src.py:1", "claim": "off-by-one", "evidence": "e",
+         "suggested_fix": None},
+        {"id": "F-002", "severity": "minor", "category": "style",
+         "location": "src.py:9", "claim": "naming", "evidence": "e",
+         "suggested_fix": "rename"},
+    ], "open_questions": [], "summary": "s"}
+    validate_schema(pre_migration, _load("findings.json"))
+
+
+def test_behavioral_category_validates_after_migration():
+    # P4-A2 (schema half): a finding with category `behavioral` validates — the
+    # verifier's finding class is accepted end-to-end at the persisted-record
+    # schema before P5 ever wires verifier execution.
+    validate_schema(_finding("behavioral"), _load("findings.json"))
+
+
+def test_findings_schema_rejects_unknown_category_fail_closed():
+    # P4-A3: a category outside the enum is rejected at validation (fail closed);
+    # it is never coerced to another category or silently dropped.
+    with pytest.raises(ValueError):
+        validate_schema(_finding("behaviorial"), _load("findings.json"))  # typo
+    with pytest.raises(ValueError):
+        validate_schema(_finding("made-up-category"), _load("findings.json"))
+
+
+def test_scaffold_findings_schema_matches_root_after_migration():
+    # The scaffold copy adopters receive must carry the same migrated enum as the
+    # governing root schema — a drift would ship adopters an unmigrated consumer.
+    root = (SCHEMAS / "findings.json").read_text()
+    scaffold = (SCAFFOLD_SCHEMAS / "findings.json").read_text()
+    assert root == scaffold
+    props = json.loads(scaffold)["properties"]["findings"]["items"]["properties"]
+    assert "behavioral" in props["category"]["enum"]

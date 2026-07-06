@@ -207,6 +207,81 @@ def test_same_profile_multilens_panel_yields_two_distinct_triage_targets(fixture
     assert len(adapters["triage"].calls) == 2
 
 
+# ===========================================================================
+# P4-A2 — a `behavioral` finding survives merge → triage → confirm end-to-end
+# ===========================================================================
+def test_behavioral_finding_survives_merge_triage_confirm(fixture_repo):
+    # FR-2.4 phase-order precondition: with the schema+consumer migration landed
+    # (and BEFORE any verifier is wired, P5), a `category: behavioral` finding
+    # must flow through the whole cycle unrejected. Both members raise the same
+    # behavioral defect → the deterministic MERGE dedups them to one primary; the
+    # primary is TRIAGEd once (validated as a finding), fixed, then CONFIRMed —
+    # the run completing proves every category-enforcing consumer accepts it.
+    repo = _ens_repo(fixture_repo)
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "behavioral", "src.py:1",
+                   "the CLI exits 0 but writes no output file")),
+        CONFIRM(CV("0-reviewer-correctness:F-001", "resolved")),
+    )
+    gemini = SeqAdapter(REVIEW(
+        _fx("F-001", "major", "behavioral", "src.py:1",
+            "running the CLI writes no output file despite exit 0"),
+    ))
+    adapters = {
+        "reviewer": reviewer, "gemini": gemini,
+        "triage": SeqAdapter(V("x")),  # id overwritten to the primary
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+        "esc": SeqAdapter(),
+    }
+    orch, _man = _build_cycle_orch(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
+    assert orch.drive() == M.RUN_DONE  # cycle converged — nothing rejected it
+    run_dir = repo / "runs" / "demo" / "run-1"
+
+    # MERGE: the two behavioral members deduped to one primary carrying the
+    # category through; the merged record still validates against the schema.
+    merged = json.loads((run_dir / "artifacts" / "findings.json").read_text())
+    from gauntlet.adapters._structured import validate_schema
+    validate_schema(merged, json.loads((repo / "schemas" / "findings.json").read_text()))
+    primary = merged["findings"][0]
+    assert primary["id"] == "0-reviewer-correctness:F-001"
+    assert primary["category"] == "behavioral"
+    assert primary["sources"] == ["reviewer", "gemini"]
+
+    # TRIAGE: the behavioral primary was triaged exactly once (reached triage).
+    assert len(adapters["triage"].calls) == 1
+    triage_targets = {v["finding_id"] for v in
+                      json.loads((run_dir / "artifacts" / "triage.json").read_text())["verdicts"]}
+    assert triage_targets == {"0-reviewer-correctness:F-001"}
+
+    # CONFIRM: the behavioral finding received a confirm verdict.
+    confirm = json.loads((run_dir / "artifacts" / "confirm.json").read_text())
+    assert confirm["verdicts"][0]["finding_id"] == "0-reviewer-correctness:F-001"
+
+
+def test_behavioral_migration_landed_before_verifier_is_wired(fixture_repo):
+    # FR-2.4 phase-order assertion: the schema + the merge consumer's per-member
+    # validator accept `behavioral` NOW, while verifier EXECUTION is still P5 (no
+    # engine/verify.py, no `verifier` step type). This is the precondition P5
+    # depends on — a behavioral finding can never reach an unmigrated consumer.
+    from gauntlet.engine import cycle as C
+    from gauntlet.adapters._structured import validate_schema
+
+    schema = json.loads((REPO / "schemas" / "findings.json").read_text())
+    assert "behavioral" in schema["properties"]["findings"]["items"]["properties"]["category"]["enum"]
+    # the STRICT per-member reviewer output schema (the merge consumer's input
+    # validator, FR-1.2) also accepts behavioral end-to-end.
+    reviewer_schema = C._reviewer_output_schema(schema)
+    validate_schema(
+        {"findings": [{"id": "F-1", "severity": "major", "category": "behavioral",
+                       "location": "src.py:1", "claim": "c", "evidence": "e",
+                       "suggested_fix": None}],
+         "open_questions": [], "summary": "s"},
+        reviewer_schema,
+    )
+    # verifier EXECUTION is not wired yet — that is P5, not P4.
+    assert not (REPO / "src" / "gauntlet" / "engine" / "verify.py").exists()
+
+
 def test_lens_fragment_reaches_member_prompt(fixture_repo):
     repo = _ens_repo(fixture_repo)
     reviewer = SeqAdapter(REVIEW())  # converge immediately
