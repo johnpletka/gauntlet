@@ -511,7 +511,16 @@
       "parked_substep": null,
       "scheduled_resume": null,
       "revalidation": null,
-      "human_responses": [],
+      "human_responses": [
+        {
+          "response_id": "impl-cycle-resp-1",
+          "response_text": "re-run: prior failure was a stale-driver strict-schema bug, fixed at HEAD",
+          "timestamp": "2026-07-06T12:20:45.312980+00:00",
+          "user": "john.pletka@gmail.com",
+          "response_attempt": 1,
+          "state": "pending"
+        }
+      ],
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
