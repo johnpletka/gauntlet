@@ -278,6 +278,28 @@ def _validate_step(
                 "breaks the clean-handoff invariant (FR-9.3/9.4); unsupported"
             )
 
+    # 2b'. acceptance_gate collector (FR-3.2 / P2-A5): the step names one collector
+    # (`collector:`), one instance per distinct collector. A collector kind with no
+    # registered collector is rejected at PIPELINE LOAD — it never reaches runtime
+    # to "park closed", so an unsupported collector cannot masquerade as supported
+    # in a plan/pipeline artifact. v1 registers only `pytest`.
+    if step.type == "acceptance_gate":
+        from gauntlet.engine.collectors import REGISTERED_KINDS, is_registered
+
+        collector = step.get("collector")
+        if not collector:
+            report.errors.append(
+                f"step {step.id!r} (acceptance_gate) declares no `collector:` "
+                "(FR-3.2): each gate names exactly one collector kind"
+            )
+        elif not is_registered(collector):
+            report.errors.append(
+                f"step {step.id!r} (acceptance_gate) names collector {collector!r}, "
+                f"which has no registered collector; v1 registers only "
+                f"{list(REGISTERED_KINDS)} (FR-3.2 / P2-A5) — rejected at load, "
+                "never run and parked at runtime"
+            )
+
     # 2c. retrospective role bindings (FR-6.2): at least one self-critiquing
     # agent is required; the proposer is optional (no proposer → self-critique
     # only, generation skipped and recorded).

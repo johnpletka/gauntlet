@@ -41,7 +41,14 @@ def test_standard_stage_and_step_shape():
     assert plan == ["plan-author", "plan-cycle", "plan-lint", "plan-approve"]
     assert by_id["plan"].steps[2].type == "phase_lint"
     phases = [st.id for st in by_id["phases"].steps]
-    assert phases == ["implement", "tests", "phase-commit", "impl-cycle"]
+    assert phases == [
+        "implement", "tests", "phase-commit", "acceptance-gate", "impl-cycle",
+    ]
+    # FR-3.2: the deterministic completeness gate runs after commit, before the
+    # reviewer cycle, and names its single collector (v1: pytest).
+    ag = by_id["phases"].steps[3]
+    assert ag.type == "acceptance_gate"
+    assert ag.get("collector") == "pytest"
     assert by_id["phases"].foreach == "plan.phases"
     assert [st.id for st in by_id["retro"].steps] == ["retrospective"]
 

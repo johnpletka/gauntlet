@@ -559,6 +559,8 @@ _VALID_PLAN = (
     "## P1 — Build it\nImplement the widget end-to-end.\n\n"
     "```gauntlet-phases\n"
     "- id: P1\n  title: Build it\n  goal: Implement the widget end-to-end.\n"
+    "  acceptance:\n"
+    "    - id: P1-A1\n      clause: The widget builds end-to-end.\n"
     "```\n"
 )
 

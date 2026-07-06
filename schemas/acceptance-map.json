@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/acceptance-map.json",
+  "title": "Acceptance mapping (FR-3.2)",
+  "description": "The implement-step completion artifact: maps each plan-phase acceptance clause id to >=1 concrete piece of collector-enumerated evidence {kind, id}. `kind` names the collector, `id` is the node/check that collector enumerates. `kind` is a CLOSED enum of registered collectors (v1: pytest only) — an evidence entry naming an unregistered collector is schema-invalid (rejected at load, never a runtime surprise), not a collector that silently 'parks closed'. The acceptance_gate proves citation + existence only; test sufficiency stays the spec-coverage review lens's job (G2).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["phase", "clauses"],
+  "properties": {
+    "phase": {
+      "type": "string",
+      "description": "The plan phase id this mapping covers (e.g. \"P2\")."
+    },
+    "clauses": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "text", "evidence"],
+        "properties": {
+          "id": {"type": "string", "description": "The acceptance clause id (e.g. \"P2-A1\")."},
+          "text": {"type": "string", "description": "The clause text, copied from the plan for audit."},
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "description": ">=1 evidence entry per clause; each cites one collector-enumerated id.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "id"],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["pytest"],
+                  "description": "The collector namespace. CLOSED enum: v1 registers only `pytest`. Widening this enum requires implementing and registering that collector's plugin (side-effect-free enumeration + config contract) — until then the kind is load-invalid, with no declare-but-unimplemented path."
+                },
+                "id": {"type": "string", "description": "The id that collector enumerates (for pytest, a `pytest --collect-only` node id, e.g. \"tests/unit/test_x.py::test_y\")."}
+              }
+            }
+          }
+        }
+      }
+    },
+    "deferrals": {
+      "type": "array",
+      "description": "Optional deferral references (\"Deferred to P<N>\"). P2 only carries them; reconciliation against real phases is a P3 deliverable (FR-3.3).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "to_phase"],
+        "properties": {
+          "text": {"type": "string"},
+          "to_phase": {"type": "string"}
+        }
+      }
+    }
+  }
+}

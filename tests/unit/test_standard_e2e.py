@@ -12,6 +12,7 @@ edit ONLY, and show it validates, runs, and appears in the manifest/report.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -36,8 +37,29 @@ Implement widget(); validates the toy spec is satisfiable end-to-end.
 - id: P1
   title: Build the widget
   goal: Implement widget(); validates the toy spec is satisfiable end-to-end.
+  acceptance:
+    - id: P1-A1
+      clause: widget() returns the string "widget".
 ```
 """
+
+# The implement step's FR-3.2 completion contract: the builder writes an
+# acceptance-map citing a real pytest node id for each clause, plus the test it
+# cites, so the acceptance_gate (now in the phases stage, after phase-commit)
+# clears. `pytest --collect-only` in the toy repo enumerates test_widget.py.
+ACCEPTANCE_MAP = json.dumps({
+    "phase": "P1",
+    "clauses": [{
+        "id": "P1-A1",
+        "text": 'widget() returns the string "widget".',
+        "evidence": [{"kind": "pytest", "id": "test_widget.py::test_widget"}],
+    }],
+})
+IMPL_WRITES = {
+    "widget.py": "def widget(): return 'widget'\n",
+    "test_widget.py": "def test_widget():\n    assert True\n",
+    "runs/toy/artifacts/acceptance-map.json": ACCEPTANCE_MAP,
+}
 
 TOY_PRD = """# PRD: Toy widget
 
@@ -101,7 +123,9 @@ def review_empty():
 def text_result(text, writes=None):
     def _run(cwd):
         for rel, content in (writes or {}).items():
-            (Path(cwd) / rel).write_text(content)
+            target = Path(cwd) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
         return AgentResult(text=text, usage=_u(), exit_code=0)
     return _run
 
@@ -124,6 +148,11 @@ def _scaffold(tmp_path: Path, *, pipeline_text: str | None = None) -> Path:
     (repo / "pipelines").mkdir()
     pipe = pipeline_text or (REPO / "pipelines" / "standard.yaml").read_text()
     (repo / "pipelines" / "standard.yaml").write_text(pipe)
+    # A pytest.ini anchors pytest's rootdir to the toy repo, so the
+    # acceptance_gate's `pytest --collect-only` emits node ids relative to it
+    # (`test_widget.py::test_widget`) rather than to whatever ancestor project
+    # config it would otherwise discover — real repos carry their own config.
+    (repo / "pytest.ini").write_text("[pytest]\n")
     (repo / ".gauntlet").mkdir()
     (repo / ".gauntlet" / "config.yaml").write_text(CFG)
     (repo / "runs" / "toy").mkdir(parents=True)
@@ -153,7 +182,7 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
         "gemini": Script(review_empty(), review_empty(), review_empty()),
         "builder": Script(
             text_result(PLAN_MD),                              # plan-author
-            text_result("implemented P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            text_result("implemented P1", IMPL_WRITES),
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
@@ -249,7 +278,7 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
         "gemini": Script(*[review_empty() for _ in range(3)]),
         "builder": Script(
             text_result(PLAN_MD),
-            text_result("did P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            text_result("did P1", IMPL_WRITES),
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(

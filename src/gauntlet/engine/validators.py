@@ -30,6 +30,7 @@ from pathlib import Path
 from gauntlet.adapters._structured import extract_json, validate_schema
 from gauntlet.engine.planphases import (
     PlanPhasesError,
+    acceptance_clause_errors,
     extract_phases,
     missing_phase_sections,
 )
@@ -77,6 +78,13 @@ def _validate_plan_phases(text: str) -> str | None:
             "have a matching '## <id> …' heading so `phase`-mode context can "
             "slice its section (FR-1.1); add the heading(s) to the plan prose"
         )
+    # FR-3.1: every phase must carry a well-formed `acceptance:` list of testable
+    # clauses so the acceptance_gate can prove each maps to a real test. A
+    # clause-less (or malformed) phase is a defect the plan-author repairs before
+    # approval — fail closed.
+    acc_errors = acceptance_clause_errors(phases)
+    if acc_errors:
+        return "; ".join(acc_errors)
     return None
 
 

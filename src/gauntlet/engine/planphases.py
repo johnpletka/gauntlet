@@ -89,8 +89,73 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
                 f"phase {pid} is missing a non-empty 'goal' (each phase must "
                 "carry id/title/goal; implement-phase.md keys off the goal)"
             )
+        # FR-3.1: validate the `acceptance:` list's SHAPE when present, but do not
+        # require presence here — an already-approved pre-FR-3 plan (a completed
+        # run's plan.md) carries none and must still load for foreach/rollback.
+        # phase_lint / the plan_phases validator require presence at the gate.
+        shape_err = _acceptance_body_error(pid, item["acceptance"]) if "acceptance" in item else None
+        if shape_err:
+            raise PlanPhasesError(shape_err)
         phases.append(item)
     return phases
+
+
+def _acceptance_body_error(pid: str, acc: Any) -> str | None:
+    """Error if ``acc`` is not a well-formed acceptance list; ``None`` if valid.
+
+    A well-formed list is non-empty and every entry is a ``{id, clause}`` mapping
+    with non-empty string values and a phase-unique ``id`` (FR-3.1 / §6). Shared
+    by :func:`extract_phases` (shape-when-present) and :func:`acceptance_clause_errors`
+    (presence required) so the two never disagree on what "well-formed" means.
+    """
+    if not isinstance(acc, list) or not acc:
+        return (
+            f"phase {pid}: 'acceptance' must be a non-empty list of "
+            "{id, clause} entries (FR-3.1)"
+        )
+    seen: set[str] = set()
+    for i, clause in enumerate(acc):
+        if not isinstance(clause, dict):
+            return f"phase {pid}: acceptance entry #{i + 1} is not a mapping: {clause!r}"
+        cid = clause.get("id")
+        if not isinstance(cid, str) or not cid.strip():
+            return f"phase {pid}: acceptance entry #{i + 1} is missing a non-empty 'id'"
+        if cid in seen:
+            return f"phase {pid}: duplicate acceptance clause id {cid!r}"
+        seen.add(cid)
+        text = clause.get("clause")
+        if not isinstance(text, str) or not text.strip():
+            return f"phase {pid}: acceptance clause {cid!r} is missing non-empty 'clause' text"
+    return None
+
+
+def acceptance_clause_errors(phases: list[dict[str, Any]]) -> list[str]:
+    """Phases lacking a well-formed, non-empty ``acceptance:`` list (FR-3.1).
+
+    Returns one human-readable error per offending phase — *missing* an
+    ``acceptance:`` list, or carrying a malformed one — and an empty list when
+    every phase is well-formed. Presence is **required** here: this is the
+    fail-closed gate check the ``plan_phases`` validator and ``phase_lint`` run so
+    a clause-less phase cannot reach human approval (FR-3.1). :func:`extract_phases`
+    stays lenient (shape-only) so pre-FR-3 approved plans still load.
+    """
+    errors: list[str] = []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        pid = phase.get("id", "<unknown>")
+        acc = phase.get("acceptance")
+        if acc is None:
+            errors.append(
+                f"phase {pid} carries no 'acceptance:' list (FR-3.1); every phase "
+                "must enumerate its testable acceptance clauses so the "
+                "acceptance_gate can prove each maps to a real test"
+            )
+            continue
+        err = _acceptance_body_error(pid, acc)
+        if err:
+            errors.append(err)
+    return errors
 
 
 def _heading_is_phase(heading: str, phase_id: str) -> bool:

@@ -27,6 +27,40 @@ inputs. Scope is everything.
   checkpoints per config, so the reviewer handoff always lands on a `P<N>:`
   commit). Do **not** review your own work — the reviewer step handles that.
 
+## Completion contract — acceptance map (FR-3.2)
+
+Before you finish, write an **acceptance map** to `artifacts/acceptance-map.json`
+**relative to this run's artifact directory** — the directory that contains the
+`plan.md` you were given by path (e.g. if plan.md is `runs/<slug>/plan.md`, write
+`runs/<slug>/artifacts/acceptance-map.json`). It maps every acceptance clause of
+the **current phase** to at least one concrete, already-existing test. Shape
+(validated against `schemas/acceptance-map.json`):
+
+```json
+{ "phase": "<this phase id>",
+  "clauses": [ { "id": "<clause id>", "text": "<the clause text from the plan>",
+                 "evidence": [ { "kind": "pytest",
+                                 "id": "tests/unit/test_x.py::test_y" } ] } ] }
+```
+
+A deterministic `acceptance_gate` runs after your commit and **parks the phase**
+unless all of the following hold — so treat this as part of finishing, not an
+afterthought:
+
+- **Every** acceptance clause id of this phase appears in `clauses[]` with ≥ 1
+  `evidence` entry. A clause you cannot yet map is not "done" — either write the
+  test or surface an `UPSTREAM CONFLICT`.
+- `kind` is **`pytest`** — the only collector in v1. Any other kind is
+  schema-invalid and rejected outright.
+- Each cited `id` is a **real** pytest node id: it must appear in
+  `pytest --collect-only`. Cite the exact node id of a test you wrote or extended
+  for that clause (run `uv run pytest --collect-only -q` to confirm the id).
+
+The gate proves the cited test **exists and is cited**, not that it is
+*sufficient* — but write tests that genuinely exercise each clause; the review
+panel's spec-coverage lens checks sufficiency and will flag `assert True`-style
+mappings.
+
 ## If the plan or PRD is wrong
 
 If implementing this phase reveals that the approved plan or PRD is wrong or

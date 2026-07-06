@@ -51,8 +51,14 @@ from gauntlet.engine.pipeline import (
     Step,
     iter_inputs,
 )
+from gauntlet.engine.collectors import (
+    CollectorEnumerationError,
+    get_collector,
+    is_registered,
+)
 from gauntlet.engine.planphases import (
     PlanPhasesError,
+    acceptance_clause_errors,
     extract_phases,
     missing_phase_sections,
     phase_section,
@@ -265,10 +271,203 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
                 "`phase`-mode context can slice it (FR-1.1)"
             ),
         )
+    # FR-3.1: every phase must carry a well-formed `acceptance:` list of testable
+    # clauses (the acceptance_gate's input). A clause-less/malformed phase fails
+    # closed here — same fail-closed path as a malformed block — so an
+    # unmappable-at-gate plan never reaches human approval.
+    acc_errors = acceptance_clause_errors(phases)
+    if acc_errors:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: {artifact} has acceptance-clause defects — "
+                + "; ".join(acc_errors)
+                + " (FR-3.1)"
+            ),
+        )
     ids = ", ".join(p["id"] for p in phases)
     return StepResult(
         status=DONE, notes=f"phase lint: {len(phases)} phase(s) valid ({ids})"
     )
+
+
+# --- acceptance_gate ---------------------------------------------------------
+# The acceptance-map artifact the implement step produces (§6). Read directly
+# from disk (not declared as a dataflow `artifact:`/`inputs:` reference — the
+# builder writes it with its file tools, so it is not an agent `output:` the
+# loader tracks), and fail closed if it is absent.
+_ACCEPTANCE_MAP_DEFAULT = "artifacts/acceptance-map.json"
+_ACCEPTANCE_MAP_SCHEMA = "schemas/acceptance-map.json"
+
+
+def _acceptance_gate_halt(notes: str) -> StepResult:
+    """A fail-closed acceptance_gate park: HALTED → RUN_PARKED for a human.
+
+    Mirrors ``phase_lint``'s precondition-halt path (a deterministic gate that
+    parks the run when it cannot pass) so an incomplete/uncheckable phase never
+    advances to the review cycle.
+    """
+    return StepResult(status=HALTED, halt_reason=HALT_REASON_PRECONDITION, notes=notes)
+
+
+def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
+    """Deterministically prove every plan-phase acceptance clause maps to a real,
+    collector-enumerated test id (FR-3.2) — the structural close of the #54 class.
+
+    One instance per distinct collector (``collector:``). It proves *citation +
+    existence*: every clause is mapped, and every id this collector is cited for
+    appears in that collector's side-effect-free enumeration. It does **not**
+    prove the cited test meaningfully exercises the clause — sufficiency stays the
+    spec-coverage review lens's job (G2 scoped accordingly).
+
+    Fail closed at every step: a missing/unparseable/schema-invalid map, an
+    unmapped clause, a cited id absent from the enumeration, or a failed/timed-out
+    enumeration all **park** — an absent or failed check is never read as "passed".
+    Enumeration runs under the P2-P4 interim posture (a bounded child subprocess
+    under the run's judge hooks, cwd scoped to the run worktree; plan P2 / F-002).
+    """
+    collector_kind = step.get("collector")
+    if not collector_kind:
+        return _acceptance_gate_halt(
+            "acceptance gate: step declares no `collector:` (FR-3.2)"
+        )
+    # Defense in depth: pipeline load already rejects an unregistered collector
+    # (validate.py), but a hand-built/bypassed pipeline fails closed here too.
+    if not is_registered(collector_kind):
+        return _acceptance_gate_halt(
+            f"acceptance gate: collector {collector_kind!r} has no registered "
+            "collector (rejected at load; unsupported collector, FR-3.2)"
+        )
+
+    phase = ctx.iteration_item
+    if not isinstance(phase, dict) or not phase.get("id"):
+        return _acceptance_gate_halt(
+            "acceptance gate: no current phase in context; this step runs inside "
+            "the `foreach: plan.phases` loop (FR-3.2)"
+        )
+    phase_id = phase["id"]
+    clauses = phase.get("acceptance") or []
+    if not clauses:
+        # phase_lint already fails closed on a clause-less phase (FR-3.1); reaching
+        # the gate with none means the lint was bypassed — fail closed here too.
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} carries no acceptance clauses "
+            "(FR-3.1 lint should have parked upstream)"
+        )
+    clause_ids = [c["id"] for c in clauses]
+
+    # 1. Load + parse + schema-validate the acceptance map. A schema-invalid map —
+    # including one whose evidence declares an unregistered collector kind (the
+    # schema's `kind` enum is closed) — is rejected HERE, at map load, before any
+    # enumeration runs. It never "parks closed after running an unsupported
+    # collector" (FR-3.2 / P2-A5).
+    map_name = step.get("map", _ACCEPTANCE_MAP_DEFAULT)
+    map_path = ctx.artifact_root / map_name
+    if not map_path.exists():
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} has no acceptance map at "
+            f"{map_name} (fail closed — an absent map is not 'all clauses mapped', "
+            "FR-3.2)"
+        )
+    try:
+        mapping = json.loads(map_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} is not parseable JSON: "
+            f"{exc} (fail closed)"
+        )
+    schema_err = _validate_acceptance_map_schema(mapping, ctx)
+    if schema_err is not None:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} is schema-invalid — "
+            f"{schema_err} (rejected at load, FR-3.2)"
+        )
+
+    # 2. Mapping completeness: every phase clause must have >=1 evidence entry.
+    mapped_ids = {c["id"] for c in mapping["clauses"] if c.get("evidence")}
+    unmapped = [cid for cid in clause_ids if cid not in mapped_ids]
+    if unmapped:
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} has unmapped acceptance "
+            f"clause(s): {', '.join(unmapped)} — every clause must cite >=1 test "
+            "(fail closed, FR-3.2)"
+        )
+
+    # 3. Existence: every id cited for THIS collector must appear in the
+    # collector's side-effect-free enumeration (run under the interim posture).
+    cited = {
+        ev["id"]
+        for c in mapping["clauses"]
+        for ev in c.get("evidence", [])
+        if ev.get("kind") == collector_kind
+    }
+    if not cited:
+        # No evidence for this collector at all, yet every clause is mapped (step 2)
+        # — the map cites only other collectors. In v1 the only registered kind is
+        # pytest and the schema forbids any other, so this is unreachable in a
+        # valid v1 map; nothing to enumerate, so this collector's gate is a no-op.
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"acceptance gate ({collector_kind}): phase {phase_id} — no "
+                f"{collector_kind} evidence to check; all {len(clause_ids)} clause(s) "
+                "mapped"
+            ),
+        )
+    collector = get_collector(collector_kind)
+    try:
+        enumerated = collector.enumerate(
+            worktree=ctx.repo_root,
+            judge_env=ctx.judge_env,
+        )
+    except CollectorEnumerationError as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): enumeration failed for phase "
+            f"{phase_id} — {exc}"
+        )
+    missing_ids = sorted(cited - enumerated)
+    if missing_ids:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): phase {phase_id} cites test id(s) "
+            f"absent from the collector enumeration: {', '.join(missing_ids)} "
+            "(fail closed — a cited id must exist, FR-3.2)"
+        )
+    return StepResult(
+        status=DONE,
+        notes=(
+            f"acceptance gate ({collector_kind}): phase {phase_id} — all "
+            f"{len(clause_ids)} clause(s) mapped, {len(cited)} cited id(s) exist "
+            "(citation + existence proven; sufficiency is the review lens's job)"
+        ),
+    )
+
+
+def _validate_acceptance_map_schema(mapping: object, ctx: StepContext) -> str | None:
+    """Validate the acceptance map against ``schemas/acceptance-map.json``.
+
+    Returns ``None`` when valid, else the schema error string. The schema's
+    ``kind`` enum is closed (registered collectors only), so an evidence entry
+    naming an unregistered collector is rejected here — schema-invalid, not a
+    runtime surprise (FR-3.2 / P2-A5).
+    """
+    from gauntlet.adapters._structured import validate_schema
+
+    # The schema lives under the configured asset_root alongside the other
+    # schemas/*.json (asset_root is "." in gauntlet's own repo), resolved the same
+    # way `validate:` schema refs are (validators.py).
+    asset_root = getattr(ctx.config, "asset_root", ".")
+    schema_file = (ctx.repo_root / asset_root / _ACCEPTANCE_MAP_SCHEMA).resolve()
+    if not schema_file.exists():
+        return f"schema {_ACCEPTANCE_MAP_SCHEMA} not found under the asset root"
+    try:
+        schema = json.loads(schema_file.read_text())
+        validate_schema(mapping, schema)
+    except ValueError as exc:
+        return str(exc)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"schema {_ACCEPTANCE_MAP_SCHEMA} is unreadable: {exc}"
+    return None
 
 
 # --- agent_task --------------------------------------------------------------
@@ -1724,6 +1923,10 @@ SPECS: dict[str, StepSpec] = {
     "phase_lint": StepSpec(
         type="phase_lint",
         handler=handle_phase_lint,  # read-only: parses plan.md, touches nothing
+    ),
+    "acceptance_gate": StepSpec(
+        type="acceptance_gate",
+        handler=handle_acceptance_gate,  # deterministic: reads the map, enumerates
     ),
     "commit": StepSpec(
         type="commit",
