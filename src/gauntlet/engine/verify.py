@@ -46,13 +46,21 @@ the verifier never degrades to "skipped, proceed" and never runs unhooked.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from gauntlet.engine import gitops
-from gauntlet.judge.hook_client import REPO_ROOT_ENV_VAR
+from gauntlet.judge.hook_client import (
+    DEFAULT_URL as _DEFAULT_JUDGE_URL,
+    MODE_ENV_VAR,
+    REPO_ROOT_ENV_VAR,
+    RUN_ID_ENV_VAR,
+    STEP_ID_ENV_VAR,
+    URL_ENV_VAR,
+)
 from gauntlet.judge.service import TOKEN_ENV_VAR
 
 
@@ -138,18 +146,43 @@ def build_sandbox_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+# The EXACT run-local judge PreToolUse hook infrastructure keys the hook reads
+# (gauntlet.judge.hook_client): judge url/token/mode + the run/step ids. Only
+# these — never the caller's whole ``judge_env`` — are re-added onto the stripped
+# verifier env. ``GAUNTLET_REPO_ROOT`` is re-added separately, re-pointed at the
+# disposable copy. This closed set is what makes the strip-by-construction
+# contract hold end-to-end (review F-003).
+_JUDGE_HOOK_ENV_KEYS: frozenset[str] = frozenset(
+    {URL_ENV_VAR, TOKEN_ENV_VAR, MODE_ENV_VAR, RUN_ID_ENV_VAR, STEP_ID_ENV_VAR}
+)
+
+
 def verifier_env(judge_env: dict[str, str], copy_root: Path) -> dict[str, str]:
     """The full environment the verifier (or the migrated enumeration) is spawned
-    with: the stripped allowlist env PLUS the run's judge env, with the judge's
-    repo-root boundary re-pointed at the disposable copy (FR-2.5).
+    with: the stripped allowlist env PLUS only the run's judge *hook infrastructure*
+    keys, with the judge's repo-root boundary re-pointed at the disposable copy
+    (FR-2.5).
 
     ``GAUNTLET_REPO_ROOT`` → the copy means the PreToolUse judge hook denies any
     tool call whose resolved path escapes the copy (the read/write-denial
-    mechanism). The judge token/url/mode are re-added on top of the stripped env
-    so the hook can actually call the judge — they are run-local infrastructure,
-    not a credential the verifier's work should carry, but the hook requires them."""
+    mechanism). Only the exact hook keys the judge needs — its url/token/mode and
+    the run/step ids (:data:`_JUDGE_HOOK_ENV_KEYS`) — are re-added on top of the
+    stripped env; they are run-local infrastructure, not a credential the
+    verifier's work should carry, but the hook requires them.
+
+    Re-adding the *whole* ``judge_env`` would defeat the strip: a caller can pass
+    environment-shaped judge data (the integration harness passes
+    ``dict(os.environ)``) that carries ``ANTHROPIC_API_KEY`` / ``AWS_SECRET_ACCESS_KEY``
+    / any ``*_TOKEN``/``*_KEY`` right back into the sandbox after the allowlist
+    filter. Restricting the re-add to the hook-key allowlist keeps every
+    secret-shaped var absent by construction — the run-local judge token is the
+    only secret-shaped key that survives, and only because the hook cannot
+    authenticate without it (review F-003)."""
     env = build_sandbox_env()
-    env.update(judge_env or {})
+    source = judge_env or {}
+    for key in _JUDGE_HOOK_ENV_KEYS:
+        if key in source:
+            env[key] = source[key]
     env[REPO_ROOT_ENV_VAR] = str(copy_root)
     return env
 
@@ -178,12 +211,16 @@ class SandboxBackend:
 
 
 def detect_backend(judge_env: dict[str, str] | None) -> SandboxBackend | None:
-    """Probe for a usable v1 backend; ``None`` when unavailable (FR-2.5, P5-A5).
+    """Passive presence check for a candidate v1 backend; ``None`` when unavailable
+    (FR-2.5, P5-A5).
 
     Requires the claude-code CLI on PATH **and** an active engine-managed judge
     for this run (a ``GAUNTLET_JUDGE_TOKEN`` in ``judge_env``) — without the judge
     the PreToolUse hook has nothing to call, so the read-denial contract cannot
-    hold and the sub-step must park rather than run the verifier unhooked."""
+    hold and the sub-step must park rather than run the verifier unhooked.
+
+    This is presence only; :func:`probe_backend` additionally exercises the judge
+    enforcement path before returning a backend (review F-001)."""
     claude = shutil.which("claude")
     if claude is None:
         return None
@@ -192,8 +229,82 @@ def detect_backend(judge_env: dict[str, str] | None) -> SandboxBackend | None:
     return SandboxBackend(claude_path=claude)
 
 
+def _judge_roundtrip(url: str, token: str, body: dict) -> dict:
+    """One authenticated ``/decide`` round-trip to the run's judge, isolated as a
+    seam so the active hook probe (review F-001) is unit-testable without a live
+    judge. Delegates to the same client the PreToolUse hook uses."""
+    from gauntlet.judge import hook_client
+
+    return hook_client._ask_judge(url, token, body)
+
+
+def exercise_judge_hook(judge_env: dict[str, str] | None) -> None:
+    """Actively confirm the run's judge enforcement backend — the service the
+    PreToolUse hook calls on every tool call — is **live and authorizing this
+    run**, before returning a backend (review F-001, P5-A5).
+
+    Passive presence of a ``claude`` binary + a token string is not evidence that
+    confinement is active: if the judge is down, foreign, or bound to a different
+    run, the hook cannot enforce the copy-root read/write/network denial and the
+    verifier would run effectively unconfined while Gauntlet believes it is jailed.
+    So this issues one authenticated ``/decide`` round-trip (the exact client the
+    hook uses) and requires the judge to answer this run with a well-formed
+    permission decision. It fails closed — an unreachable judge, an HTTP/auth
+    error, a run-id mismatch, or a malformed response raises
+    :class:`SandboxUnavailableError` and parks the sub-step.
+
+    Scope note (honest boundary): this confirms the *enforcement service* is live
+    and bound to this run, so a dead/foreign judge parks closed rather than running
+    a verifier unhooked. That claude actually *loads* the hook is the
+    ``--setting-sources project`` + pinned-CLI invariant (:data:`_SETTING_SOURCES_FLAGS`,
+    pins.yaml), exercised end-to-end by ``tests/integration/test_verifier_sandbox.py``;
+    a decision value is deliberately NOT asserted here because the fast-path policy
+    legitimately *allows* many in-copy tool calls, so requiring a specific verdict
+    would false-park healthy runs."""
+    source = judge_env or {}
+    token = source.get(TOKEN_ENV_VAR)
+    run_id = source.get(RUN_ID_ENV_VAR)
+    if not token or not run_id:
+        raise SandboxUnavailableError(
+            "verifier hook probe: the run's judge token / run id are absent, so the "
+            "judge PreToolUse enforcement path cannot be exercised — parking closed "
+            "(the verifier never runs with unconfirmed enforcement; FR-2.5, P5-A5)."
+        )
+    url = source.get(URL_ENV_VAR) or _DEFAULT_JUDGE_URL
+    body = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": "gauntlet-verifier-hook-probe"},
+        "repo_root": source.get(REPO_ROOT_ENV_VAR) or os.getcwd(),
+        "run_id": run_id,
+        "step_id": "verifier-hook-probe",
+    }
+    try:
+        result = _judge_roundtrip(url, token, body)
+    except Exception as exc:  # transport / HTTP / auth / decode — all fail closed
+        raise SandboxUnavailableError(
+            "verifier hook probe: the run's judge could not be reached to confirm "
+            f"the PreToolUse enforcement path is live ({type(exc).__name__}: {exc}); "
+            "parking closed — the verifier never runs with unconfirmed enforcement "
+            "(FR-2.5, P5-A5)."
+        ) from exc
+    decision = (result or {}).get("decision")
+    if decision not in ("allow", "deny", "ask"):
+        raise SandboxUnavailableError(
+            "verifier hook probe: the judge returned no well-formed decision "
+            f"({decision!r}) for this run's canary call; the enforcement path is "
+            "not confirmed, parking closed (FR-2.5, P5-A5)."
+        )
+
+
 def probe_backend(judge_env: dict[str, str] | None) -> SandboxBackend:
-    """Return a usable backend or raise :class:`SandboxUnavailableError` (P5-A5)."""
+    """Return a usable, enforcement-confirmed backend or raise
+    :class:`SandboxUnavailableError` (P5-A5).
+
+    Two gates, both fail-closed: the passive presence check
+    (:func:`detect_backend`) AND an active exercise of the run's judge enforcement
+    path (:func:`exercise_judge_hook`) — so a claude binary + a stale token string
+    is no longer enough to run the verifier while the judge is actually dead or
+    bound to another run (review F-001)."""
     backend = detect_backend(judge_env)
     if backend is None:
         raise SandboxUnavailableError(
@@ -202,6 +313,7 @@ def probe_backend(judge_env: dict[str, str] | None) -> SandboxBackend:
             "confinement) are required. Parking closed — the verifier never runs "
             "unhooked/unsandboxed (FR-2.5, P5-A5)."
         )
+    exercise_judge_hook(judge_env)
     return backend
 
 
@@ -278,6 +390,55 @@ def discard_disposable_copy(repo_root: Path, copy: DisposableCopy) -> None:
 
 
 # --- collector-enumeration migration into the backend (P5-A7) --------------------
+# Engine-owned sentinels the backend wraps the collector's verbatim stdout in, so
+# the enumeration output is recovered deterministically from the agent turn — a
+# turn that omits/garbles the markers fails closed (parks), never a false "all
+# mapped" pass. The markers are engine constants, never agent-authored.
+_COLLECT_BEGIN = "<<<GAUNTLET-COLLECT-BEGIN>>>"
+_COLLECT_END = "<<<GAUNTLET-COLLECT-END>>>"
+
+
+def _capture_between_markers(text: str, begin: str, end: str) -> str | None:
+    """Return the text strictly between the first ``begin`` and the next ``end``,
+    or ``None`` if either marker is absent (fail-closed signal)."""
+    if not text:
+        return None
+    i = text.find(begin)
+    if i < 0:
+        return None
+    j = text.find(end, i + len(begin))
+    if j < 0:
+        return None
+    return text[i + len(begin) : j]
+
+
+def _run_backend_bash(
+    backend: SandboxBackend,
+    *,
+    prompt: str,
+    cwd: Path,
+    env: dict[str, str],
+    allowed_tools: tuple[str, ...],
+    timeout_s: float | None,
+):
+    """Launch the claude-code backend for one hook-confined Bash task in ``cwd``,
+    returning its ``AgentResult``. Isolated as a seam so the collector-in-backend
+    migration (review F-002) and its unit tests need no live CLI.
+
+    The adapter is pinned to the verifier sandbox posture (``--setting-sources
+    project`` so the judge hook fires, the copy-pointed stripped env), then narrowed
+    to the requested tool allowlist — for enumeration, ``Bash`` only."""
+    from gauntlet.adapters.claude_code import ClaudeCodeAdapter
+
+    kwargs: dict = {"executable": backend.claude_path}
+    if timeout_s is not None:
+        kwargs["timeout_s"] = timeout_s
+    adapter = ClaudeCodeAdapter(**kwargs)
+    configure_claude_verifier(adapter, env=env)
+    adapter.allowed_tools = list(allowed_tools)
+    return adapter.run(prompt, cwd=cwd)
+
+
 def enumerate_in_sandbox(
     backend: SandboxBackend,
     collector,
@@ -288,26 +449,73 @@ def enumerate_in_sandbox(
     mem_bytes: int | None = None,
 ) -> set[str]:
     """Run a collector's side-effect-free enumeration INSIDE the v1 sandbox backend
-    (review F-002 / P5-A7): in a **disposable copy** of the run worktree, so the
-    branch-authored ``conftest``/test code that ``pytest --collect-only`` imports
-    executes read-confined to the copy (never the real worktree) with the run's
-    judge env pointed at the copy root and a resource/wall-clock bound.
+    (review F-002 / P5-A7): in a **disposable copy** of the run worktree, executed
+    through the claude-code judge-hooked ``Bash`` tool — NOT as a bare engine
+    subprocess. ``pytest --collect-only`` imports the branch's ``conftest``/test
+    modules, so it executes branch-authored code; routing it through the backend's
+    Bash tool means every tool call is gated by the PreToolUse judge hook (network
+    default-deny, copy-root path confinement) with the judge repo-root pointed at
+    the copy, closing the gap where the interim bare subprocess ran the branch's
+    import-time code outside the hook boundary.
 
-    This is the migration off the P2-P4 interim posture (which ran enumeration as a
-    bare subprocess in the *real* worktree). Fail-closed park-on-failure is
-    preserved: a failed/timed-out/unparseable enumeration raises
-    :class:`~gauntlet.engine.collectors.CollectorEnumerationError`, and a
+    The collector's engine-owned command is handed to the backend to run verbatim;
+    its stdout is recovered deterministically from between :data:`_COLLECT_BEGIN`/
+    :data:`_COLLECT_END` markers and parsed by the collector's own parser.
+    Fail-closed park-on-failure is preserved end to end: a backend launch/timeout
+    failure, a turn that omits the markers, or an empty/unparseable enumeration
+    raises :class:`~gauntlet.engine.collectors.CollectorEnumerationError`, and a
     copy-creation failure raises :class:`CopyCreationError` — both park the gate.
-    The real worktree is untouched."""
+    A garbled agent turn therefore parks (recoverable), never passes the gate. The
+    real worktree is untouched.
+
+    ``mem_bytes`` is accepted for call-site compatibility but no longer applied: the
+    OS ``RLIMIT`` of the interim subprocess posture is superseded by the backend's
+    own wall-clock timeout and the judge hook's network/path denial."""
     from gauntlet.engine import collectors as _collectors
 
     copy = make_disposable_copy(worktree)
-    kwargs: dict = {"worktree": copy.path, "judge_env": verifier_env(judge_env, copy.path)}
-    if timeout_s is not None:
-        kwargs["timeout_s"] = timeout_s
-    if mem_bytes is not None:
-        kwargs["mem_bytes"] = mem_bytes
+    command = " ".join(shlex.quote(str(c)) for c in collector.command)
+    prompt = (
+        "You are the collector-enumeration runner in a DISPOSABLE sandbox copy of a "
+        "project. Using the Bash tool, run EXACTLY this one command and nothing "
+        f"else:\n\n    {command}\n\n"
+        "Then reply with ONLY the command's verbatim stdout, enclosed between these "
+        "two markers each on their own line:\n"
+        f"{_COLLECT_BEGIN}\n<the command's stdout, byte for byte>\n{_COLLECT_END}\n"
+        "Do not summarize, reorder, de-duplicate, or add commentary."
+    )
     try:
-        return collector.enumerate(**kwargs)
+        result = _run_backend_bash(
+            backend,
+            prompt=prompt,
+            cwd=copy.path,
+            env=verifier_env(judge_env, copy.path),
+            allowed_tools=("Bash",),
+            timeout_s=timeout_s,
+        )
+    except _collectors.CollectorEnumerationError:
+        raise
+    except Exception as exc:  # any backend launch/run failure fails closed
+        raise _collectors.CollectorEnumerationError(
+            f"{collector.kind} enumeration could not run inside the sandbox backend: "
+            f"{type(exc).__name__}: {exc} (fail closed — an absent enumeration is "
+            "never treated as 'all mapped')"
+        ) from exc
     finally:
         discard_disposable_copy(worktree, copy)
+
+    captured = _capture_between_markers(result.text or "", _COLLECT_BEGIN, _COLLECT_END)
+    if captured is None:
+        raise _collectors.CollectorEnumerationError(
+            f"{collector.kind} enumeration returned no marker-delimited output from "
+            "the sandbox backend (fail closed — an unreadable enumeration is never "
+            "treated as 'all mapped')"
+        )
+    ids = collector.parse(captured)
+    if not ids:
+        raise _collectors.CollectorEnumerationError(
+            f"{collector.kind} enumeration produced no parseable ids inside the "
+            "sandbox backend (fail closed — an unparseable enumeration is never "
+            "treated as 'all mapped')"
+        )
+    return ids

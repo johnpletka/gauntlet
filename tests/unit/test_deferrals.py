@@ -221,16 +221,25 @@ def test_gate_parks_on_phantom_deferral_in_commit_body(fixture_repo):
     assert "P42" in result.notes and "nonexistent" in result.notes
 
 
+def _stub_gate_enumeration(monkeypatch, ids):
+    """Stub the P5 sandbox-backed enumeration seam (post review-F-002 migration) so
+    the deferral-reconciliation path is exercised without a claude+judge backend:
+    a usable backend probe plus a fixed enumeration result."""
+    from gauntlet.engine import verify
+
+    monkeypatch.setattr(verify, "detect_backend",
+                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
+    monkeypatch.setattr(verify, "enumerate_in_sandbox",
+                        lambda backend, collector, **k: set(ids))
+
+
 def test_gate_passes_on_valid_deferral(fixture_repo, monkeypatch):
     """A deferral to a REAL later phase reconciles cleanly (the gate proceeds)."""
-    from gauntlet.engine import collectors
-
     ctx = _ctx(fixture_repo, iteration_item=_phase("P2", ["P2-A1"]))
     _write_plan(ctx, ["P1", "P2", "P5"])  # P5 exists
     _write_map(ctx, "P2", {"P2-A1": [{"kind": "pytest", "id": "tests/x.py::t"}]},
                deferrals=[{"text": "windows paths", "to_phase": "P5"}])
-    monkeypatch.setattr(collectors, "run_bounded_enumeration",
-                        lambda *a, **k: "tests/x.py::t\n")
+    _stub_gate_enumeration(monkeypatch, {"tests/x.py::t"})
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == DONE
 
@@ -239,14 +248,11 @@ def test_gate_passes_on_out_of_run_deferral(fixture_repo, monkeypatch):
     """An out-of-run deferral (to_phase 'post-v1' — the CLAUDE.md §7 / FUTURE.md
     convention, as P2's own shipped map uses) is NOT a phantom phase and clears
     the gate, even though 'post-v1' is not a plan phase."""
-    from gauntlet.engine import collectors
-
     ctx = _ctx(fixture_repo, iteration_item=_phase("P2", ["P2-A1"]))
     _write_plan(ctx, ["P1", "P2"])
     _write_map(ctx, "P2", {"P2-A1": [{"kind": "pytest", "id": "tests/x.py::t"}]},
                deferrals=[{"text": "non-pytest collectors", "to_phase": "post-v1"}])
-    monkeypatch.setattr(collectors, "run_bounded_enumeration",
-                        lambda *a, **k: "tests/x.py::t\n")
+    _stub_gate_enumeration(monkeypatch, {"tests/x.py::t"})
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == DONE
 
@@ -254,13 +260,10 @@ def test_gate_passes_on_out_of_run_deferral(fixture_repo, monkeypatch):
 def test_gate_no_plan_when_no_deferrals(fixture_repo, monkeypatch):
     """A phase with no deferral never loads (or fails on) the plan list — the
     plain P2 gate path is unchanged when nothing needs reconciling."""
-    from gauntlet.engine import collectors
-
     ctx = _ctx(fixture_repo, iteration_item=_phase("P2", ["P2-A1"]))
     # deliberately NO plan.md written; no deferrals in the map
     _write_map(ctx, "P2", {"P2-A1": [{"kind": "pytest", "id": "tests/x.py::t"}]})
-    monkeypatch.setattr(collectors, "run_bounded_enumeration",
-                        lambda *a, **k: "tests/x.py::t\n")
+    _stub_gate_enumeration(monkeypatch, {"tests/x.py::t"})
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == DONE
 

@@ -78,6 +78,34 @@ def test_verifier_env_points_judge_root_at_copy(tmp_path):
     assert "PATH" in env and env["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
+def test_verifier_env_drops_secrets_from_judge_env(tmp_path):
+    """FR-2.5 / review F-003: verifier_env re-adds ONLY the judge hook-infrastructure
+    keys, never the caller's whole judge_env — a secret-shaped var handed in
+    judge_env (as the integration harness passes ``dict(os.environ)``) is dropped,
+    not copied back over the top of the allowlist strip."""
+    copy = tmp_path / "copy"
+    judge_env = {
+        TOKEN_ENV_VAR: "tok",
+        "GAUNTLET_JUDGE_URL": "http://127.0.0.1:9",
+        "GAUNTLET_JUDGE_MODE": "unattended",
+        "GAUNTLET_RUN_ID": "r1",
+        # secret-shaped vars a caller / os.environ could carry:
+        "ANTHROPIC_API_KEY": "sk-secret", "AWS_SECRET_ACCESS_KEY": "aws",
+        "OPENAI_API_KEY": "sk-2", "MY_DEPLOY_TOKEN": "t",
+    }
+    env = verify.verifier_env(judge_env, copy)
+    # the hook infrastructure the judge needs survives
+    assert env[TOKEN_ENV_VAR] == "tok"
+    assert env["GAUNTLET_JUDGE_URL"] == "http://127.0.0.1:9"
+    assert env["GAUNTLET_JUDGE_MODE"] == "unattended"
+    assert env["GAUNTLET_RUN_ID"] == "r1"
+    assert env[REPO_ROOT_ENV_VAR] == str(copy)
+    # every secret-shaped var in judge_env is dropped, not re-added
+    for leaked in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY",
+                   "MY_DEPLOY_TOKEN"):
+        assert leaked not in env
+
+
 def test_detect_backend_none_without_claude(monkeypatch):
     """FR-2.5 / P5-A5: with no claude-code CLI the probe finds no backend."""
     monkeypatch.setattr(verify.shutil, "which", lambda name: None)
@@ -95,6 +123,58 @@ def test_detect_backend_none_without_active_judge(monkeypatch):
     with pytest.raises(verify.SandboxUnavailableError):
         verify.probe_backend({"GAUNTLET_JUDGE_MODE": "unattended"})
     assert verify.detect_backend(_JUDGE_ENV) is not None  # claude + judge → usable
+
+
+_PROBE_ENV = {TOKEN_ENV_VAR: "tok", "GAUNTLET_RUN_ID": "r1"}
+
+
+def test_probe_backend_confirms_judge_enforcement_path(monkeypatch):
+    """review F-001 / P5-A5: probe_backend does more than the passive presence
+    check — it actively exercises the run's judge enforcement path (the service the
+    PreToolUse hook calls) with an authenticated decision round-trip and returns a
+    backend only when the judge answers this run with a well-formed decision."""
+    monkeypatch.setattr(verify.shutil, "which", lambda name: "/bin/claude")
+    calls = {}
+
+    def _ok(url, token, body):
+        calls.update(url=url, token=token, body=body)
+        return {"decision": "deny", "source": "policy", "rationale": "canary"}
+
+    monkeypatch.setattr(verify, "_judge_roundtrip", _ok)
+    backend = verify.probe_backend(_PROBE_ENV)
+    assert backend.claude_path == "/bin/claude"
+    assert calls["token"] == "tok"
+    assert calls["body"]["run_id"] == "r1"   # bound to THIS run
+
+
+def test_probe_backend_parks_when_judge_unreachable(monkeypatch):
+    """review F-001 / FR-2.5: a claude binary + a token string is NOT enough — if
+    the judge enforcement service is unreachable, the verifier would run unconfined,
+    so the probe parks closed."""
+    monkeypatch.setattr(verify.shutil, "which", lambda name: "/bin/claude")
+
+    def _boom(url, token, body):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(verify, "_judge_roundtrip", _boom)
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.probe_backend(_PROBE_ENV)
+
+
+def test_exercise_judge_hook_parks_on_malformed_decision(monkeypatch):
+    """review F-001: a judge that answers but returns no well-formed permission
+    decision leaves enforcement unconfirmed — park closed."""
+    monkeypatch.setattr(verify, "_judge_roundtrip", lambda url, token, body: {"nope": 1})
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.exercise_judge_hook(_PROBE_ENV)
+
+
+def test_exercise_judge_hook_parks_without_run_id():
+    """review F-001: a token but no run id — the enforcement path cannot be bound to
+    this run, so the probe parks closed rather than exercising a foreign/absent
+    judge."""
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.exercise_judge_hook({TOKEN_ENV_VAR: "tok"})
 
 
 def test_make_disposable_copy_fails_closed(monkeypatch, tmp_path):
@@ -339,6 +419,30 @@ def test_stubbed_non_firing_hook_parks_cycle(fixture_repo, monkeypatch, tmp_path
     result, man, run_dir = _drive_single(repo, sha, adapters)
     assert result.status == M.PARKED
     assert "FR-2.5" in result.notes
+    assert adapters["verifier"].calls == []
+
+
+def test_verifier_launch_failure_parks_not_crashes(fixture_repo, monkeypatch, tmp_path):
+    """review F-004 / FR-2.3: a verifier setup/launch fault BEFORE the sub-step
+    returns (here: verifier-posture configuration) parks the cycle fail-closed,
+    rather than escaping as an internal crash or falling through to dereference an
+    unbound ``review`` in the post-run block."""
+    repo, sha = _code_repo(fixture_repo)
+    _stub_sandbox(monkeypatch, tmp_path)
+
+    def _boom(adapter, *, env):
+        raise RuntimeError("adapter misconfigured: cannot launch verifier")
+
+    monkeypatch.setattr(verify, "configure_claude_verifier", _boom)
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW()),
+        "verifier": SeqAdapter(REVIEW(BEHAV("F-b1"))),   # must never be reached
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    result, man, run_dir = _drive_single(repo, sha, adapters)
+    assert result.status == M.PARKED
+    assert "fail-closed" in result.notes and "FR-2.3" in result.notes
     assert adapters["verifier"].calls == []
 
 

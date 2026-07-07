@@ -1613,6 +1613,22 @@ def _run_verifier(
                 "skipped verification"
             ),
         )) from exc
+    except Exception as exc:
+        # Any OTHER setup/launch/configuration fault (adapter construction,
+        # verifier-posture pinning, env build) before the sub-step returns is still
+        # a sandbox-launch failure (FR-2.3): park closed. Without this, such a fault
+        # would either escape as an internal crash or fall through to the post-run
+        # block below and dereference an unbound `review` (review F-004). `review`
+        # is bound only on a successful `_run_sub`, so the post-run processing is
+        # unreachable on any launch failure.
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.3): the verifier sub-step could "
+                f"not be launched in round {rnd} ({type(exc).__name__}: {exc}); a "
+                "sandbox-launch failure parks the cycle, never crashes past the gate"
+            ),
+        )) from exc
     finally:
         verify.discard_disposable_copy(ctx.repo_root, copy)
 

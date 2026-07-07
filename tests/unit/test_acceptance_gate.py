@@ -420,10 +420,31 @@ def test_gate_parks_when_no_sandbox_backend(fixture_repo, monkeypatch):
     assert "no usable sandbox backend" in result.notes
 
 
+class _FakeCollector:
+    """A collector stand-in exposing the engine-owned ``command``/``parse`` the P5
+    backend-routed enumeration uses (review F-002)."""
+
+    kind = "pytest"
+    command = ("pytest", "--collect-only", "-q")
+
+    def parse(self, stdout):
+        return {ln.strip() for ln in stdout.splitlines() if ln.strip()}
+
+
+def _marker_result(stdout: str):
+    """A fake backend AgentResult wrapping ``stdout`` in the engine collect markers."""
+    from gauntlet.adapters.base import AgentResult
+
+    return AgentResult(
+        text=f"{verify._COLLECT_BEGIN}\n{stdout}\n{verify._COLLECT_END}", exit_code=0
+    )
+
+
 def test_enumerate_in_sandbox_runs_collector_in_disposable_copy(monkeypatch, tmp_path):
-    """P5-A7 (migration): enumeration runs INSIDE the backend — in a disposable COPY
-    of the run worktree (not the real worktree / interim bare subprocess) — with
-    the judge repo-root pointed at the copy so the hook confines the collection."""
+    """P5-A7 (migration): enumeration runs INSIDE the backend — through the
+    claude-code judge-hooked Bash tool, in a disposable COPY of the run worktree
+    (not the real worktree / interim bare subprocess), confined to Bash only with
+    the judge repo-root pointed at the copy so the hook gates the collection."""
     copy = tmp_path / "wt-copy"
     copy.mkdir()
     monkeypatch.setattr(verify, "make_disposable_copy",
@@ -433,11 +454,11 @@ def test_enumerate_in_sandbox_runs_collector_in_disposable_copy(monkeypatch, tmp
                         lambda repo, c: discarded.setdefault("path", c.path))
     seen = {}
 
-    class _FakeCollector:
-        def enumerate(self, *, worktree, judge_env, **k):
-            seen["worktree"] = worktree
-            seen["judge_env"] = judge_env
-            return {"tests/unit/x.py::t"}
+    def _fake_launch(backend, *, prompt, cwd, env, allowed_tools, timeout_s):
+        seen.update(cwd=cwd, env=env, allowed_tools=allowed_tools, prompt=prompt)
+        return _marker_result("tests/unit/x.py::t")
+
+    monkeypatch.setattr(verify, "_run_backend_bash", _fake_launch)
 
     backend = verify.SandboxBackend(claude_path="claude")
     real_worktree = tmp_path / "real"
@@ -447,19 +468,24 @@ def test_enumerate_in_sandbox_runs_collector_in_disposable_copy(monkeypatch, tmp
         judge_env={"GAUNTLET_JUDGE_TOKEN": "tok"},
     )
     assert ids == {"tests/unit/x.py::t"}
-    # collection ran in the COPY, not the real worktree (the P5 jail)
-    assert seen["worktree"] == copy
-    assert seen["worktree"] != real_worktree
-    # the judge repo-root boundary is pointed at the copy (hook confines reads)
-    assert seen["judge_env"][verify.REPO_ROOT_ENV_VAR] == str(copy)
+    # collection ran through the backend, in the COPY, not the real worktree
+    assert seen["cwd"] == copy
+    assert seen["cwd"] != real_worktree
+    # Bash-only tool allowlist, and the judge repo-root pointed at the copy
+    assert list(seen["allowed_tools"]) == ["Bash"]
+    assert seen["env"][verify.REPO_ROOT_ENV_VAR] == str(copy)
+    # the engine-owned collector command was handed to the backend to run
+    assert "pytest --collect-only" in seen["prompt"]
     # the copy is always torn down
     assert discarded["path"] == copy
 
 
 def test_enumerate_in_sandbox_fails_closed_and_discards_copy(monkeypatch, tmp_path):
-    """P5-A7: a failed enumeration inside the backend propagates
-    CollectorEnumerationError (fail-closed park preserved) AND still discards the
-    disposable copy."""
+    """P5-A7: a failed enumeration inside the backend (any launch/run fault)
+    propagates CollectorEnumerationError (fail-closed park preserved) AND still
+    discards the disposable copy."""
+    from gauntlet.adapters.base import AdapterError
+
     copy = tmp_path / "wt-copy"
     copy.mkdir()
     monkeypatch.setattr(verify, "make_disposable_copy",
@@ -468,15 +494,35 @@ def test_enumerate_in_sandbox_fails_closed_and_discards_copy(monkeypatch, tmp_pa
     monkeypatch.setattr(verify, "discard_disposable_copy",
                         lambda repo, c: discarded.setdefault("done", True))
 
-    class _BoomCollector:
-        def enumerate(self, **k):
-            raise CollectorEnumerationError("collector enumeration exited 2 (fail closed)")
+    def _boom_launch(backend, **k):
+        raise AdapterError("claude backend failed to launch")
+
+    monkeypatch.setattr(verify, "_run_backend_bash", _boom_launch)
 
     backend = verify.SandboxBackend(claude_path="claude")
     with pytest.raises(CollectorEnumerationError, match="fail closed"):
-        verify.enumerate_in_sandbox(backend, _BoomCollector(), worktree=tmp_path,
+        verify.enumerate_in_sandbox(backend, _FakeCollector(), worktree=tmp_path,
                                     judge_env={})
     assert discarded.get("done") is True  # copy torn down even on failure
+
+
+def test_enumerate_in_sandbox_parks_on_missing_markers(monkeypatch, tmp_path):
+    """P5-A7 / F-002: a backend turn that omits the engine collect markers (garbled
+    or empty output) fails closed — an unreadable enumeration is never read as 'no
+    ids' or 'all mapped', it parks."""
+    from gauntlet.adapters.base import AgentResult
+
+    copy = tmp_path / "wt-copy"
+    copy.mkdir()
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
+    monkeypatch.setattr(verify, "_run_backend_bash",
+                        lambda backend, **k: AgentResult(text="I ran it; looks fine.", exit_code=0))
+
+    with pytest.raises(CollectorEnumerationError, match="marker"):
+        verify.enumerate_in_sandbox(verify.SandboxBackend(claude_path="claude"),
+                                    _FakeCollector(), worktree=tmp_path, judge_env={})
 
 
 # --- FR-3.2: unregistered collector rejected at pipeline LOAD (P2-A5) ---------
