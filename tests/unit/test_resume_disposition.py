@@ -96,6 +96,10 @@ class DispositionAdapter:
         self.text = text
         self.prompts: list[str] = []
         self.schemas: list[dict | None] = []
+        # Mirror a real adapter's timeout knob (default 600s) so the engine's
+        # `adapter.timeout_s = <resolved>` is observable — the two-phase resume
+        # must re-apply the profile step timeout to the rebuilt primary adapter.
+        self.timeout_s = 600.0
 
     def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
         self.prompts.append(prompt)
@@ -660,6 +664,40 @@ def test_routed_proceed_classifies_on_mechanic_then_implements_on_builder(tmp_pa
     assert factory.built == ["mechanic", "builder"]
     assert (repo / "feature.py").read_text() == "implemented\n"  # builder's work
     assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+
+
+TIMEOUT_CONFIG = """
+base_branch: main
+run_root: runs
+agents:
+  builder:
+    adapter: claude-code
+    step_timeout_s: 5400
+  mechanic: {adapter: api, model: gpt-5-mini}
+"""
+
+
+def test_routed_proceed_reapplies_step_timeout_to_rebuilt_builder(tmp_path):
+    # Regression (resume-path timeout): on a two-phase `--response` proceed the
+    # primary adapter is rebuilt AFTER the phase-1 disposition adapter, so it must
+    # re-apply the profile's `step_timeout_s`. Without the re-apply the builder ran
+    # on the adapter's 600s default and a long build halted mid-phase (the
+    # fresh-launch path applies it, so the re-drive must too).
+    repo, mgr = _build_repo(
+        tmp_path / "repo", DISPOSITION_PIPELINE, config=TIMEOUT_CONFIG
+    )
+    _drive_to_conflict(repo, mgr, DISPOSITION_PIPELINE)
+    mechanic = DispositionAdapter(_disposition("proceed_in_place"), write=False)
+    builder = DispositionAdapter(_disposition("proceed_in_place"), write=True)
+    factory = _ByNameFactory({"mechanic": mechanic, "builder": builder})
+    status = mgr.resume(
+        "demo", response="Ratify; proceed.",
+        use_judge=False, adapter_factory=factory, clock=_clock(),
+    )
+    assert status == M.RUN_DONE
+    assert factory.built == ["mechanic", "builder"]
+    # the rebuilt builder carries the profile step timeout, not the 600s default
+    assert builder.timeout_s == 5400
 
 
 def test_routed_malformed_mechanic_disposition_fails_without_builder(tmp_path):

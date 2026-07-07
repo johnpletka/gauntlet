@@ -437,6 +437,14 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         spend = _UsageAccumulator()
         spend.add(result.usage, agent=emit_agent)  # the disposition_agent's spend
         adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
+        # FR-3.3: re-apply the resolved step timeout to this freshly-built primary
+        # adapter. The `timeout` above was applied to the phase-1 disposition
+        # adapter (a different, often cheaper profile); this new adapter defaults to
+        # the adapter's DEFAULT_TIMEOUT_S and would otherwise halt a long builder
+        # step mid-phase on a `--response` resume — the fresh-launch path applies it,
+        # so the two-phase re-drive must too.
+        if timeout is not None and hasattr(adapter, "timeout_s"):
+            adapter.timeout_s = timeout
         try:
             result = _invoke(prompt, ctx.record.session_id, log_suffix="-implement")
         except SessionNotFoundError as exc:
