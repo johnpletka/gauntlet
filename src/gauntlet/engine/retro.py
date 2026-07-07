@@ -145,19 +145,25 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
 
 
 def _record_run_declines(ctx: StepContext) -> int:
-    """Append this run's reasoned triage declines to the registry (FR-5.2).
+    """Append this run's reasoned human/triage declines to the registry (FR-5.2).
 
-    Reconstructs ``(findings, verdicts)`` per round from the run's per-round
+    Reconstructs ``(findings, verdicts, by)`` per round from the run's per-round
     artifacts (the same lossless source :func:`build_run_summary` walks), then
-    hands them to the registry. Fail-open: any error is swallowed with the
-    evidence persisted — cross-run learning must never strand a completed run."""
+    hands them to the registry. Each round is tagged with **who** declined: a
+    decline in a cycle that was resolved under an authoritative human
+    ``--response`` (an FR-10.4/10.5 override/escalation decision, recorded on the
+    cycle's ``human_responses``) is a *human* decline (``by="human"``); every
+    other decline is a triage decline. This is the recording path for human
+    declines the spec requires alongside triage declines. Fail-open: any error is
+    swallowed with the evidence persisted — cross-run learning must never strand a
+    completed run."""
     from datetime import datetime, timezone
 
     from gauntlet.engine import registry as reg
 
     try:
         rounds = [
-            (rnd["findings"], rnd["verdicts"])
+            (rnd["findings"], rnd["verdicts"], "human" if cyc["human_resolved"] else "triage")
             for cyc in _collect_cycles(ctx)
             for rnd in cyc["rounds"]
         ]
@@ -321,6 +327,10 @@ def _collect_cycles(ctx: StepContext) -> list[dict[str, Any]]:
             cycles.append({
                 "step": leaf, "phase": _phase_for_step(man, rec.id),
                 "notes": rec.notes or "", "rounds": rounds,
+                # A cycle carrying an authoritative human `--response` was
+                # resolved by a human (FR-10.4/10.5), so its reasoned declines are
+                # human declines for the registry (FR-5.2).
+                "human_resolved": bool(getattr(rec, "human_responses", None)),
             })
     return cycles
 

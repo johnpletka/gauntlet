@@ -70,7 +70,8 @@ def _capture_diff(repo: Path, rel: str, new_content: str) -> str:
     return diff
 
 
-def _run_retro(repo: Path, adapters: dict, *, feedback=None, step_extra=None):
+def _run_retro(repo: Path, adapters: dict, *, feedback=None, step_extra=None,
+               cycle_human_responses=None):
     step = {
         "id": "retrospective", "type": "retrospective",
         "agents": ["builder", "reviewer"], "proposer": "triage",
@@ -94,6 +95,7 @@ def _run_retro(repo: Path, adapters: dict, *, feedback=None, step_extra=None):
         metrics={"rounds": 1, "findings_total": 2, "accepted_total": 1,
                  "verdict_counts": {"legitimate": 1, "bikeshedding": 1},
                  "confirm_counts": {"resolved": 1}},
+        human_responses=cycle_human_responses or [],
     ))
     orch = Orchestrator(
         repo_root=repo, run_dir=run_dir, artifact_root=repo,
@@ -188,6 +190,38 @@ def test_retro_records_declined_findings_to_registry(tmp_path: Path):
     # Idempotent: re-running retro for the same run id appends nothing.
     _run_retro(repo, _adapters(repo))
     assert len(reg.load_registry(reg.registry_path(repo, "."))) == 1
+
+
+def test_retro_records_human_decline_when_cycle_human_resolved(tmp_path: Path):
+    """F-003: a reasoned decline in a cycle resolved under an authoritative human
+    `--response` (FR-10.4/10.5) is recorded with ``by="human"``, not ``by="triage"``
+    — the registry records human declines, not triage declines alone."""
+    from gauntlet.engine import registry as reg
+
+    repo = _retro_repo(tmp_path)
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    finding = {"id": "F-001", "severity": "blocking", "category": "correctness",
+               "location": "src.py:5", "claim": "escalated blocker the operator dismissed",
+               "evidence": "e", "suggested_fix": None}
+    _seed_cycle_round(run_dir, finding,
+                      {"finding_id": "F-001", "verdict": "not_applicable",
+                       "action": "reject", "reasoning": "operator ruled out of scope"})
+
+    human_responses = [M.HumanResponse(
+        response_id="resp-1", response_text="out of scope for v1; dismiss it",
+        timestamp="2026-01-01T00:00:00Z", user="operator",
+        response_attempt=1, state="consumed",
+    )]
+    status, man, _ = _run_retro(repo, _adapters(repo),
+                                cycle_human_responses=human_responses)
+    assert status == M.RUN_DONE
+
+    entries = reg.load_registry(reg.registry_path(repo, "."))
+    assert len(entries) == 1
+    assert entries[0].by == "human"
+    assert entries[0].verdict == "not_applicable"
+    assert man.record("retrospective").metrics["declines_recorded"] == 1
 
 
 def _lens_adapters(repo: Path):

@@ -94,16 +94,30 @@ def run_verifier_legit(manifest: dict[str, Any]) -> int | None:
 
 
 # --- deterministic pipeline transforms ---------------------------------------
+# Both YAML list/mapping styles must be handled, because the panel/verifier are
+# *data under ratification governance*: a ratified reformat (or an adopter's own
+# pipeline) may render the reviewer panel as a block sequence and the verifier as
+# a block mapping rather than the shipped flow style, and a trigger that silently
+# emits nothing against a block-style pipeline is a fail-open governance gap. The
+# transforms therefore try the flow form first and fall back to a block-aware,
+# byte-preserving surgery (pyyaml would round-trip-reformat the whole document and
+# bloat the diff), keeping the resulting unified diff minimal in either style.
 _REVIEWERS_RE = re.compile(r"reviewers:\s*\[(?P<body>.*?)\]", re.DOTALL)
 _MEMBER_RE = re.compile(r"\{[^{}]*\}")
+# A block-style key line: `<indent>reviewers:` with nothing after the colon but
+# optional trailing whitespace/comment (a value after the colon is flow/scalar).
+_REVIEWERS_KEY_RE = re.compile(r"^(?P<indent>[ \t]*)reviewers:[ \t]*(#.*)?$")
+_VERIFIER_KEY_RE = re.compile(r"^(?P<indent>[ \t]*)verifier:[ \t]*(#.*)?$")
 
 
-def remove_reviewer(text: str, profile: str) -> str | None:
-    """Remove the panel member with ``profile`` from every ``reviewers: [...]``
-    flow list in ``text``. Returns the new text, or ``None`` if the profile was
-    not found in any panel (nothing to shrink)."""
+def _indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _remove_flow_reviewer(text: str, prof_re: re.Pattern[str]) -> str | None:
+    """Drop the ``profile``-matching member from every ``reviewers: [...]`` flow
+    list. Returns new text, or ``None`` if no flow list contained the profile."""
     changed = False
-    prof_re = re.compile(rf"profile:\s*{re.escape(profile)}\b")
 
     def _repl(m: re.Match[str]) -> str:
         nonlocal changed
@@ -118,14 +132,95 @@ def remove_reviewer(text: str, profile: str) -> str | None:
     return new if changed else None
 
 
+def _remove_block_reviewer(text: str, prof_re: re.Pattern[str]) -> str | None:
+    """Drop the ``profile``-matching member from every block-style ``reviewers:``
+    sequence (``- profile: ...`` / ``- {profile: ...}`` items). Byte-preserving:
+    every other line is kept verbatim so the unified diff removes only the matched
+    item. Returns new text, or ``None`` if no block list contained the profile."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    changed = False
+    i, n = 0, len(lines)
+    while i < n:
+        km = _REVIEWERS_KEY_RE.match(lines[i].rstrip("\n"))
+        if not km:
+            out.append(lines[i])
+            i += 1
+            continue
+        key_indent = len(km.group("indent"))
+        out.append(lines[i])
+        i += 1
+        item_indent: int | None = None
+        # Walk the sequence items nested under this `reviewers:` key.
+        while i < n:
+            raw = lines[i]
+            if raw.strip() == "":
+                break  # a blank line ends the block sequence
+            indent = _indent_width(raw)
+            if indent <= key_indent:
+                break  # dedent: the sequence ended
+            if re.match(r"^[ \t]*-[ \t]", raw) and item_indent in (None, indent):
+                item_indent = indent
+                # An item spans its `-` line plus every more-indented line under it.
+                item = [raw]
+                j = i + 1
+                while j < n and lines[j].strip() != "" and _indent_width(lines[j]) > item_indent:
+                    item.append(lines[j])
+                    j += 1
+                if any(prof_re.search(l) for l in item):
+                    changed = True  # drop the whole item
+                else:
+                    out.extend(item)
+                i = j
+            else:
+                out.append(raw)  # not an item boundary — keep verbatim
+                i += 1
+    return "".join(out) if changed else None
+
+
+def remove_reviewer(text: str, profile: str) -> str | None:
+    """Remove the panel member with ``profile`` from the pipeline's ``reviewers:``
+    list — flow (``reviewers: [{profile: ...}]``) or block (``- profile: ...``)
+    style. Returns the new text, or ``None`` if the profile was not found in any
+    panel (nothing to shrink)."""
+    prof_re = re.compile(rf"profile:\s*{re.escape(profile)}\b")
+    return _remove_flow_reviewer(text, prof_re) or _remove_block_reviewer(text, prof_re)
+
+
 _VERIFIER_LINE_RE = re.compile(r"^[ \t]*verifier:\s*\S+,?[ \t]*\n", re.MULTILINE)
 
 
+def _remove_block_verifier(text: str) -> str | None:
+    """Remove a block-style ``verifier:`` mapping (the ``verifier:`` key line plus
+    its nested indented fields) from a pipeline. Byte-preserving. Returns new text,
+    or ``None`` if no block-style verifier mapping is present."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    changed = False
+    i, n = 0, len(lines)
+    while i < n:
+        km = _VERIFIER_KEY_RE.match(lines[i].rstrip("\n"))
+        if not km:
+            out.append(lines[i])
+            i += 1
+            continue
+        key_indent = len(km.group("indent"))
+        changed = True
+        i += 1  # drop the `verifier:` key line
+        # Drop the nested mapping (every more-indented, non-blank line under it).
+        while i < n and lines[i].strip() != "" and _indent_width(lines[i]) > key_indent:
+            i += 1
+    return "".join(out) if changed else None
+
+
 def remove_verifier(text: str) -> str | None:
-    """Remove the ``verifier:`` sub-step line(s) from a pipeline, reverting the
-    verifier from default to opt-in. Returns new text, or ``None`` if absent."""
-    new, n = _VERIFIER_LINE_RE.subn("", text)
-    return new if n else None
+    """Remove the ``verifier:`` sub-step from a pipeline, reverting the verifier
+    from default to opt-in — a scalar ``verifier: <profile>`` line or a block
+    ``verifier:`` mapping. Returns new text, or ``None`` if absent."""
+    new, count = _VERIFIER_LINE_RE.subn("", text)
+    if count:
+        return new
+    return _remove_block_verifier(text)
 
 
 def _unified_diff(rel: str, old: str, new: str) -> str:

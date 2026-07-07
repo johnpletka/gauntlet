@@ -240,3 +240,35 @@ def test_build_entries_records_only_reasoned_declines(repo: Path):
     assert entries[0].fingerprint == reg.finding_fingerprint(findings[0])
     assert entries[0].verdict == "bikeshedding"
     assert entries[0].prompt_version == reg.triage_version(repo, ".")
+    assert entries[0].by == "triage"  # default decliner
+
+
+def test_human_decline_recorded_and_injected(repo: Path):
+    """A human decline (F-003) is recorded with ``by="human"`` and full current
+    provenance, then injected as advisory precedent for a matching finding — the
+    recording path is not triage-only."""
+    from gauntlet.logging.redact import RedactingWriter
+
+    finding = _finding(id="F-007", category="correctness",
+                       claim="the escalated blocking finding a human dismissed as out of scope")
+    verdicts = [{"finding_id": "F-007", "verdict": "not_applicable",
+                 "reasoning": "operator ruled this out of scope for v1"}]
+    entries = reg.build_entries_from_verdicts(
+        [finding], verdicts, repo=reg.repo_name(repo), prd_family="fam-a",
+        repo_root=repo, asset_root=".", run_id="run-h", at="2026-01-01T00:00:00Z",
+        by="human",
+    )
+    assert len(entries) == 1 and entries[0].by == "human"
+
+    path = reg.registry_path(repo, ".")
+    reg.append_entries(entries, path, RedactingWriter())
+    loaded = reg.load_registry(path)
+    assert loaded[0].by == "human"
+
+    # It injects as advisory precedent for a fingerprint-matching future finding.
+    blocks = reg.precedents_by_finding(
+        [finding], loaded, repo=reg.repo_name(repo), prd_family="fam-a",
+        repo_root=repo, asset_root=".",
+    )
+    assert finding["id"] in blocks
+    assert "prior verdict: not_applicable" in blocks[finding["id"]]

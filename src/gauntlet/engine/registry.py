@@ -408,18 +408,23 @@ def append_entries(entries: Iterable[DeclinedEntry], path: Path, writer: Any) ->
 
 def record_run_declines(
     ctx: Any,
-    rounds: Iterable[tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    rounds: Iterable[tuple[list[dict[str, Any]], list[dict[str, Any]], str]],
     *,
     at: str,
-    by: str = "triage",
 ) -> int:
-    """Record this run's reasoned triage declines to the cross-run registry.
+    """Record this run's reasoned declines to the cross-run registry (FR-5.2).
 
-    ``rounds`` is an iterable of ``(findings, verdicts)`` pairs (one per review
-    round) — the caller (retro) reconstructs these from the run's per-round
-    artifacts. Provenance is stamped from the current worktree. **Idempotent by
-    run id:** if the registry already holds an entry for ``ctx.manifest.run_id``
-    (a retro re-run on resume), nothing is appended. Returns the count appended.
+    ``rounds`` is an iterable of ``(findings, verdicts, by)`` triples (one per
+    review round) — the caller (retro) reconstructs these from the run's per-round
+    artifacts and tags each round with **who** declined: ``"human"`` when the
+    cycle was resolved under an authoritative human ``--response`` (an FR-10.4/
+    10.5 override/escalation decision), else ``"triage"``. This is how a
+    human-directed decline enters the registry with ``by="human"`` provenance —
+    the spec records declines from *both* a human and triage, not triage alone.
+
+    Provenance is stamped from the current worktree. **Idempotent by run id:** if
+    the registry already holds an entry for ``ctx.manifest.run_id`` (a retro
+    re-run on resume), nothing is appended. Returns the count appended.
     """
     path = registry_path(ctx.repo_root, ctx.config.asset_root)
     if any(e.run_id == ctx.manifest.run_id for e in load_registry(path)):
@@ -428,14 +433,17 @@ def record_run_declines(
     prd_family = ctx.manifest.slug
     batch: list[DeclinedEntry] = []
     seen: set[str] = set()
-    for findings, verdicts in rounds:
+    for findings, verdicts, by in rounds:
         entries = build_entries_from_verdicts(
             findings, verdicts, repo=repo, prd_family=prd_family,
             repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
             run_id=ctx.manifest.run_id, at=at, by=by,
         )
         for e in entries:
-            key = f"{e.fingerprint}\x00{e.verdict}\x00{e.lens_version}"
+            # `by` is part of the dedup key so a human ratification of a finding
+            # a prior autonomous cycle also declined is kept distinctly (a human
+            # decline is stronger precedent than an autonomous one).
+            key = f"{e.fingerprint}\x00{e.verdict}\x00{e.lens_version}\x00{e.by}"
             if key not in seen:
                 seen.add(key)
                 batch.append(e)

@@ -63,6 +63,59 @@ def test_remove_verifier_absent_returns_none():
     assert gov.remove_verifier("no verifier here\n") is None
 
 
+# --- block-style transforms (F-001/F-002 regression) -------------------------
+# A ratified reformat (or an adopter's own pipeline) may render the panel as a
+# block sequence and the verifier as a block mapping. A trigger that silently
+# emits nothing against block style would be a fail-open governance gap.
+PANEL_BLOCK_TEXT = (
+    "      - id: c\n"
+    "        type: adversarial_cycle\n"
+    "        reviewers:\n"
+    "          - profile: reviewer\n"
+    "            lens: correctness\n"
+    "          - profile: gemini\n"
+    "            lens: spec-coverage\n"
+    "        verifier:\n"
+    "          profile: verifier\n"
+    "          lens: behavioral\n"
+    "        max_rounds: 2\n"
+)
+
+
+def test_remove_reviewer_drops_block_member():
+    new = gov.remove_reviewer(PANEL_BLOCK_TEXT, "gemini")
+    assert new is not None
+    assert "gemini" not in new
+    assert "spec-coverage" not in new           # gemini's whole item is gone
+    assert "profile: reviewer" in new           # the peer survives
+    assert "lens: correctness" in new
+    assert "profile: verifier" in new           # unrelated block untouched
+
+
+def test_remove_reviewer_block_absent_returns_none():
+    assert gov.remove_reviewer(PANEL_BLOCK_TEXT, "nobody") is None
+
+
+def test_remove_reviewer_block_flow_items():
+    text = (
+        "        reviewers:\n"
+        "          - {profile: reviewer, lens: correctness}\n"
+        "          - {profile: gemini, lens: spec-coverage}\n"
+    )
+    new = gov.remove_reviewer(text, "gemini")
+    assert new is not None and "gemini" not in new
+    assert "profile: reviewer" in new
+
+
+def test_remove_verifier_drops_block_mapping():
+    new = gov.remove_verifier(PANEL_BLOCK_TEXT)
+    assert new is not None
+    assert "verifier:" not in new
+    assert "lens: behavioral" not in new        # the nested mapping is gone too
+    assert "profile: reviewer" in new           # reviewers block untouched
+    assert "max_rounds: 2" in new
+
+
 # --- corpus metric extraction ------------------------------------------------
 def _ens_run(run_id: str, members: dict[str, int]) -> dict:
     """A manifest dict with one cycle step carrying per-member unique_legit."""
@@ -203,3 +256,72 @@ def test_build_governance_proposals_materializes_ratifiable(tmp_path: Path):
     assert (repo / "pipelines" / "standard.yaml").read_text() == before
     # The proposals are written under the run's retro/proposals dir.
     assert (ctx.run_dir / "retro" / "proposals").exists()
+
+
+# A block-style rendering of the shipped cycle step: the panel is a block
+# sequence and the verifier a block mapping. The §9 triggers must produce valid
+# (git apply-checked) proposals against it exactly as they do the flow style.
+_BLOCK_PIPELINE = """name: standard
+version: 1
+
+stages:
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - id: impl-cycle
+        type: adversarial_cycle
+        mode: code_review
+        triager: triage
+        fixer: builder
+        reviewers:
+          - profile: reviewer
+            lens: correctness
+          - profile: gemini
+            lens: spec-coverage
+        verifier:
+          profile: verifier
+          lens: behavioral
+        escalation_agent: escalation
+        max_rounds: 2
+        review_prompt: prompts/review-code.md
+"""
+
+
+def _block_pipeline_repo(tmp_path: Path) -> Path:
+    """A git repo whose ``standard.yaml`` uses block-style reviewers + verifier."""
+    repo = _pipeline_repo(tmp_path)
+    (repo / "pipelines" / "standard.yaml").write_text(_BLOCK_PIPELINE)
+    git(repo, "commit", "-qam", "block-style pipeline")
+    return repo
+
+
+def test_governance_fires_against_block_style_pipeline(tmp_path: Path):
+    """F-001/F-002 regression: the panel-shrink and verifier-revert triggers
+    produce valid, git apply-checked proposals against a block-style pipeline —
+    the format the shipped triggers previously silently failed to touch."""
+    repo = _block_pipeline_repo(tmp_path)
+    slug = "fam"
+    _write_corpus_manifest(repo, slug, _ens_run("run-2026-01-01T00-00-00", {"reviewer": 9, "gemini": 1}))
+    _write_corpus_manifest(repo, slug, _ens_run("run-2026-01-02T00-00-00", {"reviewer": 9, "gemini": 1}))
+    _write_corpus_manifest(repo, slug, _verifier_run("run-2026-01-03T00-00-00", 0))
+    _write_corpus_manifest(repo, slug, _verifier_run("run-2026-01-04T00-00-00", 0))
+    _write_corpus_manifest(repo, slug, _verifier_run("run-2026-01-05T00-00-00", 0))
+
+    man = M.Manifest(
+        run_id="run-2026-01-06T00-00-00", slug=slug, branch="b", base_branch="main",
+        pipeline=M.PipelineRef(name="standard", version=1, hash="h"),
+    )
+    ctx = _ctx(repo, man)
+    before = (repo / "pipelines" / "standard.yaml").read_text()
+    proposals = gov.build_governance_proposals(ctx)
+
+    by_slug = {p.slug: p for p in proposals}
+    assert "shrink-panel-gemini" in by_slug
+    assert "revert-verifier-to-opt-in" in by_slug
+    # Both must be VALID — i.e. their diffs applied cleanly to the block-style
+    # bytes (the previous regex-only transforms emitted nothing here at all).
+    assert by_slug["shrink-panel-gemini"].valid
+    assert by_slug["revert-verifier-to-opt-in"].valid
+    assert all(p.status == "pending" for p in proposals)
+    # No config self-mutation.
+    assert (repo / "pipelines" / "standard.yaml").read_text() == before
