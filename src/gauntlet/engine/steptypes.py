@@ -729,6 +729,36 @@ def _render_open_deferrals(ctx: StepContext) -> str | None:
     )
 
 
+# The plan-author prompt template (basename). The trend-history block (FR-5.3,
+# P7) is injected only into this step's prompt — the plan author is the sole
+# consumer of measured phase-cost history.
+_PLAN_AUTHOR_PROMPT = "plan-author.md"
+
+
+def _render_plan_author_history(step: Step, ctx: StepContext) -> str | None:
+    """Measured phase-cost history + the size bound for the plan-author prompt.
+
+    FR-5.3 (P7): the plan author sizes phases, and without measured history it
+    sizes blind. This appends the repo's completed-run cost/duration distributions
+    by step type, the ``max_frs_per_phase`` bound, and any provider window budget
+    to the plan-author input as advisory data (the plan stays human-ratified;
+    nothing auto-tunes). Returns ``None`` for every other step — the block is
+    scoped to the plan-author template — and a non-empty block (stats or the
+    explicit no-history notice, never silence) for the plan-author step.
+    """
+    ref = step.get("prompt")
+    if not ref or Path(ref).name != _PLAN_AUTHOR_PROMPT:
+        return None
+    from gauntlet.engine.trend import render_plan_author_history
+
+    run_root = ctx.repo_root / ctx.config.run_root
+    return render_plan_author_history(
+        run_root,
+        max_frs_per_phase=ctx.config.max_frs_per_phase,
+        providers=ctx.config.providers,
+    )
+
+
 def _deferral_collection_halt(exc: DeferralCollectionError) -> StepResult:
     """Fail-closed halt when open-deferral injection cannot recover committed data.
 
@@ -1419,6 +1449,12 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
     deferral_block = _render_open_deferrals(ctx)
     if deferral_block is not None:
         parts.append(deferral_block)
+    # FR-5.3 (P7): inject measured phase-cost history + the size bound into the
+    # plan-author input so phase sizing is grounded in observed costs, not blind.
+    # No-op (None) for every non-plan-author step.
+    history_block = _render_plan_author_history(step, ctx)
+    if history_block is not None:
+        parts.append(history_block)
     # FR-1 verbatim requirement (review F-001): the builder must receive the
     # human-decision history EXACTLY as recorded. The on-disk copy is written
     # through the RedactingWriter (credential-shaped substrings become

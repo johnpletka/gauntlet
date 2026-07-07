@@ -1,50 +1,31 @@
 {
-  "phase": "P6",
+  "phase": "P7",
   "clauses": [
     {
-      "id": "P6-A1",
-      "text": "A fingerprint-matching decline surfaces in the triage prompt as advisory data under compatible (current) provenance.",
+      "id": "P7-A1",
+      "text": "A repo with ≥1 completed run renders a measured stats block in the plan-author prompt.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_matching_precedent_injects_and_metric_emitted"},
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_matching_decline_injects_under_current_provenance"},
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_precedent_block_wraps_reasoning_as_data"}
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_stats_block_with_completed_run"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_history_for_plan_author"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_collect_step_type_stats_aggregates_cost_and_duration"}
       ]
     },
     {
-      "id": "P6-A2",
-      "text": "A decline is injected only when each recorded version field's content hash (<label>@<hash>) still equals the current worktree asset file's hash (\"in force\"); an entry whose recorded hash differs from the current governed file (superseded) or whose PRD family differs is retained for audit but withheld from injection.",
+      "id": "P7-A2",
+      "text": "A repo with no completed run renders the explicit \"no history\" block, not silence.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_prompt_hash_withheld_but_retained"},
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_lens_hash_withheld"},
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_schema_hash_withheld"},
-        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_foreign_prd_family_withheld"},
-        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_stale_provenance_withheld_in_cycle"}
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_no_history_block_when_empty"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_no_history_block_for_plan_author"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_no_history_when_only_parked_runs"}
       ]
     },
     {
-      "id": "P6-A3",
-      "text": "The retro path emits a ratifiable lens proposal without directly mutating prompts/lenses/ files.",
+      "id": "P7-A3",
+      "text": "The max_frs_per_phase size bound appears in the plan-author input.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_retro.py::test_retro_emits_ratifiable_lens_proposal_without_mutating_lens"}
-      ]
-    },
-    {
-      "id": "P6-A4",
-      "text": "metrics.registry.rematched is emitted to run metrics, and a fixture proves an injected matching precedent can still be triaged legitimate (no suppression).",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_matching_precedent_injects_and_metric_emitted"},
-        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_non_matching_finding_no_injection"}
-      ]
-    },
-    {
-      "id": "P6-A5",
-      "text": "A two-consecutive-run corpus with a panel member below 25% unique-legit yield emits a ratifiable panel-shrink proposal (no unratified panel change); a three-verifier-run corpus below the behavioral-signal threshold emits a ratifiable verifier-revert-to-opt-in proposal (§9 proposal-mode enforcement, no config self-mutation).",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_build_governance_proposals_materializes_ratifiable"},
-        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_panel_shrink_fires_on_two_below_threshold"},
-        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_panel_shrink_silent_when_above_threshold"},
-        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_verifier_revert_fires_below_threshold"},
-        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_verifier_revert_needs_three_runs"}
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_states_size_bound_with_history"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_states_size_bound_without_history"},
+        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_history_for_plan_author"}
       ]
     }
   ]
