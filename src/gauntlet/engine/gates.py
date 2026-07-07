@@ -268,21 +268,34 @@ def evaluate_clean_gate(
             )
 
     # --- acceptance gate passed · tests green ----------------------------------
-    # Both are guaranteed DONE by the stage walk reaching this gate (a park/fail
-    # upstream stops the walk before here), but we assert them explicitly so a
-    # bypassed/hand-built pipeline fails closed and the snapshot is truthful.
+    # Both conjuncts are *required* (§4.2): "acceptance gate passed" and "tests
+    # green". A DONE-reaching stage walk normally guarantees both ran, but we
+    # assert them explicitly so a bypassed/hand-built pipeline fails closed and
+    # the snapshot is truthful. An *absent* acceptance/shell step before the gate
+    # means the required conjunct was never produced — that cannot prove the
+    # signal is clean, so it parks closed exactly as a failed one does (a
+    # not_run record is a miss, not a pass).
     acceptance_result = "pass"
     if any(rec.status != M.DONE for rec in acceptance):
         acceptance_result = "fail"
         misses.append("acceptance gate did not pass (FR-3.2)")
     elif not acceptance:
         acceptance_result = "not_run"
+        misses.append(
+            "no acceptance_gate ran before this code gate — the required "
+            "'acceptance gate passed' conjunct cannot be proven; failing closed "
+            "(FR-4.1)"
+        )
     tests_result = "passed"
     if any(rec.status != M.DONE for rec in shells):
         tests_result = "failed"
         misses.append("phase tests are not green")
     elif not shells:
         tests_result = "not_run"
+        misses.append(
+            "no test shell ran before this code gate — the required 'tests "
+            "green' conjunct cannot be proven; failing closed (FR-4.1)"
+        )
 
     evidence: dict[str, Any] = {
         "rounds": rounds,

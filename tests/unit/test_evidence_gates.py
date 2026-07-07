@@ -211,6 +211,29 @@ def test_violation_tests_not_green_parks():
     assert d.evidence["tests"] == "failed"
 
 
+def test_absent_acceptance_gate_parks_closed():
+    # A required conjunct that never RAN cannot be proven clean: an
+    # auto_when_clean gate with no acceptance_gate before it must park, not
+    # auto-approve on a `not_run` snapshot (fail-open regression, review F-001).
+    man = _seed_clean_manifest()
+    man.steps = [r for r in man.steps if r.id != "acceptance-gate"]
+    d = _evaluate(man, _pipeline())
+    assert d.clean is False
+    assert d.evidence["acceptance_gate"] == "not_run"
+    assert any("acceptance" in m for m in d.misses)
+
+
+def test_absent_tests_shell_parks_closed():
+    # Same as above for the "tests green" conjunct: no test shell before the gate
+    # cannot prove tests are green, so it parks (review F-001).
+    man = _seed_clean_manifest()
+    man.steps = [r for r in man.steps if r.id != "tests"]
+    d = _evaluate(man, _pipeline())
+    assert d.clean is False
+    assert d.evidence["tests"] == "not_run"
+    assert any("test" in m for m in d.misses)
+
+
 def test_missing_findings_artifacts_fails_closed():
     # A loader that cannot read the round artifacts fails the finding conjuncts
     # closed — the predicate cannot PROVE zero blocking/major findings.
