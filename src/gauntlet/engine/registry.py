@@ -404,3 +404,39 @@ def append_entries(entries: Iterable[DeclinedEntry], path: Path, writer: Any) ->
         writer.append_jsonl(path, e.to_json())
         count += 1
     return count
+
+
+def record_run_declines(
+    ctx: Any,
+    rounds: Iterable[tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    *,
+    at: str,
+    by: str = "triage",
+) -> int:
+    """Record this run's reasoned triage declines to the cross-run registry.
+
+    ``rounds`` is an iterable of ``(findings, verdicts)`` pairs (one per review
+    round) — the caller (retro) reconstructs these from the run's per-round
+    artifacts. Provenance is stamped from the current worktree. **Idempotent by
+    run id:** if the registry already holds an entry for ``ctx.manifest.run_id``
+    (a retro re-run on resume), nothing is appended. Returns the count appended.
+    """
+    path = registry_path(ctx.repo_root, ctx.config.asset_root)
+    if any(e.run_id == ctx.manifest.run_id for e in load_registry(path)):
+        return 0
+    repo = repo_name(ctx.repo_root)
+    prd_family = ctx.manifest.slug
+    batch: list[DeclinedEntry] = []
+    seen: set[str] = set()
+    for findings, verdicts in rounds:
+        entries = build_entries_from_verdicts(
+            findings, verdicts, repo=repo, prd_family=prd_family,
+            repo_root=ctx.repo_root, asset_root=ctx.config.asset_root,
+            run_id=ctx.manifest.run_id, at=at, by=by,
+        )
+        for e in entries:
+            key = f"{e.fingerprint}\x00{e.verdict}\x00{e.lens_version}"
+            if key not in seen:
+                seen.add(key)
+                batch.append(e)
+    return append_entries(batch, path, ctx.writer)

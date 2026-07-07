@@ -144,6 +144,94 @@ def test_retro_runs_and_generates_proposals(tmp_path: Path):
     assert metrics["retro_agents"] == 2
 
 
+def _seed_cycle_round(run_dir: Path, finding: dict, verdict: dict) -> None:
+    """Write the per-round artifacts _collect_cycles walks: one review finding and
+    its triage verdict, so retro can reconstruct (findings, verdicts)."""
+    rdir = run_dir / "steps" / "impl-cycle" / "r1-review"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "findings.json").write_text(
+        json.dumps({"findings": [finding], "open_questions": [], "summary": "s"})
+    )
+    vdir = run_dir / "steps" / "impl-cycle" / "r1-triage" / finding["id"]
+    vdir.mkdir(parents=True, exist_ok=True)
+    (vdir / "verdict.json").write_text(json.dumps(verdict))
+
+
+def test_retro_records_declined_findings_to_registry(tmp_path: Path):
+    """A reasoned triage decline is appended to the cross-run registry at retro
+    (FR-5.2), with current-worktree provenance; a re-run is idempotent by run id."""
+    from gauntlet.engine import registry as reg
+
+    repo = _retro_repo(tmp_path)
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    finding = {"id": "F-001", "severity": "nit", "category": "style",
+               "location": "src.py:5", "claim": "docstring style nit",
+               "evidence": "e", "suggested_fix": None}
+    _seed_cycle_round(run_dir, finding,
+                      {"finding_id": "F-001", "verdict": "bikeshedding",
+                       "action": "reject", "reasoning": "pure taste, declined"})
+
+    status, man, _ = _run_retro(repo, _adapters(repo))
+    assert status == M.RUN_DONE
+
+    entries = reg.load_registry(reg.registry_path(repo, "."))
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.fingerprint == reg.finding_fingerprint(finding)
+    assert e.verdict == "bikeshedding"
+    assert e.prd_family == "demo"
+    assert e.repo == reg.repo_name(repo)
+    assert e.prompt_version == reg.triage_version(repo, ".")
+    assert man.record("retrospective").metrics["declines_recorded"] == 1
+
+    # Idempotent: re-running retro for the same run id appends nothing.
+    _run_retro(repo, _adapters(repo))
+    assert len(reg.load_registry(reg.registry_path(repo, "."))) == 1
+
+
+def _lens_adapters(repo: Path):
+    """A proposer that proposes a lens-fragment edit (FR-5.1 lens governance)."""
+    lens_rel = "prompts/lenses/spec-coverage.md"
+    diff = _capture_diff(
+        repo, lens_rel,
+        (repo / lens_rel).read_text() + "\n- Also check acceptance-clause coverage.\n",
+    )
+    proposals = {"proposals": [
+        {"slug": "extend-spec-lens", "target_path": lens_rel,
+         "rationale": "recurring spec-coverage gap pattern across runs", "diff": diff},
+    ]}
+    return {
+        "builder": FakeAdapter(text="builder critique"),
+        "reviewer": FakeAdapter(text="reviewer critique"),
+        "triage": FakeAdapter(text="{}", structured=proposals),
+    }
+
+
+def test_retro_emits_ratifiable_lens_proposal_without_mutating_lens(tmp_path: Path):
+    """P6-A3: the retro path produces a pending, valid lens proposal and does NOT
+    mutate prompts/lenses/ directly — the only path to a lens change is the
+    ratified proposal. The lens fragment is also visible to the synthesiser."""
+    repo = _retro_repo(tmp_path)
+    lens_rel = "prompts/lenses/spec-coverage.md"
+    before = (repo / lens_rel).read_text()
+
+    status, man, run_dir = _run_retro(repo, _lens_adapters(repo))
+    assert status == M.RUN_DONE
+
+    props = P.list_proposals(run_dir / "retro" / "proposals")
+    by_slug = {p.slug: p for p in props}
+    assert "extend-spec-lens" in by_slug
+    lens_prop = by_slug["extend-spec-lens"]
+    assert lens_prop.valid and lens_prop.status == P.PENDING
+    assert lens_prop.targets == [lens_rel]
+    # No direct mutation: the lens file on disk is byte-unchanged.
+    assert (repo / lens_rel).read_text() == before
+    # The lens fragment is diffable — it reached the synthesis prompt (P1 → P6).
+    synth = (run_dir / "steps" / "retrospective" / "synthesis" / "prompt.md").read_text()
+    assert lens_rel in synth
+
+
 def test_feedback_reaches_synthesis_prompt(tmp_path: Path):
     repo = _retro_repo(tmp_path)
     feedback = FeedbackData(
