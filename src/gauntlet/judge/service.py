@@ -70,6 +70,21 @@ def create_app(
         # judge-down from judge-deny (review F-004).
         return {"status": "ok"}
 
+    @app.get("/observed")
+    def observed(
+        run_id: str | None = None,
+        nonce: str = "",
+        x_gauntlet_token: str | None = Header(default=None, alias=TOKEN_HEADER),
+    ) -> dict[str, bool]:
+        # Run-scoped, token-authenticated readout of whether the judge has SEEN a
+        # PreToolUse callback tagged with ``nonce`` — the verifier hook-loading
+        # probe (review F-001). Same auth + run binding as /decide so a foreign or
+        # wrong-run caller cannot read another run's probe state. An empty nonce is
+        # never "observed".
+        _check_token(x_gauntlet_token)
+        _check_run_id(run_id)
+        return {"observed": bool(nonce) and core.observed_probe(nonce)}
+
     @app.post("/decide", response_model=DecideResponse)
     def decide(
         req: DecideRequest,

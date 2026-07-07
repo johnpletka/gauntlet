@@ -1567,7 +1567,7 @@ def _run_verifier(
     # 1. Probe the sandbox backend at sub-step start (FR-2.5 / P5-A5). Absent or
     # judge-hook-unconfirmable → park closed; the verifier never runs unhooked.
     try:
-        verify.probe_backend(ctx.judge_env)
+        verify.probe_backend(ctx.judge_env, repo_root=ctx.repo_root)
     except verify.SandboxUnavailableError as exc:
         raise _ParkCycle(StepResult(
             status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,

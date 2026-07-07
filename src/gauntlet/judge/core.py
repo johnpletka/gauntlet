@@ -14,6 +14,7 @@ from pathlib import Path
 
 from gauntlet.judge.classifier import LLMClassifier
 from gauntlet.judge.decision import JudgeDecision
+from gauntlet.judge.hook_client import PROBE_STEP_PREFIX
 from gauntlet.judge.policy import PolicyEngine
 from gauntlet.logging.redact import RedactingWriter
 
@@ -48,6 +49,16 @@ class JudgeCore:
         # guards the cache + the decision counter because concurrent triage
         # (FR-9.1) can drive concurrent judge requests through the FastAPI layer.
         self._allow_cache: dict[str, tuple[JudgeDecision, str]] = {}
+        # --- verifier hook-loading probe observations (review F-001) ----------
+        # Nonces the judge has seen carried on a probe ``step_id`` — i.e. proof
+        # that a real claude-code turn LOADED and FIRED the PreToolUse hook, which
+        # then reached this judge. The verifier's :func:`verify.confirm_hook_loaded`
+        # writes one nonce per probe and queries it back through ``/observed``;
+        # a nonce the judge never saw means the hook did not fire, so the probe
+        # parks closed rather than run the verifier unhooked. Bounded by
+        # construction: only probe-prefixed step_ids are recorded, and there is one
+        # probe per verifier sub-step. Guarded by the same lock as the cache.
+        self._observed_probes: set[str] = set()
         self._decision_seq = 0
         self._lock = threading.Lock()
 
@@ -62,6 +73,14 @@ class JudgeCore:
         agent_profile: str | None = None,
     ) -> JudgeDecision:
         start = time.monotonic()
+        # A hook-loading probe (review F-001): record the nonce as observed as
+        # early as possible — before the ladder, and regardless of the eventual
+        # allow/deny — because merely REACHING the judge on a probe-tagged call is
+        # the evidence the probe needs (the hook fired). The recorded set is what
+        # ``/observed`` reports back to :func:`verify.confirm_hook_loaded`.
+        if step_id and step_id.startswith(PROBE_STEP_PREFIX):
+            with self._lock:
+                self._observed_probes.add(step_id[len(PROBE_STEP_PREFIX):])
         effective_root = self.repo_root or repo_root
         key = self._cache_key(
             tool_name, tool_input, effective_root, step_id, agent_profile
@@ -95,6 +114,13 @@ class JudgeCore:
             repo_root=effective_root, decision_id=decision_id,
         )
         return decision
+
+    def observed_probe(self, nonce: str) -> bool:
+        """True iff a PreToolUse call tagged with ``nonce`` has reached this judge
+        (review F-001) — i.e. a real claude-code turn loaded and fired the hook.
+        Backs the ``/observed`` endpoint the verifier probe queries."""
+        with self._lock:
+            return nonce in self._observed_probes
 
     def _cache_key(
         self, tool_name: str, tool_input: dict, repo_root: Path,

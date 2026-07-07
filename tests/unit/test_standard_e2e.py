@@ -184,7 +184,7 @@ def _stub_sandbox(monkeypatch, tmp_path):
     copy.mkdir(exist_ok=True)
     fake = verify.SandboxBackend(claude_path="claude")
     monkeypatch.setattr(verify, "detect_backend", lambda judge_env: fake)
-    monkeypatch.setattr(verify, "probe_backend", lambda judge_env: fake)
+    monkeypatch.setattr(verify, "probe_backend", lambda judge_env, **k: fake)
     monkeypatch.setattr(verify, "make_disposable_copy",
                         lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
     monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)

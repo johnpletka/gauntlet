@@ -46,6 +46,7 @@ the verifier never degrades to "skipped, proceed" and never runs unhooked.
 from __future__ import annotations
 
 import os
+import secrets
 import shlex
 import shutil
 import tempfile
@@ -56,6 +57,7 @@ from gauntlet.engine import gitops
 from gauntlet.judge.hook_client import (
     DEFAULT_URL as _DEFAULT_JUDGE_URL,
     MODE_ENV_VAR,
+    PROBE_STEP_PREFIX,
     REPO_ROOT_ENV_VAR,
     RUN_ID_ENV_VAR,
     STEP_ID_ENV_VAR,
@@ -220,7 +222,8 @@ def detect_backend(judge_env: dict[str, str] | None) -> SandboxBackend | None:
     hold and the sub-step must park rather than run the verifier unhooked.
 
     This is presence only; :func:`probe_backend` additionally exercises the judge
-    enforcement path before returning a backend (review F-001)."""
+    enforcement path AND proves a real claude turn loads/fires the hook before
+    returning a backend (review F-001)."""
     claude = shutil.which("claude")
     if claude is None:
         return None
@@ -238,6 +241,22 @@ def _judge_roundtrip(url: str, token: str, body: dict) -> dict:
     return hook_client._ask_judge(url, token, body)
 
 
+def _judge_observed(url: str, token: str, run_id: str, nonce: str) -> bool:
+    """Ask the run's judge whether it OBSERVED a PreToolUse callback tagged with
+    ``nonce`` (review F-001). Isolated as a seam so :func:`confirm_hook_loaded` is
+    unit-testable without a live judge or claude CLI."""
+    from gauntlet.judge import hook_client
+
+    result = hook_client._ask_observed(url, token, run_id, nonce)
+    return bool((result or {}).get("observed"))
+
+
+# Wall-clock ceiling on the hook-loading probe's claude turn (review F-001). It
+# does a single trivial in-copy Bash call, so a healthy backend finishes in
+# seconds; an over-limit turn is killed and parks closed (never runs unhooked).
+_PROBE_TIMEOUT_S = 120.0
+
+
 def exercise_judge_hook(judge_env: dict[str, str] | None) -> None:
     """Actively confirm the run's judge enforcement backend — the service the
     PreToolUse hook calls on every tool call — is **live and authorizing this
@@ -253,14 +272,15 @@ def exercise_judge_hook(judge_env: dict[str, str] | None) -> None:
     error, a run-id mismatch, or a malformed response raises
     :class:`SandboxUnavailableError` and parks the sub-step.
 
-    Scope note (honest boundary): this confirms the *enforcement service* is live
-    and bound to this run, so a dead/foreign judge parks closed rather than running
-    a verifier unhooked. That claude actually *loads* the hook is the
-    ``--setting-sources project`` + pinned-CLI invariant (:data:`_SETTING_SOURCES_FLAGS`,
-    pins.yaml), exercised end-to-end by ``tests/integration/test_verifier_sandbox.py``;
-    a decision value is deliberately NOT asserted here because the fast-path policy
-    legitimately *allows* many in-copy tool calls, so requiring a specific verdict
-    would false-park healthy runs."""
+    Scope note: this is the CHEAP liveness/binding pre-check — it confirms the
+    *enforcement service* is live and bound to this run, so a dead/foreign judge
+    parks closed fast, before the more expensive step. That claude actually *loads
+    and fires* the hook under ``--setting-sources project`` is no longer merely an
+    invariant deferred to integration tests: :func:`confirm_hook_loaded` proves it
+    at runtime by launching a real claude turn and requiring the judge to observe
+    its PreToolUse callback (review F-001). A decision value is deliberately NOT
+    asserted here because the fast-path policy legitimately *allows* many in-copy
+    tool calls, so requiring a specific verdict would false-park healthy runs."""
     source = judge_env or {}
     token = source.get(TOKEN_ENV_VAR)
     run_id = source.get(RUN_ID_ENV_VAR)
@@ -296,15 +316,114 @@ def exercise_judge_hook(judge_env: dict[str, str] | None) -> None:
         )
 
 
-def probe_backend(judge_env: dict[str, str] | None) -> SandboxBackend:
+def confirm_hook_loaded(
+    backend: SandboxBackend,
+    judge_env: dict[str, str] | None,
+    *,
+    repo_root: Path,
+    parent_dir: Path | None = None,
+) -> None:
+    """Prove END-TO-END that a real claude-code turn LOADS and FIRES the engine's
+    PreToolUse judge hook — the strong gate the ``/decide`` liveness pre-check
+    (:func:`exercise_judge_hook`) cannot give (review F-001, P5-A5).
+
+    A live judge answering a synthetic ``/decide`` is NOT evidence that *claude*
+    invokes the hook under ``--setting-sources project``: if claude were pinned or
+    configured such that the hook never loads, the judge would answer healthy while
+    the verifier ran effectively unconfined. So this launches a minimal real
+    claude-code turn — configured by :func:`configure_claude_verifier`, in a
+    **disposable copy**, under ``GAUNTLET_STEP_ID = PROBE_STEP_PREFIX + <nonce>`` —
+    and instructs it to make ONE harmless in-copy tool call. If claude loads the
+    hook, that tool call reaches the judge tagged with the nonce; the judge records
+    it, and this then queries ``/observed`` and requires the nonce to be present
+    before returning.
+
+    Fail closed on everything (FR-2.3/2.5): a copy-creation failure, a
+    launch/configuration fault, a wall-clock expiry, an ``/observed`` query error,
+    or a turn the judge never observed for this nonce all raise
+    :class:`SandboxUnavailableError` and park the sub-step. The disposable copy is
+    always discarded; the real worktree is untouched."""
+    source = judge_env or {}
+    token = source.get(TOKEN_ENV_VAR)
+    run_id = source.get(RUN_ID_ENV_VAR)
+    if not token or not run_id:
+        raise SandboxUnavailableError(
+            "verifier hook-loading probe: the run's judge token / run id are "
+            "absent, so a hook-firing claude turn cannot be bound to this run — "
+            "parking closed (FR-2.5, P5-A5)."
+        )
+    url = source.get(URL_ENV_VAR) or _DEFAULT_JUDGE_URL
+    nonce = secrets.token_hex(16)
+    prompt = (
+        "You are a sandbox self-test in a DISPOSABLE copy of a project. Using the "
+        "Bash tool, run EXACTLY this one command and nothing else:\n\n"
+        f"    echo {nonce}\n\n"
+        "Then reply with a single word: done. Do not run any other command."
+    )
+    try:
+        copy = make_disposable_copy(repo_root, parent_dir=parent_dir)
+    except CopyCreationError as exc:
+        raise SandboxUnavailableError(
+            "verifier hook-loading probe: could not create a disposable copy to "
+            f"exercise the PreToolUse hook ({exc}); parking closed (FR-2.3, P5-A5)."
+        ) from exc
+    # The probe env is the exact verifier posture, but tagged with the probe
+    # step_id so every tool call in this turn reaches the judge carrying the nonce.
+    env = verifier_env(judge_env or {}, copy.path)
+    env[STEP_ID_ENV_VAR] = f"{PROBE_STEP_PREFIX}{nonce}"
+    try:
+        _run_backend_bash(
+            backend,
+            prompt=prompt,
+            cwd=copy.path,
+            env=env,
+            allowed_tools=("Bash",),
+            timeout_s=_PROBE_TIMEOUT_S,
+        )
+    except Exception as exc:  # launch / config / timeout — all fail closed
+        raise SandboxUnavailableError(
+            "verifier hook-loading probe: the canary claude turn could not be "
+            f"launched to exercise the PreToolUse hook ({type(exc).__name__}: "
+            f"{exc}); parking closed — the verifier never runs unhooked (FR-2.5, "
+            "P5-A5)."
+        ) from exc
+    finally:
+        discard_disposable_copy(repo_root, copy)
+
+    try:
+        seen = _judge_observed(url, token, run_id, nonce)
+    except Exception as exc:  # transport / HTTP / decode — fail closed
+        raise SandboxUnavailableError(
+            "verifier hook-loading probe: the judge could not be queried to "
+            f"confirm it observed the hook callback ({type(exc).__name__}: {exc}); "
+            "parking closed (FR-2.5, P5-A5)."
+        ) from exc
+    if not seen:
+        raise SandboxUnavailableError(
+            "verifier hook-loading probe: the canary claude turn ran but the judge "
+            "never observed a PreToolUse callback for it — the hook did not load/"
+            "fire under --setting-sources project, so the read/write/network denial "
+            "contract is NOT active. Parking closed — the verifier never runs "
+            "unhooked (FR-2.5, P5-A5)."
+        )
+
+
+def probe_backend(
+    judge_env: dict[str, str] | None,
+    *,
+    repo_root: Path,
+    parent_dir: Path | None = None,
+) -> SandboxBackend:
     """Return a usable, enforcement-confirmed backend or raise
     :class:`SandboxUnavailableError` (P5-A5).
 
-    Two gates, both fail-closed: the passive presence check
-    (:func:`detect_backend`) AND an active exercise of the run's judge enforcement
-    path (:func:`exercise_judge_hook`) — so a claude binary + a stale token string
-    is no longer enough to run the verifier while the judge is actually dead or
-    bound to another run (review F-001)."""
+    Three gates, all fail-closed: the passive presence check
+    (:func:`detect_backend`), a cheap active exercise of the run's judge
+    enforcement path (:func:`exercise_judge_hook`), AND an end-to-end proof that a
+    real claude-code turn actually LOADS and FIRES the PreToolUse hook
+    (:func:`confirm_hook_loaded`) — so neither a claude binary + a stale token
+    string, nor a live judge that claude never actually calls, is enough to run the
+    verifier while confinement is not truly active (review F-001)."""
     backend = detect_backend(judge_env)
     if backend is None:
         raise SandboxUnavailableError(
@@ -314,6 +433,7 @@ def probe_backend(judge_env: dict[str, str] | None) -> SandboxBackend:
             "unhooked/unsandboxed (FR-2.5, P5-A5)."
         )
     exercise_judge_hook(judge_env)
+    confirm_hook_loaded(backend, judge_env, repo_root=repo_root, parent_dir=parent_dir)
     return backend
 
 

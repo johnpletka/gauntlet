@@ -34,6 +34,15 @@ REPO_ROOT_ENV_VAR = "GAUNTLET_REPO_ROOT"
 DEFAULT_URL = "http://127.0.0.1:8787"
 HOOK_TIMEOUT_S = 8.0
 
+# A ``step_id`` carrying this prefix marks a verifier hook-loading probe (review
+# F-001): the engine launches a real claude-code turn under GAUNTLET_STEP_ID =
+# ``PROBE_STEP_PREFIX + <nonce>`` so that WHEN claude actually loads and fires the
+# PreToolUse hook, every tool call in that turn reaches the judge tagged with the
+# nonce. The judge records the nonce as observed; the probe then queries
+# ``/observed`` for it. A judge that never sees the nonce is proof the hook did
+# NOT fire — so the probe parks closed rather than run the verifier unhooked.
+PROBE_STEP_PREFIX = "gauntlet-hook-probe:"
+
 
 def _emit(decision: str, reason: str) -> int:
     """Write the permission-decision contract; return the process exit code.
@@ -68,6 +77,23 @@ def _ask_judge(url: str, token: str, body: dict) -> dict:
         data=data,
         headers={"Content-Type": "application/json", "X-Gauntlet-Token": token},
         method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _ask_observed(url: str, token: str, run_id: str, nonce: str) -> dict:
+    """Query the run's judge for whether it OBSERVED a PreToolUse callback tagged
+    with ``nonce`` (a hook-loading probe; review F-001). Authenticated and
+    run-scoped exactly like ``/decide``. Same client stdlib as the hook so the
+    verifier probe carries no extra dependency."""
+    from urllib.parse import urlencode
+
+    query = urlencode({"run_id": run_id, "nonce": nonce})
+    req = urllib.request.Request(
+        f"{url}/observed?{query}",
+        headers={"X-Gauntlet-Token": token},
+        method="GET",
     )
     with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_S) as resp:
         return json.loads(resp.read().decode())

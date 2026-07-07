@@ -106,33 +106,34 @@ def test_verifier_env_drops_secrets_from_judge_env(tmp_path):
         assert leaked not in env
 
 
-def test_detect_backend_none_without_claude(monkeypatch):
+def test_detect_backend_none_without_claude(monkeypatch, tmp_path):
     """FR-2.5 / P5-A5: with no claude-code CLI the probe finds no backend."""
     monkeypatch.setattr(verify.shutil, "which", lambda name: None)
     assert verify.detect_backend(_JUDGE_ENV) is None
     with pytest.raises(verify.SandboxUnavailableError):
-        verify.probe_backend(_JUDGE_ENV)
+        verify.probe_backend(_JUDGE_ENV, repo_root=tmp_path)
 
 
-def test_detect_backend_none_without_active_judge(monkeypatch):
+def test_detect_backend_none_without_active_judge(monkeypatch, tmp_path):
     """FR-2.5 / P5-A5: even with claude present, an ABSENT judge (no token — the
     hook has nothing to call, so it cannot fire) parks closed — the verifier never
     runs unhooked."""
     monkeypatch.setattr(verify.shutil, "which", lambda name: "/bin/claude")
     assert verify.detect_backend({}) is None            # no judge token → no hook
     with pytest.raises(verify.SandboxUnavailableError):
-        verify.probe_backend({"GAUNTLET_JUDGE_MODE": "unattended"})
+        verify.probe_backend({"GAUNTLET_JUDGE_MODE": "unattended"}, repo_root=tmp_path)
     assert verify.detect_backend(_JUDGE_ENV) is not None  # claude + judge → usable
 
 
 _PROBE_ENV = {TOKEN_ENV_VAR: "tok", "GAUNTLET_RUN_ID": "r1"}
 
 
-def test_probe_backend_confirms_judge_enforcement_path(monkeypatch):
+def test_probe_backend_confirms_judge_enforcement_path(monkeypatch, tmp_path):
     """review F-001 / P5-A5: probe_backend does more than the passive presence
     check — it actively exercises the run's judge enforcement path (the service the
     PreToolUse hook calls) with an authenticated decision round-trip and returns a
-    backend only when the judge answers this run with a well-formed decision."""
+    backend only when the judge answers this run with a well-formed decision. (The
+    end-to-end hook-loading proof is stubbed here; it has its own tests below.)"""
     monkeypatch.setattr(verify.shutil, "which", lambda name: "/bin/claude")
     calls = {}
 
@@ -141,13 +142,14 @@ def test_probe_backend_confirms_judge_enforcement_path(monkeypatch):
         return {"decision": "deny", "source": "policy", "rationale": "canary"}
 
     monkeypatch.setattr(verify, "_judge_roundtrip", _ok)
-    backend = verify.probe_backend(_PROBE_ENV)
+    monkeypatch.setattr(verify, "confirm_hook_loaded", lambda *a, **k: None)
+    backend = verify.probe_backend(_PROBE_ENV, repo_root=tmp_path)
     assert backend.claude_path == "/bin/claude"
     assert calls["token"] == "tok"
     assert calls["body"]["run_id"] == "r1"   # bound to THIS run
 
 
-def test_probe_backend_parks_when_judge_unreachable(monkeypatch):
+def test_probe_backend_parks_when_judge_unreachable(monkeypatch, tmp_path):
     """review F-001 / FR-2.5: a claude binary + a token string is NOT enough — if
     the judge enforcement service is unreachable, the verifier would run unconfined,
     so the probe parks closed."""
@@ -158,7 +160,26 @@ def test_probe_backend_parks_when_judge_unreachable(monkeypatch):
 
     monkeypatch.setattr(verify, "_judge_roundtrip", _boom)
     with pytest.raises(verify.SandboxUnavailableError):
-        verify.probe_backend(_PROBE_ENV)
+        verify.probe_backend(_PROBE_ENV, repo_root=tmp_path)
+
+
+def test_probe_backend_parks_when_hook_never_fires(monkeypatch, tmp_path):
+    """review F-001 / P5-A5: the decisive gate — a live judge answering /decide is
+    NOT enough; probe_backend launches a real canary claude turn and parks closed
+    when the judge never observes its PreToolUse callback (claude did not load/fire
+    the hook), so the verifier is never run unconfined."""
+    monkeypatch.setattr(verify.shutil, "which", lambda name: "/bin/claude")
+    monkeypatch.setattr(
+        verify, "_judge_roundtrip",
+        lambda url, token, body: {"decision": "allow", "rationale": "canary"})
+    copy = verify.DisposableCopy(path=tmp_path / "c", root=tmp_path / "c")
+    monkeypatch.setattr(verify, "make_disposable_copy", lambda repo, **k: copy)
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
+    monkeypatch.setattr(verify, "_run_backend_bash", lambda *a, **k: object())
+    monkeypatch.setattr(verify, "_judge_observed",
+                        lambda url, token, run_id, nonce: False)   # hook never fired
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.probe_backend(_PROBE_ENV, repo_root=tmp_path)
 
 
 def test_exercise_judge_hook_parks_on_malformed_decision(monkeypatch):
@@ -175,6 +196,113 @@ def test_exercise_judge_hook_parks_without_run_id():
     judge."""
     with pytest.raises(verify.SandboxUnavailableError):
         verify.exercise_judge_hook({TOKEN_ENV_VAR: "tok"})
+
+
+def _confirm_stubs(monkeypatch, tmp_path, *, launch=None, observed=True):
+    """Stub the disposable copy + backend launch + observed-query seams so
+    confirm_hook_loaded exercises its own logic without a claude CLI or live judge.
+    Returns (copy, launched, discarded) for assertions."""
+    copy = verify.DisposableCopy(path=tmp_path / "c", root=tmp_path / "c")
+    monkeypatch.setattr(verify, "make_disposable_copy", lambda repo, **k: copy)
+    discarded = []
+    monkeypatch.setattr(verify, "discard_disposable_copy",
+                        lambda repo, c: discarded.append(c))
+    launched = {}
+
+    def _default_launch(be, *, prompt, cwd, env, allowed_tools, timeout_s):
+        launched.update(env=env, allowed_tools=allowed_tools, prompt=prompt, cwd=cwd)
+        return object()
+
+    monkeypatch.setattr(verify, "_run_backend_bash", launch or _default_launch)
+
+    seen = {}
+
+    def _observed(url, token, run_id, nonce):
+        seen.update(url=url, token=token, run_id=run_id, nonce=nonce)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(verify, "_judge_observed", _observed)
+    launched["seen"] = seen
+    return copy, launched, discarded
+
+
+def test_confirm_hook_loaded_requires_observed_callback(monkeypatch, tmp_path):
+    """review F-001 / P5-A5: confirm_hook_loaded launches a real canary claude turn
+    in the confined Bash-only posture, tagged with a probe step_id, and returns only
+    when the judge confirms it OBSERVED that turn's PreToolUse callback for THIS run
+    — the end-to-end proof the hook actually loaded and fired."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+    copy, launched, discarded = _confirm_stubs(monkeypatch, tmp_path, observed=True)
+    verify.confirm_hook_loaded(backend, _PROBE_ENV, repo_root=tmp_path)
+    assert launched["allowed_tools"] == ("Bash",)           # confined, no network
+    step = launched["env"][verify.STEP_ID_ENV_VAR]
+    assert step.startswith(verify.PROBE_STEP_PREFIX)          # probe-tagged turn
+    nonce = step[len(verify.PROBE_STEP_PREFIX):]
+    assert launched["seen"]["nonce"] == nonce                # same nonce queried back
+    assert launched["seen"]["run_id"] == "r1"                # bound to THIS run
+    assert discarded == [copy]                               # copy always discarded
+
+
+def test_confirm_hook_loaded_parks_when_hook_not_observed(monkeypatch, tmp_path):
+    """review F-001: the canary turn ran but the judge never saw its callback (the
+    hook did not fire) — park closed, never run the verifier unhooked."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+    copy, launched, discarded = _confirm_stubs(monkeypatch, tmp_path, observed=False)
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_hook_loaded(backend, _PROBE_ENV, repo_root=tmp_path)
+    assert discarded == [copy]
+
+
+def test_confirm_hook_loaded_parks_on_launch_failure(monkeypatch, tmp_path):
+    """review F-001 / FR-2.3: a launch/configuration fault of the canary turn parks
+    closed (and never queries the judge), and always discards the copy."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+
+    def _boom_launch(be, *, prompt, cwd, env, allowed_tools, timeout_s):
+        raise RuntimeError("cannot launch canary claude")
+
+    copy, launched, discarded = _confirm_stubs(
+        monkeypatch, tmp_path, launch=_boom_launch)
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_hook_loaded(backend, _PROBE_ENV, repo_root=tmp_path)
+    assert discarded == [copy]
+    assert launched["seen"] == {}   # judge never queried after a launch failure
+
+
+def test_confirm_hook_loaded_parks_on_copy_failure(monkeypatch, tmp_path):
+    """review F-001 / FR-2.3: a disposable-copy failure while setting up the probe
+    parks closed as SandboxUnavailableError (so probe_backend's caller catches it)."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+
+    def _boom(repo_root, **k):
+        raise verify.CopyCreationError("copy could not be created")
+
+    monkeypatch.setattr(verify, "make_disposable_copy", _boom)
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_hook_loaded(backend, _PROBE_ENV, repo_root=tmp_path)
+
+
+def test_confirm_hook_loaded_parks_on_observed_query_error(monkeypatch, tmp_path):
+    """review F-001 / FR-2.5: an unreachable/erroring /observed query leaves the
+    hook-firing unconfirmed — park closed."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+    copy, launched, discarded = _confirm_stubs(
+        monkeypatch, tmp_path, observed=OSError("connection refused"))
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_hook_loaded(backend, _PROBE_ENV, repo_root=tmp_path)
+    assert discarded == [copy]
+
+
+def test_confirm_hook_loaded_parks_without_run_id(monkeypatch, tmp_path):
+    """review F-001: no run id — the canary turn cannot be bound to this run, so it
+    parks closed before launching anything."""
+    backend = verify.SandboxBackend(claude_path="/bin/claude")
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda *a, **k: pytest.fail("must not copy without a run id"))
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_hook_loaded(backend, {TOKEN_ENV_VAR: "tok"}, repo_root=tmp_path)
 
 
 def test_make_disposable_copy_fails_closed(monkeypatch, tmp_path):
@@ -259,7 +387,7 @@ def _stub_sandbox(monkeypatch, tmp_path):
     copy_dir = tmp_path / "verify-copy"
     copy_dir.mkdir()
     monkeypatch.setattr(verify, "probe_backend",
-                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
+                        lambda judge_env, **k: verify.SandboxBackend(claude_path="claude"))
     monkeypatch.setattr(verify, "make_disposable_copy",
                         lambda repo, **k: verify.DisposableCopy(path=copy_dir, root=copy_dir))
     monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, copy: None)
@@ -379,7 +507,7 @@ def test_stubbed_copy_failure_parks_cycle(fixture_repo, monkeypatch, tmp_path):
     notes — never degrades to 'skipped, proceed'."""
     repo, sha = _code_repo(fixture_repo)
     monkeypatch.setattr(verify, "probe_backend",
-                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
+                        lambda judge_env, **k: verify.SandboxBackend(claude_path="claude"))
 
     def _boom(repo_root, **k):
         raise verify.CopyCreationError("disposable worktree copy could not be created")
@@ -402,7 +530,7 @@ def test_stubbed_non_firing_hook_parks_cycle(fixture_repo, monkeypatch, tmp_path
     fails) parks the cycle closed — the verifier never runs unhooked."""
     repo, sha = _code_repo(fixture_repo)
 
-    def _no_backend(judge_env):
+    def _no_backend(judge_env, **k):
         raise verify.SandboxUnavailableError(
             "no usable v1 verifier backend: the judge PreToolUse hook cannot be "
             "confirmed firing")

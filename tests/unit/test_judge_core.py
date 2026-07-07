@@ -64,6 +64,34 @@ def test_ask_routes_to_llm():
     assert len(adapter.calls) == 1
 
 
+def test_probe_step_id_records_observation():
+    """review F-001: a decision call tagged with a hook-loading probe step_id
+    records the nonce as observed — this is the evidence the verifier probe reads
+    back to prove a real claude turn loaded and fired the PreToolUse hook. A
+    non-probe step_id records nothing."""
+    from gauntlet.judge.hook_client import PROBE_STEP_PREFIX
+
+    core = JudgeCore(engine())
+    assert core.observed_probe("nonce-1") is False
+    core.decide(
+        "Bash", {"command": "echo nonce-1"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id=f"{PROBE_STEP_PREFIX}nonce-1",
+    )
+    assert core.observed_probe("nonce-1") is True
+    # a deny outcome still records the observation (reaching the judge is the proof)
+    core.decide(
+        "Bash", {"command": "rm -rf /"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id=f"{PROBE_STEP_PREFIX}nonce-2",
+    )
+    assert core.observed_probe("nonce-2") is True
+    # an ordinary (non-probe) step id is never recorded as a probe observation
+    core.decide(
+        "Bash", {"command": "git status"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id="ordinary-step",
+    )
+    assert core.observed_probe("ordinary-step") is False
+
+
 def test_unmatched_routes_to_llm():
     adapter = FakeAdapter(
         structured={"decision": "deny", "risk_category": "unknown", "rationale": "weird"}
