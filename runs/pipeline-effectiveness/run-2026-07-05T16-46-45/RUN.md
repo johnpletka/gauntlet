@@ -3,7 +3,7 @@
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
 - status: **running** (at `impl-cycle`)
-- totals: 3120123in/1521969out $236.0644
+- totals: 3383421in/1667901out $260.0137
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -44,7 +44,11 @@
 | [implement.7](steps/implement.7/transcript.md) | agent_task | done | 22348s | 15890in/76853out $15.4189 | agent 'builder' completed |
 | [tests.7](steps/tests.7/) | shell | done | 379s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.7 | commit | done | 17s | 6840in/1657out $0.0050 | committed 60ac36b3d5 |
-| impl-cycle.7 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
+| [impl-cycle.7](steps/impl-cycle.7/) | adversarial_cycle | done | 681s | 207996in/10329out $1.8201 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.8](steps/implement.8/transcript.md) | agent_task | done | 2866s | 9495in/133216out $22.1129 | agent 'builder' completed |
+| [tests.8](steps/tests.8/) | shell | done | 368s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.8 | commit | done | 30s | 45807in/2387out $0.0162 | committed a2267085ff |
+| impl-cycle.8 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
 
 ## Commits
 
@@ -67,3 +71,5 @@
 - `373963aec1` P7 (step `phase-commit`)
 - `555f73c720` P7.1 (step `impl-cycle`)
 - `60ac36b3d5` P8 (step `phase-commit`)
+- `47eff7176a` P8.1 (step `impl-cycle`)
+- `a2267085ff` P9 (step `phase-commit`)

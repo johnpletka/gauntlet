@@ -1999,13 +1999,220 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "running",
+      "status": "done",
       "agent": null,
       "session_id": null,
       "started": "2026-07-07T22:47:20.887154+00:00",
-      "ended": null,
+      "ended": "2026-07-07T22:58:42.318909+00:00",
       "attempts": 0,
       "base_sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 207996,
+        "output_tokens": 10329,
+        "cached_input_tokens": 1610247,
+        "cost_usd": 1.82008
+      },
+      "agent_usage": {
+        "reviewer": {
+          "input_tokens": 198934,
+          "output_tokens": 1572,
+          "cached_input_tokens": 109568,
+          "cost_usd": null
+        },
+        "triage": {
+          "input_tokens": 1931,
+          "output_tokens": 299,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.0010807500000000001
+        },
+        "escalation": {
+          "input_tokens": 1931,
+          "output_tokens": 684,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.009253750000000002
+        },
+        "builder": {
+          "input_tokens": 5200,
+          "output_tokens": 7774,
+          "cached_input_tokens": 1500679,
+          "cost_usd": 1.8097455
+        }
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate",
+      "iteration": "7",
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 1,
+        "accepted_total": 1,
+        "accepted_resolved_total": 1,
+        "verdict_counts": {
+          "legitimate": 1
+        },
+        "confirm_counts": {
+          "resolved": 1
+        }
+      },
+      "checkpoints": [
+        {
+          "sub_step": "review",
+          "round": 1,
+          "handoff_sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0",
+          "artifact": "artifacts/r1/findings.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "triage",
+          "round": 1,
+          "handoff_sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0",
+          "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "fix",
+          "round": 1,
+          "handoff_sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0",
+          "artifact": null,
+          "result_sha": "47eff7176a42555b1bf92ccc0a995a330bbf7460"
+        },
+        {
+          "sub_step": "confirm",
+          "round": 1,
+          "handoff_sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0",
+          "artifact": "artifacts/r1/confirm.json",
+          "result_sha": null
+        }
+      ],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "implement",
+      "type": "agent_task",
+      "status": "done",
+      "agent": "builder",
+      "session_id": "18697213-315b-46d8-9139-74ecb7bc12ae",
+      "started": "2026-07-07T22:58:42.325254+00:00",
+      "ended": "2026-07-07T23:46:28.813788+00:00",
+      "attempts": 0,
+      "base_sha": "47eff7176a42555b1bf92ccc0a995a330bbf7460",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 9495,
+        "output_tokens": 133216,
+        "cached_input_tokens": 28905671,
+        "cost_usd": 22.112932499999992
+      },
+      "agent_usage": {
+        "builder": {
+          "input_tokens": 9495,
+          "output_tokens": 133216,
+          "cached_input_tokens": 28905671,
+          "cost_usd": 22.112932499999992
+        }
+      },
+      "notes": "agent 'builder' completed",
+      "iteration": "8",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "tests",
+      "type": "shell",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-07T23:46:28.826275+00:00",
+      "ended": "2026-07-07T23:52:36.558424+00:00",
+      "attempts": 0,
+      "base_sha": "47eff7176a42555b1bf92ccc0a995a330bbf7460",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cost_usd": null
+      },
+      "agent_usage": {},
+      "notes": "`uv run pytest` exited 0",
+      "iteration": "8",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "phase-commit",
+      "type": "commit",
+      "status": "done",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-07T23:52:36.561328+00:00",
+      "ended": "2026-07-07T23:53:06.927028+00:00",
+      "attempts": 0,
+      "base_sha": "47eff7176a42555b1bf92ccc0a995a330bbf7460",
+      "parked_reason": null,
+      "halt_reason": null,
+      "failure_kind": null,
+      "retry_after_s": null,
+      "quota_reset_at": null,
+      "parked_substep": null,
+      "scheduled_resume": null,
+      "revalidation": null,
+      "human_responses": [],
+      "usage": {
+        "input_tokens": 45807,
+        "output_tokens": 2387,
+        "cached_input_tokens": 0,
+        "cost_usd": 0.016225749999999997
+      },
+      "agent_usage": {
+        "mechanic": {
+          "input_tokens": 45807,
+          "output_tokens": 2387,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.016225749999999997
+        }
+      },
+      "notes": "committed a2267085ff",
+      "iteration": "8",
+      "metrics": {},
+      "checkpoints": [],
+      "resumed_from_checkpoint": null
+    },
+    {
+      "id": "impl-cycle",
+      "type": "adversarial_cycle",
+      "status": "running",
+      "agent": null,
+      "session_id": null,
+      "started": "2026-07-07T23:53:06.930247+00:00",
+      "ended": null,
+      "attempts": 0,
+      "base_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
       "parked_reason": null,
       "halt_reason": null,
       "failure_kind": null,
@@ -2023,7 +2230,7 @@
       },
       "agent_usage": {},
       "notes": null,
-      "iteration": "7",
+      "iteration": "8",
       "metrics": {},
       "checkpoints": [],
       "resumed_from_checkpoint": null
@@ -2125,38 +2332,48 @@
       "step_id": "phase-commit",
       "phase": "P8",
       "sha": "60ac36b3d51762dc06da473eb9192ef34a2fd9d0"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P8.1",
+      "sha": "47eff7176a42555b1bf92ccc0a995a330bbf7460"
+    },
+    {
+      "step_id": "phase-commit",
+      "phase": "P9",
+      "sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1"
     }
   ],
   "totals": {
-    "input_tokens": 3120123,
-    "output_tokens": 1521969,
-    "cached_input_tokens": 268999532,
-    "cost_usd": 236.06442295
+    "input_tokens": 3383421,
+    "output_tokens": 1667901,
+    "cached_input_tokens": 299515450,
+    "cost_usd": 260.01366119999994
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 1950025,
-      "output_tokens": 30148,
-      "cached_input_tokens": 1035264,
+      "input_tokens": 2148959,
+      "output_tokens": 31720,
+      "cached_input_tokens": 1144832,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 102934,
-      "output_tokens": 21434,
+      "input_tokens": 104865,
+      "output_tokens": 21733,
       "cached_input_tokens": 0,
-      "cost_usd": 0.06661429999999999
+      "cost_usd": 0.06769504999999999
     },
     "escalation": {
-      "input_tokens": 22370,
-      "output_tokens": 7468,
+      "input_tokens": 24301,
+      "output_tokens": 8152,
       "cached_input_tokens": 0,
-      "cost_usd": 0.09688250000000001
+      "cost_usd": 0.10613625000000002
     },
     "builder": {
-      "input_tokens": 185786,
-      "output_tokens": 1309175,
-      "cached_input_tokens": 265864532,
-      "cost_usd": 231.10878300000002
+      "input_tokens": 200481,
+      "output_tokens": 1450165,
+      "cached_input_tokens": 296270882,
+      "cost_usd": 255.031461
     },
     "judge_llm": {
       "input_tokens": 731541,
@@ -2165,10 +2382,10 @@
       "cost_usd": 0.43776925000000005
     },
     "mechanic": {
-      "input_tokens": 123330,
-      "output_tokens": 16454,
+      "input_tokens": 169137,
+      "output_tokens": 18841,
       "cached_input_tokens": 0,
-      "cost_usd": 0.0631069
+      "cost_usd": 0.07933264999999999
     }
   },
   "recoveries": [],
