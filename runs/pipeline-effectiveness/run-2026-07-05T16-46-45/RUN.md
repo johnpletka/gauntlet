@@ -32,7 +32,7 @@
 | [implement.4](steps/implement.4/transcript.md) | agent_task | done | 78527s | 22522in/206152out $45.3988 | agent 'builder' completed |
 | [tests.4](steps/tests.4/) | shell | done | 428s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.4 | commit | done | 31s | 13462in/1901out $0.0072 | committed 2ffc57b60e |
-| impl-cycle.4 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
+| [impl-cycle.4](steps/impl-cycle.4/) | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
 
 ## Commits
 

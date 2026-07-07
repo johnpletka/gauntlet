@@ -1364,7 +1364,36 @@
       "notes": null,
       "iteration": "4",
       "metrics": {},
-      "checkpoints": [],
+      "checkpoints": [
+        {
+          "sub_step": "review",
+          "round": 1,
+          "handoff_sha": "2ffc57b60e5ccfb8a7ddd8fc9b77f8fe92d41291",
+          "artifact": "artifacts/r1/findings.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "triage",
+          "round": 1,
+          "handoff_sha": "2ffc57b60e5ccfb8a7ddd8fc9b77f8fe92d41291",
+          "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "fix",
+          "round": 1,
+          "handoff_sha": "2ffc57b60e5ccfb8a7ddd8fc9b77f8fe92d41291",
+          "artifact": null,
+          "result_sha": "1d58d95d85a0d73b7931974f90cb29a27fadc937"
+        },
+        {
+          "sub_step": "confirm",
+          "round": 1,
+          "handoff_sha": "2ffc57b60e5ccfb8a7ddd8fc9b77f8fe92d41291",
+          "artifact": "artifacts/r1/confirm.json",
+          "result_sha": null
+        }
+      ],
       "resumed_from_checkpoint": null
     }
   ],
