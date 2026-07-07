@@ -1,63 +1,50 @@
 {
-  "phase": "P5",
+  "phase": "P6",
   "clauses": [
     {
-      "id": "P5-A1",
-      "text": "The seeded behavioral-bug integration fixture yields ≥1 behavioral finding carrying the executed commands as evidence.",
+      "id": "P6-A1",
+      "text": "A fingerprint-matching decline surfaces in the triage prompt as advisory data under compatible (current) provenance.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_behavioral_finding_joins_panel_and_is_triaged"}
+        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_matching_precedent_injects_and_metric_emitted"},
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_matching_decline_injects_under_current_provenance"},
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_precedent_block_wraps_reasoning_as_data"}
       ]
     },
     {
-      "id": "P5-A2",
-      "text": "A stubbed copy-creation / sandbox-launch failure parks the cycle (never degrades to \"skipped, proceed\").",
+      "id": "P6-A2",
+      "text": "A decline is injected only when each recorded version field's content hash (<label>@<hash>) still equals the current worktree asset file's hash (\"in force\"); an entry whose recorded hash differs from the current governed file (superseded) or whose PRD family differs is retained for audit but withheld from injection.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_stubbed_copy_failure_parks_cycle"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_make_disposable_copy_fails_closed"}
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_prompt_hash_withheld_but_retained"},
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_lens_hash_withheld"},
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_superseded_schema_hash_withheld"},
+        {"kind": "pytest", "id": "tests/unit/test_declined_registry.py::test_foreign_prd_family_withheld"},
+        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_stale_provenance_withheld_in_cycle"}
       ]
     },
     {
-      "id": "P5-A3",
-      "text": "Each §7 sandbox item — outside-copy read denial, network default-deny, secret-env stripping, resource-limit expiry — has a passing enforcement test on the v1 backend.",
+      "id": "P6-A3",
+      "text": "The retro path emits a ratifiable lens proposal without directly mutating prompts/lenses/ files.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_env_points_judge_root_at_copy"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_configure_claude_verifier_pins_tools_env_and_hook"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_build_sandbox_env_keeps_allowlist_strips_secrets"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_timeout_parks_cycle"}
+        {"kind": "pytest", "id": "tests/unit/test_retro.py::test_retro_emits_ratifiable_lens_proposal_without_mutating_lens"}
       ]
     },
     {
-      "id": "P5-A4",
-      "text": "The run worktree hash is unchanged after verification.",
+      "id": "P6-A4",
+      "text": "metrics.registry.rematched is emitted to run metrics, and a fixture proves an injected matching precedent can still be triaged legitimate (no suppression).",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_run_worktree_hash_unchanged_after_verification"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_worktree_mutation_across_verification_parks"}
+        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_matching_precedent_injects_and_metric_emitted"},
+        {"kind": "pytest", "id": "tests/unit/test_registry_cycle.py::test_non_matching_finding_no_injection"}
       ]
     },
     {
-      "id": "P5-A5",
-      "text": "A host lacking the v1 sandbox backend is detected at sub-step start and parks closed (never runs the verifier unsandboxed).",
+      "id": "P6-A5",
+      "text": "A two-consecutive-run corpus with a panel member below 25% unique-legit yield emits a ratifiable panel-shrink proposal (no unratified panel change); a three-verifier-run corpus below the behavioral-signal threshold emits a ratifiable verifier-revert-to-opt-in proposal (§9 proposal-mode enforcement, no config self-mutation).",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_stubbed_non_firing_hook_parks_cycle"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_detect_backend_none_without_claude"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_detect_backend_none_without_active_judge"}
-      ]
-    },
-    {
-      "id": "P5-A6",
-      "text": "metrics.verifier.legit_findings and the verifier agent_usage cost are emitted to the run manifest (the §9 behavioral-signal instrument, readable without transcript access).",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_metrics_land_in_manifest_via_orchestrator"},
-        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_metrics_emitted"}
-      ]
-    },
-    {
-      "id": "P5-A7",
-      "text": "acceptance_gate collector enumeration is migrated to run inside the P5 sandbox backend (off the P2–P4 interim subprocess), with a test proving enumeration executes within the sandbox jail and retains fail-closed park-on-failure.",
-      "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumerate_in_sandbox_runs_collector_in_disposable_copy"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_parks_when_no_sandbox_backend"},
-        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumerate_in_sandbox_fails_closed_and_discards_copy"}
+        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_build_governance_proposals_materializes_ratifiable"},
+        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_panel_shrink_fires_on_two_below_threshold"},
+        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_panel_shrink_silent_when_above_threshold"},
+        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_verifier_revert_fires_below_threshold"},
+        {"kind": "pytest", "id": "tests/unit/test_governance.py::test_verifier_revert_needs_three_runs"}
       ]
     }
   ]
