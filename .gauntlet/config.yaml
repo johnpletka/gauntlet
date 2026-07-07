@@ -53,6 +53,17 @@ agents:
   gemini:
     adapter: api
     model: gemini/gemini-2.5-pro
+  # Behavioral verifier (P5, FR-2.1/FR-2.5; Q3 re-resolved to claude-code). Runs in
+  # a disposable copy under the judge PreToolUse hook (--setting-sources project);
+  # the sub-step points the judge repo-root at the copy so out-of-copy paths are
+  # denied, withholds network tools, and spawns from a secret-stripped env. Mirrors
+  # the builder profile's tool surface (engine/verify.py owns the confinement).
+  verifier:
+    adapter: claude-code
+    model: opus
+    permission_mode: acceptEdits
+    allowed_tools: [Bash, Read, Grep, Glob, Edit, Write]
+    base_flags: ["--setting-sources", "project"]
   # Cheap-tier models verified live on this machine (P1/P4 contract runs; only
   # an OpenAI key is present and `claude-haiku-latest` does not resolve via
   # LiteLLM — see pins.yaml). FR-3.1 tiering: mini for classification, full
@@ -82,6 +93,9 @@ identities:
   reviewer:
     name: "Gauntlet Reviewer (codex)"
     email: "reviewer@gauntlet.local"
+  verifier:
+    name: "Gauntlet Verifier (claude)"
+    email: "verifier@gauntlet.local"
   triage:
     name: "Gauntlet Triage"
     email: "triage@gauntlet.local"

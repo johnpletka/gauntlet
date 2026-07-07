@@ -76,6 +76,7 @@ from gauntlet.engine.planphases import (
     phase_section,
 )
 from gauntlet.engine.validators import validate_artifact
+from gauntlet.engine import verify
 from gauntlet.logging.transcript import StepLogger
 
 # FR-2.1: how many in-session repair attempts an invalid `output:` artifact gets
@@ -543,8 +544,25 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             ),
         )
     collector = get_collector(collector_kind)
+    # P5 migration (review F-002 / P5-A7): collector enumeration now runs INSIDE
+    # the P5 verifier sandbox backend — `pytest --collect-only` imports the
+    # branch's conftest/test modules, executing branch-authored code, so it must
+    # run in a disposable copy read-confined by the claude-code judge hook (network
+    # deny, resource-bounded), not the P2-P4 interim bare subprocess in the real
+    # worktree. Fail closed: no usable/hook-confirmed backend parks the gate
+    # (branch collection never runs unhooked, P5-A7).
+    backend = verify.detect_backend(ctx.judge_env)
+    if backend is None:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): no usable sandbox backend to run "
+            f"collector enumeration for phase {phase_id} — the claude-code CLI + an "
+            "active engine-managed judge (whose PreToolUse hook confines the "
+            "enumeration to the run-worktree copy) are required (fail closed — "
+            "enumeration never runs unhooked, P5-A7)"
+        )
     try:
-        enumerated = collector.enumerate(
+        enumerated = verify.enumerate_in_sandbox(
+            backend, collector,
             worktree=ctx.repo_root,
             judge_env=ctx.judge_env,
         )
@@ -552,6 +570,11 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
         return _acceptance_gate_halt(
             f"acceptance gate ({collector_kind}): enumeration failed for phase "
             f"{phase_id} — {exc}"
+        )
+    except verify.VerifierError as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): sandbox enumeration could not run "
+            f"for phase {phase_id} — {exc} (fail closed, P5-A7)"
         )
     missing_ids = sorted(cited - enumerated)
     if missing_ids:

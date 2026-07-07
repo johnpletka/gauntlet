@@ -111,10 +111,20 @@ stages:
       # to the worktree); the P5 verifier sandbox is its target home (plan F-002).
       - {id: acceptance-gate, type: acceptance_gate, collector: pytest,
          map: artifacts/acceptance-map.json}
+      # Behavioral verifier sub-step (pipeline-effectiveness FR-2.1, P5): between
+      # review and triage, the `verifier` (claude-code) profile executes the
+      # deliverable in a DISPOSABLE copy of the post-handoff worktree under the
+      # judge PreToolUse hook (read/write confined to the copy, network default-
+      # deny, secret-stripped env). Fail-closed: an unhooked/absent backend, a
+      # copy/launch failure, or a real-worktree mutation parks the cycle
+      # (engine/verify.py). Its behavioral findings join the merged panel and flow
+      # through triage/fix/confirm; `metrics.verifier.*` records the §9
+      # behavioral-signal instrument (legit findings + verifier cost).
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
          triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: gemini, lens: spec-coverage}],
+         verifier: verifier,
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-code.md}
 

@@ -80,6 +80,7 @@ test_command: "true"
 agents:
   builder: {adapter: claude-code, permission_mode: acceptEdits}
   reviewer: {adapter: codex, sandbox: read-only}
+  verifier: {adapter: claude-code, permission_mode: acceptEdits, allowed_tools: [Bash, Read, Grep, Glob, Edit, Write], base_flags: ["--setting-sources", "project"]}
   gemini: {adapter: api, model: gemini/gemini-2.5-pro}
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
@@ -168,8 +169,35 @@ def _factory(adapters):
     return lambda name: adapters[name]
 
 
-def test_standard_runs_end_to_end_with_fakes(tmp_path):
+def _stub_sandbox(monkeypatch, tmp_path):
+    """Stub the P5 verifier sandbox backend for the offline e2e (no claude+judge).
+
+    The whole e2e is fake-driven (faked reviewer/gemini/builder, use_judge=False),
+    so the claude-code + judge verifier backend is inherently unavailable here;
+    stub it exactly like the other CLIs are faked. The verifier's disposable copy
+    and hook confinement are integration-tested (tests/integration); here the fake
+    `verifier` adapter stands in and the acceptance_gate enumeration runs the real
+    collector on the toy repo (unchanged from the P2-P4 behavior this test asserts)."""
+    from gauntlet.engine import verify
+
+    copy = tmp_path / "verify-copy"
+    copy.mkdir(exist_ok=True)
+    fake = verify.SandboxBackend(claude_path="claude")
+    monkeypatch.setattr(verify, "detect_backend", lambda judge_env: fake)
+    monkeypatch.setattr(verify, "probe_backend", lambda judge_env: fake)
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
+    monkeypatch.setattr(
+        verify, "enumerate_in_sandbox",
+        lambda backend, collector, *, worktree, judge_env, **k:
+        collector.enumerate(worktree=worktree, judge_env={}),
+    )
+
+
+def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     repo = _scaffold(tmp_path)
+    _stub_sandbox(monkeypatch, tmp_path)
     adapters = {
         # prd-cycle, plan-cycle, impl-cycle each converge on an empty review;
         # +1 reviewer self-critique in the now-active retro stage (FR-6.2, P7).
@@ -180,6 +208,9 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
         # Ensemble panel member 2 (FR-1.1): the three cycles each run it; it
         # converges empty like the reviewer so each round finds nothing.
         "gemini": Script(review_empty(), review_empty(), review_empty()),
+        # P5 behavioral verifier: runs once on the impl-cycle (round 1); converges
+        # empty (no behavioral findings) so the cycle still converges in round 1.
+        "verifier": Script(review_empty()),
         "builder": Script(
             text_result(PLAN_MD),                              # plan-author
             text_result("implemented P1", IMPL_WRITES),
@@ -252,9 +283,10 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
     assert all(v.startswith("sha256:") for v in man.prompt_hashes.values())
 
 
-def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
+def test_yaml_only_extension_adds_a_third_review_step(tmp_path, monkeypatch):
     # FR-5.3/5.4 acceptance: add a review step to one stage by EDITING YAML only;
     # it validates, runs, and shows up in the manifest + cost report. No code.
+    _stub_sandbox(monkeypatch, tmp_path)
     spec = yaml.safe_load((REPO / "pipelines" / "standard.yaml").read_text())
     phases = next(s for s in spec["stages"] if s["id"] == "phases")
     extra = {
@@ -276,6 +308,9 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
         # Panel member 2 runs on the three panel cycles (prd/plan/impl); the added
         # impl-cycle-2 is a single-reviewer step, so gemini is called 3× not 4×.
         "gemini": Script(*[review_empty() for _ in range(3)]),
+        # P5 verifier runs on impl-cycle only (impl-cycle-2 declares no verifier);
+        # converges empty.
+        "verifier": Script(review_empty()),
         "builder": Script(
             text_result(PLAN_MD),
             text_result("did P1", IMPL_WRITES),

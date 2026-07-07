@@ -258,11 +258,13 @@ def test_behavioral_finding_survives_merge_triage_confirm(fixture_repo):
     assert confirm["verdicts"][0]["finding_id"] == "0-reviewer-correctness:F-001"
 
 
-def test_behavioral_migration_landed_before_verifier_is_wired(fixture_repo):
-    # FR-2.4 phase-order assertion: the schema + the merge consumer's per-member
-    # validator accept `behavioral` NOW, while verifier EXECUTION is still P5 (no
-    # engine/verify.py, no `verifier` step type). This is the precondition P5
-    # depends on — a behavioral finding can never reach an unmigrated consumer.
+def test_behavioral_migration_supports_the_verifier(fixture_repo):
+    # FR-2.4 (P4 guarantee, still enforced): the schema + the merge consumer's
+    # per-member validator accept `behavioral` end-to-end, so a verifier's
+    # behavioral finding can never reach an unmigrated consumer. In P4 this landed
+    # BEFORE any verifier execution; P5 has since wired the verifier on top of it
+    # (engine/verify.py), so this test now confirms the migration underpins the
+    # shipped verifier rather than that the verifier is absent.
     from gauntlet.engine import cycle as C
     from gauntlet.adapters._structured import validate_schema
 
@@ -278,8 +280,8 @@ def test_behavioral_migration_landed_before_verifier_is_wired(fixture_repo):
          "open_questions": [], "summary": "s"},
         reviewer_schema,
     )
-    # verifier EXECUTION is not wired yet — that is P5, not P4.
-    assert not (REPO / "src" / "gauntlet" / "engine" / "verify.py").exists()
+    # P5 has now wired verifier EXECUTION on top of the P4 migration.
+    assert (REPO / "src" / "gauntlet" / "engine" / "verify.py").exists()
 
 
 def test_lens_fragment_reaches_member_prompt(fixture_repo):

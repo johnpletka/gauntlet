@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from gauntlet.engine import collectors
+from gauntlet.engine import collectors, verify
 from gauntlet.engine.collectors import (
     CollectorEnumerationError,
     _parse_pytest,
@@ -96,6 +96,22 @@ def _write_map(ctx: StepContext, clauses: dict[str, list[dict]]) -> None:
 def _gate_step(**kw):
     return Step.model_validate({"id": "acceptance-gate", "type": "acceptance_gate",
                                 "collector": "pytest", **kw})
+
+
+# The P5 migration (review F-002 / P5-A7) runs collector enumeration INSIDE the
+# claude-code sandbox backend. These helpers let the gate's enumeration path be
+# exercised on a host without a claude+judge backend: `_stub_backend` satisfies
+# the fail-closed backend probe, and each test stubs `verify.enumerate_in_sandbox`
+# (the P5 backend seam the gate now calls) with the enumeration result it needs.
+def _stub_backend(monkeypatch):
+    monkeypatch.setattr(verify, "detect_backend",
+                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
+
+
+def _stub_enumeration(monkeypatch, ids):
+    _stub_backend(monkeypatch)
+    monkeypatch.setattr(verify, "enumerate_in_sandbox",
+                        lambda backend, collector, **k: set(ids))
 
 
 # --- FR-3.1: phase_lint requires a well-formed acceptance list (P2-A1) --------
@@ -182,8 +198,7 @@ def test_gate_parks_on_nonexistent_node_id(fixture_repo, monkeypatch):
     side-effect-free collector enumeration."""
     ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
     _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::missing"}]})
-    monkeypatch.setattr(collectors, "run_bounded_enumeration",
-                        lambda *a, **k: "tests/unit/x.py::present\n")
+    _stub_enumeration(monkeypatch, {"tests/unit/x.py::present"})
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == HALTED
     assert "tests/unit/x.py::missing" in result.notes
@@ -198,8 +213,7 @@ def test_gate_passes_on_complete_mapping(fixture_repo, monkeypatch):
         "P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::a"}],
         "P2-A2": [{"kind": "pytest", "id": "tests/unit/x.py::b"}],
     })
-    monkeypatch.setattr(collectors, "run_bounded_enumeration",
-                        lambda *a, **k: "tests/unit/x.py::a\ntests/unit/x.py::b\n")
+    _stub_enumeration(monkeypatch, {"tests/unit/x.py::a", "tests/unit/x.py::b"})
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == DONE
     assert "citation + existence" in result.notes
@@ -281,11 +295,12 @@ def test_enumeration_failure_parks_closed(fixture_repo, monkeypatch):
     an absent/failed enumeration is never treated as 'all mapped'."""
     ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
     _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
+    _stub_backend(monkeypatch)
 
     def _boom(*a, **k):
         raise CollectorEnumerationError("collector enumeration exited 2 (fail closed)")
 
-    monkeypatch.setattr(collectors, "run_bounded_enumeration", _boom)
+    monkeypatch.setattr(verify, "enumerate_in_sandbox", _boom)
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == HALTED
     assert "enumeration failed" in result.notes and "fail closed" in result.notes
@@ -385,6 +400,83 @@ def test_empty_enumeration_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(collectors.subprocess, "run", lambda *a, **k: _Proc())
     with pytest.raises(CollectorEnumerationError, match="no parseable ids"):
         collectors.get_collector("pytest").enumerate(worktree=tmp_path, judge_env={})
+
+
+# --- P5-A7: collector enumeration migrated into the sandbox backend ----------
+def test_gate_parks_when_no_sandbox_backend(fixture_repo, monkeypatch):
+    """P5-A7: with no usable/hook-confirmed sandbox backend the gate parks closed —
+    collector enumeration (which imports branch conftest/test code at collection)
+    never runs unhooked, and an absent backend is never read as 'all mapped'."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
+    _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
+    monkeypatch.setattr(verify, "detect_backend", lambda judge_env: None)
+    monkeypatch.setattr(
+        verify, "enumerate_in_sandbox",
+        lambda *a, **k: pytest.fail("enumeration must not run without a backend"),
+    )
+    result = handle_acceptance_gate(_gate_step(), ctx)
+    assert result.status == HALTED
+    assert result.halt_reason == HALT_REASON_PRECONDITION
+    assert "no usable sandbox backend" in result.notes
+
+
+def test_enumerate_in_sandbox_runs_collector_in_disposable_copy(monkeypatch, tmp_path):
+    """P5-A7 (migration): enumeration runs INSIDE the backend — in a disposable COPY
+    of the run worktree (not the real worktree / interim bare subprocess) — with
+    the judge repo-root pointed at the copy so the hook confines the collection."""
+    copy = tmp_path / "wt-copy"
+    copy.mkdir()
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+    discarded = {}
+    monkeypatch.setattr(verify, "discard_disposable_copy",
+                        lambda repo, c: discarded.setdefault("path", c.path))
+    seen = {}
+
+    class _FakeCollector:
+        def enumerate(self, *, worktree, judge_env, **k):
+            seen["worktree"] = worktree
+            seen["judge_env"] = judge_env
+            return {"tests/unit/x.py::t"}
+
+    backend = verify.SandboxBackend(claude_path="claude")
+    real_worktree = tmp_path / "real"
+    real_worktree.mkdir()
+    ids = verify.enumerate_in_sandbox(
+        backend, _FakeCollector(), worktree=real_worktree,
+        judge_env={"GAUNTLET_JUDGE_TOKEN": "tok"},
+    )
+    assert ids == {"tests/unit/x.py::t"}
+    # collection ran in the COPY, not the real worktree (the P5 jail)
+    assert seen["worktree"] == copy
+    assert seen["worktree"] != real_worktree
+    # the judge repo-root boundary is pointed at the copy (hook confines reads)
+    assert seen["judge_env"][verify.REPO_ROOT_ENV_VAR] == str(copy)
+    # the copy is always torn down
+    assert discarded["path"] == copy
+
+
+def test_enumerate_in_sandbox_fails_closed_and_discards_copy(monkeypatch, tmp_path):
+    """P5-A7: a failed enumeration inside the backend propagates
+    CollectorEnumerationError (fail-closed park preserved) AND still discards the
+    disposable copy."""
+    copy = tmp_path / "wt-copy"
+    copy.mkdir()
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+    discarded = {}
+    monkeypatch.setattr(verify, "discard_disposable_copy",
+                        lambda repo, c: discarded.setdefault("done", True))
+
+    class _BoomCollector:
+        def enumerate(self, **k):
+            raise CollectorEnumerationError("collector enumeration exited 2 (fail closed)")
+
+    backend = verify.SandboxBackend(claude_path="claude")
+    with pytest.raises(CollectorEnumerationError, match="fail closed"):
+        verify.enumerate_in_sandbox(backend, _BoomCollector(), worktree=tmp_path,
+                                    judge_env={})
+    assert discarded.get("done") is True  # copy torn down even on failure
 
 
 # --- FR-3.2: unregistered collector rejected at pipeline LOAD (P2-A5) ---------

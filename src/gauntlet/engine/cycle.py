@@ -47,6 +47,7 @@ from gauntlet.adapters.base import (
 from gauntlet.engine import ensemble
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
+from gauntlet.engine import verify
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -451,6 +452,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     dedup_threshold = float(
         step.get("dedup_jaccard_threshold", ensemble.DEFAULT_JACCARD_THRESHOLD)
     )
+    # FR-2.1: an optional behavioral verifier sub-step. `verifier:` names a
+    # designated agent profile (a claude-code judge-hooked backend) that executes
+    # the deliverable in a disposable sandboxed copy between review and triage.
+    # Only meaningful for a code cycle (there is a deliverable to run); in artifact
+    # mode there is nothing to execute, so it is ignored there.
+    verifier_profile = step.get("verifier") if step.get("mode", "artifact") == "code_review" else None
+    if verifier_profile and verifier_profile not in ctx.config.agents and ctx.adapter_factory is None:
+        return StepResult(
+            status=FAILED,
+            notes=f"adversarial_cycle `verifier:` profile {verifier_profile!r} is "
+            "not a configured agent profile (FR-2.1)",
+        )
     if step.get("commit_each_fix_round") is False:
         return StepResult(
             status=FAILED,
@@ -696,9 +709,29 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             open_questions = (review.structured or {}).get("open_questions") or []
             review_summary = (review.structured or {}).get("summary", "")
 
+        # ---- 1b. behavioral verifier sub-step (FR-2.1/2.2, optional) ----------
+        # Between review and triage: execute the deliverable in a DISPOSABLE
+        # sandboxed copy and emit behavioral findings that JOIN the merged panel
+        # and flow through the same triage/fix/confirm machinery — no parallel
+        # process (FR-2.2). Fail closed (FR-2.3/2.5): an unusable/unhooked backend,
+        # a copy/sandbox-launch failure, or a real-worktree mutation parks the cycle
+        # (never "skipped, proceed"). On reuse the behavioral findings are already
+        # in the checkpointed `findings`, so it never re-runs / re-pays.
+        if verifier_profile and not reuse_review:
+            try:
+                behavioral = _run_verifier(
+                    step, ctx, verifier_profile, rnd, handoff, phase,
+                    findings_schema, usage, metrics, cycle_effort,
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
+            findings.extend(behavioral)
+
         # Triage set = primaries only. A merged duplicate carries `duplicate_of`
         # and never reaches triage (FR-1.2); single-reviewer findings carry none,
         # so this is identical to `findings` for the single path (unchanged).
+        # Behavioral verifier findings (category behavioral, no duplicate_of) are
+        # primaries and reach triage alongside review primaries (FR-2.2).
         triage_findings = [f for f in findings if not f.get("duplicate_of")]
         metrics.record_round(triage_findings)  # counted on reuse too (trend math)
         if is_ensemble:  # per-(profile, lens) yield metrics (FR-1.3)
@@ -752,6 +785,8 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             metrics.record_ensemble_legit(
                 _ensemble_legit_by_member(triage_findings, verdicts)
             )
+        if verifier_profile:  # triage-legitimate behavioral yield (FR-2, §9)
+            metrics.record_verifier_legit(triage_findings, verdicts)
         # Integrity backstop BEFORE the authoritative write (data over inference):
         # every verdict must map to a finding in THIS round. The triager forces
         # finding_id = finding['id'] and the schema requires an id, so a stray id
@@ -978,6 +1013,8 @@ def _run_sub(
     session: str | None = None,
     substep: str | None = None,
     effort: str | None = None,
+    cwd: Path | None = None,
+    extra_flags: list[str] | None = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
@@ -1024,7 +1061,12 @@ def _run_sub(
         # is kept separately by _log_partial (suffixed). sink is threaded ONLY
         # when streaming — the buffered call shape is untouched (FR-6.1).
         stream = open_step_stream(ctx, adapter, logger)
-        run_kwargs: dict = {"schema": schema, "cwd": ctx.repo_root}
+        # The verifier sub-step (FR-2.1) overrides ``cwd`` to the disposable copy
+        # and passes network-deny/setting-source ``extra_flags``; every other
+        # sub-agent runs in the real run worktree with no extra flags (unchanged).
+        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.repo_root}
+        if extra_flags:
+            run_kwargs["extra_flags"] = list(extra_flags)
         if session is not None:
             run_kwargs["session"] = session  # FR-3.3 usage-limit continuation
         if stream is not None:
@@ -1454,6 +1496,142 @@ def _ensemble_legit_by_member(
             key = f"{p.get('source')}::{p.get('lens') or 'nolens'}"
             legit[key] = legit.get(key, 0) + 1
     return legit
+
+
+# --- behavioral verifier (FR-2.1/2.2/2.3/2.5) ------------------------------------
+_BUILTIN_VERIFY = (
+    "You are the behavioral verifier. You have a DISPOSABLE, sandboxed copy of the "
+    "worktree for the phase under review — you may run anything in it; nothing you "
+    "do touches the real run worktree. EXECUTE the deliverable against the phase's "
+    "acceptance clauses: run the CLI, exercise the API, probe edge inputs, run the "
+    "relevant tests. Report only what you OBSERVE BY RUNNING — behavior a diff "
+    "reader cannot see (wrong runtime output, a crash on a real input, an "
+    "acceptance clause the code does not actually satisfy when executed). "
+    "Every finding MUST use category `behavioral` and put the EXACT commands you "
+    "ran (and their observed output) in `evidence`. Raise no finding you did not "
+    "confirm by execution. If everything you executed behaves correctly, return an "
+    "empty findings list."
+)
+
+
+def _verifier_prompt(step: Step, ctx: StepContext, phase: str | None) -> str:
+    """The verifier's prompt: the phase's plan section (goal + acceptance clauses)
+    plus the execute-and-observe instruction (FR-2.1). The plan section comes from
+    the foreach `plan.phases` item in context — the same clauses the acceptance_gate
+    checks — so the verifier judges runtime behavior against exactly what the phase
+    promised."""
+    template = _template(ctx, step, "verify_prompt", "prompts/cycle-verify.md", _BUILTIN_VERIFY)
+    parts = [template]
+    item = ctx.iteration_item
+    if isinstance(item, dict) and item.get("id"):
+        section = {
+            "id": item.get("id"), "title": item.get("title"),
+            "goal": item.get("goal"), "acceptance": item.get("acceptance") or [],
+        }
+        parts.append(
+            f"\n--- the phase under verification ({item.get('id')}) — execute the "
+            "deliverable against these acceptance clauses ---\n"
+            + wrap_as_data(json.dumps(section, indent=2))
+        )
+    elif phase:
+        parts.append(f"\n--- the phase under verification: {phase} ---")
+    return "".join(parts)
+
+
+def _stamp_verifier_finding(finding: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Namespace a verifier finding's id (unique across the panel) and stamp its
+    provenance (FR-2.2): ``source`` is the sentinel ``verifier`` and ``category``
+    is forced to ``behavioral`` so a verifier finding is unambiguously a behavioral
+    signal. Engine annotation, never agent-trusted — same discipline as
+    ``_stamp_member_finding``."""
+    out = {**finding, "id": f"verifier:{finding.get('id')}"}
+    out["source"] = "verifier"
+    out["category"] = "behavioral"
+    return out
+
+
+def _run_verifier(
+    step: Step, ctx: StepContext, profile: str, rnd: int, handoff: str,
+    phase: str | None, findings_schema: dict | None, usage: Any,
+    metrics: "_CycleMetrics", effort: str | None,
+) -> list[dict[str, Any]]:
+    """Run the behavioral verifier once this round; return its stamped behavioral
+    findings (FR-2.1/2.2). FAIL CLOSED (FR-2.3/2.5): an unhooked/absent backend, a
+    copy-creation failure, an adapter failure, or a mutation of the real run
+    worktree raises :class:`_ParkCycle`. The verifier executes ONLY in a disposable
+    git-worktree copy; the real tree's HEAD tree hash is captured before and
+    confirmed after (P5-A4). The claude-code judge hook, pointed at the copy root,
+    denies any tool call whose resolved path escapes the copy (FR-2.5)."""
+    from gauntlet.engine.steptypes import step_logger
+
+    # 1. Probe the sandbox backend at sub-step start (FR-2.5 / P5-A5). Absent or
+    # judge-hook-unconfirmable → park closed; the verifier never runs unhooked.
+    try:
+        verify.probe_backend(ctx.judge_env)
+    except verify.SandboxUnavailableError as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=f"verifier parks fail-closed (FR-2.5): {exc}",
+        )) from exc
+
+    # 2. Witness the real worktree BEFORE (FR-2.5 / P5-A4).
+    before = gitops.worktree_tree_hash(ctx.repo_root)
+
+    # 3. Disposable copy (FR-2.1/2.3). Failure parks — never "skipped, proceed".
+    try:
+        copy = verify.make_disposable_copy(ctx.repo_root)
+    except verify.CopyCreationError as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=f"verifier parks fail-closed (FR-2.3): {exc}",
+        )) from exc
+
+    verifier_schema = _reviewer_output_schema(findings_schema) if findings_schema else None
+    logger = step_logger(ctx, f"r{rnd}-verify")
+    try:
+        adapter = ctx.build_adapter(profile, effort=effort)
+        # Pin the claude-code verifier posture: confined allowed_tools (no network),
+        # permission mode, --setting-sources project (so the judge hook fires), and
+        # the rebuilt secret-stripped env whose judge repo-root boundary is the copy
+        # (FR-2.5). A no-op on a test double, which carries none of those attributes.
+        env = verify.verifier_env(ctx.judge_env, copy.path)
+        extra_flags = verify.configure_claude_verifier(adapter, env=env)
+        review = _run_sub(
+            ctx, profile, _verifier_prompt(step, ctx, phase), schema=verifier_schema,
+            usage=usage, logger=logger, structured_name="findings.json",
+            substep=f"r{rnd}-verify", effort=effort,
+            cwd=copy.path, extra_flags=extra_flags,
+        )
+    except _ParkCycle:
+        raise  # transient usage-limit/overload: the cycle parks resumably
+    except (AdapterError, MalformedOutputError) as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.3): the verifier sub-step failed "
+                f"in round {rnd} ({exc}); the cycle does not proceed to triage on a "
+                "skipped verification"
+            ),
+        )) from exc
+    finally:
+        verify.discard_disposable_copy(ctx.repo_root, copy)
+
+    # 4. The real worktree must be byte-identical after verification (P5-A4).
+    after = gitops.worktree_tree_hash(ctx.repo_root)
+    if after != before:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.5): the run worktree HEAD tree "
+                f"hash changed across verification ({before[:10]} → {after[:10]}); "
+                "the verifier must execute only in the disposable copy"
+            ),
+        ))
+
+    raw = list((review.structured or {}).get("findings") or [])
+    behavioral = [_stamp_verifier_finding(f, profile) for f in raw]
+    metrics.record_verifier_findings(profile, behavioral, review.usage)
+    return behavioral
 
 
 def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
@@ -2424,6 +2602,17 @@ class _CycleMetrics:
         # (metrics.ensemble.unique_legit_by_member). Empty for a single-reviewer
         # cycle, so the `ensemble` key is omitted entirely (byte-compatible trend).
         self.ensemble_by_member: dict[str, dict[str, Any]] = {}
+        # Behavioral verifier metrics (FR-2 / §9 behavioral-signal instrument,
+        # review F-001): the verifier profile, behavioral findings raised, the
+        # triage-legitimate count, and the verifier's own agent_usage — so the §9
+        # checks ("≥1 triage-legitimate behavioral finding per run on average,
+        # verifier cost ≤10% of run cost") are computed from the manifest without
+        # transcript access, and are the input the P6 verifier-revert proposal
+        # reads. Omitted entirely (no `verifier` key) when no verifier ran.
+        self.verifier_profile: str | None = None
+        self.verifier_findings_total = 0
+        self.verifier_legit_findings = 0
+        self.verifier_usage: dict[str, Any] = {}
 
     def record_round(self, findings: list[dict[str, Any]]) -> None:
         self.rounds += 1
@@ -2466,6 +2655,35 @@ class _CycleMetrics:
         for key, count in legit_by_key.items():
             self._member(key, None, None)["unique_legit"] += int(count)
 
+    def record_verifier_findings(
+        self, profile: str, behavioral: list[dict[str, Any]], usage: Any
+    ) -> None:
+        """Accumulate a round's behavioral findings raised + the verifier's own
+        agent_usage cost (FR-2 / §9). Additive across rounds."""
+        self.verifier_profile = profile
+        self.verifier_findings_total += len(behavioral)
+        if usage is not None:
+            for field in ("input_tokens", "output_tokens", "cached_input_tokens"):
+                val = getattr(usage, field, None)
+                if isinstance(val, int):
+                    self.verifier_usage[field] = self.verifier_usage.get(field, 0) + val
+            cost = getattr(usage, "cost_usd", None)
+            if isinstance(cost, (int, float)):
+                self.verifier_usage["cost_usd"] = self.verifier_usage.get("cost_usd", 0.0) + cost
+
+    def record_verifier_legit(
+        self, triage_findings: list[dict[str, Any]], verdicts: list[dict[str, Any]]
+    ) -> None:
+        """Accumulate the triage-legitimate behavioral yield (§9 behavioral-signal).
+        A behavioral primary the triager judged ``legitimate`` counts — the number
+        the §9 threshold and the P6 verifier-revert proposal read."""
+        verdict_by_id = {v.get("finding_id"): v for v in verdicts}
+        for f in triage_findings:
+            if f.get("source") == "verifier" and f.get("category") == "behavioral":
+                v = verdict_by_id.get(f.get("id"))
+                if v and v.get("verdict") == "legitimate":
+                    self.verifier_legit_findings += 1
+
     def record_confirm(self, cdata: dict[str, Any]) -> None:
         # The confirm pass that follows immediately confirms THIS round's fixes,
         # so its verdicts are scoped to the round's findings — join against the
@@ -2491,6 +2709,13 @@ class _CycleMetrics:
                 "unique_legit_by_member": {
                     k: dict(v) for k, v in self.ensemble_by_member.items()
                 }
+            }
+        if self.verifier_profile is not None:  # FR-2 / §9; omitted with no verifier
+            out["verifier"] = {
+                "profile": self.verifier_profile,
+                "findings_total": self.verifier_findings_total,
+                "legit_findings": self.verifier_legit_findings,
+                "agent_usage": dict(self.verifier_usage),
             }
         return out
 

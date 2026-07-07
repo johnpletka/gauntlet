@@ -96,6 +96,19 @@ agents:
   gemini:
     adapter: api
     model: gemini/gemini-2.5-pro
+  # Behavioral verifier (pipeline-effectiveness FR-2.1/FR-2.5, P5; Q3 re-resolved
+  # to claude-code). Executes the deliverable in a DISPOSABLE copy under the judge
+  # PreToolUse hook (--setting-sources project); the verifier sub-step points the
+  # judge repo-root at the copy so out-of-copy Read/Write/Edit/Bash paths are
+  # DENIED, withholds network tools, and spawns from a secret-stripped env.
+  # Enforcement is hook-level (the ratified v1 tradeoff). To review without a
+  # behavioral verifier, drop `verifier:` from pipelines/standard.yaml's impl-cycle.
+  verifier:
+    adapter: claude-code
+    model: opus
+    permission_mode: acceptEdits
+    allowed_tools: [Bash, Read, Grep, Glob, Edit, Write]
+    base_flags: ["--setting-sources", "project"]
   # Cheap-tier models for classification (FR-3.1): a small model for triage and
   # the judge LLM rung, a stronger model for severity-aware triage escalation.
   # Pinned to ApiAdapter models verified live via LiteLLM (.gauntlet/pins.yaml):
@@ -125,6 +138,9 @@ identities:
   reviewer:
     name: "Gauntlet Reviewer (codex)"
     email: "reviewer@gauntlet.local"
+  verifier:
+    name: "Gauntlet Verifier (claude)"
+    email: "verifier@gauntlet.local"
   triage:
     name: "Gauntlet Triage"
     email: "triage@gauntlet.local"

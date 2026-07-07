@@ -173,6 +173,40 @@ def is_dirty_vs(repo: Path, base_sha: str, *, exclude: list[str] | None = None) 
     return head_sha(repo) != base_sha
 
 
+def worktree_tree_hash(repo: Path) -> str:
+    """A content hash of the repo's HEAD tree — the mutation-guard witness for the
+    P5 verifier (FR-2.1/FR-2.5).
+
+    Returns HEAD's tree object id (``git rev-parse HEAD^{tree}``): a stable digest
+    of the *committed* tree the verifier hands off. The verifier runs in a
+    disposable copy and must not touch the real worktree, so the plan's "run
+    worktree hash is unchanged after verification" (P5-A4) is asserted by
+    capturing this before verification and confirming it after — together with the
+    existing FR-9.6 mutation guard, which watches the real tree for uncommitted
+    dirt."""
+    return _run(repo, "rev-parse", "HEAD^{tree}").strip()
+
+
+def add_worktree(repo: Path, path: Path, ref: str = "HEAD") -> None:
+    """Create a detached git worktree of ``ref`` at ``path`` (FR-2.1 disposable
+    copy). ``--detach`` avoids branch contention with the run branch; the copy is a
+    faithful checkout of the post-handoff committed tree. Raises ``GitError`` on
+    failure so the verifier sub-step fails closed (never proceeds without a copy)."""
+    _run(repo, "worktree", "add", "--detach", "--force", str(path), ref)
+
+
+def remove_worktree(repo: Path, path: Path) -> None:
+    """Remove a disposable worktree created by :func:`add_worktree`. ``--force``
+    because the sandboxed verifier will have left uncommitted edits in the copy
+    (that is the point — it *executes* the deliverable)."""
+    _run(repo, "worktree", "remove", "--force", str(path))
+
+
+def prune_worktrees(repo: Path) -> None:
+    """Prune stale worktree administrative entries (best-effort cleanup)."""
+    _run(repo, "worktree", "prune")
+
+
 def branch_exists(repo: Path, branch: str) -> bool:
     try:
         _run(repo, "rev-parse", "--verify", f"refs/heads/{branch}")

@@ -436,7 +436,11 @@ def _effort_target_agents(step: Step) -> list[str]:
     the roles the step actually declares (``confirmer`` defaults to ``reviewer``,
     which is already covered)."""
     if step.type == "adversarial_cycle":
-        roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
+        # The verifier sub-step (FR-2.1) runs under the cycle-level `effort:` too
+        # (`_run_verifier` passes it to build_adapter), so its adapter must accept
+        # any step effort — include it in the load-time effort-compat check.
+        roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent",
+                 "verifier")
         agents = [a for a in (step.get(r) for r in roles) if a]
         if step.get("reviewers"):  # ensemble panel members (FR-1.1)
             from gauntlet.engine.cycle import _panel
@@ -451,7 +455,7 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     if step.agent:
         refs.append(step.agent)
     for key in ("message_agent", "disposition_agent", "reviewer", "triager",
-                "fixer", "confirmer", "escalation_agent", "proposer"):
+                "fixer", "confirmer", "escalation_agent", "proposer", "verifier"):
         ref = step.get(key)
         if ref:
             refs.append(ref)

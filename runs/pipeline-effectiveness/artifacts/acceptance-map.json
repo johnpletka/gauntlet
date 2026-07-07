@@ -1,28 +1,63 @@
 {
-  "phase": "P4",
+  "phase": "P5",
   "clauses": [
     {
-      "id": "P4-A1",
-      "text": "A pre-migration findings fixture (no behavioral value) validates against the migrated schema.",
+      "id": "P5-A1",
+      "text": "The seeded behavioral-bug integration fixture yields ≥1 behavioral finding carrying the executed commands as evidence.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_findings_fixture_validates_against_migrated_schema"},
-        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_categories_still_validate[correctness]"},
-        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_pre_migration_categories_still_validate[style]"}
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_behavioral_finding_joins_panel_and_is_triaged"}
       ]
     },
     {
-      "id": "P4-A2",
-      "text": "A finding with category behavioral validates and survives merge → triage → confirm.",
+      "id": "P5-A2",
+      "text": "A stubbed copy-creation / sandbox-launch failure parks the cycle (never degrades to \"skipped, proceed\").",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_ensemble_cycle.py::test_behavioral_finding_survives_merge_triage_confirm"},
-        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_behavioral_category_validates_after_migration"}
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_stubbed_copy_failure_parks_cycle"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_make_disposable_copy_fails_closed"}
       ]
     },
     {
-      "id": "P4-A3",
-      "text": "A finding whose category is absent from the enum is rejected at validation (fail closed; never coerced or dropped).",
+      "id": "P5-A3",
+      "text": "Each §7 sandbox item — outside-copy read denial, network default-deny, secret-env stripping, resource-limit expiry — has a passing enforcement test on the v1 backend.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_schemas.py::test_findings_schema_rejects_unknown_category_fail_closed"}
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_env_points_judge_root_at_copy"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_configure_claude_verifier_pins_tools_env_and_hook"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_build_sandbox_env_keeps_allowlist_strips_secrets"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_timeout_parks_cycle"}
+      ]
+    },
+    {
+      "id": "P5-A4",
+      "text": "The run worktree hash is unchanged after verification.",
+      "evidence": [
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_run_worktree_hash_unchanged_after_verification"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_worktree_mutation_across_verification_parks"}
+      ]
+    },
+    {
+      "id": "P5-A5",
+      "text": "A host lacking the v1 sandbox backend is detected at sub-step start and parks closed (never runs the verifier unsandboxed).",
+      "evidence": [
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_stubbed_non_firing_hook_parks_cycle"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_detect_backend_none_without_claude"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_detect_backend_none_without_active_judge"}
+      ]
+    },
+    {
+      "id": "P5-A6",
+      "text": "metrics.verifier.legit_findings and the verifier agent_usage cost are emitted to the run manifest (the §9 behavioral-signal instrument, readable without transcript access).",
+      "evidence": [
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_metrics_land_in_manifest_via_orchestrator"},
+        {"kind": "pytest", "id": "tests/unit/test_verify.py::test_verifier_metrics_emitted"}
+      ]
+    },
+    {
+      "id": "P5-A7",
+      "text": "acceptance_gate collector enumeration is migrated to run inside the P5 sandbox backend (off the P2–P4 interim subprocess), with a test proving enumeration executes within the sandbox jail and retains fail-closed park-on-failure.",
+      "evidence": [
+        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumerate_in_sandbox_runs_collector_in_disposable_copy"},
+        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_gate_parks_when_no_sandbox_backend"},
+        {"kind": "pytest", "id": "tests/unit/test_acceptance_gate.py::test_enumerate_in_sandbox_fails_closed_and_discards_copy"}
       ]
     }
   ]
