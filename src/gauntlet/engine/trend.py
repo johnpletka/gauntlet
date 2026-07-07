@@ -21,6 +21,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Iterator
 
+import pydantic
+
 _PHASE_RE = re.compile(r"^P\d+$")
 
 
@@ -39,6 +41,8 @@ class TrendMetrics:
     cost_per_phase: float | None
     judge_ask_rate: float | None
     total_cost: float | None
+    total_duration: float | None  # summed wall-clock seconds of timed steps
+    duration_per_phase: float | None  # seconds
 
 
 def build_run_trend(manifest: Any, *, judge_audit_path: Path | None = None) -> TrendMetrics:
@@ -87,6 +91,13 @@ def build_run_trend(manifest: Any, *, judge_audit_path: Path | None = None) -> T
     total_cost = manifest.totals.cost_usd
     cost_per_phase = (total_cost / phases) if (total_cost is not None and phases) else None
 
+    # FR-5.3 wants a per-phase DURATION distribution alongside cost, so the plan
+    # author can size phases against a window's wall-clock budget, not just its
+    # dollar budget. Sum the timed steps' wall-clock and divide by phase count.
+    step_durations = [d for d in (_step_duration_seconds(r) for r in manifest.steps) if d is not None]
+    total_duration = sum(step_durations) if step_durations else None
+    duration_per_phase = (total_duration / phases) if (total_duration is not None and phases) else None
+
     return TrendMetrics(
         run_id=manifest.run_id,
         slug=manifest.slug,
@@ -101,6 +112,8 @@ def build_run_trend(manifest: Any, *, judge_audit_path: Path | None = None) -> T
         cost_per_phase=cost_per_phase,
         judge_ask_rate=judge_ask_rate(judge_audit_path),
         total_cost=total_cost,
+        total_duration=total_duration,
+        duration_per_phase=duration_per_phase,
     )
 
 
@@ -238,7 +251,12 @@ def iter_completed_manifests(run_root: Path) -> Iterator[Any]:
                 continue
             try:
                 man = Manifest.load(man_path)
-            except (OSError, ValueError):
+            except (OSError, ValueError, pydantic.ValidationError):
+                # OSError: unreadable file. ValueError/ValidationError: unparseable
+                # JSON or JSON that is syntactically valid but violates the manifest
+                # schema. pydantic.ValidationError is listed explicitly rather than
+                # relying on its incidental ValueError base — a single bad historical
+                # run must never fail the render.
                 continue
             if man.status == RUN_DONE:
                 yield man
@@ -349,11 +367,12 @@ def render_plan_author_history(
             f"{_cost(s.median_cost):>9} {_dur(s.mean_duration):>9} "
             f"{_dur(s.median_duration):>9}\n"
         )
-    parts.append("\nPer-run cost per phase (oldest first):\n")
+    parts.append("\nPer-run cost/duration per phase (oldest first):\n")
     for r in rows:
         phases = f"{r.phases} phase(s)" if r.phases else "no numbered phases"
         parts.append(
             f"  {r.run_id:<26} {_cost(r.cost_per_phase)}/phase   "
-            f"({phases}, {_cost(r.total_cost)} total)\n"
+            f"{_dur(r.duration_per_phase)}/phase   "
+            f"({phases}, {_cost(r.total_cost)} / {_dur(r.total_duration)} total)\n"
         )
     return "".join(parts)

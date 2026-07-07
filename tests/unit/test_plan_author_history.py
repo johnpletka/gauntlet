@@ -95,6 +95,20 @@ def test_iter_completed_manifests_skips_corrupt_manifest(tmp_path: Path):
     assert ids == ["run-2026-06-13T00-00-00"]  # corrupt sibling contributes nothing
 
 
+def test_iter_completed_manifests_skips_schema_invalid_manifest(tmp_path: Path):
+    # Syntactically valid JSON that violates the manifest schema raises
+    # pydantic.ValidationError (not a plain JSON decode error). It must be
+    # swallowed like any other corrupt run so a single bad historical manifest
+    # can never fail plan-author rendering.
+    run_root = tmp_path / "runs"
+    _write_run(run_root, "a", _completed_manifest("run-2026-06-13T00-00-00"))
+    bad = run_root / "b" / "run-bad"
+    bad.mkdir(parents=True)
+    (bad / "manifest.json").write_text('{"run_id": 12345, "slug": true}')
+    ids = [m.run_id for m in iter_completed_manifests(run_root)]
+    assert ids == ["run-2026-06-13T00-00-00"]  # schema-invalid sibling ignored
+
+
 # --- collect_step_type_stats -------------------------------------------------
 def test_collect_step_type_stats_aggregates_cost_and_duration():
     m1 = _completed_manifest("run-1", cycle_cost=2.0, cycle_seconds=300)
@@ -128,9 +142,34 @@ def test_render_history_stats_block_with_completed_run(tmp_path: Path):
     assert "Measured per-step-type cost/duration across 1 completed run(s)" in block
     assert "adversarial_cycle" in block
     assert "$1.8000" in block              # the cycle's cost is surfaced
-    assert "Per-run cost per phase" in block
+    assert "Per-run cost/duration per phase" in block
     assert "run-2026-06-13T00-00-00" in block
     assert "no measured per-phase costs" not in block  # NOT the no-history block
+
+
+def test_render_history_includes_duration_per_phase(tmp_path: Path):
+    # FR-5.3: the per-run block reports duration per phase alongside cost per
+    # phase, so a plan author can size phases against a window's wall-clock
+    # budget — not just its dollar budget. The fixture run spends 420s across
+    # 2 phases → 210s (3m30s) per phase.
+    run_root = tmp_path / "runs"
+    _write_run(run_root, "demo", _completed_manifest("run-2026-06-13T00-00-00"))
+    block = render_plan_author_history(run_root, max_frs_per_phase=3)
+    assert "cost/duration per phase" in block
+    assert "3m30s/phase" in block
+
+
+def test_render_history_ignores_schema_invalid_manifest(tmp_path: Path):
+    # A schema-invalid (but syntactically valid JSON) sibling manifest must not
+    # crash the render; the remaining valid completed run still produces stats.
+    run_root = tmp_path / "runs"
+    _write_run(run_root, "demo", _completed_manifest("run-2026-06-13T00-00-00"))
+    bad = run_root / "z" / "run-bad"
+    bad.mkdir(parents=True)
+    (bad / "manifest.json").write_text('{"run_id": 12345, "slug": true}')
+    block = render_plan_author_history(run_root, max_frs_per_phase=3)
+    assert "Measured per-step-type cost/duration across 1 completed run(s)" in block
+    assert "no measured per-phase costs" not in block  # still the stats block
 
 
 # --- render_plan_author_history: P7-A2 (no-history block) -------------------
