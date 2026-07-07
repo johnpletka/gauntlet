@@ -3,7 +3,7 @@
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
 - status: **running** (at `implement`)
-- totals: 2221382in/996711out $152.5727
+- totals: 2236657in/998968out $152.5810
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -29,7 +29,7 @@
 | [tests.3](steps/tests.3/) | shell | done | 370s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.3 | commit | done | 22s | 4059in/1497out $0.0040 | committed 6c41d626d4 |
 | [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 2098s | 639583in/78267out $7.4395 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.4](steps/implement.4/transcript.md) | agent_task | parked | 16879s | 13554in/172254out $29.6258 | resume disposition: amendment_required (FR-3/FR-5/FR-10) |
+| [implement.4](steps/implement.4/transcript.md) | agent_task | halted | 19078s | 13554in/172254out $29.6258 | timeout halt (FR-3.3/FR-5.2): claude killed after 600.0s timeout |
 
 ## Commits
 
