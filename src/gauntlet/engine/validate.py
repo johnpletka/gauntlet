@@ -74,10 +74,24 @@ def validate_pipeline(
     produced: set[str] = set()
     for stage in pipeline.stages:
         stage_ids = {step.id for step in stage.steps}
+        # A code phase configures a verifier iff some adversarial_cycle in the
+        # stage declares `verifier:` (FR-4.1 / P8-A4): the clean predicate's
+        # "verifier ran clean" conjunct can never hold otherwise, so a statically
+        # verifier-less `auto_when_clean` gate is rejected here at load — before
+        # the run starts — and never reaches runtime to be recorded not_configured
+        # (review F-008 load-reject case).
+        stage_has_verifier = any(
+            s.type == "adversarial_cycle" and s.get("verifier")
+            for s in stage.steps
+        )
+        stage_is_foreach = stage.foreach is not None
         for step in stage.steps:
             _validate_step(
                 step, config, available, produced, report,
                 repo_root=repo_root, artifact_root=artifact_root,
+            )
+            _validate_gate_policy(
+                step, stage_is_foreach, stage_has_verifier, report
             )
             # on_fail routing is stage-local: the runtime jumps within the
             # current stage's step list, so a cross-stage target would validate
@@ -356,6 +370,61 @@ def _validate_step(
                 f"step {step.id!r} agent {ref!r} could not be pre-constructed "
                 f"({exc}); deferred to runtime"
             )
+
+
+def _validate_gate_policy(
+    step: Step,
+    stage_is_foreach: bool,
+    stage_has_verifier: bool,
+    report: ValidationReport,
+) -> None:
+    """Load-time validation of a ``human_gate``'s ``policy:`` (FR-4.1 / P8-A4).
+
+    Three fail-closed rules, all caught before the run starts:
+
+    * an unknown ``policy:`` value is rejected (only ``always`` /
+      ``auto_when_clean`` exist);
+    * ``auto_when_clean`` on a **document gate** (a gate in a non-``foreach``
+      stage — the PRD/plan ratification gates) is rejected: document ratification
+      stays unconditionally human (§2.2, PRD Q1);
+    * ``auto_when_clean`` on a **code phase gate** (a gate in the ``foreach``
+      phase loop) whose stage configures **no verifier sub-step** is rejected —
+      the predicate's "verifier ran clean" conjunct can never hold, so the
+      misconfiguration is a static config gap caught here, never at a gate
+      (review F-008 load-reject case).
+    """
+    from gauntlet.engine.manifest import (
+        GATE_POLICIES,
+        GATE_POLICY_ALWAYS,
+        GATE_POLICY_AUTO_WHEN_CLEAN,
+    )
+
+    if step.type != "human_gate":
+        return
+    policy = step.get("policy", GATE_POLICY_ALWAYS)
+    if policy not in GATE_POLICIES:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) has unknown policy {policy!r}; must be "
+            f"one of {sorted(GATE_POLICIES)} (FR-4.1)"
+        )
+        return
+    if policy != GATE_POLICY_AUTO_WHEN_CLEAN:
+        return
+    if not stage_is_foreach:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) sets policy {GATE_POLICY_AUTO_WHEN_CLEAN!r}, "
+            "but it is a document (PRD/plan) gate, not a per-phase code gate; "
+            "document ratification stays unconditionally human (FR-4.1 / §2.2)"
+        )
+        return
+    if not stage_has_verifier:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) sets policy {GATE_POLICY_AUTO_WHEN_CLEAN!r} "
+            "but its phase configures no verifier sub-step (no adversarial_cycle "
+            "declares `verifier:`); the clean predicate's 'verifier ran clean' "
+            "conjunct can never hold, so this is rejected at load (FR-4.1 / "
+            "review F-008 load-reject)"
+        )
 
 
 def _validate_scoped_input(

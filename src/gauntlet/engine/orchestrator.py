@@ -495,8 +495,15 @@ class Orchestrator:
             if admission is not None:
                 result = admission
             else:
+                # Evidence-tiered gate (FR-4.1, P8): a `human_gate` configured
+                # `policy: auto_when_clean` auto-approves in place of parking when
+                # the strict §4.2 clean-signal predicate holds. A miss returns None
+                # and falls through to the handler, which parks exactly as today —
+                # fail closed. Every non-gate step, and an `always`-policy gate,
+                # skip this entirely.
+                auto = self._maybe_auto_approve(step, iteration, item)
                 try:
-                    result = spec.handler(step, ctx)
+                    result = auto if auto is not None else spec.handler(step, ctx)
                 except AgentTimeoutError as exc:
                     result = StepResult(
                         status=HALTED,
@@ -1231,6 +1238,94 @@ class Orchestrator:
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
+
+    # ---- evidence-tiered gates (FR-4, P8) -----------------------------------
+    def _maybe_auto_approve(
+        self, step: Step, iteration: str | None, item: Any
+    ) -> StepResult | None:
+        """Auto-approve a clean-signal code gate, else fall through to a park.
+
+        Returns a DONE :class:`StepResult` (and appends the ``auto_approval``
+        record + sends a notification) iff ``step`` is a ``human_gate`` configured
+        ``policy: auto_when_clean`` AND the strict §4.2 clean-signal predicate
+        holds. Returns ``None`` for every other step, an ``always``-policy gate,
+        or any predicate miss — so the handler runs and parks for a human exactly
+        as today (fail closed, FR-4.1).
+        """
+        if step.type != "human_gate":
+            return None
+        if step.get("policy") != M.GATE_POLICY_AUTO_WHEN_CLEAN:
+            return None
+        from gauntlet.engine import gates
+
+        decision = gates.evaluate_clean_gate(
+            self.manifest, self.pipeline, step, iteration,
+            load_findings=self._load_round_findings,
+        )
+        if not decision.clean:
+            # Fall through to the human_gate handler (parks); leave a note so the
+            # operator sees WHY it did not auto-approve (data over inference).
+            self._record_gate_miss(step, decision)
+            return None
+        phase = self._expected_phase(step, item)
+        record = M.AutoApproval(
+            gate_id=step.id,
+            iteration=iteration,
+            phase=phase,
+            policy=M.GATE_POLICY_AUTO_WHEN_CLEAN,
+            evidence=decision.evidence,
+            at=self.clock(),
+        )
+        self.manifest.auto_approvals.append(record)
+        self._notify_auto_approval(record)
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"auto-approved (FR-4.1): {decision.summary()}; evidence snapshot "
+                f"recorded for PR-level ratification (FR-4.2): {decision.evidence}"
+            ),
+        )
+
+    def _load_round_findings(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """This phase's round findings + triage verdicts, from the cycle artifacts.
+
+        Reads ``run_dir/artifacts/{findings,triage}.json`` — the "latest round
+        wins" bookkeeping the just-run cycle wrote (the same files ``PR.md``
+        reads confirm.json from). A missing/unparseable file raises, which the
+        predicate treats as a fail-closed miss (cannot prove the findings clean).
+        """
+        import json
+
+        art = self.run_dir / "artifacts"
+        findings = json.loads((art / "findings.json").read_text()).get("findings") or []
+        verdicts = json.loads((art / "triage.json").read_text()).get("verdicts") or []
+        return findings, verdicts
+
+    def _notify_auto_approval(self, record: "M.AutoApproval") -> None:
+        """Send the FR-4.1 auto-approval notification via the advisory channel.
+
+        Stamped into ``manifest.warnings`` (the engine's durable advisory push
+        channel the web notifier surfaces) so an auto-approval is visible without
+        opening the manifest, and de-duplicated by text like every other advisory.
+        """
+        note = (
+            f"[{record.gate_id}] auto-approval (FR-4.1): code gate "
+            f"{record.phase or record.gate_id} cleared without a human on clean "
+            f"evidence (verifier={record.evidence.get('verifier')}, "
+            f"rounds={record.evidence.get('rounds')}); enumerated in PR.md for "
+            "ratification (FR-4.2)"
+        )
+        if note not in self.manifest.warnings:
+            self.manifest.warnings.append(note)
+
+    def _record_gate_miss(self, step: Step, decision) -> None:
+        """Note why an ``auto_when_clean`` gate parked instead of auto-approving."""
+        note = (
+            f"[{step.id}] auto_when_clean predicate miss (FR-4.1): parked for a "
+            f"human — {decision.summary()}"
+        )
+        if note not in self.manifest.warnings:
+            self.manifest.warnings.append(note)
 
     def _expected_phase(self, step: Step, item: Any) -> str | None:
         """The numeric phase prefix (P1, P2…) a step belongs to, or ``None``.

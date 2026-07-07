@@ -90,6 +90,29 @@ def render_pr(
     else:
         lines += ["_(no commits recorded)_", ""]
 
+    # Auto-approved gates (FR-4.2): every code gate that cleared the strict
+    # clean-signal predicate without a human is enumerated here with its evidence
+    # snapshot, so the human ratifies them COLLECTIVELY at the audit boundary (the
+    # PR). A reversed auto-approval is shown as such — the record is append-only.
+    auto = list(getattr(manifest, "auto_approvals", []) or [])
+    if auto:
+        lines += ["## Auto-approved gates (FR-4.2 — ratify collectively)", ""]
+        if getattr(manifest, "auto_approval_disabled", False):
+            lines += [
+                "> Auto-approval was **disabled** for the remainder of this run "
+                "after a recorded human reversal (FR-4.2 circuit breaker).",
+                "",
+            ]
+        for a in auto:
+            where = a.phase or a.iteration or a.gate_id
+            ev = a.evidence or {}
+            snapshot = ", ".join(f"{k}={ev[k]}" for k in sorted(ev))
+            status = " — **REVERSED**" if a.reversed_at else ""
+            lines.append(
+                f"- `{a.gate_id}` (**{where}**){status}: {snapshot or '(no evidence)'}"
+            )
+        lines.append("")
+
     verdicts = _final_verdicts(run_dir)
     lines += ["## Final per-finding verdicts (last confirm pass)", ""]
     if verdicts:

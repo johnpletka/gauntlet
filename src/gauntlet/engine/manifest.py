@@ -448,6 +448,57 @@ class CommitRecord(BaseModel):
     sha: str
 
 
+# --- evidence-tiered gates (pipeline-effectiveness FR-4, P8) ------------------
+# A per-phase code gate's policy. ``always`` (default) is today's behavior — the
+# gate parks for a human. ``auto_when_clean`` lets the gate auto-approve, but
+# only when the strict §4.2 clean-signal predicate holds; any predicate miss
+# parks exactly as ``always`` would (fail closed). PRD/plan (document) gates
+# reject ``auto_when_clean`` at pipeline load — document ratification stays
+# unconditionally human (§2.2).
+GATE_POLICY_ALWAYS = "always"
+GATE_POLICY_AUTO_WHEN_CLEAN = "auto_when_clean"
+GATE_POLICIES = frozenset({GATE_POLICY_ALWAYS, GATE_POLICY_AUTO_WHEN_CLEAN})
+
+# The verifier-result values an auto-approval evidence snapshot records (PRD §6).
+# Only ``clean`` satisfies the predicate; every other value — including
+# ``not_configured``, recorded when a phase that PASSED load (a verifier was
+# configured, or the run predates the verifier) has no clean verifier result at
+# runtime — is a predicate miss that parks closed (FR-4.1, review F-008).
+VERIFIER_CLEAN = "clean"
+VERIFIER_FINDINGS = "findings"
+VERIFIER_FAILED = "failed"
+VERIFIER_NOT_CONFIGURED = "not_configured"
+
+
+class AutoApproval(BaseModel):
+    """One auto-approved code gate + its durable evidence snapshot (FR-4.1/§6).
+
+    Appended to :attr:`Manifest.auto_approvals` the instant an ``auto_when_clean``
+    gate clears the strict clean-signal predicate, so the run's final PR can
+    enumerate every auto-approval for the human's collective ratification at the
+    audit boundary (FR-4.2). Append-only; a later human reversal never deletes
+    the record — it stamps ``reversed_*`` on it and flips the run's effective
+    policy (:attr:`Manifest.auto_approval_disabled`).
+
+    ``evidence`` carries the full §6 snapshot (rounds, blocking/major finding
+    counts, escalations, reviewer mutations, acceptance-gate result, verifier
+    result, test summary) so the decision is reconstructable without transcript
+    access. Additive — older manifests load with an empty ``auto_approvals``.
+    """
+
+    gate_id: str
+    iteration: str | None = None
+    phase: str | None = None
+    policy: str = GATE_POLICY_AUTO_WHEN_CLEAN
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    at: str
+    # A recorded human reversal (FR-4.2): stamped when a `gauntlet rollback` past
+    # this gate's phase boundary reverses the auto-approval. Additive/nullable.
+    reversed_at: str | None = None
+    reversed_by: str | None = None
+    reversal_notes: str | None = None
+
+
 # --- review-run intent provenance (lightweight `gauntlet review`, §6/FR-2.6) --
 # A review run resolves its problem statement (`intent.md`) from one of four
 # sources and tags it with a provenance on an independence axis. The block is
@@ -600,6 +651,16 @@ class Manifest(BaseModel):
     # load with an empty list.
     suspensions: list[Suspension] = Field(default_factory=list)
     commits: list[CommitRecord] = Field(default_factory=list)
+    # Auto-approved code gates + evidence snapshots (pipeline-effectiveness FR-4,
+    # P8). Append-only; enumerated in the final PR for collective ratification
+    # (FR-4.2). Additive — older manifests load with an empty list.
+    auto_approvals: list[AutoApproval] = Field(default_factory=list)
+    # Reversal circuit breaker (FR-4.2 / §9): flipped True by a recorded human
+    # reversal of any auto-approved gate. Once set, the clean predicate fails
+    # closed for the REMAINDER of the run — every later code gate parks even if
+    # its evidence is clean, because a human has signalled distrust. Additive —
+    # older manifests load with the default (auto-approval enabled).
+    auto_approval_disabled: bool = False
     totals: UsageTotals = Field(default_factory=UsageTotals)
     # Per-agent-profile usage (FR-3.2): `gauntlet report` needs the spend split
     # by profile, not just by step — a single adversarial_cycle step bills the

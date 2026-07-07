@@ -1,31 +1,60 @@
 {
-  "phase": "P7",
+  "phase": "P8",
   "clauses": [
     {
-      "id": "P7-A1",
-      "text": "A repo with ≥1 completed run renders a measured stats block in the plan-author prompt.",
+      "id": "P8-A1",
+      "text": "Each single clean-predicate violation parks for a human exactly as today.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_stats_block_with_completed_run"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_history_for_plan_author"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_collect_step_type_stats_aggregates_cost_and_duration"}
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_not_converged_round_1_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_blocking_legitimate_finding_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_major_legitimate_finding_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_reviewer_mutation_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_verifier_findings_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_cycle_not_done_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_escalation_response_history_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_acceptance_gate_not_passed_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_tests_not_green_parks" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_missing_findings_artifacts_fails_closed" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_parks_on_predicate_miss" }
       ]
     },
     {
-      "id": "P7-A2",
-      "text": "A repo with no completed run renders the explicit \"no history\" block, not silence.",
+      "id": "P8-A2",
+      "text": "The all-clean case auto-approves with an auto_approval manifest record carrying the full evidence snapshot.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_no_history_block_when_empty"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_no_history_block_for_plan_author"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_no_history_when_only_parked_runs"}
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_auto_approves_clean_gate" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_all_clean_predicate_holds" }
       ]
     },
     {
-      "id": "P7-A3",
-      "text": "The max_frs_per_phase size bound appears in the plan-author input.",
+      "id": "P8-A3",
+      "text": "Auto-approved gates are enumerated in the run's final PR.md with their evidence snapshots.",
       "evidence": [
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_states_size_bound_with_history"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_history_states_size_bound_without_history"},
-        {"kind": "pytest", "id": "tests/unit/test_plan_author_history.py::test_render_prompt_injects_history_for_plan_author"}
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_pr_enumerates_auto_approved_gates" }
+      ]
+    },
+    {
+      "id": "P8-A4",
+      "text": "PRD/plan gates reject auto_when_clean at load, and a code phase declaring auto_when_clean with no verifier sub-step configured is rejected at pipeline load (static config gap).",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_load_rejects_auto_when_clean_on_document_gate" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_load_rejects_auto_when_clean_code_phase_without_verifier" }
+      ]
+    },
+    {
+      "id": "P8-A6",
+      "text": "A phase that passed load (verifier configured, or a resumed/legacy manifest predating the verifier) but whose verifier result is absent/skipped at runtime is recorded verifier=not_configured and parks — reached distinctly from the load-reject case, never masking it.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_runtime_verifier_not_configured_parks_distinct_from_load_reject" }
+      ]
+    },
+    {
+      "id": "P8-A5",
+      "text": "A recorded human reversal flips the gate's effective policy to always for the remainder of the run; a subsequent clean gate parks rather than auto-approving.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_recorded_reversal_disables_subsequent_auto_approval" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_breaker_parks_clean_gate_after_reversal" },
+        { "kind": "pytest", "id": "tests/unit/test_run_lifecycle.py::test_rollback_reverses_auto_approval_and_flips_policy" }
       ]
     }
   ]
