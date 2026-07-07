@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
-- status: **running** (at `implement`)
-- totals: 2274031in/1036813out $168.3690
+- status: **running** (at `impl-cycle`)
+- totals: 2287493in/1038714out $168.3762
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -30,6 +30,9 @@
 | phase-commit.3 | commit | done | 22s | 4059in/1497out $0.0040 | committed 6c41d626d4 |
 | [impl-cycle.3](steps/impl-cycle.3/) | adversarial_cycle | done | 2098s | 639583in/78267out $7.4395 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
 | [implement.4](steps/implement.4/transcript.md) | agent_task | done | 78527s | 22522in/206152out $45.3988 | agent 'builder' completed |
+| [tests.4](steps/tests.4/) | shell | done | 428s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
+| phase-commit.4 | commit | done | 31s | 13462in/1901out $0.0072 | committed 2ffc57b60e |
+| impl-cycle.4 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
 
 ## Commits
 
@@ -44,3 +47,4 @@
 - `1a51cc9431` P3.1 (step `impl-cycle`)
 - `6c41d626d4` P4 (step `phase-commit`)
 - `bc13ee46e0` P4.1 (step `impl-cycle`)
+- `2ffc57b60e` P5 (step `phase-commit`)
