@@ -130,6 +130,67 @@ def test_findings_schema_rejects_unknown_category_fail_closed():
         validate_schema(_finding("made-up-category"), _load("findings.json"))
 
 
+# --- P9: confirm remainder carry schema (FR-6.1, review F-007) ---------------
+# `new_findings` expands to a full findings-schema object plus `carried_from`
+# (required-but-nullable, strict-mode convention). Backward compatibility is
+# preserved through the persisted-artifact validation path, not by omitting the
+# field: an EMPTY new_findings validates unchanged.
+
+
+def test_confirm_empty_new_findings_still_validates():
+    # P9-A4: a pre-migration confirm output with an EMPTY new_findings validates
+    # unchanged against the migrated schema.
+    validate_schema(
+        {"verdicts": [], "new_findings": [], "summary": "s"}, _load("confirm.json")
+    )
+
+
+def test_confirm_new_findings_item_lists_carried_from_required_nullable():
+    # P9 / review F-007: the migrated item lists carried_from in `required` as
+    # nullable — the required-but-nullable convention (like suggested_fix), NOT an
+    # absent-optional field, is what preserves compatibility.
+    item = _load("confirm.json")["properties"]["new_findings"]["items"]
+    assert "carried_from" in item["required"]
+    assert item["properties"]["carried_from"]["type"] == ["string", "null"]
+    # every findings-schema field is present in the expanded item (strict mode)
+    for field in ("id", "severity", "category", "location", "claim", "evidence",
+                  "suggested_fix", "carried_from"):
+        assert field in item["required"], field
+
+
+def test_confirm_diff_regression_entry_with_null_carried_from_validates():
+    # P9-A4: an ordinary diff-regression new_findings entry (carried_from: null)
+    # validates — proving the required-but-nullable convention, not an
+    # absent-optional field, is what keeps confirm outputs valid.
+    regression = {"verdicts": [], "summary": "s", "new_findings": [
+        {"id": "N", "severity": "blocking", "category": "correctness",
+         "location": "a.py:1", "claim": "regressed", "evidence": "e",
+         "suggested_fix": None, "carried_from": None}]}
+    validate_schema(regression, _load("confirm.json"))
+
+
+def test_confirm_carried_remainder_entry_validates():
+    # P9: a carried remainder new_findings entry (carried_from set to a finding id)
+    # validates against the migrated confirm schema.
+    carried = {"verdicts": [], "summary": "s", "new_findings": [
+        {"id": "F-001-r1-c0", "severity": "major", "category": "correctness",
+         "location": "a.py:3", "claim": "the specific remainder", "evidence": "e",
+         "suggested_fix": None, "carried_from": "F-001"}]}
+    validate_schema(carried, _load("confirm.json"))
+
+
+def test_findings_schema_allows_optional_carried_from():
+    # P9: findings.json accepts an engine-annotated carried_from (like
+    # duplicate_of); a legacy finding that omits it still validates (additive).
+    schema = _load("findings.json")
+    carried = {"findings": [{"id": "F-001-r1-c0", "severity": "major",
+        "category": "correctness", "location": "a.py:1", "claim": "c",
+        "evidence": "e", "suggested_fix": None, "carried_from": "F-001"}],
+        "open_questions": [], "summary": "s"}
+    validate_schema(carried, schema)
+    validate_schema(_finding("correctness"), schema)  # omits carried_from → still valid
+
+
 def test_scaffold_findings_schema_matches_root_after_migration():
     # The scaffold copy adopters receive must carry the same migrated enum as the
     # governing root schema — a drift would ship adopters an unmigrated consumer.

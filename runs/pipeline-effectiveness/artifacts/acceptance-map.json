@@ -1,60 +1,55 @@
 {
-  "phase": "P8",
+  "phase": "P9",
   "clauses": [
     {
-      "id": "P8-A1",
-      "text": "Each single clean-predicate violation parks for a human exactly as today.",
+      "id": "P9-A1",
+      "text": "A fix_now finding confirmed partially_resolved at major severity forces round N+1 (issue #49 regression).",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_not_converged_round_1_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_blocking_legitimate_finding_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_major_legitimate_finding_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_reviewer_mutation_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_verifier_findings_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_cycle_not_done_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_escalation_response_history_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_acceptance_gate_not_passed_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_violation_tests_not_green_parks" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_missing_findings_artifacts_fails_closed" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_parks_on_predicate_miss" }
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_partial_major_forces_round_and_carries_remainder" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_forcing_open_partial_forces_regardless_of_severity" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_open_remainder_exhausting_max_rounds_parks" }
       ]
     },
     {
-      "id": "P8-A2",
-      "text": "The all-clean case auto-approves with an auto_approval manifest record carrying the full evidence snapshot.",
+      "id": "P9-A2",
+      "text": "A three-obligation finding whose fix covers two returns partially_resolved naming the third; the carried remainder id targets exactly it and appears in round N+1's review scope with carried_from intact.",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_auto_approves_clean_gate" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_all_clean_predicate_holds" }
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_partial_major_forces_round_and_carries_remainder" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_assigns_reserved_namespace_id" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_collision_gets_next_free_suffix" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_two_from_same_parent_are_distinct" }
       ]
     },
     {
-      "id": "P8-A3",
-      "text": "Auto-approved gates are enumerated in the run's final PR.md with their evidence snapshots.",
+      "id": "P9-A3",
+      "text": "An artifact fix correcting one section while a second still contradicts it returns non-resolved citing both sections.",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_pr_enumerates_auto_approved_gates" }
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_artifact_partial_citing_two_sections_is_not_resolved" },
+        { "kind": "pytest", "id": "tests/unit/test_convergence_prompts.py::test_cycle_confirm_has_intra_document_consistency_rule" }
       ]
     },
     {
-      "id": "P8-A4",
-      "text": "PRD/plan gates reject auto_when_clean at load, and a code phase declaring auto_when_clean with no verifier sub-step configured is rejected at pipeline load (static config gap).",
+      "id": "P9-A4",
+      "text": "A pre-migration confirm output (no new_findings) still validates.",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_load_rejects_auto_when_clean_on_document_gate" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_load_rejects_auto_when_clean_code_phase_without_verifier" }
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_empty_new_findings_still_validates" },
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_new_findings_item_lists_carried_from_required_nullable" },
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_diff_regression_entry_with_null_carried_from_validates" }
       ]
     },
     {
-      "id": "P8-A6",
-      "text": "A phase that passed load (verifier configured, or a resumed/legacy manifest predating the verifier) but whose verifier result is absent/skipped at runtime is recorded verifier=not_configured and parks — reached distinctly from the load-reject case, never masking it.",
+      "id": "P9-A5",
+      "text": "The cycle- and gate-touching regression suites from P1, P5, and P8 pass under max_rounds 3.",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_runtime_verifier_not_configured_parks_distinct_from_load_reject" }
+        { "kind": "pytest", "id": "tests/unit/test_standard_pipeline.py::test_cycle_max_rounds_reflects_p9_carry_budget" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_clean_gate_holds_under_max_rounds_3" }
       ]
     },
     {
-      "id": "P8-A5",
-      "text": "A recorded human reversal flips the gate's effective policy to always for the remainder of the run; a subsequent clean gate parks rather than auto-approving.",
+      "id": "P9-A6",
+      "text": "A cycle whose final round holds a carried/open remainder fails the P8 auto_when_clean clean predicate and the gate parks (no auto_approval record) — the FR-6/FR-4 interaction, proving a carried remainder is never auto-approved away on the final round.",
       "evidence": [
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_recorded_reversal_disables_subsequent_auto_approval" },
-        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_orchestrator_breaker_parks_clean_gate_after_reversal" },
-        { "kind": "pytest", "id": "tests/unit/test_run_lifecycle.py::test_rollback_reverses_auto_approval_and_flips_policy" }
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_carried_remainder_open_at_gate_parks_and_is_cited" }
       ]
     }
   ]

@@ -67,6 +67,10 @@
             "type": "array",
             "items": {"type": "string"},
             "description": "Merge annotation (FR-1.2, on a merged primary): every panel-member profile whose finding merged into this primary (including the primary's own)."
+          },
+          "carried_from": {
+            "type": ["string", "null"],
+            "description": "Engine annotation (pipeline-effectiveness FR-6.1, P9): on a carried remainder merged into a later round, the `partially_resolved` accepted finding id this remainder was split from — kept intact so the round manifest links remainder -> parent. Absent/null on an ordinary finding. Like source/lens/duplicate_of it is engine-stamped, never emitted by a reviewer's strict structured output, so a legacy/pre-migration artifact that omits it validates."
           }
         }
       }

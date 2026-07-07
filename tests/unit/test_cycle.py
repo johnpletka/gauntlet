@@ -31,7 +31,10 @@ from gauntlet.engine.config import RunConfig
 from gauntlet.engine.cycle import (
     DATA_BEGIN,
     DATA_END,
+    _carried_remainder_verdict,
+    _carry_remainders,
     _code_review_base,
+    _forcing_open,
     _only_artifact_dirty,
     _persist_round_triage,
     _triage_integrity_stray,
@@ -2150,3 +2153,180 @@ def test_review_handoff_flush_is_noop_when_bookkeeping_untracked(cycle_repo):
     assert not gitops.is_tracked(repo, "runs/demo/run-1/manifest.json")
     subjects = _git_out(repo, "log", "--format=%s").splitlines()
     assert not any(s.startswith("gauntlet: flush run bookkeeping") for s in subjects)
+
+
+# --- P9: convergence honesty + confirm remainder carry (FR-6.1/6.2/6.4) --------
+# A `fix_now` finding confirmed `partially_resolved` is non-converged by
+# definition regardless of severity (issue #49's escape), and the confirm pass
+# carries the concrete remainder into the next round as a PRE-ACCEPTED fix
+# obligation that bypasses re-triage. These fixtures pin `max_rounds: 2`
+# implicitly via the default cycle_step (P9 coupling is moot here — the fixtures
+# themselves set the budget they need).
+def test_partial_major_forces_round_and_carries_remainder(cycle_repo):
+    # P9-A1 (issue #49 regression): an accepted `fix_now` finding confirmed
+    # `partially_resolved` at MAJOR severity forces round N+1 (today it converged
+    # as closed). P9-A2: the confirm carries the concrete remainder; its
+    # reserved-namespace id targets exactly it and appears in round 2's review
+    # scope with carried_from intact.
+    remainder = {"id": "placeholder", "severity": "major", "category": "correctness",
+                 "location": "src.py:3", "claim": "obligation 3 (no-payload) remains",
+                 "evidence": "seen in diff", "suggested_fix": None, "carried_from": "F-001"}
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")),
+        CONFIRM(CV("F-001", "partially_resolved"), new=[remainder]),
+        REVIEW(),  # round 2: reviewer raises nothing fresh; remainder is pre-accepted
+        CONFIRM(CV("F-001-r1-c0", "resolved")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),  # only round 1 triages; remainder bypasses
+        "builder": SeqAdapter(
+            writer("src.py", "partial\n", {}), writer("src.py", "remainder fixed\n", {}),
+        ),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    # a MAJOR partial forced a second round — the silent-closure class is shut
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
+    # the carried remainder got the reserved-namespace id targeting F-001
+    r1_confirm = json.loads((run_dir / "artifacts" / "r1" / "confirm.json").read_text())
+    assert r1_confirm["new_findings"][0]["id"] == "F-001-r1-c0"
+    assert r1_confirm["new_findings"][0]["carried_from"] == "F-001"
+    # it appeared in round 2's review scope with carried_from intact
+    assert "F-001-r1-c0" in reviewer.calls[2]["prompt"]
+    assert "carried_from" in reviewer.calls[2]["prompt"]
+    # round 2's persisted findings carry the remainder ahead of fresh findings
+    r2_findings = json.loads((run_dir / "artifacts" / "r2" / "findings.json").read_text())
+    assert r2_findings["findings"][0]["id"] == "F-001-r1-c0"
+    assert r2_findings["findings"][0]["carried_from"] == "F-001"
+    # the remainder was NOT re-triaged: round 2 triage.json holds only its
+    # engine-synthesized fix_now verdict (the triage adapter was called once).
+    r2_triage = json.loads((run_dir / "artifacts" / "r2" / "triage.json").read_text())
+    assert [v["finding_id"] for v in r2_triage["verdicts"]] == ["F-001-r1-c0"]
+    assert r2_triage["verdicts"][0]["action"] == "fix_now"
+
+
+def test_open_remainder_exhausting_max_rounds_parks(cycle_repo):
+    # P9-A1 tail: an open remainder that never lands exhausts max_rounds and
+    # ESCALATES (fail-closed terminus unchanged, FR-10.5) rather than silently
+    # closing. max_rounds pinned to 2 in-fixture.
+    rem1 = {"id": "p", "severity": "major", "category": "correctness",
+            "location": "src.py:3", "claim": "still remains", "evidence": "e",
+            "suggested_fix": None, "carried_from": "F-001"}
+    rem2 = {"id": "p", "severity": "major", "category": "correctness",
+            "location": "src.py:3", "claim": "STILL remains", "evidence": "e",
+            "suggested_fix": None, "carried_from": "F-001-r1-c0"}
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")),
+        CONFIRM(CV("F-001", "partially_resolved"), new=[rem1]),
+        REVIEW(),
+        CONFIRM(CV("F-001-r1-c0", "partially_resolved"), new=[rem2]),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "v1\n", {}), writer("src.py", "v2\n", {})),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters, step_extra={"max_rounds": 2})
+    assert status == M.RUN_PARKED
+    assert "FR-10.5" in man.record("cycle").notes
+
+
+def test_artifact_partial_citing_two_sections_is_not_resolved(cycle_repo):
+    # P9-A3 / FR-6.4: an artifact fix correcting one section while a second still
+    # contradicts it is confirmed non-`resolved` citing BOTH sections, and the
+    # remainder is carried — the fix does not close while the document
+    # self-contradicts.
+    remainder = {"id": "p", "severity": "major", "category": "spec-gap",
+                 "location": "prd.md:§deliverable",
+                 "claim": "§deliverable still asserts the opposite of the corrected §strategy",
+                 "evidence": "e", "suggested_fix": None, "carried_from": "F-001"}
+    partial = {"finding_id": "F-001", "verdict": "partially_resolved",
+               "notes": "fixed §strategy but §deliverable still contradicts it"}
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major", claim="strategy vs deliverable contradiction")),
+        CONFIRM(partial, new=[remainder]),
+        REVIEW(),
+        CONFIRM(CV("F-001-r1-c0", "resolved")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("prd.md", "fixed strategy\n", {}),
+                              writer("prd.md", "fixed deliverable too\n", {})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]  # forced, not silently closed
+    r1_confirm = json.loads((run_dir / "artifacts" / "r1" / "confirm.json").read_text())
+    v = next(v for v in r1_confirm["verdicts"] if v["finding_id"] == "F-001")
+    assert v["verdict"] == "partially_resolved"
+    assert "§strategy" in v["notes"] and "§deliverable" in v["notes"]
+
+
+# --- P9 helper-level determinism (FR-6.1 id allocation + forcing rule) ---------
+def test_carry_remainders_assigns_reserved_namespace_id():
+    cdata = {"new_findings": [
+        {"id": "x", "severity": "major", "category": "correctness",
+         "location": "a.py:1", "claim": "remainder", "evidence": "e",
+         "suggested_fix": None, "carried_from": "F-003"},
+    ]}
+    seen = {"F-003", "F-001"}
+    rem = _carry_remainders(cdata, 2, seen)
+    assert len(rem) == 1
+    assert rem[0]["id"] == "F-003-r2-c0"           # base + explicit -c0
+    assert rem[0]["carried_from"] == "F-003"
+    assert cdata["new_findings"][0]["id"] == "F-003-r2-c0"  # rewritten in place
+    assert "F-003-r2-c0" in seen
+
+
+def test_carry_remainders_collision_gets_next_free_suffix():
+    # P9-A2 collision fixture: the base id already exists among input findings →
+    # the remainder gets the next free -c<N> (no id collision).
+    cdata = {"new_findings": [
+        {"id": "x", "severity": "blocking", "category": "security", "location": "a.py:1",
+         "claim": "leak remains", "evidence": "e", "suggested_fix": None,
+         "carried_from": "F-003"},
+    ]}
+    rem = _carry_remainders(cdata, 2, {"F-003-r2-c0"})
+    assert rem[0]["id"] == "F-003-r2-c1"
+
+
+def test_carry_remainders_two_from_same_parent_are_distinct():
+    cdata = {"new_findings": [
+        {"id": "x", "severity": "major", "category": "correctness", "location": "a.py:2",
+         "claim": "second", "evidence": "e", "suggested_fix": None, "carried_from": "F-003"},
+        {"id": "y", "severity": "major", "category": "correctness", "location": "a.py:1",
+         "claim": "first", "evidence": "e", "suggested_fix": None, "carried_from": "F-003"},
+    ]}
+    rem = _carry_remainders(cdata, 1, set())
+    assert sorted(r["id"] for r in rem) == ["F-003-r1-c0", "F-003-r1-c1"]
+
+
+def test_carry_remainders_ignores_ordinary_regressions():
+    cdata = {"new_findings": [
+        {"id": "N", "severity": "blocking", "category": "correctness", "location": "a.py:1",
+         "claim": "regression", "evidence": "e", "suggested_fix": None, "carried_from": None},
+    ]}
+    assert _carry_remainders(cdata, 1, set()) == []
+
+
+def test_forcing_open_partial_forces_regardless_of_severity():
+    # P9-A1 at the predicate level: a MAJOR partially_resolved accepted finding and
+    # a carried remainder force under the default `blocking` policy, while a MAJOR
+    # unresolved open still surfaces-not-loops (policy A unchanged).
+    partial = {"id": "F-1", "severity": "major", "confirm_verdict": "partially_resolved"}
+    unresolved_major = {"id": "F-2", "severity": "major", "confirm_verdict": "unresolved"}
+    remainder = {"id": "F-1-r1-c0", "severity": "major", "_carried_remainder": True,
+                 "confirm_verdict": "partially_resolved"}
+    forcing = {it["id"] for it in _forcing_open([partial, unresolved_major, remainder], "blocking")}
+    assert "F-1" in forcing and "F-1-r1-c0" in forcing
+    assert "F-2" not in forcing
+
+
+def test_carried_remainder_verdict_is_fix_now_legitimate():
+    v = _carried_remainder_verdict({"id": "F-001-r1-c0", "carried_from": "F-001"})
+    assert v["finding_id"] == "F-001-r1-c0"
+    assert v["verdict"] == "legitimate" and v["action"] == "fix_now"
+    assert set(v) == {"finding_id", "verdict", "reasoning", "action", "confidence",
+                      "target_artifact"}  # conforms to schemas/triage.json

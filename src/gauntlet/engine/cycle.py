@@ -512,6 +512,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     artifact_writes: dict[str, Path] = {}
     metrics = _CycleMetrics()  # trend outcome counts (FR-6.6 / P7)
     carried: list[dict[str, Any]] = []  # open findings carried into the next round
+    # FR-6.1 (§6): confirm-carried remainders — PRE-ACCEPTED fix obligations
+    # injected ahead of the next round's fresh findings, bypassing re-triage.
+    carried_remainders: list[dict[str, Any]] = []
+    # Every finding id seen this run, the union the reserved carry namespace
+    # allocates a collision-free `<carried_from>-r<round>-c<N>` against (FR-6.1).
+    seen_ids: set[str] = set()
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
     resume_notes: list[str] = []  # FR-4.1/FR-4.2 audit lines for the final result
@@ -727,12 +733,30 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 return finish(park.result)
             findings.extend(behavioral)
 
+        # FR-6.1 (§6 merge order): a prior round's carried remainders are
+        # PRE-ACCEPTED fix obligations (they inherit their parent's `fix_now`
+        # acceptance and bypass re-triage). Merge them AHEAD of fresh reviewer
+        # findings. On reuse the round's review checkpoint already holds them (they
+        # were prepended before it was written), so inject only on a freshly-run
+        # review — re-prepending would double them.
+        if carried_remainders and not reuse_review:
+            findings = [dict(r) for r in carried_remainders] + findings
+        # Register every id seen this round in the run-wide set BEFORE this round's
+        # confirm allocates a remainder id against it (FR-6.1) — so a remainder is
+        # unique against all prior ids and every id already assigned this run.
+        seen_ids.update(str(f.get("id")) for f in findings if f.get("id"))
+
         # Triage set = primaries only. A merged duplicate carries `duplicate_of`
         # and never reaches triage (FR-1.2); single-reviewer findings carry none,
         # so this is identical to `findings` for the single path (unchanged).
         # Behavioral verifier findings (category behavioral, no duplicate_of) are
         # primaries and reach triage alongside review primaries (FR-2.2).
         triage_findings = [f for f in findings if not f.get("duplicate_of")]
+        # FR-6.1: carried remainders are among the primaries but bypass re-triage;
+        # only FRESH reviewer findings are triaged, and the remainders get
+        # engine-synthesized fix_now verdicts merged ahead of the fresh ones (§6).
+        carried_this_round = [f for f in triage_findings if f.get("carried_from")]
+        to_triage = [f for f in triage_findings if not f.get("carried_from")]
         metrics.record_round(triage_findings)  # counted on reuse too (trend math)
         if is_ensemble:  # per-(profile, lens) yield metrics (FR-1.3)
             metrics.record_ensemble(
@@ -762,7 +786,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # this run's own. The triager retains authority: a match never gates a
         # finding out, it only informs (PRD §7). Counted for the §9 re-litigation
         # instrument regardless of whether the triage batch is fresh or resumed.
-        precedent_by_id, registry_present = _load_precedents(ctx, triage_findings)
+        precedent_by_id, registry_present = _load_precedents(ctx, to_triage)
         metrics.note_registry_round(registry_present, len(precedent_by_id))
         rematched_ids = set(precedent_by_id)
 
@@ -770,10 +794,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # A transient (usage-limit/overload) failure in any triage sub-call parks
         # the whole cycle (FR-3.2), mirroring the reviewer wrapper above. On resume
         # the whole batch is reused as one sub-step (P5; P11 refines it per-finding).
+        # FR-6.1: carried remainders (`to_triage` excludes them) inherit their
+        # parent's fix_now and get engine-synthesized verdicts, merged AHEAD of the
+        # fresh verdicts (§6). On a reused triage the checkpoint already holds both.
+        carried_verdicts = [_carried_remainder_verdict(f) for f in carried_this_round]
         tdata = resume.reuse_data(rnd, "triage", resume_notes)  # None → re-run (fail closed / prefix broken)
         reuse_triage = tdata is not None
         if reuse_triage:
             verdicts = list(tdata.get("verdicts") or [])
+            park_reason = None
+        elif not to_triage:
+            # Only carried remainders this round: no fresh finding to triage.
+            verdicts = list(carried_verdicts)
             park_reason = None
         else:
             # FR-9.2 resume: a prior interrupted concurrent-triage round may have
@@ -783,16 +815,17 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # and ignored. `_triage` then re-runs exactly the still-incomplete
             # findings.
             completed = (
-                _load_triage_fragment(ctx, rnd, triage_findings) if reuse_review else None
+                _load_triage_fragment(ctx, rnd, to_triage) if reuse_review else None
             )
             try:
-                verdicts, park_reason = _triage(
-                    step, ctx, triage_findings, usage, rnd, triager,
+                fresh_verdicts, park_reason = _triage(
+                    step, ctx, to_triage, usage, rnd, triager,
                     effort=cycle_effort, completed=completed,
                     precedent=precedent_by_id,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
+            verdicts = carried_verdicts + fresh_verdicts
         metrics.record_verdicts(verdicts)
         if rematched_ids:  # injected precedents the triager overrode to legitimate (§9)
             metrics.add_registry_overrides(sum(
@@ -959,7 +992,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             cdata = confirm.structured or {}
         metrics.record_confirm(cdata)
         actions = {v["finding_id"]: v["action"] for v in verdicts}
-        open_items, reconciliation = _open_after_confirm(by_id, actions, cdata)
+        # FR-6.1 confirm remainder carry (§6): promote `new_findings` entries that
+        # name a `carried_from` parent to reserved-namespace, collision-free,
+        # pre-accepted remainders (rewrites their id IN `cdata` so the persisted
+        # confirm.json shows the final id). An ordinary regression (carried_from
+        # null) is untouched. Deterministic + idempotent on reuse (the id it
+        # re-derives equals the one already stored).
+        new_remainders = _carry_remainders(cdata, rnd, seen_ids)
+        open_items, reconciliation = _open_after_confirm(
+            by_id, actions, cdata, new_remainders
+        )
         forcing = _forcing_open(open_items, convergence)
         # Non-blocking open items don't loop (policy A); they accumulate and are
         # surfaced at the human gate (BOOTSTRAP-NOTES #30). Dedup by id, latest
@@ -989,7 +1031,24 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # artifact diff (FR-1.2) BEFORE advancing the handoff to the fix SHA.
         prev_review_handoff = review_handoff
         handoff = fix_sha
-        carried = forcing
+        # FR-6.1: split what carries into round N+1.
+        #  * carried remainders (confirm `new_findings` with `carried_from`) are
+        #    PRE-ACCEPTED and injected ahead of fresh findings, bypassing re-triage;
+        #  * a partially_resolved parent covered by its remainder is REPRESENTED by
+        #    that remainder, so it is dropped from the re-review carry (never
+        #    re-triaged — this is what bounds oscillation, §6);
+        #  * every other forcing open (a blocking unresolved/regression, or a
+        #    partial with no emitted remainder) is re-reviewed as before.
+        # The review scope shown to the reviewer is the re-review set PLUS the
+        # remainders (with `carried_from` intact), so a remainder appears in the
+        # next round's review scope while still bypassing triage.
+        covered = {str(r.get("carried_from")) for r in new_remainders}
+        rereview = [
+            it for it in forcing
+            if not it.get("_carried_remainder") and str(it.get("id")) not in covered
+        ]
+        carried_remainders = new_remainders
+        carried = rereview + [dict(r) for r in new_remainders]
 
     # max_rounds exhausted (FR-10.5): open blockers escalate, never carry forward.
     if last_forcing:
@@ -2408,6 +2467,7 @@ def _open_after_confirm(
     by_id: dict[str, dict[str, Any]],
     actions: dict[str, str],
     cdata: dict[str, Any],
+    new_remainders: list[dict[str, Any]] | tuple = (),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """What stays open after a confirm pass — each item tagged with severity.
 
@@ -2424,9 +2484,13 @@ def _open_after_confirm(
     ``regression_introduced`` verdict, which is always open.
 
     Open: ``unresolved``/``regression_introduced`` on an accepted finding,
-    ``partially_resolved`` on a blocking one, a missing verdict for an
-    accepted finding, and new findings of blocking/major severity (minor/nit
-    new findings are noise, not recorded). Each open item carries ``severity``
+    ``partially_resolved`` on ANY accepted finding (FR-6.1 — issue #49's escape
+    was that a non-blocking partial converged; now it is non-converged regardless
+    of severity), a missing verdict for an accepted finding, new findings of
+    blocking/major severity (minor/nit new findings are noise, not recorded), and
+    the ``new_remainders`` the caller already promoted from ``carried_from``
+    ``new_findings`` (FR-6.1 carried remainders — forcing opens regardless of
+    severity, tagged ``_carried_remainder``). Each open item carries ``severity``
     and ``confirm_verdict`` so the caller can apply its convergence policy.
     """
     verdict_by_id: dict[str, dict[str, Any]] = {}
@@ -2458,17 +2522,30 @@ def _open_after_confirm(
         relevant = accepted or verdict == "regression_introduced"
         is_open = relevant and (
             verdict in OPEN_CONFIRM_VERDICTS
-            or (verdict == "partially_resolved" and severity == "blocking")
+            # FR-6.1: a partially_resolved accepted finding is open at ANY severity
+            # (was blocking-only — issue #49's silent-closure escape).
+            or verdict == "partially_resolved"
         )
         if is_open:
             open_items.append({**finding, "severity": severity,
                                "confirm_verdict": verdict,
                                "confirm_notes": v.get("notes", "")})
     for nf in cdata.get("new_findings") or []:
+        # Carried remainders (carried_from set) are handled via `new_remainders`
+        # below (id already assigned, forcing at any severity); skip them here so
+        # they are not double-counted as ordinary regressions.
+        if nf.get("carried_from"):
+            continue
         severity = nf.get("severity")
         if severity in ("blocking", "major"):
             open_items.append({**nf, "id": "NEW", "severity": severity,
                                "confirm_verdict": "new_finding"})
+    for r in new_remainders:
+        # FR-6.1: a carried remainder is a forcing open regardless of severity
+        # (blocking or major per the FR-6.1 rule); `_carried_remainder` marks it so
+        # the caller both forces the round and routes it as a pre-accepted fix.
+        open_items.append({**r, "confirm_verdict": "partially_resolved",
+                           "_carried_remainder": True})
     reconciliation = {"missing": missing, "unknown": unknown,
                       "duplicates": duplicates}
     return open_items, reconciliation
@@ -2477,11 +2554,90 @@ def _open_after_confirm(
 def _forcing_open(open_items: list[dict[str, Any]], convergence: str) -> list[dict[str, Any]]:
     """The open items that force another round under the convergence policy.
 
-    ``blocking`` (policy A, default): only blocking-severity open items loop.
+    ``blocking`` (policy A, default): a blocking-severity open item loops, AND
+    (FR-6.1) an accepted ``partially_resolved`` finding or a carried remainder
+    loops REGARDLESS of severity — an accepted partial is non-converged by
+    definition, which is what shuts issue #49's silent-closure class. A major
+    ``unresolved`` open is still surfaced-not-looped (policy A, unchanged).
     ``strict``: every open item loops (the P4 original)."""
     if convergence == "strict":
         return list(open_items)
-    return [it for it in open_items if it.get("severity") == "blocking"]
+    return [
+        it for it in open_items
+        if it.get("severity") == "blocking"
+        or it.get("_carried_remainder")
+        or it.get("confirm_verdict") == "partially_resolved"
+    ]
+
+
+def _carried_remainder_verdict(finding: dict[str, Any]) -> dict[str, Any]:
+    """A synthetic ``fix_now`` triage verdict for a carried remainder (FR-6.1/§6).
+
+    A carried remainder inherits its parent's already-triaged ``fix_now``
+    acceptance and never re-enters triage — this is what bounds oscillation (a
+    decline is never re-opened). The engine synthesizes the verdict so the
+    remainder flows through the same fix/confirm machinery as a triaged finding.
+    Shape conforms to schemas/triage.json (``additionalProperties: false``)."""
+    return {
+        "finding_id": finding["id"],
+        "verdict": "legitimate",
+        "reasoning": (
+            f"Carried remainder of {finding.get('carried_from')} (FR-6.1): inherits "
+            "the parent's fix_now acceptance and bypasses re-triage (§6)."
+        ),
+        "action": "fix_now",
+        "confidence": "high",
+        "target_artifact": None,
+    }
+
+
+def _carry_remainders(
+    cdata: dict[str, Any], rnd: int, seen_ids: set[str]
+) -> list[dict[str, Any]]:
+    """Promote confirm ``new_findings`` carrying ``carried_from`` to pre-accepted
+    remainders with deterministic, collision-free reserved-namespace ids (FR-6.1,
+    §6). Rewrites each entry's ``id`` IN ``cdata`` (the dicts are live refs into
+    ``cdata["new_findings"]``) so the persisted confirm.json shows the final id,
+    registers the id in ``seen_ids``, and returns the remainders as complete
+    finding dicts with ``carried_from`` intact.
+
+    Id: base ``<carried_from>-r<round>``; append ``-c<N>`` for the smallest
+    ``N >= 0`` making ``<base>-c<N>`` unique against ``seen_ids`` (every finding id
+    seen this run plus every id already assigned this round). ``-c0`` is emitted
+    explicitly, so the base string is never itself a final id — a raw
+    ``<carried_from>-r<round>`` a reviewer might supply can never collide with a
+    remainder id. Order-deterministic and rewrite-stable: entries are processed in
+    a stable (carried_from, location, claim, severity, category) sort — keys that
+    do not change when the id is rewritten — so re-derivation on resume is
+    idempotent and two builders following the spec assign identical ids.
+    """
+    entries = [nf for nf in (cdata.get("new_findings") or []) if nf.get("carried_from")]
+    entries.sort(key=lambda nf: (
+        str(nf.get("carried_from")), str(nf.get("location") or ""),
+        str(nf.get("claim") or ""), str(nf.get("severity") or ""),
+        str(nf.get("category") or ""),
+    ))
+    remainders: list[dict[str, Any]] = []
+    for nf in entries:
+        parent = nf["carried_from"]
+        base = f"{parent}-r{rnd}"
+        n = 0
+        while f"{base}-c{n}" in seen_ids:
+            n += 1
+        final_id = f"{base}-c{n}"
+        seen_ids.add(final_id)
+        nf["id"] = final_id  # live ref into cdata["new_findings"] → confirm.json
+        remainders.append({
+            "id": final_id,
+            "severity": nf.get("severity") or "major",
+            "category": nf.get("category") or "correctness",
+            "location": nf.get("location") or "",
+            "claim": nf.get("claim") or "",
+            "evidence": nf.get("evidence") or "",
+            "suggested_fix": nf.get("suggested_fix"),
+            "carried_from": parent,
+        })
+    return remainders
 
 
 def _fmt_ids(items: list[dict[str, Any]]) -> str:
@@ -2896,13 +3052,14 @@ def _reviewer_output_schema(findings_schema: dict) -> dict:
 
     ``schemas/findings.json`` is the *persisted findings-record* validation schema:
     it declares the engine/merge-annotated ensemble fields
-    (``source``/``lens``/``duplicate_of``/``sources``) as optional so a merged
-    artifact validates. A reviewer agent never emits those — the engine stamps
+    (``source``/``lens``/``duplicate_of``/``sources``) and the P9 convergence-carry
+    annotation (``carried_from``) as optional so a merged/carried artifact
+    validates. A reviewer agent never emits any of those — the engine stamps
     them — so they are stripped here to recover the repo's pinned strict-mode shape
     (every property in ``required``, ``additionalProperties: false``). This
     derivation is byte-equivalent to the pre-ensemble schema for the finding item,
     so a single member still emits exactly today's finding shape (P1-A4). No-op
-    when the finding item declares none of the ensemble fields (defensive)."""
+    when the finding item declares none of those fields (defensive)."""
     schema = json.loads(json.dumps(findings_schema))
     try:
         props = schema["properties"]["findings"]["items"]["properties"]
@@ -2910,6 +3067,10 @@ def _reviewer_output_schema(findings_schema: dict) -> dict:
         return schema
     for field in ensemble.ENSEMBLE_FIELDS:
         props.pop(field, None)
+    # FR-6.1 (P9): `carried_from` is an engine annotation on a carried remainder,
+    # never a reviewer-emitted field — strip it too so the reviewer's strict output
+    # shape is unchanged.
+    props.pop("carried_from", None)
     return schema
 
 

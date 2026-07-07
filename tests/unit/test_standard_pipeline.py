@@ -73,7 +73,18 @@ def test_cycles_bind_all_roles_and_escalation():
         assert step.get("triager") == "triage"
         assert step.get("fixer") == "builder"
         assert step.get("escalation_agent") == "escalation"
-        assert step.get("max_rounds") == 2
+
+
+def test_cycle_max_rounds_reflects_p9_carry_budget():
+    # pipeline-effectiveness FR-6.1 (P9): the shipped plan-cycle/impl-cycle rise
+    # to max_rounds 3 so a carried remainder has a round to land before max-rounds
+    # escalation parks; prd-cycle stays at 2 (the bump is scoped to plan/impl per
+    # FR-6.1). This is the "reads shipped config, re-validated at 3" P9 exit check.
+    pipeline, _, _ = _load()
+    steps = {st.id: st for st in pipeline.all_steps()}
+    assert steps["prd-cycle"].get("max_rounds") == 2
+    assert steps["plan-cycle"].get("max_rounds") == 3
+    assert steps["impl-cycle"].get("max_rounds") == 3
 
 
 def test_cycles_use_the_v1_ensemble_panel():

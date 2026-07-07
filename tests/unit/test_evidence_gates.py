@@ -106,6 +106,35 @@ def test_all_clean_predicate_holds():
     assert ev["tests"] == "passed"
 
 
+# --- P9-A6: FR-6/FR-4 interaction — a carried remainder is never auto-approved
+def test_carried_remainder_open_at_gate_parks_and_is_cited():
+    # A cycle whose final round holds a carried/open remainder fails the clean
+    # predicate and parks: the carried remainder makes the round non-converged with
+    # an open fix_now-derived finding, so the strict conjunction cannot hold. The
+    # miss cites the remainder explicitly, and no auto_approval is recorded.
+    man = _seed_clean_manifest(cycle_metrics={**CLEAN_CYCLE_METRICS, "rounds": 3})
+    findings = [{"id": "F-1-r2-c0", "severity": "major", "category": "correctness",
+                 "carried_from": "F-1"}]
+    verdicts = [{"finding_id": "F-1-r2-c0", "verdict": "legitimate"}]
+    d = _evaluate(man, _pipeline(), findings=findings, verdicts=verdicts)
+    assert d.clean is False
+    assert any("carried remainder" in m for m in d.misses)
+    assert any("F-1-r2-c0" in m for m in d.misses)
+    assert man.auto_approvals == []  # the predicate never records an auto-approval on a miss
+
+
+# --- P9-A5: the P8 clean-gate predicate is unaffected by the max_rounds 2→3 bump
+def test_clean_gate_holds_under_max_rounds_3():
+    # The cycle/gate coupling: a cycle that converges in round 1 under max_rounds:3
+    # still satisfies the clean predicate (round-1 convergence is what the gate
+    # reads, not the round budget). Re-validates the P8 assumptions at max_rounds 3.
+    pipeline = _pipeline(PHASE_STAGE.replace("max_rounds: 2", "max_rounds: 3"))
+    man = _seed_clean_manifest()
+    d = _evaluate(man, pipeline)
+    assert d.clean is True
+    assert d.evidence["rounds"] == 1
+
+
 # --- P8-A1: each single predicate violation parks ----------------------------
 def test_violation_not_converged_round_1_parks():
     man = _seed_clean_manifest(

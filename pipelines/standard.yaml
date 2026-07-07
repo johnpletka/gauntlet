@@ -56,11 +56,16 @@ stages:
       # an unrelated dirty file can no longer defeat the review baseline (the
       # artifact-mode cycle's baseline commit remains a fallback for producers
       # that do not set commit_output).
+      # max_rounds 3 (pipeline-effectiveness FR-6.1, P9): a carried remainder (an
+      # accepted `partially_resolved` finding, forced non-converged) needs a round
+      # to land before max-rounds escalation parks. The bump is scoped to
+      # plan-cycle/impl-cycle per FR-6.1; the prd-cycle above stays at 2. The
+      # fail-closed terminus (escalate to human at max-rounds) is unchanged.
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
          phase: PLAN, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: gemini, lens: spec-coverage}],
-         escalation_agent: escalation, max_rounds: 2,
+         escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-document.md}
       # Deterministic structural gate (FR-5.1): the prose reviewer above never
       # parses the gauntlet-phases block, so a malformed block (e.g. an unquoted
@@ -125,7 +130,7 @@ stages:
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: gemini, lens: spec-coverage}],
          verifier: verifier,
-         escalation_agent: escalation, max_rounds: 2,
+         escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-code.md}
 
   # --- retrospective + governed self-improvement (FR-6.2/6.3; active in P7) --

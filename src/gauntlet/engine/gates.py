@@ -260,6 +260,24 @@ def evaluate_clean_gate(
                 f"{blocking} blocking + {major} major legitimate finding(s) at the "
                 "gate (FR-4.1)"
             )
+        # FR-6/FR-4 interaction (P9-A6, PRD §8): a carried remainder still present
+        # in the final round's findings is an accepted (`fix_now`) partial that was
+        # not fully resolved — it makes the round non-converged with an open
+        # fix_now-derived finding, so the strict clean conjunction cannot hold. Cite
+        # it explicitly so a carried remainder is NEVER auto-approved away on the
+        # final round, regardless of its severity (fail closed).
+        carried = [
+            str(f.get("id")) for f in findings
+            if f.get("carried_from")
+            and verdict_by_id.get(f.get("id")) == _LEGITIMATE_VERDICT
+        ]
+        if carried:
+            misses.append(
+                f"{len(carried)} carried remainder(s) open at the gate "
+                f"({', '.join(carried)}) — an accepted partial was not fully "
+                "resolved (FR-6.1); a carried remainder is never auto-approved away "
+                "on the final round (FR-6/FR-4 interaction)"
+            )
         if reviewer_mutations:
             misses.append(
                 f"{reviewer_mutations} reviewer worktree mutation(s) recorded "

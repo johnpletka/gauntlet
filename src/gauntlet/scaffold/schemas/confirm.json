@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/confirm.json",
   "title": "Confirm-pass verdicts (FR-9.5)",
-  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase.",
+  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase, AND carry the concrete unresolved remainder of a `partially_resolved` accepted finding (pipeline-effectiveness FR-6.1, P9). Strict-mode/compat note (review F-007 — same rule as findings.json): because `new_findings` is emitted through the strict `--output-schema` path, each item lists EVERY findings-schema field plus `carried_from` in `required`, with `carried_from` spelled required-but-nullable (`null` for an ordinary diff regression, a `<finding-id>` for a carried remainder). Backward compatibility is preserved through the persisted-artifact validation path, not by omitting the field: `new_findings` is already a required top-level array, so a pre-migration confirm output with an EMPTY `new_findings` validates unchanged, and the engine's read path treats a pre-`carried_from` entry as `carried_from: null` (an ordinary regression).",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdicts", "new_findings", "summary"],
@@ -30,15 +30,40 @@
     },
     "new_findings": {
       "type": "array",
-      "description": "Defects visible in the round's diff itself (scope: the diff, nothing else).",
+      "description": "Defects visible in the round's diff itself (scope: the diff, nothing else), AND carried remainders (FR-6.1): each entry is a COMPLETE findings-schema object plus `carried_from`. For an ordinary diff regression, `carried_from` is null. For the concrete unresolved remainder of a `partially_resolved` accepted finding, `carried_from` names that finding's id; the engine then assigns the entry a deterministic reserved-namespace id and merges it into the next round as a pre-accepted fix obligation (no re-triage).",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "claim", "location"],
+        "required": ["id", "severity", "category", "location", "claim", "evidence", "suggested_fix", "carried_from"],
         "properties": {
+          "id": {
+            "type": "string",
+            "description": "The confirmer's id for this entry. For a carried remainder the engine OVERWRITES it with the reserved-namespace id `<carried_from>-r<round>-c<N>`; supply any placeholder."
+          },
           "severity": {"type": "string", "enum": ["blocking", "major", "minor", "nit"]},
-          "claim": {"type": "string"},
-          "location": {"type": "string"}
+          "category": {
+            "type": "string",
+            "enum": [
+              "correctness",
+              "spec-gap",
+              "security",
+              "performance",
+              "principle-violation",
+              "style",
+              "behavioral"
+            ]
+          },
+          "location": {"type": "string", "description": "File and line/section reference — the SPECIFIC remainder for a carried entry, not the whole parent."},
+          "claim": {"type": "string", "description": "What is wrong — the specific unresolved remainder for a carried entry."},
+          "evidence": {"type": "string", "description": "Why the confirmer believes it."},
+          "suggested_fix": {
+            "type": ["string", "null"],
+            "description": "Optional per §7 — null when the confirmer offers none."
+          },
+          "carried_from": {
+            "type": ["string", "null"],
+            "description": "FR-6.1: the `partially_resolved` accepted finding id this entry is the remainder of, or null for an ordinary diff regression. Required-but-nullable for strict native structured output (the same convention `suggested_fix` uses)."
+          }
         }
       }
     },
