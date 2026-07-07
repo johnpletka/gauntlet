@@ -754,6 +754,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
+        # --- registry precedent injection (FR-5.2 / P6) ----------------------
+        # A fingerprint-matching decline recorded under still-current provenance
+        # (same repo + PRD family, unchanged prompt/lens/schema hashes) surfaces
+        # as ADVISORY per-finding triage context. Declines are recorded at retro
+        # (cross-run), so this only ever reads *prior* runs' precedent — never
+        # this run's own. The triager retains authority: a match never gates a
+        # finding out, it only informs (PRD §7). Counted for the §9 re-litigation
+        # instrument regardless of whether the triage batch is fresh or resumed.
+        precedent_by_id, registry_present = _load_precedents(ctx, triage_findings)
+        metrics.note_registry_round(registry_present, len(precedent_by_id))
+        rematched_ids = set(precedent_by_id)
+
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
         # A transient (usage-limit/overload) failure in any triage sub-call parks
         # the whole cycle (FR-3.2), mirroring the reviewer wrapper above. On resume
@@ -777,10 +789,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 verdicts, park_reason = _triage(
                     step, ctx, triage_findings, usage, rnd, triager,
                     effort=cycle_effort, completed=completed,
+                    precedent=precedent_by_id,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
         metrics.record_verdicts(verdicts)
+        if rematched_ids:  # injected precedents the triager overrode to legitimate (§9)
+            metrics.add_registry_overrides(sum(
+                1 for v in verdicts
+                if v.get("finding_id") in rematched_ids and v.get("verdict") == "legitimate"
+            ))
         if is_ensemble:  # post-triage-legitimate per member (FR-1.3)
             metrics.record_ensemble_legit(
                 _ensemble_legit_by_member(triage_findings, verdicts)
@@ -2035,10 +2053,43 @@ class _MutationGuard:
         })
 
 
+def _load_precedents(
+    ctx: StepContext, findings: list[dict[str, Any]]
+) -> tuple[dict[str, str], bool]:
+    """Advisory declined-finding precedent per finding id (FR-5.2 / P6).
+
+    Reads the cross-run registry under ``asset_root/registry/declined.jsonl`` and
+    returns ``(precedent_block_by_finding_id, registry_present)``. Only in-force
+    entries (same repo + PRD family, current prompt/lens/schema hashes) for an
+    exact fingerprint match produce a block; the reasoning is wrapped as untrusted
+    data (§8). ``registry_present`` marks the run registry-aware so the metric key
+    surfaces even at zero matches. Fail-open: a missing/corrupt registry yields no
+    precedent, never an error — precedent is advisory, not a gate.
+    """
+    from gauntlet.engine import registry as reg
+
+    path = reg.registry_path(ctx.repo_root, ctx.config.asset_root)
+    present = path.exists()
+    entries = reg.load_registry(path)
+    if not entries:
+        return {}, present
+    blocks = reg.precedents_by_finding(
+        findings,
+        entries,
+        repo=reg.repo_name(ctx.repo_root),
+        prd_family=ctx.manifest.slug,
+        repo_root=ctx.repo_root,
+        asset_root=ctx.config.asset_root,
+        wrap=wrap_as_data,
+    )
+    return blocks, present
+
+
 def _triage_one(
     ctx: StepContext, finding: dict[str, Any], i: int, rnd: int,
     triager: str, escalation_agent: str | None, template: str, context: str,
     schema: dict | None, effort: str | None, task_usage: Any,
+    precedent: str | None = None,
 ) -> dict[str, Any]:
     """Triage ONE finding (triage + severity-gated escalation), the concurrency
     unit (FR-9.1).
@@ -2057,7 +2108,11 @@ def _triage_one(
     from gauntlet.engine.steptypes import step_logger
 
     logger = step_logger(ctx, f"r{rnd}-triage", finding.get("id", f"i{i}"))
-    prompt = triage_prompt(template, finding, context=context)
+    # A per-finding declined-precedent block (FR-5.2) rides in this finding's
+    # review context — advisory, and only for the finding whose fingerprint it
+    # matched (never the whole batch's).
+    finding_context = context if not precedent else f"{context}\n\n{precedent}"
+    prompt = triage_prompt(template, finding, context=finding_context)
     verdict = _run_sub(
         ctx, triager, prompt, schema=schema, usage=task_usage,
         logger=logger, structured_name="verdict.json",
@@ -2096,6 +2151,7 @@ def _triage(
     step: Step, ctx: StepContext, findings: list[dict[str, Any]],
     usage: Any, rnd: int, triager: str, *, effort: str | None = None,
     completed: dict[str, dict[str, Any]] | None = None,
+    precedent: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Point-by-point triage with severity-aware escalation (F-009), run with
     bounded concurrency (FR-9.1) and checkpoint-fragment resume (FR-9.2).
@@ -2173,6 +2229,7 @@ def _triage(
                 pool.submit(
                     _triage_one, ctx, finding, i, rnd, triager, escalation_agent,
                     template, context, schema, effort, task_usages[i],
+                    (precedent or {}).get(finding.get("id")),
                 ): i
                 for i, finding in enumerate(pending)
             }
@@ -2629,6 +2686,16 @@ class _CycleMetrics:
         self.verifier_findings_total = 0
         self.verifier_legit_findings = 0
         self.verifier_usage: dict[str, Any] = {}
+        # Declined-findings registry re-litigation instrument (FR-5.2 / §9,
+        # review F-001). `registry_seen` is True once any round consulted the
+        # registry (the file existed), so the `registry` metric key is present on
+        # a registry-aware run even with zero matches; `rematched` counts findings
+        # whose fingerprint matched a still-in-force declined precedent and were
+        # triaged again; `override` counts those the triager nonetheless judged
+        # legitimate (advisory precedent never gates a legitimate finding out).
+        self.registry_seen = False
+        self.registry_rematched = 0
+        self.registry_override = 0
 
     def record_round(self, findings: list[dict[str, Any]]) -> None:
         self.rounds += 1
@@ -2700,6 +2767,19 @@ class _CycleMetrics:
                 if v and v.get("verdict") == "legitimate":
                     self.verifier_legit_findings += 1
 
+    def note_registry_round(self, present: bool, rematched: int) -> None:
+        """Record a round's registry consultation (FR-5.2). ``present`` marks the
+        run registry-aware (the metric surfaces even at zero matches);
+        ``rematched`` is this round's count of findings that matched an in-force
+        declined precedent and were triaged again."""
+        if present:
+            self.registry_seen = True
+        self.registry_rematched += rematched
+
+    def add_registry_overrides(self, n: int) -> None:
+        """Accumulate injected precedents the triager classified legitimate."""
+        self.registry_override += n
+
     def record_confirm(self, cdata: dict[str, Any]) -> None:
         # The confirm pass that follows immediately confirms THIS round's fixes,
         # so its verdicts are scoped to the round's findings — join against the
@@ -2732,6 +2812,11 @@ class _CycleMetrics:
                 "findings_total": self.verifier_findings_total,
                 "legit_findings": self.verifier_legit_findings,
                 "agent_usage": dict(self.verifier_usage),
+            }
+        if self.registry_seen:  # FR-5.2 / §9; omitted on a non-registry-aware run
+            out["registry"] = {
+                "rematched": self.registry_rematched,
+                "injected_precedent_override_count": self.registry_override,
             }
         return out
 
