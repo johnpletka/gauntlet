@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
-- status: **running** (at `impl-cycle`)
-- totals: 2669953in/1387684out $218.2750
+- status: **running** (at `implement`)
+- totals: 3097068in/1444370out $222.1126
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -40,7 +40,8 @@
 | [implement.6](steps/implement.6/transcript.md) | agent_task | done | 1009s | 4899in/32505out $6.0713 | agent 'builder' completed |
 | [tests.6](steps/tests.6/) | shell | done | 390s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.6 | commit | done | 21s | 8336in/1413out $0.0049 | empty P<N>: marker over 1 checkpoint(s): 373963aec1 |
-| impl-cycle.6 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
+| [impl-cycle.6](steps/impl-cycle.6/) | adversarial_cycle | done | 503s | 217274in/19507out $2.2405 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [implement.7](steps/implement.7/) | agent_task | parked | 48s | 3604in/1813out $1.4749 | usage-limit park (FR-3.2): transient_usage_limit [claude_usage_limit_message]; worktree and CLI session preserved — `gauntlet resume` continues the session |
 
 ## Commits
 
@@ -61,3 +62,4 @@
 - `b3c666672e` P6 (step `phase-commit`)
 - `5eecd99c56` P6.1 (step `impl-cycle`)
 - `373963aec1` P7 (step `phase-commit`)
+- `555f73c720` P7.1 (step `impl-cycle`)
