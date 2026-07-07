@@ -1866,15 +1866,15 @@
     {
       "id": "implement",
       "type": "agent_task",
-      "status": "parked",
+      "status": "failed",
       "agent": "builder",
       "session_id": "fcbfa12f-4fd8-4e73-9b37-2f8b6d0c7142",
       "started": "2026-07-07T16:28:16.288263+00:00",
-      "ended": "2026-07-07T16:29:03.913985+00:00",
-      "attempts": 0,
+      "ended": "2026-07-07T21:58:22.563033+00:00",
+      "attempts": 1,
       "base_sha": "555f73c7207bb2dc030df024befe23fa7422a4c2",
-      "parked_reason": "usage_limit",
-      "halt_reason": null,
+      "parked_reason": null,
+      "halt_reason": "adapter_error",
       "failure_kind": null,
       "retry_after_s": null,
       "quota_reset_at": null,
@@ -1883,13 +1883,13 @@
       "revalidation": null,
       "human_responses": [],
       "usage": {
-        "input_tokens": 3604,
-        "output_tokens": 1813,
-        "cached_input_tokens": 447170,
-        "cost_usd": 1.474904
+        "input_tokens": 4137,
+        "output_tokens": 9848,
+        "cached_input_tokens": 2099736,
+        "cost_usd": 4.291267
       },
       "agent_usage": {},
-      "notes": "usage-limit park (FR-3.2): transient_usage_limit [claude_usage_limit_message]; worktree and CLI session preserved — `gauntlet resume` continues the session",
+      "notes": "agent failed (terminal, FR-3.1): claude reported failure: exit code 1; stderr: ",
       "iteration": "7",
       "metrics": {},
       "checkpoints": [],
@@ -1990,10 +1990,10 @@
     }
   ],
   "totals": {
-    "input_tokens": 3097068,
-    "output_tokens": 1444370,
-    "cached_input_tokens": 254169757,
-    "cost_usd": 222.11262405
+    "input_tokens": 3101530,
+    "output_tokens": 1453307,
+    "cached_input_tokens": 255822323,
+    "cost_usd": 224.9317733
   },
   "agent_usage": {
     "reviewer": {
@@ -2021,10 +2021,10 @@
       "cost_usd": 219.98598850000002
     },
     "judge_llm": {
-      "input_tokens": 727612,
-      "output_tokens": 126540,
+      "input_tokens": 731541,
+      "output_tokens": 127442,
       "cached_input_tokens": 0,
-      "cost_usd": 0.434983
+      "cost_usd": 0.43776925000000005
     },
     "mechanic": {
       "input_tokens": 107071,

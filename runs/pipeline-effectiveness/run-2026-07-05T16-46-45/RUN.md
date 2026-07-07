@@ -3,7 +3,7 @@
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
 - status: **running** (at `implement`)
-- totals: 3097068in/1444370out $222.1126
+- totals: 3101530in/1453307out $224.9318
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -41,7 +41,7 @@
 | [tests.6](steps/tests.6/) | shell | done | 390s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.6 | commit | done | 21s | 8336in/1413out $0.0049 | empty P<N>: marker over 1 checkpoint(s): 373963aec1 |
 | [impl-cycle.6](steps/impl-cycle.6/) | adversarial_cycle | done | 503s | 217274in/19507out $2.2405 | converged in round 1 (blocking policy): no open blocking; 2 fixed, 0 non-blocking item(s) surfaced for the gate |
-| [implement.7](steps/implement.7/) | agent_task | parked | 48s | 3604in/1813out $1.4749 | usage-limit park (FR-3.2): transient_usage_limit [claude_usage_limit_message]; worktree and CLI session preserved — `gauntlet resume` continues the session |
+| [implement.7](steps/implement.7/) | agent_task | failed | 19806s | 4137in/9848out $4.2913 | agent failed (terminal, FR-3.1): claude reported failure: exit code 1; stderr:  |
 
 ## Commits
 
