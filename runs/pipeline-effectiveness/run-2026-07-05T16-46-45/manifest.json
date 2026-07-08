@@ -2206,15 +2206,15 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "running",
+      "status": "done",
       "agent": null,
       "session_id": "019f3eff-eb26-76b0-9145-dd4385cf704a",
       "started": "2026-07-07T23:53:06.930247+00:00",
-      "ended": "2026-07-07T23:53:08.480261+00:00",
+      "ended": "2026-07-08T01:50:59.027882+00:00",
       "attempts": 1,
       "base_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
       "parked_reason": null,
-      "halt_reason": "adapter_error",
+      "halt_reason": null,
       "failure_kind": null,
       "retry_after_s": null,
       "quota_reset_at": null,
@@ -2228,20 +2228,79 @@
           "timestamp": "2026-07-08T01:34:45.524583+00:00",
           "user": "john.pletka@gmail.com",
           "response_attempt": 1,
-          "state": "pending"
+          "state": "consumed"
         }
       ],
       "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_input_tokens": 0,
-        "cost_usd": null
+        "input_tokens": 575007,
+        "output_tokens": 28854,
+        "cached_input_tokens": 3358052,
+        "cost_usd": 2.8293132499999993
       },
-      "agent_usage": {},
-      "notes": "agent failed (terminal, FR-3.1): codex reported failure: exit code 1; stderr: ",
+      "agent_usage": {
+        "reviewer": {
+          "input_tokens": 567026,
+          "output_tokens": 2933,
+          "cached_input_tokens": 467328,
+          "cost_usd": null
+        },
+        "triage": {
+          "input_tokens": 2349,
+          "output_tokens": 435,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.0014572499999999998
+        },
+        "builder": {
+          "input_tokens": 5632,
+          "output_tokens": 25486,
+          "cached_input_tokens": 2890724,
+          "cost_usd": 2.8278559999999993
+        }
+      },
+      "notes": "converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate",
       "iteration": "8",
-      "metrics": {},
-      "checkpoints": [],
+      "metrics": {
+        "rounds": 1,
+        "findings_total": 1,
+        "accepted_total": 1,
+        "accepted_resolved_total": 1,
+        "verdict_counts": {
+          "legitimate": 1
+        },
+        "confirm_counts": {
+          "resolved": 1
+        }
+      },
+      "checkpoints": [
+        {
+          "sub_step": "review",
+          "round": 1,
+          "handoff_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
+          "artifact": "artifacts/r1/findings.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "triage",
+          "round": 1,
+          "handoff_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
+          "artifact": "artifacts/r1/triage.json",
+          "result_sha": null
+        },
+        {
+          "sub_step": "fix",
+          "round": 1,
+          "handoff_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
+          "artifact": null,
+          "result_sha": "475636c87b1bf43aafb303bcddd711e0d1fa9013"
+        },
+        {
+          "sub_step": "confirm",
+          "round": 1,
+          "handoff_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
+          "artifact": "artifacts/r1/confirm.json",
+          "result_sha": null
+        }
+      ],
       "resumed_from_checkpoint": null
     }
   ],
@@ -2351,28 +2410,33 @@
       "step_id": "phase-commit",
       "phase": "P9",
       "sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1"
+    },
+    {
+      "step_id": "impl-cycle",
+      "phase": "P9.1",
+      "sha": "475636c87b1bf43aafb303bcddd711e0d1fa9013"
     }
   ],
   "auto_approvals": [],
   "auto_approval_disabled": false,
   "totals": {
-    "input_tokens": 3492974,
-    "output_tokens": 1686134,
-    "cached_input_tokens": 299515450,
-    "cost_usd": 260.07751544999996
+    "input_tokens": 4067981,
+    "output_tokens": 1714988,
+    "cached_input_tokens": 302873502,
+    "cost_usd": 262.90682869999995
   },
   "agent_usage": {
     "reviewer": {
-      "input_tokens": 2148959,
-      "output_tokens": 31720,
-      "cached_input_tokens": 1144832,
+      "input_tokens": 2715985,
+      "output_tokens": 34653,
+      "cached_input_tokens": 1612160,
       "cost_usd": null
     },
     "triage": {
-      "input_tokens": 104865,
-      "output_tokens": 21733,
+      "input_tokens": 107214,
+      "output_tokens": 22168,
       "cached_input_tokens": 0,
-      "cost_usd": 0.06769504999999999
+      "cost_usd": 0.06915229999999999
     },
     "escalation": {
       "input_tokens": 24301,
@@ -2381,10 +2445,10 @@
       "cost_usd": 0.10613625000000002
     },
     "builder": {
-      "input_tokens": 200481,
-      "output_tokens": 1450165,
-      "cached_input_tokens": 296270882,
-      "cost_usd": 255.031461
+      "input_tokens": 206113,
+      "output_tokens": 1475651,
+      "cached_input_tokens": 299161606,
+      "cost_usd": 257.85931700000003
     },
     "judge_llm": {
       "input_tokens": 841094,
