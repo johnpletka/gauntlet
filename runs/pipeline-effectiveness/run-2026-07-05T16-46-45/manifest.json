@@ -2206,15 +2206,15 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "running",
+      "status": "failed",
       "agent": null,
-      "session_id": null,
+      "session_id": "019f3eff-eb26-76b0-9145-dd4385cf704a",
       "started": "2026-07-07T23:53:06.930247+00:00",
-      "ended": null,
-      "attempts": 0,
+      "ended": "2026-07-07T23:53:08.480261+00:00",
+      "attempts": 1,
       "base_sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1",
       "parked_reason": null,
-      "halt_reason": null,
+      "halt_reason": "adapter_error",
       "failure_kind": null,
       "retry_after_s": null,
       "quota_reset_at": null,
@@ -2229,7 +2229,7 @@
         "cost_usd": null
       },
       "agent_usage": {},
-      "notes": null,
+      "notes": "agent failed (terminal, FR-3.1): codex reported failure: exit code 1; stderr: ",
       "iteration": "8",
       "metrics": {},
       "checkpoints": [],
@@ -2344,11 +2344,13 @@
       "sha": "a2267085ff62e27a8fc3b8a0c5233434e046ccf1"
     }
   ],
+  "auto_approvals": [],
+  "auto_approval_disabled": false,
   "totals": {
-    "input_tokens": 3383421,
-    "output_tokens": 1667901,
+    "input_tokens": 3492974,
+    "output_tokens": 1686134,
     "cached_input_tokens": 299515450,
-    "cost_usd": 260.01366119999994
+    "cost_usd": 260.07751544999996
   },
   "agent_usage": {
     "reviewer": {
@@ -2376,10 +2378,10 @@
       "cost_usd": 255.031461
     },
     "judge_llm": {
-      "input_tokens": 731541,
-      "output_tokens": 127442,
+      "input_tokens": 841094,
+      "output_tokens": 145675,
       "cached_input_tokens": 0,
-      "cost_usd": 0.43776925000000005
+      "cost_usd": 0.5016235000000002
     },
     "mechanic": {
       "input_tokens": 169137,

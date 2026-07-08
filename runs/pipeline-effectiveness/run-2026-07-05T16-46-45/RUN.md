@@ -3,7 +3,7 @@
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
 - status: **running** (at `impl-cycle`)
-- totals: 3383421in/1667901out $260.0137
+- totals: 3492974in/1686134out $260.0775
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -48,7 +48,7 @@
 | [implement.8](steps/implement.8/transcript.md) | agent_task | done | 2866s | 9495in/133216out $22.1129 | agent 'builder' completed |
 | [tests.8](steps/tests.8/) | shell | done | 368s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.8 | commit | done | 30s | 45807in/2387out $0.0162 | committed a2267085ff |
-| impl-cycle.8 | adversarial_cycle | running | — | 0in/0out (tokens only) |  |
+| [impl-cycle.8](steps/impl-cycle.8/) | adversarial_cycle | failed | 2s | 0in/0out (tokens only) | agent failed (terminal, FR-3.1): codex reported failure: exit code 1; stderr:  |
 
 ## Commits
 
