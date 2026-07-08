@@ -153,6 +153,7 @@ def evaluate_clean_gate(
     iteration: str | None,
     *,
     load_findings: FindingsLoader,
+    phase: str | None = None,
 ) -> CleanGateDecision:
     """Evaluate the strict §4.2 clean-signal predicate for one code gate.
 
@@ -160,6 +161,11 @@ def evaluate_clean_gate(
     orchestrator reads them from the cycle's round artifacts); a raise means they
     could not be read, which fails the finding conjuncts closed. Every conjunct
     that fails is named in ``misses`` and the aggregate ``clean`` is their AND.
+
+    ``phase`` is the gate's PN phase prefix (the orchestrator's
+    ``_expected_phase``); it keys the evidence-freshness conjunct — fix commits
+    recorded under ``P<N>.x`` mark tests/acceptance records produced *before*
+    the cycle as stale, since they vouch for a tree the fix commits then changed.
     """
     misses: list[str] = []
 
@@ -314,6 +320,40 @@ def evaluate_clean_gate(
             "no test shell ran before this code gate — the required 'tests "
             "green' conjunct cannot be proven; failing closed (FR-4.1)"
         )
+
+    # --- evidence freshness (FR-4.1, review F-3) --------------------------------
+    # The tests/acceptance conjuncts must vouch for the tree this gate approves.
+    # A round-1-converged cycle may still land fix commits (an accepted minor
+    # finding is fixed inside round 1 without failing any conjunct above), and in
+    # the shipped stage order tests and the acceptance gate run BEFORE the cycle
+    # — their records then describe a tree the fix commits changed. Deterministic
+    # manifest-only check: with a ``P<N>.x`` fix commit recorded for this phase,
+    # every DONE tests/acceptance record positioned before the cycle is stale
+    # evidence and parks closed, exactly as a failed conjunct would. A
+    # tests/acceptance step positioned AFTER the cycle re-proved its signal
+    # against the fixed tree and stays fresh.
+    fix_shas = [
+        c.sha for c in manifest.commits
+        if phase and c.phase.startswith(f"{phase}.")
+    ]
+    if fix_shas:
+        ids = [s.id for s in stage.steps]
+        cycle_pos = max(
+            (ids.index(s.id) for s in preceding if s.type == "adversarial_cycle"),
+            default=-1,
+        )
+        for rec_list, label in ((shells, "tests"), (acceptance, "acceptance gate")):
+            for rec in rec_list:
+                if rec.status != M.DONE or rec.id not in ids:
+                    continue  # non-DONE records already missed above
+                if ids.index(rec.id) < cycle_pos:
+                    misses.append(
+                        f"{label} step {rec.id!r} ran before the cycle, and the "
+                        f"cycle landed fix commit(s) "
+                        f"{', '.join(s[:10] for s in fix_shas)} afterward — its "
+                        "evidence is stale for the tree this gate approves "
+                        "(FR-4.1 evidence freshness); failing closed"
+                    )
 
     evidence: dict[str, Any] = {
         "rounds": rounds,

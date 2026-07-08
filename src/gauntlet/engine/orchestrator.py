@@ -1258,16 +1258,17 @@ class Orchestrator:
             return None
         from gauntlet.engine import gates
 
+        phase = self._expected_phase(step, item)
         decision = gates.evaluate_clean_gate(
             self.manifest, self.pipeline, step, iteration,
             load_findings=self._load_round_findings,
+            phase=phase,
         )
         if not decision.clean:
             # Fall through to the human_gate handler (parks); leave a note so the
             # operator sees WHY it did not auto-approve (data over inference).
-            self._record_gate_miss(step, decision)
+            self._record_gate_miss(step, decision, phase)
             return None
-        phase = self._expected_phase(step, item)
         record = M.AutoApproval(
             gate_id=step.id,
             iteration=iteration,
@@ -1318,11 +1319,16 @@ class Orchestrator:
         if note not in self.manifest.warnings:
             self.manifest.warnings.append(note)
 
-    def _record_gate_miss(self, step: Step, decision) -> None:
-        """Note why an ``auto_when_clean`` gate parked instead of auto-approving."""
+    def _record_gate_miss(self, step: Step, decision, phase: str | None) -> None:
+        """Note why an ``auto_when_clean`` gate parked instead of auto-approving.
+
+        The note names the phase, not just the (foreach-stable) step id — the
+        warnings list de-duplicates by text, so a phase-less note for ``P2``
+        would silently collapse into ``P1``'s identical one (review F-9).
+        """
         note = (
-            f"[{step.id}] auto_when_clean predicate miss (FR-4.1): parked for a "
-            f"human — {decision.summary()}"
+            f"[{step.id}{f' {phase}' if phase else ''}] auto_when_clean predicate "
+            f"miss (FR-4.1): parked for a human — {decision.summary()}"
         )
         if note not in self.manifest.warnings:
             self.manifest.warnings.append(note)

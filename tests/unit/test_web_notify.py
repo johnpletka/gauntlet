@@ -31,6 +31,7 @@ from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.web.config import WebNotifyConfig, web_config_from
 from gauntlet.web.notify import (
     GAUNTLET_SLACK_WEBHOOK_ENV,
+    KIND_AUTO_APPROVED,
     KIND_COMPLETED,
     KIND_ESCALATION,
     KIND_FAILED,
@@ -314,6 +315,58 @@ def test_classify_kind_ignores_warnings():
     # A warning is NOT a classify_kind transition kind — it is handled as its own
     # notifier stream. A plain running event with a warning classifies to None.
     assert classify_kind(_running_with_warnings([_WINDOW_WARN])) is None
+
+
+# --- FR-4.1 auto-approval advisories (review F-2) ------------------------------
+_AUTO_APPROVE_WARN = (
+    "[phase-gate] auto-approval (FR-4.1): code gate P3 cleared without a human "
+    "on clean evidence (verifier=clean, rounds=1); enumerated in PR.md for "
+    "ratification (FR-4.2)"
+)
+
+
+def test_auto_approval_advisory_is_pushed_once():
+    # FR-4.1 "a notification is sent": an auto-approved gate is a DONE step (no
+    # park transition for classify_kind to see), so the advisory stamped in
+    # manifest.warnings must be pushed as its own stream — at approval time, not
+    # at the PR. Deduped by text like the usage-window stream.
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings([_AUTO_APPROVE_WARN]))
+    assert len(rec.sent) == 1
+    assert rec.sent[0].kind == KIND_AUTO_APPROVED
+    assert "P3" in (rec.sent[0].note or "")
+    later = _running_with_warnings([_AUTO_APPROVE_WARN])
+    later.current_step = "next-step"
+    n.notify(later)
+    assert len(rec.sent) == 1
+
+
+def test_auto_approval_and_window_warning_are_distinct_streams():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings([_WINDOW_WARN, _AUTO_APPROVE_WARN]))
+    kinds = sorted(note.kind for note in rec.sent)
+    assert kinds == sorted([KIND_WARNING, KIND_AUTO_APPROVED])
+
+
+def test_prime_suppresses_pre_existing_auto_approval_advisory():
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.prime(_running_with_warnings([_AUTO_APPROVE_WARN]))
+    n.notify(_running_with_warnings([_AUTO_APPROVE_WARN]))
+    assert rec.sent == []
+
+
+def test_gate_miss_note_is_not_pushed_as_auto_approval():
+    # A predicate-miss note (also stamped in warnings) carries a different
+    # marker and must not push as an approval.
+    rec = RecordingChannel()
+    n = Notifier([rec])
+    n.notify(_running_with_warnings([
+        "[gate P2] auto_when_clean predicate miss (FR-4.1): parked for a human"
+    ]))
+    assert [note.kind for note in rec.sent] == []
 
 
 # --- fail-soft ---------------------------------------------------------------

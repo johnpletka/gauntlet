@@ -65,6 +65,13 @@ KIND_COMPLETED = "run-completed"
 # its own per-warning stream (deduped by warning text), separate from
 # classify_kind. Fires while the run keeps going — the warn-don't-park default.
 KIND_WARNING = "usage-window-warning"
+# FR-4.1 auto-approval advisory: a clean-signal code gate cleared without a
+# human. Like KIND_WARNING it is a run-level advisory record (stamped in
+# manifest.warnings), not a state transition — an auto-approved gate is DONE and
+# the run keeps going, so classify_kind never sees it. Pushed per distinct
+# advisory text so the operator learns of the approval when it happens, not at
+# the PR (FR-4.1 "a notification is sent").
+KIND_AUTO_APPROVED = "gate-auto-approved"
 
 # Human labels for the notification title, by kind.
 _LABELS = {
@@ -73,6 +80,7 @@ _LABELS = {
     KIND_FAILED: "Run failed",
     KIND_COMPLETED: "Run completed",
     KIND_WARNING: "Usage-window warning",
+    KIND_AUTO_APPROVED: "Gate auto-approved (FR-4.1)",
 }
 
 # The engine-grounded marker an advisory usage-window warning carries (the
@@ -85,6 +93,14 @@ _WINDOW_WARNING_MARK = "usage-window admission"
 # adversarial_cycle step). Mirrors `intel._ESCALATION_MARK` — the same closed,
 # table-tested vocabulary, kept LLM-free (D8).
 _ESCALATION_MARK = "escalation"
+
+# The engine-grounded marker an FR-4.1 auto-approval advisory carries (the
+# orchestrator stamps "[<gate>] auto-approval (FR-4.1): …" into
+# manifest.warnings). Same closed, LLM-free vocabulary as the window marker.
+# An auto-approved gate is a DONE step — it never produces a park transition —
+# so without this stream the one human-facing signal FR-4.1 requires at
+# approval time would sit unpushed in the manifest until the PR (review F-2).
+_AUTO_APPROVAL_MARK = "auto-approval (FR-4.1)"
 
 GAUNTLET_SLACK_WEBHOOK_ENV = "GAUNTLET_SLACK_WEBHOOK"
 
@@ -125,6 +141,15 @@ def usage_window_warnings(event: WatchEvent) -> list[str]:
     unrenderable final-gate artifact) are surfaced by ``gauntlet status`` but not
     pushed as this kind."""
     return [w for w in (event.warnings or []) if _WINDOW_WARNING_MARK in w]
+
+
+def auto_approval_warnings(event: WatchEvent) -> list[str]:
+    """The FR-4.1 auto-approval advisories carried by this event.
+
+    Filters ``manifest.warnings`` (carried on the event) to the auto-approval
+    ones by their engine-stamped marker; the notifier pushes one per distinct
+    advisory, deduped by text — same contract as the usage-window stream."""
+    return [w for w in (event.warnings or []) if _AUTO_APPROVAL_MARK in w]
 
 
 class Notification(BaseModel):
@@ -320,39 +345,51 @@ class Notifier:
         return (event.run_id, kind, event.current_step)
 
     @staticmethod
-    def _warning_key(event: WatchEvent, warning: str) -> tuple[str, str, str | None]:
-        """De-dup key for a usage-window warning — keyed on the warning TEXT, not
-        ``current_step``, so a distinct warning notifies exactly once and an
-        unchanged warning riding later transitions does not re-fire (FR-10.3)."""
-        return (event.run_id, KIND_WARNING, warning)
+    def _warning_key(
+        event: WatchEvent, kind: str, warning: str
+    ) -> tuple[str, str, str | None]:
+        """De-dup key for an advisory (usage-window / auto-approval) — keyed on
+        the advisory TEXT, not ``current_step``, so a distinct advisory notifies
+        exactly once and an unchanged one riding later transitions does not
+        re-fire (FR-10.3 / FR-4.1)."""
+        return (event.run_id, kind, warning)
+
+    @staticmethod
+    def _advisories(event: WatchEvent) -> list[tuple[str, str]]:
+        """This event's advisory streams as (kind, text) pairs."""
+        return [
+            *((KIND_WARNING, w) for w in usage_window_warnings(event)),
+            *((KIND_AUTO_APPROVED, w) for w in auto_approval_warnings(event)),
+        ]
 
     def prime(self, event: WatchEvent) -> None:
         """Record the current state's de-dup keys without notifying (FR-9.1).
 
-        Primes the classified transition kind AND every usage-window warning
-        already present at first observation — so a run whose warnings predate the
-        server does not flood the operator on startup."""
-        for warning in usage_window_warnings(event):
-            self._fired.add(self._warning_key(event, warning))
+        Primes the classified transition kind AND every advisory (usage-window,
+        auto-approval) already present at first observation — so a run whose
+        warnings predate the server does not flood the operator on startup."""
+        for kind, warning in self._advisories(event):
+            self._fired.add(self._warning_key(event, kind, warning))
         kind = classify_kind(event)
         if kind is not None:
             self._fired.add(self._key(event, kind))
 
     def notify(self, event: WatchEvent) -> None:
-        """Fan out this event's new notifications (FR-9.1/10.3).
+        """Fan out this event's new notifications (FR-9.1/10.3/FR-4.1).
 
-        Two independent streams: each newly-recorded advisory usage-window warning
-        (deduped by text), and the classified transition kind (deduped by
-        ``(run_id, kind, current_step)``). A single event can carry both — an
-        advisory shortfall recorded on the same tick the run reaches a gate."""
-        for warning in usage_window_warnings(event):
-            key = self._warning_key(event, warning)
+        Independent streams: each newly-recorded advisory (usage-window
+        shortfall, auto-approved gate — deduped by text), and the classified
+        transition kind (deduped by ``(run_id, kind, current_step)``). A single
+        event can carry several — an advisory recorded on the same tick the run
+        reaches a gate."""
+        for kind, warning in self._advisories(event):
+            key = self._warning_key(event, kind, warning)
             if key in self._fired:
                 continue
             self._fired.add(key)
             self._fanout(
                 Notification.build(
-                    event, KIND_WARNING, base_url=self.base_url, note=warning
+                    event, kind, base_url=self.base_url, note=warning
                 )
             )
         kind = classify_kind(event)
@@ -419,6 +456,7 @@ __all__ = [
     "Notification",
     "classify_kind",
     "usage_window_warnings",
+    "auto_approval_warnings",
     "build_notifier",
     "DesktopChannel",
     "SlackChannel",
@@ -429,5 +467,6 @@ __all__ = [
     "KIND_FAILED",
     "KIND_COMPLETED",
     "KIND_WARNING",
+    "KIND_AUTO_APPROVED",
     "GAUNTLET_SLACK_WEBHOOK_ENV",
 ]

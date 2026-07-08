@@ -84,11 +84,74 @@ def _seed_clean_manifest(
     return man
 
 
-def _evaluate(man, pipeline, *, findings=None, verdicts=None, iteration="0"):
+def _evaluate(man, pipeline, *, findings=None, verdicts=None, iteration="0",
+              phase=None):
     return gates.evaluate_clean_gate(
         man, pipeline, _gate_step(pipeline), iteration,
         load_findings=lambda: (findings or [], verdicts or []),
+        phase=phase,
     )
+
+
+# --- FR-4.1 evidence freshness (review F-3) -----------------------------------
+# The SHIPPED stage order runs tests + acceptance-gate BEFORE impl-cycle; a
+# round-1-converged cycle can still land a fix commit (an accepted minor
+# finding), so pre-cycle evidence describes a tree the fix then changed.
+STALE_ORDER_STAGE = """
+name: demo
+version: 1
+stages:
+  - id: phases
+    foreach: vars.phases
+    steps:
+      - {id: tests, type: shell, run: "true"}
+      - {id: acceptance-gate, type: acceptance_gate, collector: pytest}
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewers: [{profile: reviewer, lens: correctness}],
+         triager: triage, fixer: builder, verifier: verifier, max_rounds: 2}
+      - {id: gate, type: human_gate, policy: auto_when_clean,
+         show: [findings.json]}
+"""
+
+
+def test_fix_commit_after_pre_cycle_evidence_parks_stale():
+    man = _seed_clean_manifest()
+    man.commits.append(CommitRecord(step_id="impl-cycle", phase="P1.1", sha="a" * 40))
+    d = _evaluate(man, _pipeline(STALE_ORDER_STAGE), phase="P1")
+    assert d.clean is False
+    stale = [m for m in d.misses if "evidence is stale" in m]
+    # both pre-cycle records are named stale, with the fix commit cited
+    assert len(stale) == 2
+    assert any("tests" in m for m in stale)
+    assert any("acceptance gate" in m for m in stale)
+    assert all("aaaaaaaaaa" in m for m in stale)
+
+
+def test_fix_commit_with_post_cycle_evidence_stays_fresh():
+    # The fixture PHASE_STAGE orders tests/acceptance AFTER the cycle — their
+    # records re-proved the signal against the fixed tree, so a fix commit does
+    # not stale them and the all-clean case still auto-approves.
+    man = _seed_clean_manifest()
+    man.commits.append(CommitRecord(step_id="impl-cycle", phase="P1.1", sha="a" * 40))
+    d = _evaluate(man, _pipeline(), phase="P1")
+    assert d.clean is True
+
+
+def test_phase_commit_is_not_stale_evidence():
+    # The P<N> phase commit itself (no .x suffix) commits the exact tree the
+    # evidence ran on — only P<N>.x FIX commits change content after the fact.
+    man = _seed_clean_manifest()
+    man.commits.append(CommitRecord(step_id="phase-commit", phase="P1", sha="b" * 40))
+    d = _evaluate(man, _pipeline(STALE_ORDER_STAGE), phase="P1")
+    assert d.clean is True
+
+
+def test_fix_commit_prefix_does_not_alias_phases():
+    # "P10.1" must not stale a P1 gate (prefix check is "P1.", not "P1").
+    man = _seed_clean_manifest()
+    man.commits.append(CommitRecord(step_id="impl-cycle", phase="P10.1", sha="c" * 40))
+    d = _evaluate(man, _pipeline(STALE_ORDER_STAGE), phase="P1")
+    assert d.clean is True
 
 
 # --- P8-A2 / predicate: the all-clean case is clean --------------------------

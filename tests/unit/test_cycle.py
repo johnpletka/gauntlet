@@ -215,10 +215,19 @@ def test_no_findings_converges_without_commit(cycle_repo):
         "triage": SeqAdapter(),
         "builder": SeqAdapter(),
     }
-    status, man, _ = run_cycle(cycle_repo, adapters)
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
     assert status == M.RUN_DONE
     assert man.commits == []
     assert "no findings" in man.record("cycle").notes
+    # FR-4.1 (review F-1): the zero-findings convergence persists an EMPTY
+    # verdict set — the evidence-tiered gate reads findings.json + triage.json
+    # to prove "zero blocking/major legitimate findings", and a missing
+    # triage.json is a fail-closed miss that would park the archetypal clean
+    # gate (round 1, zero findings) forever.
+    triage = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    assert triage == {"verdicts": []}
+    findings = json.loads((run_dir / "artifacts" / "findings.json").read_text())
+    assert findings["findings"] == []
 
 
 # --- artifact-desync guard (fix/cycle-artifact-desync) -----------------------
@@ -232,9 +241,11 @@ def test_triage_integrity_stray_flags_unknown_finding_ids():
 
 def test_stale_triage_artifact_is_cleared_when_new_findings_land(cycle_repo):
     # A prior run left an artifacts/triage.json describing different findings.
-    # The reviewer now converges (no findings this round), so no fresh triage is
-    # written — the stale artifact must be GONE, never left to disagree with the
-    # current findings.json (the desync that surfaced a phantom escalation).
+    # The reviewer now converges (no findings this round). The stale verdict set
+    # must never survive to disagree with the current findings.json (the desync
+    # that surfaced a phantom escalation) — since FR-4.1 (review F-1) the
+    # convergence REPLACES it with the round's true empty verdict set rather
+    # than leaving triage absent, so the evidence-tiered gate can read it.
     run_dir = cycle_repo / "runs" / "demo" / "run-1"
     stale = run_dir / "artifacts" / "triage.json"
     stale.parent.mkdir(parents=True, exist_ok=True)
@@ -247,15 +258,17 @@ def test_stale_triage_artifact_is_cleared_when_new_findings_land(cycle_repo):
     }
     status, _man, _ = run_cycle(cycle_repo, adapters)
     assert status == M.RUN_DONE
-    assert not stale.exists()  # cleared the instant findings.json was rewritten
+    # stale content gone; replaced by the consistent empty verdict set
+    assert json.loads(stale.read_text()) == {"verdicts": []}
 
 
 def test_converged_round_does_not_register_deleted_triage(cycle_repo):
     # PR #14 F1: round 1 triages (writes + registers triage.json); round 2
-    # converges with no findings, clearing triage.json. The DONE result must NOT
-    # still register the now-deleted path — the orchestrator merges artifact_writes
-    # into ctx.artifacts, where a downstream step / `human_gate show:` would read
-    # a dangling reference.
+    # converges with no findings. The DONE result must never register a dangling
+    # path — the orchestrator merges artifact_writes into ctx.artifacts, where a
+    # downstream step / `human_gate show:` would read it. Since FR-4.1 (review
+    # F-1) the converged round writes a fresh EMPTY verdict set (replacing round
+    # 1's), so the registered path is live and consistent with findings.json.
     reviewer = SeqAdapter(
         REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1
         REVIEW(),                                                            # r2: converge
@@ -282,8 +295,11 @@ def test_converged_round_does_not_register_deleted_triage(cycle_repo):
     )
     status = orch.drive()
     assert status == M.RUN_DONE
-    assert not (run_dir / "artifacts" / "triage.json").exists()  # cleared on r2
-    assert "triage.json" not in orch.artifacts                   # and not dangling
+    # round 2 replaced round 1's verdicts with the true empty set (FR-4.1)
+    triage_path = run_dir / "artifacts" / "triage.json"
+    assert json.loads(triage_path.read_text()) == {"verdicts": []}
+    # registered and live — never a dangling reference (PR #14 F1)
+    assert orch.artifacts.get("triage.json") == triage_path
     assert "findings.json" in orch.artifacts                     # sanity: map populated
 
 

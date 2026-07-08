@@ -801,6 +801,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if not reuse_review:  # write-ahead checkpoint (FR-4.1); reuse never re-records
             _checkpoint(ctx, "review", rnd, handoff, data=review_out)
         if not triage_findings:
+            # FR-4.1: persist the (empty) verdict set — the evidence-tiered gate
+            # reads findings.json + triage.json to prove "zero blocking/major
+            # legitimate findings", and a missing triage.json is a fail-closed
+            # predicate miss. Without this write the archetypal clean gate
+            # (round 1, zero findings) could never auto-approve.
+            _persist_round_triage(ctx, [], [], schema=None,
+                                  artifact_writes=artifact_writes)
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
