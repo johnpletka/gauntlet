@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -1744,13 +1745,31 @@ def _run_verifier(
 
     verifier_schema = _reviewer_output_schema(findings_schema) if findings_schema else None
     logger = step_logger(ctx, f"r{rnd}-verify")
+    lease = None
     try:
         adapter = ctx.build_adapter(profile, effort=effort)
+        # The verifier's OWN step id (PR #59 B1/F-003): distinct from the cycle
+        # step's (a shared id would confine the fixer too) and unique per
+        # attempt (a fresh judge-side one-shot registration can never collide
+        # with a prior attempt's). Registered as a judge-side boundary BEFORE
+        # launch, then PROVEN live: an outside-copy read must come back as the
+        # deterministic confinement deny, or the sub-step parks (never launches
+        # on unproven confinement).
+        verifier_step_id = f"verify:r{rnd}:{secrets.token_hex(8)}"
+        lease = verify.register_boundary(ctx.judge_env, verifier_step_id, copy.path)
+        verify.confirm_boundary_enforced(lease, ctx.repo_root)
+        scratch_home = copy.root / "home"
+        scratch_home.mkdir(parents=True, exist_ok=True)
         # Pin the claude-code verifier posture: confined allowed_tools (no network),
         # permission mode, --setting-sources project (so the judge hook fires), and
-        # the rebuilt secret-stripped env whose judge repo-root boundary is the copy
-        # (FR-2.5). A no-op on a test double, which carries none of those attributes.
-        env = verify.verifier_env(ctx.judge_env, copy.path)
+        # the rebuilt secret-stripped env — verifier step id (boundary key +
+        # in-pipeline denies) and scratch HOME (no ~/.aws / ~/.ssh discovery for
+        # un-hooked children) included (FR-2.5, PR #59 B1). A no-op on a test
+        # double, which carries none of those attributes.
+        env = verify.verifier_env(
+            ctx.judge_env, copy.path,
+            step_id=verifier_step_id, scratch_home=scratch_home,
+        )
         extra_flags = verify.configure_claude_verifier(adapter, env=env)
         review = _run_sub(
             ctx, profile, _verifier_prompt(step, ctx, phase), schema=verifier_schema,
@@ -1786,6 +1805,8 @@ def _run_verifier(
             ),
         )) from exc
     finally:
+        if lease is not None:
+            verify.clear_boundary(lease)
         verify.discard_disposable_copy(ctx.repo_root, copy)
 
     # 4. The real worktree must be byte-identical after verification (P5-A4).

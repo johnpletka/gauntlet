@@ -159,18 +159,28 @@ _JUDGE_HOOK_ENV_KEYS: frozenset[str] = frozenset(
 )
 
 
-def verifier_env(judge_env: dict[str, str], copy_root: Path) -> dict[str, str]:
+def verifier_env(
+    judge_env: dict[str, str],
+    copy_root: Path,
+    *,
+    step_id: str | None = None,
+    scratch_home: Path | None = None,
+) -> dict[str, str]:
     """The full environment the verifier (or the migrated enumeration) is spawned
     with: the stripped allowlist env PLUS only the run's judge *hook infrastructure*
     keys, with the judge's repo-root boundary re-pointed at the disposable copy
     (FR-2.5).
 
-    ``GAUNTLET_REPO_ROOT`` → the copy means the PreToolUse judge hook denies any
-    tool call whose resolved path escapes the copy (the read/write-denial
-    mechanism). Only the exact hook keys the judge needs — its url/token/mode and
-    the run/step ids (:data:`_JUDGE_HOOK_ENV_KEYS`) — are re-added on top of the
-    stripped env; they are run-local infrastructure, not a credential the
-    verifier's work should carry, but the hook requires them.
+    The confinement mechanism is the judge-side per-step BOUNDARY the engine
+    registers before launch (:func:`register_boundary`, PR #59 review B1) —
+    server-authoritative, keyed on the verifier's own ``step_id`` set here.
+    ``GAUNTLET_REPO_ROOT`` → the copy remains as the request-side fallback for a
+    standalone (un-pinned) judge; on the production pinned-root judge it is
+    advisory only, which is exactly why the registered boundary exists. Only the
+    exact hook keys the judge needs — its url/token/mode and the run/step ids
+    (:data:`_JUDGE_HOOK_ENV_KEYS`) — are re-added on top of the stripped env;
+    they are run-local infrastructure, not a credential the verifier's work
+    should carry, but the hook requires them.
 
     Re-adding the *whole* ``judge_env`` would defeat the strip: a caller can pass
     environment-shaped judge data (the integration harness passes
@@ -186,6 +196,24 @@ def verifier_env(judge_env: dict[str, str], copy_root: Path) -> dict[str, str]:
         if key in source:
             env[key] = source[key]
     env[REPO_ROOT_ENV_VAR] = str(copy_root)
+    # The verifier's OWN step id (PR #59 review B1/F-003) — never inherited from
+    # `judge_env` (the cycle step's id would confine the fixer too). It is (a)
+    # what the judge's per-step boundary registration keys on, and (b) a
+    # non-empty step id, so `pipeline_step_only` denies (in-run push/PR, FR-9.8)
+    # apply to the verifier like every in-run agent.
+    if step_id is not None:
+        env[STEP_ID_ENV_VAR] = step_id
+    # Scratch HOME (PR #59 review F-006): hook-mediated confinement cannot gate
+    # forked subprocesses, and the previous allowlisted real HOME let an
+    # un-hooked child read ~/.aws, ~/.ssh, ~/.config/gh directly. Pointing HOME
+    # at an empty scratch dir removes that discovery surface; the claude CLI
+    # still finds its login via CLAUDE_CONFIG_DIR, pinned to the real config
+    # dir (which remains the one credential the CLI itself must hold).
+    if scratch_home is not None:
+        real_home = env.get("HOME") or os.environ.get("HOME") or ""
+        if "CLAUDE_CONFIG_DIR" not in env and real_home:
+            env["CLAUDE_CONFIG_DIR"] = str(Path(real_home) / ".claude")
+        env["HOME"] = str(scratch_home)
     return env
 
 
@@ -249,6 +277,117 @@ def _judge_observed(url: str, token: str, run_id: str, nonce: str) -> bool:
 
     result = hook_client._ask_observed(url, token, run_id, nonce)
     return bool((result or {}).get("observed"))
+
+
+def _judge_boundary(url: str, token: str, body: dict, *, clear: bool = False) -> dict:
+    """One authenticated ``/boundary`` (or ``/boundary/clear``) round-trip,
+    isolated as a seam so the lease functions are unit-testable without a live
+    judge."""
+    from gauntlet.judge import hook_client
+
+    return hook_client._ask_boundary(url, token, body, clear=clear)
+
+
+@dataclass(frozen=True)
+class BoundaryLease:
+    """An engine-held lease on a judge-side per-step boundary (PR #59 B1).
+
+    ``key`` is the clear secret minted at registration; it never enters the
+    sandbox env, so the sandboxed agent (which necessarily holds the run token
+    for its hook) cannot clear or re-register its own boundary."""
+
+    step_id: str
+    key: str
+    url: str
+    token: str
+    run_id: str | None
+
+
+def register_boundary(
+    judge_env: dict[str, str] | None, step_id: str, root: Path
+) -> BoundaryLease:
+    """Bind ``step_id`` to the disposable-copy ``root`` on the run's judge,
+    BEFORE the sandboxed turn launches (PR #59 review B1).
+
+    This is what makes the copy confinement real on the production pinned-root
+    judge: requests carrying ``step_id`` are confined to ``root`` (reads,
+    writes, Bash paths, network default-deny, git refs) and the boundary
+    replaces the pinned root as the effective path boundary. Fails closed —
+    any transport/HTTP fault or a refused (already-bound) registration raises
+    :class:`SandboxUnavailableError` and parks the sub-step."""
+    source = judge_env or {}
+    token = source.get(TOKEN_ENV_VAR)
+    if not token:
+        raise SandboxUnavailableError(
+            "verifier boundary: no judge token in the run env — the per-step "
+            "boundary cannot be registered, parking closed (PR #59 B1)."
+        )
+    url = source.get(URL_ENV_VAR) or _DEFAULT_JUDGE_URL
+    run_id = source.get(RUN_ID_ENV_VAR)
+    key = secrets.token_hex(16)
+    body = {"step_id": step_id, "root": str(root), "key": key, "run_id": run_id}
+    try:
+        result = _judge_boundary(url, token, body)
+    except Exception as exc:  # transport / HTTP / auth / decode — fail closed
+        raise SandboxUnavailableError(
+            "verifier boundary: the judge refused or could not record the "
+            f"disposable-copy boundary for step {step_id!r} "
+            f"({type(exc).__name__}: {exc}); parking closed — the verifier "
+            "never runs without a registered boundary (PR #59 B1)."
+        ) from exc
+    if not (result or {}).get("registered"):
+        raise SandboxUnavailableError(
+            f"verifier boundary: the judge did not confirm registration for "
+            f"step {step_id!r} ({result!r}); parking closed (PR #59 B1)."
+        )
+    return BoundaryLease(step_id=step_id, key=key, url=url, token=token, run_id=run_id)
+
+
+def clear_boundary(lease: BoundaryLease) -> None:
+    """Release a boundary lease (best-effort; never raises — a stale entry in
+    the judge's in-memory registry is inert once its unique step_id retires)."""
+    body = {"step_id": lease.step_id, "key": lease.key, "run_id": lease.run_id}
+    try:
+        _judge_boundary(lease.url, lease.token, body, clear=True)
+    except Exception:
+        pass
+
+
+def confirm_boundary_enforced(lease: BoundaryLease, outside_path: Path) -> None:
+    """Prove, on the LIVE judge, that the registered boundary denies an
+    outside-copy read before the sandboxed turn runs (PR #59 review B1/F-002).
+
+    Issues one synthetic ``/decide`` carrying the verifier's step id and a path
+    outside the copy (the run worktree), with the request-side ``repo_root``
+    deliberately set to that path's own parent — so a judge that ignored the
+    registered boundary would see an in-root read and NOT hit the confinement
+    rung. Only the deterministic confinement deny
+    (``matched_rule: verifier-boundary-path``) passes; anything else — allow,
+    ask, a classifier verdict, a transport fault — parks closed."""
+    body = {
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(outside_path)},
+        "repo_root": str(outside_path.parent),
+        "run_id": lease.run_id,
+        "step_id": lease.step_id,
+    }
+    try:
+        result = _judge_roundtrip(lease.url, lease.token, body)
+    except Exception as exc:
+        raise SandboxUnavailableError(
+            "verifier boundary probe: the judge could not be queried to prove "
+            f"outside-copy denial ({type(exc).__name__}: {exc}); parking closed "
+            "(PR #59 B1, FR-2.5)."
+        ) from exc
+    decision = (result or {}).get("decision")
+    rule = (result or {}).get("matched_rule")
+    if decision != "deny" or rule != "verifier-boundary-path":
+        raise SandboxUnavailableError(
+            "verifier boundary probe: an outside-copy read was NOT denied by the "
+            f"registered boundary (decision={decision!r}, rule={rule!r}) — the "
+            "§7 read-confinement contract is not active for this step; parking "
+            "closed (PR #59 B1, FR-2.5)."
+        )
 
 
 # Wall-clock ceiling on the hook-loading probe's claude turn (review F-001). It
@@ -367,10 +506,17 @@ def confirm_hook_loaded(
             "verifier hook-loading probe: could not create a disposable copy to "
             f"exercise the PreToolUse hook ({exc}); parking closed (FR-2.3, P5-A5)."
         ) from exc
-    # The probe env is the exact verifier posture, but tagged with the probe
-    # step_id so every tool call in this turn reaches the judge carrying the nonce.
-    env = verifier_env(judge_env or {}, copy.path)
-    env[STEP_ID_ENV_VAR] = f"{PROBE_STEP_PREFIX}{nonce}"
+    # The probe env is the exact verifier posture — probe step_id (so every tool
+    # call reaches the judge carrying the nonce), scratch HOME, and a registered
+    # judge-side boundary on the probe's own step id (so the probe turn runs
+    # under the same confinement discipline the real turn will, PR #59 B1).
+    probe_step_id = f"{PROBE_STEP_PREFIX}{nonce}"
+    scratch_home = copy.root / "home"
+    scratch_home.mkdir(parents=True, exist_ok=True)
+    env = verifier_env(
+        judge_env or {}, copy.path, step_id=probe_step_id, scratch_home=scratch_home
+    )
+    lease = register_boundary(judge_env, probe_step_id, copy.path)
     try:
         _run_backend_bash(
             backend,
@@ -388,6 +534,7 @@ def confirm_hook_loaded(
             "P5-A5)."
         ) from exc
     finally:
+        clear_boundary(lease)
         discard_disposable_copy(repo_root, copy)
 
     try:

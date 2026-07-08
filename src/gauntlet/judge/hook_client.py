@@ -82,6 +82,24 @@ def _ask_judge(url: str, token: str, body: dict) -> dict:
         return json.loads(resp.read().decode())
 
 
+def _ask_boundary(
+    url: str, token: str, body: dict, *, clear: bool = False
+) -> dict:
+    """Register (or clear) a per-step confinement boundary on the run's judge
+    (PR #59 review B1). Engine-side client; authenticated exactly like
+    ``/decide``. Raises on any HTTP/transport error — callers park closed."""
+    data = json.dumps(body).encode()
+    endpoint = "/boundary/clear" if clear else "/boundary"
+    req = urllib.request.Request(
+        f"{url}{endpoint}",
+        data=data,
+        headers={"Content-Type": "application/json", "X-Gauntlet-Token": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=HOOK_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode())
+
+
 def _ask_observed(url: str, token: str, run_id: str, nonce: str) -> dict:
     """Query the run's judge for whether it OBSERVED a PreToolUse callback tagged
     with ``nonce`` (a hook-loading probe; review F-001). Authenticated and

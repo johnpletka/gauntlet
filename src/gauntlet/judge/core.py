@@ -59,8 +59,53 @@ class JudgeCore:
         # construction: only probe-prefixed step_ids are recorded, and there is one
         # probe per verifier sub-step. Guarded by the same lock as the cache.
         self._observed_probes: set[str] = set()
+        # --- per-step boundary registry (PR #59 review B1) ---------------------
+        # step_id → (boundary root, unregister key). The engine registers the
+        # verifier's disposable-copy root against the verifier's step_id BEFORE
+        # launching it; requests carrying that step_id are then confined to the
+        # boundary (reads, writes, Bash paths, network, git refs — see
+        # PolicyEngine.confinement_deny) and the boundary REPLACES the pinned
+        # repo_root as the effective root, so the real run worktree is outside
+        # the allowed surface. Server-authoritative: the agent's env can move
+        # only the request-side fallback, never this registry. Registration is
+        # ONE-SHOT per step_id and clearing requires the engine-held key, so a
+        # verifier holding the run token cannot widen or drop its own boundary.
+        self._boundaries: dict[str, tuple[Path, str]] = {}
         self._decision_seq = 0
         self._lock = threading.Lock()
+
+    def register_boundary(self, step_id: str, root: Path, key: str) -> bool:
+        """One-shot: bind ``step_id`` to a confinement ``root`` (PR #59 B1).
+
+        Returns False (refusing) when the step_id is already bound to a
+        different root/key — first write wins, so a sandboxed agent cannot
+        re-register itself wider. Re-registering identical values is an
+        idempotent success (resume-safe)."""
+        if not step_id or not key:
+            return False
+        entry = (Path(root), key)
+        with self._lock:
+            existing = self._boundaries.get(step_id)
+            if existing is not None:
+                return existing == entry
+            self._boundaries[step_id] = entry
+            return True
+
+    def clear_boundary(self, step_id: str, key: str) -> bool:
+        """Remove a boundary — only with the key its registration returned."""
+        with self._lock:
+            existing = self._boundaries.get(step_id)
+            if existing is None or existing[1] != key:
+                return False
+            del self._boundaries[step_id]
+            return True
+
+    def boundary_for(self, step_id: str | None) -> Path | None:
+        if not step_id:
+            return None
+        with self._lock:
+            entry = self._boundaries.get(step_id)
+        return entry[0] if entry else None
 
     def decide(
         self,
@@ -81,7 +126,15 @@ class JudgeCore:
         if step_id and step_id.startswith(PROBE_STEP_PREFIX):
             with self._lock:
                 self._observed_probes.add(step_id[len(PROBE_STEP_PREFIX):])
-        effective_root = self.repo_root or repo_root
+        # A registered per-step boundary (the verifier's disposable copy) WINS
+        # over the pinned repo root: the pinned root is the run's authoritative
+        # boundary for ordinary steps, but for a boundary-registered step the
+        # copy IS the allowed world and the run worktree must be outside it
+        # (PR #59 review B1 — previously the env-repointed copy root only fed
+        # the request fallback, which the pinned root always overrode, leaving
+        # the copy confinement inert in production runs).
+        boundary = self.boundary_for(step_id)
+        effective_root = boundary or self.repo_root or repo_root
         key = self._cache_key(
             tool_name, tool_input, effective_root, step_id, agent_profile
         )
@@ -103,7 +156,9 @@ class JudgeCore:
                 cached=True, cached_from=original_id,
             )
             return cached_decision
-        decision = self._ladder(tool_name, tool_input, effective_root, step_id)
+        decision = self._ladder(
+            tool_name, tool_input, effective_root, step_id, boundary=boundary
+        )
         latency_ms = round((time.monotonic() - start) * 1000, 2)
         # Cache ONLY allow decisions (FR-12.1); deny/ask always re-evaluate.
         if decision.decision == "allow":
@@ -169,8 +224,21 @@ class JudgeCore:
 
     def _ladder(
         self, tool_name: str, tool_input: dict, repo_root: Path,
-        step_id: str | None = None,
+        step_id: str | None = None, boundary: Path | None = None,
     ) -> JudgeDecision:
+        # Rung 0: boundary confinement (PR #59 B1). For a boundary-registered
+        # step (the verifier in its disposable copy), a terminal deny fires
+        # BEFORE any policy allow can bless the call: outside-boundary paths
+        # (reads included), default-deny network, ref-mutating git. Falls
+        # through with the boundary as the effective root, so the normal
+        # ladder's path rules (write-outside-repo, credential-outside-repo)
+        # also judge against the copy, not the run worktree.
+        if boundary is not None:
+            confined = self.policy_engine.confinement_deny(
+                tool_name, tool_input, boundary=boundary
+            )
+            if confined is not None:
+                return confined
         # Rung 1: deterministic policy fast path. step_id lets context-aware
         # rules (pipeline_step_only) gate in-run agents differently from the
         # operator's interactive session.

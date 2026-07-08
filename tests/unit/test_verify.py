@@ -207,7 +207,19 @@ def _confirm_stubs(monkeypatch, tmp_path, *, launch=None, observed=True):
     discarded = []
     monkeypatch.setattr(verify, "discard_disposable_copy",
                         lambda repo, c: discarded.append(c))
-    launched = {}
+    # Boundary lease seams (PR #59 B1): registration/clear against a live judge
+    # are covered by their own tests; here they are recorded for assertions.
+    leases = {"registered": [], "cleared": []}
+
+    def _register(judge_env, step_id, root):
+        leases["registered"].append((step_id, root))
+        return verify.BoundaryLease(step_id=step_id, key="k", url="http://x",
+                                    token="t", run_id="r")
+
+    monkeypatch.setattr(verify, "register_boundary", _register)
+    monkeypatch.setattr(verify, "clear_boundary",
+                        lambda lease: leases["cleared"].append(lease.step_id))
+    launched = {"leases": leases}
 
     def _default_launch(be, *, prompt, cwd, env, allowed_tools, timeout_s):
         launched.update(env=env, allowed_tools=allowed_tools, prompt=prompt, cwd=cwd)
@@ -391,6 +403,16 @@ def _stub_sandbox(monkeypatch, tmp_path):
     monkeypatch.setattr(verify, "make_disposable_copy",
                         lambda repo, **k: verify.DisposableCopy(path=copy_dir, root=copy_dir))
     monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, copy: None)
+    # Boundary lease seams (PR #59 B1): the wiring tests stand in for the live
+    # judge; the real registration/confinement path is covered by the JudgeCore
+    # unit tests and the pinned-root integration tests.
+    fake_lease = verify.BoundaryLease(step_id="verify:test", key="k",
+                                      url="http://127.0.0.1:0", token="t", run_id="r")
+    monkeypatch.setattr(verify, "register_boundary",
+                        lambda judge_env, step_id, root: fake_lease)
+    monkeypatch.setattr(verify, "confirm_boundary_enforced",
+                        lambda lease, outside_path: None)
+    monkeypatch.setattr(verify, "clear_boundary", lambda lease: None)
     return copy_dir
 
 
@@ -633,3 +655,121 @@ def test_worktree_mutation_across_verification_parks(fixture_repo, monkeypatch, 
     result, man, run_dir = _drive_single(repo, sha, adapters)
     assert result.status == M.PARKED
     assert "tree hash changed" in result.notes
+
+
+# --- PR #59 B1: verifier step id, scratch HOME, boundary lease -----------------
+def test_verifier_env_sets_own_step_id_and_scratch_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    copy = tmp_path / "copy"
+    scratch = tmp_path / "scratch-home"
+    env = verify.verifier_env(
+        _JUDGE_ENV, copy, step_id="verify:r1:abc", scratch_home=scratch,
+    )
+    # the verifier's OWN step id: boundary key + in-pipeline denies (F-003)
+    assert env["GAUNTLET_STEP_ID"] == "verify:r1:abc"
+    # scratch HOME (F-006): un-hooked subprocess children can no longer discover
+    # ~/.aws / ~/.ssh / ~/.config/gh through HOME; the claude CLI still finds
+    # its login through CLAUDE_CONFIG_DIR pinned at the REAL config dir.
+    assert env["HOME"] == str(scratch)
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "realhome" / ".claude")
+    # and the strip still holds (the run-local judge hook-infra keys are the
+    # deliberate exception — the hook cannot authenticate without them)
+    hook_infra = set(verify._JUDGE_HOOK_ENV_KEYS) | {"GAUNTLET_REPO_ROOT"}
+    assert not any(
+        verify.is_secret_key(k) for k in env if k not in hook_infra
+    )
+
+
+def test_verifier_env_respects_explicit_claude_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    env = verify.verifier_env(
+        _JUDGE_ENV, tmp_path / "copy",
+        step_id="s", scratch_home=tmp_path / "scratch",
+    )
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "cfg")  # operator's wins
+
+
+def test_register_boundary_returns_engine_held_lease(tmp_path, monkeypatch):
+    calls = {}
+
+    def _fake(url, token, body, *, clear=False):
+        calls.update(url=url, token=token, body=body, clear=clear)
+        return {"registered": True}
+
+    monkeypatch.setattr(verify, "_judge_boundary", _fake)
+    lease = verify.register_boundary(_JUDGE_ENV, "verify:r1:x", tmp_path / "copy")
+    assert calls["body"]["step_id"] == "verify:r1:x"
+    assert calls["body"]["root"] == str(tmp_path / "copy")
+    assert lease.key == calls["body"]["key"] and lease.key
+    # the lease key never enters the sandbox env — the sandboxed agent cannot
+    # clear or re-register its own boundary even though it holds the run token
+    env = verify.verifier_env(_JUDGE_ENV, tmp_path / "copy", step_id="verify:r1:x")
+    assert lease.key not in set(env.values())
+
+
+def test_register_boundary_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        verify, "_judge_boundary",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("connection refused")),
+    )
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.register_boundary(_JUDGE_ENV, "s", tmp_path)
+    # a judge that answers but does not confirm registration also parks
+    monkeypatch.setattr(verify, "_judge_boundary", lambda *a, **k: {})
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.register_boundary(_JUDGE_ENV, "s", tmp_path)
+    # and no token at all parks before any round-trip
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.register_boundary({}, "s", tmp_path)
+
+
+def test_confirm_boundary_enforced_requires_the_confinement_deny(tmp_path, monkeypatch):
+    lease = verify.BoundaryLease(step_id="s", key="k", url="http://x",
+                                 token="t", run_id="r")
+    # only the deterministic boundary deny passes
+    monkeypatch.setattr(verify, "_judge_roundtrip", lambda url, token, body: {
+        "decision": "deny", "matched_rule": "verifier-boundary-path"})
+    verify.confirm_boundary_enforced(lease, tmp_path / "outside")  # no raise
+    # an ALLOW (boundary not consulted) parks closed — the B1 failure mode
+    monkeypatch.setattr(verify, "_judge_roundtrip", lambda url, token, body: {
+        "decision": "allow", "matched_rule": "read-inspect"})
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_boundary_enforced(lease, tmp_path / "outside")
+    # a deny from some OTHER rule is not proof the boundary decided
+    monkeypatch.setattr(verify, "_judge_roundtrip", lambda url, token, body: {
+        "decision": "deny", "matched_rule": "credential-read-outside-repo"})
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_boundary_enforced(lease, tmp_path / "outside")
+    # transport failure parks closed
+    monkeypatch.setattr(
+        verify, "_judge_roundtrip",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("refused")),
+    )
+    with pytest.raises(verify.SandboxUnavailableError):
+        verify.confirm_boundary_enforced(lease, tmp_path / "outside")
+
+
+def test_boundary_registration_failure_parks_cycle(monkeypatch, tmp_path, fixture_repo):
+    """PR #59 B1 fail-closed wiring: if the disposable-copy boundary cannot be
+    registered on the run's judge, the verifier never launches and the cycle
+    parks — confinement is proven before execution, not assumed."""
+    repo, sha = _code_repo(fixture_repo)
+    _stub_sandbox(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        verify, "register_boundary",
+        lambda judge_env, step_id, root: (_ for _ in ()).throw(
+            verify.SandboxUnavailableError("no boundary")),
+    )
+    verifier = SeqAdapter(REVIEW(BEHAV("F-b1")))
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW()),
+        "verifier": verifier,
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    result, man, _run_dir = _drive_single(repo, sha, adapters)
+    assert result.status == M.PARKED
+    assert "no boundary" in result.notes
+    assert verifier.calls == []  # never launched without a registered boundary

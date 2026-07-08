@@ -40,6 +40,20 @@ class DecideResponse(BaseModel):
     matched_rule: str | None = None
 
 
+class BoundaryRequest(BaseModel):
+    """Register/clear a per-step confinement boundary (PR #59 review B1).
+
+    ``key`` is an engine-held secret minted at registration time; clearing
+    requires it, and re-registration of a bound step_id is refused — so a
+    sandboxed agent that holds the run token (its hook needs it) still cannot
+    widen or drop its own boundary."""
+
+    step_id: str
+    key: str
+    root: str | None = None  # required on register; ignored on clear
+    run_id: str | None = None
+
+
 def create_app(
     core: JudgeCore, *, token: str, expected_run_id: str | None = None
 ) -> FastAPI:
@@ -84,6 +98,38 @@ def create_app(
         _check_token(x_gauntlet_token)
         _check_run_id(run_id)
         return {"observed": bool(nonce) and core.observed_probe(nonce)}
+
+    @app.post("/boundary")
+    def register_boundary(
+        req: BoundaryRequest,
+        x_gauntlet_token: str | None = Header(default=None, alias=TOKEN_HEADER),
+    ) -> dict[str, bool]:
+        # Engine-only in effect: token+run authed like /decide, one-shot per
+        # step_id (first write wins), keyed clear. See BoundaryRequest.
+        _check_token(x_gauntlet_token)
+        _check_run_id(req.run_id)
+        if not req.root:
+            raise HTTPException(status_code=422, detail="root is required")
+        ok = core.register_boundary(req.step_id, Path(req.root), req.key)
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail="step_id already bound to a different boundary",
+            )
+        return {"registered": True}
+
+    @app.post("/boundary/clear")
+    def clear_boundary(
+        req: BoundaryRequest,
+        x_gauntlet_token: str | None = Header(default=None, alias=TOKEN_HEADER),
+    ) -> dict[str, bool]:
+        _check_token(x_gauntlet_token)
+        _check_run_id(req.run_id)
+        if not core.clear_boundary(req.step_id, req.key):
+            raise HTTPException(
+                status_code=403, detail="unknown step_id or wrong key"
+            )
+        return {"cleared": True}
 
     @app.post("/decide", response_model=DecideResponse)
     def decide(

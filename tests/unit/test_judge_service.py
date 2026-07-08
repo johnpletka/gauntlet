@@ -127,3 +127,51 @@ def test_observed_rejects_wrong_run(bound_client):
         "/observed", params={"run_id": "other-run", "nonce": "n1"},
         headers={"X-Gauntlet-Token": TOKEN})
     assert resp.status_code == 403
+
+
+# --- /boundary registration endpoints (PR #59 review B1) ----------------------
+def _hdr(token=TOKEN):
+    return {"X-Gauntlet-Token": token}
+
+
+def test_boundary_requires_token(client, tmp_path):
+    body = {"step_id": "verify:r1:x", "root": str(tmp_path), "key": "k"}
+    assert client.post("/boundary", json=body).status_code == 401
+    assert client.post(
+        "/boundary", headers=_hdr("wrong"), json=body
+    ).status_code == 401
+
+
+def test_boundary_register_confine_and_keyed_clear(client, tmp_path):
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    body = {"step_id": "verify:r1:x", "root": str(copy), "key": "k1"}
+    assert client.post("/boundary", headers=_hdr(), json=body).status_code == 200
+    # the registered boundary confines /decide for that step id
+    d = client.post("/decide", headers=_hdr(), json={
+        "tool_name": "Read", "tool_input": {"file_path": str(outside)},
+        "repo_root": str(tmp_path), "step_id": "verify:r1:x",
+    }).json()
+    assert d["decision"] == "deny"
+    assert d["matched_rule"] == "verifier-boundary-path"
+    # one-shot: re-registering a bound step_id to a different root is a 409
+    conflict = {"step_id": "verify:r1:x", "root": str(tmp_path), "key": "k2"}
+    assert client.post("/boundary", headers=_hdr(), json=conflict).status_code == 409
+    # clear requires the registration key
+    wrong = {"step_id": "verify:r1:x", "key": "nope"}
+    assert client.post("/boundary/clear", headers=_hdr(), json=wrong).status_code == 403
+    ok = {"step_id": "verify:r1:x", "key": "k1"}
+    assert client.post("/boundary/clear", headers=_hdr(), json=ok).status_code == 200
+    # cleared: the same outside read is no longer boundary-confined
+    d2 = client.post("/decide", headers=_hdr(), json={
+        "tool_name": "Read", "tool_input": {"file_path": str(outside)},
+        "repo_root": str(tmp_path), "step_id": "verify:r1:x",
+    }).json()
+    assert d2.get("matched_rule") != "verifier-boundary-path"
+
+
+def test_boundary_register_requires_root(client):
+    body = {"step_id": "verify:r1:x", "key": "k"}
+    assert client.post("/boundary", headers=_hdr(), json=body).status_code == 422

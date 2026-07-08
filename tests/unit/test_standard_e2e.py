@@ -193,6 +193,16 @@ def _stub_sandbox(monkeypatch, tmp_path):
         lambda backend, collector, *, worktree, judge_env, **k:
         collector.enumerate(worktree=worktree, judge_env={}),
     )
+    # Boundary lease seams (PR #59 B1): no live judge in the offline e2e; the
+    # real registration/confinement path has its own unit + integration tests.
+    monkeypatch.setattr(
+        verify, "register_boundary",
+        lambda judge_env, step_id, root: verify.BoundaryLease(
+            step_id=step_id, key="k", url="http://x", token="t", run_id="r"),
+    )
+    monkeypatch.setattr(verify, "confirm_boundary_enforced",
+                        lambda lease, outside_path: None)
+    monkeypatch.setattr(verify, "clear_boundary", lambda lease: None)
 
 
 def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
