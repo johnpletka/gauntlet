@@ -2206,7 +2206,7 @@
     {
       "id": "impl-cycle",
       "type": "adversarial_cycle",
-      "status": "failed",
+      "status": "running",
       "agent": null,
       "session_id": "019f3eff-eb26-76b0-9145-dd4385cf704a",
       "started": "2026-07-07T23:53:06.930247+00:00",
