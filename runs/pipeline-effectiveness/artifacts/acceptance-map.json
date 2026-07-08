@@ -33,7 +33,7 @@
       "text": "A pre-migration confirm output (no new_findings) still validates.",
       "evidence": [
         { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_empty_new_findings_still_validates" },
-        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_new_findings_item_lists_carried_from_required_nullable" },
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_new_findings_item_carried_from_is_optional_nullable" },
         { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_diff_regression_entry_with_null_carried_from_validates" }
       ]
     },

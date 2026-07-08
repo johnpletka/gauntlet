@@ -43,12 +43,20 @@ def test_standard_stage_and_step_shape():
     phases = [st.id for st in by_id["phases"].steps]
     assert phases == [
         "implement", "tests", "phase-commit", "acceptance-gate", "impl-cycle",
+        "acceptance-recheck",
     ]
     # FR-3.2: the deterministic completeness gate runs after commit, before the
     # reviewer cycle, and names its single collector (v1: pytest).
     ag = by_id["phases"].steps[3]
     assert ag.type == "acceptance_gate"
     assert ag.get("collector") == "pytest"
+    # PR #59 review F1/F2: the SAME deterministic check re-runs after the cycle,
+    # so a fix round that renames a cited test (or defers work in a P<N>.x
+    # commit body) is re-verified against the tree the phase actually ships.
+    recheck = by_id["phases"].steps[5]
+    assert recheck.type == "acceptance_gate"
+    assert recheck.get("collector") == "pytest"
+    assert recheck.get("map") == ag.get("map")
     assert by_id["phases"].foreach == "plan.phases"
     assert [st.id for st in by_id["retro"].steps] == ["retrospective"]
 

@@ -69,6 +69,16 @@ def test_cycle_fix_has_enumerated_obligation_checklist():
     assert "deferral" in text.lower()  # state deferrals explicitly, not silently drop
 
 
+# --- W3 (PR #59 review F1): fixer keeps the acceptance map current -----------
+def test_cycle_fix_obliges_acceptance_map_update_on_test_rename():
+    # A fix that renames/moves a cited test must update the acceptance map in
+    # the same fix — the post-cycle acceptance-recheck parks on stale citations.
+    text = _read("cycle-fix.md")
+    assert "acceptance-map.json" in text
+    assert "rename" in text.lower()
+    assert "FR-3.2" in text
+
+
 # --- FR-6.3: untestable-oracle rule in review + triage prompts ---------------
 def test_review_prompts_have_untestable_oracle_rule():
     for name in ("review-code.md", "review-document.md"):

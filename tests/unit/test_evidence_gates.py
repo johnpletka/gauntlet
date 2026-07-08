@@ -146,6 +146,39 @@ def test_phase_commit_is_not_stale_evidence():
     assert d.clean is True
 
 
+def test_post_cycle_recheck_absolves_stale_pre_cycle_acceptance():
+    # W3 (review F1): with the shipped acceptance-recheck AFTER the cycle, a fix
+    # commit no longer stales the acceptance signal — the recheck re-proved
+    # citation+existence against the fixed tree. The tests signal (no post-cycle
+    # shell in this stage) is still stale and still parks.
+    stage = """
+name: demo
+version: 1
+stages:
+  - id: phases
+    foreach: vars.phases
+    steps:
+      - {id: tests, type: shell, run: "true"}
+      - {id: acceptance-gate, type: acceptance_gate, collector: pytest}
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewers: [{profile: reviewer, lens: correctness}],
+         triager: triage, fixer: builder, verifier: verifier, max_rounds: 2}
+      - {id: acceptance-recheck, type: acceptance_gate, collector: pytest}
+      - {id: gate, type: human_gate, policy: auto_when_clean,
+         show: [findings.json]}
+"""
+    man = _seed_clean_manifest()
+    man.upsert(StepRecord(
+        id="acceptance-recheck", type="acceptance_gate", status=M.DONE,
+        iteration="0",
+    ))
+    man.commits.append(CommitRecord(step_id="impl-cycle", phase="P1.1", sha="a" * 40))
+    d = _evaluate(man, _pipeline(stage), phase="P1")
+    stale = [m for m in d.misses if "evidence is stale" in m]
+    assert len(stale) == 1 and "tests" in stale[0]
+    assert not any("acceptance gate" in m for m in stale)
+
+
 def test_fix_commit_prefix_does_not_alias_phases():
     # "P10.1" must not stale a P1 gate (prefix check is "P1.", not "P1").
     man = _seed_clean_manifest()

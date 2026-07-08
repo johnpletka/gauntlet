@@ -16,6 +16,10 @@ Apply them to the repository:
   silent-partial failure this rule exists to prevent (issue #49).
 - Where a finding implies a missing test case, extend the tests. The suite
   only grows; never delete or skip a passing test to make a fix land.
+- **If a fix renames, moves, or splits a test cited in this phase's acceptance
+  map** (`artifacts/acceptance-map.json`), update the map's evidence ids in the
+  same fix — the post-cycle acceptance re-check verifies every cited node id
+  still exists, and a stale citation parks the phase (FR-3.2).
 - Run the tests; everything green before you finish.
 - Do NOT commit — the engine creates the fix-round commit and its audit-trail
   body (FR-9.4).

@@ -343,9 +343,15 @@ def evaluate_clean_gate(
             default=-1,
         )
         for rec_list, label in ((shells, "tests"), (acceptance, "acceptance gate")):
-            for rec in rec_list:
-                if rec.status != M.DONE or rec.id not in ids:
-                    continue  # non-DONE records already missed above
+            done = [r for r in rec_list if r.status == M.DONE and r.id in ids]
+            # A DONE record of the same type positioned AFTER the cycle re-proved
+            # the signal against the fixed tree (the shipped acceptance-recheck):
+            # it absolves the type's pre-cycle records — the conjunct is about
+            # whether the signal holds for the approved tree, not which step
+            # instance proved it.
+            if any(ids.index(r.id) > cycle_pos for r in done):
+                continue
+            for rec in done:
                 if ids.index(rec.id) < cycle_pos:
                     misses.append(
                         f"{label} step {rec.id!r} ran before the cycle, and the "

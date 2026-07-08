@@ -132,6 +132,19 @@ stages:
          verifier: verifier,
          escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-code.md}
+      # Post-cycle re-check (PR #59 review F1): the pre-cycle acceptance gate's
+      # guarantee decays the moment a fix round touches a cited test — a P<N>.x
+      # commit can rename/remove a mapped node id AFTER the gate blessed the map
+      # (this run's own P9 artifact shipped exactly that staleness). The same
+      # deterministic check re-runs here so citation+existence holds for the
+      # tree the phase actually ships, and deferral reconciliation now sees the
+      # fix commits' bodies too (review F2 — the handler always collected P<N>.x
+      # bodies; it just never ran after they existed). This instance satisfies
+      # the FR-4.1 evidence-freshness conjunct for the acceptance signal when
+      # fix commits landed. cycle-fix.md obliges the fixer to update the map in
+      # the same fix commit when a fix renames/moves a cited test.
+      - {id: acceptance-recheck, type: acceptance_gate, collector: pytest,
+         map: artifacts/acceptance-map.json}
 
   # --- retrospective + governed self-improvement (FR-6.2/6.3; active in P7) --
   # Each agent self-critiques the run; the cheap `proposer` synthesises feedback
