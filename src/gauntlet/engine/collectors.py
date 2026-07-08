@@ -13,28 +13,36 @@ registry *namespace* exists so a future collector plugin can widen the enum, but
 a ``kind`` with no registered collector is **schema-invalid / load-rejected**,
 never a runtime surprise (there is no declare-but-unimplemented path in v1).
 
-Collector-execution threat model + P2-P4 interim posture (plan P2, review F-002).
-``pytest --collect-only`` is **not** inert: pytest collection imports
-``conftest.py`` and every test module from the branch under review, so it
-*executes branch-authored code at import time*. The P5 verifier sandbox is the
-isolation backend for branch-code execution and does not exist until P5, so P2
-must not run collection wide-open in the interim. Until the P5 migration, every
-enumeration runs under a **fail-closed interim mitigation**:
+Collector-execution threat model + posture (PR #59 review F3/F4, superseding
+the P2-P4 interim posture and the P5 LLM-mediated migration). ``pytest
+--collect-only`` is **not** inert: collection imports ``conftest.py`` and every
+test module from the branch under review, so it *executes branch-authored code
+at import time*. Enumeration therefore runs as a **bounded engine subprocess in
+a DISPOSABLE COPY of the worktree** — deterministic (no LLM anywhere in the
+evidence path: the P5 design routed stdout through a claude turn asked to echo
+it "byte for byte", which could both truncate a large id list into a chronic
+false park and fabricate ids into a false pass) — with:
 
-* a **bounded child subprocess** (never an in-process import — that would run the
-  branch's ``conftest``/test modules inside the engine process);
-* under the run's **active judge ``PreToolUse`` hooks** — the ``GAUNTLET_JUDGE_*``
-  env is forwarded to the child, so any tool call the enumeration itself spawns is
-  gated by the same judge protecting every other engine-driven command in this run;
-* with its **working directory scoped to the run worktree**;
-* under a **wall-clock timeout and a process resource limit**.
+* a **stripped environment** (the verifier's allowlist rebuild — no secrets,
+  no judge vars; the child needs no hook because it is not an agent);
+* its **working directory scoped to the disposable copy**, so import-time
+  filesystem side effects land in a tree that is discarded;
+* a **wall-clock timeout and best-effort resource limits** (rlimit CPU/AS).
+
+Residual (documented, PRD v0.4 §7): an engine subprocess is not hook-gated, so
+import-time network egress by branch conftest code is bounded only by the strip
++ copy + rlimits — the same subprocess-boundary residual the verifier's forked
+children carry.
+
+The enumeration **command** is resolved per project (:func:`resolve_command`,
+review F4): an explicit ``collectors.<kind>.command`` config wins; else a
+pytest-based ``test_command`` (e.g. ``uv run pytest``) supplies the project's
+own test environment; else the engine interpreter (which requires pytest
+importable there — gauntlet's own dev layout, not a pipx install).
 
 A non-zero collector exit, a timeout, or an unparseable/empty enumeration
 **fails closed** (:class:`CollectorEnumerationError`) — an absent or failed
 enumeration is *never* treated as "every cited id exists / all clauses mapped".
-The P5 migration moves this enumeration *inside* the verifier sandbox backend
-(plan P5, review F-002); the interim judge-hooked subprocess is the compensating
-control until it lands.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
@@ -83,17 +92,21 @@ class CollectorEnumerationError(CollectorError):
 
 
 def _enumeration_env(judge_env: dict[str, str]) -> dict[str, str]:
-    """Child env for the interim posture: inherit the parent env + the run's
-    judge ``GAUNTLET_JUDGE_*`` vars, so the enumeration subprocess runs under the
-    same active judge hooks as every other engine-driven command (plan P2).
+    """Child env for enumeration: the verifier's STRIPPED allowlist rebuild
+    (PR #59 review F3 — previously this merged the engine's whole ``os.environ``
+    plus the judge vars, handing every credential-shaped var to branch-authored
+    conftest code at import time). No judge vars either: the child is an engine
+    subprocess, not an agent — there is no hook to authenticate.
 
-    ``PYTHONDONTWRITEBYTECODE=1`` keeps enumeration **filesystem-side-effect-free**:
-    pytest collection imports every test module, which would otherwise write
-    ``__pycache__/*.pyc`` into the worktree and dirty the tree the gate runs on —
-    breaking the clean-handoff invariant (FR-9.3) before the review cycle. A
-    side-effect-free enumeration must not mutate the worktree it inspects.
+    ``PYTHONDONTWRITEBYTECODE=1`` (set by the rebuild) keeps enumeration
+    filesystem-side-effect-lean; import-time writes that do happen land in the
+    disposable copy the gate runs it in, never the run worktree. ``judge_env``
+    is accepted for call-site compatibility and deliberately unused.
     """
-    return {**os.environ, **(judge_env or {}), "PYTHONDONTWRITEBYTECODE": "1"}
+    from gauntlet.engine.verify import build_sandbox_env
+
+    del judge_env  # engine subprocess: stripped env, no hook, no judge vars
+    return build_sandbox_env()
 
 
 def _rlimit_preexec(mem_bytes: int, cpu_seconds: int) -> Callable[[], None]:
@@ -197,15 +210,19 @@ class Collector:
         judge_env: dict[str, str],
         timeout_s: float = DEFAULT_ENUMERATION_TIMEOUT_S,
         mem_bytes: int = DEFAULT_ENUMERATION_MEM_BYTES,
+        command: tuple[str, ...] | None = None,
     ) -> set[str]:
-        """Enumerate this collector's ids under the interim posture.
+        """Enumerate this collector's ids as a bounded engine subprocess.
 
-        Raises :class:`CollectorEnumerationError` on a failed/timed-out run OR on
-        an empty/unparseable enumeration (fail closed — a clean exit that yields
-        no parseable ids is not "there are no ids", it is "we could not read them").
+        ``command`` overrides the registry default with the project-resolved
+        command (:func:`resolve_command`); ``worktree`` should be the disposable
+        copy the gate created. Raises :class:`CollectorEnumerationError` on a
+        failed/timed-out run OR on an empty/unparseable enumeration (fail
+        closed — a clean exit that yields no parseable ids is not "there are no
+        ids", it is "we could not read them").
         """
         stdout = run_bounded_enumeration(
-            list(self.command),
+            list(command or self.command),
             worktree=worktree,
             judge_env=judge_env,
             timeout_s=timeout_s,
@@ -237,6 +254,44 @@ COLLECTORS: dict[str, Collector] = {
 # The closed set of registered collector kinds — the single source the schema
 # enum, the pipeline-load validator, and the gate all consult.
 REGISTERED_KINDS: tuple[str, ...] = tuple(sorted(COLLECTORS))
+
+
+# Flags every pytest-shaped enumeration appends: flat one-per-line node ids,
+# no cache-write side effect.
+_PYTEST_COLLECT_FLAGS: tuple[str, ...] = (
+    "--collect-only", "-q", "-p", "no:cacheprovider",
+)
+
+
+def resolve_command(collector: Collector, config) -> tuple[str, ...]:
+    """The enumeration command for THIS project (PR #59 review F4).
+
+    Resolution order, all engine/operator-owned (never agent-authored):
+
+    1. An explicit ``collectors.<kind>.command`` in the run config — the
+       operator's word, taken verbatim (string → shlex-split).
+    2. For ``pytest``: derive from the project's ``test_command`` when it is
+       pytest-shaped (``uv run pytest`` → ``uv run pytest --collect-only …``),
+       so enumeration runs in the SAME environment the tests do. The previous
+       hard-coded ``sys.executable -m pytest`` used the *engine's* interpreter:
+       pytest is not a runtime dependency of gauntlet, so every pipx/uv-tool
+       install — every adopter repo — parked the gate with ``No module named
+       pytest``.
+    3. The registry default (engine interpreter) — correct for gauntlet's own
+       dev layout, where the engine runs from the repo venv.
+    """
+    entries = getattr(config, "collectors", None) or {}
+    entry = entries.get(collector.kind) if isinstance(entries, dict) else None
+    override = getattr(entry, "command", None) if entry is not None else None
+    if override:
+        parts = shlex.split(override) if isinstance(override, str) else list(override)
+        if parts:
+            return tuple(parts)
+    if collector.kind == "pytest":
+        test_command = getattr(config, "test_command", None) or ""
+        if re.search(r"\bpytest\b", test_command):
+            return tuple(shlex.split(test_command)) + _PYTEST_COLLECT_FLAGS
+    return collector.command
 
 
 def is_registered(kind: str) -> bool:

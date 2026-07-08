@@ -468,6 +468,19 @@ class ReviewConfig(BaseModel):
     state_dir: str | None = None
 
 
+class CollectorConfig(BaseModel):
+    """Per-collector enumeration overrides (FR-3.2, PR #59 review F4).
+
+    ``command`` replaces the collector's derived/default enumeration command
+    verbatim (string → shlex-split; list taken as argv). Operator-owned config —
+    the acceptance gate never interpolates agent-authored text into it.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    command: str | list[str] | None = None
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -497,6 +510,11 @@ class RunConfig(BaseModel):
     # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
     asset_root: str = "."
     test_command: str = "uv run pytest"
+    # Per-collector enumeration command overrides (FR-3.2, PR #59 review F4):
+    # `collectors: {pytest: {command: "hatch run pytest"}}`. Absent, the pytest
+    # collector derives its command from `test_command` so enumeration runs in
+    # the project's own test environment (collectors.resolve_command).
+    collectors: dict[str, CollectorConfig] = Field(default_factory=dict)
     agents: dict[str, AgentProfile] = Field(default_factory=dict)
     identities: dict[str, Identity] = Field(default_factory=dict)
 

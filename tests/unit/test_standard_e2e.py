@@ -185,14 +185,23 @@ def _stub_sandbox(monkeypatch, tmp_path):
     fake = verify.SandboxBackend(claude_path="claude")
     monkeypatch.setattr(verify, "detect_backend", lambda judge_env: fake)
     monkeypatch.setattr(verify, "probe_backend", lambda judge_env, **k: fake)
+    # The stubbed "copy" points at the real toy worktree: the offline e2e runs
+    # the REAL collector (and the fake verifier adapter ignores cwd), so the
+    # acceptance gates enumerate the toy repo's genuine node ids. True
+    # copy-isolation is integration-tested; here the copy machinery is faked
+    # like the CLIs are.
     monkeypatch.setattr(verify, "make_disposable_copy",
-                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+                        lambda repo, **k: verify.DisposableCopy(path=repo, root=copy))
     monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
-    monkeypatch.setattr(
-        verify, "enumerate_in_sandbox",
-        lambda backend, collector, *, worktree, judge_env, **k:
-        collector.enumerate(worktree=worktree, judge_env={}),
-    )
+    # Enumeration (PR #59 F3/F4): the gate now runs the collector as an engine
+    # subprocess in a disposable copy. The toy repo has no uv project, so pin
+    # the registry default (engine interpreter, which has pytest here) instead
+    # of deriving from test_command, and let the REAL collector run in the REAL
+    # disposable copy of the toy repo — genuine end-to-end enumeration.
+    from gauntlet.engine import steptypes as _steptypes
+
+    monkeypatch.setattr(_steptypes, "resolve_command",
+                        lambda collector, config: collector.command)
     # Boundary lease seams (PR #59 B1): no live judge in the offline e2e; the
     # real registration/confinement path has its own unit + integration tests.
     monkeypatch.setattr(

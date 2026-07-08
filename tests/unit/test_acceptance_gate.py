@@ -98,20 +98,24 @@ def _gate_step(**kw):
                                 "collector": "pytest", **kw})
 
 
-# The P5 migration (review F-002 / P5-A7) runs collector enumeration INSIDE the
-# claude-code sandbox backend. These helpers let the gate's enumeration path be
-# exercised on a host without a claude+judge backend: `_stub_backend` satisfies
-# the fail-closed backend probe, and each test stubs `verify.enumerate_in_sandbox`
-# (the P5 backend seam the gate now calls) with the enumeration result it needs.
+# Enumeration runs as an engine subprocess in a disposable copy (PR #59 F3/F7).
+# These helpers let the gate's enumeration path be exercised without a real git
+# worktree copy or a real pytest run: the copy machinery is stubbed and
+# `Collector.enumerate` returns the scripted id set (its own subprocess behavior
+# has dedicated tests below and in test_deferrals).
 def _stub_backend(monkeypatch):
-    monkeypatch.setattr(verify, "detect_backend",
-                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
+    copy = verify.DisposableCopy(path=Path("/nonexistent-copy"),
+                                 root=Path("/nonexistent-copy"))
+    monkeypatch.setattr(verify, "make_disposable_copy", lambda repo, **k: copy)
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
 
 
 def _stub_enumeration(monkeypatch, ids):
     _stub_backend(monkeypatch)
-    monkeypatch.setattr(verify, "enumerate_in_sandbox",
-                        lambda backend, collector, **k: set(ids))
+    from gauntlet.engine.collectors import Collector
+
+    monkeypatch.setattr(Collector, "enumerate",
+                        lambda self, **k: set(ids), raising=True)
 
 
 # --- FR-3.1: phase_lint requires a well-formed acceptance list (P2-A1) --------
@@ -297,10 +301,10 @@ def test_enumeration_failure_parks_closed(fixture_repo, monkeypatch):
     _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
     _stub_backend(monkeypatch)
 
-    def _boom(*a, **k):
+    def _boom(self, **k):
         raise CollectorEnumerationError("collector enumeration exited 2 (fail closed)")
 
-    monkeypatch.setattr(verify, "enumerate_in_sandbox", _boom)
+    monkeypatch.setattr(collectors.Collector, "enumerate", _boom)
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == HALTED
     assert "enumeration failed" in result.notes and "fail closed" in result.notes
@@ -330,9 +334,11 @@ def test_run_bounded_enumeration_timeout_fails_closed(monkeypatch, tmp_path):
                                 judge_env={}, timeout_s=1)
 
 
-def test_enumeration_runs_under_bounded_judge_hooked_subprocess(monkeypatch, tmp_path):
-    """P2-A6: enumeration is spawned as a bounded child subprocess under the run's
-    judge hooks, cwd scoped to the run worktree, with a resource limit applied."""
+def test_enumeration_runs_as_bounded_stripped_subprocess(monkeypatch, tmp_path):
+    """PR #59 F3: enumeration is spawned as a bounded engine subprocess with the
+    verifier's STRIPPED env (no secrets, no judge vars — branch conftest code
+    executes at import time), cwd scoped to the caller-provided (disposable-copy)
+    worktree, with a resource limit applied."""
     captured = {}
 
     class _Proc:
@@ -346,17 +352,22 @@ def test_enumeration_runs_under_bounded_judge_hooked_subprocess(monkeypatch, tmp
         return _Proc()
 
     monkeypatch.setattr(collectors.subprocess, "run", _fake_run)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-reach-conftest")
     judge = {"GAUNTLET_JUDGE_TOKEN": "tok", "GAUNTLET_JUDGE_MODE": "unattended"}
     out = run_bounded_enumeration([sys.executable, "-m", "pytest"], worktree=tmp_path,
                                   judge_env=judge, timeout_s=90.0)
     assert out == "tests/unit/x.py::t\n"
-    # working directory scoped to the run worktree
+    # working directory scoped to the (disposable-copy) worktree
     assert captured["cwd"] == str(tmp_path)
     # a wall-clock bound is armed
     assert captured["timeout"] == 90.0
-    # the run's judge PreToolUse env is forwarded to the child (judge-hooked)
-    assert captured["env"]["GAUNTLET_JUDGE_TOKEN"] == "tok"
-    assert captured["env"]["GAUNTLET_JUDGE_MODE"] == "unattended"
+    # STRIPPED env: no secrets, and no judge vars either — the child is an
+    # engine subprocess, not an agent; there is no hook to authenticate
+    # (previously the whole engine os.environ + judge env was forwarded,
+    # handing credential-shaped vars to branch import-time code)
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "GAUNTLET_JUDGE_TOKEN" not in captured["env"]
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     # a process resource limit is applied on POSIX (preexec_fn set)
     if collectors._POSIX:
         assert captured["preexec_fn"] is not None
@@ -402,127 +413,104 @@ def test_empty_enumeration_fails_closed(monkeypatch, tmp_path):
         collectors.get_collector("pytest").enumerate(worktree=tmp_path, judge_env={})
 
 
-# --- P5-A7: collector enumeration migrated into the sandbox backend ----------
-def test_gate_parks_when_no_sandbox_backend(fixture_repo, monkeypatch):
-    """P5-A7: with no usable/hook-confirmed sandbox backend the gate parks closed —
-    collector enumeration (which imports branch conftest/test code at collection)
-    never runs unhooked, and an absent backend is never read as 'all mapped'."""
+# --- PR #59 F3/F4/F7: deterministic, project-resolved enumeration in a copy ---
+def test_gate_enumerates_in_a_disposable_copy(fixture_repo, monkeypatch):
+    """PR #59 F3: the gate creates a disposable copy, enumerates THERE (branch
+    conftest import-time effects land in a discarded tree), and always discards
+    the copy — no agent, no judge, fully deterministic."""
     ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
     _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
-    monkeypatch.setattr(verify, "detect_backend", lambda judge_env: None)
+    copy = verify.DisposableCopy(path=Path("/copy-path"), root=Path("/copy-path"))
+    events = []
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: events.append("made") or copy)
+    monkeypatch.setattr(verify, "discard_disposable_copy",
+                        lambda repo, c: events.append("discarded"))
+    seen = {}
+
+    def _enum(self, *, worktree, judge_env, command=None, **k):
+        seen.update(worktree=worktree, judge_env=judge_env, command=command)
+        return {"tests/unit/x.py::t"}
+
+    monkeypatch.setattr(collectors.Collector, "enumerate", _enum)
+    result = handle_acceptance_gate(_gate_step(), ctx)
+    assert result.status == DONE
+    assert seen["worktree"] == copy.path          # enumerated IN the copy
+    assert seen["judge_env"] == {}                # engine subprocess: no judge env
+    assert seen["command"]                        # project-resolved command passed
+    assert events == ["made", "discarded"]        # copy always torn down
+
+
+def test_gate_parks_when_copy_cannot_be_created(fixture_repo, monkeypatch):
+    """Fail closed: an absent disposable copy parks the gate — enumeration never
+    runs against the real worktree as a fallback."""
+    ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
+    _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
+
+    def _no_copy(repo, **k):
+        raise verify.CopyCreationError("mkdtemp failed")
+
+    monkeypatch.setattr(verify, "make_disposable_copy", _no_copy)
     monkeypatch.setattr(
-        verify, "enumerate_in_sandbox",
-        lambda *a, **k: pytest.fail("enumeration must not run without a backend"),
+        collectors.Collector, "enumerate",
+        lambda self, **k: pytest.fail("enumeration must not run without a copy"),
     )
     result = handle_acceptance_gate(_gate_step(), ctx)
     assert result.status == HALTED
     assert result.halt_reason == HALT_REASON_PRECONDITION
-    assert "no usable sandbox backend" in result.notes
+    assert "disposable" in result.notes and "fail closed" in result.notes
 
 
-class _FakeCollector:
-    """A collector stand-in exposing the engine-owned ``command``/``parse`` the P5
-    backend-routed enumeration uses (review F-002)."""
-
-    kind = "pytest"
-    command = ("pytest", "--collect-only", "-q")
-
-    def parse(self, stdout):
-        return {ln.strip() for ln in stdout.splitlines() if ln.strip()}
-
-
-def _marker_result(stdout: str):
-    """A fake backend AgentResult wrapping ``stdout`` in the engine collect markers."""
-    from gauntlet.adapters.base import AgentResult
-
-    return AgentResult(
-        text=f"{verify._COLLECT_BEGIN}\n{stdout}\n{verify._COLLECT_END}", exit_code=0
-    )
-
-
-def test_enumerate_in_sandbox_runs_collector_in_disposable_copy(monkeypatch, tmp_path):
-    """P5-A7 (migration): enumeration runs INSIDE the backend — through the
-    claude-code judge-hooked Bash tool, in a disposable COPY of the run worktree
-    (not the real worktree / interim bare subprocess), confined to Bash only with
-    the judge repo-root pointed at the copy so the hook gates the collection."""
-    copy = tmp_path / "wt-copy"
-    copy.mkdir()
-    monkeypatch.setattr(verify, "make_disposable_copy",
-                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
+def test_gate_discards_copy_even_when_enumeration_fails(fixture_repo, monkeypatch):
+    ctx = _ctx(fixture_repo, iteration_item=_phase(["P2-A1"]))
+    _write_map(ctx, {"P2-A1": [{"kind": "pytest", "id": "tests/unit/x.py::t"}]})
+    copy = verify.DisposableCopy(path=Path("/copy-path"), root=Path("/copy-path"))
     discarded = {}
-    monkeypatch.setattr(verify, "discard_disposable_copy",
-                        lambda repo, c: discarded.setdefault("path", c.path))
-    seen = {}
-
-    def _fake_launch(backend, *, prompt, cwd, env, allowed_tools, timeout_s):
-        seen.update(cwd=cwd, env=env, allowed_tools=allowed_tools, prompt=prompt)
-        return _marker_result("tests/unit/x.py::t")
-
-    monkeypatch.setattr(verify, "_run_backend_bash", _fake_launch)
-
-    backend = verify.SandboxBackend(claude_path="claude")
-    real_worktree = tmp_path / "real"
-    real_worktree.mkdir()
-    ids = verify.enumerate_in_sandbox(
-        backend, _FakeCollector(), worktree=real_worktree,
-        judge_env={"GAUNTLET_JUDGE_TOKEN": "tok"},
-    )
-    assert ids == {"tests/unit/x.py::t"}
-    # collection ran through the backend, in the COPY, not the real worktree
-    assert seen["cwd"] == copy
-    assert seen["cwd"] != real_worktree
-    # Bash-only tool allowlist, and the judge repo-root pointed at the copy
-    assert list(seen["allowed_tools"]) == ["Bash"]
-    assert seen["env"][verify.REPO_ROOT_ENV_VAR] == str(copy)
-    # the engine-owned collector command was handed to the backend to run
-    assert "pytest --collect-only" in seen["prompt"]
-    # the copy is always torn down
-    assert discarded["path"] == copy
-
-
-def test_enumerate_in_sandbox_fails_closed_and_discards_copy(monkeypatch, tmp_path):
-    """P5-A7: a failed enumeration inside the backend (any launch/run fault)
-    propagates CollectorEnumerationError (fail-closed park preserved) AND still
-    discards the disposable copy."""
-    from gauntlet.adapters.base import AdapterError
-
-    copy = tmp_path / "wt-copy"
-    copy.mkdir()
-    monkeypatch.setattr(verify, "make_disposable_copy",
-                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
-    discarded = {}
+    monkeypatch.setattr(verify, "make_disposable_copy", lambda repo, **k: copy)
     monkeypatch.setattr(verify, "discard_disposable_copy",
                         lambda repo, c: discarded.setdefault("done", True))
 
-    def _boom_launch(backend, **k):
-        raise AdapterError("claude backend failed to launch")
+    def _boom(self, **k):
+        raise CollectorEnumerationError("collection blew up (fail closed)")
 
-    monkeypatch.setattr(verify, "_run_backend_bash", _boom_launch)
-
-    backend = verify.SandboxBackend(claude_path="claude")
-    with pytest.raises(CollectorEnumerationError, match="fail closed"):
-        verify.enumerate_in_sandbox(backend, _FakeCollector(), worktree=tmp_path,
-                                    judge_env={})
-    assert discarded.get("done") is True  # copy torn down even on failure
+    monkeypatch.setattr(collectors.Collector, "enumerate", _boom)
+    result = handle_acceptance_gate(_gate_step(), ctx)
+    assert result.status == HALTED
+    assert discarded.get("done") is True
 
 
-def test_enumerate_in_sandbox_parks_on_missing_markers(monkeypatch, tmp_path):
-    """P5-A7 / F-002: a backend turn that omits the engine collect markers (garbled
-    or empty output) fails closed — an unreadable enumeration is never read as 'no
-    ids' or 'all mapped', it parks."""
-    from gauntlet.adapters.base import AgentResult
+# --- PR #59 F4: the enumeration command is resolved per project ---------------
+def _cfg(**kw):
+    from gauntlet.engine.config import RunConfig
 
-    copy = tmp_path / "wt-copy"
-    copy.mkdir()
-    monkeypatch.setattr(verify, "make_disposable_copy",
-                        lambda repo, **k: verify.DisposableCopy(path=copy, root=copy))
-    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
-    monkeypatch.setattr(verify, "_run_backend_bash",
-                        lambda backend, **k: AgentResult(text="I ran it; looks fine.", exit_code=0))
+    return RunConfig.model_validate(kw)
 
-    with pytest.raises(CollectorEnumerationError, match="marker"):
-        verify.enumerate_in_sandbox(verify.SandboxBackend(claude_path="claude"),
-                                    _FakeCollector(), worktree=tmp_path, judge_env={})
+
+def test_resolve_command_prefers_config_override():
+    collector = collectors.get_collector("pytest")
+    cfg = _cfg(collectors={"pytest": {"command": "hatch run pytest --collect-only -q"}})
+    assert collectors.resolve_command(collector, cfg) == (
+        "hatch", "run", "pytest", "--collect-only", "-q")
+    cfg_list = _cfg(collectors={"pytest": {"command": ["tox", "-e", "collect"]}})
+    assert collectors.resolve_command(collector, cfg_list) == ("tox", "-e", "collect")
+
+
+def test_resolve_command_derives_from_pytest_shaped_test_command():
+    """PR #59 F4: gauntlet's runtime deps do not include pytest, so the previous
+    hard-coded `sys.executable -m pytest` parked every pipx/uv-tool install and
+    every adopter repo. A pytest-shaped test_command supplies the project's OWN
+    test environment."""
+    collector = collectors.get_collector("pytest")
+    cfg = _cfg(test_command="uv run pytest")
+    assert collectors.resolve_command(collector, cfg) == (
+        "uv", "run", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider")
+
+
+def test_resolve_command_falls_back_when_test_command_is_not_pytest():
+    collector = collectors.get_collector("pytest")
+    cfg = _cfg(test_command="make test")
+    assert collectors.resolve_command(collector, cfg) == collector.command
+    assert collectors.resolve_command(collector, _cfg()) != collector.command  # default derives
 
 
 # --- FR-3.2: unregistered collector rejected at pipeline LOAD (P2-A5) ---------

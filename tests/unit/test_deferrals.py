@@ -222,15 +222,18 @@ def test_gate_parks_on_phantom_deferral_in_commit_body(fixture_repo):
 
 
 def _stub_gate_enumeration(monkeypatch, ids):
-    """Stub the P5 sandbox-backed enumeration seam (post review-F-002 migration) so
-    the deferral-reconciliation path is exercised without a claude+judge backend:
-    a usable backend probe plus a fixed enumeration result."""
-    from gauntlet.engine import verify
+    """Stub the enumeration seams (engine-subprocess-in-copy posture, PR #59 F3)
+    so the deferral-reconciliation path is exercised without a real worktree copy
+    or pytest run: a no-op copy plus a fixed enumeration result."""
+    from pathlib import Path
 
-    monkeypatch.setattr(verify, "detect_backend",
-                        lambda judge_env: verify.SandboxBackend(claude_path="claude"))
-    monkeypatch.setattr(verify, "enumerate_in_sandbox",
-                        lambda backend, collector, **k: set(ids))
+    from gauntlet.engine import collectors, verify
+
+    copy = verify.DisposableCopy(path=Path("/copy-path"), root=Path("/copy-path"))
+    monkeypatch.setattr(verify, "make_disposable_copy", lambda repo, **k: copy)
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
+    monkeypatch.setattr(collectors.Collector, "enumerate",
+                        lambda self, **k: set(ids))
 
 
 def test_gate_passes_on_valid_deferral(fixture_repo, monkeypatch):

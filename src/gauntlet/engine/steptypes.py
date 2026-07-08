@@ -55,6 +55,7 @@ from gauntlet.engine.collectors import (
     CollectorEnumerationError,
     get_collector,
     is_registered,
+    resolve_command,
 )
 from gauntlet.engine.deferrals import (
     SIZE_LINT_MODES,
@@ -383,8 +384,9 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
     Fail closed at every step: a missing/unparseable/schema-invalid map, an
     unmapped clause, a cited id absent from the enumeration, or a failed/timed-out
     enumeration all **park** — an absent or failed check is never read as "passed".
-    Enumeration runs under the P2-P4 interim posture (a bounded child subprocess
-    under the run's judge hooks, cwd scoped to the run worktree; plan P2 / F-002).
+    Enumeration is a bounded engine subprocess in a DISPOSABLE COPY with a
+    stripped env and a project-resolved command — deterministic, no LLM in the
+    evidence path (PR #59 review F3/F4/F7; see collectors.py).
     """
     collector_kind = step.get("collector")
     if not collector_kind:
@@ -544,38 +546,38 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             ),
         )
     collector = get_collector(collector_kind)
-    # P5 migration (review F-002 / P5-A7): collector enumeration now runs INSIDE
-    # the P5 verifier sandbox backend — `pytest --collect-only` imports the
-    # branch's conftest/test modules, executing branch-authored code, so it must
-    # run in a disposable copy read-confined by the claude-code judge hook (network
-    # deny, resource-bounded), not the P2-P4 interim bare subprocess in the real
-    # worktree. Fail closed: no usable/hook-confirmed backend parks the gate
-    # (branch collection never runs unhooked, P5-A7).
-    backend = verify.detect_backend(ctx.judge_env)
-    if backend is None:
+    # Enumeration posture (PR #59 review F3/F7, superseding the P5 LLM-mediated
+    # design): a bounded ENGINE SUBPROCESS in a DISPOSABLE COPY of the worktree.
+    # Deterministic — no LLM in the evidence path (the agent-echo design could
+    # truncate a large id list into a chronic false park, or fabricate ids into
+    # a false pass, defeating the gate's whole premise). `pytest --collect-only`
+    # still executes branch-authored conftest/import-time code, so it runs with
+    # the verifier's STRIPPED env, cwd pinned to the copy (import-time writes
+    # land in a discarded tree), and wall-clock + rlimit bounds. The command is
+    # project-resolved (collectors.resolve_command): the operator's
+    # `collectors.<kind>.command` override, else the project's pytest-shaped
+    # `test_command` env, else the engine interpreter.
+    command = resolve_command(collector, ctx.config)
+    try:
+        copy = verify.make_disposable_copy(ctx.repo_root)
+    except verify.CopyCreationError as exc:
         return _acceptance_gate_halt(
-            f"acceptance gate ({collector_kind}): no usable sandbox backend to run "
-            f"collector enumeration for phase {phase_id} — the claude-code CLI + an "
-            "active engine-managed judge (whose PreToolUse hook confines the "
-            "enumeration to the run-worktree copy) are required (fail closed — "
-            "enumeration never runs unhooked, P5-A7)"
+            f"acceptance gate ({collector_kind}): could not create a disposable "
+            f"copy to enumerate phase {phase_id} in — {exc} (fail closed)"
         )
     try:
-        enumerated = verify.enumerate_in_sandbox(
-            backend, collector,
-            worktree=ctx.repo_root,
-            judge_env=ctx.judge_env,
+        enumerated = collector.enumerate(
+            worktree=copy.path,
+            judge_env={},
+            command=command,
         )
     except CollectorEnumerationError as exc:
         return _acceptance_gate_halt(
             f"acceptance gate ({collector_kind}): enumeration failed for phase "
             f"{phase_id} — {exc}"
         )
-    except verify.VerifierError as exc:
-        return _acceptance_gate_halt(
-            f"acceptance gate ({collector_kind}): sandbox enumeration could not run "
-            f"for phase {phase_id} — {exc} (fail closed, P5-A7)"
-        )
+    finally:
+        verify.discard_disposable_copy(ctx.repo_root, copy)
     missing_ids = sorted(cited - enumerated)
     if missing_ids:
         return _acceptance_gate_halt(

@@ -111,9 +111,11 @@ stages:
       # + existence — every clause maps and every cited id appears in
       # `pytest --collect-only` — and parks the phase (naming the gap) otherwise,
       # before any reviewer budget is spent. It is the structural close of the #54
-      # silent-partial-delivery class. Enumeration runs under the P2-P4 interim
-      # posture (a bounded child subprocess under the run's judge hooks, cwd scoped
-      # to the worktree); the P5 verifier sandbox is its target home (plan F-002).
+      # silent-partial-delivery class. Enumeration is a bounded engine subprocess
+      # in a DISPOSABLE COPY with a stripped env, its command resolved from the
+      # project's own test environment (collectors.resolve_command; overridable
+      # via `collectors.pytest.command`) — deterministic, no LLM in the evidence
+      # path (PR #59 review F3/F4/F7).
       - {id: acceptance-gate, type: acceptance_gate, collector: pytest,
          map: artifacts/acceptance-map.json}
       # Behavioral verifier sub-step (pipeline-effectiveness FR-2.1, P5): between

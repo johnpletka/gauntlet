@@ -656,27 +656,12 @@ def discard_disposable_copy(repo_root: Path, copy: DisposableCopy) -> None:
         pass
 
 
-# --- collector-enumeration migration into the backend (P5-A7) --------------------
-# Engine-owned sentinels the backend wraps the collector's verbatim stdout in, so
-# the enumeration output is recovered deterministically from the agent turn — a
-# turn that omits/garbles the markers fails closed (parks), never a false "all
-# mapped" pass. The markers are engine constants, never agent-authored.
-_COLLECT_BEGIN = "<<<GAUNTLET-COLLECT-BEGIN>>>"
-_COLLECT_END = "<<<GAUNTLET-COLLECT-END>>>"
-
-
-def _capture_between_markers(text: str, begin: str, end: str) -> str | None:
-    """Return the text strictly between the first ``begin`` and the next ``end``,
-    or ``None`` if either marker is absent (fail-closed signal)."""
-    if not text:
-        return None
-    i = text.find(begin)
-    if i < 0:
-        return None
-    j = text.find(end, i + len(begin))
-    if j < 0:
-        return None
-    return text[i + len(begin) : j]
+# The collector-enumeration path is an ENGINE SUBPROCESS in a disposable copy
+# (collectors.run_bounded_enumeration, PR #59 review F3/F7) — the P5 design
+# that routed `pytest --collect-only` stdout through a claude turn asked to
+# echo it byte-for-byte is retired: an LLM in the evidence path could both
+# truncate a large id list (chronic false park) and fabricate ids (false
+# pass), defeating the deterministic-gate premise of FR-3.2.
 
 
 def _run_backend_bash(
@@ -706,83 +691,3 @@ def _run_backend_bash(
     return adapter.run(prompt, cwd=cwd)
 
 
-def enumerate_in_sandbox(
-    backend: SandboxBackend,
-    collector,
-    *,
-    worktree: Path,
-    judge_env: dict[str, str],
-    timeout_s: float | None = None,
-    mem_bytes: int | None = None,
-) -> set[str]:
-    """Run a collector's side-effect-free enumeration INSIDE the v1 sandbox backend
-    (review F-002 / P5-A7): in a **disposable copy** of the run worktree, executed
-    through the claude-code judge-hooked ``Bash`` tool — NOT as a bare engine
-    subprocess. ``pytest --collect-only`` imports the branch's ``conftest``/test
-    modules, so it executes branch-authored code; routing it through the backend's
-    Bash tool means every tool call is gated by the PreToolUse judge hook (network
-    default-deny, copy-root path confinement) with the judge repo-root pointed at
-    the copy, closing the gap where the interim bare subprocess ran the branch's
-    import-time code outside the hook boundary.
-
-    The collector's engine-owned command is handed to the backend to run verbatim;
-    its stdout is recovered deterministically from between :data:`_COLLECT_BEGIN`/
-    :data:`_COLLECT_END` markers and parsed by the collector's own parser.
-    Fail-closed park-on-failure is preserved end to end: a backend launch/timeout
-    failure, a turn that omits the markers, or an empty/unparseable enumeration
-    raises :class:`~gauntlet.engine.collectors.CollectorEnumerationError`, and a
-    copy-creation failure raises :class:`CopyCreationError` — both park the gate.
-    A garbled agent turn therefore parks (recoverable), never passes the gate. The
-    real worktree is untouched.
-
-    ``mem_bytes`` is accepted for call-site compatibility but no longer applied: the
-    OS ``RLIMIT`` of the interim subprocess posture is superseded by the backend's
-    own wall-clock timeout and the judge hook's network/path denial."""
-    from gauntlet.engine import collectors as _collectors
-
-    copy = make_disposable_copy(worktree)
-    command = " ".join(shlex.quote(str(c)) for c in collector.command)
-    prompt = (
-        "You are the collector-enumeration runner in a DISPOSABLE sandbox copy of a "
-        "project. Using the Bash tool, run EXACTLY this one command and nothing "
-        f"else:\n\n    {command}\n\n"
-        "Then reply with ONLY the command's verbatim stdout, enclosed between these "
-        "two markers each on their own line:\n"
-        f"{_COLLECT_BEGIN}\n<the command's stdout, byte for byte>\n{_COLLECT_END}\n"
-        "Do not summarize, reorder, de-duplicate, or add commentary."
-    )
-    try:
-        result = _run_backend_bash(
-            backend,
-            prompt=prompt,
-            cwd=copy.path,
-            env=verifier_env(judge_env, copy.path),
-            allowed_tools=("Bash",),
-            timeout_s=timeout_s,
-        )
-    except _collectors.CollectorEnumerationError:
-        raise
-    except Exception as exc:  # any backend launch/run failure fails closed
-        raise _collectors.CollectorEnumerationError(
-            f"{collector.kind} enumeration could not run inside the sandbox backend: "
-            f"{type(exc).__name__}: {exc} (fail closed — an absent enumeration is "
-            "never treated as 'all mapped')"
-        ) from exc
-    finally:
-        discard_disposable_copy(worktree, copy)
-
-    captured = _capture_between_markers(result.text or "", _COLLECT_BEGIN, _COLLECT_END)
-    if captured is None:
-        raise _collectors.CollectorEnumerationError(
-            f"{collector.kind} enumeration returned no marker-delimited output from "
-            "the sandbox backend (fail closed — an unreadable enumeration is never "
-            "treated as 'all mapped')"
-        )
-    ids = collector.parse(captured)
-    if not ids:
-        raise _collectors.CollectorEnumerationError(
-            f"{collector.kind} enumeration produced no parseable ids inside the "
-            "sandbox backend (fail closed — an unparseable enumeration is never "
-            "treated as 'all mapped')"
-        )
-    return ids
