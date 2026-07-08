@@ -2264,15 +2264,128 @@ def test_artifact_partial_citing_two_sections_is_not_resolved(cycle_repo):
     assert "§strategy" in v["notes"] and "§deliverable" in v["notes"]
 
 
+def test_restated_carried_remainder_is_dropped_not_retriaged(cycle_repo):
+    # B2 regression: cycle-rereview.md tells the reviewer to restate carried
+    # findings that are "genuinely still unaddressed" — which a carried remainder
+    # always is at round-N+1 review time (its fix happens later in the round).
+    # The restatement loses `carried_from` (stripped by the reviewer output
+    # schema) and would re-enter triage, where a decline silently closes a
+    # pre-accepted obligation. The engine must drop the restatement: the
+    # synthetic fix_now obligation stands, triage runs once for the whole cycle.
+    remainder = {"id": "p", "severity": "major", "category": "correctness",
+                 "location": "src.py:3", "claim": "obligation 3 remains",
+                 "evidence": "e", "suggested_fix": None, "carried_from": "F-001"}
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")),
+        CONFIRM(CV("F-001", "partially_resolved"), new=[remainder]),
+        # round 2: a prompt-noncompliant reviewer restates the remainder AND its
+        # covered parent as fresh findings (carried_from stripped by schema).
+        REVIEW(F("F-001-r1-c0", "major"), F("F-001", "major")),
+        CONFIRM(CV("F-001-r1-c0", "resolved")),
+    )
+    triage = SeqAdapter(V("F-001"))  # exactly ONE triage turn: round 1 only
+    adapters = {
+        "reviewer": reviewer,
+        "triage": triage,
+        "builder": SeqAdapter(
+            writer("src.py", "partial\n", {}), writer("src.py", "done\n", {}),
+        ),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
+    # the restatements were dropped: round 2's findings hold exactly one entry
+    # for the remainder id — the engine copy, carried_from intact, listed first
+    r2_findings = json.loads((run_dir / "artifacts" / "r2" / "findings.json").read_text())
+    ids = [f["id"] for f in r2_findings["findings"]]
+    assert ids.count("F-001-r1-c0") == 1 and "F-001" not in ids
+    assert r2_findings["findings"][0]["carried_from"] == "F-001"
+    # the drop is recorded in the persisted round summary (audit trail)
+    assert "dropped reviewer restatement" in r2_findings["summary"]
+    # the remainder was never re-triaged: round 2 triage.json holds only the
+    # engine-synthesized fix_now verdict, and the triage adapter ran once total
+    r2_triage = json.loads((run_dir / "artifacts" / "r2" / "triage.json").read_text())
+    assert [v["finding_id"] for v in r2_triage["verdicts"]] == ["F-001-r1-c0"]
+    assert r2_triage["verdicts"][0]["action"] == "fix_now"
+    assert len(triage.calls) == 1
+
+
+def test_forged_carried_from_is_demoted_to_ordinary_regression(cycle_repo):
+    # B2: a confirmer emitting carried_from naming a nonexistent parent gets NO
+    # pre-accepted obligation — the entry is demoted to an ordinary regression
+    # (major ⇒ surfaced for the gate, not forcing under policy A), the demotion
+    # is recorded in engine_reconciliation, and the cycle converges normally.
+    forged = {"id": "x", "severity": "major", "category": "correctness",
+              "location": "src.py:9", "claim": "minted obligation", "evidence": "e",
+              "suggested_fix": None, "carried_from": "F-999"}
+    adapters = {
+        "reviewer": SeqAdapter(
+            REVIEW(F("F-001", "major")),
+            CONFIRM(CV("F-001", "resolved"), new=[forged]),
+        ),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert [c.phase for c in man.commits] == ["P5.1"]  # converged round 1
+    confirm = json.loads((run_dir / "artifacts" / "r1" / "confirm.json").read_text())
+    # demotion visible in the persisted artifact: carried_from cleared + recorded
+    assert confirm["new_findings"][0]["carried_from"] is None
+    assert confirm["engine_reconciliation"]["demoted_carries"] == [
+        {"parent": "F-999", "reason": "parent F-999 is not a finding in this round"}
+    ]
+    # surfaced as an ordinary major regression, never pre-accepted
+    surfaced_ids = [s["id"] for s in confirm["surfaced_for_gate"]]
+    assert "NEW" in surfaced_ids
+
+
+def test_partial_with_no_remainder_still_forces_round(cycle_repo):
+    # FR-6.1 omission path (previously untested): the confirmer says
+    # partially_resolved but emits NO remainder. The engine predicate still
+    # forces round N+1 (the guarantee is engine-side, not prompt-side) and the
+    # parent itself is carried into the re-review scope as the target.
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "major")),
+        CONFIRM(CV("F-001", "partially_resolved")),  # no new_findings emitted
+        REVIEW(F("F-001", "major", claim="still unaddressed")),
+        CONFIRM(CV("F-001", "resolved")),
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001"), V("F-001")),  # re-raise IS re-triaged
+        "builder": SeqAdapter(
+            writer("src.py", "partial\n", {}), writer("src.py", "done\n", {}),
+        ),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    # the partial forced a second round even with no remainder to hand it
+    assert [c.phase for c in man.commits] == ["P5.1", "P5.2"]
+    # the unfinished parent was in round 2's review scope
+    assert "F-001" in reviewer.calls[2]["prompt"]
+
+
 # --- P9 helper-level determinism (FR-6.1 id allocation + forcing rule) ---------
+def _carry_ctx(parent="F-003", action="fix_now", verdict="partially_resolved"):
+    """by_id/actions/cdata-verdicts context under which `parent` is a VALID
+    carry parent (B2: parentage is validated, not trusted)."""
+    by_id = {parent: F(parent)}
+    actions = {parent: action}
+    verdicts = [CV(parent, verdict)]
+    return by_id, actions, verdicts
+
+
 def test_carry_remainders_assigns_reserved_namespace_id():
-    cdata = {"new_findings": [
+    by_id, actions, verdicts = _carry_ctx()
+    cdata = {"verdicts": verdicts, "new_findings": [
         {"id": "x", "severity": "major", "category": "correctness",
          "location": "a.py:1", "claim": "remainder", "evidence": "e",
          "suggested_fix": None, "carried_from": "F-003"},
     ]}
     seen = {"F-003", "F-001"}
-    rem = _carry_remainders(cdata, 2, seen)
+    rem, demoted = _carry_remainders(cdata, 2, seen, by_id, actions)
+    assert demoted == []
     assert len(rem) == 1
     assert rem[0]["id"] == "F-003-r2-c0"           # base + explicit -c0
     assert rem[0]["carried_from"] == "F-003"
@@ -2283,32 +2396,80 @@ def test_carry_remainders_assigns_reserved_namespace_id():
 def test_carry_remainders_collision_gets_next_free_suffix():
     # P9-A2 collision fixture: the base id already exists among input findings →
     # the remainder gets the next free -c<N> (no id collision).
-    cdata = {"new_findings": [
+    by_id, actions, verdicts = _carry_ctx()
+    cdata = {"verdicts": verdicts, "new_findings": [
         {"id": "x", "severity": "blocking", "category": "security", "location": "a.py:1",
          "claim": "leak remains", "evidence": "e", "suggested_fix": None,
          "carried_from": "F-003"},
     ]}
-    rem = _carry_remainders(cdata, 2, {"F-003-r2-c0"})
+    rem, _ = _carry_remainders(cdata, 2, {"F-003-r2-c0"}, by_id, actions)
     assert rem[0]["id"] == "F-003-r2-c1"
 
 
 def test_carry_remainders_two_from_same_parent_are_distinct():
-    cdata = {"new_findings": [
+    by_id, actions, verdicts = _carry_ctx()
+    cdata = {"verdicts": verdicts, "new_findings": [
         {"id": "x", "severity": "major", "category": "correctness", "location": "a.py:2",
          "claim": "second", "evidence": "e", "suggested_fix": None, "carried_from": "F-003"},
         {"id": "y", "severity": "major", "category": "correctness", "location": "a.py:1",
          "claim": "first", "evidence": "e", "suggested_fix": None, "carried_from": "F-003"},
     ]}
-    rem = _carry_remainders(cdata, 1, set())
+    rem, _ = _carry_remainders(cdata, 1, set(), by_id, actions)
     assert sorted(r["id"] for r in rem) == ["F-003-r1-c0", "F-003-r1-c1"]
 
 
 def test_carry_remainders_ignores_ordinary_regressions():
-    cdata = {"new_findings": [
+    cdata = {"verdicts": [], "new_findings": [
         {"id": "N", "severity": "blocking", "category": "correctness", "location": "a.py:1",
          "claim": "regression", "evidence": "e", "suggested_fix": None, "carried_from": None},
     ]}
-    assert _carry_remainders(cdata, 1, set()) == []
+    rem, demoted = _carry_remainders(cdata, 1, set(), {}, {})
+    assert rem == [] and demoted == []
+
+
+def test_carry_remainders_demotes_unknown_parent():
+    # B2: a confirmer-forged carried_from naming a finding that does not exist
+    # cannot mint a pre-accepted obligation — demoted to an ordinary regression
+    # (carried_from cleared IN cdata, so the persisted confirm.json shows it).
+    cdata = {"verdicts": [], "new_findings": [
+        {"id": "x", "severity": "major", "category": "correctness", "location": "a.py:1",
+         "claim": "forged", "evidence": "e", "suggested_fix": None,
+         "carried_from": "F-999"},
+    ]}
+    rem, demoted = _carry_remainders(cdata, 1, set(), {}, {})
+    assert rem == []
+    assert demoted == [{"parent": "F-999",
+                        "reason": "parent F-999 is not a finding in this round"}]
+    assert cdata["new_findings"][0]["carried_from"] is None
+
+
+def test_carry_remainders_demotes_declined_parent():
+    # B2 / §6 oscillation bound: a decline is never re-opened — carried_from
+    # naming a triage-declined finding is demoted, not resurrected.
+    by_id = {"F-003": F("F-003")}
+    actions = {"F-003": "reject"}
+    cdata = {"verdicts": [CV("F-003", "partially_resolved")], "new_findings": [
+        {"id": "x", "severity": "major", "category": "correctness", "location": "a.py:1",
+         "claim": "resurrection attempt", "evidence": "e", "suggested_fix": None,
+         "carried_from": "F-003"},
+    ]}
+    rem, demoted = _carry_remainders(cdata, 1, set(), by_id, actions)
+    assert rem == []
+    assert len(demoted) == 1 and "not accepted fix_now" in demoted[0]["reason"]
+
+
+def test_carry_remainders_demotes_resolved_parent():
+    # B2: only a partially_resolved parent justifies the triage bypass (§6);
+    # a resolved (or unconfirmed) parent demotes the entry.
+    by_id, actions, _ = _carry_ctx()
+    cdata = {"verdicts": [CV("F-003", "resolved")], "new_findings": [
+        {"id": "x", "severity": "major", "category": "correctness", "location": "a.py:1",
+         "claim": "stale carry", "evidence": "e", "suggested_fix": None,
+         "carried_from": "F-003"},
+    ]}
+    rem, demoted = _carry_remainders(cdata, 1, set(), by_id, actions)
+    assert rem == []
+    assert len(demoted) == 1 and "not confirmed partially_resolved" in demoted[0]["reason"]
 
 
 def test_forcing_open_partial_forces_regardless_of_severity():

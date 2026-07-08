@@ -17,6 +17,13 @@ the findings still open are listed below. Your job here is deliberately narrow.
   prevents the loop from converging (BOOTSTRAP-NOTES #30). The human gate is
   where any residual non-blocking concerns are weighed — not another round.
 - Re-litigate findings that triage already declined with a recorded reason.
+- Re-state a **carried remainder** — a carried entry whose `carried_from`
+  field names a parent finding. A remainder is a pre-accepted fix obligation
+  for THIS round (FR-6.1): its fix happens *after* this review, so it is
+  unaddressed by construction, and it already inherits its parent's accepted
+  verdict and bypasses triage. It is listed only so you can scope your
+  regression check around it. (The engine drops any restatement of a
+  remainder's id.)
 
 Return findings as JSON conforming to the schema (same shape as a normal
 review). If everything carried is now addressed and no blocking regression was

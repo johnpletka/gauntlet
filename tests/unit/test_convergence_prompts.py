@@ -46,6 +46,21 @@ def test_cycle_confirm_has_intra_document_consistency_rule():
     assert "contradict" in text.lower() and "section" in text.lower()
 
 
+# --- FR-6.1 / B2: cycle-rereview.md carried-remainder exemption --------------
+def test_cycle_rereview_exempts_carried_remainders_from_restatement():
+    # B2: the re-review prompt must NOT invite restatement of a carried
+    # remainder — a remainder is unaddressed by construction at review time
+    # (its fix happens later in the round), and a restatement re-enters triage
+    # where a decline can silently close a pre-accepted obligation.
+    text = _read("cycle-rereview.md")
+    assert "carried_from" in text
+    assert "pre-accepted" in text.lower()
+    assert "FR-6.1" in text
+    # the exemption lives in the Do-NOT list: no restating, no re-litigating
+    do_not = text.split("**Do NOT:**", 1)[1]
+    assert "remainder" in do_not.lower()
+
+
 # --- FR-6.2: cycle-fix.md enumerated-obligation checklist --------------------
 def test_cycle_fix_has_enumerated_obligation_checklist():
     text = _read("cycle-fix.md")

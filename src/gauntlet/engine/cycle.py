@@ -746,6 +746,26 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # were prepended before it was written), so inject only on a freshly-run
         # review — re-prepending would double them.
         if carried_remainders and not reuse_review:
+            # B2 guard: a re-reviewer that restates a carried remainder (or the
+            # parent it represents) would otherwise re-enter it into triage as a
+            # fresh finding — its `carried_from` is stripped by the reviewer
+            # output schema — where a decline could silently close a pre-accepted
+            # obligation (§6: a remainder is never a candidate for re-litigation).
+            # Drop such restatements; the synthetic fix_now obligation stands and
+            # the drop is recorded in the round's persisted review summary.
+            reserved = {str(r.get("id")) for r in carried_remainders}
+            reserved |= {str(r.get("carried_from")) for r in carried_remainders}
+            restated = sorted(
+                str(f.get("id")) for f in findings if str(f.get("id")) in reserved
+            )
+            if restated:
+                findings = [f for f in findings if str(f.get("id")) not in reserved]
+                review_summary = ((review_summary + "\n") if review_summary else "") + (
+                    "engine: dropped reviewer restatement(s) of pre-accepted "
+                    f"carried remainder(s)/parent(s): {', '.join(restated)} "
+                    "(§6 — a carried remainder bypasses re-triage; the engine-"
+                    "synthesized fix_now obligation stands)"
+                )
             findings = [dict(r) for r in carried_remainders] + findings
         # Register every id seen this round in the run-wide set BEFORE this round's
         # confirm allocates a remainder id against it (FR-6.1) — so a remainder is
@@ -1004,10 +1024,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # confirm.json shows the final id). An ordinary regression (carried_from
         # null) is untouched. Deterministic + idempotent on reuse (the id it
         # re-derives equals the one already stored).
-        new_remainders = _carry_remainders(cdata, rnd, seen_ids)
+        new_remainders, demoted_carries = _carry_remainders(
+            cdata, rnd, seen_ids, by_id, actions
+        )
         open_items, reconciliation = _open_after_confirm(
             by_id, actions, cdata, new_remainders
         )
+        if demoted_carries:
+            # B2 guard audit trail: forged/stale carried_from references were
+            # demoted to ordinary regressions — record why, next to the verdicts.
+            reconciliation["demoted_carries"] = demoted_carries
         forcing = _forcing_open(open_items, convergence)
         # Non-blocking open items don't loop (policy A); they accumulate and are
         # surfaced at the human gate (BOOTSTRAP-NOTES #30). Dedup by id, latest
@@ -2598,14 +2624,28 @@ def _carried_remainder_verdict(finding: dict[str, Any]) -> dict[str, Any]:
 
 
 def _carry_remainders(
-    cdata: dict[str, Any], rnd: int, seen_ids: set[str]
-) -> list[dict[str, Any]]:
+    cdata: dict[str, Any], rnd: int, seen_ids: set[str],
+    by_id: dict[str, dict[str, Any]], actions: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Promote confirm ``new_findings`` carrying ``carried_from`` to pre-accepted
     remainders with deterministic, collision-free reserved-namespace ids (FR-6.1,
     §6). Rewrites each entry's ``id`` IN ``cdata`` (the dicts are live refs into
     ``cdata["new_findings"]``) so the persisted confirm.json shows the final id,
     registers the id in ``seen_ids``, and returns the remainders as complete
     finding dicts with ``carried_from`` intact.
+
+    Parentage is VALIDATED, not trusted (§6 grants the triage bypass because the
+    parent is "an already-triaged, ``fix_now``-accepted finding" confirmed
+    ``partially_resolved`` — so all three legs are checked against this round's
+    engine state, never the confirmer's say-so). An entry whose ``carried_from``
+    names a finding that does not exist in this round, was not accepted
+    ``fix_now`` (a decline is never re-opened), or was not confirmed
+    ``partially_resolved`` is DEMOTED: its ``carried_from`` is cleared in
+    ``cdata`` so it flows the ordinary confirm-regression path (blocking forces,
+    major surfaces — never pre-accepted, never bypassing triage), and the
+    demotion is returned for the engine reconciliation record. Fails toward
+    scrutiny: a forged or stale parent reference can force *more* review, never
+    mint an unreviewable obligation or resurrect a decline.
 
     Id: base ``<carried_from>-r<round>``; append ``-c<N>`` for the smallest
     ``N >= 0`` making ``<base>-c<N>`` unique against ``seen_ids`` (every finding id
@@ -2617,7 +2657,31 @@ def _carry_remainders(
     do not change when the id is rewritten — so re-derivation on resume is
     idempotent and two builders following the spec assign identical ids.
     """
-    entries = [nf for nf in (cdata.get("new_findings") or []) if nf.get("carried_from")]
+    confirm_verdicts = {
+        str(v.get("finding_id")): str(v.get("verdict") or "")
+        for v in cdata.get("verdicts") or []
+    }
+    entries: list[dict[str, Any]] = []
+    demoted: list[dict[str, str]] = []
+    for nf in cdata.get("new_findings") or []:
+        parent = nf.get("carried_from")
+        if not parent:
+            continue  # ordinary regression: untouched
+        parent = str(parent)
+        if parent not in by_id:
+            reason = f"parent {parent} is not a finding in this round"
+        elif actions.get(parent) != "fix_now":
+            reason = (f"parent {parent} was not accepted fix_now "
+                      f"(action: {actions.get(parent) or 'none'}) — a decline is "
+                      "never re-opened (§6)")
+        elif confirm_verdicts.get(parent) != "partially_resolved":
+            reason = (f"parent {parent} was not confirmed partially_resolved "
+                      f"(verdict: {confirm_verdicts.get(parent) or 'none'})")
+        else:
+            entries.append(nf)
+            continue
+        nf["carried_from"] = None  # live ref: demotion is visible in confirm.json
+        demoted.append({"parent": parent, "reason": reason})
     entries.sort(key=lambda nf: (
         str(nf.get("carried_from")), str(nf.get("location") or ""),
         str(nf.get("claim") or ""), str(nf.get("severity") or ""),
@@ -2643,7 +2707,7 @@ def _carry_remainders(
             "suggested_fix": nf.get("suggested_fix"),
             "carried_from": parent,
         })
-    return remainders
+    return remainders, demoted
 
 
 def _fmt_ids(items: list[dict[str, Any]]) -> str:
@@ -3140,7 +3204,11 @@ _BUILTIN_REREVIEW = (
     "regression — do NOT hunt for fresh minor/major issues; that review "
     "happened in round 1 and re-litigating it is bikeshedding (BOOTSTRAP-NOTES "
     "#30). Re-state a carried finding (same id) only if it is genuinely still "
-    "unaddressed. Questions go in open_questions."
+    "unaddressed — EXCEPT a carried remainder (an entry whose `carried_from` "
+    "names a parent finding): that is a pre-accepted fix obligation for THIS "
+    "round (FR-6.1), unaddressed by construction since its fix happens after "
+    "this review; never re-state or re-litigate it. Questions go in "
+    "open_questions."
 )
 _BUILTIN_TRIAGE = (
     "You are a triage classifier. Judge the single review finding below.\n"
