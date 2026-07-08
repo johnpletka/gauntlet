@@ -2,8 +2,8 @@
 
 - branch: `gauntlet/pipeline-effectiveness` (base `main`)
 - pipeline: `standard` v1 (`sha256:639c398d43c4…`)
-- status: **running** (at `impl-cycle`)
-- totals: 4067981in/1714988out $262.9068
+- status: **done**
+- totals: 4126972in/1721635out $263.1489
 
 | step | type | status | duration | usage | notes |
 |---|---|---|---|---|---|
@@ -49,6 +49,7 @@
 | [tests.8](steps/tests.8/) | shell | done | 368s | 0in/0out (tokens only) | `uv run pytest` exited 0 |
 | phase-commit.8 | commit | done | 30s | 45807in/2387out $0.0162 | committed a2267085ff |
 | [impl-cycle.8](steps/impl-cycle.8/) | adversarial_cycle | done | 7072s | 575007in/28854out $2.8293 | converged in round 1 (blocking policy): no open blocking; 1 fixed, 0 non-blocking item(s) surfaced for the gate |
+| [retrospective](steps/retrospective/) | retrospective | done | 98s | 58991in/6647out $0.2421 | retrospective: 2 self-critique(s); 2 proposal(s) generated, 0 applyable; 1 decline(s) recorded |
 
 ## Commits
 
