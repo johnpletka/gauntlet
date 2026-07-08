@@ -498,7 +498,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # the reviewer adapter gets today's byte-equivalent finding shape.
     reviewer_schema = _reviewer_output_schema(findings_schema)
     triage_schema = _load_schema(ctx, step.get("triage_schema") or DEFAULT_TRIAGE_SCHEMA)
+    # The persisted confirm-record schema (carried_from optional/additive, PRD §6)
+    # and its DERIVED strict-output shape for the native --output-schema path
+    # (carried_from required-but-nullable, F-007). The confirmer adapter gets the
+    # strict one; the persisted schema is what a legacy/pre-migration artifact
+    # validates against.
     confirm_schema = _load_schema(ctx, step.get("confirm_schema") or DEFAULT_CONFIRM_SCHEMA)
+    confirmer_schema = _confirmer_output_schema(confirm_schema)
 
     convergence = step.get("convergence") or ctx.config.cycle_convergence
     if convergence not in CONVERGENCE_POLICIES:
@@ -982,7 +988,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             try:
                 confirm = _run_sub(
                     ctx, confirmer, confirm_prompt,
-                    schema=confirm_schema, usage=usage,
+                    schema=confirmer_schema, usage=usage,
                     logger=step_logger(ctx, f"r{rnd}-confirm"),
                     structured_name="confirm.json",
                     substep=f"r{rnd}-confirm", effort=cycle_effort,
@@ -3071,6 +3077,30 @@ def _reviewer_output_schema(findings_schema: dict) -> dict:
     # never a reviewer-emitted field — strip it too so the reviewer's strict output
     # shape is unchanged.
     props.pop("carried_from", None)
+    return schema
+
+
+def _confirmer_output_schema(confirm_schema: dict) -> dict:
+    """The STRICT confirm-output schema handed to the confirmer adapter (F-007).
+
+    ``schemas/confirm.json`` is the PERSISTED confirm-record schema: per PRD §6 the
+    P9 carry change is additive, so ``carried_from`` is an OPTIONAL field on each
+    ``new_findings`` item (a pre-migration entry that omits it still validates).
+    But the confirmer emits ``new_findings`` through the native ``--output-schema``
+    path, and strict mode requires EVERY property in ``required``. This derivation
+    promotes ``carried_from`` into the item's ``required`` list (required-but-
+    nullable, the same convention ``suggested_fix`` uses) so the strict shape is
+    complete. No-op when the item already requires it or has no such property
+    (defensive) — never mutates the input."""
+    schema = json.loads(json.dumps(confirm_schema))
+    try:
+        item = schema["properties"]["new_findings"]["items"]
+        props = item["properties"]
+        required = item["required"]
+    except (KeyError, TypeError):
+        return schema
+    if "carried_from" in props and "carried_from" not in required:
+        required.append("carried_from")
     return schema
 
 

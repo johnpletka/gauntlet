@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/confirm.json",
   "title": "Confirm-pass verdicts (FR-9.5)",
-  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase, AND carry the concrete unresolved remainder of a `partially_resolved` accepted finding (pipeline-effectiveness FR-6.1, P9). Strict-mode/compat note (review F-007 — same rule as findings.json): because `new_findings` is emitted through the strict `--output-schema` path, each item lists EVERY findings-schema field plus `carried_from` in `required`, with `carried_from` spelled required-but-nullable (`null` for an ordinary diff regression, a `<finding-id>` for a carried remainder). Backward compatibility is preserved through the persisted-artifact validation path, not by omitting the field: `new_findings` is already a required top-level array, so a pre-migration confirm output with an EMPTY `new_findings` validates unchanged, and the engine's read path treats a pre-`carried_from` entry as `carried_from: null` (an ordinary regression).",
+  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase, AND carry the concrete unresolved remainder of a `partially_resolved` accepted finding (pipeline-effectiveness FR-6.1, P9). Compat note (PRD §6, same rule as findings.json's engine annotations): this file is the PERSISTED confirm-record validation schema, and the P9 schema change is ADDITIVE — `carried_from` is an OPTIONAL field on each `new_findings` item (`null`/absent for an ordinary diff regression, a `<finding-id>` for a carried remainder), NOT in `required`. So a pre-migration confirm output validates unchanged whether `new_findings` is EMPTY or carries entries that predate `carried_from` (the engine's read path treats a pre-`carried_from` entry as `carried_from: null`). Strict-mode note (review F-007): native `--output-schema` requires EVERY property in `required`, so the confirmer's strict output schema — which additionally lists `carried_from` in `required` (required-but-nullable, like `suggested_fix`) — is DERIVED from this persisted schema in code (see `cycle._confirmer_output_schema`); it is never emitted by hand and never governs a persisted artifact.",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdicts", "new_findings", "summary"],
@@ -34,7 +34,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "category", "location", "claim", "evidence", "suggested_fix", "carried_from"],
+        "required": ["id", "severity", "category", "location", "claim", "evidence", "suggested_fix"],
         "properties": {
           "id": {
             "type": "string",
@@ -62,7 +62,7 @@
           },
           "carried_from": {
             "type": ["string", "null"],
-            "description": "FR-6.1: the `partially_resolved` accepted finding id this entry is the remainder of, or null for an ordinary diff regression. Required-but-nullable for strict native structured output (the same convention `suggested_fix` uses)."
+            "description": "FR-6.1: the `partially_resolved` accepted finding id this entry is the remainder of, or null for an ordinary diff regression. OPTIONAL/additive on this persisted schema (PRD §6): absent or null on a pre-migration/ordinary entry, which validates unchanged. The confirmer's DERIVED strict-output schema (cycle._confirmer_output_schema) promotes it into `required` as required-but-nullable — the same convention `suggested_fix` uses — for the native `--output-schema` path."
           }
         }
       }

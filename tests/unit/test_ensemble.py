@@ -78,6 +78,30 @@ def test_reviewer_output_schema_strips_ensemble_fields():
     assert item["additionalProperties"] is False
 
 
+def test_confirmer_output_schema_promotes_carried_from_to_required():
+    # F-001 (P9): the persisted confirm schema keeps `carried_from` OPTIONAL
+    # (additive, PRD §6), so the strict native-output schema must be DERIVED by
+    # promoting it into `required` — required-but-nullable, the F-007 convention —
+    # without mutating the persisted input.
+    from gauntlet.engine.cycle import _confirmer_output_schema
+
+    persisted = json.loads(
+        (Path(__file__).resolve().parents[2] / "schemas" / "confirm.json").read_text()
+    )
+    persisted_item = persisted["properties"]["new_findings"]["items"]
+    assert "carried_from" not in persisted_item["required"]  # persisted: optional
+
+    strict = _confirmer_output_schema(persisted)
+    strict_item = strict["properties"]["new_findings"]["items"]
+    # every property (incl. carried_from) is required in the strict shape
+    assert set(strict_item["required"]) == set(strict_item["properties"])
+    assert "carried_from" in strict_item["required"]
+    assert strict_item["properties"]["carried_from"]["type"] == ["string", "null"]
+    assert strict_item["additionalProperties"] is False
+    # derivation is non-mutating: the persisted schema is unchanged
+    assert "carried_from" not in persisted_item["required"]
+
+
 def test_unknown_finding_field_still_rejected():
     # additionalProperties:false is preserved — an unknown field fails closed.
     bad = {

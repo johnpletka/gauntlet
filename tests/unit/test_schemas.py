@@ -130,11 +130,13 @@ def test_findings_schema_rejects_unknown_category_fail_closed():
         validate_schema(_finding("made-up-category"), _load("findings.json"))
 
 
-# --- P9: confirm remainder carry schema (FR-6.1, review F-007) ---------------
-# `new_findings` expands to a full findings-schema object plus `carried_from`
-# (required-but-nullable, strict-mode convention). Backward compatibility is
-# preserved through the persisted-artifact validation path, not by omitting the
-# field: an EMPTY new_findings validates unchanged.
+# --- P9: confirm remainder carry schema (FR-6.1, review F-001/F-007) ---------
+# `new_findings` expands to a full findings-schema object plus the ADDITIVE,
+# OPTIONAL `carried_from` field (PRD §6). The migration is additive: a
+# pre-migration confirm output validates unchanged whether `new_findings` is
+# empty OR carries entries that predate `carried_from`. The strict native-output
+# shape (carried_from promoted into `required`, required-but-nullable) is DERIVED
+# in code (cycle._confirmer_output_schema), not baked into this persisted schema.
 
 
 def test_confirm_empty_new_findings_still_validates():
@@ -145,17 +147,28 @@ def test_confirm_empty_new_findings_still_validates():
     )
 
 
-def test_confirm_new_findings_item_lists_carried_from_required_nullable():
-    # P9 / review F-007: the migrated item lists carried_from in `required` as
-    # nullable — the required-but-nullable convention (like suggested_fix), NOT an
-    # absent-optional field, is what preserves compatibility.
+def test_confirm_new_findings_item_carried_from_is_optional_nullable():
+    # P9 / review F-001: the persisted schema keeps `carried_from` OPTIONAL and
+    # nullable — it is NOT in `required` (the additive-migration contract, PRD §6).
+    # The findings-schema fields ARE required; carried_from is not.
     item = _load("confirm.json")["properties"]["new_findings"]["items"]
-    assert "carried_from" in item["required"]
     assert item["properties"]["carried_from"]["type"] == ["string", "null"]
-    # every findings-schema field is present in the expanded item (strict mode)
+    assert "carried_from" not in item["required"]
     for field in ("id", "severity", "category", "location", "claim", "evidence",
-                  "suggested_fix", "carried_from"):
+                  "suggested_fix"):
         assert field in item["required"], field
+
+
+def test_confirm_pre_migration_new_findings_entry_without_carried_from_validates():
+    # P9-A4 / review F-001: a pre-migration `new_findings` entry that predates
+    # `carried_from` (ordinary regression using only the findings-schema fields,
+    # no carried_from key) still validates — the additive-migration compatibility
+    # requirement the PRD states ("entries without carried_from still validate").
+    legacy = {"verdicts": [], "summary": "s", "new_findings": [
+        {"id": "N", "severity": "blocking", "category": "correctness",
+         "location": "a.py:1", "claim": "regressed", "evidence": "e",
+         "suggested_fix": None}]}
+    validate_schema(legacy, _load("confirm.json"))
 
 
 def test_confirm_diff_regression_entry_with_null_carried_from_validates():
@@ -189,6 +202,17 @@ def test_findings_schema_allows_optional_carried_from():
         "open_questions": [], "summary": "s"}
     validate_schema(carried, schema)
     validate_schema(_finding("correctness"), schema)  # omits carried_from → still valid
+
+
+def test_scaffold_confirm_schema_matches_root():
+    # The scaffold copy adopters receive must carry the same P9 carry migration
+    # (carried_from optional/additive) as the governing root schema — a drift would
+    # ship adopters a confirm schema that rejects legacy artifacts (review F-001).
+    root = (SCHEMAS / "confirm.json").read_text()
+    scaffold = (SCAFFOLD_SCHEMAS / "confirm.json").read_text()
+    assert root == scaffold
+    item = json.loads(scaffold)["properties"]["new_findings"]["items"]
+    assert "carried_from" not in item["required"]
 
 
 def test_scaffold_findings_schema_matches_root_after_migration():
