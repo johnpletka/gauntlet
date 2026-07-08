@@ -76,9 +76,11 @@ def run_ensemble_members(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ) or {}
         for key, m in ens.items():
             entry = members.setdefault(
-                key, {"profile": m.get("profile"), "lens": m.get("lens"), "unique_legit": 0}
+                key, {"profile": m.get("profile"), "lens": m.get("lens"),
+                      "unique_legit": 0, "raised": 0}
             )
             entry["unique_legit"] += int(m.get("unique_legit", 0) or 0)
+            entry["raised"] += int(m.get("raised", 0) or 0)
     return members
 
 
@@ -271,7 +273,14 @@ def panel_shrink_items(
     def _below(members: dict[str, dict[str, Any]], key: str) -> bool | None:
         total = sum(e["unique_legit"] for e in members.values())
         if total <= 0:
-            return None  # cannot judge a yield share when nobody was legit
+            # unique_legit is SOLE-SOURCE (PR #59 review F-004): a zero total
+            # with members that RAISED findings is the full-overlap case the
+            # §1.3 kill criterion targets — every member's unique share is
+            # below any threshold. A panel that raised nothing at all is
+            # genuinely unjudgeable (no signal either way).
+            if int(members[key].get("raised", 0) or 0) > 0:
+                return True
+            return None
         return (members[key]["unique_legit"] / total) < threshold
 
     text = _pipeline_text(repo_root, asset_root, pipeline_name)

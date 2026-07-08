@@ -446,9 +446,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     panel_err = _validate_panel(panel, step, ctx)
     if isinstance(panel_err, StepResult):
         return panel_err
-    # FR-1.1: an ensemble panel (≥2 members) runs the merge/dedup path; a
-    # one-member panel is the unchanged single-reviewer path (byte-identical).
-    is_ensemble = len(panel) >= 2
+    # FR-1.1: an ensemble panel (≥2 members) runs the merge/dedup path. A
+    # one-member panel is the unchanged single-reviewer path (byte-identical)
+    # ONLY when it carries no lens — a configured lens must actually be applied
+    # (PR #59 review F-003: `_validate_panel` verified the lens file existed and
+    # the single path then reviewed without it), so a lensed single member
+    # routes through the member machinery (lens fragment + per-member artifact;
+    # the merge is a no-op at n=1).
+    is_ensemble = len(panel) >= 2 or (len(panel) == 1 and panel[0].lens is not None)
     dedup_threshold = float(
         step.get("dedup_jaccard_threshold", ensemble.DEFAULT_JACCARD_THRESHOLD)
     )
@@ -867,7 +872,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             ))
         if is_ensemble:  # post-triage-legitimate per member (FR-1.3)
             metrics.record_ensemble_legit(
-                _ensemble_legit_by_member(triage_findings, verdicts)
+                _ensemble_legit_by_member(triage_findings, verdicts, panel)
             )
         if verifier_profile:  # triage-legitimate behavioral yield (FR-2, §9)
             metrics.record_verifier_legit(triage_findings, verdicts)
@@ -1334,7 +1339,7 @@ class PanelMember:
     """One member of an ensemble review panel (FR-1.1): a reviewer ``profile``
     paired with an assigned ``lens`` fragment, in panel-config ``index`` order."""
 
-    profile: str
+    profile: str | None
     lens: str | None
     index: int
 
@@ -1371,6 +1376,13 @@ def _panel(step: Step) -> list[PanelMember]:
                     profile=r.get("profile") or r.get("reviewer"),
                     lens=r.get("lens"), index=i,
                 ))
+            else:
+                # A malformed entry (bare number, list, null — a YAML typo) keeps
+                # a profile-less placeholder so pipeline load and `_validate_panel`
+                # FAIL on the missing profile, instead of the panel silently
+                # shrinking past its configured size (PR #59 review F-009;
+                # fail closed).
+                out.append(PanelMember(profile=None, lens=None, index=i))
         return out
     reviewer = step.get("reviewer")
     return [PanelMember(profile=reviewer, lens=None, index=0)] if reviewer else []
@@ -1571,14 +1583,29 @@ def _ensemble_review(
     return merged.findings, open_questions, "\n\n".join(summaries)
 
 
+def _sole_source(finding: dict[str, Any]) -> bool:
+    """True iff this primary was raised by exactly one panel member.
+
+    ``sources`` aggregates every member that raised (a duplicate of) the
+    finding; a primary with more than one source is SHARED coverage — the
+    severity/tie-break winner merely *owns* the phrasing. Counting ownership as
+    uniqueness masks exactly the near-total-overlap case the §1.3 kill
+    criterion exists to detect (PR #59 review F-004): two members raising the
+    same set would both look uniquely productive. Absent ``sources`` (a
+    non-merged finding) falls back to the single ``source``."""
+    return len(finding.get("sources") or [finding.get("source")]) == 1
+
+
 def _ensemble_member_stats(
     ctx: StepContext, panel: list[PanelMember], rnd: int,
     primaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Per-member raised (from the persisted member artifact) + unique-after-dedup
-    (primaries this member owns) for a round (FR-1.3). Works identically on a
-    fresh merge and a reused merged review — both leave the member artifacts on
-    disk."""
+    for a round (FR-1.3). ``unique_after_dedup`` counts primaries this member
+    alone raised (sole-source — see :func:`_sole_source`), the §1.3/§9 reading:
+    a finding both members raised is shared coverage and counts toward neither.
+    Works identically on a fresh merge and a reused merged review — both leave
+    the member artifacts on disk."""
     stats: list[dict[str, Any]] = []
     for member in panel:
         raised = 0
@@ -1591,6 +1618,7 @@ def _ensemble_member_stats(
         unique = sum(
             1 for p in primaries
             if p.get("source") == member.profile and p.get("lens") == member.lens
+            and _sole_source(p)
         )
         stats.append({
             "key": member.metric_key, "profile": member.profile,
@@ -1600,17 +1628,29 @@ def _ensemble_member_stats(
 
 
 def _ensemble_legit_by_member(
-    primaries: list[dict[str, Any]], verdicts: list[dict[str, Any]]
+    primaries: list[dict[str, Any]], verdicts: list[dict[str, Any]],
+    panel: list[PanelMember],
 ) -> dict[str, int]:
-    """Per-(profile, lens) count of primaries this member owns that triage judged
-    ``legitimate`` — the post-triage-legitimate yield (FR-1.3 / §9)."""
+    """Per-(profile, lens) count of SOLE-SOURCE primaries this member raised that
+    triage judged ``legitimate`` — the post-triage unique-legit yield (FR-1.3 /
+    §9 / §1.3 kill criterion).
+
+    Restricted to actual panel members: verifier findings (``source:
+    "verifier"``) and carried remainders (no source, engine-synthesized
+    ``legitimate`` verdicts) are NOT panel yield — un-filtered they minted
+    phantom ``verifier::nolens`` / ``None::nolens`` members in the exact metric
+    the §9 panel-shrink governance consumes (PR #59 review F-002)."""
+    allowed = {m.metric_key for m in panel}
     verdict_by_id = {v.get("finding_id"): v for v in verdicts}
     legit: dict[str, int] = {}
     for p in primaries:
         v = verdict_by_id.get(p.get("id"))
-        if v and v.get("verdict") == "legitimate":
-            key = f"{p.get('source')}::{p.get('lens') or 'nolens'}"
-            legit[key] = legit.get(key, 0) + 1
+        if not v or v.get("verdict") != "legitimate":
+            continue
+        key = f"{p.get('source')}::{p.get('lens') or 'nolens'}"
+        if key not in allowed or not _sole_source(p):
+            continue
+        legit[key] = legit.get(key, 0) + 1
     return legit
 
 

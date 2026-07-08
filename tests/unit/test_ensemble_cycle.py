@@ -142,10 +142,14 @@ def test_two_member_panel_persists_merges_and_yields_metrics(fixture_repo):
     assert len(adapters["triage"].calls) == 2
 
     # P1-A3: per-(profile, lens) yield readable straight from the manifest.
+    # `unique_*` is SOLE-SOURCE (PR #59 review F-004): reviewer's F-001 was also
+    # raised by gemini (sources aggregate both), so it is SHARED coverage —
+    # owning the primary phrasing is not unique yield, and counting it as such
+    # would mask the near-total-overlap case the §1.3 kill criterion measures.
     ens = man.record("cycle").metrics["ensemble"]["unique_legit_by_member"]
     assert ens["reviewer::correctness"] == {
         "profile": "reviewer", "lens": "correctness",
-        "raised": 1, "unique_after_dedup": 1, "unique_legit": 1,
+        "raised": 1, "unique_after_dedup": 0, "unique_legit": 0,
     }
     assert ens["gemini::spec-coverage"] == {
         "profile": "gemini", "lens": "spec-coverage",
@@ -319,6 +323,65 @@ def test_one_member_config_is_byte_identical_to_single_reviewer(fixture_repo, tm
     obj = json.loads(single)
     for f in obj["findings"]:
         assert not (set(f) & {"source", "lens", "duplicate_of", "sources"})
+
+
+def test_one_member_panel_with_lens_applies_the_lens(fixture_repo):
+    # PR #59 review F-003: byte-compat covers only the LENS-LESS one-member
+    # config. A one-member panel that DECLARES a lens must actually review with
+    # it (previously `_validate_panel` proved the lens file existed, then the
+    # single-reviewer branch silently reviewed without it).
+    repo = _ens_repo(fixture_repo)
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("0-reviewer-security:F-001")))
+    adapters = {"reviewer": reviewer, "gemini": SeqAdapter(),
+                "triage": SeqAdapter(V("x")),
+                "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+                "esc": SeqAdapter()}
+    step_extra = {"reviewers": [{"profile": "reviewer", "lens": "security"}]}
+    status, _man, run_dir = run_cycle(repo, adapters, step_extra=step_extra,
+                                      config=ENS_CONFIG)
+    assert status == M.RUN_DONE
+    # the lens fragment reached the reviewer's prompt
+    assert "security** member of the review panel" in reviewer.calls[0]["prompt"]
+    # and the member machinery ran: per-member artifact + stamped ensemble fields
+    assert len(list(_members_dir(run_dir).glob("*.json"))) == 1
+    merged = json.loads((run_dir / "artifacts" / "findings.json").read_text())
+    assert merged["findings"][0]["source"] == "reviewer"
+    assert merged["findings"][0]["lens"] == "security"
+
+
+def test_legit_by_member_excludes_verifier_and_carried_phantoms():
+    # PR #59 review F-002: verifier findings (source "verifier") and carried
+    # remainders (no source, engine-synthesized legitimate verdicts) are not
+    # panel yield — un-filtered they minted phantom "verifier::nolens" /
+    # "None::nolens" members in metrics.ensemble.unique_legit_by_member, the
+    # exact field the §9 panel-shrink governance consumes.
+    from gauntlet.engine.cycle import PanelMember, _ensemble_legit_by_member
+
+    panel = [PanelMember(profile="reviewer", lens="correctness", index=0)]
+    primaries = [
+        {"id": "A", "source": "reviewer", "lens": "correctness",
+         "sources": ["reviewer"]},
+        {"id": "B", "source": "verifier", "lens": None},          # behavioral
+        {"id": "F-1-r1-c0", "carried_from": "F-1"},               # remainder
+    ]
+    verdicts = [{"finding_id": fid, "verdict": "legitimate"} for fid in
+                ("A", "B", "F-1-r1-c0")]
+    assert _ensemble_legit_by_member(primaries, verdicts, panel) == {
+        "reviewer::correctness": 1
+    }
+
+
+def test_shared_primary_is_not_unique_legit_for_its_owner():
+    # PR #59 review F-004 at the helper level: a primary with two sources is
+    # shared coverage; it counts toward NEITHER member's unique yield.
+    from gauntlet.engine.cycle import PanelMember, _ensemble_legit_by_member
+
+    panel = [PanelMember(profile="reviewer", lens="correctness", index=0),
+             PanelMember(profile="gemini", lens="spec-coverage", index=1)]
+    primaries = [{"id": "A", "source": "reviewer", "lens": "correctness",
+                  "sources": ["reviewer", "gemini"]}]
+    verdicts = [{"finding_id": "A", "verdict": "legitimate"}]
+    assert _ensemble_legit_by_member(primaries, verdicts, panel) == {}
 
 
 # ===========================================================================

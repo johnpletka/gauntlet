@@ -195,6 +195,44 @@ def test_section_overlap_uses_prefix():
     assert not E.locations_overlap(_sec("d", "5"), _sec("d", "52"))
 
 
+def test_section_prefix_holds_for_slash_and_gt_paths():
+    # PR #59 review F-001: the PRD's own §6 worked example — "§5 overlaps
+    # §5/FR-6.1; §5/FR-6.1 does NOT overlap §5/FR-6.2" — must hold for the
+    # heading-path notations reviewers actually emit, not only dotted ids.
+    a = E.parse_location("prd.md:§5")
+    b = E.parse_location("prd.md:§5/FR-6.1")
+    c = E.parse_location("prd.md:§5/FR-6.2")
+    assert E.locations_overlap(a, b)
+    assert E.locations_overlap(b, a)          # symmetric
+    assert not E.locations_overlap(b, c)      # siblings never overlap
+    # ">"-separated paths and per-segment markers canonicalize identically
+    d = E.parse_location("prd.md:#5 > §FR-6.1")
+    assert E.locations_overlap(a, d) and E.locations_overlap(b, d)
+    # whitespace inside a heading TITLE is one segment, never a separator —
+    # "deployment" must not prefix-match "deployment strategy"
+    assert E.parse_location("doc.md:§deployment strategy").section == "deployment strategy"
+    assert not E.locations_overlap(
+        E.parse_location("doc.md:§deployment"),
+        E.parse_location("doc.md:§deployment strategy"),
+    )
+
+
+def test_common_reviewer_line_shapes_parse_as_lines():
+    # PR #59 review F-008: these silently degraded to section-kind in a code
+    # file, where the cross-kind rule made them undeduplicable against genuine
+    # line ranges. Each must overlap a plain line cite inside its span.
+    line13 = E.parse_location("src/foo.py:13")
+    linecol = E.parse_location("src/foo.py:13:5")
+    assert (linecol.start, linecol.end, linecol.section) == (13, 13, None)
+    assert E.locations_overlap(linecol, line13)
+    commas = E.parse_location("src/foo.py:12, 15")
+    assert (commas.start, commas.end) == (12, 15)  # conservative envelope
+    assert E.locations_overlap(commas, line13)
+    annotated = E.parse_location("src/foo.py:12-14 (the loop)")
+    assert (annotated.start, annotated.end) == (12, 14)
+    assert E.locations_overlap(annotated, line13)
+
+
 # --- mixed line-vs-whole-file ------------------------------------------------
 def _wf(file):
     return E.Location(file=file, start=None, end=None, section=None)

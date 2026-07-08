@@ -110,7 +110,16 @@ class Location:
 
 
 _LINE_RE = re.compile(r"^\d+$")
-_RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
+_RANGE_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+# Common reviewer-emitted line shapes (PR #59 review F-008) — previously these
+# silently degraded to *section* kind in a code file, where the cross-kind rule
+# made them undeduplicable against genuine line ranges:
+#   "12:5"            line:column  ⇒ line 12 (column dropped)
+#   "12, 15" / "3,9"  comma list   ⇒ conservative envelope [min, max]
+#   "12-14 (loop)"    range + parenthetical comment ⇒ the range
+_LINECOL_RE = re.compile(r"^(\d+):(\d+)$")
+_LIST_RE = re.compile(r"^\d+(\s*,\s*\d+)+$")
+_ANNOTATED_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?\s*\(.*\)$")
 # "looks like it was meant to be a line/range ref" — only digits and dashes but
 # not one of the two valid forms ⇒ a malformed number ⇒ invalid location.
 _NUMERICISH_RE = re.compile(r"^[\d-]+$")
@@ -124,7 +133,10 @@ def parse_location(raw: str | None) -> Location:
         resolution); everything right is the locator.
       * a ``file`` with no ``:`` (and hence no locator) ⇒ whole-file.
       * locator ``<n>`` ⇒ single line ``[n, n]``; ``<a>-<b>`` ⇒ inclusive range;
-        ``§<s>``/``#<s>``/bare non-numeric text ⇒ section; empty ⇒ whole-file.
+        ``<n>:<col>`` ⇒ line ``[n, n]``; ``<a>, <b>, …`` ⇒ envelope
+        ``[min, max]``; ``<n>``/``<a>-<b>`` + a parenthetical comment ⇒ the
+        line/range; ``§<s>``/``#<s>``/bare non-numeric text ⇒ section; empty ⇒
+        whole-file.
       * a locator that looks numeric (digits/dashes) but is not a valid
         line/range ⇒ **invalid** (``valid=False``).
     """
@@ -155,6 +167,20 @@ def parse_location(raw: str | None) -> Location:
         a, b = int(m.group(1)), int(m.group(2))
         lo, hi = (a, b) if a <= b else (b, a)
         return Location(file=file, start=lo, end=hi, section=None)
+    m = _LINECOL_RE.match(locator)
+    if m:  # "12:5" line:column — the column is sub-line detail, keep the line
+        n = int(m.group(1))
+        return Location(file=file, start=n, end=n, section=None)
+    m = _LIST_RE.match(locator)
+    if m:  # "12, 15" — conservative envelope; over-covers, never wrong-kind
+        nums = [int(x) for x in re.findall(r"\d+", locator)]
+        return Location(file=file, start=min(nums), end=max(nums), section=None)
+    m = _ANNOTATED_RE.match(locator)
+    if m:  # "12-14 (the loop)" — the parenthetical is commentary, not a section
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        lo, hi = (a, b) if a <= b else (b, a)
+        return Location(file=file, start=lo, end=hi, section=None)
     if _NUMERICISH_RE.match(locator):
         # digits/dashes but not a valid line or range ⇒ malformed number.
         return Location(file=file, start=None, end=None, section=None, valid=False)
@@ -166,20 +192,33 @@ def parse_location(raw: str | None) -> Location:
 _SECTION_LEADERS = ("§", "#", "sec.", "section")
 
 
-def _canonical_section(text: str) -> str:
-    """Canonicalize a section id: lowercase, strip a leading section marker,
-    collapse whitespace, trim. Dotted/hierarchical ids keep their dots."""
-    s = text.strip().lower()
+def _strip_leader(segment: str) -> str:
     for leader in _SECTION_LEADERS:
-        if s.startswith(leader):
-            s = s[len(leader):].strip()
-            break
-    return " ".join(s.split())
+        if segment.startswith(leader):
+            return segment[len(leader):].strip()
+    return segment
+
+
+def _canonical_section(text: str) -> str:
+    """Canonicalize a section id to a dotted heading path: lowercase, collapse
+    whitespace, strip a leading section marker off every path segment, and
+    normalize the hierarchy separators reviewers actually emit (``/``, ``>``)
+    to ``.``. ``§5/FR-6.1`` and ``#5 > FR-6.1`` both canonicalize to
+    ``5.fr-6.1``, so the §6 prefix rule (``§5`` overlaps ``§5/FR-6.1``) holds
+    across notations — not only for dotted ids (PR #59 review F-001).
+    Whitespace inside a segment (a heading *title*) is never a separator."""
+    s = " ".join(text.strip().lower().split())
+    segments = [
+        _strip_leader(p.strip()) for p in re.split(r"\s*[/>]\s*", s) if p.strip()
+    ]
+    return ".".join(seg for seg in segments if seg)
 
 
 def section_is_prefix(a: str, b: str) -> bool:
     """True iff section ``a`` is a prefix of section ``b`` (``4`` matches ``4.2``
-    but not ``42``): ``b == a`` or ``b`` starts with ``a + "."``."""
+    but not ``42``): ``b == a`` or ``b`` starts with ``a + "."``. Canonical
+    sections are dotted paths (``_canonical_section``), so this covers ``/``-
+    and ``>``-separated heading paths too."""
     return b == a or b.startswith(a + ".")
 
 

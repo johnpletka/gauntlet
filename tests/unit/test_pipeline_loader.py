@@ -285,6 +285,25 @@ stages:
         validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
 
 
+def test_malformed_reviewers_entry_rejected_at_load(tmp_path):
+    # PR #59 review F-009: a reviewers: entry that is neither a profile string
+    # nor a {profile, lens} mapping (a YAML typo — here a bare number) must fail
+    # at load, not silently shrink the panel below its configured size.
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         reviewers: [42, {profile: reviewer, lens: null}],
+         triager: triage, fixer: builder, max_rounds: 1}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError, match="reviewer"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
 def test_unknown_on_fail_target_rejected(tmp_path):
     text = """
 name: d

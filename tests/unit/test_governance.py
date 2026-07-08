@@ -117,10 +117,11 @@ def test_remove_verifier_drops_block_mapping():
 
 
 # --- corpus metric extraction ------------------------------------------------
-def _ens_run(run_id: str, members: dict[str, int]) -> dict:
+def _ens_run(run_id: str, members: dict[str, int], raised: int = 10) -> dict:
     """A manifest dict with one cycle step carrying per-member unique_legit."""
     by_member = {
-        f"{p}::lens": {"profile": p, "lens": "lens", "unique_legit": n}
+        f"{p}::lens": {"profile": p, "lens": "lens", "unique_legit": n,
+                       "raised": raised}
         for p, n in members.items()
     }
     return {"run_id": run_id, "steps": [
@@ -148,6 +149,30 @@ def test_panel_shrink_fires_on_two_below_threshold(tmp_path: Path):
     assert any("gemini" in l for l in minus)          # removed on the - side
     assert not any("gemini" in l for l in plus)       # never on the + side
     assert any("reviewer, lens: correctness" in l for l in plus)  # the peer survives
+
+
+def test_panel_shrink_fires_on_full_overlap(tmp_path: Path):
+    # PR #59 review F-004 follow-through: unique_legit is SOLE-SOURCE, so a
+    # panel whose members fully overlap records 0 unique for everyone while
+    # still raising findings — the exact §1.3 failure case. Zero total with
+    # raised > 0 is "below any threshold", not "cannot judge".
+    _pipeline_repo(tmp_path)
+    corpus = [
+        _ens_run("run-a", {"reviewer": 0, "gemini": 0}),
+        _ens_run("run-b", {"reviewer": 0, "gemini": 0}),
+    ]
+    items = gov.panel_shrink_items(corpus, tmp_path, ".", "standard")
+    assert {i["slug"] for i in items} >= {"shrink-panel-gemini"}
+
+
+def test_panel_shrink_silent_when_panel_raised_nothing(tmp_path: Path):
+    # Zero unique AND zero raised: no signal either way — no proposal.
+    _pipeline_repo(tmp_path)
+    corpus = [
+        _ens_run("run-a", {"reviewer": 0, "gemini": 0}, raised=0),
+        _ens_run("run-b", {"reviewer": 0, "gemini": 0}, raised=0),
+    ]
+    assert gov.panel_shrink_items(corpus, tmp_path, ".", "standard") == []
 
 
 def test_panel_shrink_silent_when_above_threshold(tmp_path: Path):
