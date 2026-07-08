@@ -773,3 +773,19 @@ def test_boundary_registration_failure_parks_cycle(monkeypatch, tmp_path, fixtur
     assert result.status == M.PARKED
     assert "no boundary" in result.notes
     assert verifier.calls == []  # never launched without a registered boundary
+
+
+def test_configure_claude_verifier_arms_resource_caps(tmp_path):
+    """§7 item 5 (PR #59): the verifier posture arms best-effort rlimit caps on
+    the claude child (inherited by forked children — one of the few §7 controls
+    that survives the subprocess boundary); non-verifier adapters are untouched."""
+    import os as _os
+
+    from gauntlet.adapters.claude_code import ClaudeCodeAdapter
+
+    adapter = ClaudeCodeAdapter(model="opus")
+    assert adapter.spawn_preexec is None  # ordinary claude steps: unchanged
+    env = verify.verifier_env(_JUDGE_ENV, tmp_path / "copy")
+    verify.configure_claude_verifier(adapter, env=env)
+    if _os.name == "posix":
+        assert callable(adapter.spawn_preexec)

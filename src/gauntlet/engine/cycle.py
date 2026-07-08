@@ -2230,6 +2230,14 @@ def _load_precedents(
     path = reg.registry_path(ctx.repo_root, ctx.config.asset_root)
     present = path.exists()
     entries = reg.load_registry(path)
+    # Ratified supersessions retire a fingerprint from injection (FR-5.2 / §6,
+    # PR #59 review F-4) — the entry stays in declined.jsonl for audit, it just
+    # stops surfacing as precedent.
+    superseded = reg.load_superseded(
+        reg.supersessions_path(ctx.repo_root, ctx.config.asset_root)
+    )
+    if superseded:
+        entries = [e for e in entries if e.fingerprint not in superseded]
     if not entries:
         return {}, present
     blocks = reg.precedents_by_finding(
@@ -3216,14 +3224,18 @@ def _confirmer_output_schema(confirm_schema: dict) -> dict:
     """The STRICT confirm-output schema handed to the confirmer adapter (F-007).
 
     ``schemas/confirm.json`` is the PERSISTED confirm-record schema: per PRD §6 the
-    P9 carry change is additive, so ``carried_from`` is an OPTIONAL field on each
-    ``new_findings`` item (a pre-migration entry that omits it still validates).
-    But the confirmer emits ``new_findings`` through the native ``--output-schema``
-    path, and strict mode requires EVERY property in ``required``. This derivation
-    promotes ``carried_from`` into the item's ``required`` list (required-but-
-    nullable, the same convention ``suggested_fix`` uses) so the strict shape is
-    complete. No-op when the item already requires it or has no such property
-    (defensive) — never mutates the input."""
+    P9 carry change is additive, so a ``new_findings`` item requires only the true
+    pre-migration trio (``severity``, ``claim``, ``location``) — a genuinely
+    pre-migration entry (which carried exactly those three fields) still
+    validates (PR #59 review F-3: the P9.1 fix demoted only ``carried_from``,
+    leaving ``id``/``category``/``evidence``/``suggested_fix`` required — the
+    headline closed while the enumerated remainder was dropped, inside the
+    convergence-honesty phase). But the confirmer emits ``new_findings`` through
+    the native ``--output-schema`` path, and strict mode requires EVERY property
+    in ``required``. This derivation promotes every declared item property into
+    the ``required`` list (nullable-where-nullable, the convention
+    ``suggested_fix`` uses) so the NATIVE strict shape stays complete while the
+    persisted schema stays additive. Never mutates the input."""
     schema = json.loads(json.dumps(confirm_schema))
     try:
         item = schema["properties"]["new_findings"]["items"]
@@ -3231,8 +3243,9 @@ def _confirmer_output_schema(confirm_schema: dict) -> dict:
         required = item["required"]
     except (KeyError, TypeError):
         return schema
-    if "carried_from" in props and "carried_from" not in required:
-        required.append("carried_from")
+    for prop in props:
+        if prop not in required:
+            required.append(prop)
     return schema
 
 

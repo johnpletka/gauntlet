@@ -224,6 +224,10 @@ def verifier_env(
 # throwaway copy); the judge hook confines every path to the copy root.
 VERIFIER_ALLOWED_TOOLS: tuple[str, ...] = ("Bash", "Read", "Grep", "Glob", "Edit", "Write")
 VERIFIER_PERMISSION_MODE = "acceptEdits"
+# §7 item 5 resource caps (PR #59): generous — the point is bounding a runaway
+# verifier turn (fork bombs, memory blowups), not failing a healthy one.
+VERIFIER_MEM_BYTES = 8 * 1024**3
+VERIFIER_CPU_SECONDS = 3600
 # --setting-sources project makes claude load the repo's PreToolUse judge hook
 # (pins.yaml: claude only fires the engine-managed hook under this setting).
 _SETTING_SOURCES_FLAGS = ("--setting-sources", "project")
@@ -604,6 +608,17 @@ def configure_claude_verifier(adapter, *, env: dict[str, str]) -> list[str]:
         adapter.base_flags = flags
     if hasattr(adapter, "env"):
         adapter.env = dict(env)
+    # §7 item 5 (PR #59): best-effort memory/CPU caps on the verifier process
+    # group, alongside the wall-clock timeout. rlimits are inherited by forked
+    # children, so this is one of the few §7 controls that survives the
+    # subprocess boundary the hook cannot cross. Best-effort by platform
+    # (macOS ignores RLIMIT_AS); the wall-clock kill remains the hard ceiling.
+    if hasattr(adapter, "spawn_preexec") and os.name == "posix":
+        from gauntlet.engine.collectors import _rlimit_preexec
+
+        adapter.spawn_preexec = _rlimit_preexec(
+            VERIFIER_MEM_BYTES, VERIFIER_CPU_SECONDS
+        )
     return []
 
 

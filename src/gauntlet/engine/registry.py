@@ -48,6 +48,10 @@ REJECT_VERDICTS = frozenset({"bikeshedding", "premature_optimization", "not_appl
 
 # Registry file, relative to ``asset_root`` (append-only, cross-run, committable).
 REGISTRY_REL = "registry/declined.jsonl"
+# Ratified supersessions (PR #59 review F-4): append-only, on the proposals
+# allowlist — the targeted invalidation path §6 promises. A fingerprint listed
+# here is withheld from injection; its declined.jsonl entries stay for audit.
+SUPERSESSIONS_REL = "registry/supersessions.jsonl"
 
 # Governed assets whose content hash gates injection (FR-5.2 "in force").
 TRIAGE_PROMPT_REF = "prompts/triage.md"
@@ -196,6 +200,43 @@ class DeclinedEntry:
 
 def registry_path(repo_root: Path, asset_root: str) -> Path:
     return repo_root / asset_root / REGISTRY_REL
+
+
+def supersessions_path(repo_root: Path, asset_root: str) -> Path:
+    return repo_root / asset_root / SUPERSESSIONS_REL
+
+
+def load_superseded(path: Path) -> set[str]:
+    """Fingerprints explicitly retired by ratified supersession entries
+    (FR-5.2 / §6, PR #59 review F-4).
+
+    Previously the only real supersession was the wholesale hash-bump of an
+    entire prompt: a wrong or poisoned precedent recorded under CURRENT
+    prompt/lens/schema hashes could not be retired through governance at all —
+    a proposal diff touching the registry was allowlist-refused before a human
+    could ratify it. Supersessions are their own append-only file on the
+    proposals allowlist (with an append-only diff guard); a superseded
+    fingerprint is withheld from injection but RETAINED in declined.jsonl for
+    audit. Same fail-open read posture as the registry (precedent is advisory;
+    a corrupt line never crashes triage)."""
+    if not path.exists():
+        return set()
+    try:
+        text = path.read_text()
+    except OSError:
+        return set()
+    superseded: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("fingerprint"):
+            superseded.add(str(obj["fingerprint"]))
+    return superseded
 
 
 def load_registry(path: Path) -> list[DeclinedEntry]:

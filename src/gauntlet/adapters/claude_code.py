@@ -96,6 +96,10 @@ class ClaudeCodeAdapter:
         # env so the PreToolUse hook fires). ``None`` (every non-verifier claude
         # step) inherits the parent environment exactly as before — additive knob.
         self.env = dict(env) if env is not None else None
+        # Optional child preexec hook (PR #59 §7 item 5): the verifier posture
+        # (verify.configure_claude_verifier) sets best-effort rlimit caps here;
+        # ``None`` (every non-verifier claude step) spawns exactly as before.
+        self.spawn_preexec = None
         lint_flags(self._build_argv("", session=None, schema=None))
 
     def streams_to_sink(self) -> bool:
@@ -126,7 +130,7 @@ class ClaudeCodeAdapter:
         effective_sink = sink if (sink is not None and self.streams_to_sink()) else None
         out = run_with_timeout(
             argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
-            sink=effective_sink, env=self.env,
+            sink=effective_sink, env=self.env, preexec_fn=self.spawn_preexec,
         )
         if out.timed_out:
             raise AgentTimeoutError(

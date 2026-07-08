@@ -512,3 +512,51 @@ def test_steps_without_a_boundary_are_unaffected(tmp_path):
         repo_root=run_worktree, step_id="implement",
     )
     assert d.matched_rule != "verifier-boundary-path"
+
+
+# --- governed learning assets write-guard (PR #59 review F-5 / §7) ------------
+def test_pipeline_write_to_lens_or_registry_denied(tmp_path):
+    # §7 "no agent-writable path mutates them" is now enforced, not convention:
+    # an IN-PIPELINE write to a review lens or the declined/supersession
+    # registries is denied — they change only via ratified retro proposals.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    for rel in ("prompts/lenses/security.md",
+                "registry/declined.jsonl",
+                "registry/supersessions.jsonl",
+                ".gauntlet/prompts/lenses/custom.md"):  # adopter layout too
+        d = core.decide(
+            "Write", {"file_path": str(REPO_ROOT / rel), "content": "poison"},
+            repo_root=REPO_ROOT, step_id="implement",
+        )
+        assert d.decision == "deny", rel
+        assert d.matched_rule == "governed-learning-assets-in-pipeline", rel
+        e = core.decide(
+            "Edit", {"file_path": str(REPO_ROOT / rel), "old_string": "a",
+                     "new_string": "b"},
+            repo_root=REPO_ROOT, step_id="implement",
+        )
+        assert e.decision == "deny", rel
+
+
+def test_operator_session_lens_write_not_matched_by_guard(tmp_path):
+    # pipeline_step_only: the operator's own session (no step_id) is unaffected
+    # — a human editing a lens directly remains their call.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    d = core.decide(
+        "Write", {"file_path": str(REPO_ROOT / "prompts/lenses/security.md"),
+                  "content": "operator edit"},
+        repo_root=REPO_ROOT, step_id=None,
+    )
+    assert d.matched_rule != "governed-learning-assets-in-pipeline"
+
+
+def test_content_mentioning_protected_path_is_not_matched(tmp_path):
+    # notes #32 class: the rule matches operation-TARGET paths, never content —
+    # editing a file whose content mentions prompts/lenses/ must not trip it.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    d = core.decide(
+        "Edit", {"file_path": str(REPO_ROOT / "src/gauntlet/engine/registry.py"),
+                 "old_string": "x", "new_string": "see prompts/lenses/security.md"},
+        repo_root=REPO_ROOT, step_id="implement",
+    )
+    assert d.matched_rule != "governed-learning-assets-in-pipeline"

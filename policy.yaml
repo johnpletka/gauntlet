@@ -137,6 +137,26 @@ deny:
     applies_to_tools: [Write, Edit, NotebookEdit, MultiEdit]
     path_escape: true
 
+  # PR #59 review F-5 (§7 "no agent-writable path mutates them", previously
+  # convention only): review lenses and the declined/supersession registries are
+  # ratification-governed learning assets — an in-pipeline agent writing them
+  # directly would inject precedent/lens content into later phases of the same
+  # run with no human in between (with auto_when_clean gates, none until the
+  # PR). They change ONLY through the ratified retro-proposal flow. Operator
+  # sessions are unaffected (pipeline_step_only). Matches operation-target
+  # paths, never file content, so editing a file that merely MENTIONS these
+  # paths is untouched (notes #32). Bash relative-path writes are not fast-path
+  # matched here, but redirects chain-escalate to the LLM/fail-closed rung
+  # rather than being allowed.
+  - name: governed-learning-assets-in-pipeline
+    description: "In-pipeline write to a ratification-governed learning asset (prompts/lenses/*, registry/declined.jsonl, registry/supersessions.jsonl); these change only via the ratified retro-proposal flow (FR-5.1/5.2, §7)."
+    applies_to_tools: [Write, Edit, NotebookEdit, MultiEdit, Bash]
+    pipeline_step_only: true
+    risk_category: governance
+    path_patterns:
+      - '/prompts/lenses/[^/]+$'
+      - '/registry/(declined|supersessions)\.jsonl$'
+
 allow:
   - name: git-readonly
     description: "Read-only git inspection."

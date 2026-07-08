@@ -101,6 +101,13 @@ class PolicyRule(BaseModel):
     description: str = ""
     applies_to_tools: list[str] | None = None
     command_patterns: list[str] = Field(default_factory=list)
+    # Regexes over the call's RESOLVED candidate paths — the operation targets
+    # (file-tool path keys, Bash path tokens), never a file's content strings,
+    # so a file whose content merely mentions a protected path is not matched
+    # (the BOOTSTRAP-NOTES #32 false-positive class command_patterns would hit
+    # for file tools). Added for the governed-learning-asset write guard
+    # (PR #59 review F-5).
+    path_patterns: list[str] = Field(default_factory=list)
     path_escape: bool = False  # path resolves outside repo_root
     credential_path: bool = False  # path matches a credential pattern (any location)
     credential_outside_repo: bool = False  # credential pattern AND outside repo
@@ -124,7 +131,7 @@ class PolicyRule(BaseModel):
     version: str | int | None = None
     ratified: bool = False
 
-    @field_validator("command_patterns")
+    @field_validator("command_patterns", "path_patterns")
     @classmethod
     def _compilable(cls, patterns: list[str]) -> list[str]:
         for pat in patterns:
@@ -133,6 +140,9 @@ class PolicyRule(BaseModel):
 
     def compiled(self) -> list[re.Pattern[str]]:
         return [re.compile(p, re.IGNORECASE) for p in self.command_patterns]
+
+    def compiled_paths(self) -> list[re.Pattern[str]]:
+        return [re.compile(p, re.IGNORECASE) for p in self.path_patterns]
 
 
 class Policy(BaseModel):
@@ -280,6 +290,14 @@ class PolicyEngine:
         checks: list[bool] = []
         if rule.command_patterns:
             checks.append(any(p.search(command) for p in rule.compiled()))
+        if rule.path_patterns:
+            # match against RESOLVED operation-target paths (relative paths
+            # resolve against the run's repo_root) — never content strings
+            compiled_paths = rule.compiled_paths()
+            checks.append(any(
+                pat.search(str(self._resolve(p, repo_root)))
+                for p in paths for pat in compiled_paths
+            ))
         if rule.path_escape:
             checks.append(any(self._escapes(p, repo_root) for p in paths))
         if rule.credential_path:

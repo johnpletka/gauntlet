@@ -29,8 +29,16 @@ from gauntlet.logging.redact import RedactingWriter
 # Versioned-asset allowlist (review F-001). A proposal diff may touch only paths
 # under these prefixes or exactly these files; anything else is refused before
 # the human sees it. Kept deliberately small and explicit.
+# `registry/supersessions.jsonl` (PR #59 review F-4): FR-5.2/§6 say a recorded
+# decline is invalidated/superseded "through a ratified retro proposal" — but a
+# diff touching the registry was allowlist-refused before a human could ever
+# ratify it, and the only real supersession was the wholesale hash-bump of an
+# entire prompt. Supersessions are their own APPEND-ONLY file (never an in-place
+# edit of declined.jsonl, which stays pure audit): a ratified append marks one
+# fingerprint retired, and `_validate_diff` refuses any diff that removes lines
+# from it.
 ALLOWLIST_PREFIXES = ("prompts/", "pipelines/", "schemas/")
-ALLOWLIST_FILES = ("policy.yaml",)
+ALLOWLIST_FILES = ("policy.yaml", "registry/supersessions.jsonl")
 
 # Proposal lifecycle states.
 PENDING = "pending"
@@ -276,6 +284,20 @@ def _validate_diff(
             f"declared target_path {declared!r} does not match the diff's "
             f"actual target(s) {targets}"
         )
+    # Append-only contract for the supersessions registry (PR #59 review F-4):
+    # a proposal may ADD supersession entries, never rewrite or remove history —
+    # the registry files are audit records. Any removed content line in a diff
+    # targeting it is refused before the human sees it.
+    if targets and targets[0].endswith("registry/supersessions.jsonl"):
+        removed = [
+            ln for ln in diff.splitlines()
+            if ln.startswith("-") and not ln.startswith("---")
+        ]
+        if removed:
+            return False, (
+                "registry/supersessions.jsonl is append-only: the diff removes "
+                f"{len(removed)} line(s); supersession history is never rewritten"
+            )
     if not gitops.apply_patch_check(repo_root, _ensure_trailing_nl(diff)):
         return False, "diff does not apply cleanly to the current asset"
     return True, ""

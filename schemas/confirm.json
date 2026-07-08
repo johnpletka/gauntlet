@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/confirm.json",
   "title": "Confirm-pass verdicts (FR-9.5)",
-  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase, AND carry the concrete unresolved remainder of a `partially_resolved` accepted finding (pipeline-effectiveness FR-6.1, P9). Compat note (PRD §6, same rule as findings.json's engine annotations): this file is the PERSISTED confirm-record validation schema, and the P9 schema change is ADDITIVE — `carried_from` is an OPTIONAL field on each `new_findings` item (`null`/absent for an ordinary diff regression, a `<finding-id>` for a carried remainder), NOT in `required`. So a pre-migration confirm output validates unchanged whether `new_findings` is EMPTY or carries entries that predate `carried_from` (the engine's read path treats a pre-`carried_from` entry as `carried_from: null`). Strict-mode note (review F-007): native `--output-schema` requires EVERY property in `required`, so the confirmer's strict output schema — which additionally lists `carried_from` in `required` (required-but-nullable, like `suggested_fix`) — is DERIVED from this persisted schema in code (see `cycle._confirmer_output_schema`); it is never emitted by hand and never governs a persisted artifact.",
+  "description": "Diff-scoped confirm output: the reviewer judges, per prior finding, whether the commit-range diff addressed it. `new_findings` lets the confirm pass surface a regression it noticed in the diff without re-reviewing the whole phase, AND carry the concrete unresolved remainder of a `partially_resolved` accepted finding (pipeline-effectiveness FR-6.1, P9). Compat note (PRD §6, same rule as findings.json's engine annotations): this file is the PERSISTED confirm-record validation schema, and the P9 schema change is ADDITIVE — a `new_findings` item requires only the true pre-migration trio (`severity`, `claim`, `location`); `id`, `category`, `evidence`, `suggested_fix`, and `carried_from` are OPTIONAL on the persisted record (PR #59 review F-3: requiring them failed every genuinely pre-migration non-empty `new_findings`). So a pre-migration confirm output validates unchanged whether `new_findings` is EMPTY or carries true legacy entries (the engine's read path treats a pre-`carried_from` entry as `carried_from: null`). Strict-mode note (review F-007): native `--output-schema` requires EVERY property in `required`, so the confirmer's strict output schema — which promotes every declared item property into `required` (nullable-where-nullable, like `suggested_fix`) — is DERIVED from this persisted schema in code (see `cycle._confirmer_output_schema`); it is never emitted by hand and never governs a persisted artifact.",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdicts", "new_findings", "summary"],
@@ -34,7 +34,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "severity", "category", "location", "claim", "evidence", "suggested_fix"],
+        "required": ["severity", "claim", "location"],
         "properties": {
           "id": {
             "type": "string",

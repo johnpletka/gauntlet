@@ -148,27 +148,52 @@ def test_confirm_empty_new_findings_still_validates():
 
 
 def test_confirm_new_findings_item_carried_from_is_optional_nullable():
-    # P9 / review F-001: the persisted schema keeps `carried_from` OPTIONAL and
-    # nullable — it is NOT in `required` (the additive-migration contract, PRD §6).
-    # The findings-schema fields ARE required; carried_from is not.
+    # P9 / review F-001 + PR #59 review F-3: the persisted schema requires only
+    # the TRUE pre-migration trio (severity, claim, location) — the additive-
+    # migration contract, PRD §6. Everything the migration added or the modern
+    # engine stamps (id, category, evidence, suggested_fix, carried_from) is
+    # optional on the persisted record; the strict confirmer-derived schema
+    # (cycle._confirmer_output_schema) is what requires the full shape natively.
     item = _load("confirm.json")["properties"]["new_findings"]["items"]
     assert item["properties"]["carried_from"]["type"] == ["string", "null"]
-    assert "carried_from" not in item["required"]
-    for field in ("id", "severity", "category", "location", "claim", "evidence",
-                  "suggested_fix"):
-        assert field in item["required"], field
+    assert set(item["required"]) == {"severity", "claim", "location"}
 
 
 def test_confirm_pre_migration_new_findings_entry_without_carried_from_validates():
-    # P9-A4 / review F-001: a pre-migration `new_findings` entry that predates
-    # `carried_from` (ordinary regression using only the findings-schema fields,
-    # no carried_from key) still validates — the additive-migration compatibility
-    # requirement the PRD states ("entries without carried_from still validate").
+    # P9-A4 / review F-001: a `new_findings` entry without a carried_from key
+    # (a modern ordinary regression) still validates — the additive-migration
+    # compatibility requirement ("entries without carried_from still validate").
     legacy = {"verdicts": [], "summary": "s", "new_findings": [
         {"id": "N", "severity": "blocking", "category": "correctness",
          "location": "a.py:1", "claim": "regressed", "evidence": "e",
          "suggested_fix": None}]}
     validate_schema(legacy, _load("confirm.json"))
+
+
+def test_confirm_true_pre_migration_new_findings_entry_validates():
+    # PR #59 review F-3 (the P9.1 partial, finished): the GENUINE pre-migration
+    # item shape was exactly {severity, claim, location} (verified against
+    # main:schemas/confirm.json) — the prior fixture anachronistically carried
+    # id/category/evidence/suggested_fix, a shape no pre-migration engine ever
+    # emitted, so demoting only carried_from left every real legacy non-empty
+    # new_findings failing on four required fields. PRD §6: "a pre-migration
+    # confirm output with no new_findings (or entries without carried_from)
+    # still validates" — proven here with the true legacy shape.
+    true_legacy = {"verdicts": [], "summary": "s", "new_findings": [
+        {"severity": "blocking", "claim": "regressed", "location": "a.py:1"}]}
+    validate_schema(true_legacy, _load("confirm.json"))
+
+
+def test_confirmer_strict_schema_promotes_all_item_properties():
+    # The persisted-additive / strict-derived split (F-001 architecture):
+    # relaxing the persisted record must NOT relax what a live confirmer may
+    # emit — the native output schema still requires the full item shape.
+    from gauntlet.engine.cycle import _confirmer_output_schema
+
+    strict = _confirmer_output_schema(_load("confirm.json"))
+    item = strict["properties"]["new_findings"]["items"]
+    assert set(item["required"]) == set(item["properties"])
+    assert "carried_from" in item["required"] and "evidence" in item["required"]
 
 
 def test_confirm_diff_regression_entry_with_null_carried_from_validates():

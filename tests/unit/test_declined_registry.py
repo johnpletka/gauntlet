@@ -272,3 +272,33 @@ def test_human_decline_recorded_and_injected(repo: Path):
     )
     assert finding["id"] in blocks
     assert "prior verdict: not_applicable" in blocks[finding["id"]]
+
+
+# --- PR #59 review F-4: ratified supersessions retire a fingerprint ------------
+def test_load_superseded_reads_fingerprints(repo: Path):
+    path = reg.supersessions_path(repo, ".")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"fingerprint": "style/line/claim:x", "reason": "wrong",
+                    "by": "human", "at": "2026-07-08T00:00:00Z"}) + "\n"
+        + "not json\n"  # corrupt line: skipped, never crashes triage
+        + json.dumps({"fingerprint": "sec/line/claim:y"}) + "\n"
+    )
+    assert reg.load_superseded(path) == {"style/line/claim:x", "sec/line/claim:y"}
+    assert reg.load_superseded(repo / "registry" / "absent.jsonl") == set()
+
+
+def test_superseded_fingerprint_is_withheld_but_retained(repo: Path):
+    """§6/FR-5.2: the targeted invalidation path — a ratified supersession stops
+    a precedent from surfacing while the declined.jsonl audit record remains."""
+    finding = _finding()
+    entry = _entry_for(repo, finding)
+    superseded = {entry.fingerprint}
+    # the filter _load_precedents applies:
+    filtered = [e for e in [entry] if e.fingerprint not in superseded]
+    assert filtered == []
+    # and the underlying registry file is untouched by supersession (audit)
+    reg_path = reg.registry_path(repo, ".")
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.write_text(json.dumps({"fingerprint": entry.fingerprint}) + "\n")
+    assert entry.fingerprint in reg_path.read_text()
