@@ -49,6 +49,7 @@ import os
 import secrets
 import shlex
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -307,6 +308,34 @@ class BoundaryLease:
     run_id: str | None
 
 
+def make_scratch_home(root: Path) -> Path:
+    """A minimal scratch HOME for the sandboxed claude child (PR #59 F-006).
+
+    Re-pointing HOME removes the discovery surface un-hooked subprocess
+    children previously had (``~/.aws``, ``~/.ssh``, ``~/.config/gh`` were all
+    readable through the allowlisted real HOME). The claude CLI itself still
+    needs its login: the scratch home is seeded with symlinks to ONLY that
+    surface — ``~/.claude`` (config/credentials; also pinned via
+    ``CLAUDE_CONFIG_DIR``) and, on darwin, ``~/Library/Keychains`` (keychain-
+    backed OAuth). This is the conceded §7 item-6 residual (the CLI's own
+    credential), and nothing else. If login still fails, the hook-loading
+    probe parks the sub-step closed before any verifier work runs."""
+    scratch = root / "home"
+    scratch.mkdir(parents=True, exist_ok=True)
+    real = Path(os.environ.get("HOME", "")).expanduser()
+    if str(real) != "." and real.exists():
+        seeds = [".claude"]
+        if sys.platform == "darwin":
+            seeds.append("Library/Keychains")
+        for rel in seeds:
+            src = real / rel
+            dst = scratch / rel
+            if src.exists() and not (dst.exists() or dst.is_symlink()):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.symlink_to(src)
+    return scratch
+
+
 def register_boundary(
     judge_env: dict[str, str] | None, step_id: str, root: Path
 ) -> BoundaryLease:
@@ -515,8 +544,7 @@ def confirm_hook_loaded(
     # judge-side boundary on the probe's own step id (so the probe turn runs
     # under the same confinement discipline the real turn will, PR #59 B1).
     probe_step_id = f"{PROBE_STEP_PREFIX}{nonce}"
-    scratch_home = copy.root / "home"
-    scratch_home.mkdir(parents=True, exist_ok=True)
+    scratch_home = make_scratch_home(copy.root)
     env = verifier_env(
         judge_env or {}, copy.path, step_id=probe_step_id, scratch_home=scratch_home
     )

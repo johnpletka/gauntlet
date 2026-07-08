@@ -221,15 +221,27 @@ def test_unregistered_boundary_fails_the_launch_proof(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="claude CLI not installed")
+@pytest.mark.skipif(shutil.which("gauntlet-judge-hook") is None,
+                    reason="gauntlet-judge-hook not on PATH (uv tool install)")
 def test_real_claude_turn_cannot_read_outside_the_boundary(tmp_path):
     """FR-2.5 acceptance end-to-end: a real claude-code turn in a boundary-
     registered disposable copy, under a PINNED-ROOT judge, is asked to read a
     sentinel file outside the copy — the hook-mediated deny must keep the
-    sentinel content out of the turn's output."""
+    sentinel content out of the turn's output. The seeded repo carries the
+    tracked project PreToolUse hook settings (as `gauntlet init` writes and the
+    disposable copy inherits in a real run) so `--setting-sources project`
+    actually loads the hook."""
     from gauntlet.adapters.base import AdapterError
     from gauntlet.adapters.claude_code import ClaudeCodeAdapter
 
     repo = _seed_repo(tmp_path)
+    hook_settings = REPO / ".claude" / "settings.json"
+    (repo / ".claude").mkdir()
+    shutil.copy(hook_settings, repo / ".claude" / "settings.json")
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "hook settings"], cwd=repo, check=True)
     sentinel = tmp_path / "outside-secret.txt"
     sentinel.write_text("SENTINEL-9f2d1c-DO-NOT-LEAK\n")
     with _pinned_judge(repo) as (url, token, _core):

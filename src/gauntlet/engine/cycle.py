@@ -1758,8 +1758,7 @@ def _run_verifier(
         verifier_step_id = f"verify:r{rnd}:{secrets.token_hex(8)}"
         lease = verify.register_boundary(ctx.judge_env, verifier_step_id, copy.path)
         verify.confirm_boundary_enforced(lease, ctx.repo_root)
-        scratch_home = copy.root / "home"
-        scratch_home.mkdir(parents=True, exist_ok=True)
+        scratch_home = verify.make_scratch_home(copy.root)
         # Pin the claude-code verifier posture: confined allowed_tools (no network),
         # permission mode, --setting-sources project (so the judge hook fires), and
         # the rebuilt secret-stripped env — verifier step id (boundary key +

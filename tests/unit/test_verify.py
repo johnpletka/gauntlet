@@ -789,3 +789,25 @@ def test_configure_claude_verifier_arms_resource_caps(tmp_path):
     verify.configure_claude_verifier(adapter, env=env)
     if _os.name == "posix":
         assert callable(adapter.spawn_preexec)
+
+
+def test_make_scratch_home_seeds_only_the_claude_login_surface(tmp_path, monkeypatch):
+    """PR #59 F-006: the scratch HOME hides ~/.aws, ~/.ssh, ~/.config/gh from
+    un-hooked subprocess children while seeding ONLY the claude login surface
+    (the conceded §7 item-6 residual)."""
+    import sys as _sys
+
+    real = tmp_path / "realhome"
+    for rel in (".claude", ".aws", ".ssh", ".config/gh", "Library/Keychains"):
+        (real / rel).mkdir(parents=True)
+    (real / ".aws" / "credentials").write_text("[default]\n")
+    monkeypatch.setenv("HOME", str(real))
+    scratch = verify.make_scratch_home(tmp_path / "sandbox")
+    assert scratch == tmp_path / "sandbox" / "home"
+    assert (scratch / ".claude").is_symlink()
+    if _sys.platform == "darwin":
+        assert (scratch / "Library" / "Keychains").is_symlink()
+    for hidden in (".aws", ".ssh", ".config"):
+        assert not (scratch / hidden).exists(), hidden
+    # idempotent (resume-safe)
+    assert verify.make_scratch_home(tmp_path / "sandbox") == scratch
