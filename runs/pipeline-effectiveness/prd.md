@@ -1,7 +1,7 @@
 # PRD: Pipeline Effectiveness — catch more, gate smarter, learn across runs
 
 **Status:** Draft v0.5
-**Author:** John Pletka (drafted with Claude from a goals-first analysis of the pipeline, 2026-07-02; v0.2 resolves Q1/Q2/Q5; v0.3 folds in issue #49's convergence-honesty cluster as FR-6/P7, 2026-07-05; v0.4 reconciles the spec with the system as built and hardened by the PR #59 review fixes, 2026-07-16)
+**Author:** John Pletka (drafted with Claude from a goals-first analysis of the pipeline, 2026-07-02; v0.2 resolves Q1/Q2/Q5; v0.3 folds in issue #49's convergence-honesty cluster as FR-6/P7, 2026-07-05; v0.4 reconciles the spec with the system as built and hardened by the PR #59 review fixes, 2026-07-16; v0.5 recalibrates FR-4 against measured evidence after the shipped predicate was found to fire 0/9 on a real run, 2026-07-16)
 **Date:** 2026-07-16
 
 **Changelog — v0.5 (ratified by human operator, 2026-07-16).** Recalibrates
