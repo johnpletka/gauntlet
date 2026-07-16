@@ -1287,20 +1287,37 @@ class Orchestrator:
             ),
         )
 
-    def _load_round_findings(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """This phase's round findings + triage verdicts, from the cycle artifacts.
+    def _load_round_findings(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """This phase's round findings + triage verdicts + confirm verdicts, from
+        the cycle artifacts.
 
-        Reads ``run_dir/artifacts/{findings,triage}.json`` — the "latest round
-        wins" bookkeeping the just-run cycle wrote (the same files ``PR.md``
-        reads confirm.json from). A missing/unparseable file raises, which the
+        Reads ``run_dir/artifacts/{findings,triage,confirm}.json`` — the "latest
+        round wins" bookkeeping the just-run cycle wrote (the same files ``PR.md``
+        reads). A missing/unparseable findings or triage file raises, which the
         predicate treats as a fail-closed miss (cannot prove the findings clean).
+
+        ``confirm.json`` is treated as OPTIONAL-BUT-NOT-STALE (FR-4.1 v0.5). It is
+        legitimately absent on the zero-findings convergence path — nothing was
+        fixed, so nothing was confirmed — and cycle.py invalidates it there rather
+        than leaving the previous phase's file behind (absent > stale), so an
+        absent file means "this phase confirmed nothing", never "read the last
+        phase's verdicts". Absent therefore yields an empty verdict list, which is
+        only ever reached when there is also no legitimate blocking/major finding
+        to confirm; if there IS one, its missing verdict fails the conjunct closed
+        in :func:`gates.evaluate_clean_gate` rather than passing unproven.
         """
         import json
 
         art = self.run_dir / "artifacts"
         findings = json.loads((art / "findings.json").read_text()).get("findings") or []
         verdicts = json.loads((art / "triage.json").read_text()).get("verdicts") or []
-        return findings, verdicts
+        confirm_path = art / "confirm.json"
+        confirms: list[dict[str, Any]] = []
+        if confirm_path.exists():
+            confirms = json.loads(confirm_path.read_text()).get("verdicts") or []
+        return findings, verdicts, confirms
 
     def _notify_auto_approval(self, record: "M.AutoApproval") -> None:
         """Send the FR-4.1 auto-approval notification via the advisory channel.

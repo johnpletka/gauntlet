@@ -808,12 +808,20 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             _checkpoint(ctx, "review", rnd, handoff, data=review_out)
         if not triage_findings:
             # FR-4.1: persist the (empty) verdict set — the evidence-tiered gate
-            # reads findings.json + triage.json to prove "zero blocking/major
-            # legitimate findings", and a missing triage.json is a fail-closed
-            # predicate miss. Without this write the archetypal clean gate
-            # (round 1, zero findings) could never auto-approve.
+            # reads findings.json + triage.json to prove no blocking/major
+            # legitimate finding is left open, and a missing triage.json is a
+            # fail-closed predicate miss. Without this write the archetypal clean
+            # gate (round 1, zero findings) could never auto-approve.
             _persist_round_triage(ctx, [], [], schema=None,
                                   artifact_writes=artifact_writes)
+            # Absent > stale (FR-4.1 v0.5). This path fixes nothing, so it writes
+            # no confirm.json — and `artifacts/` is per-RUN, not per-phase, so
+            # without this the PREVIOUS phase's confirm.json would still be on
+            # disk while findings/triage describe this one. The gate now reads
+            # confirm verdicts to decide whether a serious finding is still open,
+            # so a stale file is a correctness hazard, not just untidy: drop it
+            # exactly as the review path drops a superseded triage.json.
+            _invalidate_artifact(ctx, "confirm.json", artifact_writes)
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
@@ -934,6 +942,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
 
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
         if not accepted:
+            # Absent > stale (FR-4.1 v0.5), as on the zero-findings path above:
+            # nothing was fixed, so this phase confirms nothing and must not leave
+            # the PREVIOUS phase's confirm.json on disk in the per-run artifacts/
+            # dir for the gate to read against THIS phase's findings.
+            _invalidate_artifact(ctx, "confirm.json", artifact_writes)
             return finish(StepResult(
                 status=DONE,
                 notes=f"converged: round-{rnd} accepted no findings "

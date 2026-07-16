@@ -43,10 +43,24 @@ _LEGITIMATE_VERDICT = "legitimate"
 # read-only contract was violated, which a human must see.
 _MUTATION_MARKER = "-MUTATION-"
 
-# The type ``FindingsLoader`` returns: (findings list, triage-verdict list) read
-# from this phase's round artifacts. Raising signals the artifacts are missing or
-# unparseable — the caller fails that conjunct closed (cannot prove clean).
-FindingsLoader = Callable[[], "tuple[list[dict[str, Any]], list[dict[str, Any]]]"]
+# The type ``FindingsLoader`` returns: (findings, triage verdicts, confirm
+# verdicts) read from this phase's round artifacts. Raising signals the artifacts
+# are missing or unparseable — the caller fails that conjunct closed (cannot
+# prove clean). Confirm verdicts joined the tuple with the FR-4.1 recalibration
+# (v0.5): the predicate asks whether a serious finding is still OPEN, which is a
+# question only the confirm pass answers.
+FindingsLoader = Callable[
+    [], "tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]"
+]
+
+# Triage `action` values (schemas/triage.json). Only `fix_now` means the finding
+# was actually accepted for repair in this phase; `defer`/`reject` leave a
+# legitimate finding unaddressed here.
+_FIX_NOW_ACTION = "fix_now"
+# The one confirm verdict that closes a finding (schemas/confirm.json). Anything
+# else — partially_resolved, unresolved, regression_introduced, or no verdict at
+# all — leaves it open.
+_RESOLVED_VERDICT = "resolved"
 
 
 def _phase_num(phase: str | None) -> int | None:
@@ -157,10 +171,17 @@ def evaluate_clean_gate(
 ) -> CleanGateDecision:
     """Evaluate the strict §4.2 clean-signal predicate for one code gate.
 
-    ``load_findings`` returns this phase's round findings + triage verdicts (the
-    orchestrator reads them from the cycle's round artifacts); a raise means they
-    could not be read, which fails the finding conjuncts closed. Every conjunct
-    that fails is named in ``misses`` and the aggregate ``clean`` is their AND.
+    ``load_findings`` returns this phase's round findings + triage verdicts +
+    confirm verdicts (the orchestrator reads them from the cycle's round
+    artifacts); a raise means they could not be read, which fails the finding
+    conjuncts closed. Every conjunct that fails is named in ``misses`` and the
+    aggregate ``clean`` is their AND.
+
+    The findings conjunct is **open-based, not raised-based** (v0.5): a
+    blocking/major legitimate finding that was accepted and confirmed `resolved`
+    does not block the gate; one that is deferred, rejected, unconfirmed, or
+    confirmed anything other than `resolved` does. See the conjunct body for why
+    the raised-based form was unfireable in practice.
 
     ``phase`` is the gate's PN phase prefix (the orchestrator's
     ``_expected_phase``); it keys the evidence-freshness conjunct — fix commits
@@ -237,34 +258,66 @@ def evaluate_clean_gate(
                 "(FR-4.1, review F-008)"
             )
 
-    # --- zero blocking/major legitimate findings · zero reviewer mutations -----
+    # --- zero blocking/major legitimate findings left OPEN · zero mutations ----
+    # Recalibrated (FR-4.1, v0.5). The predicate used to count blocking/major
+    # legitimate findings *raised*. Measured against the only real multi-phase
+    # run, that fired 0/9: every phase raised at least one blocking or major
+    # finding, because that is what an adversarial panel is FOR. The old conjunct
+    # asked "did review find nothing serious?" — a state this tool exists to
+    # prevent from going unnoticed — and FR-1's ensemble makes it rarer still
+    # (more lenses ⇒ more findings ⇒ lower chance of zero). A predicate that can
+    # only fire when the product underperforms is not a gate policy.
+    # So the question is now "is anything serious still OPEN?": a blocking/major
+    # legitimate finding must have been accepted `fix_now` AND confirmed
+    # `resolved`. Found-fixed-confirmed is the loop working, not a red flag.
+    # Deferred, rejected, unconfirmed, or non-`resolved` all stay misses, so the
+    # gate still parks on every finding that is genuinely unfinished.
     blocking = major = reviewer_mutations = 0
+    open_serious: list[str] = []
     try:
-        findings, verdicts = load_findings()
+        findings, verdicts, confirms = load_findings()
     except Exception as exc:  # fail closed: cannot prove the findings are clean
         misses.append(
-            f"could not read this phase's findings/triage artifacts to prove zero "
-            f"blocking/major legitimate findings ({exc}); failing closed (FR-4.1)"
+            f"could not read this phase's findings/triage/confirm artifacts to "
+            f"prove no blocking/major legitimate finding is left open ({exc}); "
+            "failing closed (FR-4.1)"
         )
-        findings, verdicts = [], []
+        findings, verdicts, confirms = [], [], []
     else:
         severity_by_id = {f.get("id"): f.get("severity") for f in findings}
         verdict_by_id = {v.get("finding_id"): v.get("verdict") for v in verdicts}
+        action_by_id = {v.get("finding_id"): v.get("action") for v in verdicts}
+        confirm_by_id = {c.get("finding_id"): c.get("verdict") for c in confirms}
         for fid, severity in severity_by_id.items():
             if fid and _MUTATION_MARKER in str(fid):
                 reviewer_mutations += 1
-            if (
+            if not (
                 verdict_by_id.get(fid) == _LEGITIMATE_VERDICT
                 and severity in _BLOCKING_SEVERITIES
             ):
-                if severity == "blocking":
-                    blocking += 1
-                else:
-                    major += 1
-        if blocking or major:
+                continue
+            if severity == "blocking":
+                blocking += 1
+            else:
+                major += 1
+            action = action_by_id.get(fid)
+            confirmed = confirm_by_id.get(fid)
+            if action != _FIX_NOW_ACTION:
+                open_serious.append(
+                    f"{fid} ({severity}, triaged legitimate but action={action!r} — "
+                    "not fixed in this phase)"
+                )
+            elif confirmed != _RESOLVED_VERDICT:
+                # Covers "no confirm verdict at all" (confirmed is None): an
+                # unconfirmed fix is an unproven one — fail closed.
+                open_serious.append(
+                    f"{fid} ({severity}, accepted fix_now but confirm verdict is "
+                    f"{confirmed!r}, not {_RESOLVED_VERDICT!r})"
+                )
+        if open_serious:
             misses.append(
-                f"{blocking} blocking + {major} major legitimate finding(s) at the "
-                "gate (FR-4.1)"
+                f"{len(open_serious)} blocking/major legitimate finding(s) still "
+                f"open at the gate: {'; '.join(open_serious)} (FR-4.1)"
             )
         # FR-6/FR-4 interaction (P9-A6, PRD §8): a carried remainder still present
         # in the final round's findings is an accepted (`fix_now`) partial that was
@@ -365,6 +418,14 @@ def evaluate_clean_gate(
         "rounds": rounds,
         "blocking": blocking,
         "major": major,
+        # v0.5: `blocking`/`major` count what was RAISED; the predicate turns on
+        # what is still OPEN. Both are recorded — an auto-approval that says only
+        # "blocking: 0" would now be a lie by omission, since the gate can clear a
+        # phase that raised four blocking findings and resolved all four. The
+        # human ratifying at the PR boundary (FR-4.2) needs to see both numbers to
+        # judge the approval, so the snapshot states raised, open, and resolved.
+        "blocking_major_open": len(open_serious),
+        "blocking_major_resolved": (blocking + major) - len(open_serious),
         "escalations": 0,
         "reviewer_mutations": reviewer_mutations,
         "acceptance_gate": acceptance_result,

@@ -221,13 +221,46 @@ def test_no_findings_converges_without_commit(cycle_repo):
     assert "no findings" in man.record("cycle").notes
     # FR-4.1 (review F-1): the zero-findings convergence persists an EMPTY
     # verdict set — the evidence-tiered gate reads findings.json + triage.json
-    # to prove "zero blocking/major legitimate findings", and a missing
+    # to prove no blocking/major legitimate finding is left open, and a missing
     # triage.json is a fail-closed miss that would park the archetypal clean
     # gate (round 1, zero findings) forever.
     triage = json.loads((run_dir / "artifacts" / "triage.json").read_text())
     assert triage == {"verdicts": []}
     findings = json.loads((run_dir / "artifacts" / "findings.json").read_text())
     assert findings["findings"] == []
+    # FR-4.1 v0.5, absent > stale: this path fixes nothing, so it confirms
+    # nothing and must leave NO confirm.json behind. `artifacts/` is per-RUN, so
+    # a lingering file here would be read by the gate against a later phase's
+    # findings (see the cross-phase fixture below).
+    assert not (run_dir / "artifacts" / "confirm.json").exists()
+
+
+def test_zero_findings_phase_clears_a_previous_phase_confirm_artifact(cycle_repo):
+    # The stale-confirm hazard the v0.5 open-based predicate introduced, pinned.
+    # `artifacts/confirm.json` is per-RUN bookkeeping, but the gate reads it to
+    # decide whether THIS phase left a serious finding open. A phase that
+    # confirms nothing must not inherit the previous phase's verdicts, or a
+    # later phase could be auto-approved on evidence belonging to an earlier one.
+    # run_dir mirrors run_cycle's; artifacts/ lives under it (excluded from every
+    # engine git operation, so seeding it here does not dirty the worktree).
+    art = cycle_repo / "runs" / "demo" / "run-1" / "artifacts"
+    art.mkdir(parents=True, exist_ok=True)
+    stale = art / "confirm.json"
+    stale.write_text(json.dumps(
+        {"verdicts": [{"finding_id": "F-OLD", "verdict": "resolved"}]}
+    ))
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW()),  # this phase raises nothing
+        "triage": SeqAdapter(),
+        "builder": SeqAdapter(),
+    }
+    status, _man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert (run_dir / "artifacts") == art  # the seeded dir IS the one in play
+    assert not stale.exists(), (
+        "a previous phase's confirm.json survived a zero-findings phase — the "
+        "gate would read F-OLD's 'resolved' as this phase's evidence"
+    )
 
 
 # --- artifact-desync guard (fix/cycle-artifact-desync) -----------------------

@@ -147,6 +147,28 @@ stages:
       # the same fix commit when a fix renames/moves a cited test.
       - {id: acceptance-recheck, type: acceptance_gate, collector: pytest,
          map: artifacts/acceptance-map.json}
+      # Post-cycle test re-run (FR-4.1 evidence freshness). The `tests` step above
+      # runs BEFORE the cycle, so once a round lands a P<N>.x fix commit its record
+      # vouches for a tree the fix then changed — stale evidence the freshness
+      # conjunct parks on. `acceptance-recheck` re-proves the acceptance signal;
+      # this re-proves the tests signal, against the tree the phase actually ships.
+      # Without it the gate below could never auto-approve any phase that fixed
+      # anything, which is nearly every phase.
+      - {id: tests-recheck, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800}
+      # Evidence-tiered phase gate (FR-4.1). Policy `auto_when_clean`: the strict
+      # §4.2 conjunction auto-approves and records an evidence snapshot; ANY miss
+      # parks for a human exactly as a plain gate would. Note what this changes on
+      # this pipeline: there was no phase gate here at all, so phases proceeded
+      # unconditionally after a converged cycle. This gate does not remove a human
+      # step — it ADDS a fail-closed stop for phases whose evidence is ambiguous,
+      # while clean phases keep flowing. The predicate turns on whether anything
+      # serious is still OPEN (v0.5), not on whether review found nothing: the
+      # raised-based form measured 0/9 on this repo's own run, because a working
+      # adversarial panel always finds something. FR-4.1 requires a verifier on
+      # any phase declaring this policy — impl-cycle configures one above.
+      - {id: phase-gate, type: human_gate, policy: auto_when_clean,
+         show: [findings.json, triage.json, confirm.json, acceptance-map.json]}
 
   # --- retrospective + governed self-improvement (FR-6.2/6.3; active in P7) --
   # Each agent self-critiques the run; the cheap `proposer` synthesises feedback

@@ -84,13 +84,23 @@ def _seed_clean_manifest(
     return man
 
 
-def _evaluate(man, pipeline, *, findings=None, verdicts=None, iteration="0",
-              phase=None):
+def _evaluate(man, pipeline, *, findings=None, verdicts=None, confirms=None,
+              iteration="0", phase=None):
     return gates.evaluate_clean_gate(
         man, pipeline, _gate_step(pipeline), iteration,
-        load_findings=lambda: (findings or [], verdicts or []),
+        load_findings=lambda: (findings or [], verdicts or [], confirms or []),
         phase=phase,
     )
+
+
+def _fixed(fid):
+    """A triage verdict accepting ``fid`` for repair (legitimate + fix_now)."""
+    return {"finding_id": fid, "verdict": "legitimate", "action": "fix_now"}
+
+
+def _resolved(fid):
+    """A confirm verdict closing ``fid``."""
+    return {"finding_id": fid, "verdict": "resolved"}
 
 
 # --- FR-4.1 evidence freshness (review F-3) -----------------------------------
@@ -276,6 +286,89 @@ def test_minor_or_nonlegitimate_finding_does_not_block():
     d = _evaluate(man, _pipeline(), findings=findings, verdicts=verdicts)
     assert d.clean is True
     assert d.evidence["blocking"] == 0 and d.evidence["major"] == 0
+
+
+# --- FR-4.1 v0.5: the findings conjunct is OPEN-based, not RAISED-based -------
+# The raised-based form asked "did review find nothing serious?" — measured 0/9
+# on this repo's own nine-phase run, because a working adversarial panel always
+# finds something. These fixtures pin the recalibration: found-and-closed clears
+# the gate; every flavour of still-open parks.
+def test_serious_finding_fixed_and_confirmed_resolved_auto_approves():
+    # The case the raised-based predicate could never clear, and the reason FR-4
+    # was inert: a blocking finding was raised, accepted, fixed, and confirmed
+    # resolved. That is the adversarial loop working, not a red flag.
+    man = _seed_clean_manifest()
+    findings = [{"id": "F-1", "severity": "blocking", "category": "correctness"}]
+    d = _evaluate(man, _pipeline(), findings=findings,
+                  verdicts=[_fixed("F-1")], confirms=[_resolved("F-1")])
+    assert d.clean is True, d.misses
+    # ...and the snapshot still tells the FR-4.2 ratifier it happened.
+    assert d.evidence["blocking"] == 1
+    assert d.evidence["blocking_major_open"] == 0
+    assert d.evidence["blocking_major_resolved"] == 1
+
+
+def test_serious_finding_confirmed_partially_resolved_parks():
+    man = _seed_clean_manifest()
+    findings = [{"id": "F-1", "severity": "blocking", "category": "correctness"}]
+    d = _evaluate(man, _pipeline(), findings=findings, verdicts=[_fixed("F-1")],
+                  confirms=[{"finding_id": "F-1", "verdict": "partially_resolved"}])
+    assert d.clean is False
+    assert d.evidence["blocking_major_open"] == 1
+    assert any("partially_resolved" in m and "F-1" in m for m in d.misses)
+
+
+def test_serious_finding_with_no_confirm_verdict_parks_closed():
+    # An unconfirmed fix is an unproven one — absence of a verdict must not read
+    # as resolved (fail closed).
+    man = _seed_clean_manifest()
+    findings = [{"id": "F-1", "severity": "major", "category": "correctness"}]
+    d = _evaluate(man, _pipeline(), findings=findings, verdicts=[_fixed("F-1")],
+                  confirms=[])
+    assert d.clean is False
+    assert d.evidence["blocking_major_open"] == 1
+    assert any("F-1" in m for m in d.misses)
+
+
+def test_serious_finding_triaged_legitimate_but_deferred_parks():
+    # Legitimate + defer is not "fixed": the phase ships a known major defect.
+    man = _seed_clean_manifest()
+    findings = [{"id": "F-2", "severity": "major", "category": "spec-gap"}]
+    d = _evaluate(
+        man, _pipeline(), findings=findings,
+        verdicts=[{"finding_id": "F-2", "verdict": "legitimate", "action": "defer"}],
+        confirms=[_resolved("F-2")],  # a confirm verdict must not rescue a defer
+    )
+    assert d.clean is False
+    assert any("defer" in m and "F-2" in m for m in d.misses)
+
+
+def test_confirm_verdict_for_other_finding_does_not_close_this_one():
+    # Guards the id join: a `resolved` verdict for F-9 must not clear F-1.
+    man = _seed_clean_manifest()
+    findings = [{"id": "F-1", "severity": "blocking", "category": "correctness"}]
+    d = _evaluate(man, _pipeline(), findings=findings, verdicts=[_fixed("F-1")],
+                  confirms=[_resolved("F-9")])
+    assert d.clean is False
+    assert d.evidence["blocking_major_open"] == 1
+
+
+def test_mixed_phase_one_resolved_one_open_parks_citing_only_the_open_one():
+    man = _seed_clean_manifest()
+    findings = [
+        {"id": "F-1", "severity": "blocking", "category": "correctness"},
+        {"id": "F-2", "severity": "major", "category": "correctness"},
+    ]
+    d = _evaluate(
+        man, _pipeline(), findings=findings,
+        verdicts=[_fixed("F-1"), _fixed("F-2")],
+        confirms=[_resolved("F-1"), {"finding_id": "F-2", "verdict": "unresolved"}],
+    )
+    assert d.clean is False
+    assert d.evidence["blocking_major_open"] == 1
+    assert d.evidence["blocking_major_resolved"] == 1
+    joined = "; ".join(d.misses)
+    assert "F-2" in joined and "F-1" not in joined
 
 
 def test_violation_reviewer_mutation_parks():
