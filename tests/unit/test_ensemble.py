@@ -365,8 +365,89 @@ def test_severity_tie_uses_panel_order_then_id():
 def test_single_member_passthrough_marks_no_duplicates():
     a = _f("codex:F-001", "major", "correctness", "z.py:5", "a real defect here", "codex", "correctness")
     res = E.merge_findings([a], panel_order={"codex": 0}, threshold=0.5)
-    assert res.primaries == [{**a, "sources": ["codex"]}]
+    assert res.primaries == [
+        {**a, "sources": ["codex"], "source_members": ["codex::correctness"]}
+    ]
     assert res.duplicates == []
+
+
+# --- complete linkage: non-transitive compatibility must not chain ----------
+# PR #59 review F-004. Both legs of merge_compatible are non-transitive, so
+# single linkage builds a transitive closure and marks a finding `duplicate_of`
+# a primary it is NOT compatible with — only primaries reach triage, so that
+# finding's distinct claim is silently lost. Dedup fails toward KEEPING (§4.2:
+# "an over-merge is a lost defect"). One fixture per non-transitive leg.
+def test_chained_line_ranges_do_not_transitively_merge():
+    # A∩B and B∩C, but A∩C = ∅ (disjoint ranges). Claims share a core, so the
+    # fingerprint leg is satisfied throughout and location is the only guard.
+    claim = "the parser drops trailing commas silently"
+    a = _f("codex:F-100", "major", "correctness", "src/p.py:1-10", claim, "codex", "correctness")
+    b = _f("codex:F-101", "major", "correctness", "src/p.py:8-20", claim, "codex", "correctness")
+    c = _f("codex:F-102", "major", "correctness", "src/p.py:18-30", claim, "codex", "correctness")
+    assert E.merge_compatible(a, b, threshold=0.5)
+    assert E.merge_compatible(b, c, threshold=0.5)
+    assert not E.merge_compatible(a, c, threshold=0.5)  # the non-transitive step
+    res = E.merge_findings([a, b, c], panel_order={"codex": 0}, threshold=0.5)
+    # C must survive to triage rather than collapse into A's group behind B.
+    assert {p["id"] for p in res.primaries} == {"codex:F-100", "codex:F-102"}
+    _assert_duplicates_compatible_with_primary(res)
+
+
+def test_chained_claim_fingerprints_do_not_transitively_merge():
+    # Same file+line (location compatible throughout) so the fingerprint leg is
+    # the only guard. Nested keyword cores give Jaccard 0.67 / 0.50 / 0.33:
+    # A~B and B~C clear the 0.5 threshold, A~C does not.
+    a = _f("codex:F-110", "major", "correctness", "src/q.py:7",
+           "the cache key omits the tenant id shard", "codex", "correctness")
+    b = _f("codex:F-111", "major", "correctness", "src/q.py:7",
+           "the cache key omits the tenant", "codex", "correctness")
+    c = _f("codex:F-112", "major", "correctness", "src/q.py:7",
+           "the cache key", "codex", "correctness")
+    assert E.merge_compatible(a, b, threshold=0.5)
+    assert E.merge_compatible(b, c, threshold=0.5)
+    assert not E.merge_compatible(a, c, threshold=0.5)  # the non-transitive step
+    res = E.merge_findings([a, b, c], panel_order={"codex": 0}, threshold=0.5)
+    assert {p["id"] for p in res.primaries} == {"codex:F-110", "codex:F-112"}
+    _assert_duplicates_compatible_with_primary(res)
+
+
+def _assert_duplicates_compatible_with_primary(res):
+    """The complete-linkage invariant: a suppressed finding is always compatible
+    with the primary that subsumes it. This is the property F-004 violated."""
+    by_id = {p["id"]: p for p in res.primaries}
+    for dup in res.duplicates:
+        primary = by_id[dup["duplicate_of"]]
+        assert E.merge_compatible(dup, primary, threshold=0.5), (
+            f"{dup['id']} suppressed as duplicate_of {primary['id']} but is not "
+            "compatible with it — its distinct claim never reaches triage"
+        )
+
+
+# --- source_members: a member is (profile, lens), not a profile --------------
+def test_same_profile_two_lenses_records_both_members():
+    # PR #59 review F-005: one profile on the panel under two lenses. Both
+    # members raise the same finding, so `sources` collapses to one profile —
+    # but this is SHARED coverage and must not read as sole-source yield.
+    claim = "the cache key omits the tenant id"
+    a = _f("codex:F-120", "major", "correctness", "src/c.py:5", claim, "codex", "correctness")
+    b = _f("codex:F-121", "major", "correctness", "src/c.py:5", claim, "codex", "security")
+    res = E.merge_findings([a, b], panel_order={"codex": 0}, threshold=0.5)
+    assert len(res.primaries) == 1
+    primary = res.primaries[0]
+    # `sources` stays profile-keyed (FR-1.2 / schema contract) and collapses...
+    assert primary["sources"] == ["codex"]
+    # ...so member identity is tracked separately, and shows the true panel span.
+    assert primary["source_members"] == ["codex::correctness", "codex::security"]
+
+
+def test_source_members_dedups_repeated_member():
+    # Two findings from the SAME member merging: one member entry, not two.
+    claim = "the ledger window admits a duplicate run"
+    a = _f("codex:F-130", "major", "correctness", "src/l.py:1-10", claim, "codex", "correctness")
+    b = _f("codex:F-131", "minor", "correctness", "src/l.py:5", claim, "codex", "correctness")
+    res = E.merge_findings([a, b], panel_order={"codex": 0}, threshold=0.5)
+    assert len(res.primaries) == 1
+    assert res.primaries[0]["source_members"] == ["codex::correctness"]
 
 
 def test_merge_is_deterministic_regardless_of_input_order():

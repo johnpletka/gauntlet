@@ -68,6 +68,11 @@
             "items": {"type": "string"},
             "description": "Merge annotation (FR-1.2, on a merged primary): every panel-member profile whose finding merged into this primary (including the primary's own)."
           },
+          "source_members": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Merge annotation (FR-1.2/FR-1.3, on a merged primary): every panel MEMBER (`profile::lens`) whose finding merged into this primary, including the primary's own. Distinct from `sources`, which is profile-only: one profile may sit on the panel under two lenses, and both members raising the same finding collapse to a single `sources` entry — which the FR-1.3 sole-source yield metric would then miscount as unique coverage (PR #59 review F-005). Member identity is what §1.3's kill criterion means. Engine-stamped like source/lens/duplicate_of/sources, never emitted by a reviewer's strict structured output; absent on a legacy/single-reviewer artifact, which validates."
+          },
           "carried_from": {
             "type": ["string", "null"],
             "description": "Engine annotation (pipeline-effectiveness FR-6.1, P9): on a carried remainder merged into a later round, the `partially_resolved` accepted finding id this remainder was split from — kept intact so the round manifest links remainder -> parent. Absent/null on an ordinary finding. Like source/lens/duplicate_of it is engine-stamped, never emitted by a reviewer's strict structured output, so a legacy/pre-migration artifact that omits it validates."

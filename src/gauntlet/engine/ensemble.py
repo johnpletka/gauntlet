@@ -34,11 +34,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# The four engine/merge-annotated fields (FR-1.2 / plan review F-007). They are
+# The engine/merge-annotated fields (FR-1.2 / plan review F-007). They are
 # NEVER emitted by a reviewer agent's strict structured output — ``source``/
-# ``lens`` are stamped per member by the engine, ``duplicate_of``/``sources`` are
-# written here by the merge. They are absent from a single-reviewer artifact.
-ENSEMBLE_FIELDS = ("source", "lens", "duplicate_of", "sources")
+# ``lens`` are stamped per member by the engine, ``duplicate_of``/``sources``/
+# ``source_members`` are written here by the merge. They are absent from a
+# single-reviewer artifact.
+ENSEMBLE_FIELDS = ("source", "lens", "duplicate_of", "sources", "source_members")
 
 # Claim-fingerprint Jaccard tie value (FR-1.2). Pinned + documented, not magic;
 # the cycle passes the config-overridable value, defaulting to this.
@@ -306,6 +307,19 @@ def merge_compatible(
     )
 
 
+def member_key(finding: dict[str, Any]) -> str:
+    """The panel-member identity that raised ``finding``: ``profile::lens``.
+
+    A panel member is a (profile, lens) pair, not a profile — the same profile is
+    a valid panel entry under two different lenses (``_panel`` builds it,
+    ``PanelMember.metric_key`` keys the yield metrics on it). ``source`` alone
+    therefore does NOT identify a member, and aggregating merge provenance by
+    profile collapses two distinct members into one (PR #59 review F-005). This
+    mirrors ``cycle.PanelMember.metric_key`` exactly; the two must agree or the
+    yield metrics silently attribute to a member key that never existed."""
+    return f"{finding.get('source')}::{finding.get('lens') or 'nolens'}"
+
+
 @dataclass
 class MergeResult:
     """Merged panel findings.
@@ -333,10 +347,20 @@ def merge_findings(
 
     ``stamped`` findings must already carry a unique ``id``, a ``source``
     (profile), and a ``lens``; ``panel_order`` maps a profile → its panel index
-    for the severity tie-break. Grouping is greedy single-linkage against each
-    group's current members, iterated in canonical order (panel index, then the
-    finding's original position); a finding joins the first compatible group,
-    else starts its own. The primary of a group is the highest-severity member,
+    for the severity tie-break. Grouping is greedy **complete-linkage**: a
+    finding joins the first group it is compatible with **every** member of,
+    else starts its own, iterated in canonical order (panel index, then the
+    finding's original position). Complete linkage — not single linkage — because
+    both legs of ``merge_compatible`` are non-transitive: A can overlap B and B
+    overlap C while A and C are disjoint (chained line ranges), and claim
+    fingerprints can chain the same way. Under single linkage that closure puts
+    A, B and C in one group, and C is then marked ``duplicate_of`` a primary it
+    is NOT compatible with — C never reaches triage and its distinct claim is
+    silently lost (PR #59 review F-004). Complete linkage makes every group a
+    clique, so a duplicate is always compatible with the primary that subsumes
+    it. It can only ever split groups further, never merge more: dedup fails
+    toward keeping findings (FR-1.2, §4.2 — "an over-merge is a lost defect").
+    The primary of a group is the highest-severity member,
     ties broken by (1) panel index then (2) lexicographic id. The primary keeps
     its own phrasing and records all group profiles in ``sources``; every
     non-primary carries ``duplicate_of: <primary id>``. Output order is
@@ -352,7 +376,7 @@ def merge_findings(
     for _, finding in ordered:
         placed = False
         for group in groups:
-            if any(merge_compatible(finding, member, threshold=threshold) for member in group):
+            if all(merge_compatible(finding, member, threshold=threshold) for member in group):
                 group.append(finding)
                 placed = True
                 break
@@ -375,15 +399,29 @@ def merge_findings(
         members = sorted(group, key=primary_key)
         primary = members[0]
         others = members[1:]
-        # sources: every group profile, unique, in panel order (FR-1.2).
+        # sources: every group PROFILE, unique, in panel order (FR-1.2 — the
+        # schema defines this field as profiles, and FR-1.2's `source` IS the
+        # profile, so this stays profile-keyed).
+        # source_members: every group MEMBER (profile::lens), unique, in the same
+        # order. Distinct from `sources` because one profile may sit on the panel
+        # under two lenses: both members raising the same finding collapse to a
+        # single `sources` entry, which then reads as sole-source coverage when it
+        # is really shared (PR #59 review F-005). Member identity is what the
+        # FR-1.3 yield metrics and the §1.3 kill criterion actually mean.
         seen: set[str] = set()
         sources: list[str] = []
+        seen_members: set[str] = set()
+        source_members: list[str] = []
         for m in sorted(group, key=lambda f: (panel_order.get(f.get("source", ""), len(panel_order)), str(f.get("id")))):
             src = m.get("source")
             if src is not None and src not in seen:
                 seen.add(src)
                 sources.append(src)
-        primary_out = {**primary, "sources": sources}
+            key = member_key(m)
+            if m.get("source") is not None and key not in seen_members:
+                seen_members.add(key)
+                source_members.append(key)
+        primary_out = {**primary, "sources": sources, "source_members": source_members}
         primary_out.pop("duplicate_of", None)
         for m in group:
             owner_of[str(m.get("id"))] = str(primary.get("id"))

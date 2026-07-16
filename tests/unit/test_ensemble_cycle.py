@@ -379,9 +379,47 @@ def test_shared_primary_is_not_unique_legit_for_its_owner():
     panel = [PanelMember(profile="reviewer", lens="correctness", index=0),
              PanelMember(profile="gemini", lens="spec-coverage", index=1)]
     primaries = [{"id": "A", "source": "reviewer", "lens": "correctness",
-                  "sources": ["reviewer", "gemini"]}]
+                  "sources": ["reviewer", "gemini"],
+                  "source_members": ["reviewer::correctness", "gemini::spec-coverage"]}]
     verdicts = [{"finding_id": "A", "verdict": "legitimate"}]
     assert _ensemble_legit_by_member(primaries, verdicts, panel) == {}
+
+
+def test_same_profile_two_lens_shared_primary_is_not_unique_legit():
+    # PR #59 review F-005: the same profile is a valid panel entry under two
+    # lenses. Both members raised A, so `sources` collapses to ["reviewer"] —
+    # counting profiles would read A as sole-source and credit the owning lens
+    # with unique yield it did not earn, corrupting the §1.3 kill criterion in
+    # the direction that keeps a redundant panel alive.
+    from gauntlet.engine.cycle import PanelMember, _ensemble_legit_by_member
+
+    panel = [PanelMember(profile="reviewer", lens="correctness", index=0),
+             PanelMember(profile="reviewer", lens="security", index=1)]
+    primaries = [{"id": "A", "source": "reviewer", "lens": "correctness",
+                  "sources": ["reviewer"],  # collapsed: one profile, two members
+                  "source_members": ["reviewer::correctness", "reviewer::security"]}]
+    verdicts = [{"finding_id": "A", "verdict": "legitimate"}]
+    assert _ensemble_legit_by_member(primaries, verdicts, panel) == {}
+
+
+def test_legacy_primary_without_source_members_falls_back_to_sources():
+    # A pre-migration artifact has no member data to recover; the profile-level
+    # count is the best available answer and must still work (schema keeps
+    # source_members optional, so a legacy findings.json validates and reads).
+    from gauntlet.engine.cycle import PanelMember, _ensemble_legit_by_member
+
+    panel = [PanelMember(profile="reviewer", lens="correctness", index=0),
+             PanelMember(profile="gemini", lens="spec-coverage", index=1)]
+    sole = [{"id": "A", "source": "reviewer", "lens": "correctness",
+             "sources": ["reviewer"]}]
+    shared = [{"id": "B", "source": "reviewer", "lens": "correctness",
+               "sources": ["reviewer", "gemini"]}]
+    assert _ensemble_legit_by_member(
+        sole, [{"finding_id": "A", "verdict": "legitimate"}], panel
+    ) == {"reviewer::correctness": 1}
+    assert _ensemble_legit_by_member(
+        shared, [{"finding_id": "B", "verdict": "legitimate"}], panel
+    ) == {}
 
 
 # ===========================================================================

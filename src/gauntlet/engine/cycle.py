@@ -1585,15 +1585,24 @@ def _ensemble_review(
 
 
 def _sole_source(finding: dict[str, Any]) -> bool:
-    """True iff this primary was raised by exactly one panel member.
+    """True iff this primary was raised by exactly one panel MEMBER.
 
-    ``sources`` aggregates every member that raised (a duplicate of) the
-    finding; a primary with more than one source is SHARED coverage — the
-    severity/tie-break winner merely *owns* the phrasing. Counting ownership as
-    uniqueness masks exactly the near-total-overlap case the §1.3 kill
+    ``source_members`` aggregates every member (profile::lens) that raised (a
+    duplicate of) the finding; a primary with more than one is SHARED coverage —
+    the severity/tie-break winner merely *owns* the phrasing. Counting ownership
+    as uniqueness masks exactly the near-total-overlap case the §1.3 kill
     criterion exists to detect (PR #59 review F-004): two members raising the
-    same set would both look uniquely productive. Absent ``sources`` (a
-    non-merged finding) falls back to the single ``source``."""
+    same set would both look uniquely productive.
+
+    Counts MEMBERS, not ``sources`` (profiles): one profile may sit on the panel
+    under two lenses, so two members raising the same finding collapse to a
+    single ``sources`` entry and would read as sole-source (PR #59 review F-005).
+    Falls back to ``sources`` then ``source`` for a legacy artifact merged before
+    ``source_members`` existed — a pre-migration record has no member data to
+    recover, and its profile-level count is the best available answer."""
+    members = finding.get("source_members")
+    if members:
+        return len(members) == 1
     return len(finding.get("sources") or [finding.get("source")]) == 1
 
 
