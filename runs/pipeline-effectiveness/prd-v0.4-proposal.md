@@ -1,7 +1,9 @@
 # PRD v0.4 amendment proposal — pipeline-effectiveness
 
-**Status:** DRAFT — awaiting human ratification (this file proposes; `prd.md`
-changes only through its own revision process, CLAUDE.md §2/§8)
+**Status:** RATIFIED — human operator, 2026-07-16. Sections A–F are folded into
+`prd.md` as **v0.4**, which is now the artifact of record; see its changelog.
+This file is retained as the audit trail of *what* was proposed and *why*, and
+is historical from here — it is not a live draft and must not be re-applied.
 **Author:** Claude (PR #59 review-fix pass, 2026-07-08), for John Pletka
 **Scope:** Reconcile `prd.md` (v0.3) with the system as actually built and
 hardened by the PR #59 review fixes. Two kinds of change: (a) places where a
@@ -127,3 +129,18 @@ Approving this proposal authorizes folding sections A–F into `prd.md` as
 corresponding implementation choice through its own loop. Until ratified,
 `prd.md` v0.3 remains the artifact of record and this file documents the
 known divergences.
+
+**Outcome: ratified in full by the human operator, 2026-07-16.** All of A–F
+were folded into `prd.md` v0.4; no section was declined, so no implementation
+choice was reverted. `prd.md` v0.4 is the artifact of record and supersedes
+this proposal — read it, not this file, for the current spec.
+
+One addition beyond A–F was made in the same edit and is called out here so
+the audit trail is honest: §6 gained the `source_members` finding field and a
+normative **dedup-grouping (complete linkage)** rule. Both document fixes to
+review findings F-005 and F-004 landed alongside this ratification. Neither
+weakens a guarantee — they close the gap between §4.2's existing
+"dedup fails toward keeping findings" / FR-1.3's existing per-(profile, lens)
+requirement and an implementation that did not honor them — but they are
+normative statements this proposal did not contain, and a later reviewer
+should judge them on their merits rather than assume ratification covered them.
