@@ -32,7 +32,14 @@ PROPOSALS_SCHEMA = "schemas/proposals.json"
 
 # Allowlisted, human-tunable assets the synthesiser diffs against; full content
 # is included (a git-applyable diff needs exact lines) for files under this cap.
-_ASSET_GLOBS = ("prompts/*.md", "prompts/*.jsonl", "pipelines/*.yaml")
+# `prompts/lenses/*.md` is listed explicitly (a non-recursive glob) so the
+# synthesiser can diff the versioned lens fragments (FR-5.1 lens governance, P6):
+# a recurring finding pattern becomes a ratifiable lens proposal, and the only
+# path to a lens change is that ratified proposal — the retro never mutates
+# `prompts/lenses/` directly.
+_ASSET_GLOBS = (
+    "prompts/*.md", "prompts/*.jsonl", "prompts/lenses/*.md", "pipelines/*.yaml"
+)
 _ASSET_FILES = ("policy.yaml",)
 _ASSET_SIZE_CAP = 16_384
 
@@ -102,11 +109,23 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     else:
         gen_note = "; no proposer configured — self-critique only"
 
-    valid = sum(1 for p in generated if p.valid)
+    # Declined-findings registry (FR-5.2, P6): record this run's reasoned triage
+    # declines to the cross-run registry so a future run's triage surfaces the
+    # precedent (advisory) instead of re-litigating it. Best-effort — a recording
+    # fault must not fail a complete run's retro (the audit is the primary
+    # deliverable; the registry is downstream learning). Idempotent by run id.
+    recorded = _record_run_declines(ctx)
+    # §9 proposal-mode governance (FR-5.1): the retro may emit deterministic,
+    # ratifiable proposals (panel-shrink, verifier-revert) from the P1/P5 corpus
+    # metrics — no config self-mutation, human ratification only.
+    governance = _emit_governance_proposals(ctx)
+
+    valid = sum(1 for p in generated if p.valid) + sum(1 for p in governance if p.valid)
     notes = (
         f"retrospective: {len(critiques)} self-critique(s)"
         + (f" ({len(failed_agents)} failed: {', '.join(failed_agents)})" if failed_agents else "")
-        + f"; {len(generated)} proposal(s) generated, {valid} applyable"
+        + f"; {len(generated) + len(governance)} proposal(s) generated, {valid} applyable"
+        + (f"; {recorded} decline(s) recorded" if recorded else "")
         + gen_note
     )
     status = FAILED if (synth_error is not None and not proposals_optional) else DONE
@@ -117,10 +136,63 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
         notes=notes,
         metrics={
             "retro_agents": len(agents),
-            "proposals_generated": len(generated),
+            "proposals_generated": len(generated) + len(governance),
             "proposals_valid": valid,
+            "declines_recorded": recorded,
+            "governance_proposals": len(governance),
         },
     )
+
+
+def _record_run_declines(ctx: StepContext) -> int:
+    """Append this run's reasoned human/triage declines to the registry (FR-5.2).
+
+    Reconstructs ``(findings, verdicts, by)`` per round from the run's per-round
+    artifacts (the same lossless source :func:`build_run_summary` walks), then
+    hands them to the registry. Each round is tagged with **who** declined: a
+    decline in a cycle that was resolved under an authoritative human
+    ``--response`` (an FR-10.4/10.5 override/escalation decision, recorded on the
+    cycle's ``human_responses``) is a *human* decline (``by="human"``); every
+    other decline is a triage decline. This is the recording path for human
+    declines the spec requires alongside triage declines. Fail-open: any error is
+    swallowed with the evidence persisted — cross-run learning must never strand a
+    completed run."""
+    from datetime import datetime, timezone
+
+    from gauntlet.engine import registry as reg
+
+    try:
+        rounds = [
+            (rnd["findings"], rnd["verdicts"], "human" if cyc["human_resolved"] else "triage")
+            for cyc in _collect_cycles(ctx)
+            for rnd in cyc["rounds"]
+        ]
+        if not rounds:
+            return 0
+        at = datetime.now(timezone.utc).isoformat()
+        return reg.record_run_declines(ctx, rounds, at=at)
+    except Exception as exc:  # pragma: no cover - defensive; recording is downstream
+        ctx.writer.write_text(
+            ctx.run_dir / "retro" / "registry-record-error.txt",
+            f"declined-registry recording failed: {exc!r}\n",
+        )
+        return 0
+
+
+def _emit_governance_proposals(ctx: StepContext) -> list[Any]:
+    """Emit the §9 deterministic proposals (panel-shrink, verifier-revert) from
+    the run corpus (FR-5.1, P6). Fail-open: a fault is logged, not fatal — these
+    are advisory learning proposals, never a gate on run completion."""
+    from gauntlet.engine import governance
+
+    try:
+        return governance.build_governance_proposals(ctx)
+    except Exception as exc:  # pragma: no cover - defensive
+        ctx.writer.write_text(
+            ctx.run_dir / "retro" / "governance-proposals-error.txt",
+            f"governance proposal generation failed: {exc!r}\n",
+        )
+        return []
 
 
 def _run_critique(ctx: StepContext, agent: str, prompt: str, usage: Any, logger: Any):
@@ -255,6 +327,10 @@ def _collect_cycles(ctx: StepContext) -> list[dict[str, Any]]:
             cycles.append({
                 "step": leaf, "phase": _phase_for_step(man, rec.id),
                 "notes": rec.notes or "", "rounds": rounds,
+                # A cycle carrying an authoritative human `--response` was
+                # resolved by a human (FR-10.4/10.5), so its reasoned declines are
+                # human declines for the registry (FR-5.2).
+                "human_resolved": bool(getattr(rec, "human_responses", None)),
             })
     return cycles
 

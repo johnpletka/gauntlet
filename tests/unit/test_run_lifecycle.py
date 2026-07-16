@@ -415,6 +415,39 @@ def test_rollback_to_phase_one_rewinds_branch_and_manifest(fixture_repo):
     assert p2_sha in refs or "refs/gauntlet/backup/" in refs
 
 
+def test_rollback_reverses_auto_approval_and_flips_policy(fixture_repo):
+    # pipeline-effectiveness FR-4.2 / P8-A5: a `gauntlet rollback` past a phase
+    # boundary IS the human reversal of any auto-approved gate at or beyond it —
+    # it stamps the reversal on the record and flips the run's effective policy
+    # to `always` for the remainder (auto_approval_disabled), the deterministic
+    # in-run circuit breaker.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    # Simulate an auto-approved P2 gate having occurred: inject the record on disk.
+    layout = mgr.layout("demo")
+    run_dir = layout.active_run_dir()
+    man = M.Manifest.load(run_dir / "manifest.json")
+    man.auto_approvals.append(M.AutoApproval(
+        gate_id="p2-gate", phase="P2", evidence={"verifier": "clean", "rounds": 1},
+        at="2026-07-07T00:00:00Z",
+    ))
+    man.write_atomic(run_dir / "manifest.json")
+
+    mgr.rollback("demo", phase=1)
+    rolled = M.Manifest.load(run_dir / "manifest.json")
+    assert rolled.auto_approval_disabled is True
+    assert rolled.auto_approvals[0].reversed_at is not None
+    assert rolled.auto_approvals[0].reversed_by == "operator"
+
+
 def test_rollback_refuses_branch_ahead_of_manifest(fixture_repo):
     # F-003: an extra unmanifested commit means branch != manifest tip -> refuse.
     mgr = _prepare(fixture_repo)

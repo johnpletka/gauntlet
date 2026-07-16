@@ -911,6 +911,18 @@ def _referenced_agents(repo_root: Path, asset_root: str = ".") -> set[str] | Non
         agents = step.get("agents")
         if isinstance(agents, list):
             names.update(a for a in agents if isinstance(a, str))
+        # Ensemble review panel members (pipeline-effectiveness FR-1.1): each is a
+        # referenced reviewer profile, so its api key requirement is a FAIL (not a
+        # WARN) and doctor covers the panel member up front (P1-A5 / review F-005).
+        reviewers = step.get("reviewers")
+        if isinstance(reviewers, list):
+            for member in reviewers:
+                if isinstance(member, str):
+                    names.add(member)
+                elif isinstance(member, dict):
+                    profile = member.get("profile") or member.get("reviewer")
+                    if isinstance(profile, str):
+                        names.add(profile)
     return names
 
 

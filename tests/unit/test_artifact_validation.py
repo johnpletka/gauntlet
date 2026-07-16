@@ -53,9 +53,15 @@ Do the second thing.
 - id: P1
   title: First phase
   goal: Do the first thing.
+  acceptance:
+    - id: P1-A1
+      clause: The first thing is done.
 - id: P2
   title: Second phase
   goal: Do the second thing.
+  acceptance:
+    - id: P2-A1
+      clause: The second thing is done.
 ```
 """
 

@@ -56,6 +56,38 @@ CREDENTIAL_PATH_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 # Extract candidate absolute or home-relative paths from a shell command.
 _PATH_TOKEN_RE = re.compile(r"(?<![\w/])(~|/)[^\s'\";|&]*")
 
+# --- verifier-boundary confinement (PR #59 review B1 / PRD §7 items 1, 2, 4) ---
+# These apply ONLY to a step with an engine-registered boundary (the verifier's
+# disposable copy) — never to builder/operator sessions. They live in code, not
+# policy.yaml, because they key on per-step registration state a static rule
+# table cannot express.
+#
+# Relative parent-dir tokens in a Bash command ("cd ..", "cat ../../secrets"):
+# _PATH_TOKEN_RE harvests only absolute/~ paths, but inside a boundary the cwd
+# is the copy, so a `..` token is a live escape route and must be resolved.
+_RELATIVE_ESCAPE_RE = re.compile(r"(?<![\w/.])\.\.(?:/[^\s'\";|&]*)?")
+# Network egress surface reachable from Bash. Inside a boundary the posture is
+# DEFAULT-DENY (PRD §7 item 2) — no allowlist: known fetch/transfer binaries,
+# git against a remote, package-manager installs, and any explicit URL.
+_CONFINED_NETWORK_RE = re.compile(
+    r"\b(curl|wget|nc|ncat|netcat|ssh|scp|sftp|ftp|telnet|rsync)\b"
+    r"|\bgit\s+(clone|fetch|pull|push)\b"
+    r"|\b(pip3?|uv)\s+(?:[^\s;|&]+\s+)*install\b"
+    r"|\bnpm\s+(install|ci|update|exec)\b"
+    r"|https?://",
+    re.IGNORECASE,
+)
+# Ref/remote-mutating git. The disposable copy is a `git worktree` sharing the
+# real repo's object store, refs, and remotes — a `git tag`/`branch`/`push`
+# from inside the copy lands in (or publishes) the REAL repo's state, which the
+# working-tree mutation guard cannot see. Read-only git (status/log/diff/show)
+# stays available for probing the deliverable.
+_CONFINED_GIT_REF_RE = re.compile(
+    r"\bgit\b[^;|&\n]*\b(push|fetch|pull|remote|tag|branch|update-ref|reflog"
+    r"|gc|prune|worktree|submodule)\b",
+    re.IGNORECASE,
+)
+
 # Shell constructs that chain, substitute, or redirect — their presence means a
 # single allow rule matching one segment cannot vouch for the whole line
 # (review P2 F-001). Such lines are escalated to the LLM/fail-closed rung
@@ -69,6 +101,13 @@ class PolicyRule(BaseModel):
     description: str = ""
     applies_to_tools: list[str] | None = None
     command_patterns: list[str] = Field(default_factory=list)
+    # Regexes over the call's RESOLVED candidate paths — the operation targets
+    # (file-tool path keys, Bash path tokens), never a file's content strings,
+    # so a file whose content merely mentions a protected path is not matched
+    # (the BOOTSTRAP-NOTES #32 false-positive class command_patterns would hit
+    # for file tools). Added for the governed-learning-asset write guard
+    # (PR #59 review F-5).
+    path_patterns: list[str] = Field(default_factory=list)
     path_escape: bool = False  # path resolves outside repo_root
     credential_path: bool = False  # path matches a credential pattern (any location)
     credential_outside_repo: bool = False  # credential pattern AND outside repo
@@ -92,7 +131,7 @@ class PolicyRule(BaseModel):
     version: str | int | None = None
     ratified: bool = False
 
-    @field_validator("command_patterns")
+    @field_validator("command_patterns", "path_patterns")
     @classmethod
     def _compilable(cls, patterns: list[str]) -> list[str]:
         for pat in patterns:
@@ -101,6 +140,9 @@ class PolicyRule(BaseModel):
 
     def compiled(self) -> list[re.Pattern[str]]:
         return [re.compile(p, re.IGNORECASE) for p in self.command_patterns]
+
+    def compiled_paths(self) -> list[re.Pattern[str]]:
+        return [re.compile(p, re.IGNORECASE) for p in self.path_patterns]
 
 
 class Policy(BaseModel):
@@ -159,6 +201,75 @@ class PolicyEngine:
                     )
         return None
 
+    # -- verifier-boundary confinement (PR #59 review B1 / PRD §7) --------------
+
+    def confinement_deny(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        boundary: Path,
+    ) -> JudgeDecision | None:
+        """The boundary-confinement rung for a step with a registered boundary.
+
+        Returns a terminal ``deny`` when the call reaches outside the disposable
+        copy, or ``None`` to fall through to the normal ladder (which then runs
+        with the boundary as its effective root). Enforces, mechanically, the
+        §7 items the prompt could previously only request: reads AND writes
+        outside the copy are denied (items 1/4 — every candidate path,
+        including Bash path tokens and relative ``..`` escapes, must resolve
+        inside the boundary), network is default-deny with no allowlist
+        (item 2), and ref/remote-mutating git is denied because the copy shares
+        the real repo's refs. Deny decisions are never cached, so this
+        re-evaluates on every call."""
+        command = self._command_text(tool_name, tool_input)
+        # Network and git-ref checks run BEFORE the path check: a URL's
+        # `//host/path` also parses as an outside path token, and the network
+        # rationale is the actionable one for the audit trail.
+        if tool_name == "Bash":
+            if _CONFINED_NETWORK_RE.search(command):
+                return JudgeDecision(
+                    decision="deny",
+                    source="fast-path",
+                    rationale=(
+                        "verifier confinement: network egress is default-deny "
+                        "inside the disposable copy — no allowlist (PRD §7 item 2)"
+                    ),
+                    risk_category="network",
+                    matched_rule="verifier-boundary-network",
+                )
+            if _CONFINED_GIT_REF_RE.search(command):
+                return JudgeDecision(
+                    decision="deny",
+                    source="fast-path",
+                    rationale=(
+                        "verifier confinement: the disposable copy is a git "
+                        "worktree sharing the real repo's refs/remotes — "
+                        "ref/remote-mutating git is denied inside it"
+                    ),
+                    risk_category="sandbox-escape",
+                    matched_rule="verifier-boundary-git-refs",
+                )
+        paths = self._candidate_paths(tool_name, tool_input, command)
+        if tool_name == "Bash" and isinstance(tool_input.get("command"), str):
+            # relative parent-dir tokens are live escapes from the copy cwd
+            for match in _RELATIVE_ESCAPE_RE.finditer(tool_input["command"]):
+                paths.append(Path(match.group(0)))
+        for p in paths:
+            if self._escapes(p, boundary):
+                return JudgeDecision(
+                    decision="deny",
+                    source="fast-path",
+                    rationale=(
+                        f"verifier confinement: path {p} resolves outside the "
+                        f"disposable copy {boundary} — reads and writes outside "
+                        "the copy are denied (PRD §7 items 1/4)"
+                    ),
+                    risk_category="sandbox-escape",
+                    matched_rule="verifier-boundary-path",
+                )
+        return None
+
     # -- matching --------------------------------------------------------------
 
     def _matches(
@@ -179,6 +290,14 @@ class PolicyEngine:
         checks: list[bool] = []
         if rule.command_patterns:
             checks.append(any(p.search(command) for p in rule.compiled()))
+        if rule.path_patterns:
+            # match against RESOLVED operation-target paths (relative paths
+            # resolve against the run's repo_root) — never content strings
+            compiled_paths = rule.compiled_paths()
+            checks.append(any(
+                pat.search(str(self._resolve(p, repo_root)))
+                for p in paths for pat in compiled_paths
+            ))
         if rule.path_escape:
             checks.append(any(self._escapes(p, repo_root) for p in paths))
         if rule.credential_path:

@@ -495,8 +495,15 @@ class Orchestrator:
             if admission is not None:
                 result = admission
             else:
+                # Evidence-tiered gate (FR-4.1, P8): a `human_gate` configured
+                # `policy: auto_when_clean` auto-approves in place of parking when
+                # the strict §4.2 clean-signal predicate holds. A miss returns None
+                # and falls through to the handler, which parks exactly as today —
+                # fail closed. Every non-gate step, and an `always`-policy gate,
+                # skip this entirely.
+                auto = self._maybe_auto_approve(step, iteration, item)
                 try:
-                    result = spec.handler(step, ctx)
+                    result = auto if auto is not None else spec.handler(step, ctx)
                 except AgentTimeoutError as exc:
                     result = StepResult(
                         status=HALTED,
@@ -767,26 +774,37 @@ class Orchestrator:
     # correctly checks a distinct confirmer profile when one is configured.
     _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
 
-    def _admission_profiles(self, step: Step) -> list[str]:
-        """The agent profiles whose provider window this step must clear (FR-10.2).
+    def _admission_profiles(self, step: Step) -> dict[str, int]:
+        """The agent profiles whose provider window this step must clear, mapped to
+        the admission SCALE FACTOR for each (FR-10.2; pipeline-effectiveness FR-1.1).
 
-        An ``agent_task`` bills one profile (``step.agent``); an
+        An ``agent_task`` bills one profile (``step.agent``) once; an
         ``adversarial_cycle`` bills one PER declared role — each can drive a
         constrained provider into a reactive usage-limit park, so each is
-        admission-checked before the cycle launches (F-002). De-duplicated (roles
-        may share a profile) with first-seen order preserved so the check is
-        deterministic.
+        admission-checked before the cycle launches (F-002). The reviewer role
+        expands to the review panel (``reviewers:``): a member profile used by N
+        lenses is counted N times, so window admission scales its estimate by panel
+        size rather than a single-reviewer one (plan-cycle-resp-2a). Other roles
+        contribute their profile once, de-duplicated with the panel (first-seen),
+        so a single-reviewer cycle is exactly today's one-per-profile check.
         """
+        from gauntlet.engine.cycle import _panel
+
+        counts: dict[str, int] = {}
         if step.type == "agent_task":
-            return [step.agent] if step.agent else []
+            if step.agent:
+                counts[step.agent] = 1
+            return counts
         if step.type == "adversarial_cycle":
-            profiles: list[str] = []
-            for role in self._CYCLE_ROLES:
+            for member in _panel(step):  # reviewer / panel members, N per profile
+                if member.profile:
+                    counts[member.profile] = counts.get(member.profile, 0) + 1
+            for role in ("triager", "fixer", "confirmer", "escalation_agent"):
                 profile = step.get(role)
-                if profile and profile not in profiles:
-                    profiles.append(profile)
-            return profiles
-        return []
+                if profile and profile not in counts:  # dedup vs the panel
+                    counts[profile] = 1
+            return counts
+        return {}
 
     def _window_admission(self, step: Step, rec: StepRecord) -> StepResult | None:
         """Pre-step provider-window admission (FR-10.2/10.3).
@@ -811,7 +829,7 @@ class Orchestrator:
         except Exception:
             return None  # advisory: never block a launch on a ledger error
         now = self._now_dt()
-        for profile in profiles:
+        for profile, count in profiles.items():
             provider = L.profile_provider(self.config, profile)
             if provider is None:
                 continue
@@ -821,7 +839,7 @@ class Orchestrator:
             try:
                 decision = L.admit_step(
                     rows, window, provider=provider, step_type=step.type,
-                    profile=profile, now=now,
+                    profile=profile, now=now, count=count,
                 )
             except Exception:
                 continue  # advisory: an estimate fault never blocks a launch
@@ -1220,6 +1238,117 @@ class Orchestrator:
 
     def _head_sha(self) -> str:
         return gitops.head_sha(self.repo_root)
+
+    # ---- evidence-tiered gates (FR-4, P8) -----------------------------------
+    def _maybe_auto_approve(
+        self, step: Step, iteration: str | None, item: Any
+    ) -> StepResult | None:
+        """Auto-approve a clean-signal code gate, else fall through to a park.
+
+        Returns a DONE :class:`StepResult` (and appends the ``auto_approval``
+        record + sends a notification) iff ``step`` is a ``human_gate`` configured
+        ``policy: auto_when_clean`` AND the strict §4.2 clean-signal predicate
+        holds. Returns ``None`` for every other step, an ``always``-policy gate,
+        or any predicate miss — so the handler runs and parks for a human exactly
+        as today (fail closed, FR-4.1).
+        """
+        if step.type != "human_gate":
+            return None
+        if step.get("policy") != M.GATE_POLICY_AUTO_WHEN_CLEAN:
+            return None
+        from gauntlet.engine import gates
+
+        phase = self._expected_phase(step, item)
+        decision = gates.evaluate_clean_gate(
+            self.manifest, self.pipeline, step, iteration,
+            load_findings=self._load_round_findings,
+            phase=phase,
+        )
+        if not decision.clean:
+            # Fall through to the human_gate handler (parks); leave a note so the
+            # operator sees WHY it did not auto-approve (data over inference).
+            self._record_gate_miss(step, decision, phase)
+            return None
+        record = M.AutoApproval(
+            gate_id=step.id,
+            iteration=iteration,
+            phase=phase,
+            policy=M.GATE_POLICY_AUTO_WHEN_CLEAN,
+            evidence=decision.evidence,
+            at=self.clock(),
+        )
+        self.manifest.auto_approvals.append(record)
+        self._notify_auto_approval(record)
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"auto-approved (FR-4.1): {decision.summary()}; evidence snapshot "
+                f"recorded for PR-level ratification (FR-4.2): {decision.evidence}"
+            ),
+        )
+
+    def _load_round_findings(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """This phase's round findings + triage verdicts + confirm verdicts, from
+        the cycle artifacts.
+
+        Reads ``run_dir/artifacts/{findings,triage,confirm}.json`` — the "latest
+        round wins" bookkeeping the just-run cycle wrote (the same files ``PR.md``
+        reads). A missing/unparseable findings or triage file raises, which the
+        predicate treats as a fail-closed miss (cannot prove the findings clean).
+
+        ``confirm.json`` is treated as OPTIONAL-BUT-NOT-STALE (FR-4.1 v0.5). It is
+        legitimately absent on the zero-findings convergence path — nothing was
+        fixed, so nothing was confirmed — and cycle.py invalidates it there rather
+        than leaving the previous phase's file behind (absent > stale), so an
+        absent file means "this phase confirmed nothing", never "read the last
+        phase's verdicts". Absent therefore yields an empty verdict list, which is
+        only ever reached when there is also no legitimate blocking/major finding
+        to confirm; if there IS one, its missing verdict fails the conjunct closed
+        in :func:`gates.evaluate_clean_gate` rather than passing unproven.
+        """
+        import json
+
+        art = self.run_dir / "artifacts"
+        findings = json.loads((art / "findings.json").read_text()).get("findings") or []
+        verdicts = json.loads((art / "triage.json").read_text()).get("verdicts") or []
+        confirm_path = art / "confirm.json"
+        confirms: list[dict[str, Any]] = []
+        if confirm_path.exists():
+            confirms = json.loads(confirm_path.read_text()).get("verdicts") or []
+        return findings, verdicts, confirms
+
+    def _notify_auto_approval(self, record: "M.AutoApproval") -> None:
+        """Send the FR-4.1 auto-approval notification via the advisory channel.
+
+        Stamped into ``manifest.warnings`` (the engine's durable advisory push
+        channel the web notifier surfaces) so an auto-approval is visible without
+        opening the manifest, and de-duplicated by text like every other advisory.
+        """
+        note = (
+            f"[{record.gate_id}] auto-approval (FR-4.1): code gate "
+            f"{record.phase or record.gate_id} cleared without a human on clean "
+            f"evidence (verifier={record.evidence.get('verifier')}, "
+            f"rounds={record.evidence.get('rounds')}); enumerated in PR.md for "
+            "ratification (FR-4.2)"
+        )
+        if note not in self.manifest.warnings:
+            self.manifest.warnings.append(note)
+
+    def _record_gate_miss(self, step: Step, decision, phase: str | None) -> None:
+        """Note why an ``auto_when_clean`` gate parked instead of auto-approving.
+
+        The note names the phase, not just the (foreach-stable) step id — the
+        warnings list de-duplicates by text, so a phase-less note for ``P2``
+        would silently collapse into ``P1``'s identical one (review F-9).
+        """
+        note = (
+            f"[{step.id}{f' {phase}' if phase else ''}] auto_when_clean predicate "
+            f"miss (FR-4.1): parked for a human — {decision.summary()}"
+        )
+        if note not in self.manifest.warnings:
+            self.manifest.warnings.append(note)
 
     def _expected_phase(self, step: Step, item: Any) -> str | None:
         """The numeric phase prefix (P1, P2…) a step belongs to, or ``None``.

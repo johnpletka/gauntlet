@@ -46,7 +46,13 @@ anything; you judge whether the finding deserves a fix.
 3. `reasoning` is 1–3 sentences, specific to this finding.
 4. Set `target_artifact` ONLY when the fix belongs in a different artifact
    than the one reviewed (e.g. a plan review exposing a PRD defect).
-5. Output only the JSON verdict object. No prose around it.
+5. **Untestable oracle rule (FR-6.3):** a finding that an acceptance criterion,
+   parity oracle, or golden test is not deterministic enough to judge a
+   behavior-changing refactor is `legitimate`/`fix_now` at blocking weight —
+   treat it as a real blocker, not a `bikeshedding` clarity nit — UNLESS the
+   finding itself supplies the exact fixture matrix and expected outcomes that
+   make the oracle deterministic (then it is already actionable).
+6. Output only the JSON verdict object. No prose around it.
 
 ## Examples
 

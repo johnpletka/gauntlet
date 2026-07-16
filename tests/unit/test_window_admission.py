@@ -206,6 +206,71 @@ def test_cycle_with_no_window_provider_is_admitted(fixture_repo):
     assert orch.manifest.warnings == []
 
 
+# --- ensemble panel scales admission by panel size (FR-1.1, P1-A8) -----------
+PANEL_CYCLE = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: reviewer, lens: security}],
+         triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-code.md}
+"""
+
+SINGLE_CYCLE = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
+         reviewer: reviewer, triager: triage, fixer: builder,
+         escalation_agent: escalation, max_rounds: 2,
+         review_prompt: prompts/review-code.md}
+"""
+
+
+def _admit(orch):
+    step = orch.pipeline.all_steps()[0]
+    rec = StepRecord(id=step.id, type=step.type, status=M.PENDING)
+    return orch._window_admission(step, rec)
+
+
+def test_admission_profiles_counts_panel_members(fixture_repo):
+    # Two lenses on ONE reviewer profile ⇒ that profile is billed twice; other
+    # roles once (deduped vs the panel). A single-reviewer cycle stays one-each.
+    orch = _build(fixture_repo, PANEL_CYCLE, config=_cycle_cfg(
+        budget=1000, enforce=False, fallback=None))
+    counts = orch._admission_profiles(orch.pipeline.all_steps()[0])
+    assert counts["reviewer"] == 2
+    assert counts["triage"] == 1 and counts["builder"] == 1
+
+    single = _build(fixture_repo, SINGLE_CYCLE, config=_cycle_cfg(
+        budget=1000, enforce=False, fallback=None))
+    assert single._admission_profiles(single.pipeline.all_steps()[0])["reviewer"] == 1
+
+
+def test_ensemble_panel_admission_parks_where_single_reviewer_fits(fixture_repo):
+    # fallback per-member estimate 60; budget 100. A single reviewer (60 ≤ 100)
+    # is admitted; the two-member panel projects 2×60 = 120 > 100 and parks
+    # (enforce). This is the scaling that keeps the fail-closed park from being
+    # defeated by a single-reviewer estimate (P1-A8).
+    cfg = _cycle_cfg(budget=100, enforce=True, fallback=60)
+
+    single = _build(fixture_repo, SINGLE_CYCLE, config=cfg)
+    assert _admit(single) is None  # 60 ≤ 100 → admitted
+
+    panel = _build(fixture_repo, PANEL_CYCLE, config=cfg)
+    result = _admit(panel)
+    assert result is not None and result.status == M.PARKED
+    assert result.parked_reason == M.PARKED_REASON_USAGE_WINDOW
+    assert "120" in (result.notes or "")  # scaled estimate 2×60
+
+
 # --- enforce admission (FR-10.3) ---------------------------------------------
 
 

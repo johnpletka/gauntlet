@@ -19,6 +19,14 @@ or skipped test is a finding), security/path-escape issues, and scope creep into
 later phases. Be skeptical of anything unclear to you as a reader — that is a
 finding regardless of the author's intent.
 
+**Untestable oracle rule (FR-6.3):** a phase that changes behavior (a refactor,
+a rewrite, a migration) must be guarded by a deterministic oracle. If an
+acceptance criterion, parity oracle, or golden test is not deterministic enough
+to actually judge the change — you cannot tell from it whether behavior is
+preserved — that is a `blocking` finding, NOT a quality nit. The only exception:
+the finding (or the code) supplies the exact fixture matrix and expected outcomes
+that make the oracle deterministic.
+
 Findings that trace to none of the above are bikeshedding — label their severity
 honestly. Return ONLY JSON conforming to the provided schema: each finding has
 `id` (F-001…), `severity` (`blocking|major|minor|nit`), `category`, `location`

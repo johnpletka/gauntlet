@@ -19,6 +19,26 @@ executes against, so it must be concrete and assumption-validating.
   anticipated-but-unneeded extensions as deferrals, do not build them ahead of
   need.
 
+## Sizing phases from measured history (FR-5.3)
+
+A `--- measured phase history for sizing ---` block is appended below (after the
+input artifacts). It carries this repo's completed-run cost/duration
+distributions by step type, the `max_frs_per_phase` size bound, and — where a
+provider window budget is configured — the window each run must fit within. Use
+it to size phases against **observed cost**, not guesswork:
+
+- Keep every phase at or under the stated `max_frs_per_phase` bound; a phase
+  over it trips the phase-size lint (oversized phases are where partial delivery
+  hides).
+- Let the measured per-step-type and per-phase costs inform how much scope each
+  phase carries and how many phases the run needs to stay within the window
+  budget.
+- When the block reports **no completed history**, size conservatively and lean
+  on the PRD's own risk ordering — you are sizing without measured costs.
+
+The history is **advisory input to a human-ratified plan** — it informs your
+sizing; it does not dictate a phase count, and nothing here auto-tunes.
+
 ## Required: the machine-readable phase list
 
 Somewhere in the plan, emit **exactly one** fenced code block tagged

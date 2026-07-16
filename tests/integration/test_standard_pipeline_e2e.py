@@ -52,6 +52,21 @@ agents:
     base_flags: ["--setting-sources", "project"]
     step_timeout_s: 3600
   reviewer: {adapter: codex, model: gpt-5.5, sandbox: read-only}
+  # The shipped standard.yaml has referenced these since the pipeline-
+  # effectiveness run's P1 (gemini panel member), FR-6.3 (mechanic), and P5
+  # (verifier); the fixture was never updated, so this test failed pipeline
+  # validation before any agent ran (found during the PR #59 review-fix pass).
+  # `gemini` is a PROFILE NAME — on this machine only an OpenAI key is
+  # provisioned (pins.yaml), so the second panel member runs on the available
+  # api provider rather than a live Gemini model id.
+  gemini: {adapter: api, model: gpt-5-mini}
+  mechanic: {adapter: api, model: gpt-5-mini}
+  verifier:
+    adapter: claude-code
+    model: opus
+    permission_mode: acceptEdits
+    allowed_tools: [Bash, Read, Grep, Glob, Edit, Write]
+    base_flags: ["--setting-sources", "project"]
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
   judge_llm: {adapter: api, model: gpt-5-mini}

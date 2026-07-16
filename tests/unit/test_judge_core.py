@@ -64,6 +64,34 @@ def test_ask_routes_to_llm():
     assert len(adapter.calls) == 1
 
 
+def test_probe_step_id_records_observation():
+    """review F-001: a decision call tagged with a hook-loading probe step_id
+    records the nonce as observed — this is the evidence the verifier probe reads
+    back to prove a real claude turn loaded and fired the PreToolUse hook. A
+    non-probe step_id records nothing."""
+    from gauntlet.judge.hook_client import PROBE_STEP_PREFIX
+
+    core = JudgeCore(engine())
+    assert core.observed_probe("nonce-1") is False
+    core.decide(
+        "Bash", {"command": "echo nonce-1"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id=f"{PROBE_STEP_PREFIX}nonce-1",
+    )
+    assert core.observed_probe("nonce-1") is True
+    # a deny outcome still records the observation (reaching the judge is the proof)
+    core.decide(
+        "Bash", {"command": "rm -rf /"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id=f"{PROBE_STEP_PREFIX}nonce-2",
+    )
+    assert core.observed_probe("nonce-2") is True
+    # an ordinary (non-probe) step id is never recorded as a probe observation
+    core.decide(
+        "Bash", {"command": "git status"}, repo_root=REPO_ROOT, run_id="r1",
+        step_id="ordinary-step",
+    )
+    assert core.observed_probe("ordinary-step") is False
+
+
 def test_unmatched_routes_to_llm():
     adapter = FakeAdapter(
         structured={"decision": "deny", "risk_category": "unknown", "rationale": "weird"}
@@ -337,3 +365,198 @@ def test_agent_profile_scopes_the_cache_key():
     # repeating the first profile's call is now a hit (no third evaluation)
     core.decide(*call, repo_root=REPO_ROOT, agent_profile="builder")
     assert clf.calls == 2
+
+
+# --- per-step boundary confinement (PR #59 review B1 / PRD §7 items 1, 2, 4) ---
+def _boundary_core(tmp_path):
+    """A PINNED-ROOT core (the production posture judgeproc starts) with a
+    disposable-copy boundary registered for the verifier's step id. tmp_path
+    stands in for the real run worktree; the copy lives outside it, exactly like
+    a tempfile.mkdtemp copy in a real run."""
+    run_worktree = tmp_path / "repo"
+    run_worktree.mkdir(parents=True)
+    (run_worktree / "secret-config.txt").write_text("real-tree\n")
+    copy = tmp_path / "copy" / "worktree"
+    copy.mkdir(parents=True)
+    (copy / "inside.txt").write_text("copy\n")
+    core = JudgeCore(engine(), repo_root=run_worktree)
+    assert core.register_boundary("verify:r1:abc", copy, "lease-key")
+    return core, run_worktree, copy
+
+
+def test_boundary_wins_over_pinned_root_and_denies_run_worktree_read(tmp_path):
+    # THE B1 regression: previously the pinned repo_root always overrode the
+    # copy root (`self.repo_root or repo_root`), so in a production run the
+    # verifier's path boundary was the REAL worktree — reads of it were inside
+    # the allowed surface and the copy confinement was inert. A registered
+    # boundary must win over the pinned root and deny the run-worktree read.
+    core, run_worktree, copy = _boundary_core(tmp_path)
+    d = core.decide(
+        "Read", {"file_path": str(run_worktree / "secret-config.txt")},
+        repo_root=copy, step_id="verify:r1:abc",
+    )
+    assert d.decision == "deny"
+    assert d.matched_rule == "verifier-boundary-path"
+    # and READS are covered at all — PRD §7 items 1/4 (previously only write
+    # tools carried a path-escape rule; read-shaped calls had no path boundary)
+    d2 = core.decide(
+        "Read", {"file_path": "/etc/passwd"}, repo_root=copy,
+        step_id="verify:r1:abc",
+    )
+    assert d2.decision == "deny" and d2.matched_rule == "verifier-boundary-path"
+
+
+def test_boundary_confines_bash_paths_and_relative_escapes(tmp_path):
+    core, run_worktree, copy = _boundary_core(tmp_path)
+    kw = dict(repo_root=copy, step_id="verify:r1:abc")
+    assert core.decide(
+        "Bash", {"command": "cat /etc/passwd"}, **kw
+    ).matched_rule == "verifier-boundary-path"
+    # relative parent-dir tokens are live escapes from the copy cwd
+    assert core.decide(
+        "Bash", {"command": "cat ../../repo/secret-config.txt"}, **kw
+    ).matched_rule == "verifier-boundary-path"
+    # an in-copy read is NOT confinement-denied (falls through to the ladder)
+    d = core.decide("Bash", {"command": f"cat {copy / 'inside.txt'}"}, **kw)
+    assert d.matched_rule != "verifier-boundary-path"
+    assert d.decision != "deny"  # read-inspect allow with the copy as root
+
+
+def test_boundary_network_is_default_deny_overriding_the_allowlist(tmp_path):
+    # PRD §7 item 2: outside a boundary, policy.yaml's outbound-network rule
+    # ALLOWS github.com/pypi.org; inside a boundary the posture is default-deny
+    # with no allowlist.
+    core, _, copy = _boundary_core(tmp_path)
+    unconfined = core.decide(
+        "Bash", {"command": "curl -sL https://github.com/x/y"},
+        repo_root=copy, step_id="implement",
+    )
+    assert unconfined.matched_rule != "verifier-boundary-network"
+    confined = core.decide(
+        "Bash", {"command": "curl -sL https://github.com/x/y"},
+        repo_root=copy, step_id="verify:r1:abc",
+    )
+    assert confined.decision == "deny"
+    assert confined.matched_rule == "verifier-boundary-network"
+    # package installs are network fetches too
+    d = core.decide(
+        "Bash", {"command": "uv pip install requests"},
+        repo_root=copy, step_id="verify:r1:abc",
+    )
+    assert d.decision == "deny" and d.matched_rule == "verifier-boundary-network"
+
+
+def test_boundary_denies_ref_mutating_git_in_shared_worktree(tmp_path):
+    # The disposable copy is a git worktree SHARING the real repo's refs and
+    # remotes: a push/tag from inside it publishes or mutates the real repo's
+    # state, which the working-tree mutation guard cannot see (PR #59 F-003).
+    core, _, copy = _boundary_core(tmp_path)
+    kw = dict(repo_root=copy, step_id="verify:r1:abc")
+    for cmd in ("git push origin HEAD:x", "git tag v1", "git branch evil",
+                "git remote add x http://e", "git worktree add /tmp/z"):
+        d = core.decide("Bash", {"command": cmd}, **kw)
+        assert d.decision == "deny", cmd
+        assert d.matched_rule in (
+            "verifier-boundary-git-refs", "verifier-boundary-network"
+        ), cmd
+    # read-only git stays available for probing the deliverable
+    d = core.decide("Bash", {"command": "git status"}, **kw)
+    assert d.decision == "allow"
+
+
+def test_boundary_write_inside_copy_is_not_denied(tmp_path):
+    # The verifier may build/patch inside the throwaway copy: with the boundary
+    # as effective root, an in-copy Write neither hits the confinement rung nor
+    # the write-outside-repo path_escape rule.
+    core, _, copy = _boundary_core(tmp_path)
+    d = core.decide(
+        "Write", {"file_path": str(copy / "scratch.py"), "content": "x"},
+        repo_root=copy, step_id="verify:r1:abc",
+    )
+    # not boundary-denied and not a write-outside-repo path escape — it falls
+    # through to the ladder like any in-repo write (this classifier-less
+    # fixture then fail-closes on the unmatched rung, which is not the boundary)
+    assert d.matched_rule not in (
+        "verifier-boundary-path", "verifier-boundary-network",
+        "verifier-boundary-git-refs", "write-outside-repo",
+    )
+    # ...while a write to the RUN worktree is boundary-denied
+    core2, run_worktree, copy2 = _boundary_core(tmp_path / "b")
+    d2 = core2.decide(
+        "Write", {"file_path": str(run_worktree / "evil.py"), "content": "x"},
+        repo_root=copy2, step_id="verify:r1:abc",
+    )
+    assert d2.decision == "deny" and d2.matched_rule == "verifier-boundary-path"
+
+
+def test_boundary_registration_is_one_shot_and_clear_is_keyed(tmp_path):
+    core, _, copy = _boundary_core(tmp_path)
+    # a sandboxed agent (holding the run token) cannot re-register itself wider
+    assert not core.register_boundary("verify:r1:abc", Path("/"), "other-key")
+    assert core.boundary_for("verify:r1:abc") == copy
+    # idempotent re-registration of the SAME values is resume-safe
+    assert core.register_boundary("verify:r1:abc", copy, "lease-key")
+    # clearing requires the engine-held key
+    assert not core.clear_boundary("verify:r1:abc", "wrong-key")
+    assert core.boundary_for("verify:r1:abc") == copy
+    assert core.clear_boundary("verify:r1:abc", "lease-key")
+    assert core.boundary_for("verify:r1:abc") is None
+
+
+def test_steps_without_a_boundary_are_unaffected(tmp_path):
+    core, run_worktree, copy = _boundary_core(tmp_path)
+    # a different step id (the builder) is judged against the pinned root as
+    # before: an in-repo read is not confinement-denied
+    d = core.decide(
+        "Read", {"file_path": str(run_worktree / "secret-config.txt")},
+        repo_root=run_worktree, step_id="implement",
+    )
+    assert d.matched_rule != "verifier-boundary-path"
+
+
+# --- governed learning assets write-guard (PR #59 review F-5 / §7) ------------
+def test_pipeline_write_to_lens_or_registry_denied(tmp_path):
+    # §7 "no agent-writable path mutates them" is now enforced, not convention:
+    # an IN-PIPELINE write to a review lens or the declined/supersession
+    # registries is denied — they change only via ratified retro proposals.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    for rel in ("prompts/lenses/security.md",
+                "registry/declined.jsonl",
+                "registry/supersessions.jsonl",
+                ".gauntlet/prompts/lenses/custom.md"):  # adopter layout too
+        d = core.decide(
+            "Write", {"file_path": str(REPO_ROOT / rel), "content": "poison"},
+            repo_root=REPO_ROOT, step_id="implement",
+        )
+        assert d.decision == "deny", rel
+        assert d.matched_rule == "governed-learning-assets-in-pipeline", rel
+        e = core.decide(
+            "Edit", {"file_path": str(REPO_ROOT / rel), "old_string": "a",
+                     "new_string": "b"},
+            repo_root=REPO_ROOT, step_id="implement",
+        )
+        assert e.decision == "deny", rel
+
+
+def test_operator_session_lens_write_not_matched_by_guard(tmp_path):
+    # pipeline_step_only: the operator's own session (no step_id) is unaffected
+    # — a human editing a lens directly remains their call.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    d = core.decide(
+        "Write", {"file_path": str(REPO_ROOT / "prompts/lenses/security.md"),
+                  "content": "operator edit"},
+        repo_root=REPO_ROOT, step_id=None,
+    )
+    assert d.matched_rule != "governed-learning-assets-in-pipeline"
+
+
+def test_content_mentioning_protected_path_is_not_matched(tmp_path):
+    # notes #32 class: the rule matches operation-TARGET paths, never content —
+    # editing a file whose content mentions prompts/lenses/ must not trip it.
+    core = JudgeCore(engine(), repo_root=REPO_ROOT)
+    d = core.decide(
+        "Edit", {"file_path": str(REPO_ROOT / "src/gauntlet/engine/registry.py"),
+                 "old_string": "x", "new_string": "see prompts/lenses/security.md"},
+        repo_root=REPO_ROOT, step_id="implement",
+    )
+    assert d.matched_rule != "governed-learning-assets-in-pipeline"

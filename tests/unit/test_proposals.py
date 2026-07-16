@@ -337,3 +337,54 @@ def test_reject_records_status(asset_repo: Path):
     P.reject_proposal(proposal, "not worth it")
     assert P.parse_proposal(proposal.path).status == P.REJECTED
     assert "not worth it" in P.parse_proposal(proposal.path).invalid_reason
+
+
+# --- PR #59 review F-4: supersessions registry on the allowlist, append-only ---
+def test_supersessions_registry_is_allowlisted():
+    assert P.path_allowed("registry/supersessions.jsonl")
+    # ...but the audit registry itself stays OUT of the proposal surface: a
+    # decline record is never rewritten via a proposal
+    assert not P.path_allowed("registry/declined.jsonl")
+
+
+def test_supersession_append_proposal_validates(asset_repo: Path):
+    (asset_repo / "registry").mkdir()
+    (asset_repo / "registry" / "supersessions.jsonl").write_text("")
+    _git(asset_repo, "add", "-A")
+    _git(asset_repo, "commit", "-qm", "seed registry")
+    diff = _capture_diff(
+        asset_repo, "registry/supersessions.jsonl",
+        '{"fingerprint": "style/line/claim:x", "reason": "wrong precedent"}\n',
+    )
+    proposals_dir = asset_repo / "runs" / "demo" / "run-1" / "retro" / "proposals"
+    [proposal] = P.materialize_proposals(
+        asset_repo, proposals_dir,
+        [{"slug": "supersede-x", "target_path": "registry/supersessions.jsonl",
+          "rationale": "retire a wrong precedent", "diff": diff}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+    assert proposal.valid and proposal.status == P.PENDING
+
+
+def test_supersession_rewrite_proposal_is_invalid(asset_repo: Path):
+    # Append-only: a diff REMOVING a supersession line is refused before the
+    # human sees it — supersession history is never rewritten.
+    (asset_repo / "registry").mkdir()
+    (asset_repo / "registry" / "supersessions.jsonl").write_text(
+        '{"fingerprint": "old"}\n'
+    )
+    _git(asset_repo, "add", "-A")
+    _git(asset_repo, "commit", "-qm", "seed registry")
+    diff = _capture_diff(
+        asset_repo, "registry/supersessions.jsonl",
+        '{"fingerprint": "replacement"}\n',  # replaces (removes) the old line
+    )
+    proposals_dir = asset_repo / "runs" / "demo" / "run-1" / "retro" / "proposals"
+    [proposal] = P.materialize_proposals(
+        asset_repo, proposals_dir,
+        [{"slug": "rewrite", "target_path": "registry/supersessions.jsonl",
+          "rationale": "rewrite history", "diff": diff}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+    assert not proposal.valid and proposal.status == P.INVALID
+    assert "append-only" in proposal.invalid_reason

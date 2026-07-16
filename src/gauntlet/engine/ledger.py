@@ -480,6 +480,7 @@ def estimate_step(
     profile: str | None,
     unit: str,
     fallback: float | None,
+    count: int = 1,
 ) -> float | None:
     """Median historical usage of same-type/same-profile steps (FR-10.2).
 
@@ -488,7 +489,15 @@ def estimate_step(
     ran. Rows contributing ``None`` for the unit (a cost query on a tokens-only
     row) are excluded. With no usable history, returns ``fallback`` (which may be
     ``None`` → the caller treats the estimate as unknown and does not block).
-    """
+
+    ``count`` scales the estimate by the number of same-profile invocations the
+    step will make in one launch (pipeline-effectiveness FR-1.1 / plan
+    plan-cycle-resp-2a): an ensemble review runs ``count`` panel members on one
+    profile, so its projected usage is ``count`` × a single member's — admitting a
+    multi-member panel against a single-reviewer estimate would under-count it and
+    defeat the fail-closed park. ``count=1`` (the default) is today's behavior.
+    An unknown estimate (``fallback is None`` and no history) stays unknown — a
+    guess is never manufactured by scaling ``None``."""
     values: list[float] = []
     for row in rows:
         if row.step_type != step_type or row.profile != profile:
@@ -496,9 +505,8 @@ def estimate_step(
         value = row.value(unit)
         if value is not None:
             values.append(value)
-    if not values:
-        return fallback
-    return statistics.median(values)
+    base = statistics.median(values) if values else fallback
+    return None if base is None else base * count
 
 
 def replenishment_at(
@@ -567,6 +575,7 @@ def admit_step(
     step_type: str,
     profile: str | None,
     now: datetime,
+    count: int = 1,
 ) -> AdmissionDecision:
     """Decide whether the next step fits the provider window (FR-10.2/10.3).
 
@@ -585,7 +594,7 @@ def admit_step(
     headroom = window.window_budget - spent
     estimate = estimate_step(
         rows, step_type=step_type, profile=profile, unit=unit,
-        fallback=window.fallback_estimate,
+        fallback=window.fallback_estimate, count=count,
     )
     sufficient = estimate is None or estimate <= headroom
     replenish = None if sufficient else replenishment_at(

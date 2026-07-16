@@ -30,8 +30,12 @@ to a park-at-gate instead of silently carrying them forward (FR-10.5).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import secrets
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,8 +45,10 @@ from gauntlet.adapters.base import (
     MalformedOutputError,
     SessionNotFoundError,
 )
+from gauntlet.engine import ensemble
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
+from gauntlet.engine import verify
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -437,6 +443,33 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     if isinstance(roles, StepResult):
         return roles
     reviewer, triager, fixer, confirmer = roles
+    panel = _panel(step)
+    panel_err = _validate_panel(panel, step, ctx)
+    if isinstance(panel_err, StepResult):
+        return panel_err
+    # FR-1.1: an ensemble panel (≥2 members) runs the merge/dedup path. A
+    # one-member panel is the unchanged single-reviewer path (byte-identical)
+    # ONLY when it carries no lens — a configured lens must actually be applied
+    # (PR #59 review F-003: `_validate_panel` verified the lens file existed and
+    # the single path then reviewed without it), so a lensed single member
+    # routes through the member machinery (lens fragment + per-member artifact;
+    # the merge is a no-op at n=1).
+    is_ensemble = len(panel) >= 2 or (len(panel) == 1 and panel[0].lens is not None)
+    dedup_threshold = float(
+        step.get("dedup_jaccard_threshold", ensemble.DEFAULT_JACCARD_THRESHOLD)
+    )
+    # FR-2.1: an optional behavioral verifier sub-step. `verifier:` names a
+    # designated agent profile (a claude-code judge-hooked backend) that executes
+    # the deliverable in a disposable sandboxed copy between review and triage.
+    # Only meaningful for a code cycle (there is a deliverable to run); in artifact
+    # mode there is nothing to execute, so it is ignored there.
+    verifier_profile = step.get("verifier") if step.get("mode", "artifact") == "code_review" else None
+    if verifier_profile and verifier_profile not in ctx.config.agents and ctx.adapter_factory is None:
+        return StepResult(
+            status=FAILED,
+            notes=f"adversarial_cycle `verifier:` profile {verifier_profile!r} is "
+            "not a configured agent profile (FR-2.1)",
+        )
     if step.get("commit_each_fix_round") is False:
         return StepResult(
             status=FAILED,
@@ -466,8 +499,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         )
 
     findings_schema = _load_schema(ctx, step.get("findings_schema") or DEFAULT_FINDINGS_SCHEMA)
+    # The strict per-member output schema (FR-1.2 / F-007): the ensemble-annotated
+    # fields in schemas/findings.json are engine-stamped, never agent-emitted, so
+    # the reviewer adapter gets today's byte-equivalent finding shape.
+    reviewer_schema = _reviewer_output_schema(findings_schema)
     triage_schema = _load_schema(ctx, step.get("triage_schema") or DEFAULT_TRIAGE_SCHEMA)
+    # The persisted confirm-record schema (carried_from optional/additive, PRD §6)
+    # and its DERIVED strict-output shape for the native --output-schema path
+    # (carried_from required-but-nullable, F-007). The confirmer adapter gets the
+    # strict one; the persisted schema is what a legacy/pre-migration artifact
+    # validates against.
     confirm_schema = _load_schema(ctx, step.get("confirm_schema") or DEFAULT_CONFIRM_SCHEMA)
+    confirmer_schema = _confirmer_output_schema(confirm_schema)
 
     convergence = step.get("convergence") or ctx.config.cycle_convergence
     if convergence not in CONVERGENCE_POLICIES:
@@ -481,6 +524,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     artifact_writes: dict[str, Path] = {}
     metrics = _CycleMetrics()  # trend outcome counts (FR-6.6 / P7)
     carried: list[dict[str, Any]] = []  # open findings carried into the next round
+    # FR-6.1 (§6): confirm-carried remainders — PRE-ACCEPTED fix obligations
+    # injected ahead of the next round's fresh findings, bypassing re-triage.
+    carried_remainders: list[dict[str, Any]] = []
+    # Every finding id seen this run, the union the reserved carry namespace
+    # allocates a collision-free `<carried_from>-r<round>-c<N>` against (FR-6.1).
+    seen_ids: set[str] = set()
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
     resume_notes: list[str] = []  # FR-4.1/FR-4.2 audit lines for the final result
@@ -595,19 +644,56 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # round's review is reused we re-enter PAST that handoff (the guard held
         # when it first ran), so skip it — and never fail a reused round on the
         # partial fixer edits we reset just before the fix sub-step.
-        if not reuse_review and not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            return finish(_clean_handoff_failure(ctx, rnd))
+        if not reuse_review:
+            # RAW-worktree clean handoff (review F-001): once a run has hit an
+            # FR-2.2 response checkpoint its manifest.json/RUN.md are TRACKED, so
+            # the engine's live updates dirty a bare `git status` (the reviewer's
+            # view) at this handoff — even though the `--exclude`-scoped guard just
+            # below stays green. Re-commit that tracked bookkeeping so both views
+            # agree and control passes to the reviewer on a genuinely clean tree. A
+            # no-op when bookkeeping is still untracked (the run-dir self-ignore
+            # already hides it) — this never force-adds. It may land a bookkeeping
+            # commit on HEAD above `handoff`; a later usage-limit park then re-runs
+            # the round fresh (the SHA guard's sanctioned fail-closed path, §2)
+            # rather than reusing — correct, if slightly less efficient.
+            _persist_manifest(ctx)  # commit the CURRENT state, not a stale flush
+            gitops.commit_tracked_bookkeeping(
+                ctx.repo_root,
+                f"gauntlet: flush run bookkeeping before "
+                f"{phase or ctx.record.id} round-{rnd} review handoff",
+                run_bookkeeping_paths(ctx.repo_root, ctx.run_dir),
+                identity=gitops.ENGINE_IDENTITY,
+            )
+            if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+                return finish(_clean_handoff_failure(ctx, rnd))
 
-        # ---- 1. review, FR-9.6 guard applied after EVERY attempt (F-004) ------
-        # A reviewer can mutate the tree and THEN fail schema validation; the
-        # guard therefore runs between attempts (so a retry never re-enters on
-        # a dirty tree) and on the failure path (so the policy always applies).
+        # ---- 1. review (single reviewer OR ensemble panel) --------------------
+        # `findings` is the PERSISTED record: for a single reviewer, exactly the
+        # reviewer's findings (+ synthetic mutation findings); for an ensemble,
+        # the merged set (primaries + marked duplicates, each engine-annotated).
+        # `triage_findings` is what reaches triage — the PRIMARIES only, so a
+        # deduplicated defect is never re-litigated N times (FR-1.2). The FR-9.6
+        # mutation guard runs after EVERY reviewer attempt (F-004): a reviewer can
+        # mutate the tree and THEN fail validation, so the guard runs between
+        # attempts and on the failure path.
         if reuse_review:
-            # FR-4.1 reuse: the reviewer already ran (its findings, incl. any
-            # synthetic mutation findings, are in the checkpoint); do not re-invoke.
+            # FR-4.1 reuse: review already ran (findings incl. synthetic mutation
+            # findings and any ensemble annotations are in the checkpoint).
             findings = list(rdata.get("findings") or [])
             open_questions = rdata.get("open_questions") or []
             review_summary = rdata.get("summary", "")
+        elif is_ensemble:
+            # FR-1.1/FR-1.2: run/reuse each panel member, then deterministically
+            # merge. Fail-closed park on any member error/usage-limit is raised as
+            # a _ParkCycle from inside (plan-cycle-resp-2a).
+            try:
+                findings, open_questions, review_summary = _ensemble_review(
+                    step, ctx, panel, rnd, handoff, policy, phase, commits,
+                    reviewer_schema, usage, carried, prev_review_handoff,
+                    dedup_threshold, cycle_effort,
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
         else:
             review_prompt = _review_prompt(
                 step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
@@ -621,14 +707,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     # call; consume it so later calls run fresh.
                     review = _resume_review(
                         ctx, reviewer, cont_session, review_prompt,
-                        findings_schema, usage, review_logger, guard,
+                        reviewer_schema, usage, review_logger, guard,
                         substep=f"r{rnd}-review", effort=cycle_effort,
                     )
                     resume_session = None
                 else:
                     review = _run_sub(
                         ctx, reviewer, review_prompt,
-                        schema=findings_schema, usage=usage,
+                        schema=reviewer_schema, usage=usage,
                         logger=review_logger,
                         structured_name="findings.json",
                         after_attempt=guard.check,
@@ -641,7 +727,73 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             open_questions = (review.structured or {}).get("open_questions") or []
             review_summary = (review.structured or {}).get("summary", "")
 
-        metrics.record_round(findings)  # counted on reuse too, so trend math matches
+        # ---- 1b. behavioral verifier sub-step (FR-2.1/2.2, optional) ----------
+        # Between review and triage: execute the deliverable in a DISPOSABLE
+        # sandboxed copy and emit behavioral findings that JOIN the merged panel
+        # and flow through the same triage/fix/confirm machinery — no parallel
+        # process (FR-2.2). Fail closed (FR-2.3/2.5): an unusable/unhooked backend,
+        # a copy/sandbox-launch failure, or a real-worktree mutation parks the cycle
+        # (never "skipped, proceed"). On reuse the behavioral findings are already
+        # in the checkpointed `findings`, so it never re-runs / re-pays.
+        if verifier_profile and not reuse_review:
+            try:
+                behavioral = _run_verifier(
+                    step, ctx, verifier_profile, rnd, handoff, phase,
+                    findings_schema, usage, metrics, cycle_effort,
+                )
+            except _ParkCycle as park:
+                return finish(park.result)
+            findings.extend(behavioral)
+
+        # FR-6.1 (§6 merge order): a prior round's carried remainders are
+        # PRE-ACCEPTED fix obligations (they inherit their parent's `fix_now`
+        # acceptance and bypass re-triage). Merge them AHEAD of fresh reviewer
+        # findings. On reuse the round's review checkpoint already holds them (they
+        # were prepended before it was written), so inject only on a freshly-run
+        # review — re-prepending would double them.
+        if carried_remainders and not reuse_review:
+            # B2 guard: a re-reviewer that restates a carried remainder (or the
+            # parent it represents) would otherwise re-enter it into triage as a
+            # fresh finding — its `carried_from` is stripped by the reviewer
+            # output schema — where a decline could silently close a pre-accepted
+            # obligation (§6: a remainder is never a candidate for re-litigation).
+            # Drop such restatements; the synthetic fix_now obligation stands and
+            # the drop is recorded in the round's persisted review summary.
+            reserved = {str(r.get("id")) for r in carried_remainders}
+            reserved |= {str(r.get("carried_from")) for r in carried_remainders}
+            restated = sorted(
+                str(f.get("id")) for f in findings if str(f.get("id")) in reserved
+            )
+            if restated:
+                findings = [f for f in findings if str(f.get("id")) not in reserved]
+                review_summary = ((review_summary + "\n") if review_summary else "") + (
+                    "engine: dropped reviewer restatement(s) of pre-accepted "
+                    f"carried remainder(s)/parent(s): {', '.join(restated)} "
+                    "(§6 — a carried remainder bypasses re-triage; the engine-"
+                    "synthesized fix_now obligation stands)"
+                )
+            findings = [dict(r) for r in carried_remainders] + findings
+        # Register every id seen this round in the run-wide set BEFORE this round's
+        # confirm allocates a remainder id against it (FR-6.1) — so a remainder is
+        # unique against all prior ids and every id already assigned this run.
+        seen_ids.update(str(f.get("id")) for f in findings if f.get("id"))
+
+        # Triage set = primaries only. A merged duplicate carries `duplicate_of`
+        # and never reaches triage (FR-1.2); single-reviewer findings carry none,
+        # so this is identical to `findings` for the single path (unchanged).
+        # Behavioral verifier findings (category behavioral, no duplicate_of) are
+        # primaries and reach triage alongside review primaries (FR-2.2).
+        triage_findings = [f for f in findings if not f.get("duplicate_of")]
+        # FR-6.1: carried remainders are among the primaries but bypass re-triage;
+        # only FRESH reviewer findings are triaged, and the remainders get
+        # engine-synthesized fix_now verdicts merged ahead of the fresh ones (§6).
+        carried_this_round = [f for f in triage_findings if f.get("carried_from")]
+        to_triage = [f for f in triage_findings if not f.get("carried_from")]
+        metrics.record_round(triage_findings)  # counted on reuse too (trend math)
+        if is_ensemble:  # per-(profile, lens) yield metrics (FR-1.3)
+            metrics.record_ensemble(
+                _ensemble_member_stats(ctx, panel, rnd, triage_findings)
+            )
         review_out = {"findings": findings, "open_questions": open_questions,
                       "summary": review_summary}
         artifact_writes["findings.json"] = _write_artifact(ctx, "findings.json", review_out)
@@ -654,18 +806,53 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         _invalidate_artifact(ctx, "triage.json", artifact_writes)
         if not reuse_review:  # write-ahead checkpoint (FR-4.1); reuse never re-records
             _checkpoint(ctx, "review", rnd, handoff, data=review_out)
-        if not findings:
+        if not triage_findings:
+            # FR-4.1: persist the (empty) verdict set — the evidence-tiered gate
+            # reads findings.json + triage.json to prove no blocking/major
+            # legitimate finding is left open, and a missing triage.json is a
+            # fail-closed predicate miss. Without this write the archetypal clean
+            # gate (round 1, zero findings) could never auto-approve.
+            _persist_round_triage(ctx, [], [], schema=None,
+                                  artifact_writes=artifact_writes)
+            # Absent > stale (FR-4.1 v0.5). This path fixes nothing, so it writes
+            # no confirm.json — and `artifacts/` is per-RUN, not per-phase, so
+            # without this the PREVIOUS phase's confirm.json would still be on
+            # disk while findings/triage describe this one. The gate now reads
+            # confirm verdicts to decide whether a serious finding is still open,
+            # so a stale file is a correctness hazard, not just untidy: drop it
+            # exactly as the review path drops a superseded triage.json.
+            _invalidate_artifact(ctx, "confirm.json", artifact_writes)
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
+
+        # --- registry precedent injection (FR-5.2 / P6) ----------------------
+        # A fingerprint-matching decline recorded under still-current provenance
+        # (same repo + PRD family, unchanged prompt/lens/schema hashes) surfaces
+        # as ADVISORY per-finding triage context. Declines are recorded at retro
+        # (cross-run), so this only ever reads *prior* runs' precedent — never
+        # this run's own. The triager retains authority: a match never gates a
+        # finding out, it only informs (PRD §7). Counted for the §9 re-litigation
+        # instrument regardless of whether the triage batch is fresh or resumed.
+        precedent_by_id, registry_present = _load_precedents(ctx, to_triage)
+        metrics.note_registry_round(registry_present, len(precedent_by_id))
+        rematched_ids = set(precedent_by_id)
 
         # ---- 2. triage (point-by-point, escalation-aware) ---------------------
         # A transient (usage-limit/overload) failure in any triage sub-call parks
         # the whole cycle (FR-3.2), mirroring the reviewer wrapper above. On resume
         # the whole batch is reused as one sub-step (P5; P11 refines it per-finding).
+        # FR-6.1: carried remainders (`to_triage` excludes them) inherit their
+        # parent's fix_now and get engine-synthesized verdicts, merged AHEAD of the
+        # fresh verdicts (§6). On a reused triage the checkpoint already holds both.
+        carried_verdicts = [_carried_remainder_verdict(f) for f in carried_this_round]
         tdata = resume.reuse_data(rnd, "triage", resume_notes)  # None → re-run (fail closed / prefix broken)
         reuse_triage = tdata is not None
         if reuse_triage:
             verdicts = list(tdata.get("verdicts") or [])
+            park_reason = None
+        elif not to_triage:
+            # Only carried remainders this round: no fresh finding to triage.
+            verdicts = list(carried_verdicts)
             park_reason = None
         else:
             # FR-9.2 resume: a prior interrupted concurrent-triage round may have
@@ -675,16 +862,29 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # and ignored. `_triage` then re-runs exactly the still-incomplete
             # findings.
             completed = (
-                _load_triage_fragment(ctx, rnd, findings) if reuse_review else None
+                _load_triage_fragment(ctx, rnd, to_triage) if reuse_review else None
             )
             try:
-                verdicts, park_reason = _triage(
-                    step, ctx, findings, usage, rnd, triager,
+                fresh_verdicts, park_reason = _triage(
+                    step, ctx, to_triage, usage, rnd, triager,
                     effort=cycle_effort, completed=completed,
+                    precedent=precedent_by_id,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
+            verdicts = carried_verdicts + fresh_verdicts
         metrics.record_verdicts(verdicts)
+        if rematched_ids:  # injected precedents the triager overrode to legitimate (§9)
+            metrics.add_registry_overrides(sum(
+                1 for v in verdicts
+                if v.get("finding_id") in rematched_ids and v.get("verdict") == "legitimate"
+            ))
+        if is_ensemble:  # post-triage-legitimate per member (FR-1.3)
+            metrics.record_ensemble_legit(
+                _ensemble_legit_by_member(triage_findings, verdicts, panel)
+            )
+        if verifier_profile:  # triage-legitimate behavioral yield (FR-2, §9)
+            metrics.record_verifier_legit(triage_findings, verdicts)
         # Integrity backstop BEFORE the authoritative write (data over inference):
         # every verdict must map to a finding in THIS round. The triager forces
         # finding_id = finding['id'] and the schema requires an id, so a stray id
@@ -693,7 +893,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # writes mismatched verdicts to a diagnostic file and leaves triage.json
         # absent; aligned verdicts are written and registered.
         stray = _persist_round_triage(
-            ctx, findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
+            ctx, triage_findings, verdicts, schema=triage_schema, artifact_writes=artifact_writes
         )
         if stray:
             return finish(StepResult(status=PARKED, notes=(
@@ -707,7 +907,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if not reuse_triage:  # checkpoint the completed, integrity-checked batch
             _checkpoint(ctx, "triage", rnd, handoff, data={"verdicts": verdicts})
 
-        by_id = {f["id"]: f for f in findings}
+        by_id = {f["id"]: f for f in triage_findings}
 
         # ---- closure guards (P4.r1 F-002): never converge past these ----------
         # A legitimate blocking finding that is not being fixed this round is
@@ -742,6 +942,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
 
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
         if not accepted:
+            # Absent > stale (FR-4.1 v0.5), as on the zero-findings path above:
+            # nothing was fixed, so this phase confirms nothing and must not leave
+            # the PREVIOUS phase's confirm.json on disk in the per-run artifacts/
+            # dir for the gate to read against THIS phase's findings.
+            _invalidate_artifact(ctx, "confirm.json", artifact_writes)
             return finish(StepResult(
                 status=DONE,
                 notes=f"converged: round-{rnd} accepted no findings "
@@ -795,7 +1000,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
                     f"{len(accepted)} accepted finding(s); failing closed"))
-            message = _fix_commit_message(phase, rnd, findings, verdicts)
+            message = _fix_commit_message(phase, rnd, triage_findings, verdicts)
             err = validate_commit_message(message)
             if err is not None:  # engine-composed; a violation here is a bug
                 return finish(StepResult(
@@ -825,11 +1030,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             cdata = {k: v for k, v in stored.items()
                      if k not in ("engine_reconciliation", "surfaced_for_gate")}
         else:
-            confirm_prompt = _confirm_prompt(step, ctx, handoff, fix_sha, findings, verdicts)
+            confirm_prompt = _confirm_prompt(step, ctx, handoff, fix_sha, triage_findings, verdicts)
             try:
                 confirm = _run_sub(
                     ctx, confirmer, confirm_prompt,
-                    schema=confirm_schema, usage=usage,
+                    schema=confirmer_schema, usage=usage,
                     logger=step_logger(ctx, f"r{rnd}-confirm"),
                     structured_name="confirm.json",
                     substep=f"r{rnd}-confirm", effort=cycle_effort,
@@ -839,7 +1044,22 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             cdata = confirm.structured or {}
         metrics.record_confirm(cdata)
         actions = {v["finding_id"]: v["action"] for v in verdicts}
-        open_items, reconciliation = _open_after_confirm(by_id, actions, cdata)
+        # FR-6.1 confirm remainder carry (§6): promote `new_findings` entries that
+        # name a `carried_from` parent to reserved-namespace, collision-free,
+        # pre-accepted remainders (rewrites their id IN `cdata` so the persisted
+        # confirm.json shows the final id). An ordinary regression (carried_from
+        # null) is untouched. Deterministic + idempotent on reuse (the id it
+        # re-derives equals the one already stored).
+        new_remainders, demoted_carries = _carry_remainders(
+            cdata, rnd, seen_ids, by_id, actions
+        )
+        open_items, reconciliation = _open_after_confirm(
+            by_id, actions, cdata, new_remainders
+        )
+        if demoted_carries:
+            # B2 guard audit trail: forged/stale carried_from references were
+            # demoted to ordinary regressions — record why, next to the verdicts.
+            reconciliation["demoted_carries"] = demoted_carries
         forcing = _forcing_open(open_items, convergence)
         # Non-blocking open items don't loop (policy A); they accumulate and are
         # surfaced at the human gate (BOOTSTRAP-NOTES #30). Dedup by id, latest
@@ -869,7 +1089,24 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         # artifact diff (FR-1.2) BEFORE advancing the handoff to the fix SHA.
         prev_review_handoff = review_handoff
         handoff = fix_sha
-        carried = forcing
+        # FR-6.1: split what carries into round N+1.
+        #  * carried remainders (confirm `new_findings` with `carried_from`) are
+        #    PRE-ACCEPTED and injected ahead of fresh findings, bypassing re-triage;
+        #  * a partially_resolved parent covered by its remainder is REPRESENTED by
+        #    that remainder, so it is dropped from the re-review carry (never
+        #    re-triaged — this is what bounds oscillation, §6);
+        #  * every other forcing open (a blocking unresolved/regression, or a
+        #    partial with no emitted remainder) is re-reviewed as before.
+        # The review scope shown to the reviewer is the re-review set PLUS the
+        # remainders (with `carried_from` intact), so a remainder appears in the
+        # next round's review scope while still bypassing triage.
+        covered = {str(r.get("carried_from")) for r in new_remainders}
+        rereview = [
+            it for it in forcing
+            if not it.get("_carried_remainder") and str(it.get("id")) not in covered
+        ]
+        carried_remainders = new_remainders
+        carried = rereview + [dict(r) for r in new_remainders]
 
     # max_rounds exhausted (FR-10.5): open blockers escalate, never carry forward.
     if last_forcing:
@@ -911,6 +1148,8 @@ def _run_sub(
     session: str | None = None,
     substep: str | None = None,
     effort: str | None = None,
+    cwd: Path | None = None,
+    extra_flags: list[str] | None = None,
 ):
     """One sub-agent call with FR-4 logging and bounded schema re-ask.
 
@@ -957,7 +1196,12 @@ def _run_sub(
         # is kept separately by _log_partial (suffixed). sink is threaded ONLY
         # when streaming — the buffered call shape is untouched (FR-6.1).
         stream = open_step_stream(ctx, adapter, logger)
-        run_kwargs: dict = {"schema": schema, "cwd": ctx.repo_root}
+        # The verifier sub-step (FR-2.1) overrides ``cwd`` to the disposable copy
+        # and passes network-deny/setting-source ``extra_flags``; every other
+        # sub-agent runs in the real run worktree with no extra flags (unchanged).
+        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.repo_root}
+        if extra_flags:
+            run_kwargs["extra_flags"] = list(extra_flags)
         if session is not None:
             run_kwargs["session"] = session  # FR-3.3 usage-limit continuation
         if stream is not None:
@@ -1087,15 +1331,521 @@ def _log_partial(
 # --- round pieces ----------------------------------------------------------------
 def _roles(step: Step):
     reviewer = step.get("reviewer")
+    panel = _panel(step)
+    # FR-1.1: an ensemble config declares `reviewers: [...]` instead of a single
+    # `reviewer:`. The first panel member stands in for the singular reviewer role
+    # (and the confirmer default) so the rest of the cycle contract is unchanged.
+    if reviewer is None and panel:
+        reviewer = panel[0].profile
     triager = step.get("triager")
     fixer = step.get("fixer")
     if not (reviewer and triager and fixer):
         return StepResult(
             status=FAILED,
-            notes="adversarial_cycle requires `reviewer:`, `triager:` and "
-            "`fixer:` agent references (FR-5.2)",
+            notes="adversarial_cycle requires a reviewer (`reviewer:` or "
+            "`reviewers:`), `triager:` and `fixer:` agent references (FR-5.2)",
         )
     return reviewer, triager, fixer, (step.get("confirmer") or reviewer)
+
+
+@dataclass
+class PanelMember:
+    """One member of an ensemble review panel (FR-1.1): a reviewer ``profile``
+    paired with an assigned ``lens`` fragment, in panel-config ``index`` order."""
+
+    profile: str | None
+    lens: str | None
+    index: int
+
+    @property
+    def key(self) -> str:
+        """Filesystem-safe, collision-free per-member artifact/log key."""
+        return f"{self.index}-{_slug(self.profile)}-{_slug(self.lens or 'nolens')}"
+
+    @property
+    def metric_key(self) -> str:
+        """Stable per-(profile, lens) key for the yield metrics (FR-1.3)."""
+        return f"{self.profile}::{self.lens or 'nolens'}"
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(value))
+
+
+def _panel(step: Step) -> list[PanelMember]:
+    """Resolve the review panel (FR-1.1).
+
+    ``reviewers:`` is a list of members — each either a bare profile string or a
+    ``{profile, lens}`` mapping. With no ``reviewers:``, the singular ``reviewer:``
+    is the one-member panel (today's default). A one-member panel takes the
+    unchanged single-reviewer path (no dedup, no engine-annotated fields)."""
+    revs = step.get("reviewers")
+    if revs:
+        out: list[PanelMember] = []
+        for i, r in enumerate(revs):
+            if isinstance(r, str):
+                out.append(PanelMember(profile=r, lens=None, index=i))
+            elif isinstance(r, dict):
+                out.append(PanelMember(
+                    profile=r.get("profile") or r.get("reviewer"),
+                    lens=r.get("lens"), index=i,
+                ))
+            else:
+                # A malformed entry (bare number, list, null — a YAML typo) keeps
+                # a profile-less placeholder so pipeline load and `_validate_panel`
+                # FAIL on the missing profile, instead of the panel silently
+                # shrinking past its configured size (PR #59 review F-009;
+                # fail closed).
+                out.append(PanelMember(profile=None, lens=None, index=i))
+        return out
+    reviewer = step.get("reviewer")
+    return [PanelMember(profile=reviewer, lens=None, index=0)] if reviewer else []
+
+
+def _validate_panel(panel: list[PanelMember], step: Step, ctx: StepContext):
+    """Fail closed at cycle start on a malformed panel (FR-1.1): 1–3 members,
+    each with a profile, and every declared lens fragment present on disk (a
+    missing lens is caught here, not silently reviewed without a lens)."""
+    if step.get("reviewers") is None:
+        return None  # single-reviewer default: nothing extra to validate
+    n = len(panel)
+    if not 1 <= n <= 3:
+        return StepResult(
+            status=FAILED,
+            notes=f"adversarial_cycle `reviewers:` panel must have 1–3 members "
+            f"(FR-1.1); got {n}",
+        )
+    for m in panel:
+        if not m.profile:
+            return StepResult(
+                status=FAILED,
+                notes="adversarial_cycle `reviewers:` entry is missing a profile "
+                "(FR-1.1)",
+            )
+        if m.lens is not None and not _lens_path(ctx, m.lens).exists():
+            return StepResult(
+                status=FAILED,
+                notes=f"adversarial_cycle reviewer lens fragment not found: "
+                f"prompts/lenses/{m.lens}.md (FR-1.1); failing closed rather "
+                "than reviewing with no lens",
+            )
+    return None
+
+
+def _lens_path(ctx: StepContext, lens: str) -> Path:
+    return ctx.repo_root / ctx.config.asset_root / "prompts" / "lenses" / f"{lens}.md"
+
+
+def _lens_fragment(ctx: StepContext, lens: str | None) -> str:
+    """The lens fragment appended to a panel member's review prompt (FR-1.1).
+    Empty for a lens-less member. Existence is validated at cycle start."""
+    if not lens:
+        return ""
+    body = _lens_path(ctx, lens).read_text()
+    return f"\n\n--- your review lens: {lens} (apply it on top of the review above) ---\n{body}"
+
+
+# --- ensemble review (FR-1.1/FR-1.2/FR-1.3) --------------------------------------
+def _member_artifact_path(ctx: StepContext, rnd: int, member: PanelMember) -> Path:
+    return ctx.run_dir / "artifacts" / f"r{rnd}" / "members" / f"{member.key}.json"
+
+
+def _member_artifact_reuse(
+    ctx: StepContext, rnd: int, member: PanelMember, handoff: str, scope_hash: str
+) -> dict[str, Any] | None:
+    """A persisted member artifact, iff it is content-addressed to the current
+    ``(handoff, review-scope)`` (plan-cycle-resp-2a). Returns None — so the member
+    (re-)runs — when the artifact is absent, unreadable, or from a different
+    scope. This is what lets a resumed panel re-pay ONLY the not-yet-completed
+    members: a completed member's artifact matches and is read back; an incomplete
+    member has no matching artifact and runs."""
+    path = _member_artifact_path(ctx, rnd, member)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if data.get("handoff") != handoff or data.get("scope_hash") != scope_hash:
+        return None
+    return data
+
+
+def _stamp_member_finding(finding: dict[str, Any], member: PanelMember) -> dict[str, Any]:
+    """Namespace a member finding's id (so ids are unique across the panel) and
+    stamp its ``source``/``lens`` (FR-1.2). These are engine annotations, never
+    agent-emitted.
+
+    The id is namespaced with the collision-free ``member.key`` (which carries
+    the panel ``index``), NOT the profile alone: a panel may run the same profile
+    under two different lenses (e.g. ``reviewer/correctness`` + ``reviewer/security``),
+    and two same-profile members that both emit ``F-001`` must stay two distinct
+    stable ids — triage and confirm reference findings by id, so a profile-only
+    namespace would collapse them into one ambiguous target (FR-1.2)."""
+    out = {**finding, "id": f"{member.key}:{finding.get('id')}"}
+    out["source"] = member.profile
+    if member.lens is not None:
+        out["lens"] = member.lens
+    return out
+
+
+def _stamp_member_oqs(oqs: list[dict[str, Any]], member: PanelMember) -> list[dict[str, Any]]:
+    return [{**oq, "id": f"{member.key}:{oq.get('id')}"} for oq in oqs]
+
+
+def _run_member(
+    step: Step, ctx: StepContext, member: PanelMember, base_prompt: str,
+    rnd: int, handoff: str, scope_hash: str, policy: str, phase: str,
+    commits: list[tuple[str, str]], reviewer_schema: dict | None, usage: Any,
+    effort: str | None,
+) -> dict[str, Any]:
+    """Run ONE panel member and persist its per-member findings artifact the
+    moment it completes (before the ensemble step as a whole finishes, so a later
+    member's failure never loses this one — plan-cycle-resp-2a). FAIL CLOSED: a
+    transient failure propagates as the usage-limit _ParkCycle (resumable); any
+    other member error is converted to a _ParkCycle that parks the whole ensemble
+    step for a human — it never proceeds to dedup/triage on a reduced panel."""
+    from gauntlet.engine.steptypes import step_logger
+
+    member_prompt = base_prompt + _lens_fragment(ctx, member.lens)
+    guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, member.profile, commits)
+    logger = step_logger(ctx, f"r{rnd}-review", member.key)
+    try:
+        review = _run_sub(
+            ctx, member.profile, member_prompt, schema=reviewer_schema, usage=usage,
+            logger=logger, structured_name="findings.json",
+            after_attempt=guard.check, substep=f"r{rnd}-review-{member.key}",
+            effort=effort,
+        )
+    except _ParkCycle:
+        raise  # transient usage-limit/overload: the cycle parks resumably
+    except (AdapterError, MalformedOutputError) as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "ensemble review parks fail-closed (plan-cycle-resp-2a): panel "
+                f"member {member.profile}/{member.lens or 'nolens'} failed in "
+                f"round {rnd} ({exc}); the panel is not reduced and the missing "
+                "member is not treated as clean — a human must resolve"
+            ),
+        )) from exc
+    raw = list((review.structured or {}).get("findings") or [])
+    raw.extend(guard.synthetic_findings)
+    data = {
+        "member": {"profile": member.profile, "lens": member.lens, "index": member.index},
+        "handoff": handoff,
+        "scope_hash": scope_hash,
+        "findings": [_stamp_member_finding(f, member) for f in raw],
+        "open_questions": _stamp_member_oqs(
+            (review.structured or {}).get("open_questions") or [], member
+        ),
+        "summary": (review.structured or {}).get("summary", ""),
+    }
+    ctx.writer.write_text(
+        _member_artifact_path(ctx, rnd, member),
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
+    return data
+
+
+def _ensemble_review(
+    step: Step, ctx: StepContext, panel: list[PanelMember], rnd: int, handoff: str,
+    policy: str, phase: str, commits: list[tuple[str, str]],
+    reviewer_schema: dict | None, usage: Any, carried: list[dict[str, Any]],
+    prev_review_handoff: str | None, threshold: float, effort: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Run/reuse every panel member independently, then deterministically merge
+    (FR-1.1/FR-1.2). Members run sequentially in panel order — deliberately, not
+    concurrently: they share one worktree and each is followed by the FR-9.6
+    mutation guard, so serial execution keeps git state coherent (determinism
+    over cleverness). Members are content-addressed to ``(handoff, review-scope)``
+    so a resumed panel re-pays only the not-yet-completed ones. Fail-closed park
+    on any member error is raised as a _ParkCycle from :func:`_run_member`.
+
+    Returns ``(merged_findings, merged_open_questions, merged_summary)`` — the
+    merged set is primaries + marked duplicates; only primaries reach triage."""
+    base_prompt = _review_prompt(
+        step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
+    )
+    scope_hash = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
+    stamped: list[dict[str, Any]] = []
+    open_questions: list[dict[str, Any]] = []
+    summaries: list[str] = []
+    for member in panel:
+        data = _member_artifact_reuse(ctx, rnd, member, handoff, scope_hash)
+        if data is None:
+            data = _run_member(
+                step, ctx, member, base_prompt, rnd, handoff, scope_hash,
+                policy, phase, commits, reviewer_schema, usage, effort,
+            )
+        stamped.extend(data.get("findings") or [])
+        open_questions.extend(data.get("open_questions") or [])
+        if data.get("summary"):
+            summaries.append(
+                f"[{member.profile}/{member.lens or 'nolens'}] {data['summary']}"
+            )
+    # Panel order for the merge tie-break, keyed by profile (the finding's
+    # ``source``). A profile that appears under multiple lenses maps to its FIRST
+    # member's index (setdefault over index-ordered panel) so cross-profile
+    # ordering is first-appearance-stable; two same-profile members then share
+    # that slot and are ordered against each other by their id — which carries
+    # the panel index (``member.key``), keeping the tie-break member-faithful.
+    panel_order: dict[str, int] = {}
+    for m in panel:
+        panel_order.setdefault(m.profile, m.index)
+    merged = ensemble.merge_findings(stamped, panel_order=panel_order, threshold=threshold)
+    return merged.findings, open_questions, "\n\n".join(summaries)
+
+
+def _sole_source(finding: dict[str, Any]) -> bool:
+    """True iff this primary was raised by exactly one panel MEMBER.
+
+    ``source_members`` aggregates every member (profile::lens) that raised (a
+    duplicate of) the finding; a primary with more than one is SHARED coverage —
+    the severity/tie-break winner merely *owns* the phrasing. Counting ownership
+    as uniqueness masks exactly the near-total-overlap case the §1.3 kill
+    criterion exists to detect (PR #59 review F-004): two members raising the
+    same set would both look uniquely productive.
+
+    Counts MEMBERS, not ``sources`` (profiles): one profile may sit on the panel
+    under two lenses, so two members raising the same finding collapse to a
+    single ``sources`` entry and would read as sole-source (PR #59 review F-005).
+    Falls back to ``sources`` then ``source`` for a legacy artifact merged before
+    ``source_members`` existed — a pre-migration record has no member data to
+    recover, and its profile-level count is the best available answer."""
+    members = finding.get("source_members")
+    if members:
+        return len(members) == 1
+    return len(finding.get("sources") or [finding.get("source")]) == 1
+
+
+def _ensemble_member_stats(
+    ctx: StepContext, panel: list[PanelMember], rnd: int,
+    primaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Per-member raised (from the persisted member artifact) + unique-after-dedup
+    for a round (FR-1.3). ``unique_after_dedup`` counts primaries this member
+    alone raised (sole-source — see :func:`_sole_source`), the §1.3/§9 reading:
+    a finding both members raised is shared coverage and counts toward neither.
+    Works identically on a fresh merge and a reused merged review — both leave
+    the member artifacts on disk."""
+    stats: list[dict[str, Any]] = []
+    for member in panel:
+        raised = 0
+        path = _member_artifact_path(ctx, rnd, member)
+        if path.exists():
+            try:
+                raised = len(json.loads(path.read_text()).get("findings") or [])
+            except (OSError, ValueError):
+                raised = 0
+        unique = sum(
+            1 for p in primaries
+            if p.get("source") == member.profile and p.get("lens") == member.lens
+            and _sole_source(p)
+        )
+        stats.append({
+            "key": member.metric_key, "profile": member.profile,
+            "lens": member.lens, "raised": raised, "unique_after_dedup": unique,
+        })
+    return stats
+
+
+def _ensemble_legit_by_member(
+    primaries: list[dict[str, Any]], verdicts: list[dict[str, Any]],
+    panel: list[PanelMember],
+) -> dict[str, int]:
+    """Per-(profile, lens) count of SOLE-SOURCE primaries this member raised that
+    triage judged ``legitimate`` — the post-triage unique-legit yield (FR-1.3 /
+    §9 / §1.3 kill criterion).
+
+    Restricted to actual panel members: verifier findings (``source:
+    "verifier"``) and carried remainders (no source, engine-synthesized
+    ``legitimate`` verdicts) are NOT panel yield — un-filtered they minted
+    phantom ``verifier::nolens`` / ``None::nolens`` members in the exact metric
+    the §9 panel-shrink governance consumes (PR #59 review F-002)."""
+    allowed = {m.metric_key for m in panel}
+    verdict_by_id = {v.get("finding_id"): v for v in verdicts}
+    legit: dict[str, int] = {}
+    for p in primaries:
+        v = verdict_by_id.get(p.get("id"))
+        if not v or v.get("verdict") != "legitimate":
+            continue
+        key = f"{p.get('source')}::{p.get('lens') or 'nolens'}"
+        if key not in allowed or not _sole_source(p):
+            continue
+        legit[key] = legit.get(key, 0) + 1
+    return legit
+
+
+# --- behavioral verifier (FR-2.1/2.2/2.3/2.5) ------------------------------------
+_BUILTIN_VERIFY = (
+    "You are the behavioral verifier. You have a DISPOSABLE, sandboxed copy of the "
+    "worktree for the phase under review — you may run anything in it; nothing you "
+    "do touches the real run worktree. EXECUTE the deliverable against the phase's "
+    "acceptance clauses: run the CLI, exercise the API, probe edge inputs, run the "
+    "relevant tests. Report only what you OBSERVE BY RUNNING — behavior a diff "
+    "reader cannot see (wrong runtime output, a crash on a real input, an "
+    "acceptance clause the code does not actually satisfy when executed). "
+    "Every finding MUST use category `behavioral` and put the EXACT commands you "
+    "ran (and their observed output) in `evidence`. Raise no finding you did not "
+    "confirm by execution. If everything you executed behaves correctly, return an "
+    "empty findings list."
+)
+
+
+def _verifier_prompt(step: Step, ctx: StepContext, phase: str | None) -> str:
+    """The verifier's prompt: the phase's plan section (goal + acceptance clauses)
+    plus the execute-and-observe instruction (FR-2.1). The plan section comes from
+    the foreach `plan.phases` item in context — the same clauses the acceptance_gate
+    checks — so the verifier judges runtime behavior against exactly what the phase
+    promised."""
+    template = _template(ctx, step, "verify_prompt", "prompts/cycle-verify.md", _BUILTIN_VERIFY)
+    parts = [template]
+    item = ctx.iteration_item
+    if isinstance(item, dict) and item.get("id"):
+        section = {
+            "id": item.get("id"), "title": item.get("title"),
+            "goal": item.get("goal"), "acceptance": item.get("acceptance") or [],
+        }
+        parts.append(
+            f"\n--- the phase under verification ({item.get('id')}) — execute the "
+            "deliverable against these acceptance clauses ---\n"
+            + wrap_as_data(json.dumps(section, indent=2))
+        )
+    elif phase:
+        parts.append(f"\n--- the phase under verification: {phase} ---")
+    return "".join(parts)
+
+
+def _stamp_verifier_finding(finding: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Namespace a verifier finding's id (unique across the panel) and stamp its
+    provenance (FR-2.2): ``source`` is the sentinel ``verifier`` and ``category``
+    is forced to ``behavioral`` so a verifier finding is unambiguously a behavioral
+    signal. Engine annotation, never agent-trusted — same discipline as
+    ``_stamp_member_finding``."""
+    out = {**finding, "id": f"verifier:{finding.get('id')}"}
+    out["source"] = "verifier"
+    out["category"] = "behavioral"
+    return out
+
+
+def _run_verifier(
+    step: Step, ctx: StepContext, profile: str, rnd: int, handoff: str,
+    phase: str | None, findings_schema: dict | None, usage: Any,
+    metrics: "_CycleMetrics", effort: str | None,
+) -> list[dict[str, Any]]:
+    """Run the behavioral verifier once this round; return its stamped behavioral
+    findings (FR-2.1/2.2). FAIL CLOSED (FR-2.3/2.5): an unhooked/absent backend, a
+    copy-creation failure, an adapter failure, or a mutation of the real run
+    worktree raises :class:`_ParkCycle`. The verifier executes ONLY in a disposable
+    git-worktree copy; the real tree's HEAD tree hash is captured before and
+    confirmed after (P5-A4). The claude-code judge hook, pointed at the copy root,
+    denies any tool call whose resolved path escapes the copy (FR-2.5)."""
+    from gauntlet.engine.steptypes import step_logger
+
+    # 1. Probe the sandbox backend at sub-step start (FR-2.5 / P5-A5). Absent or
+    # judge-hook-unconfirmable → park closed; the verifier never runs unhooked.
+    try:
+        verify.probe_backend(ctx.judge_env, repo_root=ctx.repo_root)
+    except verify.SandboxUnavailableError as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=f"verifier parks fail-closed (FR-2.5): {exc}",
+        )) from exc
+
+    # 2. Witness the real worktree BEFORE (FR-2.5 / P5-A4).
+    before = gitops.worktree_tree_hash(ctx.repo_root)
+
+    # 3. Disposable copy (FR-2.1/2.3). Failure parks — never "skipped, proceed".
+    try:
+        copy = verify.make_disposable_copy(ctx.repo_root)
+    except verify.CopyCreationError as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=f"verifier parks fail-closed (FR-2.3): {exc}",
+        )) from exc
+
+    verifier_schema = _reviewer_output_schema(findings_schema) if findings_schema else None
+    logger = step_logger(ctx, f"r{rnd}-verify")
+    lease = None
+    try:
+        adapter = ctx.build_adapter(profile, effort=effort)
+        # The verifier's OWN step id (PR #59 B1/F-003): distinct from the cycle
+        # step's (a shared id would confine the fixer too) and unique per
+        # attempt (a fresh judge-side one-shot registration can never collide
+        # with a prior attempt's). Registered as a judge-side boundary BEFORE
+        # launch, then PROVEN live: an outside-copy read must come back as the
+        # deterministic confinement deny, or the sub-step parks (never launches
+        # on unproven confinement).
+        verifier_step_id = f"verify:r{rnd}:{secrets.token_hex(8)}"
+        lease = verify.register_boundary(ctx.judge_env, verifier_step_id, copy.path)
+        verify.confirm_boundary_enforced(lease, ctx.repo_root)
+        scratch_home = verify.make_scratch_home(copy.root)
+        # Pin the claude-code verifier posture: confined allowed_tools (no network),
+        # permission mode, --setting-sources project (so the judge hook fires), and
+        # the rebuilt secret-stripped env — verifier step id (boundary key +
+        # in-pipeline denies) and scratch HOME (no ~/.aws / ~/.ssh discovery for
+        # un-hooked children) included (FR-2.5, PR #59 B1). A no-op on a test
+        # double, which carries none of those attributes.
+        env = verify.verifier_env(
+            ctx.judge_env, copy.path,
+            step_id=verifier_step_id, scratch_home=scratch_home,
+        )
+        extra_flags = verify.configure_claude_verifier(adapter, env=env)
+        review = _run_sub(
+            ctx, profile, _verifier_prompt(step, ctx, phase), schema=verifier_schema,
+            usage=usage, logger=logger, structured_name="findings.json",
+            substep=f"r{rnd}-verify", effort=effort,
+            cwd=copy.path, extra_flags=extra_flags,
+        )
+    except _ParkCycle:
+        raise  # transient usage-limit/overload: the cycle parks resumably
+    except (AdapterError, MalformedOutputError) as exc:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.3): the verifier sub-step failed "
+                f"in round {rnd} ({exc}); the cycle does not proceed to triage on a "
+                "skipped verification"
+            ),
+        )) from exc
+    except Exception as exc:
+        # Any OTHER setup/launch/configuration fault (adapter construction,
+        # verifier-posture pinning, env build) before the sub-step returns is still
+        # a sandbox-launch failure (FR-2.3): park closed. Without this, such a fault
+        # would either escape as an internal crash or fall through to the post-run
+        # block below and dereference an unbound `review` (review F-004). `review`
+        # is bound only on a successful `_run_sub`, so the post-run processing is
+        # unreachable on any launch failure.
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.3): the verifier sub-step could "
+                f"not be launched in round {rnd} ({type(exc).__name__}: {exc}); a "
+                "sandbox-launch failure parks the cycle, never crashes past the gate"
+            ),
+        )) from exc
+    finally:
+        if lease is not None:
+            verify.clear_boundary(lease)
+        verify.discard_disposable_copy(ctx.repo_root, copy)
+
+    # 4. The real worktree must be byte-identical after verification (P5-A4).
+    after = gitops.worktree_tree_hash(ctx.repo_root)
+    if after != before:
+        raise _ParkCycle(StepResult(
+            status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
+            notes=(
+                "verifier parks fail-closed (FR-2.5): the run worktree HEAD tree "
+                f"hash changed across verification ({before[:10]} → {after[:10]}); "
+                "the verifier must execute only in the disposable copy"
+            ),
+        ))
+
+    raw = list((review.structured or {}).get("findings") or [])
+    behavioral = [_stamp_verifier_finding(f, profile) for f in raw]
+    metrics.record_verifier_findings(profile, behavioral, review.usage)
+    return behavioral
 
 
 def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
@@ -1483,10 +2233,51 @@ class _MutationGuard:
         })
 
 
+def _load_precedents(
+    ctx: StepContext, findings: list[dict[str, Any]]
+) -> tuple[dict[str, str], bool]:
+    """Advisory declined-finding precedent per finding id (FR-5.2 / P6).
+
+    Reads the cross-run registry under ``asset_root/registry/declined.jsonl`` and
+    returns ``(precedent_block_by_finding_id, registry_present)``. Only in-force
+    entries (same repo + PRD family, current prompt/lens/schema hashes) for an
+    exact fingerprint match produce a block; the reasoning is wrapped as untrusted
+    data (§8). ``registry_present`` marks the run registry-aware so the metric key
+    surfaces even at zero matches. Fail-open: a missing/corrupt registry yields no
+    precedent, never an error — precedent is advisory, not a gate.
+    """
+    from gauntlet.engine import registry as reg
+
+    path = reg.registry_path(ctx.repo_root, ctx.config.asset_root)
+    present = path.exists()
+    entries = reg.load_registry(path)
+    # Ratified supersessions retire a fingerprint from injection (FR-5.2 / §6,
+    # PR #59 review F-4) — the entry stays in declined.jsonl for audit, it just
+    # stops surfacing as precedent.
+    superseded = reg.load_superseded(
+        reg.supersessions_path(ctx.repo_root, ctx.config.asset_root)
+    )
+    if superseded:
+        entries = [e for e in entries if e.fingerprint not in superseded]
+    if not entries:
+        return {}, present
+    blocks = reg.precedents_by_finding(
+        findings,
+        entries,
+        repo=reg.repo_name(ctx.repo_root),
+        prd_family=ctx.manifest.slug,
+        repo_root=ctx.repo_root,
+        asset_root=ctx.config.asset_root,
+        wrap=wrap_as_data,
+    )
+    return blocks, present
+
+
 def _triage_one(
     ctx: StepContext, finding: dict[str, Any], i: int, rnd: int,
     triager: str, escalation_agent: str | None, template: str, context: str,
     schema: dict | None, effort: str | None, task_usage: Any,
+    precedent: str | None = None,
 ) -> dict[str, Any]:
     """Triage ONE finding (triage + severity-gated escalation), the concurrency
     unit (FR-9.1).
@@ -1505,7 +2296,11 @@ def _triage_one(
     from gauntlet.engine.steptypes import step_logger
 
     logger = step_logger(ctx, f"r{rnd}-triage", finding.get("id", f"i{i}"))
-    prompt = triage_prompt(template, finding, context=context)
+    # A per-finding declined-precedent block (FR-5.2) rides in this finding's
+    # review context — advisory, and only for the finding whose fingerprint it
+    # matched (never the whole batch's).
+    finding_context = context if not precedent else f"{context}\n\n{precedent}"
+    prompt = triage_prompt(template, finding, context=finding_context)
     verdict = _run_sub(
         ctx, triager, prompt, schema=schema, usage=task_usage,
         logger=logger, structured_name="verdict.json",
@@ -1544,6 +2339,7 @@ def _triage(
     step: Step, ctx: StepContext, findings: list[dict[str, Any]],
     usage: Any, rnd: int, triager: str, *, effort: str | None = None,
     completed: dict[str, dict[str, Any]] | None = None,
+    precedent: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Point-by-point triage with severity-aware escalation (F-009), run with
     bounded concurrency (FR-9.1) and checkpoint-fragment resume (FR-9.2).
@@ -1621,6 +2417,7 @@ def _triage(
                 pool.submit(
                     _triage_one, ctx, finding, i, rnd, triager, escalation_agent,
                     template, context, schema, effort, task_usages[i],
+                    (precedent or {}).get(finding.get("id")),
                 ): i
                 for i, finding in enumerate(pending)
             }
@@ -1799,6 +2596,7 @@ def _open_after_confirm(
     by_id: dict[str, dict[str, Any]],
     actions: dict[str, str],
     cdata: dict[str, Any],
+    new_remainders: list[dict[str, Any]] | tuple = (),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """What stays open after a confirm pass — each item tagged with severity.
 
@@ -1815,9 +2613,13 @@ def _open_after_confirm(
     ``regression_introduced`` verdict, which is always open.
 
     Open: ``unresolved``/``regression_introduced`` on an accepted finding,
-    ``partially_resolved`` on a blocking one, a missing verdict for an
-    accepted finding, and new findings of blocking/major severity (minor/nit
-    new findings are noise, not recorded). Each open item carries ``severity``
+    ``partially_resolved`` on ANY accepted finding (FR-6.1 — issue #49's escape
+    was that a non-blocking partial converged; now it is non-converged regardless
+    of severity), a missing verdict for an accepted finding, new findings of
+    blocking/major severity (minor/nit new findings are noise, not recorded), and
+    the ``new_remainders`` the caller already promoted from ``carried_from``
+    ``new_findings`` (FR-6.1 carried remainders — forcing opens regardless of
+    severity, tagged ``_carried_remainder``). Each open item carries ``severity``
     and ``confirm_verdict`` so the caller can apply its convergence policy.
     """
     verdict_by_id: dict[str, dict[str, Any]] = {}
@@ -1849,17 +2651,30 @@ def _open_after_confirm(
         relevant = accepted or verdict == "regression_introduced"
         is_open = relevant and (
             verdict in OPEN_CONFIRM_VERDICTS
-            or (verdict == "partially_resolved" and severity == "blocking")
+            # FR-6.1: a partially_resolved accepted finding is open at ANY severity
+            # (was blocking-only — issue #49's silent-closure escape).
+            or verdict == "partially_resolved"
         )
         if is_open:
             open_items.append({**finding, "severity": severity,
                                "confirm_verdict": verdict,
                                "confirm_notes": v.get("notes", "")})
     for nf in cdata.get("new_findings") or []:
+        # Carried remainders (carried_from set) are handled via `new_remainders`
+        # below (id already assigned, forcing at any severity); skip them here so
+        # they are not double-counted as ordinary regressions.
+        if nf.get("carried_from"):
+            continue
         severity = nf.get("severity")
         if severity in ("blocking", "major"):
             open_items.append({**nf, "id": "NEW", "severity": severity,
                                "confirm_verdict": "new_finding"})
+    for r in new_remainders:
+        # FR-6.1: a carried remainder is a forcing open regardless of severity
+        # (blocking or major per the FR-6.1 rule); `_carried_remainder` marks it so
+        # the caller both forces the round and routes it as a pre-accepted fix.
+        open_items.append({**r, "confirm_verdict": "partially_resolved",
+                           "_carried_remainder": True})
     reconciliation = {"missing": missing, "unknown": unknown,
                       "duplicates": duplicates}
     return open_items, reconciliation
@@ -1868,11 +2683,128 @@ def _open_after_confirm(
 def _forcing_open(open_items: list[dict[str, Any]], convergence: str) -> list[dict[str, Any]]:
     """The open items that force another round under the convergence policy.
 
-    ``blocking`` (policy A, default): only blocking-severity open items loop.
+    ``blocking`` (policy A, default): a blocking-severity open item loops, AND
+    (FR-6.1) an accepted ``partially_resolved`` finding or a carried remainder
+    loops REGARDLESS of severity — an accepted partial is non-converged by
+    definition, which is what shuts issue #49's silent-closure class. A major
+    ``unresolved`` open is still surfaced-not-looped (policy A, unchanged).
     ``strict``: every open item loops (the P4 original)."""
     if convergence == "strict":
         return list(open_items)
-    return [it for it in open_items if it.get("severity") == "blocking"]
+    return [
+        it for it in open_items
+        if it.get("severity") == "blocking"
+        or it.get("_carried_remainder")
+        or it.get("confirm_verdict") == "partially_resolved"
+    ]
+
+
+def _carried_remainder_verdict(finding: dict[str, Any]) -> dict[str, Any]:
+    """A synthetic ``fix_now`` triage verdict for a carried remainder (FR-6.1/§6).
+
+    A carried remainder inherits its parent's already-triaged ``fix_now``
+    acceptance and never re-enters triage — this is what bounds oscillation (a
+    decline is never re-opened). The engine synthesizes the verdict so the
+    remainder flows through the same fix/confirm machinery as a triaged finding.
+    Shape conforms to schemas/triage.json (``additionalProperties: false``)."""
+    return {
+        "finding_id": finding["id"],
+        "verdict": "legitimate",
+        "reasoning": (
+            f"Carried remainder of {finding.get('carried_from')} (FR-6.1): inherits "
+            "the parent's fix_now acceptance and bypasses re-triage (§6)."
+        ),
+        "action": "fix_now",
+        "confidence": "high",
+        "target_artifact": None,
+    }
+
+
+def _carry_remainders(
+    cdata: dict[str, Any], rnd: int, seen_ids: set[str],
+    by_id: dict[str, dict[str, Any]], actions: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Promote confirm ``new_findings`` carrying ``carried_from`` to pre-accepted
+    remainders with deterministic, collision-free reserved-namespace ids (FR-6.1,
+    §6). Rewrites each entry's ``id`` IN ``cdata`` (the dicts are live refs into
+    ``cdata["new_findings"]``) so the persisted confirm.json shows the final id,
+    registers the id in ``seen_ids``, and returns the remainders as complete
+    finding dicts with ``carried_from`` intact.
+
+    Parentage is VALIDATED, not trusted (§6 grants the triage bypass because the
+    parent is "an already-triaged, ``fix_now``-accepted finding" confirmed
+    ``partially_resolved`` — so all three legs are checked against this round's
+    engine state, never the confirmer's say-so). An entry whose ``carried_from``
+    names a finding that does not exist in this round, was not accepted
+    ``fix_now`` (a decline is never re-opened), or was not confirmed
+    ``partially_resolved`` is DEMOTED: its ``carried_from`` is cleared in
+    ``cdata`` so it flows the ordinary confirm-regression path (blocking forces,
+    major surfaces — never pre-accepted, never bypassing triage), and the
+    demotion is returned for the engine reconciliation record. Fails toward
+    scrutiny: a forged or stale parent reference can force *more* review, never
+    mint an unreviewable obligation or resurrect a decline.
+
+    Id: base ``<carried_from>-r<round>``; append ``-c<N>`` for the smallest
+    ``N >= 0`` making ``<base>-c<N>`` unique against ``seen_ids`` (every finding id
+    seen this run plus every id already assigned this round). ``-c0`` is emitted
+    explicitly, so the base string is never itself a final id — a raw
+    ``<carried_from>-r<round>`` a reviewer might supply can never collide with a
+    remainder id. Order-deterministic and rewrite-stable: entries are processed in
+    a stable (carried_from, location, claim, severity, category) sort — keys that
+    do not change when the id is rewritten — so re-derivation on resume is
+    idempotent and two builders following the spec assign identical ids.
+    """
+    confirm_verdicts = {
+        str(v.get("finding_id")): str(v.get("verdict") or "")
+        for v in cdata.get("verdicts") or []
+    }
+    entries: list[dict[str, Any]] = []
+    demoted: list[dict[str, str]] = []
+    for nf in cdata.get("new_findings") or []:
+        parent = nf.get("carried_from")
+        if not parent:
+            continue  # ordinary regression: untouched
+        parent = str(parent)
+        if parent not in by_id:
+            reason = f"parent {parent} is not a finding in this round"
+        elif actions.get(parent) != "fix_now":
+            reason = (f"parent {parent} was not accepted fix_now "
+                      f"(action: {actions.get(parent) or 'none'}) — a decline is "
+                      "never re-opened (§6)")
+        elif confirm_verdicts.get(parent) != "partially_resolved":
+            reason = (f"parent {parent} was not confirmed partially_resolved "
+                      f"(verdict: {confirm_verdicts.get(parent) or 'none'})")
+        else:
+            entries.append(nf)
+            continue
+        nf["carried_from"] = None  # live ref: demotion is visible in confirm.json
+        demoted.append({"parent": parent, "reason": reason})
+    entries.sort(key=lambda nf: (
+        str(nf.get("carried_from")), str(nf.get("location") or ""),
+        str(nf.get("claim") or ""), str(nf.get("severity") or ""),
+        str(nf.get("category") or ""),
+    ))
+    remainders: list[dict[str, Any]] = []
+    for nf in entries:
+        parent = nf["carried_from"]
+        base = f"{parent}-r{rnd}"
+        n = 0
+        while f"{base}-c{n}" in seen_ids:
+            n += 1
+        final_id = f"{base}-c{n}"
+        seen_ids.add(final_id)
+        nf["id"] = final_id  # live ref into cdata["new_findings"] → confirm.json
+        remainders.append({
+            "id": final_id,
+            "severity": nf.get("severity") or "major",
+            "category": nf.get("category") or "correctness",
+            "location": nf.get("location") or "",
+            "claim": nf.get("claim") or "",
+            "evidence": nf.get("evidence") or "",
+            "suggested_fix": nf.get("suggested_fix"),
+            "carried_from": parent,
+        })
+    return remainders, demoted
 
 
 def _fmt_ids(items: list[dict[str, Any]]) -> str:
@@ -2060,6 +2992,33 @@ class _CycleMetrics:
         self.verdict_counts: dict[str, int] = {}
         self.confirm_counts: dict[str, int] = {}
         self._round_accepted_ids: set[str] = set()
+        # Per-(profile, lens) ensemble yield (FR-1.3), accumulated across rounds:
+        # findings raised, unique-after-dedup (primaries owned), and
+        # post-triage-legitimate. Read from the manifest without transcript access
+        # (metrics.ensemble.unique_legit_by_member). Empty for a single-reviewer
+        # cycle, so the `ensemble` key is omitted entirely (byte-compatible trend).
+        self.ensemble_by_member: dict[str, dict[str, Any]] = {}
+        # Behavioral verifier metrics (FR-2 / §9 behavioral-signal instrument,
+        # review F-001): the verifier profile, behavioral findings raised, the
+        # triage-legitimate count, and the verifier's own agent_usage — so the §9
+        # checks ("≥1 triage-legitimate behavioral finding per run on average,
+        # verifier cost ≤10% of run cost") are computed from the manifest without
+        # transcript access, and are the input the P6 verifier-revert proposal
+        # reads. Omitted entirely (no `verifier` key) when no verifier ran.
+        self.verifier_profile: str | None = None
+        self.verifier_findings_total = 0
+        self.verifier_legit_findings = 0
+        self.verifier_usage: dict[str, Any] = {}
+        # Declined-findings registry re-litigation instrument (FR-5.2 / §9,
+        # review F-001). `registry_seen` is True once any round consulted the
+        # registry (the file existed), so the `registry` metric key is present on
+        # a registry-aware run even with zero matches; `rematched` counts findings
+        # whose fingerprint matched a still-in-force declined precedent and were
+        # triaged again; `override` counts those the triager nonetheless judged
+        # legitimate (advisory precedent never gates a legitimate finding out).
+        self.registry_seen = False
+        self.registry_rematched = 0
+        self.registry_override = 0
 
     def record_round(self, findings: list[dict[str, Any]]) -> None:
         self.rounds += 1
@@ -2077,6 +3036,73 @@ class _CycleMetrics:
                 if fid:
                     self._round_accepted_ids.add(fid)
 
+    def _member(self, key: str, profile: str | None, lens: str | None) -> dict[str, Any]:
+        entry = self.ensemble_by_member.get(key)
+        if entry is None:
+            entry = {
+                "profile": profile, "lens": lens,
+                "raised": 0, "unique_after_dedup": 0, "unique_legit": 0,
+            }
+            self.ensemble_by_member[key] = entry
+        return entry
+
+    def record_ensemble(self, member_stats: list[dict[str, Any]]) -> None:
+        """Accumulate a round's per-member raised + unique-after-dedup (FR-1.3)."""
+        for m in member_stats:
+            entry = self._member(m["key"], m.get("profile"), m.get("lens"))
+            entry["raised"] += int(m.get("raised", 0))
+            entry["unique_after_dedup"] += int(m.get("unique_after_dedup", 0))
+
+    def record_ensemble_legit(self, legit_by_key: dict[str, int]) -> None:
+        """Accumulate a round's per-member post-triage-legitimate yield (FR-1.3).
+
+        Keys are the same ``<profile>::<lens>`` as :meth:`record_ensemble`, which
+        runs first each round, so every legit key already has an entry."""
+        for key, count in legit_by_key.items():
+            self._member(key, None, None)["unique_legit"] += int(count)
+
+    def record_verifier_findings(
+        self, profile: str, behavioral: list[dict[str, Any]], usage: Any
+    ) -> None:
+        """Accumulate a round's behavioral findings raised + the verifier's own
+        agent_usage cost (FR-2 / §9). Additive across rounds."""
+        self.verifier_profile = profile
+        self.verifier_findings_total += len(behavioral)
+        if usage is not None:
+            for field in ("input_tokens", "output_tokens", "cached_input_tokens"):
+                val = getattr(usage, field, None)
+                if isinstance(val, int):
+                    self.verifier_usage[field] = self.verifier_usage.get(field, 0) + val
+            cost = getattr(usage, "cost_usd", None)
+            if isinstance(cost, (int, float)):
+                self.verifier_usage["cost_usd"] = self.verifier_usage.get("cost_usd", 0.0) + cost
+
+    def record_verifier_legit(
+        self, triage_findings: list[dict[str, Any]], verdicts: list[dict[str, Any]]
+    ) -> None:
+        """Accumulate the triage-legitimate behavioral yield (§9 behavioral-signal).
+        A behavioral primary the triager judged ``legitimate`` counts — the number
+        the §9 threshold and the P6 verifier-revert proposal read."""
+        verdict_by_id = {v.get("finding_id"): v for v in verdicts}
+        for f in triage_findings:
+            if f.get("source") == "verifier" and f.get("category") == "behavioral":
+                v = verdict_by_id.get(f.get("id"))
+                if v and v.get("verdict") == "legitimate":
+                    self.verifier_legit_findings += 1
+
+    def note_registry_round(self, present: bool, rematched: int) -> None:
+        """Record a round's registry consultation (FR-5.2). ``present`` marks the
+        run registry-aware (the metric surfaces even at zero matches);
+        ``rematched`` is this round's count of findings that matched an in-force
+        declined precedent and were triaged again."""
+        if present:
+            self.registry_seen = True
+        self.registry_rematched += rematched
+
+    def add_registry_overrides(self, n: int) -> None:
+        """Accumulate injected precedents the triager classified legitimate."""
+        self.registry_override += n
+
     def record_confirm(self, cdata: dict[str, Any]) -> None:
         # The confirm pass that follows immediately confirms THIS round's fixes,
         # so its verdicts are scoped to the round's findings — join against the
@@ -2089,7 +3115,7 @@ class _CycleMetrics:
                 self.accepted_resolved_total += 1
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "rounds": self.rounds,
             "findings_total": self.findings_total,
             "accepted_total": self.accepted_total,
@@ -2097,6 +3123,25 @@ class _CycleMetrics:
             "verdict_counts": dict(self.verdict_counts),
             "confirm_counts": dict(self.confirm_counts),
         }
+        if self.ensemble_by_member:  # FR-1.3; omitted for a single-reviewer cycle
+            out["ensemble"] = {
+                "unique_legit_by_member": {
+                    k: dict(v) for k, v in self.ensemble_by_member.items()
+                }
+            }
+        if self.verifier_profile is not None:  # FR-2 / §9; omitted with no verifier
+            out["verifier"] = {
+                "profile": self.verifier_profile,
+                "findings_total": self.verifier_findings_total,
+                "legit_findings": self.verifier_legit_findings,
+                "agent_usage": dict(self.verifier_usage),
+            }
+        if self.registry_seen:  # FR-5.2 / §9; omitted on a non-registry-aware run
+            out["registry"] = {
+                "rematched": self.registry_rematched,
+                "injected_precedent_override_count": self.registry_override,
+            }
+        return out
 
 
 def _write_artifact(
@@ -2168,6 +3213,63 @@ def _load_schema(ctx: StepContext, ref: str) -> dict:
     return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
 
 
+def _reviewer_output_schema(findings_schema: dict) -> dict:
+    """The STRICT per-member output schema handed to a reviewer adapter (FR-1.2 /
+    review F-007).
+
+    ``schemas/findings.json`` is the *persisted findings-record* validation schema:
+    it declares the engine/merge-annotated ensemble fields
+    (``source``/``lens``/``duplicate_of``/``sources``) and the P9 convergence-carry
+    annotation (``carried_from``) as optional so a merged/carried artifact
+    validates. A reviewer agent never emits any of those — the engine stamps
+    them — so they are stripped here to recover the repo's pinned strict-mode shape
+    (every property in ``required``, ``additionalProperties: false``). This
+    derivation is byte-equivalent to the pre-ensemble schema for the finding item,
+    so a single member still emits exactly today's finding shape (P1-A4). No-op
+    when the finding item declares none of those fields (defensive)."""
+    schema = json.loads(json.dumps(findings_schema))
+    try:
+        props = schema["properties"]["findings"]["items"]["properties"]
+    except (KeyError, TypeError):
+        return schema
+    for field in ensemble.ENSEMBLE_FIELDS:
+        props.pop(field, None)
+    # FR-6.1 (P9): `carried_from` is an engine annotation on a carried remainder,
+    # never a reviewer-emitted field — strip it too so the reviewer's strict output
+    # shape is unchanged.
+    props.pop("carried_from", None)
+    return schema
+
+
+def _confirmer_output_schema(confirm_schema: dict) -> dict:
+    """The STRICT confirm-output schema handed to the confirmer adapter (F-007).
+
+    ``schemas/confirm.json`` is the PERSISTED confirm-record schema: per PRD §6 the
+    P9 carry change is additive, so a ``new_findings`` item requires only the true
+    pre-migration trio (``severity``, ``claim``, ``location``) — a genuinely
+    pre-migration entry (which carried exactly those three fields) still
+    validates (PR #59 review F-3: the P9.1 fix demoted only ``carried_from``,
+    leaving ``id``/``category``/``evidence``/``suggested_fix`` required — the
+    headline closed while the enumerated remainder was dropped, inside the
+    convergence-honesty phase). But the confirmer emits ``new_findings`` through
+    the native ``--output-schema`` path, and strict mode requires EVERY property
+    in ``required``. This derivation promotes every declared item property into
+    the ``required`` list (nullable-where-nullable, the convention
+    ``suggested_fix`` uses) so the NATIVE strict shape stays complete while the
+    persisted schema stays additive. Never mutates the input."""
+    schema = json.loads(json.dumps(confirm_schema))
+    try:
+        item = schema["properties"]["new_findings"]["items"]
+        props = item["properties"]
+        required = item["required"]
+    except (KeyError, TypeError):
+        return schema
+    for prop in props:
+        if prop not in required:
+            required.append(prop)
+    return schema
+
+
 def _verdict_schema(triage_schema: dict) -> dict:
     """Per-call schema for one point-by-point verdict (PRD §7 triage entry).
 
@@ -2204,7 +3306,11 @@ _BUILTIN_REREVIEW = (
     "regression — do NOT hunt for fresh minor/major issues; that review "
     "happened in round 1 and re-litigating it is bikeshedding (BOOTSTRAP-NOTES "
     "#30). Re-state a carried finding (same id) only if it is genuinely still "
-    "unaddressed. Questions go in open_questions."
+    "unaddressed — EXCEPT a carried remainder (an entry whose `carried_from` "
+    "names a parent finding): that is a pre-accepted fix obligation for THIS "
+    "round (FR-6.1), unaddressed by construction since its fix happens after "
+    "this review; never re-state or re-litigate it. Questions go in "
+    "open_questions."
 )
 _BUILTIN_TRIAGE = (
     "You are a triage classifier. Judge the single review finding below.\n"

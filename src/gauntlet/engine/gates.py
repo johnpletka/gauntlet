@@ -1,0 +1,435 @@
+"""Evidence-tiered gate predicate (pipeline-effectiveness FR-4, P8).
+
+A per-phase **code** gate configured ``policy: auto_when_clean`` auto-approves
+only when the strict §4.2 clean-signal conjunction holds:
+
+    converged in round 1 · zero blocking/major legitimate findings ·
+    acceptance gate passed · tests green · zero escalations ·
+    zero reviewer mutations · verifier ran clean
+
+Any single ambiguous signal parks for a human exactly as ``policy: always``
+would — fail closed (CLAUDE.md §2). The predicate is a **pure function over
+facts the pipeline already records** (the manifest step records, their metrics,
+and the round findings/triage artifacts, P1–P5): no new judgment call, no LLM.
+Keeping it here — separate from the orchestrator's control flow — makes it
+directly unit-testable against a synthetic manifest, which is how every P8-A1
+single-violation-parks fixture drives it.
+
+The orchestrator consumes :func:`evaluate_clean_gate` when a ``human_gate`` step
+carries ``policy: auto_when_clean``; a clean decision becomes an ``auto_approval``
+manifest record, a miss falls through to the normal human park.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from gauntlet.engine import manifest as M
+from gauntlet.engine.pipeline import Pipeline, Stage, Step
+
+# Severities that make a *legitimate* finding a predicate miss (§4.2). A minor/nit
+# legitimate finding does not block auto-approval; a blocking/major one does.
+_BLOCKING_SEVERITIES = frozenset({"blocking", "major"})
+
+# The triage verdict marking a finding a real defect (schemas/triage.json). Only a
+# ``legitimate`` verdict counts against the "zero blocking/major legitimate
+# findings" conjunct — a bikeshedding/premature/not-applicable finding does not.
+_LEGITIMATE_VERDICT = "legitimate"
+
+# Substring identifying a synthetic reviewer-mutation finding (cycle.py stamps the
+# id ``F-R<round>-MUTATION-<seq>`` when a reviewer mutates the worktree, FR-9.6).
+# A reviewer mutation is a predicate miss regardless of its triage verdict — the
+# read-only contract was violated, which a human must see.
+_MUTATION_MARKER = "-MUTATION-"
+
+# The type ``FindingsLoader`` returns: (findings, triage verdicts, confirm
+# verdicts) read from this phase's round artifacts. Raising signals the artifacts
+# are missing or unparseable — the caller fails that conjunct closed (cannot
+# prove clean). Confirm verdicts joined the tuple with the FR-4.1 recalibration
+# (v0.5): the predicate asks whether a serious finding is still OPEN, which is a
+# question only the confirm pass answers.
+FindingsLoader = Callable[
+    [], "tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]"
+]
+
+# Triage `action` values (schemas/triage.json). Only `fix_now` means the finding
+# was actually accepted for repair in this phase; `defer`/`reject` leave a
+# legitimate finding unaddressed here.
+_FIX_NOW_ACTION = "fix_now"
+# The one confirm verdict that closes a finding (schemas/confirm.json). Anything
+# else — partially_resolved, unresolved, regression_introduced, or no verdict at
+# all — leaves it open.
+_RESOLVED_VERDICT = "resolved"
+
+
+def _phase_num(phase: str | None) -> int | None:
+    """Parse a numeric phase prefix (``P8`` → 8), else ``None``."""
+    if not phase:
+        return None
+    text = str(phase).split(".")[0]
+    if text.upper().startswith("P") and text[1:].isdigit():
+        return int(text[1:])
+    return None
+
+
+def record_reversals(
+    manifest: M.Manifest,
+    *,
+    min_phase_num: int,
+    user: str,
+    notes: str,
+    at: str,
+) -> int:
+    """Record human reversals of auto-approved gates ≥ ``min_phase_num`` (FR-4.2).
+
+    Stamps every not-yet-reversed ``auto_approval`` whose numeric phase is at or
+    beyond the rolled-back boundary, and — iff any matched — flips the run's
+    effective auto-approval policy to ``always`` for the remainder of the run
+    (:attr:`Manifest.auto_approval_disabled`). Returns the count reversed. This
+    is the deterministic in-run circuit breaker: after a recorded reversal the
+    clean predicate can no longer auto-approve, because a human signalled
+    distrust (§9). Append-only — the reversed record is stamped, never deleted.
+    """
+    reversed_n = 0
+    for rec in manifest.auto_approvals:
+        if rec.reversed_at is not None:
+            continue
+        pnum = _phase_num(rec.phase)
+        if pnum is not None and pnum >= min_phase_num:
+            rec.reversed_at = at
+            rec.reversed_by = user
+            rec.reversal_notes = notes
+            reversed_n += 1
+    if reversed_n:
+        manifest.auto_approval_disabled = True
+    return reversed_n
+
+
+@dataclass
+class CleanGateDecision:
+    """The outcome of the §4.2 clean-signal predicate for one code gate.
+
+    ``clean`` is the strict conjunction; ``evidence`` is the full §6 snapshot
+    stamped into the ``auto_approval`` record whether or not it passed (so a
+    parked-for-a-miss gate's evidence is still recorded in the notes); ``misses``
+    names every failed conjunct (data over inference — the operator sees *why* a
+    gate parked, not just that it did).
+    """
+
+    clean: bool
+    evidence: dict[str, Any] = field(default_factory=dict)
+    misses: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if self.clean:
+            return "all clean-signal conjuncts hold"
+        return "; ".join(self.misses)
+
+
+def _stage_of(pipeline: Pipeline, step_id: str) -> Stage | None:
+    for stage in pipeline.stages:
+        if any(s.id == step_id for s in stage.steps):
+            return stage
+    return None
+
+
+def _preceding_steps(stage: Stage, gate_id: str) -> list[Step]:
+    """The steps in ``stage`` before ``gate_id`` — the phase's produced signals."""
+    ids = [s.id for s in stage.steps]
+    if gate_id not in ids:
+        return []
+    return stage.steps[: ids.index(gate_id)]
+
+
+def _verifier_status(cycle_metrics: dict[str, Any]) -> str:
+    """Map a cycle's recorded verifier metrics to a §6 verifier-result value.
+
+    Only ``clean`` (a verifier ran and raised zero behavioral findings) satisfies
+    the predicate. No ``verifier`` key means the verifier did not produce a clean
+    result at runtime — dynamically skipped, or a resumed/legacy manifest that
+    predates the verifier config — recorded ``not_configured`` and parked closed
+    (review F-008 runtime case). A failed verifier parks the cycle upstream (it
+    never reaches the gate), so a DONE cycle only ever shows clean-or-findings.
+    """
+    verifier = cycle_metrics.get("verifier")
+    if not isinstance(verifier, dict):
+        return M.VERIFIER_NOT_CONFIGURED
+    if int(verifier.get("findings_total", 0) or 0) > 0:
+        return M.VERIFIER_FINDINGS
+    return M.VERIFIER_CLEAN
+
+
+def evaluate_clean_gate(
+    manifest: M.Manifest,
+    pipeline: Pipeline,
+    gate_step: Step,
+    iteration: str | None,
+    *,
+    load_findings: FindingsLoader,
+    phase: str | None = None,
+) -> CleanGateDecision:
+    """Evaluate the strict §4.2 clean-signal predicate for one code gate.
+
+    ``load_findings`` returns this phase's round findings + triage verdicts +
+    confirm verdicts (the orchestrator reads them from the cycle's round
+    artifacts); a raise means they could not be read, which fails the finding
+    conjuncts closed. Every conjunct that fails is named in ``misses`` and the
+    aggregate ``clean`` is their AND.
+
+    The findings conjunct is **open-based, not raised-based** (v0.5): a
+    blocking/major legitimate finding that was accepted and confirmed `resolved`
+    does not block the gate; one that is deferred, rejected, unconfirmed, or
+    confirmed anything other than `resolved` does. See the conjunct body for why
+    the raised-based form was unfireable in practice.
+
+    ``phase`` is the gate's PN phase prefix (the orchestrator's
+    ``_expected_phase``); it keys the evidence-freshness conjunct — fix commits
+    recorded under ``P<N>.x`` mark tests/acceptance records produced *before*
+    the cycle as stale, since they vouch for a tree the fix commits then changed.
+    """
+    misses: list[str] = []
+
+    # Reversal circuit breaker (FR-4.2): a recorded reversal disables auto-approval
+    # for the remainder of the run — a fail-closed short-circuit read here so the
+    # predicate can never auto-approve after a human signalled distrust. Recorded
+    # as a miss (not an early return) so the evidence snapshot is still complete.
+    if manifest.auto_approval_disabled:
+        misses.append(
+            "auto-approval disabled for the remainder of the run after a recorded "
+            "human reversal (FR-4.2 circuit breaker)"
+        )
+
+    stage = _stage_of(pipeline, gate_step.id)
+    if stage is None:  # defensive: a gate must live in a stage
+        misses.append(f"gate {gate_step.id!r} is not in any pipeline stage")
+        return CleanGateDecision(clean=False, misses=misses)
+
+    preceding = _preceding_steps(stage, gate_step.id)
+
+    def _recs(step_type: str) -> list[M.StepRecord]:
+        out: list[M.StepRecord] = []
+        for s in preceding:
+            if s.type != step_type:
+                continue
+            rec = manifest.record(s.id, iteration)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    cycles = _recs("adversarial_cycle")
+    acceptance = _recs("acceptance_gate")
+    shells = _recs("shell")
+
+    # --- converged in round 1 · zero escalations · verifier clean --------------
+    rounds = 0
+    verifier_status = M.VERIFIER_NOT_CONFIGURED
+    if not cycles:
+        misses.append(
+            "no adversarial_cycle precedes this code gate to evaluate for "
+            "convergence (FR-4.1)"
+        )
+    for rec in cycles:
+        if rec.status != M.DONE:
+            misses.append(f"cycle {rec.id!r} did not converge (status {rec.status})")
+        # A human already intervened on this cycle (an escalation resolved by a
+        # `--response`), so it is not a rubber-stamp candidate — park (zero
+        # escalations conjunct). A live escalation parks upstream and never
+        # reaches the gate; this catches the escalation-then-resolved history.
+        if rec.human_responses:
+            misses.append(
+                f"cycle {rec.id!r} carries a human escalation/response — not a "
+                "clean-signal gate (FR-4.1 zero escalations)"
+            )
+        cyc_rounds = int((rec.metrics or {}).get("rounds", 0) or 0)
+        rounds = max(rounds, cyc_rounds)
+        if cyc_rounds != 1:
+            misses.append(
+                f"cycle {rec.id!r} did not converge in round 1 (rounds={cyc_rounds})"
+            )
+        status = _verifier_status(rec.metrics or {})
+        # Aggregate to the worst status across cycles (clean only if all clean).
+        if verifier_status == M.VERIFIER_NOT_CONFIGURED or status != M.VERIFIER_CLEAN:
+            verifier_status = status
+        if status != M.VERIFIER_CLEAN:
+            misses.append(
+                f"cycle {rec.id!r} verifier did not run clean (verifier={status}); "
+                "a phase using auto_when_clean requires a clean verifier result "
+                "(FR-4.1, review F-008)"
+            )
+
+    # --- zero blocking/major legitimate findings left OPEN · zero mutations ----
+    # Recalibrated (FR-4.1, v0.5). The predicate used to count blocking/major
+    # legitimate findings *raised*. Measured against the only real multi-phase
+    # run, that fired 0/9: every phase raised at least one blocking or major
+    # finding, because that is what an adversarial panel is FOR. The old conjunct
+    # asked "did review find nothing serious?" — a state this tool exists to
+    # prevent from going unnoticed — and FR-1's ensemble makes it rarer still
+    # (more lenses ⇒ more findings ⇒ lower chance of zero). A predicate that can
+    # only fire when the product underperforms is not a gate policy.
+    # So the question is now "is anything serious still OPEN?": a blocking/major
+    # legitimate finding must have been accepted `fix_now` AND confirmed
+    # `resolved`. Found-fixed-confirmed is the loop working, not a red flag.
+    # Deferred, rejected, unconfirmed, or non-`resolved` all stay misses, so the
+    # gate still parks on every finding that is genuinely unfinished.
+    blocking = major = reviewer_mutations = 0
+    open_serious: list[str] = []
+    try:
+        findings, verdicts, confirms = load_findings()
+    except Exception as exc:  # fail closed: cannot prove the findings are clean
+        misses.append(
+            f"could not read this phase's findings/triage/confirm artifacts to "
+            f"prove no blocking/major legitimate finding is left open ({exc}); "
+            "failing closed (FR-4.1)"
+        )
+        findings, verdicts, confirms = [], [], []
+    else:
+        severity_by_id = {f.get("id"): f.get("severity") for f in findings}
+        verdict_by_id = {v.get("finding_id"): v.get("verdict") for v in verdicts}
+        action_by_id = {v.get("finding_id"): v.get("action") for v in verdicts}
+        confirm_by_id = {c.get("finding_id"): c.get("verdict") for c in confirms}
+        for fid, severity in severity_by_id.items():
+            if fid and _MUTATION_MARKER in str(fid):
+                reviewer_mutations += 1
+            if not (
+                verdict_by_id.get(fid) == _LEGITIMATE_VERDICT
+                and severity in _BLOCKING_SEVERITIES
+            ):
+                continue
+            if severity == "blocking":
+                blocking += 1
+            else:
+                major += 1
+            action = action_by_id.get(fid)
+            confirmed = confirm_by_id.get(fid)
+            if action != _FIX_NOW_ACTION:
+                open_serious.append(
+                    f"{fid} ({severity}, triaged legitimate but action={action!r} — "
+                    "not fixed in this phase)"
+                )
+            elif confirmed != _RESOLVED_VERDICT:
+                # Covers "no confirm verdict at all" (confirmed is None): an
+                # unconfirmed fix is an unproven one — fail closed.
+                open_serious.append(
+                    f"{fid} ({severity}, accepted fix_now but confirm verdict is "
+                    f"{confirmed!r}, not {_RESOLVED_VERDICT!r})"
+                )
+        if open_serious:
+            misses.append(
+                f"{len(open_serious)} blocking/major legitimate finding(s) still "
+                f"open at the gate: {'; '.join(open_serious)} (FR-4.1)"
+            )
+        # FR-6/FR-4 interaction (P9-A6, PRD §8): a carried remainder still present
+        # in the final round's findings is an accepted (`fix_now`) partial that was
+        # not fully resolved — it makes the round non-converged with an open
+        # fix_now-derived finding, so the strict clean conjunction cannot hold. Cite
+        # it explicitly so a carried remainder is NEVER auto-approved away on the
+        # final round, regardless of its severity (fail closed).
+        carried = [
+            str(f.get("id")) for f in findings
+            if f.get("carried_from")
+            and verdict_by_id.get(f.get("id")) == _LEGITIMATE_VERDICT
+        ]
+        if carried:
+            misses.append(
+                f"{len(carried)} carried remainder(s) open at the gate "
+                f"({', '.join(carried)}) — an accepted partial was not fully "
+                "resolved (FR-6.1); a carried remainder is never auto-approved away "
+                "on the final round (FR-6/FR-4 interaction)"
+            )
+        if reviewer_mutations:
+            misses.append(
+                f"{reviewer_mutations} reviewer worktree mutation(s) recorded "
+                "(FR-9.6) — the read-only contract was violated; a human must "
+                "review (FR-4.1)"
+            )
+
+    # --- acceptance gate passed · tests green ----------------------------------
+    # Both conjuncts are *required* (§4.2): "acceptance gate passed" and "tests
+    # green". A DONE-reaching stage walk normally guarantees both ran, but we
+    # assert them explicitly so a bypassed/hand-built pipeline fails closed and
+    # the snapshot is truthful. An *absent* acceptance/shell step before the gate
+    # means the required conjunct was never produced — that cannot prove the
+    # signal is clean, so it parks closed exactly as a failed one does (a
+    # not_run record is a miss, not a pass).
+    acceptance_result = "pass"
+    if any(rec.status != M.DONE for rec in acceptance):
+        acceptance_result = "fail"
+        misses.append("acceptance gate did not pass (FR-3.2)")
+    elif not acceptance:
+        acceptance_result = "not_run"
+        misses.append(
+            "no acceptance_gate ran before this code gate — the required "
+            "'acceptance gate passed' conjunct cannot be proven; failing closed "
+            "(FR-4.1)"
+        )
+    tests_result = "passed"
+    if any(rec.status != M.DONE for rec in shells):
+        tests_result = "failed"
+        misses.append("phase tests are not green")
+    elif not shells:
+        tests_result = "not_run"
+        misses.append(
+            "no test shell ran before this code gate — the required 'tests "
+            "green' conjunct cannot be proven; failing closed (FR-4.1)"
+        )
+
+    # --- evidence freshness (FR-4.1, review F-3) --------------------------------
+    # The tests/acceptance conjuncts must vouch for the tree this gate approves.
+    # A round-1-converged cycle may still land fix commits (an accepted minor
+    # finding is fixed inside round 1 without failing any conjunct above), and in
+    # the shipped stage order tests and the acceptance gate run BEFORE the cycle
+    # — their records then describe a tree the fix commits changed. Deterministic
+    # manifest-only check: with a ``P<N>.x`` fix commit recorded for this phase,
+    # every DONE tests/acceptance record positioned before the cycle is stale
+    # evidence and parks closed, exactly as a failed conjunct would. A
+    # tests/acceptance step positioned AFTER the cycle re-proved its signal
+    # against the fixed tree and stays fresh.
+    fix_shas = [
+        c.sha for c in manifest.commits
+        if phase and c.phase.startswith(f"{phase}.")
+    ]
+    if fix_shas:
+        ids = [s.id for s in stage.steps]
+        cycle_pos = max(
+            (ids.index(s.id) for s in preceding if s.type == "adversarial_cycle"),
+            default=-1,
+        )
+        for rec_list, label in ((shells, "tests"), (acceptance, "acceptance gate")):
+            done = [r for r in rec_list if r.status == M.DONE and r.id in ids]
+            # A DONE record of the same type positioned AFTER the cycle re-proved
+            # the signal against the fixed tree (the shipped acceptance-recheck):
+            # it absolves the type's pre-cycle records — the conjunct is about
+            # whether the signal holds for the approved tree, not which step
+            # instance proved it.
+            if any(ids.index(r.id) > cycle_pos for r in done):
+                continue
+            for rec in done:
+                if ids.index(rec.id) < cycle_pos:
+                    misses.append(
+                        f"{label} step {rec.id!r} ran before the cycle, and the "
+                        f"cycle landed fix commit(s) "
+                        f"{', '.join(s[:10] for s in fix_shas)} afterward — its "
+                        "evidence is stale for the tree this gate approves "
+                        "(FR-4.1 evidence freshness); failing closed"
+                    )
+
+    evidence: dict[str, Any] = {
+        "rounds": rounds,
+        "blocking": blocking,
+        "major": major,
+        # v0.5: `blocking`/`major` count what was RAISED; the predicate turns on
+        # what is still OPEN. Both are recorded — an auto-approval that says only
+        # "blocking: 0" would now be a lie by omission, since the gate can clear a
+        # phase that raised four blocking findings and resolved all four. The
+        # human ratifying at the PR boundary (FR-4.2) needs to see both numbers to
+        # judge the approval, so the snapshot states raised, open, and resolved.
+        "blocking_major_open": len(open_serious),
+        "blocking_major_resolved": (blocking + major) - len(open_serious),
+        "escalations": 0,
+        "reviewer_mutations": reviewer_mutations,
+        "acceptance_gate": acceptance_result,
+        "verifier": verifier_status,
+        "tests": tests_result,
+    }
+    return CleanGateDecision(clean=not misses, evidence=evidence, misses=misses)

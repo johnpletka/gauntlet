@@ -27,7 +27,9 @@ stages:
       # The human-authored prd.md is already committed (it is the run's seed);
       # the cycle reviews it as a document and applies accepted fixes.
       - {id: prd-cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
-         phase: PRD, reviewer: reviewer, triager: triage, fixer: builder,
+         phase: PRD, triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-document.md}
       - {id: prd-approve, type: human_gate,
@@ -54,9 +56,16 @@ stages:
       # an unrelated dirty file can no longer defeat the review baseline (the
       # artifact-mode cycle's baseline commit remains a fallback for producers
       # that do not set commit_output).
+      # max_rounds 3 (pipeline-effectiveness FR-6.1, P9): a carried remainder (an
+      # accepted `partially_resolved` finding, forced non-converged) needs a round
+      # to land before max-rounds escalation parks. The bump is scoped to
+      # plan-cycle/impl-cycle per FR-6.1; the prd-cycle above stays at 2. The
+      # fail-closed terminus (escalate to human at max-rounds) is unchanged.
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
-         phase: PLAN, reviewer: reviewer, triager: triage, fixer: builder,
-         escalation_agent: escalation, max_rounds: 2,
+         phase: PLAN, triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
+         escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-document.md}
       # Deterministic structural gate (FR-5.1): the prose reviewer above never
       # parses the gauntlet-phases block, so a malformed block (e.g. an unquoted
@@ -96,10 +105,70 @@ stages:
       # (still format-validated + redrafted), not the builder.
       - {id: phase-commit, type: commit, message_agent: mechanic,
          prompt: prompts/commit-message.md}
+      # Deterministic completeness gate (FR-3.2): the implement step's completion
+      # contract produces artifacts/acceptance-map.json, mapping every acceptance
+      # clause of this phase to >=1 real pytest node id. This gate proves citation
+      # + existence — every clause maps and every cited id appears in
+      # `pytest --collect-only` — and parks the phase (naming the gap) otherwise,
+      # before any reviewer budget is spent. It is the structural close of the #54
+      # silent-partial-delivery class. Enumeration is a bounded engine subprocess
+      # in a DISPOSABLE COPY with a stripped env, its command resolved from the
+      # project's own test environment (collectors.resolve_command; overridable
+      # via `collectors.pytest.command`) — deterministic, no LLM in the evidence
+      # path (PR #59 review F3/F4/F7).
+      - {id: acceptance-gate, type: acceptance_gate, collector: pytest,
+         map: artifacts/acceptance-map.json}
+      # Behavioral verifier sub-step (pipeline-effectiveness FR-2.1, P5): between
+      # review and triage, the `verifier` (claude-code) profile executes the
+      # deliverable in a DISPOSABLE copy of the post-handoff worktree under the
+      # judge PreToolUse hook (read/write confined to the copy, network default-
+      # deny, secret-stripped env). Fail-closed: an unhooked/absent backend, a
+      # copy/launch failure, or a real-worktree mutation parks the cycle
+      # (engine/verify.py). Its behavioral findings join the merged panel and flow
+      # through triage/fix/confirm; `metrics.verifier.*` records the §9
+      # behavioral-signal instrument (legit findings + verifier cost).
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
-         reviewer: reviewer, triager: triage, fixer: builder,
-         escalation_agent: escalation, max_rounds: 2,
+         triager: triage, fixer: builder,
+         reviewers: [{profile: reviewer, lens: correctness},
+                     {profile: gemini, lens: spec-coverage}],
+         verifier: verifier,
+         escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-code.md}
+      # Post-cycle re-check (PR #59 review F1): the pre-cycle acceptance gate's
+      # guarantee decays the moment a fix round touches a cited test — a P<N>.x
+      # commit can rename/remove a mapped node id AFTER the gate blessed the map
+      # (this run's own P9 artifact shipped exactly that staleness). The same
+      # deterministic check re-runs here so citation+existence holds for the
+      # tree the phase actually ships, and deferral reconciliation now sees the
+      # fix commits' bodies too (review F2 — the handler always collected P<N>.x
+      # bodies; it just never ran after they existed). This instance satisfies
+      # the FR-4.1 evidence-freshness conjunct for the acceptance signal when
+      # fix commits landed. cycle-fix.md obliges the fixer to update the map in
+      # the same fix commit when a fix renames/moves a cited test.
+      - {id: acceptance-recheck, type: acceptance_gate, collector: pytest,
+         map: artifacts/acceptance-map.json}
+      # Post-cycle test re-run (FR-4.1 evidence freshness). The `tests` step above
+      # runs BEFORE the cycle, so once a round lands a P<N>.x fix commit its record
+      # vouches for a tree the fix then changed — stale evidence the freshness
+      # conjunct parks on. `acceptance-recheck` re-proves the acceptance signal;
+      # this re-proves the tests signal, against the tree the phase actually ships.
+      # Without it the gate below could never auto-approve any phase that fixed
+      # anything, which is nearly every phase.
+      - {id: tests-recheck, type: shell, run: "{{config.test_command}}",
+         timeout_s: 1800}
+      # Evidence-tiered phase gate (FR-4.1). Policy `auto_when_clean`: the strict
+      # §4.2 conjunction auto-approves and records an evidence snapshot; ANY miss
+      # parks for a human exactly as a plain gate would. Note what this changes on
+      # this pipeline: there was no phase gate here at all, so phases proceeded
+      # unconditionally after a converged cycle. This gate does not remove a human
+      # step — it ADDS a fail-closed stop for phases whose evidence is ambiguous,
+      # while clean phases keep flowing. The predicate turns on whether anything
+      # serious is still OPEN (v0.5), not on whether review found nothing: the
+      # raised-based form measured 0/9 on this repo's own run, because a working
+      # adversarial panel always finds something. FR-4.1 requires a verifier on
+      # any phase declaring this policy — impl-cycle configures one above.
+      - {id: phase-gate, type: human_gate, policy: auto_when_clean,
+         show: [findings.json, triage.json, confirm.json, acceptance-map.json]}
 
   # --- retrospective + governed self-improvement (FR-6.2/6.3; active in P7) --
   # Each agent self-critiques the run; the cheap `proposer` synthesises feedback

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "gauntlet/schemas/findings.json",
   "title": "Reviewer findings (PRD §7, FR-5.2)",
-  "description": "Structured output of an adversarial review step. The `findings` array is normative per PRD §7. `open_questions` and `summary` are P4 schema additions (BOOTSTRAP-NOTES #5): reviewers naturally emit questions that are not claims, and forcing them through the verdict enum is wrong — they get their own slot and the triager handles them first-class. The PRD §7 excerpt itself is unchanged. Strict-mode note (pinned, codex 0.139.0): native structured output requires EVERY property in `required`, so §7-optional fields are spelled required-but-nullable; `suggested_fix: null` means 'none offered'.",
+  "description": "Structured output of an adversarial review step. The `findings` array is normative per PRD §7. `open_questions` and `summary` are P4 schema additions (BOOTSTRAP-NOTES #5): reviewers naturally emit questions that are not claims, and forcing them through the verdict enum is wrong — they get their own slot and the triager handles them first-class. The PRD §7 excerpt itself is unchanged. Strict-mode note (pinned, codex 0.139.0): native structured output requires EVERY property in `required`, so §7-optional fields are spelled required-but-nullable; `suggested_fix: null` means 'none offered'. Ensemble note (pipeline-effectiveness FR-1.2 / review F-007): this file is the PERSISTED findings-record validation schema. `source`/`lens`/`duplicate_of`/`sources` are engine/merge-annotated — NEVER emitted by a reviewer agent's strict structured output (the engine stamps source/lens per panel member and the deterministic merge writes duplicate_of/sources). They are therefore OPTIONAL here (a legacy or single-reviewer artifact that omits them validates), and are stripped out of the strict per-member output schema handed to the reviewer adapter (see `cycle._reviewer_output_schema`), so the reviewer's pinned strict-mode shape is unchanged and a one-member artifact is byte-identical to pre-ensemble output.",
   "type": "object",
   "additionalProperties": false,
   "required": ["findings", "open_questions", "summary"],
@@ -24,13 +24,15 @@
           },
           "category": {
             "type": "string",
+            "description": "Finding category. `behavioral` (pipeline-effectiveness FR-2.4, P4) is an ADDITIVE enum member for findings a verifier raises by *executing* the deliverable (a signal class no diff reader produces); it migrates in with every category-enforcing consumer (cycle merge, triage, confirm, metrics) at once so a behavioral finding can never reach an unmigrated consumer. Pre-migration findings using only the original categories still validate; a `category` outside this enum fails validation closed (never coerced or dropped).",
             "enum": [
               "correctness",
               "spec-gap",
               "security",
               "performance",
               "principle-violation",
-              "style"
+              "style",
+              "behavioral"
             ]
           },
           "location": {
@@ -48,6 +50,32 @@
           "suggested_fix": {
             "type": ["string", "null"],
             "description": "Optional per §7 — null when the reviewer offers none."
+          },
+          "source": {
+            "type": "string",
+            "description": "Engine-stamped ensemble annotation (FR-1.2): the panel member's profile that raised this finding. Absent on a single-reviewer / legacy artifact."
+          },
+          "lens": {
+            "type": "string",
+            "description": "Engine-stamped ensemble annotation (FR-1.2): the lens fragment id assigned to the member that raised this finding. Absent on a single-reviewer / legacy artifact."
+          },
+          "duplicate_of": {
+            "type": ["string", "null"],
+            "description": "Merge annotation (FR-1.2): the primary finding id this finding deduplicated into, or null/absent for a primary. Only primaries reach triage."
+          },
+          "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Merge annotation (FR-1.2, on a merged primary): every panel-member profile whose finding merged into this primary (including the primary's own)."
+          },
+          "source_members": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Merge annotation (FR-1.2/FR-1.3, on a merged primary): every panel MEMBER (`profile::lens`) whose finding merged into this primary, including the primary's own. Distinct from `sources`, which is profile-only: one profile may sit on the panel under two lenses, and both members raising the same finding collapse to a single `sources` entry — which the FR-1.3 sole-source yield metric would then miscount as unique coverage (PR #59 review F-005). Member identity is what §1.3's kill criterion means. Engine-stamped like source/lens/duplicate_of/sources, never emitted by a reviewer's strict structured output; absent on a legacy/single-reviewer artifact, which validates."
+          },
+          "carried_from": {
+            "type": ["string", "null"],
+            "description": "Engine annotation (pipeline-effectiveness FR-6.1, P9): on a carried remainder merged into a later round, the `partially_resolved` accepted finding id this remainder was split from — kept intact so the round manifest links remainder -> parent. Absent/null on an ordinary finding. Like source/lens/duplicate_of it is engine-stamped, never emitted by a reviewer's strict structured output, so a legacy/pre-migration artifact that omits it validates."
           }
         }
       }

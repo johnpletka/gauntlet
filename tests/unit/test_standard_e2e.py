@@ -12,6 +12,7 @@ edit ONLY, and show it validates, runs, and appears in the manifest/report.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -36,8 +37,29 @@ Implement widget(); validates the toy spec is satisfiable end-to-end.
 - id: P1
   title: Build the widget
   goal: Implement widget(); validates the toy spec is satisfiable end-to-end.
+  acceptance:
+    - id: P1-A1
+      clause: widget() returns the string "widget".
 ```
 """
+
+# The implement step's FR-3.2 completion contract: the builder writes an
+# acceptance-map citing a real pytest node id for each clause, plus the test it
+# cites, so the acceptance_gate (now in the phases stage, after phase-commit)
+# clears. `pytest --collect-only` in the toy repo enumerates test_widget.py.
+ACCEPTANCE_MAP = json.dumps({
+    "phase": "P1",
+    "clauses": [{
+        "id": "P1-A1",
+        "text": 'widget() returns the string "widget".',
+        "evidence": [{"kind": "pytest", "id": "test_widget.py::test_widget"}],
+    }],
+})
+IMPL_WRITES = {
+    "widget.py": "def widget(): return 'widget'\n",
+    "test_widget.py": "def test_widget():\n    assert True\n",
+    "runs/toy/artifacts/acceptance-map.json": ACCEPTANCE_MAP,
+}
 
 TOY_PRD = """# PRD: Toy widget
 
@@ -58,6 +80,8 @@ test_command: "true"
 agents:
   builder: {adapter: claude-code, permission_mode: acceptEdits}
   reviewer: {adapter: codex, sandbox: read-only}
+  verifier: {adapter: claude-code, permission_mode: acceptEdits, allowed_tools: [Bash, Read, Grep, Glob, Edit, Write], base_flags: ["--setting-sources", "project"]}
+  gemini: {adapter: api, model: gemini/gemini-2.5-pro}
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
   mechanic: {adapter: api, model: gpt-5-mini}
@@ -100,7 +124,9 @@ def review_empty():
 def text_result(text, writes=None):
     def _run(cwd):
         for rel, content in (writes or {}).items():
-            (Path(cwd) / rel).write_text(content)
+            target = Path(cwd) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
         return AgentResult(text=text, usage=_u(), exit_code=0)
     return _run
 
@@ -123,6 +149,11 @@ def _scaffold(tmp_path: Path, *, pipeline_text: str | None = None) -> Path:
     (repo / "pipelines").mkdir()
     pipe = pipeline_text or (REPO / "pipelines" / "standard.yaml").read_text()
     (repo / "pipelines" / "standard.yaml").write_text(pipe)
+    # A pytest.ini anchors pytest's rootdir to the toy repo, so the
+    # acceptance_gate's `pytest --collect-only` emits node ids relative to it
+    # (`test_widget.py::test_widget`) rather than to whatever ancestor project
+    # config it would otherwise discover — real repos carry their own config.
+    (repo / "pytest.ini").write_text("[pytest]\n")
     (repo / ".gauntlet").mkdir()
     (repo / ".gauntlet" / "config.yaml").write_text(CFG)
     (repo / "runs" / "toy").mkdir(parents=True)
@@ -138,8 +169,54 @@ def _factory(adapters):
     return lambda name: adapters[name]
 
 
-def test_standard_runs_end_to_end_with_fakes(tmp_path):
+def _stub_sandbox(monkeypatch, tmp_path):
+    """Stub the P5 verifier sandbox backend for the offline e2e (no claude+judge).
+
+    The whole e2e is fake-driven (faked reviewer/gemini/builder, use_judge=False),
+    so the claude-code + judge verifier backend is inherently unavailable here;
+    stub it exactly like the other CLIs are faked. The verifier's disposable copy
+    and hook confinement are integration-tested (tests/integration); here the fake
+    `verifier` adapter stands in and the acceptance_gate enumeration runs the real
+    collector on the toy repo (unchanged from the P2-P4 behavior this test asserts)."""
+    from gauntlet.engine import verify
+
+    copy = tmp_path / "verify-copy"
+    copy.mkdir(exist_ok=True)
+    fake = verify.SandboxBackend(claude_path="claude")
+    monkeypatch.setattr(verify, "detect_backend", lambda judge_env: fake)
+    monkeypatch.setattr(verify, "probe_backend", lambda judge_env, **k: fake)
+    # The stubbed "copy" points at the real toy worktree: the offline e2e runs
+    # the REAL collector (and the fake verifier adapter ignores cwd), so the
+    # acceptance gates enumerate the toy repo's genuine node ids. True
+    # copy-isolation is integration-tested; here the copy machinery is faked
+    # like the CLIs are.
+    monkeypatch.setattr(verify, "make_disposable_copy",
+                        lambda repo, **k: verify.DisposableCopy(path=repo, root=copy))
+    monkeypatch.setattr(verify, "discard_disposable_copy", lambda repo, c: None)
+    # Enumeration (PR #59 F3/F4): the gate now runs the collector as an engine
+    # subprocess in a disposable copy. The toy repo has no uv project, so pin
+    # the registry default (engine interpreter, which has pytest here) instead
+    # of deriving from test_command, and let the REAL collector run in the REAL
+    # disposable copy of the toy repo — genuine end-to-end enumeration.
+    from gauntlet.engine import steptypes as _steptypes
+
+    monkeypatch.setattr(_steptypes, "resolve_command",
+                        lambda collector, config: collector.command)
+    # Boundary lease seams (PR #59 B1): no live judge in the offline e2e; the
+    # real registration/confinement path has its own unit + integration tests.
+    monkeypatch.setattr(
+        verify, "register_boundary",
+        lambda judge_env, step_id, root: verify.BoundaryLease(
+            step_id=step_id, key="k", url="http://x", token="t", run_id="r"),
+    )
+    monkeypatch.setattr(verify, "confirm_boundary_enforced",
+                        lambda lease, outside_path: None)
+    monkeypatch.setattr(verify, "clear_boundary", lambda lease: None)
+
+
+def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     repo = _scaffold(tmp_path)
+    _stub_sandbox(monkeypatch, tmp_path)
     adapters = {
         # prd-cycle, plan-cycle, impl-cycle each converge on an empty review;
         # +1 reviewer self-critique in the now-active retro stage (FR-6.2, P7).
@@ -147,9 +224,15 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
             review_empty(), review_empty(), review_empty(),
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
+        # Ensemble panel member 2 (FR-1.1): the three cycles each run it; it
+        # converges empty like the reviewer so each round finds nothing.
+        "gemini": Script(review_empty(), review_empty(), review_empty()),
+        # P5 behavioral verifier: runs once on the impl-cycle (round 1); converges
+        # empty (no behavioral findings) so the cycle still converges in round 1.
+        "verifier": Script(review_empty()),
         "builder": Script(
             text_result(PLAN_MD),                              # plan-author
-            text_result("implemented P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            text_result("implemented P1", IMPL_WRITES),
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(
@@ -219,9 +302,10 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path):
     assert all(v.startswith("sha256:") for v in man.prompt_hashes.values())
 
 
-def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
+def test_yaml_only_extension_adds_a_third_review_step(tmp_path, monkeypatch):
     # FR-5.3/5.4 acceptance: add a review step to one stage by EDITING YAML only;
     # it validates, runs, and shows up in the manifest + cost report. No code.
+    _stub_sandbox(monkeypatch, tmp_path)
     spec = yaml.safe_load((REPO / "pipelines" / "standard.yaml").read_text())
     phases = next(s for s in spec["stages"] if s["id"] == "phases")
     extra = {
@@ -240,9 +324,15 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path):
             *[review_empty() for _ in range(4)],
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
+        # Panel member 2 runs on the three panel cycles (prd/plan/impl); the added
+        # impl-cycle-2 is a single-reviewer step, so gemini is called 3× not 4×.
+        "gemini": Script(*[review_empty() for _ in range(3)]),
+        # P5 verifier runs on impl-cycle only (impl-cycle-2 declares no verifier);
+        # converges empty.
+        "verifier": Script(review_empty()),
         "builder": Script(
             text_result(PLAN_MD),
-            text_result("did P1", {"widget.py": "def widget(): return 'widget'\n"}),
+            text_result("did P1", IMPL_WRITES),
             AgentResult(text="builder retrospective", usage=_u(), exit_code=0),
         ),
         "triage": Script(

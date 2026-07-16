@@ -94,6 +94,7 @@ def run_with_timeout(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
     sink: Callable[[str], None] | None = None,
+    preexec_fn: Callable[[], None] | None = None,
 ) -> ProcessOutput:
     """Run ``argv`` with a hard wall-clock timeout.
 
@@ -120,7 +121,7 @@ def run_with_timeout(
     if sink is None:
         return _run_buffered(
             argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
-            deadline=deadline,
+            deadline=deadline, preexec_fn=preexec_fn,
         )
     return _run_streaming(
         argv,
@@ -130,6 +131,7 @@ def run_with_timeout(
         env=env,
         sink=sink,
         deadline=deadline,
+        preexec_fn=preexec_fn,
     )
 
 
@@ -141,6 +143,7 @@ def _run_buffered(
     cwd: Path | None,
     env: Mapping[str, str] | None,
     deadline: "object | None" = None,
+    preexec_fn: Callable[[], None] | None = None,
 ) -> ProcessOutput:
     """The buffered path — one ``communicate()`` (or a polled one under a deadline).
 
@@ -160,6 +163,7 @@ def _run_buffered(
         env=dict(env) if env is not None else None,
         text=True,
         start_new_session=True,  # own process group, so killpg reaps children
+        preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
     )
     if deadline is None:
         try:
@@ -234,6 +238,7 @@ def _run_streaming(
     env: Mapping[str, str] | None,
     sink: Callable[[str], None],
     deadline: "object | None" = None,
+    preexec_fn: Callable[[], None] | None = None,
 ) -> ProcessOutput:
     """Incremental, deadlock-safe reader that frames stdout on ``\\n``.
 
@@ -265,6 +270,7 @@ def _run_streaming(
         env=dict(env) if env is not None else None,
         bufsize=0,  # raw binary pipes; we frame + decode ourselves
         start_new_session=True,
+        preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
     )
 
     # Raw byte buffers, maintained independently of the line sink: every byte

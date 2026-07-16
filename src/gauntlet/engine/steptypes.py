@@ -51,13 +51,33 @@ from gauntlet.engine.pipeline import (
     Step,
     iter_inputs,
 )
+from gauntlet.engine.collectors import (
+    CollectorEnumerationError,
+    get_collector,
+    is_registered,
+    resolve_command,
+)
+from gauntlet.engine.deferrals import (
+    SIZE_LINT_MODES,
+    SIZE_LINT_PARK,
+    SIZE_LINT_WARN,
+    Deferral,
+    deferrals_from_map,
+    distinct_fr_refs,
+    open_deferrals_for,
+    parse_body_deferrals,
+    phantom_deferrals,
+)
 from gauntlet.engine.planphases import (
     PlanPhasesError,
+    acceptance_clause_errors,
     extract_phases,
+    load_plan_phases,
     missing_phase_sections,
     phase_section,
 )
 from gauntlet.engine.validators import validate_artifact
+from gauntlet.engine import verify
 from gauntlet.logging.transcript import StepLogger
 
 # FR-2.1: how many in-session repair attempts an invalid `output:` artifact gets
@@ -265,10 +285,525 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
                 "`phase`-mode context can slice it (FR-1.1)"
             ),
         )
+    # FR-3.1: every phase must carry a well-formed `acceptance:` list of testable
+    # clauses (the acceptance_gate's input). A clause-less/malformed phase fails
+    # closed here — same fail-closed path as a malformed block — so an
+    # unmappable-at-gate plan never reaches human approval.
+    acc_errors = acceptance_clause_errors(phases)
+    if acc_errors:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: {artifact} has acceptance-clause defects — "
+                + "; ".join(acc_errors)
+                + " (FR-3.1)"
+            ),
+        )
+    # FR-3.4: the phase-size lint. A phase carrying more than `max_frs_per_phase`
+    # (default 3) distinct FR references is oversized — the scope where partial
+    # delivery hides (#54 cause 4). Counted from each phase's PROSE section (where
+    # the "Deliverables (FR-…)" refs live), not the machine-readable block. The
+    # disposition is the step's `size_lint:` option — warn (default; surface, do
+    # not block) or park (fail closed at the plan gate).
+    size_mode = step.get("size_lint", SIZE_LINT_WARN)
+    if size_mode not in SIZE_LINT_MODES:
+        return StepResult(
+            status=HALTED,
+            halt_reason=HALT_REASON_PRECONDITION,
+            notes=(
+                f"phase lint: unknown size_lint mode {size_mode!r}; must be one of "
+                f"{sorted(SIZE_LINT_MODES)} (FR-3.4)"
+            ),
+        )
+    bound = ctx.config.max_frs_per_phase
+    oversized: list[str] = []
+    for phase in phases:
+        section = phase_section(text, phase["id"]) or ""
+        refs = distinct_fr_refs(section)
+        if len(refs) > bound:
+            oversized.append(
+                f"{phase['id']} carries {len(refs)} distinct FR refs "
+                f"({', '.join(sorted(refs))})"
+            )
     ids = ", ".join(p["id"] for p in phases)
+    if oversized:
+        detail = (
+            f"{len(oversized)} phase(s) exceed max_frs_per_phase={bound}: "
+            + "; ".join(oversized)
+            + " — oversized phases hide partial delivery (FR-3.4)"
+        )
+        if size_mode == SIZE_LINT_PARK:
+            return StepResult(
+                status=HALTED, halt_reason=HALT_REASON_PRECONDITION,
+                notes=f"phase lint: {detail}",
+            )
+        # warn mode: not a blocker — surface the finding in the notes so it lands
+        # in RUN.md / status without stopping the plan gate.
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"phase lint: {len(phases)} phase(s) valid ({ids}); "
+                f"WARNING — {detail}"
+            ),
+        )
     return StepResult(
         status=DONE, notes=f"phase lint: {len(phases)} phase(s) valid ({ids})"
     )
+
+
+# --- acceptance_gate ---------------------------------------------------------
+# The acceptance-map artifact the implement step produces (§6). Read directly
+# from disk (not declared as a dataflow `artifact:`/`inputs:` reference — the
+# builder writes it with its file tools, so it is not an agent `output:` the
+# loader tracks), and fail closed if it is absent.
+_ACCEPTANCE_MAP_DEFAULT = "artifacts/acceptance-map.json"
+_ACCEPTANCE_MAP_SCHEMA = "schemas/acceptance-map.json"
+
+
+def _acceptance_gate_halt(notes: str) -> StepResult:
+    """A fail-closed acceptance_gate park: HALTED → RUN_PARKED for a human.
+
+    Mirrors ``phase_lint``'s precondition-halt path (a deterministic gate that
+    parks the run when it cannot pass) so an incomplete/uncheckable phase never
+    advances to the review cycle.
+    """
+    return StepResult(status=HALTED, halt_reason=HALT_REASON_PRECONDITION, notes=notes)
+
+
+def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
+    """Deterministically prove every plan-phase acceptance clause maps to a real,
+    collector-enumerated test id (FR-3.2) — the structural close of the #54 class.
+
+    One instance per distinct collector (``collector:``). It proves *citation +
+    existence*: every clause is mapped, and every id this collector is cited for
+    appears in that collector's side-effect-free enumeration. It does **not**
+    prove the cited test meaningfully exercises the clause — sufficiency stays the
+    spec-coverage review lens's job (G2 scoped accordingly).
+
+    Fail closed at every step: a missing/unparseable/schema-invalid map, an
+    unmapped clause, a cited id absent from the enumeration, or a failed/timed-out
+    enumeration all **park** — an absent or failed check is never read as "passed".
+    Enumeration is a bounded engine subprocess in a DISPOSABLE COPY with a
+    stripped env and a project-resolved command — deterministic, no LLM in the
+    evidence path (PR #59 review F3/F4/F7; see collectors.py).
+    """
+    collector_kind = step.get("collector")
+    if not collector_kind:
+        return _acceptance_gate_halt(
+            "acceptance gate: step declares no `collector:` (FR-3.2)"
+        )
+    # Defense in depth: pipeline load already rejects an unregistered collector
+    # (validate.py), but a hand-built/bypassed pipeline fails closed here too.
+    if not is_registered(collector_kind):
+        return _acceptance_gate_halt(
+            f"acceptance gate: collector {collector_kind!r} has no registered "
+            "collector (rejected at load; unsupported collector, FR-3.2)"
+        )
+
+    phase = ctx.iteration_item
+    if not isinstance(phase, dict) or not phase.get("id"):
+        return _acceptance_gate_halt(
+            "acceptance gate: no current phase in context; this step runs inside "
+            "the `foreach: plan.phases` loop (FR-3.2)"
+        )
+    phase_id = phase["id"]
+    clauses = phase.get("acceptance") or []
+    if not clauses:
+        # phase_lint already fails closed on a clause-less phase (FR-3.1); reaching
+        # the gate with none means the lint was bypassed — fail closed here too.
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} carries no acceptance clauses "
+            "(FR-3.1 lint should have parked upstream)"
+        )
+    clause_ids = [c["id"] for c in clauses]
+
+    # 1. Load + parse + schema-validate the acceptance map. A schema-invalid map —
+    # including one whose evidence declares an unregistered collector kind (the
+    # schema's `kind` enum is closed) — is rejected HERE, at map load, before any
+    # enumeration runs. It never "parks closed after running an unsupported
+    # collector" (FR-3.2 / P2-A5).
+    map_name = step.get("map", _ACCEPTANCE_MAP_DEFAULT)
+    map_path = ctx.artifact_root / map_name
+    if not map_path.exists():
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} has no acceptance map at "
+            f"{map_name} (fail closed — an absent map is not 'all clauses mapped', "
+            "FR-3.2)"
+        )
+    try:
+        mapping = json.loads(map_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} is not parseable JSON: "
+            f"{exc} (fail closed)"
+        )
+    schema_err = _validate_acceptance_map_schema(mapping, ctx)
+    if schema_err is not None:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} is schema-invalid — "
+            f"{schema_err} (rejected at load, FR-3.2)"
+        )
+
+    # 1b. Phase scoping: the acceptance map is a phase-scoped artifact (schema
+    # `phase`). A map whose `phase` is not this phase's id — a stale or
+    # wrong-phase acceptance-map.json — is rejected here (review F-001). Reusing
+    # clause ids such as `A1` across phases must NOT let a prior phase's map
+    # satisfy this gate; the map must declare it covers THIS phase (fail closed,
+    # FR-3.2).
+    map_phase = mapping.get("phase")
+    if map_phase != phase_id:
+        return _acceptance_gate_halt(
+            f"acceptance gate: acceptance map {map_name} covers phase "
+            f"{map_phase!r}, not the current phase {phase_id} — a stale or "
+            "wrong-phase map is not this phase's completion artifact (fail "
+            "closed, FR-3.2)"
+        )
+
+    # 1c. Exact map: the artifact must map exactly this phase's clauses — no
+    # extras. A clause id in the map but absent from the plan phase is a
+    # stale/unrelated entry that would let incorrect evidence ride in the audit
+    # artifact consumed by P3 deferral reconciliation; reject it (review F-002,
+    # FR-3.2).
+    clause_id_set = set(clause_ids)
+    extra_ids = sorted(
+        {c["id"] for c in mapping["clauses"] if c["id"] not in clause_id_set}
+    )
+    if extra_ids:
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} acceptance map {map_name} carries "
+            f"clause id(s) not in the plan phase: {', '.join(extra_ids)} — the map "
+            "must be an exact map of the current phase's acceptance list (fail "
+            "closed, FR-3.2)"
+        )
+
+    # 1d. FR-3.3 deferral reconciliation: a deferral (in this phase's acceptance
+    # map `deferrals[]` or in its commit body — the CLAUDE.md §7 "Deferred to
+    # P<N>" convention) that points to a phase the plan does not contain lands the
+    # deferred work nowhere. Reconciled HERE, at the phase that authored the
+    # deferral, against the plan's actual phase ids — a phantom target parks the
+    # phase closed (a deferral that points nowhere is silently-dropped work). Open
+    # deferrals themselves are injected into the target phase's implement prompt at
+    # render time (`_render_prompt`); this gate is the fail-closed existence check.
+    deferrals = deferrals_from_map(mapping, source=f"acceptance-map:{phase_id}")
+    for rec in ctx.manifest.commits:
+        if rec.phase == phase_id or rec.phase.startswith(f"{phase_id}."):
+            try:
+                body = gitops.commit_message(ctx.repo_root, rec.sha)
+            except gitops.GitError:
+                continue
+            deferrals.extend(
+                parse_body_deferrals(body, source=f"commit:{rec.sha[:10]}")
+            )
+    # Only touch the plan when there is something to reconcile: a phase with no
+    # deferral needs no phase-list load (and must not fail closed for lack of one).
+    if deferrals:
+        known_ids = _plan_phase_ids(ctx)
+        if known_ids is None:
+            return _acceptance_gate_halt(
+                f"acceptance gate: phase {phase_id} declares deferral(s) but the "
+                "plan's phase list cannot be loaded from plan.md to reconcile them "
+                "(fail closed, FR-3.3)"
+            )
+        phantom = phantom_deferrals(deferrals, known_ids)
+        if phantom:
+            named = "; ".join(f"{d.to_phase} ({d.source})" for d in phantom)
+            return _acceptance_gate_halt(
+                f"acceptance gate: phase {phase_id} defers work to nonexistent "
+                f"phase(s): {named} — a deferral must target a real plan phase "
+                "(fail closed, FR-3.3)"
+            )
+
+    # 2. Mapping completeness: every phase clause must have >=1 evidence entry.
+    mapped_ids = {c["id"] for c in mapping["clauses"] if c.get("evidence")}
+    unmapped = [cid for cid in clause_ids if cid not in mapped_ids]
+    if unmapped:
+        return _acceptance_gate_halt(
+            f"acceptance gate: phase {phase_id} has unmapped acceptance "
+            f"clause(s): {', '.join(unmapped)} — every clause must cite >=1 test "
+            "(fail closed, FR-3.2)"
+        )
+
+    # 3. Existence: every id cited for THIS collector must appear in the
+    # collector's side-effect-free enumeration (run under the interim posture).
+    cited = {
+        ev["id"]
+        for c in mapping["clauses"]
+        for ev in c.get("evidence", [])
+        if ev.get("kind") == collector_kind
+    }
+    if not cited:
+        # No evidence for this collector at all, yet every clause is mapped (step 2)
+        # — the map cites only other collectors. In v1 the only registered kind is
+        # pytest and the schema forbids any other, so this is unreachable in a
+        # valid v1 map; nothing to enumerate, so this collector's gate is a no-op.
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"acceptance gate ({collector_kind}): phase {phase_id} — no "
+                f"{collector_kind} evidence to check; all {len(clause_ids)} clause(s) "
+                "mapped"
+            ),
+        )
+    collector = get_collector(collector_kind)
+    # Enumeration posture (PR #59 review F3/F7, superseding the P5 LLM-mediated
+    # design): a bounded ENGINE SUBPROCESS in a DISPOSABLE COPY of the worktree.
+    # Deterministic — no LLM in the evidence path (the agent-echo design could
+    # truncate a large id list into a chronic false park, or fabricate ids into
+    # a false pass, defeating the gate's whole premise). `pytest --collect-only`
+    # still executes branch-authored conftest/import-time code, so it runs with
+    # the verifier's STRIPPED env, cwd pinned to the copy (import-time writes
+    # land in a discarded tree), and wall-clock + rlimit bounds. The command is
+    # project-resolved (collectors.resolve_command): the operator's
+    # `collectors.<kind>.command` override, else the project's pytest-shaped
+    # `test_command` env, else the engine interpreter.
+    command = resolve_command(collector, ctx.config)
+    try:
+        copy = verify.make_disposable_copy(ctx.repo_root)
+    except verify.CopyCreationError as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): could not create a disposable "
+            f"copy to enumerate phase {phase_id} in — {exc} (fail closed)"
+        )
+    try:
+        enumerated = collector.enumerate(
+            worktree=copy.path,
+            judge_env={},
+            command=command,
+        )
+    except CollectorEnumerationError as exc:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): enumeration failed for phase "
+            f"{phase_id} — {exc}"
+        )
+    finally:
+        verify.discard_disposable_copy(ctx.repo_root, copy)
+    missing_ids = sorted(cited - enumerated)
+    if missing_ids:
+        return _acceptance_gate_halt(
+            f"acceptance gate ({collector_kind}): phase {phase_id} cites test id(s) "
+            f"absent from the collector enumeration: {', '.join(missing_ids)} "
+            "(fail closed — a cited id must exist, FR-3.2)"
+        )
+    return StepResult(
+        status=DONE,
+        notes=(
+            f"acceptance gate ({collector_kind}): phase {phase_id} — all "
+            f"{len(clause_ids)} clause(s) mapped, {len(cited)} cited id(s) exist "
+            "(citation + existence proven; sufficiency is the review lens's job)"
+        ),
+    )
+
+
+def _plan_phase_ids(ctx: StepContext) -> set[str] | None:
+    """The plan's actual phase ids (P1, P2…) for deferral reconciliation (FR-3.3).
+
+    Returns ``None`` when plan.md is absent or its ``gauntlet-phases`` block is
+    unparseable — the caller fails closed (a deferral cannot be reconciled without
+    the phase list). ``phase_lint`` already rejects a malformed plan at the plan
+    gate, so this is the last-ditch guard for a bypassed plan.
+    """
+    try:
+        phases = load_plan_phases(ctx.artifact_root / "plan.md")
+    except PlanPhasesError:
+        return None
+    if not phases:
+        return None
+    return {p["id"] for p in phases if isinstance(p, dict) and p.get("id")}
+
+
+def _acceptance_map_relpath(ctx: StepContext) -> str | None:
+    """Repo-relative POSIX path of the default acceptance map, for `git show`.
+
+    Deferral injection (FR-3.3) reads each prior phase's committed
+    ``acceptance-map.json`` out of history (the live on-disk file is the *current*
+    phase's map), which needs the path relative to the repo root. ``None`` when it
+    resolves outside the repo (defensive; the map lives under the artifact root).
+    """
+    path = (ctx.artifact_root / _ACCEPTANCE_MAP_DEFAULT).resolve()
+    try:
+        return path.relative_to(ctx.repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+class DeferralCollectionError(Exception):
+    """A prior phase's committed deferral data could not be recovered (FR-3.3).
+
+    Raised when a commit that *tracks* the acceptance map cannot have its
+    structured ``deferrals[]`` read/parsed. It fails the prompt render closed so
+    the phase is never built with an open deferral silently dropped (review
+    F-001); the handler turns it into a precondition halt for a human to resolve.
+    """
+
+
+def _collect_run_deferrals(ctx: StepContext, *, map_relpath: str | None) -> list[Deferral]:
+    """All deferrals recorded across this run's phase commits (FR-3.3).
+
+    Two durable sources per recorded commit: the commit BODY ("Deferred to P<N>:"
+    prose, CLAUDE.md §7) and the ``acceptance-map.json`` committed at that sha (its
+    structured ``deferrals[]``, read out of history because the live file on disk
+    is the current phase's map).
+
+    The structured source fails CLOSED (review F-001): a commit that *tracks* the
+    acceptance map must have its ``deferrals[]`` recovered, so a git read failure
+    or an unparseable committed map on such a commit raises
+    :class:`DeferralCollectionError` rather than degrading to "no deferrals here".
+    Silently reducing an unrecoverable committed map to absent data would drop the
+    obligation a prior phase handed forward — the exact silently-lost-work failure
+    FR-3.3 exists to prevent, and a violation of the fail-closed / data-over-
+    inference principles (CLAUDE.md §2). A commit that simply does not carry the
+    map (the ordinary case for every non-phase commit) is not an error and is
+    skipped. Commit-body prose stays best-effort: it is a convention, not a
+    committed structured artifact, so an unreadable message yields no prose
+    deferrals without halting.
+    """
+    out: list[Deferral] = []
+    seen: set[str] = set()
+    for rec in ctx.manifest.commits:
+        sha = rec.sha
+        if not sha or sha in seen:
+            continue
+        seen.add(sha)
+        try:
+            body = gitops.commit_message(ctx.repo_root, sha)
+        except gitops.GitError:
+            body = ""
+        out.extend(parse_body_deferrals(body, source=f"commit:{sha[:10]}"))
+        if not map_relpath:
+            continue
+        # Distinguish "this commit has no map" (fine — skip) from "the map is there
+        # but unrecoverable" (fail closed). `git show <sha>:<path>` collapses both
+        # to a non-zero exit, so a tracked-ness probe is what separates them.
+        try:
+            carries_map = gitops.any_tracked_at(ctx.repo_root, sha, [map_relpath])
+        except gitops.GitError as exc:
+            raise DeferralCollectionError(
+                f"cannot determine whether commit {sha[:10]} carries {map_relpath} "
+                f"for open-deferral reconciliation: {exc}"
+            ) from exc
+        if not carries_map:
+            continue
+        raw = gitops.file_at_commit(ctx.repo_root, sha, map_relpath)
+        if raw is None:
+            raise DeferralCollectionError(
+                f"acceptance map {map_relpath} is committed at {sha[:10]} but could "
+                "not be read out of history for open-deferral reconciliation"
+            )
+        try:
+            mapping = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise DeferralCollectionError(
+                f"acceptance map {map_relpath} committed at {sha[:10]} is not valid "
+                f"JSON, so its structured deferrals cannot be recovered: {exc}"
+            ) from exc
+        out.extend(deferrals_from_map(mapping, source=f"acceptance-map@{sha[:10]}"))
+    return out
+
+
+def _render_open_deferrals(ctx: StepContext) -> str | None:
+    """The verbatim open-deferral block for the current phase's prompt (FR-3.3).
+
+    A prior phase that explicitly deferred work to THIS phase must not have the
+    obligation silently dropped: the builder receives each deferral's text
+    verbatim so it implements or explicitly re-defers it. Returns ``None`` when
+    there is no current phase or no open deferral targeting it (the ordinary
+    first-phase / no-deferral case, where no block is injected).
+
+    Raises :class:`DeferralCollectionError` (via :func:`_collect_run_deferrals`)
+    when a prior phase's committed acceptance map cannot be recovered — the render
+    fails closed rather than omit a block whose absence is indistinguishable from
+    "no deferral" (review F-001).
+    """
+    phase_id = _iteration_phase(ctx)
+    if not phase_id:
+        return None
+    all_deferrals = _collect_run_deferrals(ctx, map_relpath=_acceptance_map_relpath(ctx))
+    open_ = open_deferrals_for(phase_id, all_deferrals)
+    if not open_:
+        return None
+    lines = "\n".join(d.render() for d in open_)
+    return (
+        f"\n\n--- open deferrals targeting {phase_id} (FR-3.3) ---\n"
+        "A prior phase explicitly deferred the following work to THIS phase. "
+        "Implement each, or re-defer it explicitly (do not silently drop it):\n"
+        f"{lines}\n"
+    )
+
+
+# The plan-author prompt template (basename). The trend-history block (FR-5.3,
+# P7) is injected only into this step's prompt — the plan author is the sole
+# consumer of measured phase-cost history.
+_PLAN_AUTHOR_PROMPT = "plan-author.md"
+
+
+def _render_plan_author_history(step: Step, ctx: StepContext) -> str | None:
+    """Measured phase-cost history + the size bound for the plan-author prompt.
+
+    FR-5.3 (P7): the plan author sizes phases, and without measured history it
+    sizes blind. This appends the repo's completed-run cost/duration distributions
+    by step type, the ``max_frs_per_phase`` bound, and any provider window budget
+    to the plan-author input as advisory data (the plan stays human-ratified;
+    nothing auto-tunes). Returns ``None`` for every other step — the block is
+    scoped to the plan-author template — and a non-empty block (stats or the
+    explicit no-history notice, never silence) for the plan-author step.
+    """
+    ref = step.get("prompt")
+    if not ref or Path(ref).name != _PLAN_AUTHOR_PROMPT:
+        return None
+    from gauntlet.engine.trend import render_plan_author_history
+
+    run_root = ctx.repo_root / ctx.config.run_root
+    return render_plan_author_history(
+        run_root,
+        max_frs_per_phase=ctx.config.max_frs_per_phase,
+        providers=ctx.config.providers,
+    )
+
+
+def _deferral_collection_halt(exc: DeferralCollectionError) -> StepResult:
+    """Fail-closed halt when open-deferral injection cannot recover committed data.
+
+    A dropped open deferral is silently-lost work (FR-3.3), so we do not render the
+    phase prompt without it — we halt for a human, exactly like any other
+    unsatisfied precondition (review F-001).
+    """
+    return StepResult(
+        status=FAILED,
+        halt_reason=HALT_REASON_PRECONDITION,
+        notes=(
+            "open-deferral injection failed closed: a prior phase's committed "
+            f"acceptance map could not be recovered — {exc}. The phase prompt is "
+            "not rendered without its open deferrals (FR-3.3 / review F-001)."
+        ),
+    )
+
+
+def _validate_acceptance_map_schema(mapping: object, ctx: StepContext) -> str | None:
+    """Validate the acceptance map against ``schemas/acceptance-map.json``.
+
+    Returns ``None`` when valid, else the schema error string. The schema's
+    ``kind`` enum is closed (registered collectors only), so an evidence entry
+    naming an unregistered collector is rejected here — schema-invalid, not a
+    runtime surprise (FR-3.2 / P2-A5).
+    """
+    from gauntlet.adapters._structured import validate_schema
+
+    # The schema lives under the configured asset_root alongside the other
+    # schemas/*.json (asset_root is "." in gauntlet's own repo), resolved the same
+    # way `validate:` schema refs are (validators.py).
+    asset_root = getattr(ctx.config, "asset_root", ".")
+    schema_file = (ctx.repo_root / asset_root / _ACCEPTANCE_MAP_SCHEMA).resolve()
+    if not schema_file.exists():
+        return f"schema {_ACCEPTANCE_MAP_SCHEMA} not found under the asset root"
+    try:
+        schema = json.loads(schema_file.read_text())
+        validate_schema(mapping, schema)
+    except ValueError as exc:
+        return str(exc)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"schema {_ACCEPTANCE_MAP_SCHEMA} is unreadable: {exc}"
+    return None
 
 
 # --- agent_task --------------------------------------------------------------
@@ -330,7 +865,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     is_quota_resume = bool(
         ctx.record.parked_reason == PARKED_REASON_USAGE_LIMIT and ctx.record.session_id
     )
-    prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
+    try:
+        prompt = _CONTINUATION_PROMPT if is_quota_resume else _render_prompt(step, ctx)
+    except DeferralCollectionError as exc:
+        return _deferral_collection_halt(exc)
     schema = (
         _resume_disposition_schema(ctx)
         if consuming_response
@@ -404,7 +942,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             "usage-limit resume: stored session was unknown/expired; fell back "
             "to a full re-run with no session (FR-3.3)"
         )
-        prompt = _render_prompt(step, ctx)
+        try:
+            prompt = _render_prompt(step, ctx)
+        except DeferralCollectionError as exc:
+            return _deferral_collection_halt(exc)
         result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     # Attribute usage to the agent that actually ran (the disposition emitter on a
@@ -903,6 +1444,19 @@ def _render_prompt(step: Step, ctx: StepContext) -> str:
         )
     for ref in input_refs:
         parts.append(_render_input(ref, ctx, artifacts))
+    # FR-3.3: inject any open deferrals a prior phase pushed to THIS phase, so the
+    # builder cannot silently drop the obligation. Placed after the plan-phase
+    # excerpt (near the scoped context it relates to) and before the human-decision
+    # history. No-op for a phase with no incoming deferral (the ordinary case).
+    deferral_block = _render_open_deferrals(ctx)
+    if deferral_block is not None:
+        parts.append(deferral_block)
+    # FR-5.3 (P7): inject measured phase-cost history + the size bound into the
+    # plan-author input so phase sizing is grounded in observed costs, not blind.
+    # No-op (None) for every non-plan-author step.
+    history_block = _render_plan_author_history(step, ctx)
+    if history_block is not None:
+        parts.append(history_block)
     # FR-1 verbatim requirement (review F-001): the builder must receive the
     # human-decision history EXACTLY as recorded. The on-disk copy is written
     # through the RedactingWriter (credential-shaped substrings become
@@ -1732,6 +2286,10 @@ SPECS: dict[str, StepSpec] = {
     "phase_lint": StepSpec(
         type="phase_lint",
         handler=handle_phase_lint,  # read-only: parses plan.md, touches nothing
+    ),
+    "acceptance_gate": StepSpec(
+        type="acceptance_gate",
+        handler=handle_acceptance_gate,  # deterministic: reads the map, enumerates
     ),
     "commit": StepSpec(
         type="commit",

@@ -468,6 +468,19 @@ class ReviewConfig(BaseModel):
     state_dir: str | None = None
 
 
+class CollectorConfig(BaseModel):
+    """Per-collector enumeration overrides (FR-3.2, PR #59 review F4).
+
+    ``command`` replaces the collector's derived/default enumeration command
+    verbatim (string → shlex-split; list taken as argv). Operator-owned config —
+    the acceptance gate never interpolates agent-authored text into it.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    command: str | list[str] | None = None
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -497,6 +510,11 @@ class RunConfig(BaseModel):
     # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
     asset_root: str = "."
     test_command: str = "uv run pytest"
+    # Per-collector enumeration command overrides (FR-3.2, PR #59 review F4):
+    # `collectors: {pytest: {command: "hatch run pytest"}}`. Absent, the pytest
+    # collector derives its command from `test_command` so enumeration runs in
+    # the project's own test environment (collectors.resolve_command).
+    collectors: dict[str, CollectorConfig] = Field(default_factory=dict)
     agents: dict[str, AgentProfile] = Field(default_factory=dict)
     identities: dict[str, Identity] = Field(default_factory=dict)
 
@@ -569,6 +587,14 @@ class RunConfig(BaseModel):
     #   "strict" — any accepted-but-unresolved finding loops (the P4 original);
     #     higher fidelity, but oscillates on majors/minors.
     cycle_convergence: str = "blocking"
+
+    # --- phase-size lint (FR-3.4) -------------------------------------------
+    # The distinct-FR-reference budget a single plan phase may carry before the
+    # `phase_lint` size lint fires (default 3). Oversized phases are where partial
+    # delivery hides (#54 cause 4). The lint's disposition (warn vs park) is the
+    # `phase_lint` step's own `size_lint:` option; this bound is a project-wide
+    # config value because plan authoring is also handed it (FR-5.3, P7).
+    max_frs_per_phase: int = 3
 
     # --- concurrent triage (harness-efficiency FR-9.1) ----------------------
     # Independent per-finding triage calls run on a bounded worker pool. Findings
@@ -644,6 +670,18 @@ class RunConfig(BaseModel):
         """A pool of at least 1 worker; fail closed on a non-positive value (FR-9.1)."""
         if v < 1:
             raise ValueError(f"triage_concurrency must be >= 1; got {v!r}")
+        return v
+
+    @field_validator("max_frs_per_phase")
+    @classmethod
+    def _validate_max_frs_per_phase(cls, v: int) -> int:
+        """The size-lint bound must admit at least one FR per phase (FR-3.4).
+
+        A non-positive bound would flag every phase (a phase with zero FR refs is
+        already degenerate); reject it at load so a mis-set bound fails closed
+        rather than turning the advisory lint into a blanket park."""
+        if v < 1:
+            raise ValueError(f"max_frs_per_phase must be >= 1; got {v!r}")
         return v
 
     @model_validator(mode="after")

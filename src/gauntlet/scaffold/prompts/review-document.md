@@ -18,6 +18,14 @@ or unmeasurable requirements, missing edge cases or failure modes, phases that
 depend on later work, and assumptions stated as facts. For a plan, check that
 its `gauntlet-phases` block exists, is well-formed, and matches the prose.
 
+**Untestable oracle rule (FR-6.3):** when a phase changes behavior (a refactor,
+rewrite, or migration), its acceptance clauses must define a deterministic
+oracle. If an acceptance criterion, parity oracle, or golden test is not
+deterministic enough to judge whether the change preserves behavior, that is a
+`blocking` finding, NOT a minor clarity nit — unless the clause itself already
+supplies the exact fixture matrix and expected outcomes that make it
+deterministic.
+
 Findings that trace to none of the above are bikeshedding — label their severity
 honestly. Return ONLY JSON conforming to the provided schema: each finding has
 `id` (F-001…), `severity` (`blocking|major|minor|nit`), `category`, `location`

@@ -67,6 +67,34 @@ def test_trend_math_from_fixture_manifest():
     assert t.cost_per_phase == pytest.approx(2.0)
 
 
+def test_trend_duration_per_phase_from_timed_steps():
+    # FR-5.3 wants a per-phase DURATION distribution alongside cost. Two timed
+    # steps summing to 420s over one numbered phase → 420s total, 420s/phase.
+    man = Manifest(
+        run_id="r", slug="d", branch="b", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+    )
+    man.steps.append(StepRecord(
+        id="cyc", type="adversarial_cycle",
+        started="2026-06-13T00:00:00+00:00", ended="2026-06-13T00:05:00+00:00",  # 300s
+    ))
+    man.steps.append(StepRecord(
+        id="plan", type="agent_task",
+        started="2026-06-13T00:10:00+00:00", ended="2026-06-13T00:12:00+00:00",  # 120s
+    ))
+    man.commits.append(CommitRecord(step_id="c", phase="P1", sha="a" * 40))
+    t = build_run_trend(man)
+    assert t.total_duration == pytest.approx(420.0)
+    assert t.duration_per_phase == pytest.approx(420.0)
+
+
+def test_trend_duration_none_without_timestamps():
+    # No timed steps → no duration to report (must not fabricate 0 or crash).
+    t = build_run_trend(_manifest())
+    assert t.total_duration is None
+    assert t.duration_per_phase is None
+
+
 def test_fix_survival_ignores_declined_findings(tmp_path: Path):
     # F-004: a round can accept 1 finding (resolved) and decline 3 others, whose
     # confirm verdicts are the expected `unresolved`. Survival must be 100% (the

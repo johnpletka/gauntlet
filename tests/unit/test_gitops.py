@@ -50,6 +50,96 @@ def test_path_is_untracked_distinguishes_tracked_states(fixture_repo):
     assert not gitops.path_is_untracked(fixture_repo, "note.md")
 
 
+def test_is_tracked_is_reliable_for_gitignored_paths(fixture_repo):
+    """``is_tracked`` reports index membership, not the ``??`` porcelain state.
+
+    A gitignored-but-untracked file emits no ``??`` line (ignored entries are
+    hidden), so a "not untracked" test would misread it as tracked. ``is_tracked``
+    uses ``ls-files`` so it stays correct there — the F-001 flush relies on this to
+    avoid ``git add``-ing an ignored path without ``-f`` (the #33 clash).
+    """
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".gitignore").write_text("*\n")  # run-dir self-ignore
+    (run_dir / "manifest.json").write_text("{}\n")
+    rel = "runs/demo/run-1/manifest.json"
+
+    # Gitignored + untracked → NOT tracked (though path_is_untracked hides it).
+    assert not gitops.is_tracked(fixture_repo, rel)
+    assert not gitops.path_is_untracked(fixture_repo, rel)  # ignored → no `??`
+
+    # Force past the ignore rule (the FR-2.2 response-checkpoint mechanism) → tracked.
+    gitops._run(fixture_repo, "add", "-f", "--", rel)
+    gitops._run(fixture_repo, "commit", "-qm", "track manifest")
+    assert gitops.is_tracked(fixture_repo, rel)
+
+
+def test_commit_tracked_bookkeeping_commits_only_tracked_dirty(fixture_repo):
+    """F-001: re-commit already-tracked, dirty run bookkeeping — never force-add.
+
+    Once a response checkpoint force-tracked the bookkeeping, later live updates
+    dirty a raw ``git status``; this flush re-commits them so a handoff is clean.
+    It commits ONLY tracked+dirty paths, is idempotent, and is a no-op (never an
+    #33 error) when the bookkeeping is still untracked+ignored.
+    """
+    ident = Identity("Gauntlet Engine", "engine@gauntlet.local")
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".gitignore").write_text("*\n")
+    man = run_dir / "manifest.json"
+    runmd = run_dir / "RUN.md"
+    man.write_text("{}\n")
+    runmd.write_text("# run\n")
+    paths = ["runs/demo/run-1/manifest.json", "runs/demo/run-1/RUN.md"]
+
+    # Untracked + ignored: flushing is a no-op (must NOT force-track / must NOT
+    # raise the "paths are ignored" error).
+    assert gitops.commit_tracked_bookkeeping(
+        fixture_repo, "gauntlet: flush", paths, identity=ident
+    ) is None
+    assert not gitops.is_tracked(fixture_repo, paths[0])
+
+    # Track them (simulating a prior FR-2.2 response checkpoint).
+    gitops._run(fixture_repo, "add", "-f", "--", *paths)
+    gitops._run(fixture_repo, "commit", "-qm", "track bookkeeping")
+
+    # Clean now → idempotent no-op.
+    assert gitops.commit_tracked_bookkeeping(
+        fixture_repo, "gauntlet: flush", paths, identity=ident
+    ) is None
+
+    # Live update dirties the tracked bookkeeping → flush commits ONLY those paths.
+    man.write_text('{"totals": 1}\n')
+    (fixture_repo / "impl.py").write_text("unrelated work\n")  # dirty non-bookkeeping
+    sha = gitops.commit_tracked_bookkeeping(
+        fixture_repo, "gauntlet: flush run bookkeeping", paths, identity=ident
+    )
+    assert sha is not None
+    files = gitops._run(
+        fixture_repo, "show", "--name-only", "--format=", sha
+    ).split()
+    assert files == ["runs/demo/run-1/manifest.json"]  # RUN.md unchanged, not committed
+    # Engine-attributed, and the unrelated implementation work is untouched.
+    assert gitops._run(fixture_repo, "log", "-1", "--format=%an|%ae", sha).strip() == (
+        "Gauntlet Engine|engine@gauntlet.local"
+    )
+    assert gitops.path_is_untracked(fixture_repo, "impl.py")
+
+
+def test_file_at_commit_reads_history_and_none_when_absent(fixture_repo):
+    """file_at_commit reads a path's committed bytes (FR-3.3 deferral injection
+    reads a prior phase's committed acceptance-map out of history), and returns
+    None — not an error — for a path absent at that commit."""
+    (fixture_repo / "a.json").write_text('{"phase": "P2"}')
+    gitops._run(fixture_repo, "add", "a.json")
+    sha = gitops.commit_all(
+        fixture_repo, "P2: add a\n\nbody", identity=Identity("B", "b@g.local")
+    )
+    assert gitops.file_at_commit(fixture_repo, sha, "a.json") == '{"phase": "P2"}'
+    # a path that does not exist at that commit -> None (git show exits non-zero)
+    assert gitops.file_at_commit(fixture_repo, sha, "nope.json") is None
+
+
 def test_commit_all_uses_identity(fixture_repo):
     (fixture_repo / "f.py").write_text("code")
     sha = gitops.commit_all(

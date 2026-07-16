@@ -108,7 +108,9 @@ def _set_judge_llm(repo: Path, model: str | None, *, adapter: str = "api") -> No
 
 
 _GOOD_VERSIONS = {"claude": "2.1.172", "codex": "codex-cli 0.139.0"}
-_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y"}
+# The scaffolded default config now includes the Gemini ensemble-panel member
+# (pipeline-effectiveness FR-1.1), so a healthy environment carries its key too.
+_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y", "GEMINI_API_KEY": "z"}
 
 
 def _by_name(results) -> dict:
@@ -306,7 +308,11 @@ def test_unused_profile_missing_key_warns(tmp_path):
     data = yaml.safe_load(p.read_text())
     data["agents"]["spare"] = {"adapter": "api", "model": "anthropic/claude-x"}
     p.write_text(yaml.safe_dump(data))
-    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x"}))
+    # GEMINI_API_KEY is present because the default panel references the gemini
+    # profile; the only missing key is the genuinely-unused "spare" profile's.
+    results = run_doctor(
+        repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x", "GEMINI_API_KEY": "z"})
+    )
     keys = _by_name(results)["api-keys"]
     assert keys.status == WARN
     assert "spare" in keys.detail
@@ -692,6 +698,55 @@ def test_bad_model_alias_in_one_profile_fails_only_that_profile(tmp_path):
     assert names["profile:builder"].status == OK
     assert names["profile:triage"].status == OK
     assert has_failure(results)
+
+
+# --- pipeline-effectiveness P1-A5: the Gemini api panel member is doctor-covered
+def test_gemini_panel_profile_bad_model_id_fails_probe():
+    # A misspelled/unavailable Gemini panel model id FAILs the per-profile model
+    # probe via the offline LiteLLM-resolvability branch (no network) — so a bad
+    # panel model id is caught before the first ensemble review, not at runtime.
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import _real_profile_model_probe
+
+    profile = AgentProfile(adapter="api", model="gemini-totally-bogus-xyzzy")
+    result = _real_profile_model_probe("gemini", profile)
+    assert result.status == FAIL
+    assert "not resolvable" in result.detail
+
+
+def test_gemini_panel_profile_valid_model_id_probes_ok(monkeypatch):
+    # A resolvable Gemini id passes the probe (offline resolvability + a stubbed
+    # bounded round trip standing in for the live call).
+    from types import SimpleNamespace
+
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import _real_profile_model_probe
+
+    monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
+    monkeypatch.setattr(
+        ApiAdapter, "_complete",
+        lambda self, messages: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))],
+            usage=None,
+        ),
+    )
+    profile = AgentProfile(adapter="api", model="gemini/gemini-2.5-pro")
+    assert _real_profile_model_probe("gemini", profile).status == OK
+
+
+def test_shipped_gemini_panel_profile_is_a_covered_api_profile():
+    # The ratified v1 panel's Gemini member is a configured `api` profile, so
+    # doctor's per-profile model probe — which iterates every config.agents entry —
+    # covers it (the coverage P1-A5 requires).
+    from gauntlet.engine.config import RunConfig
+
+    repo = Path(__file__).resolve().parents[2]
+    cfg = RunConfig.model_validate(
+        yaml.safe_load((repo / ".gauntlet" / "config.yaml").read_text())
+    )
+    assert "gemini" in cfg.agents
+    assert cfg.agents["gemini"].adapter == "api" and cfg.agents["gemini"].model
 
 
 def test_reference_profile_blind_sandbox_fails_read_probe(tmp_path):

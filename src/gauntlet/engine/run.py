@@ -2613,6 +2613,24 @@ class RunManager:
 
         gitops.reset_hard(self.repo_root, target)
         self._rewind_manifest(man, run_dir, target)
+        # Reversal circuit breaker (pipeline-effectiveness FR-4.2): rolling back
+        # past a phase boundary IS the human reversal of any auto-approved gate at
+        # or beyond it. Record the reversal on each such `auto_approval` and flip
+        # the run's effective auto-approval policy to `always` for the remainder
+        # of the run, so a later resume never re-auto-approves a gate the human
+        # just rolled back — a human has signalled distrust (§9).
+        from gauntlet.engine import gates
+
+        reversed_n = gates.record_reversals(
+            man, min_phase_num=phase, user="operator",
+            at=_utc_stamp(),
+            notes=f"gauntlet rollback to phase P{phase} boundary",
+        )
+        if reversed_n:
+            man.warnings.append(
+                f"auto-approval disabled for the remainder of the run: {reversed_n} "
+                f"auto-approved gate(s) reversed by rollback to P{phase} (FR-4.2)"
+            )
         man.write_atomic(run_dir / "manifest.json")
         return target
 

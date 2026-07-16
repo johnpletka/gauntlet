@@ -75,6 +75,7 @@ class ClaudeCodeAdapter:
         executable: str = "claude",
         timeout_s: float = DEFAULT_TIMEOUT_S,
         base_flags: list[str] | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         if output_format not in ("json", "stream-json"):
             raise ValueError(f"unsupported output_format {output_format!r}")
@@ -89,6 +90,16 @@ class ClaudeCodeAdapter:
         self.executable = executable
         self.timeout_s = timeout_s
         self.base_flags = list(base_flags or [])
+        # A fully-rebuilt child environment (pipeline-effectiveness FR-2.5, P5): the
+        # behavioral verifier spawns claude from an explicit allowlist with every
+        # secret/token/credential var stripped by construction (plus the run's judge
+        # env so the PreToolUse hook fires). ``None`` (every non-verifier claude
+        # step) inherits the parent environment exactly as before — additive knob.
+        self.env = dict(env) if env is not None else None
+        # Optional child preexec hook (PR #59 §7 item 5): the verifier posture
+        # (verify.configure_claude_verifier) sets best-effort rlimit caps here;
+        # ``None`` (every non-verifier claude step) spawns exactly as before.
+        self.spawn_preexec = None
         lint_flags(self._build_argv("", session=None, schema=None))
 
     def streams_to_sink(self) -> bool:
@@ -119,7 +130,7 @@ class ClaudeCodeAdapter:
         effective_sink = sink if (sink is not None and self.streams_to_sink()) else None
         out = run_with_timeout(
             argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
-            sink=effective_sink,
+            sink=effective_sink, env=self.env, preexec_fn=self.spawn_preexec,
         )
         if out.timed_out:
             raise AgentTimeoutError(

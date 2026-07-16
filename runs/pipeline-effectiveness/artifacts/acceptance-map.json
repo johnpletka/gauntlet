@@ -1,0 +1,56 @@
+{
+  "phase": "P9",
+  "clauses": [
+    {
+      "id": "P9-A1",
+      "text": "A fix_now finding confirmed partially_resolved at major severity forces round N+1 (issue #49 regression).",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_partial_major_forces_round_and_carries_remainder" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_forcing_open_partial_forces_regardless_of_severity" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_open_remainder_exhausting_max_rounds_parks" }
+      ]
+    },
+    {
+      "id": "P9-A2",
+      "text": "A three-obligation finding whose fix covers two returns partially_resolved naming the third; the carried remainder id targets exactly it and appears in round N+1's review scope with carried_from intact.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_partial_major_forces_round_and_carries_remainder" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_assigns_reserved_namespace_id" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_collision_gets_next_free_suffix" },
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_carry_remainders_two_from_same_parent_are_distinct" }
+      ]
+    },
+    {
+      "id": "P9-A3",
+      "text": "An artifact fix correcting one section while a second still contradicts it returns non-resolved citing both sections.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_cycle.py::test_artifact_partial_citing_two_sections_is_not_resolved" },
+        { "kind": "pytest", "id": "tests/unit/test_convergence_prompts.py::test_cycle_confirm_has_intra_document_consistency_rule" }
+      ]
+    },
+    {
+      "id": "P9-A4",
+      "text": "A pre-migration confirm output (no new_findings) still validates.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_empty_new_findings_still_validates" },
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_new_findings_item_carried_from_is_optional_nullable" },
+        { "kind": "pytest", "id": "tests/unit/test_schemas.py::test_confirm_diff_regression_entry_with_null_carried_from_validates" }
+      ]
+    },
+    {
+      "id": "P9-A5",
+      "text": "The cycle- and gate-touching regression suites from P1, P5, and P8 pass under max_rounds 3.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_standard_pipeline.py::test_cycle_max_rounds_reflects_p9_carry_budget" },
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_clean_gate_holds_under_max_rounds_3" }
+      ]
+    },
+    {
+      "id": "P9-A6",
+      "text": "A cycle whose final round holds a carried/open remainder fails the P8 auto_when_clean clean predicate and the gate parks (no auto_approval record) — the FR-6/FR-4 interaction, proving a carried remainder is never auto-approved away on the final round.",
+      "evidence": [
+        { "kind": "pytest", "id": "tests/unit/test_evidence_gates.py::test_carried_remainder_open_at_gate_parks_and_is_cited" }
+      ]
+    }
+  ]
+}

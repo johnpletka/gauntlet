@@ -6,6 +6,178 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-16
+
+**Pipeline effectiveness: catch more, gate smarter, learn across runs** (PRD
+`runs/pipeline-effectiveness/prd.md`, P1–P9; PR #59). The organizing principle:
+Gauntlet's pitch is adversarial multi-model review, but every cycle ran exactly
+one reviewer, one pass, reading a diff — so this release widens what the
+pipeline can detect, then uses the widened evidence to narrow ceremony. Built by
+a `gauntlet run` dogfood on this repo. All new machinery defaults to prior
+behavior except the `standard.yaml` phase gate (see **Changed**).
+
+Two of this release's headline claims were falsified by measuring them, and the
+spec was corrected rather than the measurement: the evidence-tiered gate
+predicate would have fired **0/9** on this repo's own run, and the PRD premise
+it was built on described a pipeline that did not exist. Both are recorded in
+the PRD's v0.5 changelog.
+
+### Added — detection (catch more)
+
+- **Ensemble review panels (FR-1).** An adversarial cycle accepts multiple
+  reviewers, each with a distinct lens (`reviewers: [{profile, lens}, …]`,
+  panel capped at 3). Members run sequentially against one worktree, each
+  followed by the mutation guard, and are content-addressed so a resumed panel
+  re-pays only unfinished members. Findings merge deterministically before
+  triage — same file, overlapping location per the §6 normalized-location
+  model, same category, and a compatible claim fingerprint — with the
+  highest-severity phrasing kept as primary and every source recorded. Only
+  primaries reach triage. `standard.yaml` ships a two-member panel (codex
+  `correctness` + gemini `spec-coverage`): three distinct providers across the
+  pipeline, zero builder-window contention.
+- **Per-member yield metrics (FR-1.3).** `metrics.ensemble.unique_legit_by_member`
+  answers "unique legitimate findings per panel member" from the manifest, with
+  no transcript access. Yield is **sole-source**: a finding two members raised
+  is shared coverage and counts toward neither. This exists to make the tool's
+  founding premise — that reviewer diversity pays — a measured quantity with an
+  explicit kill criterion, rather than an assertion.
+- **Behavioral verifier sub-step (FR-2).** An optional `verifier:` between
+  review and triage *executes* the phase deliverable in a disposable worktree
+  copy and reports `category: behavioral` findings with the executed commands as
+  evidence — a signal class no diff reader produces. Its findings join the merged
+  panel and flow through the same triage/fix/confirm machinery. Fail-closed
+  throughout: an unhooked or absent backend, an unproven boundary, a copy or
+  launch failure, or a wall-clock expiry parks the cycle; it never degrades to
+  "skipped, proceed".
+- **Verifier sandbox contract (FR-2.5).** Confinement is a server-authoritative
+  per-step judge boundary: the engine registers the copy root against the
+  verifier's step id before launch (one-shot; clearing needs an engine-held
+  lease key the sandbox never sees), proves on the live judge that an
+  outside-copy read is denied, and parks if it is not. Plus network default-deny
+  at the boundary, a rebuilt-allowlist environment (no credential-shaped var
+  survives by construction), a scratch HOME, inherited rlimits, and a git
+  ref-mutation deny. **Enforcement is hook-mediated, not OS-kernel-level** — a
+  forked child is not independently gated. That residual is named in the PRD
+  with its compensating controls rather than papered over; kernel-level
+  isolation awaits the post-v1 codex `[permissions]` backend.
+- **Acceptance mapping + `acceptance_gate` (FR-3.2).** The implement contract
+  produces `artifacts/acceptance-map.json` mapping every plan acceptance clause
+  to ≥1 collector-enumerated test id; a deterministic gate proves citation and
+  existence and parks the phase naming any unmapped clause. This structurally
+  closes the silent-partial-delivery class (BOOTSTRAP-NOTES #54: a phase shipped
+  25% of its planned FRs and diff review had no mechanism to notice). Scope is
+  deliberate — the gate proves *existence*, not sufficiency; whether a cited test
+  meaningfully exercises its clause stays the spec-coverage lens's job.
+- **Deferral reconciliation + phase-size lint (FR-3.3/3.4).** "Deferred to P<N>"
+  references in commit bodies and mapping artifacts are validated against the
+  plan's real phases (a deferral to a phantom phase parks); open deferrals are
+  injected into the target phase's implement prompt. `phase_lint` flags phases
+  carrying more than `max_frs_per_phase` (default 3) distinct FR refs.
+- **Declined-findings registry (FR-5.2).** Reasoned declines are recorded with
+  provenance (`repo`, `prd_family`, prompt/lens/schema versions, run id) and
+  surface as **advisory** precedent to a future run's triage — but only while
+  that provenance is current. A decline recorded under a superseded prompt,
+  lens, or schema, or a different PRD family, is retained for audit and never
+  injected. The triager keeps authority; a match never decides.
+- **Trend-informed plan authoring (FR-5.3).** Measured per-phase cost/duration
+  distributions and the `max_frs_per_phase` bound are injected into the
+  plan-author prompt, so phase sizing is grounded in observed cost. An empty
+  history renders a stated "no history" block, not silence.
+
+### Added — ceremony (gate smarter)
+
+- **Evidence-tiered phase gates (FR-4).** A per-phase code gate accepts
+  `policy: auto_when_clean`: a strict conjunction over evidence the pipeline
+  already records auto-approves the gate and writes a durable `auto_approval`
+  manifest record with its full evidence snapshot; any miss parks for a human
+  and names *why*. Document gates (PRD/plan) reject the policy at load, as does
+  a code phase with no verifier configured. Auto-approved gates are enumerated
+  in `PR.md` for collective ratification, and a single recorded reversal
+  disables auto-approval for the rest of the run.
+- **Convergence honesty (FR-6).** An accepted (`fix_now`) finding confirmed
+  `partially_resolved` is **non-converged by definition** — the engine predicate
+  says so regardless of severity, and the confirm pass emits the specific
+  unresolved remainder as a carryable finding (`carried_from`) so the next round
+  has a concrete target. `max_rounds` rises 2 → 3 so a remainder has a round to
+  land. Carry parentage is validated on all three legs; an entry failing any is
+  demoted to an ordinary regression rather than minting a triage-exempt
+  obligation. Closes issue #49's silent-closure class, found by a real adopting
+  repo.
+
+### Changed
+
+- **`standard.yaml` gains a per-phase gate.** This is the release's one
+  behavior change for existing pipelines, and it is worth reading twice: the
+  phases stage previously had **no gate at all**, so every phase proceeded
+  automatically after a converged cycle. The new `phase-gate` (`auto_when_clean`)
+  does not remove a human step — it **adds a fail-closed stop** for phases whose
+  evidence is ambiguous, while clean phases keep flowing. A `tests-recheck` step
+  is added after the cycle alongside `acceptance-recheck` to keep both evidence
+  signals fresh. Pipelines that want the prior behavior omit the gate.
+- **The FR-4 clean predicate is open-based, not raised-based.** A blocking/major
+  legitimate finding blocks the gate unless it was accepted `fix_now` *and*
+  confirmed `resolved`. The original form counted findings *raised* and,
+  replayed against this repo's nine-phase run, would have auto-approved **0/9** —
+  it asked whether review had found nothing serious, which is the one state an
+  adversarial panel exists to make unlikely, and ensemble review pushes further
+  out of reach. Deferred, rejected, unconfirmed, and non-`resolved` findings all
+  still park. Snapshots record findings raised *and* still-open, so an
+  auto-approval cannot hide that anything was found.
+- **The acceptance-gate runs twice per phase**, before and after the cycle: a
+  fix round can rename a cited test after the first pass blessed the map.
+- **Collector enumeration is a bounded engine subprocess** in a disposable copy
+  with a stripped environment, and its command resolves from the project's own
+  `test_command`. Deterministic by design — no LLM in the evidence path, since a
+  model asked to echo collector output can truncate it (chronic false park) or
+  fabricate ids (false pass), either of which defeats the gate's whole premise.
+- **Findings schema** gains `source`, `lens`, `duplicate_of`, `sources`,
+  `source_members`, and `carried_from`; `category` gains `behavioral`. All
+  additive and engine-stamped — legacy and single-reviewer artifacts validate
+  unchanged, and the reviewer's pinned strict-output shape is untouched.
+- **Governed learning assets are enforced, not conventional.** An in-pipeline
+  agent write to `prompts/lenses/*` or `registry/*.jsonl` is judge-denied.
+
+### Fixed (post-review hardening, from the PR-59 adversarial reviews)
+
+- **Dedup could silently lose a defect.** Grouping used single linkage, but both
+  legs of the merge predicate are non-transitive: A can overlap B and B overlap C
+  while A and C are disjoint. The transitive closure marked a finding
+  `duplicate_of` a primary it did not match — and only primaries reach triage, so
+  its distinct claim vanished. Grouping is now complete linkage: every group is a
+  clique, so a duplicate always matches its primary.
+- **Per-lens yield was miscounted when one profile carried two lenses.** Merge
+  provenance aggregated by profile, so two members raising one finding collapsed
+  to a single source and read as unique yield — inflating the metric in the
+  loosening direction and masking the full-overlap case the kill criterion exists
+  to detect. Provenance is now tracked by panel-member identity.
+- **The archetypal clean gate could never fire:** zero-findings convergence left
+  no triage artifact, so the predicate parked forever on a missing file.
+- **Stale evidence could vouch for a tree that no longer existed** — tests and
+  acceptance records predating a fix commit are now a predicate miss unless
+  re-proved after the cycle.
+- **A stale `confirm.json` could leak across phases.** `artifacts/` is per-run,
+  and the two convergence paths that fix nothing returned without writing it,
+  leaving the previous phase's verdicts on disk. Harmless until the gate began
+  reading them; both paths now invalidate it (absent > stale).
+- Verifier scratch HOME seeded with the CLI login surface only; enumeration
+  env stripped of the credentials it previously inherited; carried-remainder
+  re-litigation blocked; supersession path made functional; assorted schema
+  compatibility and resource-cap fixes.
+
+### Notes
+
+- **No new runtime dependency.** The orchestrator stays thin by design.
+- **PRD as artifact of record.** `runs/pipeline-effectiveness/prd.md` reached
+  **v0.5** during this release: v0.4 reconciled the spec with the built system
+  (the hook-mediated verifier backend a plan-level amendment could not
+  legitimately waive), and v0.5 recalibrated FR-4 against measured evidence.
+  Both are ratified and their reasoning is in the document's changelog — the
+  project's rule is that approved artifacts change only through their own loop
+  and gate, and these did.
+- **Known gap:** the shipped `phase-gate` has not yet fired on a live run. The
+  recalibrated predicate is verified by replay against P1–P9 and by unit
+  fixtures. The first real multi-phase run is its first live exercise.
+
 ## [0.5.0] — 2026-07-05
 
 **Harness efficiency & resilience** (PRD `runs/harness-efficiency/prd.md`,
@@ -544,6 +716,8 @@ safety invariant rather than being able to weaken one.
   worktree active-run lock); everything else reads on-disk state or shells out to
   CLI verbs.
 
+[0.6.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.6.0
+[0.5.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.5.0
 [0.4.0]: https://github.com/johnpletka/gauntlet/releases/tag/v0.4.0
 [0.3.3]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.3
 [0.3.2]: https://github.com/johnpletka/gauntlet/releases/tag/v0.3.2

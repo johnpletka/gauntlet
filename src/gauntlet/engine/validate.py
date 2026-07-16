@@ -74,10 +74,24 @@ def validate_pipeline(
     produced: set[str] = set()
     for stage in pipeline.stages:
         stage_ids = {step.id for step in stage.steps}
+        # A code phase configures a verifier iff some adversarial_cycle in the
+        # stage declares `verifier:` (FR-4.1 / P8-A4): the clean predicate's
+        # "verifier ran clean" conjunct can never hold otherwise, so a statically
+        # verifier-less `auto_when_clean` gate is rejected here at load — before
+        # the run starts — and never reaches runtime to be recorded not_configured
+        # (review F-008 load-reject case).
+        stage_has_verifier = any(
+            s.type == "adversarial_cycle" and s.get("verifier")
+            for s in stage.steps
+        )
+        stage_is_foreach = stage.foreach is not None
         for step in stage.steps:
             _validate_step(
                 step, config, available, produced, report,
                 repo_root=repo_root, artifact_root=artifact_root,
+            )
+            _validate_gate_policy(
+                step, stage_is_foreach, stage_has_verifier, report
             )
             # on_fail routing is stage-local: the runtime jumps within the
             # current stage's step list, so a cross-stage target would validate
@@ -244,7 +258,22 @@ def _validate_step(
     # repo (FR-2.3); the REVIEWER is intended read-only (FR-9.6), so a
     # repo-write check on it would be exactly backwards.
     if step.type == "adversarial_cycle":
-        for role in ("reviewer", "triager", "fixer"):
+        from gauntlet.engine.cycle import _panel
+
+        # FR-1.1: the reviewer role is satisfied by a singular `reviewer:` OR a
+        # `reviewers:` panel (1–3 members, each a profile). The panel members are
+        # resolved/capability-checked as agent refs below.
+        panel = _panel(step)
+        if not panel or not all(m.profile for m in panel):
+            report.errors.append(
+                f"step {step.id!r} (adversarial_cycle) is missing required role "
+                "'reviewer' (a `reviewer:` or a `reviewers:` panel, FR-5.2/FR-1.1)"
+            )
+        if step.get("reviewers") is not None and not 1 <= len(panel) <= 3:
+            report.errors.append(
+                f"step {step.id!r} `reviewers:` panel must have 1–3 members (FR-1.1)"
+            )
+        for role in ("triager", "fixer"):
             if not step.get(role):
                 report.errors.append(
                     f"step {step.id!r} (adversarial_cycle) is missing required "
@@ -261,6 +290,28 @@ def _validate_step(
             report.errors.append(
                 f"step {step.id!r} sets commit_each_fix_round=false, which "
                 "breaks the clean-handoff invariant (FR-9.3/9.4); unsupported"
+            )
+
+    # 2b'. acceptance_gate collector (FR-3.2 / P2-A5): the step names one collector
+    # (`collector:`), one instance per distinct collector. A collector kind with no
+    # registered collector is rejected at PIPELINE LOAD — it never reaches runtime
+    # to "park closed", so an unsupported collector cannot masquerade as supported
+    # in a plan/pipeline artifact. v1 registers only `pytest`.
+    if step.type == "acceptance_gate":
+        from gauntlet.engine.collectors import REGISTERED_KINDS, is_registered
+
+        collector = step.get("collector")
+        if not collector:
+            report.errors.append(
+                f"step {step.id!r} (acceptance_gate) declares no `collector:` "
+                "(FR-3.2): each gate names exactly one collector kind"
+            )
+        elif not is_registered(collector):
+            report.errors.append(
+                f"step {step.id!r} (acceptance_gate) names collector {collector!r}, "
+                f"which has no registered collector; v1 registers only "
+                f"{list(REGISTERED_KINDS)} (FR-3.2 / P2-A5) — rejected at load, "
+                "never run and parked at runtime"
             )
 
     # 2c. retrospective role bindings (FR-6.2): at least one self-critiquing
@@ -319,6 +370,61 @@ def _validate_step(
                 f"step {step.id!r} agent {ref!r} could not be pre-constructed "
                 f"({exc}); deferred to runtime"
             )
+
+
+def _validate_gate_policy(
+    step: Step,
+    stage_is_foreach: bool,
+    stage_has_verifier: bool,
+    report: ValidationReport,
+) -> None:
+    """Load-time validation of a ``human_gate``'s ``policy:`` (FR-4.1 / P8-A4).
+
+    Three fail-closed rules, all caught before the run starts:
+
+    * an unknown ``policy:`` value is rejected (only ``always`` /
+      ``auto_when_clean`` exist);
+    * ``auto_when_clean`` on a **document gate** (a gate in a non-``foreach``
+      stage — the PRD/plan ratification gates) is rejected: document ratification
+      stays unconditionally human (§2.2, PRD Q1);
+    * ``auto_when_clean`` on a **code phase gate** (a gate in the ``foreach``
+      phase loop) whose stage configures **no verifier sub-step** is rejected —
+      the predicate's "verifier ran clean" conjunct can never hold, so the
+      misconfiguration is a static config gap caught here, never at a gate
+      (review F-008 load-reject case).
+    """
+    from gauntlet.engine.manifest import (
+        GATE_POLICIES,
+        GATE_POLICY_ALWAYS,
+        GATE_POLICY_AUTO_WHEN_CLEAN,
+    )
+
+    if step.type != "human_gate":
+        return
+    policy = step.get("policy", GATE_POLICY_ALWAYS)
+    if policy not in GATE_POLICIES:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) has unknown policy {policy!r}; must be "
+            f"one of {sorted(GATE_POLICIES)} (FR-4.1)"
+        )
+        return
+    if policy != GATE_POLICY_AUTO_WHEN_CLEAN:
+        return
+    if not stage_is_foreach:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) sets policy {GATE_POLICY_AUTO_WHEN_CLEAN!r}, "
+            "but it is a document (PRD/plan) gate, not a per-phase code gate; "
+            "document ratification stays unconditionally human (FR-4.1 / §2.2)"
+        )
+        return
+    if not stage_has_verifier:
+        report.errors.append(
+            f"step {step.id!r} (human_gate) sets policy {GATE_POLICY_AUTO_WHEN_CLEAN!r} "
+            "but its phase configures no verifier sub-step (no adversarial_cycle "
+            "declares `verifier:`); the clean predicate's 'verifier ran clean' "
+            "conjunct can never hold, so this is rejected at load (FR-4.1 / "
+            "review F-008 load-reject)"
+        )
 
 
 def _validate_scoped_input(
@@ -399,8 +505,17 @@ def _effort_target_agents(step: Step) -> list[str]:
     the roles the step actually declares (``confirmer`` defaults to ``reviewer``,
     which is already covered)."""
     if step.type == "adversarial_cycle":
-        roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
-        return [a for a in (step.get(r) for r in roles) if a]
+        # The verifier sub-step (FR-2.1) runs under the cycle-level `effort:` too
+        # (`_run_verifier` passes it to build_adapter), so its adapter must accept
+        # any step effort — include it in the load-time effort-compat check.
+        roles = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent",
+                 "verifier")
+        agents = [a for a in (step.get(r) for r in roles) if a]
+        if step.get("reviewers"):  # ensemble panel members (FR-1.1)
+            from gauntlet.engine.cycle import _panel
+
+            agents.extend(m.profile for m in _panel(step) if m.profile)
+        return agents
     return [step.agent] if step.agent else []
 
 
@@ -409,7 +524,7 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     if step.agent:
         refs.append(step.agent)
     for key in ("message_agent", "disposition_agent", "reviewer", "triager",
-                "fixer", "confirmer", "escalation_agent", "proposer"):
+                "fixer", "confirmer", "escalation_agent", "proposer", "verifier"):
         ref = step.get(key)
         if ref:
             refs.append(ref)
@@ -417,6 +532,14 @@ def _agent_refs(step: Step, needs_agent: bool) -> list[str]:
     # (FR-6.2); each must resolve to a profile like any other agent reference.
     for ref in step.get("agents", []) or []:
         refs.append(ref)
+    # Ensemble review panel members (FR-1.1) must resolve to a profile too, so an
+    # undefined/misconfigured panel profile is caught at load, not at runtime.
+    if step.type == "adversarial_cycle" and step.get("reviewers"):
+        from gauntlet.engine.cycle import _panel
+
+        for m in _panel(step):
+            if m.profile:
+                refs.append(m.profile)
     return refs
 
 

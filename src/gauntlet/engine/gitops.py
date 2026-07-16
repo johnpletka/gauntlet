@@ -173,6 +173,40 @@ def is_dirty_vs(repo: Path, base_sha: str, *, exclude: list[str] | None = None) 
     return head_sha(repo) != base_sha
 
 
+def worktree_tree_hash(repo: Path) -> str:
+    """A content hash of the repo's HEAD tree — the mutation-guard witness for the
+    P5 verifier (FR-2.1/FR-2.5).
+
+    Returns HEAD's tree object id (``git rev-parse HEAD^{tree}``): a stable digest
+    of the *committed* tree the verifier hands off. The verifier runs in a
+    disposable copy and must not touch the real worktree, so the plan's "run
+    worktree hash is unchanged after verification" (P5-A4) is asserted by
+    capturing this before verification and confirming it after — together with the
+    existing FR-9.6 mutation guard, which watches the real tree for uncommitted
+    dirt."""
+    return _run(repo, "rev-parse", "HEAD^{tree}").strip()
+
+
+def add_worktree(repo: Path, path: Path, ref: str = "HEAD") -> None:
+    """Create a detached git worktree of ``ref`` at ``path`` (FR-2.1 disposable
+    copy). ``--detach`` avoids branch contention with the run branch; the copy is a
+    faithful checkout of the post-handoff committed tree. Raises ``GitError`` on
+    failure so the verifier sub-step fails closed (never proceeds without a copy)."""
+    _run(repo, "worktree", "add", "--detach", "--force", str(path), ref)
+
+
+def remove_worktree(repo: Path, path: Path) -> None:
+    """Remove a disposable worktree created by :func:`add_worktree`. ``--force``
+    because the sandboxed verifier will have left uncommitted edits in the copy
+    (that is the point — it *executes* the deliverable)."""
+    _run(repo, "worktree", "remove", "--force", str(path))
+
+
+def prune_worktrees(repo: Path) -> None:
+    """Prune stale worktree administrative entries (best-effort cleanup)."""
+    _run(repo, "worktree", "prune")
+
+
 def branch_exists(repo: Path, branch: str) -> bool:
     try:
         _run(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
@@ -333,6 +367,60 @@ def commit_run_bookkeeping(
     return head_sha(repo)
 
 
+def is_tracked(repo: Path, relpath: str) -> bool:
+    """True iff git tracks ``relpath`` (it is in the index / a HEAD tree).
+
+    Unlike :func:`path_is_untracked`, this is reliable for a **gitignored** path:
+    a gitignored-but-untracked file yields no ``??`` porcelain line (ignored
+    entries are hidden), so a "not untracked" test would misread it as tracked and
+    then ``git add`` it without ``-f`` — the #33 pathspec clash. ``ls-files``
+    reports only tracked paths, so an ignored-untracked run-dir file correctly
+    returns False here.
+    """
+    return bool(_run(repo, "ls-files", "--", relpath).strip())
+
+
+def commit_tracked_bookkeeping(
+    repo: Path, message: str, paths: list[str], *, identity: Identity
+) -> str | None:
+    """Commit already-tracked, dirty run bookkeeping so the RAW worktree is clean
+    when control passes to a reviewer (review F-001).
+
+    A run that ever hit an FR-2.2 response checkpoint has its manifest.json/RUN.md
+    force-committed (:func:`commit_run_bookkeeping`'s ``add -f``) and therefore
+    TRACKED from then on — after which the run-dir ``*`` self-ignore no longer
+    hides the engine's live updates, so every later review handoff shows them as
+    uncommitted dirt in a bare ``git status`` (the reviewer's view), even though
+    the engine's own ``--exclude``-scoped clean check stays green. Re-committing
+    that tracked bookkeeping makes the two views agree so the handoff is genuinely
+    clean (CLAUDE.md §1).
+
+    NEVER force-adds (contrast :func:`commit_run_bookkeeping`): a run whose
+    bookkeeping is still untracked is already invisible to ``git status`` via the
+    self-ignore, so tracking it here would only defeat that, add commit noise, and
+    collide with the ignore rule (#33). Commits ONLY the subset of ``paths`` git
+    already tracks, and only when they are dirty. **Idempotent:** returns ``None``
+    (no commit) when nothing tracked is dirty. The message is passed on stdin
+    (``-F -``); no agent-authored text reaches argv. Returns the new SHA, or
+    ``None``.
+    """
+    tracked = [p for p in paths if is_tracked(repo, p)]
+    if not tracked:
+        return None
+    _run(repo, "add", "--", *tracked)  # tracked → no `-f`, no #33 clash
+    # Scope the change check to OUR paths so unrelated staged/worktree state never
+    # makes this look "dirty" (or get swept into the commit below).
+    if not _run(repo, "diff", "--cached", "--name-only", "--", *tracked).strip():
+        return None
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit", "-F", "-", "--", *tracked,
+    ]
+    _run(repo, *args, stdin=message)
+    return head_sha(repo)
+
+
 def commit_subject(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%s", sha).strip()
 
@@ -425,6 +513,22 @@ def any_tracked_at(repo: Path, sha: str, paths: list[str]) -> bool:
     if not paths:
         return False
     return bool(_run(repo, "ls-tree", "--name-only", sha, "--", *paths).strip())
+
+
+def file_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
+    """The contents of ``relpath`` as of ``sha``, or ``None`` if absent there.
+
+    Reads a committed artifact out of history (``git show <sha>:<path>``) without
+    touching the worktree — used to recover a prior phase's committed
+    ``acceptance-map.json`` for deferral injection (FR-3.3), since the live file
+    on disk is the *current* phase's map (each phase overwrites it). A path that
+    does not exist at that commit is not an error: ``git show`` exits non-zero and
+    this returns ``None`` so the caller simply has no map to read there.
+    """
+    try:
+        return _run(repo, "show", f"{sha}:{relpath}")
+    except GitError:
+        return None
 
 
 def range_diff_path(repo: Path, base: str, head: str, relpath: str) -> str:
