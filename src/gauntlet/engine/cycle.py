@@ -2053,6 +2053,36 @@ def _intent_review_block(step: Step) -> str:
     )
 
 
+# Headroom under the adapter's declared input cap for everything appended
+# around the diff (lens fragments, carried findings, the human-decision block)
+# plus CLI envelope overhead. 64 KiB is deliberately generous: the cost of
+# switching to by-reference a little early is a few reviewer git reads; the
+# cost of switching late is the whole invocation rejected (`input_too_large`).
+_REVIEW_PROMPT_HEADROOM = 65_536
+
+
+def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
+    """The tightest ``max_input_chars`` declared across the step's review panel,
+    and whether EVERY member's adapter reads the repo (FR-1.3) — both needed
+    before an oversize diff may be handed by reference. ``(None, …)`` when no
+    member declares a cap, or when a profile cannot be resolved (test doubles
+    injected via ``adapter_factory`` have no config profile): unknown means
+    behave as today and inline."""
+    caps: list[int] = []
+    reads_repo = True
+    for member in _panel(step):
+        if not member.profile:
+            continue
+        try:
+            capabilities = ctx.config.profile(member.profile).adapter_class().capabilities
+        except Exception:
+            return None, False
+        if capabilities.max_input_chars is not None:
+            caps.append(capabilities.max_input_chars)
+        reads_repo = reads_repo and capabilities.reads_repo
+    return (min(caps) if caps else None), reads_repo
+
+
 def _review_prompt(
     step: Step, ctx: StepContext, handoff: str, rnd: int,
     carried: list[dict[str, Any]], prev_review_sha: str | None = None,
@@ -2085,7 +2115,33 @@ def _review_prompt(
             # the handoff is the fix commit, so `handoff^` diffs only that fix.
             base = f"{handoff}^"
         diff = gitops.range_diff(ctx.repo_root, base, handoff)
-        parts.append(f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}")
+        section = (
+            f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}"
+        )
+        cap, panel_reads_repo = _panel_input_cap(step, ctx)
+        if (
+            cap is not None
+            and panel_reads_repo
+            and sum(len(p) for p in parts) + len(section)
+            > cap - _REVIEW_PROMPT_HEADROOM
+        ):
+            # An over-cap prompt is rejected WHOLESALE by the adapter (codex
+            # `input_too_large`), killing the round — and truncating instead
+            # would silently narrow review scope. Every panel adapter reads the
+            # repo (FR-1.3), so hand the range by reference: full scope through
+            # the reviewer's own git, at the cost of the reviewer paying the
+            # reads itself.
+            section = (
+                f"\n--- commit-range diff under review ({base}..{handoff[:10]}): "
+                f"BY REFERENCE — too large to inline ({len(diff)} chars vs the "
+                f"{cap}-char input limit) ---\n"
+                f"You are running inside the repository worktree. Read the diff "
+                f"yourself with git (read-only), e.g.:\n"
+                f"  git diff --stat {base}..{handoff}   # the change map — start here\n"
+                f"  git diff {base}..{handoff} -- <path>  # per-file, as you review\n"
+                f"Review the ENTIRE range exactly as if it were inlined here.\n"
+            )
+        parts.append(section)
         # A lightweight review run injects the originating problem statement here
         # so the reviewer judges solution-correctness against it (FR-2.2), not
         # just diff quality. Empty for every non-review / --code-only cycle.

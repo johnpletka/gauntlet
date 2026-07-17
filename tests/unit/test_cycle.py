@@ -724,6 +724,49 @@ def test_code_review_mode_reviews_commit_range(cycle_repo):
     assert "commit-range diff under review" in prompt
 
 
+def test_code_review_oversize_diff_goes_by_reference(cycle_repo, monkeypatch):
+    """A phase diff too large for the review panel's declared input cap is
+    handed BY REFERENCE — the reviewer reads the repo itself (FR-1.3) — instead
+    of inlined. An inlined oversize prompt is rejected wholesale by the CLI
+    (codex `input_too_large`), killing the round (clerk-auth P3, live). The
+    fallback never truncates: a clipped diff would silently narrow review scope."""
+    from gauntlet.adapters.codex import CodexAdapter
+
+    monkeypatch.setattr(
+        CodexAdapter, "capabilities",
+        CodexAdapter.capabilities.model_copy(update={"max_input_chars": 80_000}),
+    )
+    (cycle_repo / "feature.py").write_text("HUGE-SENTINEL\n" * 8_000)  # ≫ cap
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "P5: work"], check=True)
+    phase_sha = gitops.head_sha(cycle_repo)
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {k: v for k, v in cycle_step(mode="code_review").items()
+             if k not in ("artifact", "phase")},
+        ]}],
+    })
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    man.commits.append(M.CommitRecord(step_id="commit", phase="P5", sha=phase_sha))
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=RunConfig.model_validate(BASE_CONFIG),
+        pipeline=pipeline, manifest=man, adapter_factory=lambda n: adapters[n],
+    )
+    assert orch.drive() == M.RUN_DONE
+    prompt = reviewer.calls[0]["prompt"]
+    assert "commit-range diff under review" in prompt
+    assert "BY REFERENCE" in prompt
+    assert "HUGE-SENTINEL" not in prompt  # the diff body is NOT inlined
+    # the reviewer is told exactly which range to read with its own git
+    assert f"git diff {phase_sha}^..{phase_sha}" in prompt
+
+
 def test_code_review_base_spans_phase_including_checkpoints():
     """`_code_review_base` returns the PREVIOUS recorded phase commit, not
     `handoff^`, so the round-1 diff spans a phase's intra-phase checkpoint commits
