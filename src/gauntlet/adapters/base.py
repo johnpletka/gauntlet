@@ -53,6 +53,14 @@ class AdapterCapabilities(BaseModel):
     # profile's *effective* capability is this value under that profile's actual
     # sandbox, verified by `gauntlet doctor`'s read probe (FR-6.4, P7).
     reads_repo: bool = False
+    # The adapter's hard per-invocation input size in characters, or None when
+    # no cap is known. An over-cap prompt is rejected WHOLESALE by the CLI
+    # (codex app-server `input_too_large` at 1 MiB), killing the step — so
+    # prompt builders consult this to fall back to by-reference context (the
+    # agent reads the payload from the repo itself) instead of inlining a
+    # payload the adapter can never accept. Declaration only — nothing trims a
+    # prompt to fit (a silent trim would narrow the agent's view; fail closed).
+    max_input_chars: int | None = None
 
 
 # --- failure classification (harness-efficiency FR-3.1) ----------------------

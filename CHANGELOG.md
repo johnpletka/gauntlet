@@ -6,6 +6,23 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-17
+
+**Fix oversize review diffs killing the round.** A `code_review` round
+inlined the full commit-range diff into the review prompt unconditionally.
+The codex app-server rejects any turn over 1 MiB of input wholesale
+(`input_too_large`), so a phase whose diff exceeded the cap (clerk-auth P3:
+1.23M chars, observed live) killed the round with a terminal `adapter_error`
+and no recovery lever.
+
+`AdapterCapabilities` gains `max_input_chars` (declared: codex 1 MiB, others
+`None`). `_review_prompt` consults the tightest cap across the review panel
+and, when the inline diff would exceed it and every member's adapter
+`reads_repo` (FR-1.3), swaps the inline section for a by-reference block
+naming the exact range and the git commands to read it. Never truncates: a
+clipped diff would silently narrow review scope (fail closed). Unknown cap
+or a non-repo-reading panel behaves exactly as before.
+
 ## [0.6.0] — 2026-07-16
 
 **Pipeline effectiveness: catch more, gate smarter, learn across runs** (PRD

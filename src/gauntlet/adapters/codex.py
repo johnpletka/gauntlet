@@ -55,6 +55,11 @@ class CodexAdapter:
     capabilities = AdapterCapabilities(
         repo_write=True, structured_output="native", resume=True,
         reads_repo=True,  # FR-1.3: `codex exec` runs in the repo and can read files
+        # The codex app-server rejects any `turn/start` over 1 MiB of input
+        # wholesale (`input_too_large`, max_chars=1048576 — observed live on the
+        # clerk-auth P3 review). Declared so prompt builders can hand oversize
+        # payloads by reference instead of losing the whole invocation.
+        max_input_chars=1_048_576,
     )
 
     def __init__(

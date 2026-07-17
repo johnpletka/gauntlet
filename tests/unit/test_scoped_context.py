@@ -37,6 +37,16 @@ def test_adapter_reads_repo_capability_declarations():
     assert ApiAdapter.capabilities.reads_repo is False
 
 
+def test_adapter_max_input_chars_declarations():
+    # codex's app-server rejects any turn over 1 MiB of input wholesale
+    # (`input_too_large`, observed live on the clerk-auth P3 review), so the
+    # adapter declares the cap and prompt builders can fall back to
+    # by-reference context. The others declare no known cap.
+    assert CodexAdapter.capabilities.max_input_chars == 1_048_576
+    assert ClaudeCodeAdapter.capabilities.max_input_chars is None
+    assert ApiAdapter.capabilities.max_input_chars is None
+
+
 # --- iter_inputs normalization (FR-1.1) -------------------------------------
 def test_iter_inputs_normalizes_strings_and_mappings():
     step = Step.model_validate({
