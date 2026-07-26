@@ -45,10 +45,12 @@ the verifier never degrades to "skipped, proceed" and never runs unhooked.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -159,32 +161,84 @@ _JUDGE_HOOK_ENV_KEYS: frozenset[str] = frozenset(
     {URL_ENV_VAR, TOKEN_ENV_VAR, MODE_ENV_VAR, RUN_ID_ENV_VAR, STEP_ID_ENV_VAR}
 )
 
-# The claude CLI's own headless-auth token (`claude setup-token`). On hosts whose
-# claude credential is Keychain-backed (macOS; no `~/.claude/.credentials.json`),
-# the scratch-HOME repoint (F-006) breaks the CLI's Keychain lookup, so the
-# verifier canary comes up "Not logged in" and the hook-loading probe false-parks
-# the whole impl-cycle (#67). When the host provides this token it is re-added onto
-# the stripped verifier env — the same conceded residual as the run judge token
-# (":func:`_JUDGE_HOOK_ENV_KEYS`"): the one credential the CLI itself must hold to
-# run at all, NOT a provider `*_KEY` the verifier's *work* should carry. It is
-# re-added AFTER :func:`build_sandbox_env` (which strips it as `*_TOKEN`-shaped),
-# exactly like the judge token, so strip-by-construction still holds for every
-# other secret. Absent → behaviour is unchanged (the Keychain-symlink path).
+# The claude CLI's own OAuth token. On hosts whose claude credential is
+# Keychain-backed (macOS; no `~/.claude/.credentials.json`), the scratch-HOME
+# repoint (F-006) breaks the CLI's Keychain lookup, so the verifier canary comes
+# up "Not logged in" and the hook-loading probe false-parks the whole impl-cycle
+# (#67). The token is re-added onto the stripped verifier env — the same conceded
+# residual as the run judge token (":func:`_JUDGE_HOOK_ENV_KEYS`"): the one
+# credential the CLI itself must hold to run at all, NOT a provider `*_KEY` the
+# verifier's *work* should carry. It is re-added AFTER :func:`build_sandbox_env`
+# (which strips it as `*_TOKEN`-shaped), exactly like the judge token, so
+# strip-by-construction still holds for every other secret.
 CLAUDE_OAUTH_TOKEN_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+
+# The macOS login-Keychain service the claude CLI stores its OAuth credential
+# under; the value is a JSON blob whose `claudeAiOauth.accessToken` is what the
+# CLI authenticates with.
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Wall-clock cap on the `security` read so a GUI Keychain-unlock prompt (which
+# would block a non-interactive engine) fails to None instead of hanging.
+_KEYCHAIN_READ_TIMEOUT_S = 10.0
+
+
+def _extract_keychain_oauth_token() -> str | None:
+    """Best-effort read of the claude OAuth access token from the macOS login
+    Keychain (#67, hybrid path). Returns ``None`` on ANY failure — non-darwin, no
+    ``security`` tool, a non-zero/ empty read, a GUI-prompt timeout, or a blob we
+    cannot parse — so the caller falls back to the fail-closed park rather than
+    guessing. Never raises; never logs the token.
+
+    The extracted access token is short-lived (the CLI normally refreshes it via
+    the Keychain's refresh token, which an injected env snapshot cannot do): if it
+    has expired, the canary re-parks with the same clear "Not logged in" message,
+    and the operator can set a long-lived ``CLAUDE_CODE_OAUTH_TOKEN``
+    (`claude setup-token`) instead."""
+    if sys.platform != "darwin":
+        return None
+    security = shutil.which("security")
+    if security is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [security, "find-generic-password", "-s", _CLAUDE_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    blob = (proc.stdout or "").strip()
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+    except (ValueError, TypeError):
+        return None
+    tok = (data.get("claudeAiOauth") or {}).get("accessToken") if isinstance(data, dict) else None
+    return tok if isinstance(tok, str) and tok.strip() else None
 
 
 def resolve_claude_oauth_token(source: dict[str, str] | None = None) -> str | None:
-    """The host-provided claude headless-auth token, or ``None`` (#67).
+    """The claude OAuth token to hand the sandboxed verifier, or ``None`` (#67).
 
-    Checked in ``source`` (the run's ``judge_env``) first, then the parent process
-    env, so an operator export in a shell profile flows through. Empty/whitespace
-    is treated as absent (fail-closed: an empty token would only re-trigger the
-    "Not logged in" park)."""
+    Resolution order, so an existing login "just works" while an explicit token
+    remains an override:
+
+    1. An explicit ``CLAUDE_CODE_OAUTH_TOKEN`` in ``source`` (the run's
+       ``judge_env``), then the parent process env — a long-lived
+       ``claude setup-token`` an operator exported; robust across expiry/CI.
+    2. Otherwise (macOS), the operator's **existing** login session, read from the
+       login Keychain (:func:`_extract_keychain_oauth_token`) — no setup needed.
+
+    Empty/whitespace is treated as absent (fail-closed: an empty token would only
+    re-trigger the "Not logged in" park). ``None`` when nothing resolves, leaving
+    the sub-step to park closed with its actionable message."""
     for env in (source or {}, os.environ):
         tok = env.get(CLAUDE_OAUTH_TOKEN_ENV_VAR)
         if tok and tok.strip():
             return tok
-    return None
+    return _extract_keychain_oauth_token()
 
 
 def verifier_env(
