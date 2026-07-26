@@ -193,6 +193,30 @@ setx OPENAI_API_KEY "sk-..."
 Run `gauntlet doctor` (below) to verify everything resolves before your first
 run.
 
+**macOS — the sandboxed verifier and your `claude` login.** The adversarial
+verifier runs `claude` in an isolated `HOME` (it hides `~/.aws`/`~/.ssh` from
+un-hooked subprocesses). On macOS the `claude` login lives in the **Keychain**
+(no `~/.claude/.credentials.json`), and that isolation breaks the CLI's Keychain
+lookup. The verifier handles this for you: it reads your **existing** login
+session from the Keychain and hands it to the sandboxed turn, so a normal
+`claude /login` just works — no extra setup.
+
+If you'd rather not depend on the Keychain session (it holds a short-lived token
+the sandbox can't refresh, and CI has no interactive login), set an explicit
+long-lived token, which takes precedence:
+
+```sh
+claude setup-token                       # mints a long-lived OAuth token
+export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat-..."   # add to ~/.zshenv to persist
+```
+
+Either way this is the one claude credential the verifier is allowed to carry
+(the same class as the run's judge token); every other secret stays stripped from
+the sandbox. Linux hosts with file-based `~/.claude/.credentials.json` are
+unaffected. If neither the session nor a token is available, the verifier parks
+the review closed with an actionable hook-probe message rather than running
+unauthenticated.
+
 ---
 
 ## Quick start (≤ 3 commands)

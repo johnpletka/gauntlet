@@ -106,6 +106,106 @@ def test_verifier_env_drops_secrets_from_judge_env(tmp_path):
         assert leaked not in env
 
 
+def test_resolve_claude_oauth_token_explicit_wins_then_environ(monkeypatch):
+    """#67: an explicit CLAUDE_CODE_OAUTH_TOKEN resolves from judge_env first, then
+    the parent process env, and takes precedence over the Keychain fallback;
+    empty/whitespace is treated as absent."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    # Keychain would answer, but an explicit token must win over it.
+    monkeypatch.setattr(verify, "_extract_keychain_oauth_token", lambda: "kc-should-not-win")
+    assert verify.resolve_claude_oauth_token(
+        {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-src"}) == "sk-ant-oat-src"
+    # whitespace-only in source is absent → falls through (here, to the keychain stub)
+    assert verify.resolve_claude_oauth_token({"CLAUDE_CODE_OAUTH_TOKEN": "  "}) == "kc-should-not-win"
+    # os.environ is the second explicit source, still ahead of the keychain
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-env")
+    assert verify.resolve_claude_oauth_token({}) == "sk-ant-oat-env"
+    assert verify.resolve_claude_oauth_token(None) == "sk-ant-oat-env"
+
+
+def test_resolve_claude_oauth_token_falls_back_to_keychain(monkeypatch):
+    """#67 hybrid: with no explicit token, the existing login session is read from
+    the Keychain seam; None there yields None (→ fail-closed park)."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(verify, "_extract_keychain_oauth_token", lambda: "kc-session-tok")
+    assert verify.resolve_claude_oauth_token({}) == "kc-session-tok"
+    monkeypatch.setattr(verify, "_extract_keychain_oauth_token", lambda: None)
+    assert verify.resolve_claude_oauth_token({}) is None
+
+
+def test_extract_keychain_oauth_token_paths(monkeypatch):
+    """#67 hybrid: the macOS Keychain read parses `claudeAiOauth.accessToken`, and
+    fails to None on non-darwin, missing tool, non-zero/empty/malformed output, or
+    a timeout (a GUI unlock prompt must never hang the engine)."""
+    import subprocess as _sp
+
+    # non-darwin → None without shelling out
+    monkeypatch.setattr(verify.sys, "platform", "linux")
+    assert verify._extract_keychain_oauth_token() is None
+
+    monkeypatch.setattr(verify.sys, "platform", "darwin")
+    monkeypatch.setattr(verify.shutil, "which", lambda _: None)   # no `security`
+    assert verify._extract_keychain_oauth_token() is None
+
+    monkeypatch.setattr(verify.shutil, "which", lambda _: "/usr/bin/security")
+
+    def _run(result=None, exc=None):
+        def _fn(*a, **k):
+            if exc is not None:
+                raise exc
+            return result
+        return _fn
+
+    class _P:
+        def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+
+    good = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat-kc"}})
+    monkeypatch.setattr(verify.subprocess, "run", _run(_P(0, good)))
+    assert verify._extract_keychain_oauth_token() == "sk-ant-oat-kc"
+    # timeout (would-be GUI prompt) → None, not a hang
+    monkeypatch.setattr(verify.subprocess, "run",
+                        _run(exc=_sp.TimeoutExpired(cmd="security", timeout=10)))
+    assert verify._extract_keychain_oauth_token() is None
+    # non-zero, empty, and unparseable all → None
+    monkeypatch.setattr(verify.subprocess, "run", _run(_P(1, good)))
+    assert verify._extract_keychain_oauth_token() is None
+    monkeypatch.setattr(verify.subprocess, "run", _run(_P(0, "")))
+    assert verify._extract_keychain_oauth_token() is None
+    monkeypatch.setattr(verify.subprocess, "run", _run(_P(0, "{not json")))
+    assert verify._extract_keychain_oauth_token() is None
+    # well-formed JSON but no accessToken → None
+    monkeypatch.setattr(verify.subprocess, "run", _run(_P(0, json.dumps({"x": 1}))))
+    assert verify._extract_keychain_oauth_token() is None
+
+
+def test_verifier_env_readds_claude_oauth_token_but_no_other_secret(tmp_path, monkeypatch):
+    """#67: CLAUDE_CODE_OAUTH_TOKEN — the claude CLI's own credential — survives the
+    strip so the canary authenticates under the scratch HOME. It is the ONLY new
+    secret-shaped survivor; every provider *_KEY / *_TOKEN handed in stays dropped,
+    exactly like before (strip-by-construction preserved)."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(verify, "_extract_keychain_oauth_token", lambda: None)  # hermetic
+    copy = tmp_path / "copy"
+    judge_env = {
+        TOKEN_ENV_VAR: "tok",
+        "GAUNTLET_RUN_ID": "r1",
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-01",
+        "ANTHROPIC_API_KEY": "sk-secret", "MY_DEPLOY_TOKEN": "t",
+    }
+    env = verify.verifier_env(judge_env, copy)
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-01"   # the one CLI credential
+    assert env[TOKEN_ENV_VAR] == "tok"                          # judge token still there
+    for leaked in ("ANTHROPIC_API_KEY", "MY_DEPLOY_TOKEN"):     # everything else dropped
+        assert leaked not in env
+    # No explicit token and no keychain → not synthesized (fail-closed).
+    env2 = verify.verifier_env({TOKEN_ENV_VAR: "tok"}, copy)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env2
+    # Keychain-provided session flows through when no explicit token is set.
+    monkeypatch.setattr(verify, "_extract_keychain_oauth_token", lambda: "kc-session")
+    env3 = verify.verifier_env({TOKEN_ENV_VAR: "tok"}, copy)
+    assert env3["CLAUDE_CODE_OAUTH_TOKEN"] == "kc-session"
+
+
 def test_detect_backend_none_without_claude(monkeypatch, tmp_path):
     """FR-2.5 / P5-A5: with no claude-code CLI the probe finds no backend."""
     monkeypatch.setattr(verify.shutil, "which", lambda name: None)
