@@ -159,6 +159,33 @@ _JUDGE_HOOK_ENV_KEYS: frozenset[str] = frozenset(
     {URL_ENV_VAR, TOKEN_ENV_VAR, MODE_ENV_VAR, RUN_ID_ENV_VAR, STEP_ID_ENV_VAR}
 )
 
+# The claude CLI's own headless-auth token (`claude setup-token`). On hosts whose
+# claude credential is Keychain-backed (macOS; no `~/.claude/.credentials.json`),
+# the scratch-HOME repoint (F-006) breaks the CLI's Keychain lookup, so the
+# verifier canary comes up "Not logged in" and the hook-loading probe false-parks
+# the whole impl-cycle (#67). When the host provides this token it is re-added onto
+# the stripped verifier env — the same conceded residual as the run judge token
+# (":func:`_JUDGE_HOOK_ENV_KEYS`"): the one credential the CLI itself must hold to
+# run at all, NOT a provider `*_KEY` the verifier's *work* should carry. It is
+# re-added AFTER :func:`build_sandbox_env` (which strips it as `*_TOKEN`-shaped),
+# exactly like the judge token, so strip-by-construction still holds for every
+# other secret. Absent → behaviour is unchanged (the Keychain-symlink path).
+CLAUDE_OAUTH_TOKEN_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def resolve_claude_oauth_token(source: dict[str, str] | None = None) -> str | None:
+    """The host-provided claude headless-auth token, or ``None`` (#67).
+
+    Checked in ``source`` (the run's ``judge_env``) first, then the parent process
+    env, so an operator export in a shell profile flows through. Empty/whitespace
+    is treated as absent (fail-closed: an empty token would only re-trigger the
+    "Not logged in" park)."""
+    for env in (source or {}, os.environ):
+        tok = env.get(CLAUDE_OAUTH_TOKEN_ENV_VAR)
+        if tok and tok.strip():
+            return tok
+    return None
+
 
 def verifier_env(
     judge_env: dict[str, str],
@@ -190,13 +217,27 @@ def verifier_env(
     filter. Restricting the re-add to the hook-key allowlist keeps every
     secret-shaped var absent by construction — the run-local judge token is the
     only secret-shaped key that survives, and only because the hook cannot
-    authenticate without it (review F-003)."""
+    authenticate without it (review F-003).
+
+    One further secret-shaped key survives the strip when the host provides it:
+    ``CLAUDE_CODE_OAUTH_TOKEN`` (:func:`resolve_claude_oauth_token`). It is the
+    claude CLI's own headless-auth token — the credential the backend must hold to
+    run at all — re-added so the canary authenticates under the scratch HOME
+    instead of the Keychain the repoint hides (#67). Same class as the judge
+    token, not a provider ``*_KEY``."""
     env = build_sandbox_env()
     source = judge_env or {}
     for key in _JUDGE_HOOK_ENV_KEYS:
         if key in source:
             env[key] = source[key]
     env[REPO_ROOT_ENV_VAR] = str(copy_root)
+    # Re-add the claude CLI's own OAuth token if the host provides one (#67), so a
+    # Keychain-auth host authenticates the canary under the scratch HOME. Added
+    # after build_sandbox_env (which strips it as `*_TOKEN`), exactly like the
+    # judge token — every other secret stays absent by construction.
+    oauth_token = resolve_claude_oauth_token(source)
+    if oauth_token is not None:
+        env[CLAUDE_OAUTH_TOKEN_ENV_VAR] = oauth_token
     # The verifier's OWN step id (PR #59 review B1/F-003) — never inherited from
     # `judge_env` (the cycle step's id would confine the fixer too). It is (a)
     # what the judge's per-step boundary registration keys on, and (b) a

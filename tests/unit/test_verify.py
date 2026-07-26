@@ -106,6 +106,46 @@ def test_verifier_env_drops_secrets_from_judge_env(tmp_path):
         assert leaked not in env
 
 
+def test_resolve_claude_oauth_token_source_then_environ(monkeypatch):
+    """#67: the claude headless-auth token resolves from judge_env first, then the
+    parent process env; empty/whitespace and absence both yield None."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert verify.resolve_claude_oauth_token({}) is None
+    assert verify.resolve_claude_oauth_token({"CLAUDE_CODE_OAUTH_TOKEN": "  "}) is None
+    # judge_env (source) wins
+    assert verify.resolve_claude_oauth_token(
+        {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-src"}) == "sk-ant-oat-src"
+    # falls back to os.environ when source lacks it
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-env")
+    assert verify.resolve_claude_oauth_token({}) == "sk-ant-oat-env"
+    assert verify.resolve_claude_oauth_token(None) == "sk-ant-oat-env"
+
+
+def test_verifier_env_readds_claude_oauth_token_but_no_other_secret(tmp_path, monkeypatch):
+    """#67: CLAUDE_CODE_OAUTH_TOKEN — the claude CLI's own headless-auth credential —
+    survives the strip so the canary authenticates under the scratch HOME (the
+    Keychain the HOME repoint hides is no longer required). It is the ONLY new
+    secret-shaped survivor; every provider *_KEY / *_TOKEN handed in stays dropped,
+    exactly like before (strip-by-construction preserved)."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    copy = tmp_path / "copy"
+    judge_env = {
+        TOKEN_ENV_VAR: "tok",
+        "GAUNTLET_RUN_ID": "r1",
+        "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-01",
+        "ANTHROPIC_API_KEY": "sk-secret", "MY_DEPLOY_TOKEN": "t",
+    }
+    env = verify.verifier_env(judge_env, copy)
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-01"   # the one CLI credential
+    assert env[TOKEN_ENV_VAR] == "tok"                          # judge token still there
+    for leaked in ("ANTHROPIC_API_KEY", "MY_DEPLOY_TOKEN"):     # everything else dropped
+        assert leaked not in env
+    # Absent everywhere → not synthesized (behaviour unchanged for hosts that
+    # never set it).
+    env2 = verify.verifier_env({TOKEN_ENV_VAR: "tok"}, copy)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env2
+
+
 def test_detect_backend_none_without_claude(monkeypatch, tmp_path):
     """FR-2.5 / P5-A5: with no claude-code CLI the probe finds no backend."""
     monkeypatch.setattr(verify.shutil, "which", lambda name: None)
