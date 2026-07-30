@@ -6,6 +6,32 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**Fix the plan-author↔plan-lint contract (#64).** The shipped `plan-author.md`
+specified `gauntlet-phases` entries with only `id`/`title`/`goal`, but
+`phase_lint` and the `plan_phases` validator require every phase to carry an
+`acceptance:` list of `{id, clause}` entries — the planner followed its prompt
+faithfully and the gate rejected the result, wedging every fresh run at
+plan-lint. The prompt now specifies (and its example models) the full schema the
+gate enforces, and a new `tests/unit/test_prompt_contract.py` round-trips the
+prompt's own embedded example through the parser, the lint, and the in-step
+validator so contract drift fails the build instead of a user's run.
+
+**Size-lint counts declared scope, not prose mentions (#66).** The FR-3.4
+phase-size lint regex-swept each phase's whole prose section, so incidental
+cross-references and parent-vs-child FRs (`FR-4` + `FR-4.1` = 2) inflated counts
+past `max_frs_per_phase` — a false positive that would fail closed at the plan
+gate under `size_lint: park`. Phases now declare their scope in an `frs:` list
+in the `gauntlet-phases` block (shape-validated when present; the prompt always
+emits it) and the lint counts those declared refs; pre-`frs` plans keep the
+prose-sweep fallback.
+
+**Honest halted-status meaning (#64).** `gauntlet status` rendered every halted
+run as "the budget/timeout guard tripped" — the meaning line was keyed on run
+state, collapsing all seven `halt_reason` values (a `precondition` halt read as
+a budget problem). The footer now names the guard that actually fired, with an
+explicit "reason unrecorded" fallback for pre-P3 manifests; `status --json` is
+unchanged (`steps[].halt_reason` already carried it).
+
 ## [0.7.0] — 2026-07-17
 
 **Fix oversize review diffs killing the round.** A `code_review` round
