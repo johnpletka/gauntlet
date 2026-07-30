@@ -135,6 +135,38 @@ subsequent phases through `gauntlet run`. Manual process execution from P5
 onward is a bug. Record any gap that forced you to fall back to manual in
 `BOOTSTRAP-NOTES.md`.
 
+### Known self-hosting hazards (mitigate — do NOT disable self-hosting)
+Running Gauntlet against Gauntlet is intended (this is a dogfood project), and it
+is how real tool bugs get found — do **not** "fix" a rough run by banning
+self-hosting; that suppresses the messenger. But self-hosting has specific
+hazards that must be mitigated *before* a run, or the run thrashes and needs
+constant manual rescue. When a hazard traces to a tool bug, the fix is a normal
+`fix/` branch + PR against the bug, not avoidance.
+
+1. **Shared provider quota.** A `gauntlet run` and any operator/agent session
+   here draw on the **same** Anthropic (and OpenAI) account. A long run — or one
+   that runs *alongside* operator work — repeatedly hits usage limits and parks;
+   each park is a manual `resume` until `resume_on_quota: auto` exists and is
+   configured. Mitigation: give the run its own account/quota where possible, or
+   expect and batch the resumes; never run heavy operator work in parallel with a
+   live run on one account. (See the parallel-quota note in operator memory.)
+2. **The behavioral verifier must be environment-ready first.** The verifier runs
+   `claude` in an isolated `HOME` + network-denied disposable copy. Two things
+   silently false-park **every** review if not set up: (a) **auth** — on macOS the
+   Keychain login must reach the sandbox (the `CLAUDE_CODE_OAUTH_TOKEN` /
+   Keychain-session path; issue #67), and (b) **offline test provisioning** — a
+   `uv`/network-provisioned repo needs the toolchain cache reachable offline
+   (`UV_CACHE_DIR` + offline; issue #69). `gauntlet doctor` does **not** exercise a
+   real hooked verifier turn, so confirm a verifier turn actually runs before
+   trusting a run to complete.
+3. **Engine/schema self-modification.** A phase that edits Gauntlet's own engine
+   or schemas is changing the same code the driver runs. Resume with a **fresh
+   driver** so it loads on-disk code (never hand-edit artifacts to compensate);
+   watch for stale-driver schema skew (see `BOOTSTRAP-NOTES.md`).
+4. **Suite size amplifies verifier timeouts.** This repo's own suite is large;
+   the verifier turn timeout (`step_timeout_s` on the `verifier` profile) must
+   accommodate provisioning + the tests it runs.
+
 ---
 
 ## 4. When you are the `builder` agent inside a Gauntlet pipeline
