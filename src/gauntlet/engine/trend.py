@@ -327,7 +327,8 @@ def render_plan_author_history(
         f"Size bound: max_frs_per_phase = {max_frs_per_phase}. A phase carrying "
         f"more than this many distinct FR references trips the phase-size lint — "
         f"oversized phases are where partial delivery hides (#54). Keep each phase "
-        f"at or under the bound."
+        f"at or under the bound. Declare each phase's scope in its `frs:` list; "
+        f"the lint counts those declared refs."
     )
     parts = [f"\n\n{header}\n{bound}\n"]
 
