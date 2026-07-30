@@ -109,6 +109,10 @@ agents:
     permission_mode: acceptEdits
     allowed_tools: [Bash, Read, Grep, Glob, Edit, Write]
     base_flags: ["--setting-sources", "project"]
+    # The verifier provisions the toolchain and RUNS the phase's tests, so its turn
+    # needs more wall-clock than a quick agent turn (the adapter default is 600s).
+    # Raise this as your suite grows; offline provisioning is wired in-engine (#69).
+    step_timeout_s: 1800
   # Cheap-tier models for classification (FR-3.1): a small model for triage and
   # the judge LLM rung, a stronger model for severity-aware triage escalation.
   # Pinned to ApiAdapter models verified live via LiteLLM (.gauntlet/pins.yaml):
