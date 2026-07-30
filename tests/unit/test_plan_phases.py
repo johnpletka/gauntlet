@@ -7,6 +7,7 @@ import pytest
 from gauntlet.engine.planphases import (
     PlanPhasesError,
     extract_phases,
+    frs_declaration_errors,
     load_plan_phases,
     missing_phase_sections,
 )
@@ -164,6 +165,24 @@ def test_bad_frs_token_rejected(bad):
 def test_duplicate_frs_token_rejected():
     with pytest.raises(PlanPhasesError, match="duplicate frs entry"):
         extract_phases(_phase_with_frs("[FR-1.1, FR-1.1]"))
+
+
+def test_frs_declaration_errors_requires_presence_per_phase():
+    # The author-time gate (PR #73 review P1): a phase omitting `frs` is an
+    # error HERE, while extract_phases stays lenient for pre-`frs` plans.
+    phases = extract_phases(
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: a\n  goal: g\n  frs: [FR-1.1]\n"
+        "- id: P2\n  title: b\n  goal: g\n```\n"
+    )
+    errors = frs_declaration_errors(phases)
+    assert len(errors) == 1
+    assert "P2" in errors[0] and "declares no 'frs:' list" in errors[0]
+
+
+def test_frs_declaration_errors_empty_when_all_declared():
+    phases = extract_phases(_phase_with_frs("[FR-1.1]"))
+    assert frs_declaration_errors(phases) == []
 
 
 # --- locatable prose sections (F-001, FR-1.1) -------------------------------

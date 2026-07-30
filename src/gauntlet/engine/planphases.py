@@ -171,6 +171,34 @@ def _frs_body_error(pid: str, frs: Any) -> str | None:
     return None
 
 
+def frs_declaration_errors(phases: list[dict[str, Any]]) -> list[str]:
+    """Phases lacking a well-formed, non-empty ``frs:`` list (#66, FR-3.4).
+
+    Presence is required **only at author time** — the ``plan_phases`` validator
+    calls this so a fresh plan that omits ``frs`` is repaired in-session before
+    the gate. ``phase_lint`` deliberately does NOT: a mid-flight plan authored
+    pre-``frs`` (validator already passed) must still lint via the prose-sweep
+    fallback rather than wedge at the gate on a contract it predates.
+    """
+    errors: list[str] = []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        pid = phase.get("id", "<unknown>")
+        frs = phase.get("frs")
+        if frs is None:
+            errors.append(
+                f"phase {pid} declares no 'frs:' list; list the FR ids the "
+                "phase delivers (e.g. frs: [FR-1.1]) so the phase-size lint "
+                "counts declared scope, not incidental prose mentions (FR-3.4)"
+            )
+            continue
+        err = _frs_body_error(pid, frs)
+        if err:
+            errors.append(err)
+    return errors
+
+
 def acceptance_clause_errors(phases: list[dict[str, Any]]) -> list[str]:
     """Phases lacking a well-formed, non-empty ``acceptance:`` list (FR-3.1).
 

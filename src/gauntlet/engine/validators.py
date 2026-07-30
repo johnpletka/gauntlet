@@ -32,6 +32,7 @@ from gauntlet.engine.planphases import (
     PlanPhasesError,
     acceptance_clause_errors,
     extract_phases,
+    frs_declaration_errors,
     missing_phase_sections,
 )
 
@@ -85,6 +86,14 @@ def _validate_plan_phases(text: str) -> str | None:
     acc_errors = acceptance_clause_errors(phases)
     if acc_errors:
         return "; ".join(acc_errors)
+    # #66: every fresh phase must declare its FR scope in an `frs:` list so the
+    # phase-size lint counts declared refs, never the prose-sweep fallback (whose
+    # incidental cross-references can false-positive a park at the gate). Author
+    # time only — `extract_phases` and `phase_lint` stay lenient so pre-`frs`
+    # plans (mid-flight or approved) still load and lint.
+    frs_errors = frs_declaration_errors(phases)
+    if frs_errors:
+        return "; ".join(frs_errors)
     return None
 
 

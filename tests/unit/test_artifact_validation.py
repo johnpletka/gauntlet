@@ -53,12 +53,14 @@ Do the second thing.
 - id: P1
   title: First phase
   goal: Do the first thing.
+  frs: [FR-1.1]
   acceptance:
     - id: P1-A1
       clause: The first thing is done.
 - id: P2
   title: Second phase
   goal: Do the second thing.
+  frs: [FR-2.1]
   acceptance:
     - id: P2-A1
       clause: The second thing is done.
@@ -362,6 +364,21 @@ def test_plan_phases_validator_rejects_malformed_block():
         "plan_phases", MALFORMED_PLAN, repo_root=Path("/"), asset_root="."
     )
     assert err is not None and "P<n>" in err
+
+
+def test_plan_phases_validator_requires_frs_declaration():
+    # PR #73 review P1: without an author-time presence gate, a planner that
+    # omits `frs` despite the prompt drops to the prose sweep and can reproduce
+    # #66's false-positive park. The repair loop must catch the omission here.
+    no_frs_plan = VALID_PLAN.replace("  frs: [FR-1.1]\n", "").replace(
+        "  frs: [FR-2.1]\n", ""
+    )
+    assert "frs" not in no_frs_plan  # the fixture edit actually removed both
+    err = validate_artifact(
+        "plan_phases", no_frs_plan, repo_root=Path("/"), asset_root="."
+    )
+    assert err is not None and "declares no 'frs:' list" in err
+    assert "P1" in err and "P2" in err
 
 
 def test_plan_phases_validator_rejects_missing_block():
