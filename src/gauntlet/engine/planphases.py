@@ -30,6 +30,14 @@ _BLOCK_RE = re.compile(
 
 _PHASE_ID_RE = re.compile(r"^P\d+$")
 
+# A DECLARED FR token in a phase's `frs:` list (#66). Anchored full-match —
+# unlike the word-boundary sweep `deferrals._FR_REF_RE` uses on prose — because
+# a declared entry must BE a token, not merely contain one. Sub-segments may
+# nest deeper than the sweep's FR-<n>.<m> and may be lettered (real PRDs
+# subdivide, e.g. FR-5.1.a) — rejecting a legitimate PRD id shape here would
+# wedge the plan gate on a contract technicality (#64's failure class).
+_FRS_TOKEN_RE = re.compile(r"^FR-\d+(?:\.(?:\d+|[A-Za-z]\d*))*$")
+
 # An ATX markdown heading: 1–6 leading `#`, the heading text, optional trailing
 # `#` decoration. Used to slice a single phase's prose section out of plan.md
 # for `phase`-mode context (harness-efficiency FR-1.1).
@@ -96,6 +104,13 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
         shape_err = _acceptance_body_error(pid, item["acceptance"]) if "acceptance" in item else None
         if shape_err:
             raise PlanPhasesError(shape_err)
+        # #66: validate the declared `frs:` list's SHAPE when present. Presence
+        # is never required — phase_lint falls back to the prose sweep for
+        # pre-`frs` plans — but a present-and-empty (or malformed) list would
+        # silently defeat the size lint, so it fails closed here.
+        shape_err = _frs_body_error(pid, item["frs"]) if "frs" in item else None
+        if shape_err:
+            raise PlanPhasesError(shape_err)
         phases.append(item)
     return phases
 
@@ -127,6 +142,61 @@ def _acceptance_body_error(pid: str, acc: Any) -> str | None:
         if not isinstance(text, str) or not text.strip():
             return f"phase {pid}: acceptance clause {cid!r} is missing non-empty 'clause' text"
     return None
+
+
+def _frs_body_error(pid: str, frs: Any) -> str | None:
+    """Error if ``frs`` is not a well-formed declared-FR list; ``None`` if valid.
+
+    A well-formed list is non-empty and every entry is a distinct string
+    full-matching :data:`_FRS_TOKEN_RE` (#66). Absent is always fine — the phase-size
+    lint sweeps the phase's prose instead — but a declared list is authoritative
+    scope, so an empty or malformed one fails closed rather than silently
+    exempting the phase from the size lint (FR-3.4).
+    """
+    if not isinstance(frs, list) or not frs:
+        return (
+            f"phase {pid}: 'frs' must be a non-empty list of FR ids "
+            "(e.g. [FR-1.1, FR-1.2]); omit it entirely if the phase declares none"
+        )
+    seen: set[str] = set()
+    for i, ref in enumerate(frs):
+        if not isinstance(ref, str) or not _FRS_TOKEN_RE.match(ref):
+            return (
+                f"phase {pid}: frs entry #{i + 1} is {ref!r}; each entry must be "
+                "an FR id like 'FR-3', 'FR-3.4', or 'FR-5.1.a'"
+            )
+        if ref in seen:
+            return f"phase {pid}: duplicate frs entry {ref!r}"
+        seen.add(ref)
+    return None
+
+
+def frs_declaration_errors(phases: list[dict[str, Any]]) -> list[str]:
+    """Phases lacking a well-formed, non-empty ``frs:`` list (#66, FR-3.4).
+
+    Presence is required **only at author time** — the ``plan_phases`` validator
+    calls this so a fresh plan that omits ``frs`` is repaired in-session before
+    the gate. ``phase_lint`` deliberately does NOT: a mid-flight plan authored
+    pre-``frs`` (validator already passed) must still lint via the prose-sweep
+    fallback rather than wedge at the gate on a contract it predates.
+    """
+    errors: list[str] = []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        pid = phase.get("id", "<unknown>")
+        frs = phase.get("frs")
+        if frs is None:
+            errors.append(
+                f"phase {pid} declares no 'frs:' list; list the FR ids the "
+                "phase delivers (e.g. frs: [FR-1.1]) so the phase-size lint "
+                "counts declared scope, not incidental prose mentions (FR-3.4)"
+            )
+            continue
+        err = _frs_body_error(pid, frs)
+        if err:
+            errors.append(err)
+    return errors
 
 
 def acceptance_clause_errors(phases: list[dict[str, Any]]) -> list[str]:

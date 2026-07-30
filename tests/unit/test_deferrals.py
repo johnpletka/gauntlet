@@ -442,3 +442,71 @@ def test_size_lint_unknown_mode_fails_closed(fixture_repo):
     result = handle_phase_lint(_lint_step(size_lint="explode"), ctx)
     assert result.status == HALTED
     assert "unknown size_lint mode" in result.notes
+
+
+# --- #66: a declared `frs:` list is the authoritative scope ------------------
+def _plan_with_declared_frs(prose_refs: list[str], declared: list[str] | None) -> str:
+    """A one-phase plan whose prose names ``prose_refs`` and whose block
+    declares ``declared`` (``None`` omits the ``frs:`` key → prose fallback)."""
+    deliverables = ", ".join(prose_refs)
+    frs_line = f"  frs: [{', '.join(declared)}]\n" if declared is not None else ""
+    return (
+        "# Plan\n\n"
+        f"## P1 — Big phase\nDeliverables and cross-references: {deliverables}.\n\n"
+        "## Machine-readable phase list\n\n"
+        "```gauntlet-phases\n"
+        f"- id: P1\n  title: Big phase\n  goal: do it\n{frs_line}"
+        "  acceptance:\n    - id: P1-A1\n      clause: it works\n```\n"
+    )
+
+
+def test_size_lint_uses_declared_frs_over_prose_sweep(fixture_repo):
+    """#66: incidental prose cross-references (and parent-vs-child FRs) must not
+    inflate the count when the phase declares its scope in `frs:`."""
+    ctx = _ctx(fixture_repo)
+    prose = ["FR-4", "FR-4.1", "FR-4.2", "FR-4.3", "FR-1.2", "FR-5", "FR-5.2"]
+    (ctx.artifact_root / "plan.md").write_text(
+        _plan_with_declared_frs(prose, ["FR-4.1", "FR-4.2", "FR-4.3"]))
+    result = handle_phase_lint(_lint_step(size_lint="park"), ctx)
+    assert result.status == DONE
+    assert "WARNING" not in result.notes
+
+
+def test_size_lint_flags_oversized_declared_frs(fixture_repo):
+    """A declared list over the bound still fires — warn by default, park when
+    configured — and the notes name the declared refs."""
+    declared = ["FR-1.1", "FR-1.2", "FR-1.3", "FR-1.4"]
+    ctx = _ctx(fixture_repo)
+    (ctx.artifact_root / "plan.md").write_text(
+        _plan_with_declared_frs(["FR-9.9"], declared))
+    result = handle_phase_lint(_lint_step(), ctx)
+    assert result.status == DONE
+    assert "WARNING" in result.notes and "P1 carries 4" in result.notes
+    assert "FR-1.4" in result.notes
+
+    result = handle_phase_lint(_lint_step(size_lint="park"), ctx)
+    assert result.status == HALTED
+    assert result.halt_reason == HALT_REASON_PRECONDITION
+
+
+def test_size_lint_falls_back_to_prose_when_frs_absent(fixture_repo):
+    """A pre-`frs` phase keeps the prose sweep: on a mixed plan only the
+    undeclared, prose-oversized phase is flagged."""
+    ctx = _ctx(fixture_repo)
+    text = (
+        "# Plan\n\n"
+        "## P1 — Declared phase\nMentions FR-1.1, FR-1.2, FR-1.3, FR-1.4, FR-1.5.\n\n"
+        "## P2 — Undeclared phase\nDeliverables (FR-2.1, FR-2.2, FR-2.3, FR-2.4): stuff.\n\n"
+        "## Machine-readable phase list\n\n"
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: Declared phase\n  goal: do it\n  frs: [FR-1.1]\n"
+        "  acceptance:\n    - id: P1-A1\n      clause: it works\n"
+        "- id: P2\n  title: Undeclared phase\n  goal: do it\n"
+        "  acceptance:\n    - id: P2-A1\n      clause: it works\n```\n"
+    )
+    (ctx.artifact_root / "plan.md").write_text(text)
+    result = handle_phase_lint(_lint_step(), ctx)
+    assert result.status == DONE
+    assert "WARNING" in result.notes
+    assert "P2 carries 4" in result.notes
+    assert "P1 carries" not in result.notes

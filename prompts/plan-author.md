@@ -49,6 +49,13 @@ the phase loop over (`foreach: plan.phases`). Each entry has:
 - `title`: a short imperative phase title.
 - `goal`: one or two sentences on what the phase delivers and the assumption it
   validates.
+- `frs`: the FR ids this phase delivers, e.g. `frs: [FR-1.1, FR-1.2]`. Always
+  list them — the phase-size lint counts these declared refs against
+  `max_frs_per_phase`, not incidental FR mentions in your prose.
+- `acceptance`: REQUIRED — a non-empty list of `{id, clause}` entries. `id` is
+  unique within the phase (convention: `P<n>-A<m>`); `clause` is one testable
+  sentence. The plan gate rejects any phase without this list (FR-3.1): the
+  acceptance gate later proves each clause maps to a real test.
 
 It must agree with the prose phases — the human ratifies the prose, the engine
 executes the list, and they must not drift. Concretely: **every phase id in the
@@ -62,9 +69,17 @@ Example:
 - id: P1
   title: Core data model + storage
   goal: Persist and reload records; validates the schema survives a round-trip.
+  frs: [FR-1.1, FR-1.2]
+  acceptance:
+    - id: P1-A1
+      clause: A record written by the store reloads with identical field values.
 - id: P2
   title: HTTP API over the model
   goal: Expose CRUD endpoints; validates the model covers the required operations.
+  frs: [FR-2.1]
+  acceptance:
+    - id: P2-A1
+      clause: Every CRUD endpoint round-trips a record against the live store.
 ```
 
 Write the full plan as Markdown (the prose plan **and** the `gauntlet-phases`

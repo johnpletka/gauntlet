@@ -302,10 +302,12 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
         )
     # FR-3.4: the phase-size lint. A phase carrying more than `max_frs_per_phase`
     # (default 3) distinct FR references is oversized — the scope where partial
-    # delivery hides (#54 cause 4). Counted from each phase's PROSE section (where
-    # the "Deliverables (FR-…)" refs live), not the machine-readable block. The
-    # disposition is the step's `size_lint:` option — warn (default; surface, do
-    # not block) or park (fail closed at the plan gate).
+    # delivery hides (#54 cause 4). Counted from the phase's DECLARED `frs:` list
+    # when it carries one (the authoritative scope, #66 — a prose sweep counts
+    # incidental cross-references and parent-vs-child FRs as scope); pre-`frs`
+    # plans fall back to sweeping the phase's prose section. The disposition is
+    # the step's `size_lint:` option — warn (default; surface, do not block) or
+    # park (fail closed at the plan gate).
     size_mode = step.get("size_lint", SIZE_LINT_WARN)
     if size_mode not in SIZE_LINT_MODES:
         return StepResult(
@@ -319,8 +321,12 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     bound = ctx.config.max_frs_per_phase
     oversized: list[str] = []
     for phase in phases:
-        section = phase_section(text, phase["id"]) or ""
-        refs = distinct_fr_refs(section)
+        declared = phase.get("frs")
+        if declared is not None:  # shape-validated by extract_phases; never empty
+            refs = set(declared)
+        else:
+            section = phase_section(text, phase["id"]) or ""
+            refs = distinct_fr_refs(section)
         if len(refs) > bound:
             oversized.append(
                 f"{phase['id']} carries {len(refs)} distinct FR refs "

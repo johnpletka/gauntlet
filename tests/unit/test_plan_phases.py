@@ -7,6 +7,7 @@ import pytest
 from gauntlet.engine.planphases import (
     PlanPhasesError,
     extract_phases,
+    frs_declaration_errors,
     load_plan_phases,
     missing_phase_sections,
 )
@@ -116,6 +117,72 @@ def test_invalid_yaml_rejected():
     text = "```gauntlet-phases\n- id: P1\n   : broken\n  title: x\n```\n"
     with pytest.raises(PlanPhasesError):
         extract_phases(text)
+
+
+# --- declared `frs:` list — shape-when-present (#66, FR-3.4) -----------------
+def _phase_with_frs(frs_yaml: str) -> str:
+    return (
+        "```gauntlet-phases\n"
+        f"- id: P1\n  title: x\n  goal: do it\n  frs: {frs_yaml}\n```\n"
+    )
+
+
+def test_valid_frs_list_passes_through():
+    phases = extract_phases(_phase_with_frs("[FR-1.1, FR-2]"))
+    assert phases[0]["frs"] == ["FR-1.1", "FR-2"]
+
+
+def test_deep_and_lettered_frs_tokens_accepted():
+    # Real PRDs subdivide requirements (scheduled-restart declared FR-5.1.a);
+    # rejecting a legitimate id shape would wedge the plan gate (#64's class).
+    phases = extract_phases(_phase_with_frs("[FR-5.1.a, FR-1.1.1, FR-2.3.b2]"))
+    assert phases[0]["frs"] == ["FR-5.1.a", "FR-1.1.1", "FR-2.3.b2"]
+
+
+def test_absent_frs_is_fine():
+    phases = extract_phases("```gauntlet-phases\n- id: P1\n  title: x\n  goal: g\n```\n")
+    assert "frs" not in phases[0]
+
+
+def test_empty_frs_list_rejected():
+    # An empty declared list would silently exempt the phase from the size
+    # lint — fail closed; omit the key instead.
+    with pytest.raises(PlanPhasesError, match="non-empty list of FR ids"):
+        extract_phases(_phase_with_frs("[]"))
+
+
+def test_non_list_frs_rejected():
+    with pytest.raises(PlanPhasesError, match="non-empty list of FR ids"):
+        extract_phases(_phase_with_frs("FR-1.1"))
+
+
+@pytest.mark.parametrize("bad", ["FR-x", "fr-1.1", "4", "FR-1 and FR-2", "FR-1."])
+def test_bad_frs_token_rejected(bad):
+    with pytest.raises(PlanPhasesError, match="must be an FR id"):
+        extract_phases(_phase_with_frs(f"['{bad}']"))
+
+
+def test_duplicate_frs_token_rejected():
+    with pytest.raises(PlanPhasesError, match="duplicate frs entry"):
+        extract_phases(_phase_with_frs("[FR-1.1, FR-1.1]"))
+
+
+def test_frs_declaration_errors_requires_presence_per_phase():
+    # The author-time gate (PR #73 review P1): a phase omitting `frs` is an
+    # error HERE, while extract_phases stays lenient for pre-`frs` plans.
+    phases = extract_phases(
+        "```gauntlet-phases\n"
+        "- id: P1\n  title: a\n  goal: g\n  frs: [FR-1.1]\n"
+        "- id: P2\n  title: b\n  goal: g\n```\n"
+    )
+    errors = frs_declaration_errors(phases)
+    assert len(errors) == 1
+    assert "P2" in errors[0] and "declares no 'frs:' list" in errors[0]
+
+
+def test_frs_declaration_errors_empty_when_all_declared():
+    phases = extract_phases(_phase_with_frs("[FR-1.1]"))
+    assert frs_declaration_errors(phases) == []
 
 
 # --- locatable prose sections (F-001, FR-1.1) -------------------------------

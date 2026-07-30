@@ -78,10 +78,11 @@ def _manifest(status: str, steps: list[StepRecord], *, slug: str = "demo") -> Ma
 
 
 def _step(id: str, type: str, status: str, *, reason=None, iteration=None,
-          metrics=None, failure_kind=None) -> StepRecord:
+          metrics=None, failure_kind=None, halt_reason=None) -> StepRecord:
     return StepRecord(
         id=id, type=type, status=status, parked_reason=reason,
         iteration=iteration, metrics=metrics or {}, failure_kind=failure_kind,
+        halt_reason=halt_reason,
     )
 
 
@@ -321,12 +322,14 @@ def test_parked_for_response_classifies_cycle_escalation():
 def test_parked_run_with_halted_step_reports_failure_descriptor():
     # The real engine representation (FR-3.3): RUN_PARKED + a HALTED step. The
     # failure descriptor and current_step must name that step, not be `unknown`.
-    man = _manifest(M.RUN_PARKED, [_step("impl", "agent_task", M.HALTED, iteration="1")])
+    man = _manifest(M.RUN_PARKED, [_step("impl", "agent_task", M.HALTED, iteration="1",
+                                         halt_reason=M.HALT_REASON_PRECONDITION)])
     rstate = op.compute_run_state(man, op.LIVENESS_NONE)
     assert rstate.state == op.STATE_HALTED
     assert rstate.failure is not None
     assert rstate.failure.step_id == "impl.1"
     assert rstate.failure.status == M.HALTED
+    assert rstate.failure.halt_reason == M.HALT_REASON_PRECONDITION
     assert rstate.current_step == "impl.1"
 
 
@@ -381,6 +384,36 @@ def test_footer_done_has_no_action_lines():
     lines = op.render_footer(driver, rstate)
     assert not [ln for ln in lines if ln.strip().startswith("$ ")]
     assert any("none — the run is finished" in ln for ln in lines)
+
+
+def _halted_state_line(halt_reason) -> str:
+    """The footer's `state:` line for a RUN_PARKED + HALTED-step manifest."""
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(
+        M.RUN_PARKED, [_step("s", "agent_task", M.HALTED, halt_reason=halt_reason)]
+    )
+    rstate = op.compute_run_state(man, driver.state)
+    lines = op.render_footer(driver, rstate)
+    return next(ln for ln in lines if ln.startswith("state:"))
+
+
+def test_footer_halted_meaning_names_halt_reason():
+    # #64: a precondition halt used to render as "the budget/timeout guard
+    # tripped", misdirecting the operator toward a budget problem that doesn't
+    # exist. The meaning line must name the guard that actually fired.
+    line = _halted_state_line(M.HALT_REASON_PRECONDITION)
+    assert "precondition" in line
+    assert "budget" not in line and "timeout" not in line
+
+    assert "cost-budget" in _halted_state_line(M.HALT_REASON_BUDGET)
+    assert "timeout" in _halted_state_line(M.HALT_REASON_TIMEOUT)
+
+
+def test_footer_halted_meaning_falls_back_on_unrecorded_reason():
+    # A pre-P3 manifest (null halt_reason) renders the honest fallback, not a
+    # guessed cause.
+    line = _halted_state_line(None)
+    assert "reason unrecorded" in line
 
 
 def test_footer_driver_line_shows_pid_host_since():
