@@ -6,6 +6,17 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**Dirty-worktree preflight before the run branch exists (#61).** `gauntlet
+run` on a dirty worktree created `gauntlet/<slug>`, checked it out (carrying
+the uncommitted changes), and then failed — stranding the operator on a
+half-born branch they had to hand-delete after stashing/committing on the
+original branch. `start()` now refuses up front, while still on the
+operator's own branch, naming the offending paths in a friendly one-line CLI
+error. The run root is exempt: a freshly authored `prd.md` (the run
+baseline-commits it, FR-5.1) and a completed sibling run's deliberately
+uncommitted `PR.md` (PRD §2.2) must not block the ordinary
+finish-one-start-the-next sequence.
+
 **Fix the plan-author↔plan-lint contract (#64).** The shipped `plan-author.md`
 specified `gauntlet-phases` entries with only `id`/`title`/`goal`, but
 `phase_lint` and the `plan_phases` validator require every phase to carry an

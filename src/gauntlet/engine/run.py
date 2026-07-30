@@ -1114,6 +1114,43 @@ class RunManager:
                     "branch to run from (or set base_branch) — the base must "
                     "not be a gauntlet/* branch"
                 )
+            # #61: refuse a dirty worktree BEFORE the run branch exists.
+            # `checkout -b` carries uncommitted changes onto the fresh
+            # gauntlet/* branch, and the first clean-handoff guard (FR-9.3)
+            # then fails the run — stranding the operator on a half-born
+            # branch they must hand-delete. The whole run root is exempt, not
+            # just this slug: a freshly authored prd.md is expected input
+            # (the cycle baseline-commits it, FR-5.1), and a completed
+            # sibling run legitimately leaves its PR.md uncommitted for the
+            # human (PRD §2.2) — refusing on either would block the ordinary
+            # finish-one-start-the-next sequence.
+            try:
+                run_root_rel = (
+                    layout.slug_dir.parent.resolve()
+                    .relative_to(self.repo_root.resolve())
+                    .as_posix()
+                )
+                preflight_excludes = [run_root_rel]
+            except ValueError:
+                preflight_excludes = []
+            # `untracked_all` so untracked files are listed individually — in
+            # `normal` mode a fully-untracked run root collapses to one
+            # `runs/` entry the slug-dir exclude pathspec cannot suppress
+            # (see the status_porcelain docstring).
+            dirt = gitops.status_porcelain(
+                self.repo_root, exclude=preflight_excludes, untracked_all=True
+            )
+            if dirt:
+                listing = "\n  ".join(dirt.splitlines()[:8])
+                raise WorktreeDirtyError(
+                    f"refusing to start {slug!r}: the worktree has "
+                    "uncommitted changes outside the run's artifact dir:\n"
+                    f"  {listing}\n"
+                    "Commit, stash, or discard them first — starting now "
+                    f"would create {branch!r} carrying these changes and "
+                    "fail the first clean-handoff guard (FR-9.3), leaving a "
+                    "half-initialized run branch to clean up by hand (#61)"
+                )
             self._prepare_run_branch(branch, base_branch)
 
             run_dir = layout.run_dir(run_id)

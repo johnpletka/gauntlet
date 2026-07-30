@@ -89,6 +89,10 @@ def _pipeline(repo: Path, text: str, name: str = "p") -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     path = repo / "pipelines" / f"{name}.yaml"
     path.write_text(text)
+    # the start() preflight (#61) refuses uncommitted files outside the slug
+    # dir, so fixtures commit the pipeline like a real adopter would
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", f"add pipeline {name}")
     return path
 
 
@@ -325,9 +329,9 @@ def test_concurrent_acquire_yields_exactly_one_holder(fixture_repo):
 def test_lock_released_on_done_and_park(fixture_repo):
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "done-slug")
-    _author_prd(mgr, "park-slug")
     done_path = _pipeline(fixture_repo, SIMPLE_DONE, name="simple")
     park_path = _pipeline(fixture_repo, GATED, name="gated")
+    _author_prd(mgr, "park-slug")
     assert mgr.start("done-slug", done_path, use_judge=False) == M.RUN_DONE
     assert not _lock_path(fixture_repo).exists()  # released on done
     assert mgr.start("park-slug", park_path, use_judge=False) == M.RUN_PARKED

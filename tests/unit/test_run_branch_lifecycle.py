@@ -72,6 +72,10 @@ def _write_pipeline(repo: Path, text: str = LINEAR) -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     path = repo / "pipelines" / "p.yaml"
     path.write_text(text)
+    # the start() preflight (#61) refuses uncommitted files outside the slug
+    # dir, so fixtures commit the pipeline like a real adopter would
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", "add pipeline")
     return path
 
 
@@ -108,6 +112,49 @@ def test_base_current_refuses_detached_head(fixture_repo):
     path = _write_pipeline(fixture_repo)
     with pytest.raises(EntryContractError, match="detached"):
         mgr.start("demo", path, use_judge=False)
+
+
+# --- #61: dirty-worktree preflight (before the branch exists) ----------------
+def test_start_refuses_dirty_worktree_before_creating_branch(fixture_repo):
+    # The reported bug (#61): start() created gauntlet/<slug>, THEN failed on
+    # the dirty tree — stranding the operator on a half-born branch they had
+    # to hand-delete. Now: refuse first, while still on the operator's branch.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (fixture_repo / "wip.py").write_text("uncommitted scratch\n")  # untracked
+    with pytest.raises(WorktreeDirtyError, match="wip.py"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_start_refuses_modified_tracked_file(fixture_repo):
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (fixture_repo / "README.md").write_text("edited but not committed\n")
+    with pytest.raises(WorktreeDirtyError, match="uncommitted changes"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+
+
+def test_start_allows_uncommitted_run_artifacts(fixture_repo):
+    # The canonical flow: prd.md freshly authored and NOT yet committed (the
+    # run's own baseline commit handles it, FR-5.1). Must not be refused.
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+
+
+def test_start_allows_sibling_slug_artifacts_and_pending_pr_md(fixture_repo):
+    # The whole run root is exempt from the preflight: a completed sibling
+    # run leaves its PR.md uncommitted for the human by design (PRD §2.2),
+    # and another slug's authored-but-unstarted prd.md is expected input —
+    # neither may block the ordinary finish-one-start-the-next sequence.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "other")
+    (mgr.layout("other").slug_dir / "PR.md").write_text("## Draft PR\n")
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
 
 
 # --- stale-branch guard ------------------------------------------------------
