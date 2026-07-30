@@ -208,7 +208,7 @@ DONE = "done"
 FAILED = "failed"
 INTERRUPTED = "interrupted"  # killed mid-step, dirty worktree (F-003)
 PARKED = "parked"  # human_gate / interrupted-park awaiting a human
-HALTED = "halted"  # budget/timeout guard tripped (FR-3.3)
+HALTED = "halted"  # a terminal guard halt; the cause is the step's halt_reason (HALT_REASON_*)
 SKIPPED = "skipped"  # `when:` false
 
 # --- run lifecycle states ----------------------------------------------------

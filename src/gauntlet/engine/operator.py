@@ -118,11 +118,25 @@ _MEANING: dict[str, str] = {
     STATE_PARKED_USAGE_WINDOW: "parked before a step to stay within the provider usage window — `resume` retries once it replenishes",
     STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
     STATE_FAILED: "a step failed",
-    STATE_HALTED: "the budget/timeout guard tripped",
+    STATE_HALTED: "a guard halted the step (reason unrecorded — see steps[].halt_reason in status --json)",
     STATE_INTERRUPTED: "the run was killed mid-step",
     STATE_DONE: "run complete",
     STATE_ABORTED: "run aborted by an operator",
     STATE_UNKNOWN: "unrecognized or contradictory run state — inspect read-only only",
+}
+
+# A halted run's footer meaning, keyed by the halted step's ``halt_reason``
+# (#64: every HALTED run used to render as "the budget/timeout guard tripped",
+# misdirecting the operator for the five other reasons). The `_MEANING` entry
+# above is the fallback for a null/unknown reason (pre-P3 manifests).
+_HALT_REASON_MEANING: dict[str, str] = {
+    M.HALT_REASON_TIMEOUT: "a step timeout tripped — inspect logs, then `resume` re-runs the step",
+    M.HALT_REASON_BUDGET: "the cost-budget guard tripped — raise the budget or trim scope, then `resume`",
+    M.HALT_REASON_JUDGE_DENY: "a judge deny terminated the step — review the judge decision before resuming",
+    M.HALT_REASON_SIGNAL_KILL: "the step was killed by a signal/crash mid-flight",
+    M.HALT_REASON_ADAPTER_ERROR: "a terminal adapter/handler failure ended the step",
+    M.HALT_REASON_PRECONDITION: "a fail-closed precondition guard rejected the step before anything ran — fix the named defect (see the step notes), then `resume` re-runs the check",
+    M.HALT_REASON_OPERATOR_RECOVER: "`gauntlet recover` finalized the step",
 }
 
 
@@ -194,6 +208,10 @@ class FailureDescriptor:
     # the operator fixes the precondition, while a terminal failure needs a
     # `resume --response` decision — so the next-action recommendation differs.
     failure_kind: str | None = None
+    # The step's ``halt_reason`` (HALT_REASON_*), when recorded. Drives the
+    # halted footer's reason-specific meaning line (#64); not part of the
+    # ``--json`` failure object (``steps[].halt_reason`` already carries it).
+    halt_reason: str | None = None
 
 
 @dataclass
@@ -632,7 +650,9 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
         halt_steps = [s for s in man.steps if s.status in (M.HALTED, M.INTERRUPTED)]
         if len(halt_steps) == 1 and not parked_steps:
             hs = halt_steps[0]
-            return hs.status, None, FailureDescriptor(render_step_id(hs), hs.status)
+            return hs.status, None, FailureDescriptor(
+                render_step_id(hs), hs.status, halt_reason=hs.halt_reason
+            )
         if len(parked_steps) != 1 or halt_steps:
             return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
         ps = parked_steps[0]
@@ -688,7 +708,7 @@ def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | Non
             return STATE_UNKNOWN, None, None  # failed run with no failure step
         fs = failure_steps[-1]
         return fs.status, None, FailureDescriptor(
-            render_step_id(fs), fs.status, fs.failure_kind
+            render_step_id(fs), fs.status, fs.failure_kind, halt_reason=fs.halt_reason
         )
 
     # P4: any unrecognized run_status.
@@ -2505,6 +2525,21 @@ def follow_logs(
 
 
 # --- human footer rendering (FR-1.1/FR-1.2) ----------------------------------
+def _state_meaning(rstate: RunState) -> str:
+    """The footer's "what this state means" phrase for ``rstate``.
+
+    For a halted run with a recorded ``halt_reason``, the meaning names the
+    actual guard that fired (#64); everything else uses the per-state line.
+    """
+    if (
+        rstate.state == STATE_HALTED
+        and rstate.failure is not None
+        and rstate.failure.halt_reason in _HALT_REASON_MEANING
+    ):
+        return _HALT_REASON_MEANING[rstate.failure.halt_reason]
+    return _MEANING.get(rstate.state, "")
+
+
 def render_footer(
     driver: DriverInfo,
     rstate: RunState,
@@ -2547,7 +2582,7 @@ def render_footer(
         suffix = f" ({', '.join(extra)})" if extra else ""
         lines.append(f"driver: {driver.state}{suffix}")
 
-    lines.append(f"state: {rstate.state} — {_MEANING.get(rstate.state, '')}")
+    lines.append(f"state: {rstate.state} — {_state_meaning(rstate)}")
 
     # FR-7.3: elapsed + cost-so-far, so a parked/running state is legible without
     # opening a transcript. Each line is added only when its datum is available,
