@@ -64,6 +64,9 @@ agents:
     permission_mode: acceptEdits
     allowed_tools: [Bash, Read, Grep, Glob, Edit, Write]
     base_flags: ["--setting-sources", "project"]
+    # This repo's own suite is large; the verifier provisions the toolchain and
+    # runs tests, so it needs well over the 600s adapter default (#69).
+    step_timeout_s: 1800
   # Cheap-tier models verified live on this machine (P1/P4 contract runs; only
   # an OpenAI key is present and `claude-haiku-latest` does not resolve via
   # LiteLLM — see pins.yaml). FR-3.1 tiering: mini for classification, full

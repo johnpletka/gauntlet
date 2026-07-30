@@ -309,6 +309,19 @@ def verifier_env(
         real_home = env.get("HOME") or os.environ.get("HOME") or ""
         if "CLAUDE_CONFIG_DIR" not in env and real_home:
             env["CLAUDE_CONFIG_DIR"] = str(Path(real_home) / ".claude")
+        # Offline toolchain provisioning (#69): the disposable copy has no `.venv`
+        # (gitignored) and the scratch HOME hides `~/.cache/uv`, while the sandbox
+        # denies network — so `uv run pytest` cannot build the test env and the
+        # verifier hangs to the turn timeout. Point uv at the REAL cache and force
+        # offline so it provisions a fresh venv INSIDE the copy from cache only (no
+        # network — the deny stands; a cache miss fails fast instead of hanging).
+        # The venv lives in the throwaway copy; the real one is never touched.
+        uv_cache = os.environ.get("UV_CACHE_DIR") or (
+            str(Path(real_home) / ".cache" / "uv") if real_home else ""
+        )
+        if uv_cache:
+            env["UV_CACHE_DIR"] = uv_cache
+        env["UV_OFFLINE"] = "1"
         env["HOME"] = str(scratch_home)
     return env
 

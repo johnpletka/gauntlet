@@ -791,6 +791,30 @@ def test_verifier_env_respects_explicit_claude_config_dir(tmp_path, monkeypatch)
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "cfg")  # operator's wins
 
 
+def test_verifier_env_offline_uv_provisioning(tmp_path, monkeypatch):
+    """#69: under the scratch HOME the disposable copy has no .venv and ~/.cache/uv
+    is hidden while the sandbox denies network, so verifier_env points uv at the
+    REAL cache and forces UV_OFFLINE — else `uv run pytest` cannot provision and
+    the verifier hangs to the turn timeout."""
+    monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    # No scratch HOME → uv provisioning env is untouched (behaviour unchanged).
+    env0 = verify.verifier_env(_JUDGE_ENV, tmp_path / "copy")
+    assert "UV_OFFLINE" not in env0
+    # Scratch HOME → offline provisioning wired, cache derived from the real HOME.
+    env = verify.verifier_env(
+        _JUDGE_ENV, tmp_path / "copy", step_id="s", scratch_home=tmp_path / "scratch",
+    )
+    assert env["UV_OFFLINE"] == "1"
+    assert env["UV_CACHE_DIR"] == str(tmp_path / "realhome" / ".cache" / "uv")
+    # An operator-set UV_CACHE_DIR is honored verbatim.
+    monkeypatch.setenv("UV_CACHE_DIR", "/custom/uvcache")
+    env2 = verify.verifier_env(
+        _JUDGE_ENV, tmp_path / "copy", step_id="s", scratch_home=tmp_path / "scratch",
+    )
+    assert env2["UV_CACHE_DIR"] == "/custom/uvcache"
+
+
 def test_register_boundary_returns_engine_held_lease(tmp_path, monkeypatch):
     calls = {}
 
