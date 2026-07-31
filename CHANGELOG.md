@@ -13,14 +13,16 @@ half-born branch they had to hand-delete after stashing/committing on the
 original branch. `start()` now refuses up front, while still on the
 operator's own branch, naming the offending paths in a friendly one-line CLI
 error. The preflight applies the same exclusion policy as the drive itself
-(PR #75 review): this slug's artifact dir is exempt (a freshly authored
-`prd.md` is expected input the run baseline-commits, FR-5.1), and every
-slug's human-owned `PR.md` is now excluded engine-wide — from the preflight,
-the clean-handoff checks, and the engine's commits — so a finished sibling
-run's pending `PR.md` neither blocks the next start nor gets swept into a
-machine commit. A sibling slug's other uncommitted artifacts are refused up
-front, exactly because they would fail the handoff guard after the branch
-existed.
+(PR #75 review, both rounds): exactly this slug's `prd.md` is exempt — the
+one artifact legitimately uncommitted at start, which the first cycle
+baseline-commits (FR-5.1) — and every slug's human-owned `PR.md` is now
+excluded engine-wide (preflight, clean-handoff checks, and the engine's
+commits), so a finished sibling run's pending `PR.md` neither blocks the
+next start nor gets swept into a machine commit. Everything else — an extra
+file beside the PRD, a stale `plan.md`, a sibling slug's artifacts — is
+refused up front, exactly because the baseline commit fires only when the
+single dirty path is the artifact itself, so any of it would fail the
+handoff guard after the branch existed.
 
 **Fix the plan-author↔plan-lint contract (#64).** The shipped `plan-author.md`
 specified `gauntlet-phases` entries with only `id`/`title`/`goal`, but

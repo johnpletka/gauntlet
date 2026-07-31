@@ -1119,21 +1119,24 @@ class RunManager:
             # gauntlet/* branch, and the first clean-handoff guard (FR-9.3)
             # then fails the run — stranding the operator on a half-born
             # branch they must hand-delete. The exclusion policy is exactly
-            # the one the drive itself applies (PR #75 review: preflight and
-            # clean-handoff must never disagree, or the stranded-branch bug
-            # returns through the gap): the shared bookkeeping excludes
-            # (this run's instance dir + EVERY slug's human-owned PR.md,
-            # PRD §2.2) plus this slug's own artifact dir — a freshly
-            # authored prd.md is expected input the cycle baseline-commits
-            # (FR-5.1). A SIBLING slug's uncommitted artifacts are refused
-            # here, precisely because they would fail the handoff guard
-            # after the branch existed.
+            # the one the drive itself applies (PR #75 review, both rounds:
+            # preflight and clean-handoff must never disagree, or the
+            # stranded-branch bug returns through the gap): the shared
+            # bookkeeping excludes (this run's instance dir + EVERY slug's
+            # human-owned PR.md, PRD §2.2) plus EXACTLY this slug's prd.md —
+            # the one artifact legitimately uncommitted at start, which the
+            # first cycle baseline-commits (FR-5.1). Not the whole slug dir:
+            # the baseline fires only when the SINGLE dirty path is the
+            # artifact itself, so any extra slug-dir file (notes.md, a stale
+            # plan.md) would pass a dir-wide exemption and then fail the
+            # handoff guard after the branch existed. Sibling-slug artifacts
+            # are refused for the same reason.
             preflight_excludes = run_bookkeeping_excludes(
                 self.repo_root, layout.run_dir(run_id), layout.slug_dir
             )
             try:
                 preflight_excludes.append(
-                    layout.slug_dir.resolve()
+                    layout.prd_path.resolve()
                     .relative_to(self.repo_root.resolve())
                     .as_posix()
                 )
@@ -1151,7 +1154,7 @@ class RunManager:
                 listing = "\n  ".join(dirt.splitlines()[:8])
                 raise WorktreeDirtyError(
                     f"refusing to start {slug!r}: the worktree has "
-                    "uncommitted changes outside this run's artifact dir:\n"
+                    "uncommitted changes beyond this run's prd.md:\n"
                     f"  {listing}\n"
                     "Commit, stash, or discard them first — starting now "
                     f"would create {branch!r} carrying these changes and "

@@ -162,6 +162,37 @@ def test_start_allows_pending_sibling_pr_md_and_never_commits_it(fixture_repo):
     assert "PR.md" not in tracked
 
 
+def test_start_refuses_extra_file_beside_uncommitted_prd(fixture_repo):
+    # PR #75 review round 2 (P1): the first cycle's baseline commit fires only
+    # when the SINGLE dirty path is the artifact itself, so prd.md PLUS
+    # notes.md in this slug's dir would pass a dir-wide exemption and then
+    # fail the clean-handoff guard AFTER the branch existed — #61 again. The
+    # preflight exempts exactly prd.md, so the extra file is refused up
+    # front, before the branch is created.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (mgr.layout("demo").slug_dir / "notes.md").write_text("scratch notes\n")
+    with pytest.raises(WorktreeDirtyError, match="notes.md"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_start_refuses_stale_uncommitted_plan_md(fixture_repo):
+    # A plan.md at start() is stale state from a prior aborted attempt (the
+    # run itself authors plan.md after the branch exists) — refuse rather
+    # than let it fail the plan-cycle handoff post-branch.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (mgr.layout("demo").slug_dir / "plan.md").write_text("# stale plan\n")
+    with pytest.raises(WorktreeDirtyError, match="plan.md"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
 def test_start_refuses_sibling_slug_artifact_dirt(fixture_repo):
     # PR #75 review P1: a SIBLING slug's uncommitted prd.md would pass any
     # run-root-wide exemption and then fail the clean-handoff guard AFTER the
