@@ -1134,8 +1134,8 @@ class RunManager:
             except ValueError:
                 preflight_excludes = []
             # `untracked_all` so untracked files are listed individually — in
-            # `normal` mode a fully-untracked run root collapses to one
-            # `runs/` entry the slug-dir exclude pathspec cannot suppress
+            # `normal` mode git may collapse a fully-untracked directory into a
+            # single `dir/` entry, which makes the refusal message less actionable
             # (see the status_porcelain docstring).
             dirt = gitops.status_porcelain(
                 self.repo_root, exclude=preflight_excludes, untracked_all=True
