@@ -89,8 +89,8 @@ def _pipeline(repo: Path, text: str, name: str = "p") -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     path = repo / "pipelines" / f"{name}.yaml"
     path.write_text(text)
-    # the start() preflight (#61) refuses uncommitted files outside the slug
-    # dir, so fixtures commit the pipeline like a real adopter would
+    # the start() preflight (#61) refuses uncommitted files outside the run root
+    # (runs/ is exempt), so fixtures commit the pipeline like a real adopter would
     git(repo, "add", "pipelines")
     git(repo, "commit", "-qm", f"add pipeline {name}")
     return path
