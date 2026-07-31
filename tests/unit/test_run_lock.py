@@ -331,9 +331,16 @@ def test_lock_released_on_done_and_park(fixture_repo):
     _author_prd(mgr, "done-slug")
     done_path = _pipeline(fixture_repo, SIMPLE_DONE, name="simple")
     park_path = _pipeline(fixture_repo, GATED, name="gated")
-    _author_prd(mgr, "park-slug")
     assert mgr.start("done-slug", done_path, use_judge=False) == M.RUN_DONE
     assert not _lock_path(fixture_repo).exists()  # released on done
+    # SIMPLE_DONE has no commit step, so done-slug's prd.md is still untracked
+    # — sibling-slug dirt to the next start()'s preflight (#61/PR #75 review),
+    # as it would be to FR-9.3 downstream. Commit it like the standard
+    # pipeline's baseline commit (or an operator) would, then author the next
+    # slug's PRD (its own artifact dir is exempt for its own start).
+    git(fixture_repo, "add", "runs/done-slug")
+    git(fixture_repo, "commit", "-qm", "tidy done-slug artifacts")
+    _author_prd(mgr, "park-slug")
     assert mgr.start("park-slug", park_path, use_judge=False) == M.RUN_PARKED
     assert not _lock_path(fixture_repo).exists()  # released on park
 

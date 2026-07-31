@@ -220,11 +220,16 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     -f"), which broke the commit step (BOOTSTRAP-NOTES #33). Letting gitignore
     own it is both correct and avoids the pathspec collision.
 
-    ``PR.md`` (FR-9.8) IS listed: it is engine-drafted at final-gate pass but
-    must never be auto-committed or pushed — opening the PR stays a human action
-    (PRD §2.2). Excluding it keeps the engine's own commits and clean/rollback
-    checks from sweeping it in, while leaving it plainly visible for the human to
-    ``git add`` and commit deliberately (it is not gitignored, so no #33 clash).
+    ``PR.md`` (FR-9.8) IS listed — for EVERY slug under the run root, as a
+    ``<run_root>/*/PR.md`` exclude glob (PR #75 review): it is engine-drafted at
+    final-gate pass but must never be auto-committed or pushed — opening the PR
+    stays a human action (PRD §2.2). A completed sibling run's PR.md therefore
+    legitimately sits uncommitted while the next run drives; scoping the exclude
+    to only the current slug made that pending file read as dirt to the next
+    run's clean-handoff checks and let commit steps sweep it into a machine
+    commit. The glob keeps every slug's PR.md out of the engine's commits and
+    clean/rollback/handoff checks while leaving each plainly visible for the
+    human to ``git add`` and commit deliberately (not gitignored, no #33 clash).
     """
     excludes: list[str] = []
     root = repo_root.resolve()
@@ -232,8 +237,18 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
         excludes.append(run_dir.resolve().relative_to(root).as_posix())
     except ValueError:
         pass
+    art = artifact_root.resolve()
+    if art != root:
+        try:
+            run_root_rel = art.parent.relative_to(root).as_posix()
+            excludes.append(f"{run_root_rel}/*/PR.md")
+            return excludes
+        except ValueError:
+            pass
+    # Fallback (artifact_root at/outside the repo root — no sibling slugs can
+    # exist): the original single-file exclude.
     try:
-        excludes.append((artifact_root / "PR.md").resolve().relative_to(root).as_posix())
+        excludes.append((art / "PR.md").relative_to(root).as_posix())
     except ValueError:
         pass
     return excludes

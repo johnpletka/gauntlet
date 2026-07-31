@@ -1118,25 +1118,32 @@ class RunManager:
             # `checkout -b` carries uncommitted changes onto the fresh
             # gauntlet/* branch, and the first clean-handoff guard (FR-9.3)
             # then fails the run — stranding the operator on a half-born
-            # branch they must hand-delete. The whole run root is exempt, not
-            # just this slug: a freshly authored prd.md is expected input
-            # (the cycle baseline-commits it, FR-5.1), and a completed
-            # sibling run legitimately leaves its PR.md uncommitted for the
-            # human (PRD §2.2) — refusing on either would block the ordinary
-            # finish-one-start-the-next sequence.
+            # branch they must hand-delete. The exclusion policy is exactly
+            # the one the drive itself applies (PR #75 review: preflight and
+            # clean-handoff must never disagree, or the stranded-branch bug
+            # returns through the gap): the shared bookkeeping excludes
+            # (this run's instance dir + EVERY slug's human-owned PR.md,
+            # PRD §2.2) plus this slug's own artifact dir — a freshly
+            # authored prd.md is expected input the cycle baseline-commits
+            # (FR-5.1). A SIBLING slug's uncommitted artifacts are refused
+            # here, precisely because they would fail the handoff guard
+            # after the branch existed.
+            preflight_excludes = run_bookkeeping_excludes(
+                self.repo_root, layout.run_dir(run_id), layout.slug_dir
+            )
             try:
-                run_root_rel = (
-                    layout.slug_dir.parent.resolve()
+                preflight_excludes.append(
+                    layout.slug_dir.resolve()
                     .relative_to(self.repo_root.resolve())
                     .as_posix()
                 )
-                preflight_excludes = [run_root_rel]
             except ValueError:
-                preflight_excludes = []
+                pass
             # `untracked_all` so untracked files are listed individually — in
             # `normal` mode git may collapse a fully-untracked directory into a
-            # single `dir/` entry, which makes the refusal message less actionable
-            # (see the status_porcelain docstring).
+            # single `dir/` entry the exclude pathspecs cannot suppress, and
+            # the refusal message would be less actionable (see the
+            # status_porcelain docstring).
             dirt = gitops.status_porcelain(
                 self.repo_root, exclude=preflight_excludes, untracked_all=True
             )
@@ -1144,12 +1151,14 @@ class RunManager:
                 listing = "\n  ".join(dirt.splitlines()[:8])
                 raise WorktreeDirtyError(
                     f"refusing to start {slug!r}: the worktree has "
-                    "uncommitted changes outside the run root:\n"
+                    "uncommitted changes outside this run's artifact dir:\n"
                     f"  {listing}\n"
                     "Commit, stash, or discard them first — starting now "
                     f"would create {branch!r} carrying these changes and "
                     "fail the first clean-handoff guard (FR-9.3), leaving a "
-                    "half-initialized run branch to clean up by hand (#61)"
+                    "half-initialized run branch to clean up by hand (#61). "
+                    "(A pending PR.md from a finished run is exempt and "
+                    "never blocks a start.)"
                 )
             self._prepare_run_branch(branch, base_branch)
 

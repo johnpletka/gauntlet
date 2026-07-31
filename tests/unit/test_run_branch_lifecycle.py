@@ -146,15 +146,36 @@ def test_start_allows_uncommitted_run_artifacts(fixture_repo):
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
 
 
-def test_start_allows_sibling_slug_artifacts_and_pending_pr_md(fixture_repo):
-    # The whole run root is exempt from the preflight: a completed sibling
-    # run leaves its PR.md uncommitted for the human by design (PRD §2.2),
-    # and another slug's authored-but-unstarted prd.md is expected input —
-    # neither may block the ordinary finish-one-start-the-next sequence.
+def test_start_allows_pending_sibling_pr_md_and_never_commits_it(fixture_repo):
+    # PR #75 review P1: a completed sibling run leaves its PR.md uncommitted
+    # for the human by design (PRD §2.2) — it must not block the ordinary
+    # finish-one-start-the-next sequence, AND the next run's commit steps
+    # must never sweep it into a machine commit (it stays human-owned).
     mgr = _prepare(fixture_repo)
-    _author_prd(mgr, "other")
-    (mgr.layout("other").slug_dir / "PR.md").write_text("## Draft PR\n")
+    sibling_pr = fixture_repo / "runs" / "other" / "PR.md"
+    sibling_pr.parent.mkdir(parents=True)
+    sibling_pr.write_text("## Draft PR\n")
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    # still on disk, still untracked — no engine commit adopted it
+    assert sibling_pr.read_text() == "## Draft PR\n"
+    tracked = git(fixture_repo, "ls-files", "runs/other")
+    assert "PR.md" not in tracked
+
+
+def test_start_refuses_sibling_slug_artifact_dirt(fixture_repo):
+    # PR #75 review P1: a SIBLING slug's uncommitted prd.md would pass any
+    # run-root-wide exemption and then fail the clean-handoff guard AFTER the
+    # branch existed — the exact stranded-branch bug #61 reported. The
+    # preflight applies the same exclusion policy as the drive, so it refuses
+    # up front, before the branch is created.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "other")  # authored-but-unstarted sibling PRD
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    with pytest.raises(WorktreeDirtyError, match="runs/other"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
 
 
 # --- stale-branch guard ------------------------------------------------------
