@@ -33,6 +33,10 @@ def _write_pipeline(repo: Path, text: str) -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     path = repo / "pipelines" / "p.yaml"
     path.write_text(text)
+    # the start() preflight (#61) refuses uncommitted files outside the run
+    # root, so fixtures commit the pipeline like a real adopter would
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", "add pipeline")
     return path
 
 

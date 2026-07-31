@@ -46,6 +46,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         RecoverError,
         RollbackGuardError,
         UnsafeRunSegment,
+        WorktreeDirtyError,
     )
 
     return (
@@ -56,6 +57,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         AbortGuardError,
         RecoverError,
         UnsafeRunSegment,
+        WorktreeDirtyError,
         RunResolutionError,
         StatusContractError,
         PlanPhasesError,

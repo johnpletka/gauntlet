@@ -72,6 +72,10 @@ def _write_pipeline(repo: Path, text: str = LINEAR) -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     path = repo / "pipelines" / "p.yaml"
     path.write_text(text)
+    # the start() preflight (#61) refuses uncommitted files outside the run root
+    # (runs/ is exempt), so fixtures commit the pipeline like a real adopter would
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", "add pipeline")
     return path
 
 
@@ -108,6 +112,101 @@ def test_base_current_refuses_detached_head(fixture_repo):
     path = _write_pipeline(fixture_repo)
     with pytest.raises(EntryContractError, match="detached"):
         mgr.start("demo", path, use_judge=False)
+
+
+# --- #61: dirty-worktree preflight (before the branch exists) ----------------
+def test_start_refuses_dirty_worktree_before_creating_branch(fixture_repo):
+    # The reported bug (#61): start() created gauntlet/<slug>, THEN failed on
+    # the dirty tree — stranding the operator on a half-born branch they had
+    # to hand-delete. Now: refuse first, while still on the operator's branch.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (fixture_repo / "wip.py").write_text("uncommitted scratch\n")  # untracked
+    with pytest.raises(WorktreeDirtyError, match="wip.py"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_start_refuses_modified_tracked_file(fixture_repo):
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (fixture_repo / "README.md").write_text("edited but not committed\n")
+    with pytest.raises(WorktreeDirtyError, match="uncommitted changes"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+
+
+def test_start_allows_uncommitted_run_artifacts(fixture_repo):
+    # The canonical flow: prd.md freshly authored and NOT yet committed (the
+    # run's own baseline commit handles it, FR-5.1). Must not be refused.
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+
+
+def test_start_allows_pending_sibling_pr_md_and_never_commits_it(fixture_repo):
+    # PR #75 review P1: a completed sibling run leaves its PR.md uncommitted
+    # for the human by design (PRD §2.2) — it must not block the ordinary
+    # finish-one-start-the-next sequence, AND the next run's commit steps
+    # must never sweep it into a machine commit (it stays human-owned).
+    mgr = _prepare(fixture_repo)
+    sibling_pr = fixture_repo / "runs" / "other" / "PR.md"
+    sibling_pr.parent.mkdir(parents=True)
+    sibling_pr.write_text("## Draft PR\n")
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    # still on disk, still untracked — no engine commit adopted it
+    assert sibling_pr.read_text() == "## Draft PR\n"
+    tracked = git(fixture_repo, "ls-files", "runs/other")
+    assert "PR.md" not in tracked
+
+
+def test_start_refuses_extra_file_beside_uncommitted_prd(fixture_repo):
+    # PR #75 review round 2 (P1): the first cycle's baseline commit fires only
+    # when the SINGLE dirty path is the artifact itself, so prd.md PLUS
+    # notes.md in this slug's dir would pass a dir-wide exemption and then
+    # fail the clean-handoff guard AFTER the branch existed — #61 again. The
+    # preflight exempts exactly prd.md, so the extra file is refused up
+    # front, before the branch is created.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (mgr.layout("demo").slug_dir / "notes.md").write_text("scratch notes\n")
+    with pytest.raises(WorktreeDirtyError, match="notes.md"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_start_refuses_stale_uncommitted_plan_md(fixture_repo):
+    # A plan.md at start() is stale state from a prior aborted attempt (the
+    # run itself authors plan.md after the branch exists) — refuse rather
+    # than let it fail the plan-cycle handoff post-branch.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (mgr.layout("demo").slug_dir / "plan.md").write_text("# stale plan\n")
+    with pytest.raises(WorktreeDirtyError, match="plan.md"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_start_refuses_sibling_slug_artifact_dirt(fixture_repo):
+    # PR #75 review P1: a SIBLING slug's uncommitted prd.md would pass any
+    # run-root-wide exemption and then fail the clean-handoff guard AFTER the
+    # branch existed — the exact stranded-branch bug #61 reported. The
+    # preflight applies the same exclusion policy as the drive, so it refuses
+    # up front, before the branch is created.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "other")  # authored-but-unstarted sibling PRD
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    with pytest.raises(WorktreeDirtyError, match="runs/other"):
+        mgr.start("demo", path, use_judge=False)
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert gitops.current_branch(fixture_repo) == "main"
 
 
 # --- stale-branch guard ------------------------------------------------------

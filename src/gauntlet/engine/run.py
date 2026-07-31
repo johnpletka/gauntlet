@@ -1114,6 +1114,55 @@ class RunManager:
                     "branch to run from (or set base_branch) — the base must "
                     "not be a gauntlet/* branch"
                 )
+            # #61: refuse a dirty worktree BEFORE the run branch exists.
+            # `checkout -b` carries uncommitted changes onto the fresh
+            # gauntlet/* branch, and the first clean-handoff guard (FR-9.3)
+            # then fails the run — stranding the operator on a half-born
+            # branch they must hand-delete. The exclusion policy is exactly
+            # the one the drive itself applies (PR #75 review, both rounds:
+            # preflight and clean-handoff must never disagree, or the
+            # stranded-branch bug returns through the gap): the shared
+            # bookkeeping excludes (this run's instance dir + EVERY slug's
+            # human-owned PR.md, PRD §2.2) plus EXACTLY this slug's prd.md —
+            # the one artifact legitimately uncommitted at start, which the
+            # first cycle baseline-commits (FR-5.1). Not the whole slug dir:
+            # the baseline fires only when the SINGLE dirty path is the
+            # artifact itself, so any extra slug-dir file (notes.md, a stale
+            # plan.md) would pass a dir-wide exemption and then fail the
+            # handoff guard after the branch existed. Sibling-slug artifacts
+            # are refused for the same reason.
+            preflight_excludes = run_bookkeeping_excludes(
+                self.repo_root, layout.run_dir(run_id), layout.slug_dir
+            )
+            try:
+                preflight_excludes.append(
+                    layout.prd_path.resolve()
+                    .relative_to(self.repo_root.resolve())
+                    .as_posix()
+                )
+            except ValueError:
+                pass
+            # `untracked_all` so untracked files are listed individually — in
+            # `normal` mode git may collapse a fully-untracked directory into a
+            # single `dir/` entry the exclude pathspecs cannot suppress, and
+            # the refusal message would be less actionable (see the
+            # status_porcelain docstring).
+            dirt = gitops.status_porcelain(
+                self.repo_root, exclude=preflight_excludes, untracked_all=True
+            )
+            if dirt:
+                listing = "\n  ".join(dirt.splitlines()[:8])
+                raise WorktreeDirtyError(
+                    f"refusing to start {slug!r}: the worktree has "
+                    "uncommitted changes beyond this run's prd.md:\n"
+                    f"  {listing}\n"
+                    "Commit, stash, or discard them first — starting now "
+                    f"would create {branch!r} carrying these changes and "
+                    "fail the first clean-handoff guard (FR-9.3), leaving a "
+                    "half-initialized run branch to clean up by hand (#61). "
+                    "(A pending PR.md from a finished run is exempt and "
+                    "never blocks a start.)"
+                )
             self._prepare_run_branch(branch, base_branch)
 
             run_dir = layout.run_dir(run_id)

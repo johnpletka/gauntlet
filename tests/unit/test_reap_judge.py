@@ -455,6 +455,10 @@ def _run_to_done(mgr: RunManager, repo: Path, slug: str = "demo") -> Path:
     (repo / "pipelines").mkdir(exist_ok=True)
     ppath = repo / "pipelines" / "p.yaml"
     ppath.write_text(LINEAR)
+    # the start() preflight (#61) refuses uncommitted files outside the run
+    # root, so fixtures commit the pipeline like a real adopter would
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", "add pipeline")
     mgr.start(
         slug, ppath, use_judge=False,
         adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}),

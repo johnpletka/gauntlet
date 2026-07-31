@@ -252,6 +252,15 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     mgr = RunManager(repo)
     pipe = repo / "pipelines" / "standard.yaml"
 
+    # PR #75 review P1 (#61): a finished sibling run's PR.md sits uncommitted
+    # by design (PRD §2.2). It must not trip the start() preflight, must not
+    # trip any cycle's clean-handoff guard mid-run, and must never be adopted
+    # by an engine commit — through a REAL adversarial-cycle pipeline, not a
+    # linear one whose commit step could mask a sweep.
+    sibling_pr = repo / "runs" / "prior" / "PR.md"
+    sibling_pr.parent.mkdir(parents=True)
+    sibling_pr.write_text("## Pending PR from a finished sibling run\n")
+
     # PRD gate
     status = mgr.start("toy", pipe, use_judge=False, adapter_factory=_factory(adapters))
     assert status == M.RUN_PARKED
@@ -287,6 +296,16 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     assert pr.exists()
     assert "Toy widget" in pr.read_text()
     assert "Not opened, not pushed" in pr.read_text()
+
+    # the sibling run's pending PR.md survived the whole run: still on disk,
+    # still untracked — no baseline/phase/bookkeeping commit adopted it, and
+    # no handoff guard tripped on it (PR #75 review P1)
+    assert sibling_pr.read_text() == "## Pending PR from a finished sibling run\n"
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "runs/prior"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "PR.md" not in tracked
 
     # cost report attributes per profile (FR-3.2); classification (triage) tiny
     report = build_report(man)
