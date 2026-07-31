@@ -37,6 +37,7 @@ Implement widget(); validates the toy spec is satisfiable end-to-end.
 - id: P1
   title: Build the widget
   goal: Implement widget(); validates the toy spec is satisfiable end-to-end.
+  frs: [FR-1]
   acceptance:
     - id: P1-A1
       clause: widget() returns the string "widget".
