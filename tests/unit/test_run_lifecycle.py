@@ -452,6 +452,40 @@ def test_rollback_reverses_auto_approval_and_flips_policy(fixture_repo):
     assert rolled.auto_approvals[0].reversed_by == "operator"
 
 
+def test_rollback_tolerates_engine_bookkeeping_above_last_recorded(fixture_repo):
+    """#62: engine bookkeeping commits (response checkpoints) are never appended
+    to man.commits, so Guard 2's strict HEAD == last-recorded made every run
+    that ever took a checkpoint permanently un-rollback-able. Bookkeeping-only
+    advance is not divergence."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    run_dir = mgr.layout("demo").active_run_dir()
+    rel = run_dir.relative_to(fixture_repo).as_posix()
+    bk = gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: response impl2-resp-1 pending",
+        [f"{rel}/manifest.json"], identity=gitops.ENGINE_IDENTITY,
+    )
+    assert bk is not None  # HEAD is now ahead of the manifest's last commit
+
+    target = mgr.rollback("demo", phase=1)
+    assert gitops.head_sha(fixture_repo) == target
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: phase one"
+    man = mgr.status("demo")
+    assert [c.phase for c in man.commits] == ["P1"]
+    assert man.record("impl2").status == M.PENDING
+    # The pre-rollback tip (incl. the bookkeeping commit) is backed up.
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
+    assert "refs/gauntlet/backup/" in refs
+
+
 def test_rollback_refuses_branch_ahead_of_manifest(fixture_repo):
     # F-003: an extra unmanifested commit means branch != manifest tip -> refuse.
     mgr = _prepare(fixture_repo)

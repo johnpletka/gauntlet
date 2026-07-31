@@ -326,6 +326,105 @@ stages:
     assert adapter.calls == []  # not re-run over the partial artifact
 
 
+_RESUME_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+
+
+def test_resume_after_engine_bookkeeping_advance_reruns_cleanly(fixture_repo):
+    """#62/#65 incident replay: the engine's own bookkeeping commits advance
+    HEAD past the recorded base_sha; a plain resume must re-run the step, not
+    re-park INTERRUPTED forever on the engine's own commits."""
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    # Between the kill and this resume the engine landed a response checkpoint
+    # (force-tracked manifest.json under the excluded run dir) — porcelain is
+    # clean, but HEAD != base_sha.
+    (fixture_repo / "runs" / "demo" / "run-1").mkdir(parents=True)
+    (fixture_repo / "runs" / "demo" / "run-1" / "manifest.json").write_text("{}\n")
+    bk = gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: response implement-resp-1 pending",
+        ["runs/demo/run-1/manifest.json"], identity=gitops.ENGINE_IDENTITY,
+    )
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    assert orch.drive() == M.RUN_DONE
+    assert adapter.calls  # re-ran; the engine's own commits are not dirt
+    # The transaction boundary was re-armed at THIS attempt's entry HEAD (#65),
+    # not left at the stale pre-bookkeeping base.
+    assert orch.manifest.record("implement").base_sha == bk
+
+
+def test_resume_with_real_commits_past_base_parks_loudly(fixture_repo):
+    """Real (non-engine) commits above the base still park — and the park names
+    the offending commit range instead of a bare status (#65)."""
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "wip.py").write_text("committed but unmanifested\n")
+    gitops.commit_all(
+        fixture_repo, "P2 wip: arm the thing\n\nbody",
+        identity=gitops.Identity("Builder", "b@g.local"),
+    )
+    adapter = FakeAdapter()
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.INTERRUPTED
+    assert adapter.calls == []  # protection intact: never re-run over real commits
+    assert "interrupted mid-edit" in rec.notes
+    # The dirty verdict is inspectable from the park message alone.
+    assert "P2 wip: arm the thing" in rec.notes
+    assert base[:10] in rec.notes
+
+
+def test_engine_marked_commit_touching_implementation_still_parks(fixture_repo):
+    # Fail closed: engine markers alone don't buy tolerance — a commit that
+    # moves implementation reads dirty even with ENGINE_IDENTITY + `gauntlet:`.
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "impl.py").write_text("smuggled\n")
+    gitops.commit_paths(
+        fixture_repo, "gauntlet: rewind implementation to abcdef1234 for re-run (x)",
+        ["impl.py"], identity=gitops.ENGINE_IDENTITY,
+    )
+    adapter = FakeAdapter()
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.manifest.record("implement").status == M.INTERRUPTED
+    assert adapter.calls == []
+
+
+def test_reset_for_retry_rearms_transaction_boundary(fixture_repo):
+    """#65: base_sha belongs to a step ATTEMPT — an on_fail retry must re-stamp
+    it at the retry's own entry HEAD, never keep the first attempt's."""
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: a, type: shell, run: "true"}
+      - {id: b, type: shell, run: "true"}
+"""
+    orch = _build(fixture_repo, text)
+    orch.manifest.upsert(StepRecord(id="a", type="shell", status=M.DONE,
+                                    base_sha="a" * 40))
+    orch.manifest.upsert(StepRecord(id="b", type="shell", status=M.FAILED,
+                                    base_sha="b" * 40))
+    orch._reset_for_retry(orch.pipeline.stages[0], "a", None)
+    assert orch.manifest.record("a").status == M.PENDING
+    assert orch.manifest.record("a").base_sha is None
+    assert orch.manifest.record("b").base_sha is None
+
+
 def test_step_foreach_skips_completed_iterations_on_resume(fixture_repo):
     # Review F-004: a resumed step-level foreach must not re-run done iterations.
     text = """

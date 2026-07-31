@@ -1133,6 +1133,35 @@ def resume(
         typer.echo(f"resume cannot proceed: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"run status: {status}")
+    _echo_interrupted_park_detail(mgr, slug, status)
+
+
+def _echo_interrupted_park_detail(mgr, slug: str, status: str) -> None:
+    """After a resume that ends parked, say WHY — never a bare status (#65).
+
+    A dirty-base insta-park does zero agent work and used to print only
+    `run status: parked` (exit 0), sending the operator straight back into the
+    resume loop. The park's evidence already lives in the step notes (the dirty
+    verdict + offending commit range); surface it here. Best-effort read-only
+    reporting: a failure to load the manifest never masks the resume outcome.
+    """
+    from gauntlet.engine import manifest as M
+
+    if status != M.RUN_PARKED:
+        return
+    try:
+        run_dir = mgr.layout(slug).active_run_dir()
+        man = M.Manifest.load(run_dir / "manifest.json")
+    except Exception:
+        return
+    noted = [
+        s for s in man.steps
+        if s.status in (M.INTERRUPTED, M.HALTED) and s.notes
+    ]
+    if not noted:
+        return
+    step = noted[-1]
+    typer.echo(f"step {step.id}: {step.notes}", err=True)
 
 
 @app.command()

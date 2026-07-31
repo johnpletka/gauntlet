@@ -432,6 +432,12 @@ class Orchestrator:
             if rec is not None:
                 rec.status = M.PENDING
                 rec.ended = None
+                # The transaction boundary belongs to a step ATTEMPT, not to the
+                # record's first run ever (#65): the retried attempt must stamp
+                # base_sha at its own entry HEAD. Keeping the stale value makes
+                # a later interrupt's dirty check diff against — and a
+                # reset_to_base rewind past — everything the run landed since.
+                rec.base_sha = None
 
     # ---- single-step execution ----------------------------------------------
     def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:
@@ -608,7 +614,17 @@ class Orchestrator:
         # partial *artifact* under the run root (not just a repo-root file) is
         # still seen as a mid-edit interruption (review F-001).
         if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=self.excludes):
-            return None  # clean re-entry: agent never progressed; safe to re-run
+            # Clean re-entry: the agent left no partial edits, and any HEAD
+            # advance past base_sha is engine bookkeeping only (is_dirty_vs
+            # tolerates exactly that). Re-arm the transaction boundary the same
+            # way the FAILED+rerunnable path does: clear base_sha so `_execute`
+            # re-stamps it at the current HEAD — the boundary tracks THIS
+            # attempt, never a prior one (#65). A stale boundary makes a later
+            # `interrupted_step=reset_to_base` rewind past work that predates
+            # this attempt (e.g. a plan-cycle base stamped before plan.md
+            # existed) — destructive by construction.
+            rec.base_sha = None
+            return None  # agent never progressed; safe to re-run
         if self.config.interrupted_step == "reset_to_base":
             ts = self.clock().replace(":", "-")
             backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
@@ -679,9 +695,36 @@ class Orchestrator:
             notes=(
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
-                "interrupted_step=park)"
+                "interrupted_step=park)."
+                + self._dirty_verdict_detail(rec.base_sha)
             ),
         )
+
+    def _dirty_verdict_detail(self, base_sha: str) -> str:
+        """The evidence behind a dirty-base park (#65): WHAT read as dirty.
+
+        A zero-work insta-park that says only "parked" sends the operator in
+        circles; name the uncommitted paths and/or the commits sitting between
+        the recorded base and HEAD so the verdict is inspectable from the park
+        message alone. Best-effort — never let evidence-gathering mask the park.
+        """
+        parts: list[str] = []
+        try:
+            porcelain = gitops.status_porcelain(self.repo_root, exclude=self.excludes)
+            if porcelain:
+                parts.append(f"uncommitted changes:\n{porcelain}")
+            head = gitops.head_sha(self.repo_root)
+            if head != base_sha:
+                rng = gitops.log_range(self.repo_root, base_sha, head)
+                parts.append(
+                    f"commits in {base_sha[:10]}..{head[:10]}:\n"
+                    + (rng or "(none — HEAD is behind or forked from the base)")
+                )
+        except gitops.GitError as exc:
+            parts.append(f"(dirty-verdict detail unavailable: {exc})")
+        if not parts:
+            return ""
+        return " Dirty verdict — " + "\n".join(parts)
 
     def _restore_clean_after_conflict_park(
         self, step: Step, spec, rec: StepRecord, result: StepResult

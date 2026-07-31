@@ -6,6 +6,29 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**The engine's own bookkeeping commits no longer wedge resume and rollback
+(#62, #65).** `is_dirty_vs`'s HEAD leg demanded `HEAD == base_sha` exactly,
+but the engine itself advances HEAD during every drive — response checkpoints
+and run-bookkeeping flushes — and every plain resume commits a fresh pending
+checkpoint *before* the dirty check runs. An interrupted worktree-writing step
+therefore re-parked INTERRUPTED in under a second, forever, exit 0, with
+`status` recommending the same `resume` right back into the loop (and
+`rollback`'s divergence guard was unsatisfiable for any run that ever took a
+checkpoint). The dirty check now tolerates a `base_sha..HEAD` range iff every
+commit carries both engine markers (`ENGINE_IDENTITY` author and the
+`gauntlet:` subject) *and* — the authoritative leg — the aggregate tree diff
+outside the bookkeeping exclusions is empty, so an engine-labelled commit that
+moves implementation still reads dirty; rollback's guard shares the same
+tolerance. The transaction boundary is now re-armed per step *attempt*: a
+cleanly re-entering interrupted step and an `on_fail` retry both re-stamp
+`base_sha` at their own entry HEAD, so `interrupted_step: reset_to_base` can
+no longer rewind to a stale phase boundary predating the artifact under review
+(#65's destructive-escape hazard). And the park is loud: the INTERRUPTED notes
+now carry the dirty verdict (porcelain paths + the offending commit range),
+and `resume` prints them instead of a bare `run status: parked`. Regression
+tests replay the incident end-to-end, including the resume that must drive
+past its own freshly committed pending checkpoint.
+
 **Dirty-worktree preflight before the run branch exists (#61).** `gauntlet
 run` on a dirty worktree created `gauntlet/<slug>`, checked it out (carrying
 the uncommitted changes), and then failed — stranding the operator on a

@@ -2633,14 +2633,21 @@ class RunManager:
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
-        # Guard 2: branch tip MUST equal the manifest's last recorded commit.
-        # A branch ahead of the manifest (extra unmanifested commits) is a
-        # divergence — reset would silently discard those commits (review F-003).
+        # Guard 2: branch tip MUST agree with the manifest's last recorded
+        # commit. A branch ahead of the manifest (extra unmanifested commits)
+        # is a divergence — reset would silently discard those commits (review
+        # F-003). Tolerated exception (#62): a tip ahead by ONLY engine
+        # bookkeeping commits (response checkpoints, run-bookkeeping flushes —
+        # never appended to man.commits) is not a divergence; without the
+        # exemption, any run that ever took a response checkpoint could never
+        # roll back without git surgery.
         if not man.commits:
             raise RollbackGuardError("no recorded commits to roll back to")
         last_recorded = man.commits[-1].sha
         head = gitops.head_sha(self.repo_root)
-        if head != last_recorded:
+        if head != last_recorded and not gitops.advance_is_engine_bookkeeping(
+            self.repo_root, last_recorded, exclude=excludes
+        ):
             raise RollbackGuardError(
                 "refusing rollback: branch has diverged from the manifest "
                 f"(HEAD {head[:10]} != last recorded {last_recorded[:10]}); the "

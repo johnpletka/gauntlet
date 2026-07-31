@@ -166,11 +166,58 @@ def is_dirty_vs(repo: Path, base_sha: str, *, exclude: list[str] | None = None) 
     The engine's transaction boundary (review F-003) records a step's base SHA
     before any worktree-touching step. On resume it compares against that base:
     a difference means the killed step left partial edits.
+
+    HEAD ahead of ``base_sha`` is NOT dirt when the advance is purely the
+    engine's own bookkeeping (#62/#65): the engine itself moves HEAD past the
+    recorded base during a drive with response checkpoints and run-bookkeeping
+    flushes, which touch only ``exclude``d paths. A bare ``head != base`` here
+    made every plain resume of an interrupted step re-park on the engine's own
+    commits, forever. Real commits above the base — wip checkpoints, operator
+    commits, anything not engine bookkeeping — still read as dirty (fail
+    closed); so does a HEAD behind or forked from the base.
     """
     if status_porcelain(repo, exclude=exclude) != "":
         return True
-    # No working-tree changes; confirm HEAD still points at the recorded base.
-    return head_sha(repo) != base_sha
+    if head_sha(repo) == base_sha:
+        return False
+    return not advance_is_engine_bookkeeping(repo, base_sha, exclude=exclude)
+
+
+def advance_is_engine_bookkeeping(
+    repo: Path, base_sha: str, *, exclude: list[str] | None = None
+) -> bool:
+    """True iff ``base_sha..HEAD`` is nothing but engine bookkeeping (#62/#65).
+
+    Three legs, ALL required (fail closed):
+
+    1. ``base_sha`` is an ancestor of HEAD — behind or genuinely forked is
+       never bookkeeping drift.
+    2. Every commit in the range carries BOTH engine markers: the
+       ``ENGINE_IDENTITY`` author AND the ``gauntlet: `` subject prefix. Either
+       marker alone is forgeable/ambiguous; requiring both keeps the commit
+       convention honest.
+    3. The AUTHORITATIVE leg: the aggregate tree diff ``base_sha..HEAD``
+       outside the ``exclude``d bookkeeping paths is empty. The markers are a
+       cheap precondition, but a ``gauntlet:``-subject commit CAN carry an
+       implementation tree change (``rewind_impl_preserving_bookkeeping``
+       builds one), so the tree diff — not the commit labels — decides.
+    """
+    head = head_sha(repo)
+    if head == base_sha:
+        return True
+    if not is_ancestor(repo, base_sha, head):
+        return False
+    out = _run(repo, "log", "--format=%H%x00%an%x00%ae%x00%s", f"{base_sha}..{head}")
+    for line in out.splitlines():
+        _sha, name, email, subject = line.split("\x00", 3)
+        if name != ENGINE_IDENTITY.name or email != ENGINE_IDENTITY.email:
+            return False
+        if not _ENGINE_SUBJECT_RE.match(subject):
+            return False
+    diff = _run(
+        repo, "diff", "--name-only", base_sha, head, *_exclude_pathspec(exclude)
+    ).strip()
+    return diff == ""
 
 
 def worktree_tree_hash(repo: Path) -> str:

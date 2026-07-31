@@ -697,6 +697,46 @@ def test_recovery_pending_with_no_response_arg_relaunches(tmp_path):
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
 
 
+def test_interrupted_step_resumes_past_engine_checkpoint_commits(tmp_path):
+    """#65 incident replay: every plain resume FIRST commits a fresh
+    `gauntlet: response … pending` checkpoint (the reconcile flush), advancing
+    HEAD past the interrupted step's base_sha BEFORE the dirty-base check runs.
+    With a bare `head != base` check that re-parked INTERRUPTED in <1s, forever
+    — un-loopable from outside even by hand-repairing base_sha. The engine's
+    own commits are not the killed step's partial edits: resume must drive."""
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    # A real run's PRD is committed (approved artifact); the fixture's untracked
+    # stub would otherwise dirty the porcelain leg and mask the HEAD-leg bug.
+    git(repo, "add", "runs/demo/prd.md")
+    git(repo, "commit", "-qm", "PRD.1: author prd")
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    _seed_pending(mgr, "Ratify option 1.")
+    # The kill left the step INTERRUPTED (not PARKED) with its base_sha stamped
+    # before the pending checkpoint the next resume will flush.
+    run_dir = _run_dir(mgr)
+    man = Manifest.load(run_dir / "manifest.json")
+    rec = man.record("implement")
+    rec.status = M.INTERRUPTED
+    rec.parked_reason = None
+    rec.halt_reason = M.HALT_REASON_SIGNAL_KILL
+    assert rec.base_sha == gitops.head_sha(repo)  # stamped pre-checkpoint
+    man.write_atomic(run_dir / "manifest.json")
+
+    adapter = ScriptedAdapter("proceed")
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_DONE  # drove the step — no insta-re-park loop
+    assert len(adapter.prompts) == 1
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.DONE
+    assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+    assert _checkpoint_log(repo) == [
+        "Gauntlet Engine|gauntlet: response implement-resp-1 pending",
+        "Gauntlet Engine|gauntlet: response implement-resp-1 consumed",
+    ]
+
+
 def test_recovery_different_response_over_pending_errors(tmp_path):
     repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
     _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
