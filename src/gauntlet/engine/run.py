@@ -1144,7 +1144,7 @@ class RunManager:
                 listing = "\n  ".join(dirt.splitlines()[:8])
                 raise WorktreeDirtyError(
                     f"refusing to start {slug!r}: the worktree has "
-                    "uncommitted changes outside the run's artifact dir:\n"
+                    "uncommitted changes outside the run root:\n"
                     f"  {listing}\n"
                     "Commit, stash, or discard them first — starting now "
                     f"would create {branch!r} carrying these changes and "
