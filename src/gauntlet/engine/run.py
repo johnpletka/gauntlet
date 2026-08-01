@@ -27,7 +27,10 @@ from pathlib import Path
 
 from gauntlet.engine import gitops, manifest as M, prd_stub
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
-from gauntlet.engine.execution import run_bookkeeping_excludes
+from gauntlet.engine.execution import (
+    engine_bookkeeping_candidates,
+    run_bookkeeping_excludes,
+)
 from gauntlet.engine.identity import resolve_operator_identity
 from gauntlet.engine.judgeproc import (
     JUDGE_RECORD_NAME,
@@ -2646,7 +2649,8 @@ class RunManager:
         last_recorded = man.commits[-1].sha
         head = gitops.head_sha(self.repo_root)
         if head != last_recorded and not gitops.advance_is_engine_bookkeeping(
-            self.repo_root, last_recorded, exclude=excludes
+            self.repo_root, last_recorded,
+            bookkeeping=engine_bookkeeping_candidates(self.repo_root, run_dir),
         ):
             raise RollbackGuardError(
                 "refusing rollback: branch has diverged from the manifest "

@@ -331,7 +331,12 @@ def test_reset_soft_keeps_worktree_and_stages_changes(fixture_repo):
 
 
 # --- engine-bookkeeping tolerance in the dirty-base check (#62/#65) -----------
-_BK_EXCLUDES = ["runs/demo/run-1"]
+# The dirty-check exclusions (porcelain leg) vs the exact allowlist of paths an
+# engine COMMIT may touch (the tolerance leg) — deliberately different sets:
+# the exclusions also hide human-owned files (PR.md) the engine never commits
+# (PR #76 review F-001).
+_BK_EXCLUDES = ["runs/demo/run-1", "runs/*/PR.md"]
+_BK_PATHS = ["runs/demo/run-1/manifest.json", "runs/demo/run-1/RUN.md"]
 
 
 def _bookkeeping_commit(repo, subject="gauntlet: response r-1 pending", *,
@@ -362,14 +367,16 @@ def test_is_dirty_vs_tolerates_engine_bookkeeping_advance(fixture_repo):
     _bookkeeping_commit(
         fixture_repo, "gauntlet: flush run bookkeeping before P2 round-1 review handoff"
     )
-    assert not gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
-    assert gitops.advance_is_engine_bookkeeping(fixture_repo, base, exclude=_BK_EXCLUDES)
-    # Without the exclusion policy the same range reads dirty (fail closed):
-    # the bookkeeping paths themselves are then a real tree change.
+    assert not gitops.is_dirty_vs(
+        fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS
+    )
+    assert gitops.advance_is_engine_bookkeeping(fixture_repo, base, bookkeeping=_BK_PATHS)
+    # Without a bookkeeping allowlist the tolerance is OFF (fail closed): a
+    # HEAD past the base reads dirty exactly as before.
     assert gitops.is_dirty_vs(fixture_repo, base)
     # Uncommitted real work still reads dirty regardless of the tolerance.
     (fixture_repo / "partial.py").write_text("half written")
-    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
 
 
 def test_bookkeeping_tolerance_requires_engine_author(fixture_repo):
@@ -380,9 +387,9 @@ def test_bookkeeping_tolerance_requires_engine_author(fixture_repo):
         fixture_repo, "gauntlet: response r-1 pending",
         identity=Identity("Impostor", "impostor@example.com"),
     )
-    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
     assert not gitops.advance_is_engine_bookkeeping(
-        fixture_repo, base, exclude=_BK_EXCLUDES
+        fixture_repo, base, bookkeeping=_BK_PATHS
     )
 
 
@@ -392,7 +399,7 @@ def test_bookkeeping_tolerance_requires_engine_subject(fixture_repo):
     _bookkeeping_commit(
         fixture_repo, "flush run bookkeeping", identity=gitops.ENGINE_IDENTITY
     )
-    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
 
 
 def test_bookkeeping_tolerance_tree_diff_is_authoritative(fixture_repo):
@@ -405,9 +412,9 @@ def test_bookkeeping_tolerance_tree_diff_is_authoritative(fixture_repo):
         fixture_repo, "gauntlet: rewind implementation to abcdef1234 for re-run (x)",
         ["impl.py"], identity=gitops.ENGINE_IDENTITY,
     )
-    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
     assert not gitops.advance_is_engine_bookkeeping(
-        fixture_repo, base, exclude=_BK_EXCLUDES
+        fixture_repo, base, bookkeeping=_BK_PATHS
     )
 
 
@@ -418,11 +425,31 @@ def test_bookkeeping_tolerance_refuses_behind_and_forked(fixture_repo):
     )
     # HEAD strictly BEHIND the recorded base: never bookkeeping drift.
     gitops.reset_hard(fixture_repo, f"{ahead}~1")
-    assert gitops.is_dirty_vs(fixture_repo, ahead, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, ahead, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
     # Genuine fork off the same parent: also refused.
     (fixture_repo / "b.py").write_text("b\n")
     gitops.commit_all(fixture_repo, "P1: b\n\nbody", identity=Identity("B", "b@g.local"))
-    assert gitops.is_dirty_vs(fixture_repo, ahead, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, ahead, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
+
+
+def test_bookkeeping_tolerance_is_an_allowlist_not_the_exclusions(fixture_repo):
+    """PR #76 review F-001: PR.md sits in the dirty-check EXCLUSIONS (human-
+    owned, hidden from porcelain and engine commits) but is never engine-
+    committed — an engine-shaped commit touching it must NOT classify as
+    bookkeeping, or rollback would hard-reset a human-owned change away."""
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "runs" / "demo").mkdir(parents=True)
+    (fixture_repo / "runs" / "demo" / "PR.md").write_text("human-owned draft\n")
+    gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: response r-1 pending", ["runs/demo/PR.md"],
+        identity=gitops.ENGINE_IDENTITY,
+    )
+    assert not gitops.advance_is_engine_bookkeeping(
+        fixture_repo, base, bookkeeping=_BK_PATHS
+    )
+    assert gitops.is_dirty_vs(
+        fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS
+    )
 
 
 def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
@@ -434,4 +461,4 @@ def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
         fixture_repo, "P2 wip: real work\n\nbody",
         identity=Identity("Builder", "b@g.local"), exclude=_BK_EXCLUDES,
     )
-    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES)
+    assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)

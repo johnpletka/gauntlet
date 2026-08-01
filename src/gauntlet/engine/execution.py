@@ -254,6 +254,27 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     return excludes
 
 
+def engine_bookkeeping_candidates(repo_root: Path, run_dir: Path) -> list[str]:
+    """Every path an engine bookkeeping COMMIT may touch (PR #76 review F-001).
+
+    The exact allowlist — existence-independent, because a commit classifier
+    walks history, where a path may appear that no longer exists on disk. This
+    is deliberately NARROWER than ``run_bookkeeping_excludes``: the dirty-check
+    exclusions also hide human-owned files (every slug's ``PR.md``) that the
+    engine must never commit, so classifying a commit as engine bookkeeping by
+    the *exclusion* list would let an engine-shaped commit touching ``PR.md``
+    pass — and rollback would then hard-reset a human-owned change away.
+    """
+    root = repo_root.resolve()
+    paths: list[str] = []
+    for name in ("manifest.json", "RUN.md"):
+        try:
+            paths.append((run_dir / name).resolve().relative_to(root).as_posix())
+        except ValueError:
+            pass
+    return paths
+
+
 def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
     """Repo-relative paths of the two on-disk run-bookkeeping files.
 
@@ -264,14 +285,7 @@ def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
     commits and the cycle's fix-rerun rewind so the two can never disagree on
     what counts as bookkeeping.
     """
-    root = repo_root.resolve()
-    paths: list[str] = []
-    for name in ("manifest.json", "RUN.md"):
-        p = run_dir / name
-        if not p.exists():
-            continue
-        try:
-            paths.append(p.resolve().relative_to(root).as_posix())
-        except ValueError:
-            pass
-    return paths
+    return [
+        rel for rel in engine_bookkeeping_candidates(repo_root, run_dir)
+        if (repo_root.resolve() / rel).exists()
+    ]

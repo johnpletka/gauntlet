@@ -1142,8 +1142,11 @@ def _echo_interrupted_park_detail(mgr, slug: str, status: str) -> None:
     A dirty-base insta-park does zero agent work and used to print only
     `run status: parked` (exit 0), sending the operator straight back into the
     resume loop. The park's evidence already lives in the step notes (the dirty
-    verdict + offending commit range); surface it here. Best-effort read-only
-    reporting: a failure to load the manifest never masks the resume outcome.
+    verdict + offending commit range); surface it here — on stdout, with the
+    status line it explains: a park after a successful resume is an outcome,
+    not an error (stderr is this CLI's refusal/error channel). Best-effort
+    read-only reporting: a failure to load the manifest never masks the resume
+    outcome.
     """
     from gauntlet.engine import manifest as M
 
@@ -1161,7 +1164,7 @@ def _echo_interrupted_park_detail(mgr, slug: str, status: str) -> None:
     if not noted:
         return
     step = noted[-1]
-    typer.echo(f"step {step.id}: {step.notes}", err=True)
+    typer.echo(f"step {step.id}: {step.notes}")
 
 
 @app.command()

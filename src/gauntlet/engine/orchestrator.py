@@ -34,6 +34,7 @@ from gauntlet.engine.execution import (
     SKIPPED,
     StepContext,
     StepResult,
+    engine_bookkeeping_candidates,
     get_spec,
     run_bookkeeping_excludes,
     run_bookkeeping_paths,
@@ -613,7 +614,10 @@ class Orchestrator:
         # Detect partial work against the narrow bookkeeping exclusion, so a
         # partial *artifact* under the run root (not just a repo-root file) is
         # still seen as a mid-edit interruption (review F-001).
-        if not gitops.is_dirty_vs(self.repo_root, rec.base_sha, exclude=self.excludes):
+        if not gitops.is_dirty_vs(
+            self.repo_root, rec.base_sha, exclude=self.excludes,
+            bookkeeping=engine_bookkeeping_candidates(self.repo_root, self.run_dir),
+        ):
             # Clean re-entry: the agent left no partial edits, and any HEAD
             # advance past base_sha is engine bookkeeping only (is_dirty_vs
             # tolerates exactly that). Re-arm the transaction boundary the same

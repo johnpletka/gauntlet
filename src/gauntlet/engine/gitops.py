@@ -160,7 +160,13 @@ def is_clean(repo: Path, *, exclude: list[str] | None = None) -> bool:
     return status_porcelain(repo, exclude=exclude) == ""
 
 
-def is_dirty_vs(repo: Path, base_sha: str, *, exclude: list[str] | None = None) -> bool:
+def is_dirty_vs(
+    repo: Path,
+    base_sha: str,
+    *,
+    exclude: list[str] | None = None,
+    bookkeeping: list[str] | None = None,
+) -> bool:
     """True if the worktree (tracked + staged + untracked) differs from ``base_sha``.
 
     The engine's transaction boundary (review F-003) records a step's base SHA
@@ -170,25 +176,33 @@ def is_dirty_vs(repo: Path, base_sha: str, *, exclude: list[str] | None = None) 
     HEAD ahead of ``base_sha`` is NOT dirt when the advance is purely the
     engine's own bookkeeping (#62/#65): the engine itself moves HEAD past the
     recorded base during a drive with response checkpoints and run-bookkeeping
-    flushes, which touch only ``exclude``d paths. A bare ``head != base`` here
-    made every plain resume of an interrupted step re-park on the engine's own
-    commits, forever. Real commits above the base — wip checkpoints, operator
-    commits, anything not engine bookkeeping — still read as dirty (fail
-    closed); so does a HEAD behind or forked from the base.
+    flushes. A bare ``head != base`` here made every plain resume of an
+    interrupted step re-park on the engine's own commits, forever.
+    ``bookkeeping`` is the EXACT allowlist of paths engine commits may touch
+    (``engine_bookkeeping_candidates``) — deliberately not the broader
+    ``exclude`` list, which also hides human-owned files the engine never
+    commits (PR #76 review F-001). ``None`` disables the tolerance entirely
+    (fail closed). Real commits above the base — wip checkpoints, operator
+    commits, anything not engine bookkeeping — still read as dirty; so does a
+    HEAD behind or forked from the base.
     """
     if status_porcelain(repo, exclude=exclude) != "":
         return True
     if head_sha(repo) == base_sha:
         return False
-    return not advance_is_engine_bookkeeping(repo, base_sha, exclude=exclude)
+    if bookkeeping is None:
+        return True
+    return not advance_is_engine_bookkeeping(repo, base_sha, bookkeeping=bookkeeping)
 
 
 def advance_is_engine_bookkeeping(
-    repo: Path, base_sha: str, *, exclude: list[str] | None = None
+    repo: Path, base_sha: str, *, bookkeeping: list[str]
 ) -> bool:
     """True iff ``base_sha..HEAD`` is nothing but engine bookkeeping (#62/#65).
 
-    Three legs, ALL required (fail closed):
+    ``bookkeeping`` is the exact allowlist of repo-relative paths an engine
+    bookkeeping commit may touch (the run's ``manifest.json``/``RUN.md`` — see
+    ``engine_bookkeeping_candidates``). Three legs, ALL required (fail closed):
 
     1. ``base_sha`` is an ancestor of HEAD — behind or genuinely forked is
        never bookkeeping drift.
@@ -196,11 +210,14 @@ def advance_is_engine_bookkeeping(
        ``ENGINE_IDENTITY`` author AND the ``gauntlet: `` subject prefix. Either
        marker alone is forgeable/ambiguous; requiring both keeps the commit
        convention honest.
-    3. The AUTHORITATIVE leg: the aggregate tree diff ``base_sha..HEAD``
-       outside the ``exclude``d bookkeeping paths is empty. The markers are a
-       cheap precondition, but a ``gauntlet:``-subject commit CAN carry an
-       implementation tree change (``rewind_impl_preserving_bookkeeping``
-       builds one), so the tree diff — not the commit labels — decides.
+    3. The AUTHORITATIVE leg: every path changed across ``base_sha..HEAD`` is
+       in the ``bookkeeping`` allowlist. The markers are a cheap precondition,
+       but a ``gauntlet:``-subject commit CAN carry other tree changes
+       (``rewind_impl_preserving_bookkeeping`` builds one, and the markers are
+       locally forgeable), so the tree diff — not the commit labels — decides.
+       An allowlist, not the dirty-check exclusions: those exclusions also
+       hide human-owned paths (every slug's ``PR.md``) that must never be
+       classified as engine bookkeeping (PR #76 review F-001).
     """
     head = head_sha(repo)
     if head == base_sha:
@@ -214,10 +231,9 @@ def advance_is_engine_bookkeeping(
             return False
         if not _ENGINE_SUBJECT_RE.match(subject):
             return False
-    diff = _run(
-        repo, "diff", "--name-only", base_sha, head, *_exclude_pathspec(exclude)
-    ).strip()
-    return diff == ""
+    changed = _run(repo, "diff", "--name-only", base_sha, head).splitlines()
+    allowed = set(bookkeeping)
+    return all(path in allowed for path in changed if path)
 
 
 def worktree_tree_hash(repo: Path) -> str:

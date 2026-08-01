@@ -486,6 +486,29 @@ def test_rollback_tolerates_engine_bookkeeping_above_last_recorded(fixture_repo)
     assert "refs/gauntlet/backup/" in refs
 
 
+def test_rollback_refuses_engine_shaped_commit_touching_pr_md(fixture_repo):
+    """PR #76 review F-001: PR.md is hidden from dirty checks (human-owned) but
+    the engine never commits it, so an engine-MARKED commit that touches it is
+    not bookkeeping — rollback must refuse, not hard-reset it away."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    (fixture_repo / "runs" / "demo" / "PR.md").write_text("human-owned draft\n")
+    gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: response impl2-resp-1 pending",
+        ["runs/demo/PR.md"], identity=gitops.ENGINE_IDENTITY,
+    )
+    with pytest.raises(RollbackGuardError, match="diverged"):
+        mgr.rollback("demo", phase=1)
+
+
 def test_rollback_refuses_branch_ahead_of_manifest(fixture_repo):
     # F-003: an extra unmanifested commit means branch != manifest tip -> refuse.
     mgr = _prepare(fixture_repo)

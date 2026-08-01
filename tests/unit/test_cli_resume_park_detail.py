@@ -54,10 +54,14 @@ def test_parked_resume_prints_the_dirty_verdict(tmp_path, monkeypatch):
     monkeypatch.setattr(RunManager, "resume", lambda self, slug, **kw: M.RUN_PARKED)
     result = runner.invoke(app, ["resume", "demo"])
     assert result.exit_code == 0
-    assert "run status: parked" in result.output
+    # Status AND its explanation travel together on STDOUT (PR #76 review):
+    # the park is an outcome, not an error, and asserting the stdout stream
+    # specifically keeps this contract stable across click versions (whose
+    # CliRunner has changed how `.output` mixes stderr).
+    assert "run status: parked" in result.stdout
     # The WHY travels with the status — never a bare park (#65).
-    assert "interrupted mid-edit" in result.output
-    assert "P2 wip: arm the thing" in result.output
+    assert "interrupted mid-edit" in result.stdout
+    assert "P2 wip: arm the thing" in result.stdout
 
 
 def test_non_parked_resume_stays_quiet(tmp_path, monkeypatch):
@@ -66,5 +70,5 @@ def test_non_parked_resume_stays_quiet(tmp_path, monkeypatch):
     monkeypatch.setattr(RunManager, "resume", lambda self, slug, **kw: M.RUN_DONE)
     result = runner.invoke(app, ["resume", "demo"])
     assert result.exit_code == 0
-    assert "run status: done" in result.output
+    assert "run status: done" in result.stdout
     assert "interrupted mid-edit" not in result.output

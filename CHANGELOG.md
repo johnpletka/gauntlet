@@ -16,10 +16,11 @@ therefore re-parked INTERRUPTED in under a second, forever, exit 0, with
 `rollback`'s divergence guard was unsatisfiable for any run that ever took a
 checkpoint). The dirty check now tolerates a `base_sha..HEAD` range iff every
 commit carries both engine markers (`ENGINE_IDENTITY` author and the
-`gauntlet:` subject) *and* — the authoritative leg — the aggregate tree diff
-outside the bookkeeping exclusions is empty, so an engine-labelled commit that
-moves implementation still reads dirty; rollback's guard shares the same
-tolerance. The transaction boundary is now re-armed per step *attempt*: a
+`gauntlet:` subject) *and* — the authoritative leg — every changed path is in
+the exact allowlist of engine-committed bookkeeping files (the run's
+`manifest.json`/`RUN.md`), so an engine-labelled commit that moves anything
+else — implementation, or a human-owned excluded file like `PR.md` — still
+reads dirty; rollback's guard shares the same tolerance. The transaction boundary is now re-armed per step *attempt*: a
 cleanly re-entering interrupted step and an `on_fail` retry both re-stamp
 `base_sha` at their own entry HEAD, so `interrupted_step: reset_to_base` can
 no longer rewind to a stale phase boundary predating the artifact under review
