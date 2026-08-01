@@ -642,16 +642,18 @@ class Orchestrator:
             ts = self.clock().replace(":", "-")
             backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
             # Human-owned excluded files (PR.md) are hidden from the dirty
-            # check AND the backup by policy, but the reset below is not
-            # policy-scoped — carry their uncommitted bytes across the rewind
-            # (PR #77 review).
+            # check by policy, but the reset below is not policy-scoped. Carry
+            # their worktree state across the rewind and include it in the
+            # backup ref so the preservation is durable (PR #77 review).
+            human_patterns = human_owned_excludes(self.excludes)
             overlay = gitops.worktree_overlay(
-                self.repo_root, human_owned_excludes(self.excludes)
+                self.repo_root, human_patterns
             )
             # Snapshot the partial work (tracked + untracked) before discarding.
             gitops.backup_dirty_worktree(
                 self.repo_root, backup, f"interrupted {rec.id} partial work",
                 exclude=self.excludes,
+                include=human_patterns if overlay else None,
             )
             # Flush the authoritative in-memory manifest to disk BEFORE the
             # rewind, so the bookkeeping the rewind preserves carries the latest
@@ -804,17 +806,18 @@ class Orchestrator:
             return result
         ts = self.clock().replace(":", "-")
         backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-conflict-{ts}"
-        # PR #77 review: a tracked PR.md with uncommitted human edits is under
-        # the run root (excluded from this backup) but NOT protected from the
-        # reset below — carry it across by hand.
+        # PR #77 review: carry human-owned PR.md state across the reset and
+        # include it in the backup ref so preservation survives a process kill.
+        human_patterns = human_owned_excludes(self.excludes)
         overlay = gitops.worktree_overlay(
-            self.repo_root, human_owned_excludes(self.excludes)
+            self.repo_root, human_patterns
         )
         gitops.backup_dirty_worktree(
             self.repo_root,
             backup,
             f"conflict-park partial work for {rec.id} (F-001)",
             exclude=run_root,
+            include=human_patterns if overlay else None,
         )
         gitops.reset_hard(self.repo_root, self._head_sha())
         # `reset --hard` leaves untracked files; clear the builder's untracked

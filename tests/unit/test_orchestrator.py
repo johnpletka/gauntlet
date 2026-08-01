@@ -466,6 +466,46 @@ def test_reset_policy_preserves_uncommitted_pr_md_edits(fixture_repo):
     assert orch.drive() == M.RUN_DONE
     assert not (fixture_repo / "partial.py").exists()  # partial work discarded
     assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/backup/",
+    ).splitlines()
+    backup = next(ref for ref in refs if "/implement-" in ref)
+    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") == (
+        "PR draft v2 — human edited, uncommitted\n"
+    )
+
+
+def test_reset_policy_preserves_and_backs_up_pr_md_deletion(fixture_repo):
+    """A tracked PR.md deletion is an uncommitted human edit: reset must not
+    resurrect it, and the backup ref must durably represent the deletion."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("PR draft to delete\n")
+    gitops.commit_all(
+        fixture_repo, "P1: track the PR draft\n\nbody",
+        identity=gitops.Identity("Human", "h@g.local"),
+    )
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "partial.py").write_text("half written")
+    pr.unlink()
+    orch = _build(
+        fixture_repo,
+        _RESUME_PIPELINE,
+        adapters={"builder": FakeAdapter(writes={"clean.py": "real output\n"})},
+        manifest=man,
+        interrupted="reset_to_base",
+    )
+
+    assert orch.drive() == M.RUN_DONE
+    assert not pr.exists()
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/backup/",
+    ).splitlines()
+    backup = next(ref for ref in refs if "/implement-" in ref)
+    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") is None
 
 
 def test_interrupted_park_notes_name_the_reset_verb(fixture_repo):

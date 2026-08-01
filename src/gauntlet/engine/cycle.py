@@ -396,17 +396,18 @@ def _reset_dirty_to_handoff(
         f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
         f"{ctx.record.id}-r{rnd}-fix-resume"
     )
-    # PR #77 review: human-owned PR.md is excluded from the dirty check and
-    # the backup by policy, but the reset below is not policy-scoped — carry
-    # its uncommitted bytes across the rewind.
+    # PR #77 review: carry human-owned PR.md state across the reset and include
+    # it in the backup ref so preservation survives a process kill.
+    human_patterns = human_owned_excludes(ctx.excludes)
     overlay = gitops.worktree_overlay(
-        ctx.repo_root, human_owned_excludes(ctx.excludes)
+        ctx.repo_root, human_patterns
     )
     gitops.backup_dirty_worktree(
         ctx.repo_root, backup,
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
         f"round {rnd} (P5 re-enter at fix)",
         exclude=ctx.excludes,
+        include=human_patterns if overlay else None,
     )
     paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
     if (
@@ -2235,15 +2236,17 @@ class _MutationGuard:
             f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
             f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}"
         )
-        # PR #77 review: carry human-owned PR.md edits across the revert —
-        # excluded from the backup by policy, but not from the reset.
+        # PR #77 review: carry human-owned PR.md state across the revert and
+        # include it in the backup ref so preservation survives a process kill.
+        human_patterns = human_owned_excludes(ctx.excludes)
         overlay = gitops.worktree_overlay(
-            ctx.repo_root, human_owned_excludes(ctx.excludes)
+            ctx.repo_root, human_patterns
         )
         gitops.backup_dirty_worktree(
             ctx.repo_root, backup,
             f"reviewer mutation during {ctx.record.id} round {self.rnd}",
             exclude=ctx.excludes,
+            include=human_patterns if overlay else None,
         )
         gitops.reset_hard(ctx.repo_root, self.handoff)
         # Clean with the SAME narrow excludes as detection (P4.r1 F-006): a

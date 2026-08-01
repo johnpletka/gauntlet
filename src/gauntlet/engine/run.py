@@ -2753,7 +2753,23 @@ class RunManager:
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
-        gitops.checkout_branch(repo, man.branch)
+        current_branch = gitops.current_branch(repo)
+        if current_branch != man.branch:
+            # PR #77 confirm review: PR.md is intentionally excluded from the
+            # generic dirty guard, but a checkout can still refuse when those
+            # edits conflict with the run branch. Fail before switching branches
+            # with a precise, sanctioned resolution instead of leaking a raw git
+            # error or risking a carry-over onto the wrong branch.
+            checkout_overlay = gitops.worktree_overlay(
+                repo, human_owned_excludes(excludes)
+            )
+            if checkout_overlay:
+                raise RollbackGuardError(
+                    "refusing rollback: the current branch has uncommitted "
+                    "human-owned PR.md state; commit or move those edits before "
+                    f"switching to run branch {man.branch!r}"
+                )
+            gitops.checkout_branch(repo, man.branch)
         # Guard 2: branch tip must AGREE with the manifest's last recorded
         # commit before a rewind (FR-9.9). Three tiers (#62/#72):
         # - tip == last recorded, or ahead by ONLY engine bookkeeping commits
@@ -2795,10 +2811,25 @@ class RunManager:
                 f"no recorded phase-{phase} commit boundary to roll back to"
             )
 
+        # Capture human-owned state before the backup/reset. It is excluded from
+        # the normal dirty guard by policy, but must be both restored after the
+        # reset and represented durably in the backup ref (PR #77 review).
+        human_patterns = human_owned_excludes(excludes)
+        overlay = gitops.worktree_overlay(self.repo_root, human_patterns)
+
         # Backup ref + manifest snapshot before any rewind (F-010).
         ts = _utc_stamp()
         backup_ref = f"refs/gauntlet/backup/{man.run_id}/{ts}"
-        gitops.create_ref(self.repo_root, backup_ref, head)
+        if overlay:
+            gitops.backup_dirty_worktree(
+                self.repo_root,
+                backup_ref,
+                f"rollback {man.slug} to phase P{phase}",
+                exclude=excludes,
+                include=human_patterns,
+            )
+        else:
+            gitops.create_ref(self.repo_root, backup_ref, head)
         shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.snapshot-{ts}.json")
         if absorbed is not None:
             # Loud absorption (#72): the discarded-but-backed-up range is part
@@ -2811,12 +2842,6 @@ class RunManager:
                 f"backed up at {backup_ref}:\n{absorbed}"
             )
 
-        # PR #77 review: human-owned PR.md files are excluded from the dirty
-        # check and the backup by policy, but `reset --hard` is not
-        # policy-scoped — carry their uncommitted bytes across the rewind.
-        overlay = gitops.worktree_overlay(
-            self.repo_root, human_owned_excludes(excludes)
-        )
         gitops.reset_hard(self.repo_root, target)
         gitops.restore_overlay(self.repo_root, overlay)
         self._rewind_manifest(man, run_dir, target)

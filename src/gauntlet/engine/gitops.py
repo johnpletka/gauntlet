@@ -914,53 +914,72 @@ def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:
     _run(repo, *args)
 
 
-def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes]:
-    """Worktree bytes of files matching ``patterns`` that differ from HEAD.
+def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes | None]:
+    """Worktree state of files matching ``patterns`` that differs from HEAD.
 
-    Captures modified/staged/untracked matches as ``{repo-rel-path: bytes}``.
+    Captures modified/staged/untracked matches as ``{repo-rel-path: bytes}``
+    and tracked deletions as ``{repo-rel-path: None}`` tombstones.
     Used to carry human-owned excluded files (``PR.md``, FR-9.8) across a
     rewind: they are invisible to the dirty checks by policy, so a
     ``reset --hard`` would otherwise silently destroy their uncommitted edits
-    with no backup (PR #77 review). Restore with :func:`restore_overlay` after
-    the rewind — the files come back as uncommitted worktree content, exactly
-    as the human left them.
+    (PR #77 review). Restore with :func:`restore_overlay` after the rewind;
+    callers also include these paths in the durable backup ref so a crash
+    between reset and restore cannot strand the only copy in process memory.
     """
     if not patterns:
         return {}
     out = _run(
         repo, "status", "--porcelain", "--untracked-files=all", "--", *patterns
     )
-    overlay: dict[str, bytes] = {}
+    overlay: dict[str, bytes | None] = {}
     for line in out.splitlines():
+        status = line[:2]
         rel = line[3:]
         if " -> " in rel:  # rename entry: the new path is the live one
             rel = rel.split(" -> ", 1)[1]
         rel = rel.strip().strip('"')
         path = repo / rel
-        if path.is_file():
+        if "D" in status and not path.exists() and not path.is_symlink():
+            overlay[rel] = None
+        elif path.is_file():
             overlay[rel] = path.read_bytes()
     return overlay
 
 
-def restore_overlay(repo: Path, overlay: dict[str, bytes]) -> None:
-    """Rewrite :func:`worktree_overlay` captures after a rewind (uncommitted)."""
+def restore_overlay(repo: Path, overlay: dict[str, bytes | None]) -> None:
+    """Restore :func:`worktree_overlay` bytes/deletions after a rewind."""
     for rel, data in overlay.items():
         path = repo / rel
+        if data is None:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            continue
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
 
 def backup_dirty_worktree(
-    repo: Path, ref: str, message: str, *, exclude: list[str] | None = None
+    repo: Path,
+    ref: str,
+    message: str,
+    *,
+    exclude: list[str] | None = None,
+    include: list[str] | None = None,
 ) -> str:
     """Snapshot the full dirty worktree (tracked + untracked) to a backup ref.
 
     Captures partial work that ``reset --hard`` would otherwise destroy
     (review F-003 / F-010 safety). ``exclude`` (the run root) is left out so the
     snapshot — and the subsequent reset — never touch the run bookkeeping.
+    ``include`` is staged after the exclusion pass, allowing a caller to put
+    human-owned excluded paths into the *backup ref only*. This makes their
+    modified bytes or deletion durable without changing the engine's normal
+    dirty-check/commit policy (PR #77 review).
     Returns the backup commit SHA.
     """
     _run(repo, "add", "-A", *_exclude_pathspec(exclude))
+    if include:
+        _run(repo, "add", "-A", "--", *include)
     tree = _run(repo, "write-tree").strip()
     parent = head_sha(repo)
     backup = _run(repo, "commit-tree", tree, "-p", parent, "-m", message).strip()

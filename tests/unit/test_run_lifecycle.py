@@ -606,6 +606,25 @@ def test_rollback_refuses_missing_run_branch(fixture_repo):
         mgr.rollback("demo", phase=1)
 
 
+def test_rollback_refuses_cross_branch_checkout_with_pr_md_edits(fixture_repo):
+    """Excluded human edits must be handled before switching to the run branch;
+    fail with an actionable guard instead of leaking a checkout failure."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, LINEAR)
+    mgr.start("demo", path, use_judge=False,
+              adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
+    git(fixture_repo, "checkout", "-q", "main")
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True, exist_ok=True)
+    pr.write_text("uncommitted human draft\n")
+
+    with pytest.raises(RollbackGuardError, match="human-owned PR.md"):
+        mgr.rollback("demo", phase=1)
+    assert gitops.current_branch(fixture_repo) == "main"
+    assert pr.read_text() == "uncommitted human draft\n"
+
+
 def test_rollback_preserves_uncommitted_pr_md_edits(fixture_repo):
     """PR #77 review (blocking): PR.md is excluded from the dirty check and
     the backup by policy, but reset --hard is not policy-scoped — the human's
@@ -634,6 +653,43 @@ def test_rollback_preserves_uncommitted_pr_md_edits(fixture_repo):
     # The tracked version was absorbed (backed up); the uncommitted edit is
     # back in the worktree byte-for-byte.
     assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/backup/",
+    ).splitlines()
+    backup = refs[-1]
+    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") == (
+        "PR draft v2 — human edited, uncommitted\n"
+    )
+
+
+def test_rollback_preserves_and_backs_up_pr_md_deletion(fixture_repo):
+    """Rollback restores a tracked PR.md deletion after reset and represents
+    that deletion durably in its backup ref."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.write_text("draft to delete\n")
+    git(fixture_repo, "add", "runs/demo/prd.md", "runs/demo/PR.md")
+    git(fixture_repo, "commit", "-qm", "track run inputs")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    pr.unlink()
+
+    mgr.rollback("demo", phase=1)
+    assert not pr.exists()
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/backup/",
+    ).splitlines()
+    backup = refs[-1]
+    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") is None
 
 
 def test_rollback_refuses_branch_forked_from_manifest(fixture_repo):

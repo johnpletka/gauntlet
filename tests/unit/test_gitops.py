@@ -474,6 +474,50 @@ def test_worktree_overlay_round_trip(fixture_repo):
     gitops._run(fixture_repo, "checkout", "--", "runs/demo/PR.md")
     assert gitops.worktree_overlay(fixture_repo, []) == {}
 
+    # A deletion is state too: record a tombstone so reset cannot silently
+    # resurrect a human-owned file the operator deliberately removed.
+    pr.unlink()
+    overlay = gitops.worktree_overlay(fixture_repo, ["runs/*/PR.md"])
+    assert overlay == {"runs/demo/PR.md": None}
+    gitops.reset_hard(fixture_repo, "HEAD")
+    assert pr.exists()
+    gitops.restore_overlay(fixture_repo, overlay)
+    assert not pr.exists()
+
+
+def test_backup_dirty_worktree_durably_includes_excluded_overlay(fixture_repo):
+    """Human-owned paths stay excluded from engine policy but are explicitly
+    included in rewind backup refs, including a tracked deletion."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("draft v1\n")
+    gitops._run(fixture_repo, "add", "-A")
+    gitops._run(fixture_repo, "commit", "-qm", "track PR draft")
+
+    patterns = ["runs/*/PR.md"]
+    pr.write_text("draft v2 — human edited\n")
+    modified = gitops.backup_dirty_worktree(
+        fixture_repo,
+        "refs/gauntlet/backup/modified-pr",
+        "snapshot modified PR",
+        exclude=patterns,
+        include=patterns,
+    )
+    assert gitops.file_at_commit(
+        fixture_repo, modified, "runs/demo/PR.md"
+    ) == "draft v2 — human edited\n"
+
+    gitops.reset_hard(fixture_repo, "HEAD")
+    pr.unlink()
+    deleted = gitops.backup_dirty_worktree(
+        fixture_repo,
+        "refs/gauntlet/backup/deleted-pr",
+        "snapshot deleted PR",
+        exclude=patterns,
+        include=patterns,
+    )
+    assert gitops.file_at_commit(fixture_repo, deleted, "runs/demo/PR.md") is None
+
 
 def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
     # One real commit anywhere in the range poisons the whole tolerance.

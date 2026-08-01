@@ -29,9 +29,11 @@ and verifies + checks out the run branch explicitly before any guard reads a
 SHA (bare HEAD under the absorb tier would have hard-reset a checked-out
 merged `main`); every rewind site (interrupted reset, conflict-park restore,
 rollback, the cycle's fix-resume and mutation reverts) carries uncommitted
-edits to human-owned excluded files (`PR.md`) across the reset byte-for-byte
-— they are hidden from the dirty checks by policy, but `reset --hard` is not
-policy-scoped; and the recover reconciliation is best-effort end-to-end (a
+edits and deletions to human-owned excluded files (`PR.md`) across the reset,
+and includes that state in the durable backup ref — they are hidden from the
+dirty checks by policy, but `reset --hard` is not policy-scoped. A cross-branch
+rollback now refuses with an actionable guard before checkout when such local
+state exists; and the recover reconciliation is best-effort end-to-end (a
 failing `update-ref`/`log` degrades to a warning, never blocks the kill/audit
 finalization). Regression tests replay the incident at the recover, rollback,
 and full-stack resume level.
