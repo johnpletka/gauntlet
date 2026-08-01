@@ -83,6 +83,14 @@ behind that output. Drive every decision off the reported state class:
   halt means the *agent* genuinely exceeded its budget, not that the laptop lid
   closed. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
+  A plain `resume` re-parks (fast, zero agent work) when the killed attempt left
+  the tree or branch dirty vs the step's recorded base — the park message shows
+  the dirty verdict (uncommitted paths and/or the offending commit range). The
+  sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it backs the
+  partial work up to `refs/gauntlet/backup/`, rewinds only to the latest
+  committed `P<N> wip:` checkpoint (committed milestones survive), and re-runs
+  the step cleanly. One-shot — the configured `interrupted_step` policy is
+  unchanged. Never reach for `git reset` on a run branch instead.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
 - **`unknown`** — an unrecognized or internally contradictory manifest. Action:
@@ -102,7 +110,10 @@ Work top-down; stop at the first branch that matches.
    → supply the response (§3). A gate decision is the only routine pause; make it
    deliberately, never reflexively.
 3. **Did it fail?** `failed` / `halted` / `interrupted` → `gauntlet logs <slug>`
-   to see the failing step's transcript and dir, diagnose, then `resume`.
+   to see the failing step's transcript and dir, diagnose, then `resume`. An
+   `interrupted` step that re-parks on a dirty base has a sanctioned exit:
+   `resume --reset-interrupted` (§1); a branch left ahead of the manifest by a
+   killed builder is reconciled by `rollback` or that same verb (§4/§4a).
 4. **Does the manifest say running?** Then trust *liveness*, not the manifest:
    - `in_progress` → it is genuinely working; wait and observe. If it looks
      stalled, read the stall classification before acting: the driver heartbeat
@@ -149,6 +160,34 @@ group, and it refuses on any unverifiable datum. It does **not** auto-resume:
 after it marks the step `interrupted`, run `gauntlet resume <slug>` as a separate,
 deliberate step. Never reach for `recover` on an `orphaned` run (that is
 `resume`'s job) or an `indeterminate`/`unknown` one (inspect first).
+
+Recover also reconciles the branch↔manifest pair it leaves behind: it snapshots
+the killed branch tip to a backup ref (`refs/gauntlet/backup/<run_id>/recover-…`)
+and, when the killed driver had committed work the manifest never recorded (a
+builder killed before a flush), records that unmanifested range on the §6.4
+audit record and as a manifest warning naming the two ways out: `rollback`
+(absorbs the unmanifested commits to a phase boundary, after backup) or
+`resume --reset-interrupted` (discards the interrupted attempt,
+checkpoint-preserving). Both are native verbs; neither needs git surgery.
+
+## 4a. Rollback (rewinding to a phase boundary)
+
+`gauntlet rollback <slug> --phase N` rewinds the run branch AND the manifest to
+the end-of-phase-N boundary together (FR-9.9) — they never disagree afterward.
+Before any rewind it writes a backup ref and a manifest snapshot, so every
+rollback is reversible. The guards, in order:
+
+- **Dirty worktree** → refuses; commit or discard first (only engine
+  bookkeeping and `PR.md` are exempt).
+- **Branch tip vs last recorded commit:** equal, or ahead by only engine
+  bookkeeping commits → proceeds. Ahead by *real* unmanifested commits that
+  descend from the last recorded commit (the recover-left-ahead shape) →
+  proceeds by **absorbing** them: they are captured in the backup ref and the
+  absorption is recorded as a manifest warning naming the ref. A tip that has
+  **forked** from (or lost) the recorded history → refuses; restore the branch
+  before rewinding.
+- Rolling back past an auto-approved gate reverses it and disables
+  auto-approval for the rest of the run (FR-4.2).
 
 ## 5. Evidence on demand
 

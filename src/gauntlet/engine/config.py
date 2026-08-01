@@ -51,6 +51,15 @@ _CHECKPOINT_COMMIT_MODES = frozenset(
     {CHECKPOINT_COMMITS_KEEP, CHECKPOINT_COMMITS_SQUASH}
 )
 
+# Interrupted-step disposition on resume of a dirty transaction boundary
+# (F-003 / #72). ``park`` (default) parks for a human; ``reset_to_base`` backs
+# up the partial work and rewinds to the latest committed checkpoint.
+INTERRUPTED_STEP_PARK = "park"
+INTERRUPTED_STEP_RESET = "reset_to_base"
+_INTERRUPTED_STEP_MODES = frozenset(
+    {INTERRUPTED_STEP_PARK, INTERRUPTED_STEP_RESET}
+)
+
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
 
@@ -648,6 +657,23 @@ class RunConfig(BaseModel):
         if name not in _RESUME_ON_QUOTA_MODES:
             raise ValueError(
                 f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
+                f"got {v!r}"
+            )
+        return name
+
+    @field_validator("interrupted_step")
+    @classmethod
+    def _validate_interrupted_step(cls, v: str) -> str:
+        """Only ``park``/``reset_to_base`` are valid; fail closed (F-003/#72).
+
+        Previously unvalidated: any typo (``reset-to-base``, ``RESET_TO_BASE``)
+        silently meant ``park`` at the single ``== "reset_to_base"`` check —
+        the operator's configured recovery policy just didn't happen.
+        """
+        name = (v or "").strip().lower()
+        if name not in _INTERRUPTED_STEP_MODES:
+            raise ValueError(
+                f"interrupted_step must be one of {sorted(_INTERRUPTED_STEP_MODES)}; "
                 f"got {v!r}"
             )
         return name

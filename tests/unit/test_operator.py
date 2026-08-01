@@ -284,7 +284,9 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
         (M.RUN_FAILED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_FAILED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
-         op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+         op.STATE_INTERRUPTED,
+         ["gauntlet logs demo", "gauntlet resume demo",
+          "gauntlet resume demo --reset-interrupted"]),
         # The ACTUAL engine representation (orchestrator._set_run_status, FR-3.3):
         # a budget/timeout halt or a mid-step interruption parks the *run*
         # (RUN_PARKED) while the *step* keeps its HALTED/INTERRUPTED status. These
@@ -292,7 +294,9 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
         (M.RUN_PARKED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_PARKED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
-         op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+         op.STATE_INTERRUPTED,
+         ["gauntlet logs demo", "gauntlet resume demo",
+          "gauntlet resume demo --reset-interrupted"]),
         (M.RUN_DONE, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,
          op.STATE_DONE, []),
         (M.RUN_ABORTED, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,

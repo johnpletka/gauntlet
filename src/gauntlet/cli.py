@@ -1106,6 +1106,15 @@ def resume(
              'parsing.',
     ),
     no_judge: bool = typer.Option(False, "--no-judge"),
+    reset_interrupted: bool = typer.Option(
+        False, "--reset-interrupted",
+        help="One-shot: discard an INTERRUPTED step's partial work and re-run "
+             "it cleanly (#72). Backs the partial work up to "
+             "refs/gauntlet/backup/ first and rewinds only to the latest "
+             "committed checkpoint (never past committed milestones). Applies "
+             "to this resume only — the configured interrupted_step policy is "
+             "unchanged. A no-op when nothing is interrupted-dirty.",
+    ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
@@ -1125,7 +1134,10 @@ def resume(
         _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
         return
     try:
-        status = mgr.resume(slug, response=response, use_judge=not no_judge)
+        status = mgr.resume(
+            slug, response=response, use_judge=not no_judge,
+            reset_interrupted=reset_interrupted,
+        )
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and

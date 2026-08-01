@@ -737,6 +737,51 @@ def test_interrupted_step_resumes_past_engine_checkpoint_commits(tmp_path):
     ]
 
 
+def test_resume_reset_interrupted_discards_and_reruns(tmp_path):
+    """#72 resolution replay: a dirty interrupted step parks under the default
+    policy with the notes naming `--reset-interrupted`; that resume then backs
+    up + discards the partial work and drives to completion — the park state
+    has a native, non-destructive exit (no git surgery)."""
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    git(repo, "add", "runs/demo/prd.md")
+    git(repo, "commit", "-qm", "PRD.1: author prd")
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    _seed_pending(mgr, "Ratify option 1.")
+    run_dir = _run_dir(mgr)
+    man = Manifest.load(run_dir / "manifest.json")
+    rec = man.record("implement")
+    rec.status = M.INTERRUPTED
+    rec.parked_reason = None
+    rec.halt_reason = M.HALT_REASON_SIGNAL_KILL
+    man.write_atomic(run_dir / "manifest.json")
+    (repo / "partial.py").write_text("half written by the killed attempt\n")
+
+    # Plain resume: parks (dirty), zero agent work, and the notes name the verb.
+    adapter = ScriptedAdapter("proceed")
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+    )
+    assert status == M.RUN_PARKED
+    assert adapter.prompts == []
+    rec = mgr.status("demo").record("implement")
+    assert "gauntlet resume demo --reset-interrupted" in rec.notes
+
+    # The named verb: backup + discard + clean re-run, one shot.
+    adapter = ScriptedAdapter("proceed")
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter, clock=_clock(),
+        reset_interrupted=True,
+    )
+    assert status == M.RUN_DONE
+    assert len(adapter.prompts) == 1
+    assert not (repo / "partial.py").exists()  # discarded...
+    refs = gitops._run(repo, "for-each-ref", "refs/gauntlet/backup/")
+    assert "refs/gauntlet/backup/" in refs  # ...but backed up first
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.DONE
+    assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
+
+
 def test_recovery_different_response_over_pending_errors(tmp_path):
     repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
     _drive_to_conflict(repo, mgr, PIPELINE_SOLO)

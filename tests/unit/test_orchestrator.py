@@ -402,6 +402,72 @@ def test_engine_marked_commit_touching_implementation_still_parks(fixture_repo):
     assert adapter.calls == []
 
 
+def test_reset_interrupted_override_forces_reset_under_park_policy(fixture_repo):
+    """#72: `resume --reset-interrupted` is a one-shot override — the config
+    says park, the override discards the interrupted attempt (backed up) and
+    re-runs cleanly. The park state gains a sanctioned exit."""
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "partial.py").write_text("half written")
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    orch.interrupted_override = "reset_to_base"
+    assert orch.drive() == M.RUN_DONE
+    assert adapter.calls  # re-ran after the reset
+    assert not (fixture_repo / "partial.py").exists()  # partial work discarded
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
+    assert "refs/gauntlet/backup/" in refs  # ...but backed up first
+
+
+def test_reset_interrupted_override_preserves_wip_checkpoints(fixture_repo):
+    """#72: the override rewinds to the latest committed `P<N> wip:` milestone
+    (FR-11.2), never past it — committed builder work survives the discard."""
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "milestone.py").write_text("committed milestone\n")
+    gitops.commit_all(
+        fixture_repo, "P2 wip: arm the thing\n\nbody",
+        identity=gitops.Identity("Builder", "b@g.local"),
+    )
+    (fixture_repo / "partial.py").write_text("uncommitted partial")
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    orch.interrupted_override = "reset_to_base"
+    assert orch.drive() == M.RUN_DONE
+    assert adapter.calls
+    assert (fixture_repo / "milestone.py").exists()  # committed wip preserved
+    assert not (fixture_repo / "partial.py").exists()  # partial discarded
+    assert orch.manifest.record("implement").resumed_from_checkpoint == (
+        "P2 wip: arm the thing"
+    )
+
+
+def test_interrupted_park_notes_name_the_reset_verb(fixture_repo):
+    # The park message must point at a REAL command, not implied git surgery
+    # (#72): `gauntlet resume <slug> --reset-interrupted`.
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "partial.py").write_text("half written")
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": FakeAdapter()},
+                  manifest=man, interrupted="park")
+    assert orch.drive() == M.RUN_PARKED
+    notes = orch.manifest.record("implement").notes
+    assert "gauntlet resume demo --reset-interrupted" in notes
+
+
+def test_interrupted_step_config_rejects_unknown_value():
+    # F-003/#72: previously unvalidated — a typo silently meant `park` and the
+    # configured recovery policy just didn't happen. Fail closed at load.
+    import pytest
+
+    with pytest.raises(ValueError, match="interrupted_step must be one of"):
+        RunConfig.model_validate({**BUILDER_CFG, "interrupted_step": "reset-to-base"})
+    cfg = RunConfig.model_validate({**BUILDER_CFG, "interrupted_step": "RESET_TO_BASE"})
+    assert cfg.interrupted_step == "reset_to_base"  # case-normalized, valid
+
+
 def test_reset_for_retry_rearms_transaction_boundary(fixture_repo):
     """#65: base_sha belongs to a step ATTEMPT — an on_fail retry must re-stamp
     it at the retry's own entry HEAD, never keep the first attempt's."""

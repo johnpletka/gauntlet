@@ -486,10 +486,13 @@ def test_rollback_tolerates_engine_bookkeeping_above_last_recorded(fixture_repo)
     assert "refs/gauntlet/backup/" in refs
 
 
-def test_rollback_refuses_engine_shaped_commit_touching_pr_md(fixture_repo):
-    """PR #76 review F-001: PR.md is hidden from dirty checks (human-owned) but
-    the engine never commits it, so an engine-MARKED commit that touches it is
-    not bookkeeping — rollback must refuse, not hard-reset it away."""
+def test_rollback_engine_shaped_pr_md_commit_is_not_bookkeeping(fixture_repo):
+    """PR #76 review F-001 (updated for #72 absorb): PR.md is hidden from dirty
+    checks (human-owned) but the engine never commits it, so an engine-MARKED
+    commit touching it must NOT take the silent bookkeeping fast path. Under
+    the #72 absorb tier it is handled like any real unmanifested descendant:
+    backed up and absorbed LOUDLY — a recorded warning + backup ref, never a
+    silent discard."""
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo, TWO_PHASE)
@@ -505,21 +508,74 @@ def test_rollback_refuses_engine_shaped_commit_touching_pr_md(fixture_repo):
         fixture_repo, "gauntlet: response impl2-resp-1 pending",
         ["runs/demo/PR.md"], identity=gitops.ENGINE_IDENTITY,
     )
-    with pytest.raises(RollbackGuardError, match="diverged"):
-        mgr.rollback("demo", phase=1)
+    ahead = gitops.head_sha(fixture_repo)
+
+    mgr.rollback("demo", phase=1)
+    man = mgr.status("demo")
+    # The absorb audit trail proves the commit was NOT classified bookkeeping
+    # (the bookkeeping fast path records no warning and needs no absorption).
+    assert any("absorbed 1 unmanifested commit" in w for w in man.warnings)
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(objectname)",
+        "refs/gauntlet/backup/",
+    )
+    assert ahead in refs  # the discarded state is reachable, by construction
 
 
-def test_rollback_refuses_branch_ahead_of_manifest(fixture_repo):
-    # F-003: an extra unmanifested commit means branch != manifest tip -> refuse.
+def test_rollback_absorbs_strictly_ahead_commits_with_backup(fixture_repo):
+    """#72: an unmanifested descendant commit (a builder killed after
+    committing wip but before a manifest flush, then `recover`ed) used to
+    deadlock rollback behind the FR-9.9 guard with no native way out. It is
+    now backed up, absorbed to the phase boundary, and recorded loudly."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    (fixture_repo / "wip.py").write_text("committed but unmanifested\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=B", "-c", "user.email=b@g.local",
+        "commit", "-qm", "P2 wip: arm the thing")
+    ahead = gitops.head_sha(fixture_repo)
+
+    target = mgr.rollback("demo", phase=1)
+    assert gitops.head_sha(fixture_repo) == target
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: phase one"
+    man = mgr.status("demo")
+    assert any(
+        "absorbed 1 unmanifested commit" in w and "P2 wip: arm the thing" in w
+        for w in man.warnings
+    )
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(objectname)",
+        "refs/gauntlet/backup/",
+    )
+    assert ahead in refs
+
+
+def test_rollback_refuses_branch_forked_from_manifest(fixture_repo):
+    # F-003 protection, retained under the #72 absorb tier: a tip that is NOT a
+    # descendant of the last recorded commit (genuine fork — recorded commits
+    # missing from the branch) still refuses. Only strictly-ahead descendants
+    # are absorbed; a fork cannot be represented as a linear backup range.
+    # (Updated with #72: the prior descendant-commit variant of this test now
+    # absorbs by design — see test_rollback_absorbs_strictly_ahead_commits.)
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo, LINEAR)
     mgr.start("demo", path, use_judge=False,
               adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
-    (fixture_repo / "extra.py").write_text("out of band\n")
+    last_recorded = gitops.head_sha(fixture_repo)
+    gitops.reset_hard(fixture_repo, f"{last_recorded}~1")
+    (fixture_repo / "extra.py").write_text("forked line of history\n")
     git(fixture_repo, "add", "-A")
     git(fixture_repo, "-c", "user.name=H", "-c", "user.email=h@h.local",
-        "commit", "-qm", "out-of-band commit")
+        "commit", "-qm", "fork commit")
     with pytest.raises(RollbackGuardError, match="diverged"):
         mgr.rollback("demo", phase=1)
 

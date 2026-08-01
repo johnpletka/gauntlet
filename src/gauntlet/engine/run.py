@@ -1211,7 +1211,7 @@ class RunManager:
     def resume(self, slug: str, *, response: str | None = None,
                use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None,
-               auto_sleep=None) -> str:
+               auto_sleep=None, reset_interrupted: bool = False) -> str:
         """One resume, then in-process auto-resume of a usage-limit park (FR-3.4).
 
         A manual resume always continues the session once immediately (the
@@ -1224,7 +1224,11 @@ class RunManager:
         status = self._resume_once(
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
+            reset_interrupted=reset_interrupted,
         )
+        # NOTE: reset_interrupted is deliberately NOT forwarded to the
+        # auto-resume continuation — it is a one-shot operator decision for
+        # THIS resume, never a standing policy (#72).
         return self._auto_resume_if_scheduled(
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock, sleep=auto_sleep,
@@ -1232,7 +1236,8 @@ class RunManager:
 
     def _resume_once(self, slug: str, *, response: str | None = None,
                      use_judge: bool = True, adapter_factory=None,
-                     extra_context: dict | None = None, clock=None) -> str:
+                     extra_context: dict | None = None, clock=None,
+                     reset_interrupted: bool = False) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
@@ -1295,6 +1300,7 @@ class RunManager:
                 use_judge=use_judge, adapter_factory=adapter_factory,
                 extra_context=extra_context, clock=clock,
                 response_action=action,
+                interrupted_override="reset_to_base" if reset_interrupted else None,
             )
         finally:
             self._release_worktree_lock(handle)
@@ -2159,6 +2165,19 @@ class RunManager:
             rec.halt_reason = M.HALT_REASON_OPERATOR_RECOVER
             rec.parked_reason = None
             man.status = M.RUN_FAILED
+            # #72: recover must leave a *reconcilable* branch/manifest pair. A
+            # killed builder can have committed work git knows about but the
+            # manifest does not (no flush survived the kill). Always snapshot
+            # the killed branch tip behind a backup ref, and record the tip +
+            # any unmanifested `last-recorded..tip` commits on the audit record
+            # — so the operator's way out is a named, reversible verb
+            # (`rollback` absorbs descendants; `resume --reset-interrupted`
+            # discards the attempt) instead of forbidden git surgery.
+            # Best-effort: a repo-less run tree (or a deleted branch) still
+            # finalizes, with the gap recorded as a warning, never silently.
+            branch_head, unmanifested = self._record_recovery_reconciliation(
+                man, intent
+            )
             man.recoveries.append(
                 M.RecoveryRecord(
                     ts=intent.ts,
@@ -2176,6 +2195,8 @@ class RunManager:
                     prior_run_status=intent.prior_run_status,
                     resulting_step_status=M.INTERRUPTED,
                     resulting_run_status=M.RUN_FAILED,
+                    branch_head=branch_head,
+                    unmanifested_range=unmanifested,
                 )
             )
             man.write_atomic(manifest_path)
@@ -2187,6 +2208,63 @@ class RunManager:
         # Step 8: release the lock under the recorded-nonce guard.
         self._release_lock_if_nonce(intent.lock_nonce)
         return True
+
+    def _record_recovery_reconciliation(
+        self, man: Manifest, intent: "_RecoveryIntent"
+    ) -> tuple[str | None, str | None]:
+        """Backup ref + branch↔manifest divergence evidence at recover time (#72).
+
+        Writes ``refs/gauntlet/backup/<run_id>/recover-<ts>`` at the run-branch
+        tip ALWAYS (any later reconciliation — an absorbing rollback, a
+        reset-interrupted resume — is then reversible by construction), and
+        returns ``(branch_head, unmanifested_range)`` for the §6.4 record. When
+        the tip is strictly ahead of the manifest's last recorded commit, the
+        warning names the two sanctioned ways out; a genuine fork is warned
+        about too (resume's branch guard will refuse it). Mutates only
+        ``man.warnings`` — the caller owns the atomic write.
+        """
+        try:
+            branch_head = gitops.rev_parse(self.repo_root, man.branch)
+        except gitops.GitError as exc:
+            man.warnings.append(
+                f"recover: no backup ref written (branch {man.branch!r} "
+                f"unresolvable: {exc}); reconcile branch and manifest manually "
+                "before any rewind"
+            )
+            return None, None
+        backup = (
+            f"refs/gauntlet/backup/{man.run_id}/recover-"
+            f"{intent.ts.replace(':', '-')}"
+        )
+        gitops.create_ref(self.repo_root, backup, branch_head)
+        unmanifested: str | None = None
+        if man.commits:
+            last = man.commits[-1].sha
+            if branch_head != last:
+                if gitops.is_ancestor(self.repo_root, last, branch_head):
+                    unmanifested = gitops.log_range(
+                        self.repo_root, last, branch_head
+                    )
+                    n = len(unmanifested.splitlines())
+                    man.warnings.append(
+                        f"recover: branch {man.branch!r} is {n} commit(s) ahead "
+                        f"of the manifest's last recorded {last[:10]} (the "
+                        f"driver was killed before a manifest flush); killed "
+                        f"state backed up at {backup}. Reconcile with `gauntlet "
+                        f"rollback {man.slug} --phase N` (absorbs the "
+                        f"unmanifested commits after backup) or `gauntlet "
+                        f"resume {man.slug} --reset-interrupted` (discards the "
+                        "interrupted attempt, checkpoint-preserving)."
+                    )
+                else:
+                    man.warnings.append(
+                        f"recover: branch {man.branch!r} tip {branch_head[:10]} "
+                        f"has FORKED from the manifest's last recorded "
+                        f"{last[:10]} (not a descendant); killed state backed "
+                        f"up at {backup}. Resume/rollback will refuse — "
+                        "restore the branch before proceeding."
+                    )
+        return branch_head, unmanifested
 
     def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
         """Finalize or discard a surviving recovery intent (FR-5.6, mutating).
@@ -2636,27 +2714,38 @@ class RunManager:
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
-        # Guard 2: branch tip MUST agree with the manifest's last recorded
-        # commit. A branch ahead of the manifest (extra unmanifested commits)
-        # is a divergence — reset would silently discard those commits (review
-        # F-003). Tolerated exception (#62): a tip ahead by ONLY engine
-        # bookkeeping commits (response checkpoints, run-bookkeeping flushes —
-        # never appended to man.commits) is not a divergence; without the
-        # exemption, any run that ever took a response checkpoint could never
-        # roll back without git surgery.
+        # Guard 2: branch tip must AGREE with the manifest's last recorded
+        # commit before a rewind (FR-9.9). Three tiers (#62/#72):
+        # - tip == last recorded, or ahead by ONLY engine bookkeeping commits
+        #   (response checkpoints — never appended to man.commits): proceed.
+        # - tip a strict DESCENDANT of the last recorded commit (unmanifested
+        #   real commits — e.g. a builder killed after committing wip but
+        #   before a manifest flush, then `recover`ed): absorb them. The
+        #   backup ref + manifest snapshot below capture the tip first, so the
+        #   reset is reversible, and the absorption is recorded as a manifest
+        #   warning. Refusing this case gave the exact recovery verb meant for
+        #   a killed phase no path forward except forbidden git surgery (#72).
+        # - anything else (fork, or tip BEHIND — recorded commits missing):
+        #   refuse, exactly as before. That is the p3-F-003 protection: a
+        #   rewind must never silently discard a state the backup cannot
+        #   represent as a linear ancestor range.
         if not man.commits:
             raise RollbackGuardError("no recorded commits to roll back to")
         last_recorded = man.commits[-1].sha
         head = gitops.head_sha(self.repo_root)
+        absorbed: str | None = None
         if head != last_recorded and not gitops.advance_is_engine_bookkeeping(
             self.repo_root, last_recorded,
             bookkeeping=engine_bookkeeping_candidates(self.repo_root, run_dir),
         ):
-            raise RollbackGuardError(
-                "refusing rollback: branch has diverged from the manifest "
-                f"(HEAD {head[:10]} != last recorded {last_recorded[:10]}); the "
-                "branch and manifest must agree before a rewind (FR-9.9)"
-            )
+            if not gitops.is_ancestor(self.repo_root, last_recorded, head):
+                raise RollbackGuardError(
+                    "refusing rollback: branch has diverged from the manifest "
+                    f"(HEAD {head[:10]} is not a descendant of the last "
+                    f"recorded {last_recorded[:10]}); the branch and manifest "
+                    "must agree before a rewind (FR-9.9)"
+                )
+            absorbed = gitops.log_range(self.repo_root, last_recorded, head)
         # Resolve the target: the last commit whose phase prefix is P<phase>.
         target = self._phase_boundary_sha(man, phase)
         if target is None:
@@ -2666,10 +2755,19 @@ class RunManager:
 
         # Backup ref + manifest snapshot before any rewind (F-010).
         ts = _utc_stamp()
-        gitops.create_ref(
-            self.repo_root, f"refs/gauntlet/backup/{man.run_id}/{ts}", head
-        )
+        backup_ref = f"refs/gauntlet/backup/{man.run_id}/{ts}"
+        gitops.create_ref(self.repo_root, backup_ref, head)
         shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.snapshot-{ts}.json")
+        if absorbed is not None:
+            # Loud absorption (#72): the discarded-but-backed-up range is part
+            # of the audit trail, never a silent side effect of the reset.
+            n = len(absorbed.splitlines())
+            man.warnings.append(
+                f"rollback absorbed {n} unmanifested commit(s) above the last "
+                f"recorded commit {last_recorded[:10]} (branch was ahead of the "
+                f"manifest — e.g. a builder killed before a manifest flush); "
+                f"backed up at {backup_ref}:\n{absorbed}"
+            )
 
         gitops.reset_hard(self.repo_root, target)
         self._rewind_manifest(man, run_dir, target)
@@ -2738,7 +2836,8 @@ class RunManager:
         return match
 
     def _drive(self, layout, run_dir, pipeline, man, *, use_judge, adapter_factory,
-               extra_context, clock, response_action=None) -> str:
+               extra_context, clock, response_action=None,
+               interrupted_override=None) -> str:
         # Suspend/sleep resilience (FR-5): a heartbeat writer runs for the life of
         # the drive so a host sleep is detectable + creditable (via the process-
         # global registry adapters/process.py polls), and — opt-in — `caffeinate`
@@ -2764,13 +2863,15 @@ class RunManager:
                         layout, run_dir, pipeline, man, judge_env={},
                         adapter_factory=adapter_factory,
                         extra_context=extra_context, clock=clock,
-                        response_action=response_action)
+                        response_action=response_action,
+                        interrupted_override=interrupted_override)
                     status = orch.drive()
                 else:
                     status = self._with_judge(man, run_dir, lambda env: self._orchestrator(
                         layout, run_dir, pipeline, man, judge_env=env,
                         adapter_factory=adapter_factory, extra_context=extra_context,
-                        clock=clock, response_action=response_action).drive())
+                        clock=clock, response_action=response_action,
+                        interrupted_override=interrupted_override).drive())
             finally:
                 # Fold any detected suspension intervals into the manifest (the
                 # orchestrator is the sole in-drive manifest writer, so this drains
@@ -2894,7 +2995,7 @@ class RunManager:
 
     def _orchestrator(self, layout, run_dir, pipeline, man, *, judge_env,
                       adapter_factory=None, extra_context=None, clock=None,
-                      response_action=None) -> Orchestrator:
+                      response_action=None, interrupted_override=None) -> Orchestrator:
         kwargs = dict(
             repo_root=self.repo_root,
             run_dir=run_dir,
@@ -2907,6 +3008,7 @@ class RunManager:
             adapter_factory=adapter_factory,
             extra_context=extra_context or {},
             response_action=response_action,
+            interrupted_override=interrupted_override,
         )
         if clock is not None:
             kwargs["clock"] = clock

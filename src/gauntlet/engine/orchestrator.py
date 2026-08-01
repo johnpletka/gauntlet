@@ -144,6 +144,7 @@ class Orchestrator:
         clock: Callable[[], str] = _utcnow,
         response_action: "ResponseAction | None" = None,
         ledger_path: Path | None = None,
+        interrupted_override: str | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.run_dir = run_dir
@@ -157,6 +158,13 @@ class Orchestrator:
         self.extra_context = extra_context or {}
         self.clock = clock
         self.response_action = response_action
+        # One-shot `resume --reset-interrupted` override (#72): forces the
+        # reset_to_base disposition for THIS drive only, giving the
+        # interrupted-park state a sanctioned, non-destructive operator verb
+        # (backup ref + checkpoint-preserving rewind) instead of git surgery.
+        # Never persisted — the configured `interrupted_step` policy resumes
+        # effect on the next drive.
+        self.interrupted_override = interrupted_override
         # Machine-global usage ledger (FR-10.1): resolved once (honors
         # GAUNTLET_LEDGER_PATH) so the append/admission paths agree on one file.
         self.ledger_path = ledger_path or L.default_ledger_path()
@@ -629,7 +637,7 @@ class Orchestrator:
             # existed) — destructive by construction.
             rec.base_sha = None
             return None  # agent never progressed; safe to re-run
-        if self.config.interrupted_step == "reset_to_base":
+        if (self.interrupted_override or self.config.interrupted_step) == "reset_to_base":
             ts = self.clock().replace(":", "-")
             backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
             # Snapshot the partial work (tracked + untracked) before discarding.
@@ -699,7 +707,11 @@ class Orchestrator:
             notes=(
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
-                "interrupted_step=park)."
+                "interrupted_step=park). To discard the interrupted attempt "
+                "and re-run cleanly (partial work is backed up to "
+                "refs/gauntlet/backup/ first, and committed checkpoints are "
+                f"preserved): `gauntlet resume {self.manifest.slug} "
+                "--reset-interrupted`."
                 + self._dirty_verdict_detail(rec.base_sha)
             ),
         )

@@ -6,6 +6,27 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**Recover, rollback, and the interrupted park now reconcile a branch left
+ahead of the manifest (#72).** `gauntlet recover` on a builder that had
+committed wip but never flushed the manifest left the branch ahead of the
+manifest's last recorded commit — then every sanctioned path deadlocked:
+`resume` re-parked, `rollback` refused on the FR-9.9 divergence guard, and the
+only escape was the exact `git reset --hard` the docs and harness forbid (the
+`scheduled-restart` run died this way). Three coordinated changes: `recover`
+now always snapshots the killed branch tip to a backup ref
+(`refs/gauntlet/backup/<run_id>/recover-…`) and records the tip + unmanifested
+range on the §6.4 audit record with a warning naming the ways out; `rollback`
+absorbs a tip that is a strict *descendant* of the last recorded commit
+(backed up first, absorption recorded as a warning) while still refusing
+genuine forks; and `gauntlet resume --reset-interrupted` gives the
+interrupted-park a native one-shot resolution — back up the partial work,
+rewind only to the latest committed `P<N> wip:` checkpoint, re-run cleanly —
+which the park message and `status` next-actions now name. Also:
+`interrupted_step` is finally validated (`park|reset_to_base`; a typo used to
+silently mean `park`), and the operator playbook documents rollback for the
+first time. Regression tests replay the incident at the recover, rollback, and
+full-stack resume level.
+
 **The engine's own bookkeeping commits no longer wedge resume and rollback
 (#62, #65).** `is_dirty_vs`'s HEAD leg demanded `HEAD == base_sha` exactly,
 but the engine itself advances HEAD during every drive — response checkpoints

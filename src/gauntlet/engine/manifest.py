@@ -627,6 +627,13 @@ class RecoveryRecord(BaseModel):
     prior_run_status: str
     resulting_step_status: str
     resulting_run_status: str
+    # Branch↔manifest reconciliation evidence (#72): the run-branch tip at
+    # recovery time, and — when that tip is strictly ahead of the manifest's
+    # last recorded commit (a builder killed after committing but before a
+    # manifest flush) — the unmanifested ``last..tip`` commit list, one line
+    # per commit. ``None`` on pre-#72 records or when git was unavailable.
+    branch_head: str | None = None
+    unmanifested_range: str | None = None
 
 
 class Manifest(BaseModel):

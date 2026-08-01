@@ -64,6 +64,23 @@ def test_parked_resume_prints_the_dirty_verdict(tmp_path, monkeypatch):
     assert "P2 wip: arm the thing" in result.stdout
 
 
+def test_reset_interrupted_flag_reaches_the_manager(tmp_path, monkeypatch):
+    # #72: the CLI flag is plumbing, not policy — assert it arrives verbatim.
+    monkeypatch.chdir(tmp_path)
+    _seed_parked_run(tmp_path)
+    seen: dict = {}
+
+    def fake_resume(self, slug, **kw):
+        seen.update(kw, slug=slug)
+        return M.RUN_DONE
+
+    monkeypatch.setattr(RunManager, "resume", fake_resume)
+    result = runner.invoke(app, ["resume", "demo", "--reset-interrupted"])
+    assert result.exit_code == 0
+    assert seen["slug"] == "demo"
+    assert seen["reset_interrupted"] is True
+
+
 def test_non_parked_resume_stays_quiet(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _seed_parked_run(tmp_path)

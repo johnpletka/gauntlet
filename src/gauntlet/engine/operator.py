@@ -400,6 +400,23 @@ def _decide_resume_response(slug: str) -> Action:
                   f'gauntlet resume {slug} --response "<your decision>"')
 
 
+def _control_reset_interrupted(slug: str) -> Action:
+    # #72: the sanctioned resolution for an interrupted park — a plain resume
+    # re-parks when the tree/branch is dirty vs the step's base, and the only
+    # alternative used to be forbidden git surgery. This verb discards the
+    # interrupted attempt non-destructively (backup ref first, committed
+    # checkpoints preserved) and re-runs the step.
+    consequence = (
+        "backs up the interrupted attempt's partial work to "
+        "refs/gauntlet/backup/, rewinds to the latest committed checkpoint, "
+        "and re-runs the step cleanly (one-shot; config policy unchanged)"
+    )
+    return Action("resume --reset-interrupted", "control",
+                  ["gauntlet", "resume", slug, "--reset-interrupted"], [], True,
+                  f"gauntlet resume {slug} --reset-interrupted",
+                  consequence=consequence)
+
+
 def _actions_for(
     state: str, slug: str, failure: "FailureDescriptor | None" = None,
     *, gate_cycle_id: str | None = None,
@@ -438,8 +455,18 @@ def _actions_for(
         if failure is not None and failure.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             return [_observe_logs(slug), _control_resume(slug)]
         return [_observe_logs(slug), _decide_resume_response(slug)]
-    if state in (STATE_HALTED, STATE_INTERRUPTED):
+    if state == STATE_HALTED:
         return [_observe_logs(slug), _control_resume(slug)]
+    if state == STATE_INTERRUPTED:
+        # A plain resume re-parks when the interrupted step left the tree/
+        # branch dirty vs its base; offer the sanctioned discard-and-re-run
+        # path alongside it so the operator is never pointed into a loop with
+        # no exit (#72).
+        return [
+            _observe_logs(slug),
+            _control_resume(slug),
+            _control_reset_interrupted(slug),
+        ]
     if state in (STATE_DONE, STATE_ABORTED):
         return []
     # indeterminate and unknown: read-only inspection only, never a mutating verb.
