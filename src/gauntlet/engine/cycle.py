@@ -57,6 +57,7 @@ from gauntlet.engine.execution import (
     StepContext,
     StepResult,
     StepSpec,
+    human_owned_excludes,
     run_bookkeeping_paths,
 )
 from gauntlet.engine.pipeline import Step
@@ -395,6 +396,12 @@ def _reset_dirty_to_handoff(
         f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
         f"{ctx.record.id}-r{rnd}-fix-resume"
     )
+    # PR #77 review: human-owned PR.md is excluded from the dirty check and
+    # the backup by policy, but the reset below is not policy-scoped — carry
+    # its uncommitted bytes across the rewind.
+    overlay = gitops.worktree_overlay(
+        ctx.repo_root, human_owned_excludes(ctx.excludes)
+    )
     gitops.backup_dirty_worktree(
         ctx.repo_root, backup,
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
@@ -429,6 +436,7 @@ def _reset_dirty_to_handoff(
     else:
         gitops.reset_hard(ctx.repo_root, handoff)
     gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+    gitops.restore_overlay(ctx.repo_root, overlay)
     return (
         f"resume: reset round-{rnd} worktree to the handoff "
         f"(backed up at {backup}) before re-running the fix sub-step (FR-4.1)"
@@ -2227,6 +2235,11 @@ class _MutationGuard:
             f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
             f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}"
         )
+        # PR #77 review: carry human-owned PR.md edits across the revert —
+        # excluded from the backup by policy, but not from the reset.
+        overlay = gitops.worktree_overlay(
+            ctx.repo_root, human_owned_excludes(ctx.excludes)
+        )
         gitops.backup_dirty_worktree(
             ctx.repo_root, backup,
             f"reviewer mutation during {ctx.record.id} round {self.rnd}",
@@ -2238,6 +2251,7 @@ class _MutationGuard:
         # must be removed, or it rides into the next fix commit. The live run
         # dir survives regardless (self-.gitignore; clean has no -x).
         gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+        gitops.restore_overlay(ctx.repo_root, overlay)
         if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
             residue = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
             raise _ParkCycle(StepResult(  # fail closed on residue

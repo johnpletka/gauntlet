@@ -444,6 +444,30 @@ def test_reset_interrupted_override_preserves_wip_checkpoints(fixture_repo):
     )
 
 
+def test_reset_policy_preserves_uncommitted_pr_md_edits(fixture_repo):
+    """PR #77 review (blocking): a tracked PR.md with uncommitted human edits
+    is invisible to the dirty check AND the backup (policy exclusion), but
+    reset --hard is not policy-scoped — the edit must be carried across the
+    rewind, byte-for-byte, not silently destroyed."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("PR draft v1\n")
+    gitops.commit_all(
+        fixture_repo, "P1: track the PR draft\n\nbody",
+        identity=gitops.Identity("Human", "h@g.local"),
+    )
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "partial.py").write_text("half written")  # killed mid-edit
+    pr.write_text("PR draft v2 — human edited, uncommitted\n")
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="reset_to_base")
+    assert orch.drive() == M.RUN_DONE
+    assert not (fixture_repo / "partial.py").exists()  # partial work discarded
+    assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
+
+
 def test_interrupted_park_notes_name_the_reset_verb(fixture_repo):
     # The park message must point at a REAL command, not implied git surgery
     # (#72): `gauntlet resume <slug> --reset-interrupted`.

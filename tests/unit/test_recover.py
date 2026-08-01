@@ -875,6 +875,37 @@ def test_finalize_recovery_backs_up_and_records_unmanifested_range(fixture_repo)
     assert "recover-" in refs
 
 
+def test_finalize_recovery_survives_backup_ref_failure(fixture_repo, monkeypatch):
+    """PR #77 review / Copilot: git failures AFTER resolving the branch (a
+    failing update-ref or log) must degrade to a warning — the driver is
+    already dead by finalize time, so the kill/audit path never blocks."""
+    from conftest import git
+
+    from gauntlet.engine import gitops
+
+    mgr = _mgr(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_RUNNING, current_step="implement",
+        steps=[StepRecord(id="implement", type="agent_task", status=M.RUNNING)],
+    )
+    man.write_atomic(run_dir / "manifest.json")
+
+    def boom(repo, ref, sha):
+        raise gitops.GitError(["update-ref", ref], 128, "refname broken")
+
+    monkeypatch.setattr(gitops, "create_ref", boom)
+    assert mgr._finalize_recovery(run_dir, _intent(), "terminated_sigterm") is True
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.record("implement").status == M.INTERRUPTED  # finalized anyway
+    assert man.recoveries[-1].branch_head is not None  # what WAS resolved, kept
+    assert any("reconciliation incomplete" in w for w in man.warnings)
+
+
 def test_finalize_recovery_without_git_warns_not_fails(tmp_path):
     """A git-less run tree (or an unresolvable branch) still finalizes — the
     kill/audit path must never be held hostage by the backup — but the missing

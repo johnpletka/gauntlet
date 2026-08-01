@@ -254,6 +254,23 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     return excludes
 
 
+def human_owned_excludes(exclude: list[str] | None) -> list[str]:
+    """The human-owned entries of a ``run_bookkeeping_excludes()`` list.
+
+    That list emits exactly two kinds of entries: the engine's own
+    run-instance dir, and human-owned ``PR.md`` paths/globs (FR-9.8). Rewind
+    code must tell them apart: engine bookkeeping survives a rewind via the
+    bookkeeping-preserving mechanisms, but a human-owned file is invisible to
+    the dirty checks *by policy* while ``reset --hard`` is not policy-scoped —
+    an uncommitted edit to a tracked ``PR.md`` would be silently destroyed,
+    unbacked-up (PR #77 review). Every rewind site captures these files'
+    worktree bytes first (``gitops.worktree_overlay``) and restores them after.
+    """
+    return [
+        e for e in (exclude or []) if e.rsplit("/", 1)[-1] == "PR.md"
+    ]
+
+
 def engine_bookkeeping_candidates(repo_root: Path, run_dir: Path) -> list[str]:
     """Every path an engine bookkeeping COMMIT may touch (PR #76 review F-001).
 

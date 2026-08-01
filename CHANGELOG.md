@@ -24,8 +24,17 @@ rewind only to the latest committed `P<N> wip:` checkpoint, re-run cleanly —
 which the park message and `status` next-actions now name. Also:
 `interrupted_step` is finally validated (`park|reset_to_base`; a typo used to
 silently mean `park`), and the operator playbook documents rollback for the
-first time. Regression tests replay the incident at the recover, rollback, and
-full-stack resume level.
+first time. Hardened per PR #77 review: rollback now takes the worktree lock
+and verifies + checks out the run branch explicitly before any guard reads a
+SHA (bare HEAD under the absorb tier would have hard-reset a checked-out
+merged `main`); every rewind site (interrupted reset, conflict-park restore,
+rollback, the cycle's fix-resume and mutation reverts) carries uncommitted
+edits to human-owned excluded files (`PR.md`) across the reset byte-for-byte
+— they are hidden from the dirty checks by policy, but `reset --hard` is not
+policy-scoped; and the recover reconciliation is best-effort end-to-end (a
+failing `update-ref`/`log` degrades to a warning, never blocks the kill/audit
+finalization). Regression tests replay the incident at the recover, rollback,
+and full-stack resume level.
 
 **The engine's own bookkeeping commits no longer wedge resume and rollback
 (#62, #65).** `is_dirty_vs`'s HEAD leg demanded `HEAD == base_sha` exactly,

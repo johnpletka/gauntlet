@@ -452,6 +452,29 @@ def test_bookkeeping_tolerance_is_an_allowlist_not_the_exclusions(fixture_repo):
     )
 
 
+def test_worktree_overlay_round_trip(fixture_repo):
+    """PR #77 review: human-owned excluded files (PR.md) must survive a
+    reset --hard — captured before, byte-identical after, untouched files and
+    non-matching paths ignored."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("draft v1\n")
+    gitops._run(fixture_repo, "add", "-A")
+    gitops._run(fixture_repo, "commit", "-qm", "track PR draft")
+    pr.write_text("draft v2 — human edited\n")
+    (fixture_repo / "other.py").write_text("not matched\n")
+
+    overlay = gitops.worktree_overlay(fixture_repo, ["runs/*/PR.md"])
+    assert overlay == {"runs/demo/PR.md": "draft v2 — human edited\n".encode()}
+    gitops.reset_hard(fixture_repo, "HEAD")
+    assert pr.read_text() == "draft v1\n"  # the reset destroyed the edit...
+    gitops.restore_overlay(fixture_repo, overlay)
+    assert pr.read_text() == "draft v2 — human edited\n"  # ...and it came back
+    # A clean match and an empty pattern list are both empty overlays.
+    gitops._run(fixture_repo, "checkout", "--", "runs/demo/PR.md")
+    assert gitops.worktree_overlay(fixture_repo, []) == {}
+
+
 def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
     # One real commit anywhere in the range poisons the whole tolerance.
     base = gitops.head_sha(fixture_repo)

@@ -29,6 +29,7 @@ from gauntlet.engine import gitops, manifest as M, prd_stub
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     engine_bookkeeping_candidates,
+    human_owned_excludes,
     run_bookkeeping_excludes,
 )
 from gauntlet.engine.identity import resolve_operator_identity
@@ -2232,38 +2233,52 @@ class RunManager:
                 "before any rewind"
             )
             return None, None
-        backup = (
-            f"refs/gauntlet/backup/{man.run_id}/recover-"
-            f"{intent.ts.replace(':', '-')}"
-        )
-        gitops.create_ref(self.repo_root, backup, branch_head)
         unmanifested: str | None = None
-        if man.commits:
-            last = man.commits[-1].sha
-            if branch_head != last:
-                if gitops.is_ancestor(self.repo_root, last, branch_head):
-                    unmanifested = gitops.log_range(
-                        self.repo_root, last, branch_head
-                    )
-                    n = len(unmanifested.splitlines())
-                    man.warnings.append(
-                        f"recover: branch {man.branch!r} is {n} commit(s) ahead "
-                        f"of the manifest's last recorded {last[:10]} (the "
-                        f"driver was killed before a manifest flush); killed "
-                        f"state backed up at {backup}. Reconcile with `gauntlet "
-                        f"rollback {man.slug} --phase N` (absorbs the "
-                        f"unmanifested commits after backup) or `gauntlet "
-                        f"resume {man.slug} --reset-interrupted` (discards the "
-                        "interrupted attempt, checkpoint-preserving)."
-                    )
-                else:
-                    man.warnings.append(
-                        f"recover: branch {man.branch!r} tip {branch_head[:10]} "
-                        f"has FORKED from the manifest's last recorded "
-                        f"{last[:10]} (not a descendant); killed state backed "
-                        f"up at {backup}. Resume/rollback will refuse — "
-                        "restore the branch before proceeding."
-                    )
+        # Every git call below is best-effort too (PR #77 review / Copilot):
+        # the driver is already dead by the time this runs, so a failing
+        # `update-ref`/`log` must degrade to a warning — never escape and
+        # leave the manifest unfinalized with the intent stranded.
+        try:
+            backup = (
+                f"refs/gauntlet/backup/{man.run_id}/recover-"
+                f"{intent.ts.replace(':', '-')}"
+            )
+            gitops.create_ref(self.repo_root, backup, branch_head)
+            if man.commits:
+                last = man.commits[-1].sha
+                if branch_head != last:
+                    if gitops.is_ancestor(self.repo_root, last, branch_head):
+                        unmanifested = gitops.log_range(
+                            self.repo_root, last, branch_head
+                        )
+                        n = len(unmanifested.splitlines())
+                        man.warnings.append(
+                            f"recover: branch {man.branch!r} is {n} commit(s) "
+                            f"ahead of the manifest's last recorded {last[:10]} "
+                            f"(the driver was killed before a manifest flush); "
+                            f"killed state backed up at {backup}. Reconcile "
+                            f"with `gauntlet rollback {man.slug} --phase N` "
+                            f"(absorbs the unmanifested commits after backup) "
+                            f"or `gauntlet resume {man.slug} "
+                            "--reset-interrupted` (discards the interrupted "
+                            "attempt, checkpoint-preserving)."
+                        )
+                    else:
+                        man.warnings.append(
+                            f"recover: branch {man.branch!r} tip "
+                            f"{branch_head[:10]} has FORKED from the "
+                            f"manifest's last recorded {last[:10]} (not a "
+                            f"descendant); killed state backed up at {backup}. "
+                            "Resume/rollback will refuse — restore the branch "
+                            "before proceeding."
+                        )
+        except gitops.GitError as exc:
+            man.warnings.append(
+                f"recover: branch↔manifest reconciliation incomplete (git "
+                f"failed after resolving {man.branch!r} at {branch_head[:10]}: "
+                f"{exc}); verify refs/gauntlet/backup/ before any rewind"
+            )
+            return branch_head, None
         return branch_head, unmanifested
 
     def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
@@ -2706,14 +2721,39 @@ class RunManager:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
+        # Rollback is a worktree-mutating verb: take the drive lock so a live
+        # driver can never race the rewind (PR #77 review), exactly like
+        # resume/abort.
+        handle = self._acquire_worktree_lock(slug, man.run_id)
+        try:
+            return self._rollback_locked(layout, run_dir, man, phase)
+        finally:
+            self._release_worktree_lock(handle)
 
-        # Guard 1: clean work tree — only the engine's own bookkeeping is
-        # excluded (review F-001), so an uncommitted real artifact still blocks.
+    def _rollback_locked(self, layout, run_dir, man: Manifest, phase: int) -> str:
+        # Rollback rewinds the RUN BRANCH (FR-9.9) — never whatever branch
+        # happens to be checked out (PR #77 review, blocking finding): with
+        # the descendant-absorption tier below, a checked-out merged base
+        # branch IS a descendant of the last recorded commit, so reading bare
+        # HEAD would pass the guards and hard-reset THAT branch while the run
+        # branch stood still. Verify and check out `man.branch` explicitly
+        # before any guard reads a SHA (same contract as resume's F-1 guard).
+        repo = self.repo_root
+        if not gitops.branch_exists(repo, man.branch):
+            raise RollbackGuardError(
+                f"refusing rollback: run branch {man.branch!r} is missing; "
+                "restore it (e.g. from refs/gauntlet/backup/) first"
+            )
+        # Guard 1: clean work tree — checked BEFORE the checkout (switching
+        # branches over uncommitted work could carry or clobber it). Only the
+        # engine's own bookkeeping is excluded (review F-001), so an
+        # uncommitted real artifact still blocks.
         excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
         if not gitops.is_clean(self.repo_root, exclude=excludes):
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
+        gitops.checkout_branch(repo, man.branch)
         # Guard 2: branch tip must AGREE with the manifest's last recorded
         # commit before a rewind (FR-9.9). Three tiers (#62/#72):
         # - tip == last recorded, or ahead by ONLY engine bookkeeping commits
@@ -2732,6 +2772,8 @@ class RunManager:
         if not man.commits:
             raise RollbackGuardError("no recorded commits to roll back to")
         last_recorded = man.commits[-1].sha
+        # The run branch is checked out above, so HEAD here is explicitly its
+        # tip — never an unrelated checkout's.
         head = gitops.head_sha(self.repo_root)
         absorbed: str | None = None
         if head != last_recorded and not gitops.advance_is_engine_bookkeeping(
@@ -2769,7 +2811,14 @@ class RunManager:
                 f"backed up at {backup_ref}:\n{absorbed}"
             )
 
+        # PR #77 review: human-owned PR.md files are excluded from the dirty
+        # check and the backup by policy, but `reset --hard` is not
+        # policy-scoped — carry their uncommitted bytes across the rewind.
+        overlay = gitops.worktree_overlay(
+            self.repo_root, human_owned_excludes(excludes)
+        )
         gitops.reset_hard(self.repo_root, target)
+        gitops.restore_overlay(self.repo_root, overlay)
         self._rewind_manifest(man, run_dir, target)
         # Reversal circuit breaker (pipeline-effectiveness FR-4.2): rolling back
         # past a phase boundary IS the human reversal of any auto-approved gate at

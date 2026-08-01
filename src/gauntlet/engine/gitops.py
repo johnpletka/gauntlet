@@ -914,6 +914,42 @@ def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:
     _run(repo, *args)
 
 
+def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes]:
+    """Worktree bytes of files matching ``patterns`` that differ from HEAD.
+
+    Captures modified/staged/untracked matches as ``{repo-rel-path: bytes}``.
+    Used to carry human-owned excluded files (``PR.md``, FR-9.8) across a
+    rewind: they are invisible to the dirty checks by policy, so a
+    ``reset --hard`` would otherwise silently destroy their uncommitted edits
+    with no backup (PR #77 review). Restore with :func:`restore_overlay` after
+    the rewind — the files come back as uncommitted worktree content, exactly
+    as the human left them.
+    """
+    if not patterns:
+        return {}
+    out = _run(
+        repo, "status", "--porcelain", "--untracked-files=all", "--", *patterns
+    )
+    overlay: dict[str, bytes] = {}
+    for line in out.splitlines():
+        rel = line[3:]
+        if " -> " in rel:  # rename entry: the new path is the live one
+            rel = rel.split(" -> ", 1)[1]
+        rel = rel.strip().strip('"')
+        path = repo / rel
+        if path.is_file():
+            overlay[rel] = path.read_bytes()
+    return overlay
+
+
+def restore_overlay(repo: Path, overlay: dict[str, bytes]) -> None:
+    """Rewrite :func:`worktree_overlay` captures after a rewind (uncommitted)."""
+    for rel, data in overlay.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+
 def backup_dirty_worktree(
     repo: Path, ref: str, message: str, *, exclude: list[str] | None = None
 ) -> str:

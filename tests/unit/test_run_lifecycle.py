@@ -558,6 +558,84 @@ def test_rollback_absorbs_strictly_ahead_commits_with_backup(fixture_repo):
     assert ahead in refs
 
 
+def test_rollback_rewinds_the_run_branch_not_the_checkout(fixture_repo):
+    """PR #77 review (blocking): with the descendant-absorb tier, a checked-out
+    merged base branch IS a descendant of the last recorded commit — reading
+    bare HEAD would hard-reset MAIN while the run branch stood still. Rollback
+    must resolve and check out man.branch explicitly."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    run_tip = gitops.head_sha(fixture_repo)
+    # The operator merged the run branch to main and main moved on — a strict
+    # descendant of the last recorded commit, checked out at rollback time.
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "merge", "-q", "--ff-only", "gauntlet/demo")
+    (fixture_repo / "post-merge.py").write_text("main moved on\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=H", "-c", "user.email=h@h.local",
+        "commit", "-qm", "post-merge work on main")
+    main_tip = gitops.head_sha(fixture_repo)
+
+    target = mgr.rollback("demo", phase=1)
+    # main is untouched; the RUN branch was checked out and rewound.
+    assert gitops.rev_parse(fixture_repo, "main") == main_tip
+    assert gitops.rev_parse(fixture_repo, "gauntlet/demo") == target
+    assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+    assert gitops.rev_parse(fixture_repo, "gauntlet/demo") != run_tip
+
+
+def test_rollback_refuses_missing_run_branch(fixture_repo):
+    # PR #77 review: a deleted run branch must refuse loudly, never fall back
+    # to rewinding whatever is checked out.
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, LINEAR)
+    mgr.start("demo", path, use_judge=False,
+              adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qD", "gauntlet/demo")
+    with pytest.raises(RollbackGuardError, match="missing"):
+        mgr.rollback("demo", phase=1)
+
+
+def test_rollback_preserves_uncommitted_pr_md_edits(fixture_repo):
+    """PR #77 review (blocking): PR.md is excluded from the dirty check and
+    the backup by policy, but reset --hard is not policy-scoped — the human's
+    uncommitted edit must be carried across the rewind, not destroyed."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo, TWO_PHASE)
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    # The human tracked the drafted PR.md (a real descendant commit — absorbed
+    # by the #72 tier), then kept editing without committing.
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.write_text("PR draft v1\n")
+    git(fixture_repo, "add", "runs/demo/PR.md")
+    git(fixture_repo, "-c", "user.name=H", "-c", "user.email=h@h.local",
+        "commit", "-qm", "chore: track the PR draft")
+    pr.write_text("PR draft v2 — human edited, uncommitted\n")
+
+    target = mgr.rollback("demo", phase=1)
+    assert gitops.head_sha(fixture_repo) == target
+    # The tracked version was absorbed (backed up); the uncommitted edit is
+    # back in the worktree byte-for-byte.
+    assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
+
+
 def test_rollback_refuses_branch_forked_from_manifest(fixture_repo):
     # F-003 protection, retained under the #72 absorb tier: a tip that is NOT a
     # descendant of the last recorded commit (genuine fork — recorded commits

@@ -36,6 +36,7 @@ from gauntlet.engine.execution import (
     StepResult,
     engine_bookkeeping_candidates,
     get_spec,
+    human_owned_excludes,
     run_bookkeeping_excludes,
     run_bookkeeping_paths,
 )
@@ -640,6 +641,13 @@ class Orchestrator:
         if (self.interrupted_override or self.config.interrupted_step) == "reset_to_base":
             ts = self.clock().replace(":", "-")
             backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
+            # Human-owned excluded files (PR.md) are hidden from the dirty
+            # check AND the backup by policy, but the reset below is not
+            # policy-scoped — carry their uncommitted bytes across the rewind
+            # (PR #77 review).
+            overlay = gitops.worktree_overlay(
+                self.repo_root, human_owned_excludes(self.excludes)
+            )
             # Snapshot the partial work (tracked + untracked) before discarding.
             gitops.backup_dirty_worktree(
                 self.repo_root, backup, f"interrupted {rec.id} partial work",
@@ -692,6 +700,7 @@ class Orchestrator:
             # the authored prd.md, or prior declared artifacts — the re-run
             # regenerates its own outputs over them.
             gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
+            gitops.restore_overlay(self.repo_root, overlay)
             # The rewind restored the on-disk manifest to base_sha's tree + the
             # overlaid bookkeeping; re-persist the authoritative in-memory state
             # over it and idempotently flush the checkpoint (still `pending` here
@@ -795,6 +804,12 @@ class Orchestrator:
             return result
         ts = self.clock().replace(":", "-")
         backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-conflict-{ts}"
+        # PR #77 review: a tracked PR.md with uncommitted human edits is under
+        # the run root (excluded from this backup) but NOT protected from the
+        # reset below — carry it across by hand.
+        overlay = gitops.worktree_overlay(
+            self.repo_root, human_owned_excludes(self.excludes)
+        )
         gitops.backup_dirty_worktree(
             self.repo_root,
             backup,
@@ -806,6 +821,7 @@ class Orchestrator:
         # edits too, sparing the whole run root so the manifest/transcripts/
         # authored artifacts under it survive.
         gitops.clean_untracked(self.repo_root, exclude=run_root)
+        gitops.restore_overlay(self.repo_root, overlay)
         note = (
             f"conflict park left an uncommitted worktree; backed up to {backup} "
             "and restored the clean tree before handoff (F-001)"
