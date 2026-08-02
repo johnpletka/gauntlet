@@ -519,6 +519,68 @@ def test_backup_dirty_worktree_durably_includes_excluded_overlay(fixture_repo):
     assert gitops.file_at_commit(fixture_repo, deleted, "runs/demo/PR.md") is None
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="P2 replaces the live-index backup with separate index/worktree snapshots",
+)
+def test_rewind_backup_preserves_divergent_staged_and_worktree_versions(fixture_repo):
+    """P1 contract: staged B and worktree C are both recoverable evidence.
+
+    The PR #77 helper currently runs ``git add -A`` against the real index, so
+    this intentionally fails until P2 introduces a temporary-index snapshot.
+    """
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("A committed\n")
+    gitops._run(fixture_repo, "add", "-A")
+    gitops._run(fixture_repo, "commit", "-qm", "track A")
+    pr.write_text("B staged\n")
+    gitops._run(fixture_repo, "add", "--", "runs/demo/PR.md")
+    staged_oid = gitops._run(
+        fixture_repo, "rev-parse", ":runs/demo/PR.md"
+    ).strip()
+    pr.write_text("C unstaged\n")
+
+    gitops.backup_dirty_worktree(
+        fixture_repo,
+        "refs/gauntlet/backup/divergent-pr",
+        "snapshot divergent PR",
+        exclude=["runs/*/PR.md"],
+        include=["runs/*/PR.md"],
+    )
+
+    assert gitops._run(
+        fixture_repo, "rev-parse", ":runs/demo/PR.md"
+    ).strip() == staged_oid
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P2 replaces byte overlays with symlink-aware Git snapshots",
+)
+def test_overlay_restore_never_follows_a_symlink_outside_repo(fixture_repo, tmp_path):
+    """P1 contract: capture/restore may not read or write through symlinks."""
+    original_target = tmp_path / "outside-original.txt"
+    changed_target = tmp_path / "outside-changed.txt"
+    original_target.write_text("outside original\n")
+    changed_target.write_text("outside changed\n")
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.symlink_to(original_target)
+    gitops._run(fixture_repo, "add", "-A")
+    gitops._run(fixture_repo, "commit", "-qm", "track PR symlink")
+    pr.unlink()
+    pr.symlink_to(changed_target)
+
+    overlay = gitops.worktree_overlay(fixture_repo, ["runs/*/PR.md"])
+    gitops.reset_hard(fixture_repo, "HEAD")
+    gitops.restore_overlay(fixture_repo, overlay)
+
+    assert original_target.read_text() == "outside original\n"
+    assert pr.is_symlink()
+    assert pr.readlink() == changed_target
+
+
 def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
     # One real commit anywhere in the range poisons the whole tolerance.
     base = gitops.head_sha(fixture_repo)
