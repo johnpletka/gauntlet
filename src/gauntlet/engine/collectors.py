@@ -263,6 +263,35 @@ _PYTEST_COLLECT_FLAGS: tuple[str, ...] = (
 )
 
 
+def _pytest_enumeration_command(test_command: str) -> tuple[str, ...]:
+    """Turn a pytest test command into one deterministic collection command.
+
+    Project commands commonly already contain ``-q``.  Appending another
+    quiet flag changes pytest's output format (``-qq``), which suppresses node
+    ids and makes a successful collection look unparseable.  Normalize only
+    the flags owned by the collector, preserving every project-specific
+    launcher, selection, and configuration argument.
+    """
+    parts = shlex.split(test_command)
+    normalized: list[str] = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        if part in {"--collect-only", "--co", "-q", "--quiet"}:
+            index += 1
+            continue
+        if (
+            part == "-p"
+            and index + 1 < len(parts)
+            and parts[index + 1] == "no:cacheprovider"
+        ):
+            index += 2
+            continue
+        normalized.append(part)
+        index += 1
+    return tuple(normalized) + _PYTEST_COLLECT_FLAGS
+
+
 def resolve_command(collector: Collector, config) -> tuple[str, ...]:
     """The enumeration command for THIS project (PR #59 review F4).
 
@@ -290,7 +319,7 @@ def resolve_command(collector: Collector, config) -> tuple[str, ...]:
     if collector.kind == "pytest":
         test_command = getattr(config, "test_command", None) or ""
         if re.search(r"\bpytest\b", test_command):
-            return tuple(shlex.split(test_command)) + _PYTEST_COLLECT_FLAGS
+            return _pytest_enumeration_command(test_command)
     return collector.command
 
 
