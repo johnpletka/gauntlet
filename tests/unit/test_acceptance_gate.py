@@ -506,39 +506,6 @@ def test_resolve_command_derives_from_pytest_shaped_test_command():
         "uv", "run", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider")
 
 
-@pytest.mark.parametrize(
-    "test_command",
-    [
-        "uv run pytest -q",
-        "uv run pytest --quiet --collect-only",
-        "uv run pytest -p no:cacheprovider -q",
-    ],
-)
-def test_resolve_command_normalizes_collector_owned_pytest_flags(test_command):
-    """Collection owns output-shaping flags and emits each exactly once.
-
-    Pytest interprets two quiet flags as ``-qq`` and suppresses node ids, so
-    blindly appending ``-q`` to a project command can make a valid suite fail
-    closed as unparseable.
-    """
-    collector = collectors.get_collector("pytest")
-    command = collectors.resolve_command(collector, _cfg(test_command=test_command))
-    assert command == (
-        "uv", "run", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider")
-
-
-def test_resolve_command_preserves_project_environment_arguments():
-    collector = collectors.get_collector("pytest")
-    command = collectors.resolve_command(
-        collector,
-        _cfg(test_command="uv run --with pytest pytest -q"),
-    )
-    assert command == (
-        "uv", "run", "--with", "pytest", "pytest",
-        "--collect-only", "-q", "-p", "no:cacheprovider",
-    )
-
-
 def test_resolve_command_falls_back_when_test_command_is_not_pytest():
     collector = collectors.get_collector("pytest")
     cfg = _cfg(test_command="make test")

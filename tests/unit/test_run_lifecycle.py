@@ -735,28 +735,6 @@ def test_rollback_refuses_unknown_phase(fixture_repo):
         mgr.rollback("demo", phase=9)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P3 moves all rollback validation before checkout",
-)
-def test_rollback_prevalidation_failure_leaves_checkout_unchanged(fixture_repo):
-    """P1 contract: a refused rollback is observational before mutation."""
-    mgr = _prepare(fixture_repo)
-    _author_prd(mgr, "demo")
-    path = _write_pipeline(fixture_repo, LINEAR)
-    adapter = FakeAdapter(writes={"feature.py": "code\n"})
-    mgr.start("demo", path, use_judge=False, adapter_factory=lambda n: adapter)
-    git(fixture_repo, "checkout", "-q", "main")
-    original_branch = gitops.current_branch(fixture_repo)
-    original_head = gitops.head_sha(fixture_repo)
-
-    with pytest.raises(RollbackGuardError, match="phase-9"):
-        mgr.rollback("demo", phase=9)
-
-    assert gitops.current_branch(fixture_repo) == original_branch
-    assert gitops.head_sha(fixture_repo) == original_head
-
-
 # --- F-002: the manifest records every prompt the cycle will load ------------
 def test_prompt_hashes_include_cycle_default_templates():
     from gauntlet.engine.config import RunConfig

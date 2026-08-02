@@ -42,13 +42,11 @@ def test_smoke_toolless_json(tmp_path):
 def test_resume_continuity(tmp_path):
     adapter = toolless_adapter()
     first = adapter.run(
-        "For this software deployment check, remember that the deployment "
-        "identifier is ZIRCON-42. Confirm that you recorded it.",
-        cwd=tmp_path,
+        "The codeword is ZIRCON-42. Reply with exactly: OK", cwd=tmp_path
     )
     assert first.session_id
     second = adapter.run(
-        "What deployment identifier did I provide for this check?",
+        "Reply with the codeword I gave you earlier, and nothing else.",
         session=first.session_id,
         cwd=tmp_path,
     )
