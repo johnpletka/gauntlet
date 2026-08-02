@@ -23,6 +23,8 @@ from gauntlet.engine.recovery import (
     GitEntryObservation,
     GitEntryVersion,
     GitIndexStage,
+    derive_git_delta,
+    fingerprint_data,
 )
 
 
@@ -134,6 +136,18 @@ class RecoveryGitFixture:
     def create_branch(self, branch: str, start: str = "HEAD") -> None:
         git(self.repo, "branch", branch, start)
 
+    def merge_conflict(self, branch: str) -> None:
+        """Merge ``branch`` and require a genuine unresolved index conflict."""
+        proc = subprocess.run(
+            ["git", "-C", str(self.repo), "merge", "--no-edit", branch],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            raise AssertionError("fixture merge unexpectedly completed without conflict")
+        if not _git_bytes(self.repo, "ls-files", "--unmerged"):
+            raise AssertionError(f"fixture merge failed without index stages: {proc.stderr}")
+
     @property
     def head_sha(self) -> str:
         return git(self.repo, "rev-parse", "HEAD").strip()
@@ -155,13 +169,15 @@ class RecoveryGitFixture:
         )
 
     def observe_path(self, rel: str, *, protected: bool = False) -> GitEntryObservation:
-        head, _head_stages = self._tree_version("HEAD", rel)
+        head = self._tree_version("HEAD", rel)
         index, index_stages = self._index_version(rel)
         worktree = self._worktree_version(rel)
-        index_delta = self._delta(head, index)
         if index_stages:
             index_delta = GitDelta.UNMERGED
-        worktree_delta = self._delta(index, worktree, untracked=True)
+            worktree_delta = GitDelta.CONFLICTED
+        else:
+            index_delta = derive_git_delta(head, index)
+            worktree_delta = derive_git_delta(index, worktree, untracked=True)
         return GitEntryObservation(
             path=rel,
             head=head,
@@ -173,20 +189,17 @@ class RecoveryGitFixture:
             protected=protected,
         )
 
-    def _tree_version(
-        self, ref: str, rel: str
-    ) -> tuple[GitEntryVersion, tuple[GitIndexStage, ...]]:
+    def _tree_version(self, ref: str, rel: str) -> GitEntryVersion:
         proc = subprocess.run(
             ["git", "-C", str(self.repo), "ls-tree", "-z", ref, "--", rel],
             capture_output=True,
+            check=True,
         )
-        if proc.returncode != 0:
-            return ABSENT_GIT_ENTRY, ()
         if not proc.stdout:
-            return ABSENT_GIT_ENTRY, ()
+            return ABSENT_GIT_ENTRY
         metadata, _path = proc.stdout[:-1].split(b"\t", 1)
         mode, kind, oid = metadata.decode().split()
-        return self._object_version(mode, kind, oid), ()
+        return self._object_version(mode, kind, oid)
 
     def _index_version(
         self, rel: str
@@ -237,7 +250,23 @@ class RecoveryGitFixture:
                 symlink_target=target,
             )
         if stat.S_ISDIR(info.st_mode):
-            return GitEntryVersion(kind=GitEntryKind.DIRECTORY, mode="040000")
+            entries = []
+            for child in sorted(path.rglob("*")):
+                child_info = child.lstat()
+                rel_child = child.relative_to(path).as_posix()
+                if stat.S_ISLNK(child_info.st_mode):
+                    entries.append((rel_child, "symlink", os.readlink(child)))
+                elif stat.S_ISREG(child_info.st_mode):
+                    entries.append(
+                        (rel_child, "file", self._hash_object(child.read_bytes()))
+                    )
+                elif stat.S_ISDIR(child_info.st_mode):
+                    entries.append((rel_child, "directory", ""))
+            return GitEntryVersion(
+                kind=GitEntryKind.DIRECTORY,
+                mode="040000",
+                object_id=fingerprint_data(entries),
+            )
         if stat.S_ISREG(info.st_mode):
             data = path.read_bytes()
             mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
@@ -246,30 +275,13 @@ class RecoveryGitFixture:
                 mode=mode,
                 object_id=self._hash_object(data),
             )
-        return GitEntryVersion(kind=GitEntryKind.UNKNOWN)
+        return GitEntryVersion(
+            kind=GitEntryKind.UNKNOWN,
+            unknown_reason=f"unsupported filesystem mode {info.st_mode:o}",
+        )
 
     def _hash_object(self, data: bytes) -> str:
         return _git_bytes(self.repo, "hash-object", "--stdin", stdin=data).decode().strip()
-
-    @staticmethod
-    def _delta(
-        left: GitEntryVersion,
-        right: GitEntryVersion,
-        *,
-        untracked: bool = False,
-    ) -> GitDelta:
-        if left == right:
-            return GitDelta.UNCHANGED
-        if left.kind is GitEntryKind.ABSENT:
-            return GitDelta.UNTRACKED if untracked else GitDelta.ADDED
-        if right.kind is GitEntryKind.ABSENT:
-            return GitDelta.DELETED
-        if left.kind is not right.kind:
-            return GitDelta.TYPE_CHANGED
-        if left.mode != right.mode:
-            return GitDelta.MODE_CHANGED
-        return GitDelta.MODIFIED
-
 
 @pytest.fixture
 def recovery_git(fixture_repo: Path) -> RecoveryGitFixture:

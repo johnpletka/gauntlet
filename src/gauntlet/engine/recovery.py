@@ -1,20 +1,21 @@
-"""Recovery observations and contracts shared by future recovery workflows.
+"""Fail-closed recovery observations and executable action contracts.
 
-This module is intentionally side-effect free.  P1 establishes the vocabulary
-used to describe repository and state-machine evidence; later phases will make
-``status``, ``resume``, ``recover``, and ``rollback`` consume it through a
-single planner/executor.  Keeping these models independent of the existing
-rewind implementation lets the migration proceed without changing production
-recovery behaviour before lossless snapshots exist.
+P1 defines the complete, immutable evidence vocabulary used by later recovery
+phases.  The models are deliberately side-effect free: observers must prove
+that Git planes, commit ranges, lifecycle states, and actions are internally
+consistent before a future planner can consume them.  P2-P4 will add snapshot,
+planner, executor, and public-command behaviour without weakening these
+contracts.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import Enum
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Annotated, Any, Literal, TypeAlias, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -27,7 +28,7 @@ class _ClosedStringEnum(str, Enum):
 
 
 class BranchRelation(_ClosedStringEnum):
-    """Relationship between the run branch and its recorded boundary."""
+    """Graph relationship between the run ref and its recorded boundary."""
 
     EQUAL = "equal"
     ENGINE_BOOKKEEPING_AHEAD = "engine_bookkeeping_ahead"
@@ -37,6 +38,7 @@ class BranchRelation(_ClosedStringEnum):
     BEHIND = "behind"
     FORKED = "forked"
     MISSING = "missing"
+    UNRECORDED = "unrecorded"
 
 
 class DriverLiveness(_ClosedStringEnum):
@@ -46,6 +48,34 @@ class DriverLiveness(_ClosedStringEnum):
     ORPHANED = "orphaned"
     INDETERMINATE = "indeterminate"
     NONE = "none"
+
+
+class RunStatus(_ClosedStringEnum):
+    """Persistable run lifecycle values."""
+
+    RUNNING = "running"
+    PARKED = "parked"
+    DONE = "done"
+    ABORTED = "aborted"
+    FAILED = "failed"
+
+
+class StepStatus(_ClosedStringEnum):
+    """Persistable step lifecycle values."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    PARKED = "parked"
+    HALTED = "halted"
+    SKIPPED = "skipped"
+
+
+class ResponseState(_ClosedStringEnum):
+    PENDING = "pending"
+    CONSUMED = "consumed"
 
 
 class GitEntryKind(_ClosedStringEnum):
@@ -70,9 +100,30 @@ class GitDelta(_ClosedStringEnum):
     TYPE_CHANGED = "type_changed"
     MODE_CHANGED = "mode_changed"
     UNMERGED = "unmerged"
+    CONFLICTED = "conflicted"
     UNTRACKED = "untracked"
     IGNORED = "ignored"
     UNKNOWN = "unknown"
+
+
+class CommitKind(_ClosedStringEnum):
+    """Evidence-backed ownership/role of a commit in a recovery range."""
+
+    ENGINE_BOOKKEEPING = "engine_bookkeeping"
+    CHECKPOINT = "checkpoint"
+    PHASE = "phase"
+    OPERATOR = "operator"
+    UNKNOWN = "unknown"
+
+
+class PathChangeKind(_ClosedStringEnum):
+    ADDED = "added"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+    RENAMED = "renamed"
+    COPIED = "copied"
+    TYPE_CHANGED = "type_changed"
+    UNMERGED = "unmerged"
 
 
 class RecoveryCause(_ClosedStringEnum):
@@ -104,6 +155,7 @@ class RecoveryDisposition(_ClosedStringEnum):
     SNAPSHOT_AND_RESTART = "snapshot_and_restart"
     RESTORE_SNAPSHOT = "restore_snapshot"
     CONTINUE_ON_RECOVERY_BRANCH = "continue_on_recovery_branch"
+    REBUILD_PROJECTION = "rebuild_projection"
     HUMAN_DECISION = "human_decision"
     ABORT_ONLY = "abort_only"
 
@@ -119,6 +171,7 @@ class RecoveryActionKind(_ClosedStringEnum):
     SNAPSHOT_AND_RESTART = "snapshot_and_restart"
     RESTORE_SNAPSHOT = "restore_snapshot"
     CONTINUE_ON_RECOVERY_BRANCH = "continue_on_recovery_branch"
+    REBUILD_PROJECTION = "rebuild_projection"
     HUMAN_DECISION = "human_decision"
     ABORT = "abort"
 
@@ -130,23 +183,42 @@ class _FrozenModel(BaseModel):
 class GitEntryVersion(_FrozenModel):
     """One path as represented in HEAD, the index, or the working tree.
 
-    ``object_id`` is normally the Git object ID.  A future observer may use a
-    content fingerprint when an object has not yet been written; callers must
-    compare only values produced by the same observer.  Symlink targets are
-    data and are never dereferenced.
+    Every present, known entry carries both a mode and a content/object identity.
+    Symlink targets are recorded as data and are never dereferenced.  ``UNKNOWN``
+    is explicit evidence degradation and must explain why identification failed.
     """
 
     kind: GitEntryKind
     mode: str | None = None
     object_id: str | None = None
     symlink_target: str | None = None
+    unknown_reason: str | None = None
 
     @model_validator(mode="after")
     def _metadata_matches_kind(self) -> "GitEntryVersion":
         if self.kind is GitEntryKind.ABSENT:
-            if any((self.mode, self.object_id, self.symlink_target)):
+            if any((self.mode, self.object_id, self.symlink_target, self.unknown_reason)):
                 raise ValueError("an absent Git entry cannot carry metadata")
             return self
+        if self.kind is GitEntryKind.UNKNOWN:
+            if not self.unknown_reason:
+                raise ValueError("an unknown Git entry must explain missing evidence")
+            if self.symlink_target is not None:
+                raise ValueError("an unknown Git entry cannot claim a symlink target")
+            return self
+        if not self.mode or not self.object_id:
+            raise ValueError("a present Git entry requires mode and object_id")
+        if self.unknown_reason is not None:
+            raise ValueError("a known Git entry cannot carry unknown_reason")
+        expected_mode = {
+            GitEntryKind.SYMLINK: "120000",
+            GitEntryKind.GITLINK: "160000",
+            GitEntryKind.DIRECTORY: "040000",
+        }.get(self.kind)
+        if expected_mode is not None and self.mode != expected_mode:
+            raise ValueError(f"{self.kind.value} entries require mode {expected_mode}")
+        if self.kind is GitEntryKind.REGULAR and self.mode not in {"100644", "100755"}:
+            raise ValueError("regular entries require mode 100644 or 100755")
         if self.kind is GitEntryKind.SYMLINK:
             if self.symlink_target is None:
                 raise ValueError("a symlink observation must record its target")
@@ -158,6 +230,31 @@ class GitEntryVersion(_FrozenModel):
 ABSENT_GIT_ENTRY = GitEntryVersion(kind=GitEntryKind.ABSENT)
 
 
+def derive_git_delta(
+    left: GitEntryVersion,
+    right: GitEntryVersion,
+    *,
+    untracked: bool = False,
+) -> GitDelta:
+    """Derive a plane delta from versions; callers do not supply trusted labels."""
+
+    if left == right:
+        return GitDelta.UNCHANGED
+    if GitEntryKind.UNKNOWN in {left.kind, right.kind}:
+        return GitDelta.UNKNOWN
+    if left.kind is GitEntryKind.ABSENT:
+        return GitDelta.UNTRACKED if untracked else GitDelta.ADDED
+    if right.kind is GitEntryKind.ABSENT:
+        return GitDelta.DELETED
+    if left.kind is not right.kind:
+        return GitDelta.TYPE_CHANGED
+    if left.mode != right.mode:
+        return GitDelta.MODE_CHANGED
+    if left.object_id != right.object_id or left.symlink_target != right.symlink_target:
+        return GitDelta.MODIFIED
+    return GitDelta.UNCHANGED
+
+
 class GitIndexStage(_FrozenModel):
     """One conflict-stage entry from an unmerged index."""
 
@@ -166,13 +263,13 @@ class GitIndexStage(_FrozenModel):
 
     @model_validator(mode="after")
     def _stage_is_present(self) -> "GitIndexStage":
-        if self.version.kind is GitEntryKind.ABSENT:
-            raise ValueError("an index conflict stage cannot be absent")
+        if self.version.kind in {GitEntryKind.ABSENT, GitEntryKind.UNKNOWN}:
+            raise ValueError("an index conflict stage must be identified and present")
         return self
 
 
 class GitEntryObservation(_FrozenModel):
-    """Independent HEAD/index/worktree state for one repository-relative path."""
+    """Independent, self-consistent HEAD/index/worktree state for one path."""
 
     path: str
     head: GitEntryVersion = ABSENT_GIT_ENTRY
@@ -189,20 +286,116 @@ class GitEntryObservation(_FrozenModel):
         _validate_repo_relative_path(self.path, field="path")
         if self.renamed_from is not None:
             _validate_repo_relative_path(self.renamed_from, field="renamed_from")
+            if self.renamed_from == self.path:
+                raise ValueError("renamed_from must differ from path")
         if self.index_stages:
             stages = tuple(stage.stage for stage in self.index_stages)
             if len(set(stages)) != len(stages):
                 raise ValueError("index conflict stages must be unique")
+            if self.index.kind is not GitEntryKind.ABSENT:
+                raise ValueError("an unmerged index has no stage-0 entry")
             if self.index_delta is not GitDelta.UNMERGED:
                 raise ValueError("conflict stages require index_delta='unmerged'")
-        if self.index_delta is GitDelta.UNMERGED and not self.index_stages:
-            raise ValueError("index_delta='unmerged' requires conflict stages")
-        if self.renamed_from is not None and not (
-            self.index_delta is GitDelta.RENAMED
-            or self.worktree_delta is GitDelta.RENAMED
-        ):
-            raise ValueError("renamed_from requires a renamed delta")
+            if self.worktree_delta is not GitDelta.CONFLICTED:
+                raise ValueError("an unmerged path requires worktree_delta='conflicted'")
+            if self.renamed_from is not None:
+                raise ValueError("an unmerged path cannot also be declared renamed")
+            return self
+        if self.index_delta in {GitDelta.UNMERGED, GitDelta.CONFLICTED}:
+            raise ValueError("unmerged index deltas require conflict stages")
+        if self.worktree_delta in {GitDelta.UNMERGED, GitDelta.CONFLICTED}:
+            raise ValueError("conflicted worktree deltas require conflict stages")
+
+        expected_index = derive_git_delta(self.head, self.index)
+        expected_worktree = derive_git_delta(self.index, self.worktree, untracked=True)
+        if self.renamed_from is not None:
+            if GitDelta.RENAMED not in {self.index_delta, self.worktree_delta}:
+                raise ValueError("renamed_from requires a renamed delta")
+            if self.index_delta is not GitDelta.RENAMED and self.index_delta is not expected_index:
+                raise ValueError("index_delta contradicts HEAD/index evidence")
+            if (
+                self.worktree_delta is not GitDelta.RENAMED
+                and self.worktree_delta is not expected_worktree
+            ):
+                raise ValueError("worktree_delta contradicts index/worktree evidence")
+            return self
+        if self.index_delta is not expected_index:
+            raise ValueError("index_delta contradicts HEAD/index evidence")
+        if self.worktree_delta is GitDelta.IGNORED:
+            if not (
+                self.index.kind is GitEntryKind.ABSENT
+                and self.worktree.kind is not GitEntryKind.ABSENT
+            ):
+                raise ValueError("ignored worktree evidence must be untracked")
+        elif self.worktree_delta is not expected_worktree:
+            raise ValueError("worktree_delta contradicts index/worktree evidence")
         return self
+
+
+class GitCommitPathChange(_FrozenModel):
+    """One path-level change made by a commit in a recovery range."""
+
+    kind: PathChangeKind
+    path: str
+    previous_path: str | None = None
+    protected: bool = False
+    approved_artifact: bool = False
+
+    @model_validator(mode="after")
+    def _path_contract(self) -> "GitCommitPathChange":
+        _validate_repo_relative_path(self.path, field="path")
+        if self.kind in {PathChangeKind.RENAMED, PathChangeKind.COPIED}:
+            if self.previous_path is None:
+                raise ValueError("renamed/copied changes require previous_path")
+            _validate_repo_relative_path(self.previous_path, field="previous_path")
+        elif self.previous_path is not None:
+            raise ValueError("previous_path is valid only for renamed/copied changes")
+        return self
+
+
+class GitCommitObservation(_FrozenModel):
+    """Auditable identity and change evidence for one observed commit."""
+
+    sha: str
+    parents: tuple[str, ...]
+    author_name: str = Field(min_length=1)
+    author_email: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    changed_paths: tuple[GitCommitPathChange, ...] = ()
+    kind: CommitKind
+    attempt_id: str | None = None
+    phase_id: str | None = None
+    checkpoint_id: str | None = None
+    classification_evidence: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _commit_contract(self) -> "GitCommitObservation":
+        _validate_sha(self.sha, field="sha")
+        for parent in self.parents:
+            _validate_sha(parent, field="parent")
+        if len(set(self.parents)) != len(self.parents):
+            raise ValueError("commit parents must be unique")
+        paths = tuple(change.path for change in self.changed_paths)
+        if len(set(paths)) != len(paths):
+            raise ValueError("commit changed paths must be unique")
+        if self.kind is CommitKind.CHECKPOINT:
+            if not self.phase_id or not self.checkpoint_id:
+                raise ValueError("checkpoint commits require phase_id and checkpoint_id")
+        elif self.checkpoint_id is not None:
+            raise ValueError("checkpoint_id is valid only for checkpoint commits")
+        if self.kind is CommitKind.PHASE and not self.phase_id:
+            raise ValueError("phase commits require phase_id")
+        return self
+
+
+_AHEAD_RELATIONS = frozenset(
+    {
+        BranchRelation.ENGINE_BOOKKEEPING_AHEAD,
+        BranchRelation.CHECKPOINT_AHEAD,
+        BranchRelation.OPERATOR_AHEAD,
+        BranchRelation.MIXED_AHEAD,
+    }
+)
 
 
 class GitObservation(_FrozenModel):
@@ -214,59 +407,279 @@ class GitObservation(_FrozenModel):
     run_branch_sha: str | None
     recorded_sha: str | None
     branch_relation: BranchRelation
+    merge_base_sha: str | None = None
+    run_branch_commits: tuple[GitCommitObservation, ...] = ()
     index_fingerprint: str
     worktree_fingerprint: str
     dirty_entries: tuple[GitEntryObservation, ...] = ()
 
     @model_validator(mode="after")
     def _branch_contract(self) -> "GitObservation":
-        if self.branch_relation is BranchRelation.MISSING:
-            if self.run_branch_sha is not None:
-                raise ValueError("a missing run branch cannot have a tip SHA")
-        elif self.run_branch_sha is None:
-            raise ValueError("a non-missing run branch must have a tip SHA")
+        _validate_sha(self.head_sha, field="head_sha")
+        if self.run_branch_sha is not None:
+            _validate_sha(self.run_branch_sha, field="run_branch_sha")
+        if self.recorded_sha is not None:
+            _validate_sha(self.recorded_sha, field="recorded_sha")
+        if self.merge_base_sha is not None:
+            _validate_sha(self.merge_base_sha, field="merge_base_sha")
+
+        relation = self.branch_relation
+        if relation is BranchRelation.MISSING:
+            if self.run_branch_sha is not None or self.run_branch_commits:
+                raise ValueError("a missing run branch cannot have a tip or commits")
+        elif relation is BranchRelation.UNRECORDED:
+            if self.run_branch_sha is None or self.recorded_sha is not None:
+                raise ValueError("unrecorded requires a run tip and no recorded SHA")
+            if self.run_branch_commits:
+                raise ValueError("unrecorded history has no recorded range boundary")
+        else:
+            if self.run_branch_sha is None or self.recorded_sha is None:
+                raise ValueError("a recorded branch relation requires both SHAs")
+
+        if relation is BranchRelation.EQUAL:
+            if self.run_branch_sha != self.recorded_sha:
+                raise ValueError("equal relation requires identical SHAs")
+            if self.run_branch_commits:
+                raise ValueError("equal relation cannot carry range commits")
+        elif relation in _AHEAD_RELATIONS:
+            if self.run_branch_sha == self.recorded_sha:
+                raise ValueError("ahead relation requires different SHAs")
+            self._validate_linear_range(self.recorded_sha)
+            kinds = {commit.kind for commit in self.run_branch_commits}
+            if relation is BranchRelation.ENGINE_BOOKKEEPING_AHEAD and kinds != {
+                CommitKind.ENGINE_BOOKKEEPING
+            }:
+                raise ValueError("engine-bookkeeping relation contradicts commit roles")
+            if relation is BranchRelation.CHECKPOINT_AHEAD and not (
+                CommitKind.CHECKPOINT in kinds
+                and kinds <= {CommitKind.CHECKPOINT, CommitKind.ENGINE_BOOKKEEPING}
+            ):
+                raise ValueError("checkpoint relation contradicts commit roles")
+            if relation is BranchRelation.OPERATOR_AHEAD and kinds != {CommitKind.OPERATOR}:
+                raise ValueError("operator relation contradicts commit roles")
+            if relation is BranchRelation.MIXED_AHEAD and len(kinds) < 2:
+                raise ValueError("mixed relation requires at least two commit roles")
+        elif relation is BranchRelation.BEHIND:
+            if self.run_branch_sha == self.recorded_sha:
+                raise ValueError("behind relation requires different SHAs")
+            if self.merge_base_sha != self.run_branch_sha:
+                raise ValueError("behind relation requires merge base at run tip")
+            if self.run_branch_commits:
+                raise ValueError("behind relation has no run-only commits")
+        elif relation is BranchRelation.FORKED:
+            if self.run_branch_sha == self.recorded_sha:
+                raise ValueError("forked relation requires different SHAs")
+            if self.merge_base_sha in {None, self.run_branch_sha, self.recorded_sha}:
+                raise ValueError("forked relation requires a distinct merge base")
+            self._validate_linear_range(self.merge_base_sha)
+
         paths = tuple(entry.path for entry in self.dirty_entries)
         if len(set(paths)) != len(paths):
             raise ValueError("dirty entry paths must be unique")
+        if any(
+            entry.index_delta is GitDelta.UNCHANGED
+            and entry.worktree_delta is GitDelta.UNCHANGED
+            for entry in self.dirty_entries
+        ):
+            raise ValueError("dirty_entries cannot contain a clean path")
         return self
+
+    def _validate_linear_range(self, boundary_sha: str | None) -> None:
+        if boundary_sha is None or not self.run_branch_commits:
+            raise ValueError("branch range requires inventoried commits")
+        previous = boundary_sha
+        seen: set[str] = set()
+        for commit in self.run_branch_commits:
+            if commit.sha in seen:
+                raise ValueError("branch range commits must be unique")
+            if previous not in commit.parents:
+                raise ValueError("branch range is not a contiguous parent chain")
+            seen.add(commit.sha)
+            previous = commit.sha
+        if previous != self.run_branch_sha:
+            raise ValueError("branch range must end at the run-branch tip")
 
 
 class StateObservation(_FrozenModel):
     """Persisted state-machine and process evidence, without policy inference."""
 
-    run_status: str
-    step_status: str | None = None
+    run_status: RunStatus
+    step_status: StepStatus | None = None
     attempt_id: str | None = None
     liveness: DriverLiveness
     pending_response_id: str | None = None
+    pending_response_state: ResponseState | None = None
     last_snapshot_id: str | None = None
     artifact_fingerprint: str | None = None
 
-
-class RecoveryAction(_FrozenModel):
-    """One concrete action that can be selected from an assessment."""
-
-    kind: RecoveryActionKind
-    description: str = Field(min_length=1)
-    requires_snapshot: bool = False
-    requires_human_decision: bool = False
-    parameters: tuple[tuple[str, str], ...] = ()
-
     @model_validator(mode="after")
-    def _unique_parameters(self) -> "RecoveryAction":
-        names = tuple(name for name, _value in self.parameters)
-        if len(set(names)) != len(names):
-            raise ValueError("recovery action parameter names must be unique")
-        if (
-            self.kind is RecoveryActionKind.HUMAN_DECISION
-            and not self.requires_human_decision
-        ):
-            raise ValueError("human_decision actions must require a human decision")
+    def _response_contract(self) -> "StateObservation":
+        if (self.pending_response_id is None) != (self.pending_response_state is None):
+            raise ValueError("pending response id and state must appear together")
         return self
 
 
+class _ActionBase(_FrozenModel):
+    description: str = Field(min_length=1)
+    requires_snapshot: bool
+    requires_human_decision: bool
+
+
+class RetryAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.RETRY] = RecoveryActionKind.RETRY
+    operation: str = Field(min_length=1)
+    attempt_id: str | None = None
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[False] = False
+
+
+class ResumeSessionAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.RESUME_SESSION] = RecoveryActionKind.RESUME_SESSION
+    session_id: str = Field(min_length=1)
+    step_id: str = Field(min_length=1)
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[False] = False
+
+
+class EditThenRetryAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.EDIT_THEN_RETRY] = RecoveryActionKind.EDIT_THEN_RETRY
+    artifact_path: str
+    expected_fingerprint: str = Field(min_length=1)
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _contained_artifact(self) -> "EditThenRetryAction":
+        _validate_repo_relative_path(self.artifact_path, field="artifact_path")
+        return self
+
+
+class RestartFromCheckpointAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.RESTART_FROM_CHECKPOINT] = (
+        RecoveryActionKind.RESTART_FROM_CHECKPOINT
+    )
+    checkpoint_sha: str
+    step_id: str = Field(min_length=1)
+    requires_snapshot: Literal[True] = True
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _valid_checkpoint(self) -> "RestartFromCheckpointAction":
+        _validate_sha(self.checkpoint_sha, field="checkpoint_sha")
+        return self
+
+
+class AdoptCommitsAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.ADOPT_COMMITS] = RecoveryActionKind.ADOPT_COMMITS
+    base_sha: str
+    tip_sha: str
+    commit_shas: tuple[str, ...] = Field(min_length=1)
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _valid_range(self) -> "AdoptCommitsAction":
+        _validate_sha(self.base_sha, field="base_sha")
+        _validate_sha(self.tip_sha, field="tip_sha")
+        for sha in self.commit_shas:
+            _validate_sha(sha, field="commit_sha")
+        if len(set(self.commit_shas)) != len(self.commit_shas):
+            raise ValueError("adopt commit SHAs must be unique")
+        if self.commit_shas[-1] != self.tip_sha or self.base_sha in self.commit_shas:
+            raise ValueError("adopt range must exclude base and end at tip")
+        return self
+
+
+class SnapshotAndRestartAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.SNAPSHOT_AND_RESTART] = (
+        RecoveryActionKind.SNAPSHOT_AND_RESTART
+    )
+    target_ref: str = Field(min_length=1)
+    target_sha: str
+    reason: str = Field(min_length=1)
+    requires_snapshot: Literal[True] = True
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _valid_target(self) -> "SnapshotAndRestartAction":
+        _validate_sha(self.target_sha, field="target_sha")
+        return self
+
+
+class RestoreSnapshotAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.RESTORE_SNAPSHOT] = RecoveryActionKind.RESTORE_SNAPSHOT
+    snapshot_id: str = Field(min_length=1)
+    requires_snapshot: Literal[True] = True
+    requires_human_decision: Literal[False] = False
+
+
+class ContinueOnRecoveryBranchAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH] = (
+        RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH
+    )
+    branch_name: str = Field(min_length=1)
+    start_sha: str
+    requires_snapshot: Literal[True] = True
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _valid_start(self) -> "ContinueOnRecoveryBranchAction":
+        _validate_sha(self.start_sha, field="start_sha")
+        return self
+
+
+class RebuildProjectionAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.REBUILD_PROJECTION] = (
+        RecoveryActionKind.REBUILD_PROJECTION
+    )
+    journal_path: str
+    projection_path: str
+    evidence_fingerprint: str = Field(min_length=1)
+    requires_snapshot: Literal[True] = True
+    requires_human_decision: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _contained_paths(self) -> "RebuildProjectionAction":
+        _validate_repo_relative_path(self.journal_path, field="journal_path")
+        _validate_repo_relative_path(self.projection_path, field="projection_path")
+        return self
+
+
+class HumanDecisionAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.HUMAN_DECISION] = RecoveryActionKind.HUMAN_DECISION
+    decision_id: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[True] = True
+
+
+class AbortAction(_ActionBase):
+    kind: Literal[RecoveryActionKind.ABORT] = RecoveryActionKind.ABORT
+    reason: str = Field(min_length=1)
+    requires_snapshot: Literal[False] = False
+    requires_human_decision: Literal[False] = False
+
+
+RecoveryAction: TypeAlias = Annotated[
+    Union[
+        RetryAction,
+        ResumeSessionAction,
+        EditThenRetryAction,
+        RestartFromCheckpointAction,
+        AdoptCommitsAction,
+        SnapshotAndRestartAction,
+        RestoreSnapshotAction,
+        ContinueOnRecoveryBranchAction,
+        RebuildProjectionAction,
+        HumanDecisionAction,
+        AbortAction,
+    ],
+    Field(discriminator="kind"),
+]
+
+
 class RecoveryAssessment(_FrozenModel):
-    """A cause, strategy, and auditable set of safe executable actions."""
+    """A cause, strategy, and auditable set of executable actions."""
 
     cause: RecoveryCause
     disposition: RecoveryDisposition
@@ -294,20 +707,18 @@ class ProgressFingerprint(_FrozenModel):
     current_step: str | None = None
     iteration: str | int | None = None
     attempt_id: str | None = None
-    run_status: str
-    step_status: str | None = None
+    run_status: RunStatus
+    step_status: StepStatus | None = None
     run_branch_sha: str | None = None
     index_fingerprint: str
     worktree_fingerprint: str
     artifact_fingerprint: str | None = None
     pending_response_id: str | None = None
-    pending_response_state: str | None = None
+    pending_response_state: ResponseState | None = None
     latest_cycle_substep: str | None = None
 
     @property
     def digest(self) -> str:
-        """A deterministic SHA-256 over every progress-bearing field."""
-
         payload = json.dumps(
             self.model_dump(mode="json"),
             sort_keys=True,
@@ -318,12 +729,7 @@ class ProgressFingerprint(_FrozenModel):
 
 
 class NoProgressError(RuntimeError):
-    """A mutating recovery command returned to an identical state.
-
-    The exception carries the complete before/after evidence and at least one
-    executable next action.  P4 will wire this contract into public commands;
-    P1 only makes the fail-loud outcome precise and testable.
-    """
+    """A mutating recovery command returned to an identical state."""
 
     def __init__(
         self,
@@ -366,12 +772,16 @@ def _validate_repo_relative_path(value: str, *, field: str) -> None:
         raise ValueError(f"{field} must be a contained repository-relative path")
 
 
-def fingerprint_data(value: Any) -> str:
-    """Return a stable SHA-256 for JSON-compatible observation data.
+_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
-    This helper is intentionally generic enough for test fixtures and early
-    observers.  Git snapshot object IDs remain separate evidence in P2.
-    """
+
+def _validate_sha(value: str, *, field: str) -> None:
+    if not _SHA_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a full 40- or 64-hex object id")
+
+
+def fingerprint_data(value: Any) -> str:
+    """Return a stable SHA-256 for JSON-compatible observation data."""
 
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -381,22 +791,41 @@ def fingerprint_data(value: Any) -> str:
 
 __all__ = [
     "ABSENT_GIT_ENTRY",
+    "AbortAction",
+    "AdoptCommitsAction",
     "BranchRelation",
+    "CommitKind",
+    "ContinueOnRecoveryBranchAction",
     "DriverLiveness",
+    "EditThenRetryAction",
+    "GitCommitObservation",
+    "GitCommitPathChange",
     "GitDelta",
     "GitEntryKind",
     "GitEntryObservation",
     "GitEntryVersion",
     "GitIndexStage",
     "GitObservation",
+    "HumanDecisionAction",
     "NoProgressError",
+    "PathChangeKind",
     "ProgressFingerprint",
+    "RebuildProjectionAction",
     "RecoveryAction",
     "RecoveryActionKind",
     "RecoveryAssessment",
     "RecoveryCause",
     "RecoveryDisposition",
+    "ResponseState",
+    "RestartFromCheckpointAction",
+    "RestoreSnapshotAction",
+    "ResumeSessionAction",
+    "RetryAction",
+    "RunStatus",
+    "SnapshotAndRestartAction",
     "StateObservation",
+    "StepStatus",
+    "derive_git_delta",
     "fingerprint_data",
     "require_progress",
 ]

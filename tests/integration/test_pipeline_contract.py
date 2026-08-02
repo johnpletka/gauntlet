@@ -148,6 +148,11 @@ def test_real_pipeline_agent_shell_commit_with_live_judge(tmp_path):
             }
         )
     )
+    # The run-start cleanliness check is a production invariant.  Keep the
+    # live-hook fixture realistic by committing its project settings instead
+    # of relying on the engine to ignore untracked test setup.
+    _git(repo, "add", ".claude/settings.json")
+    _git(repo, "commit", "-qm", "wire live judge hook")
     mgr = RunManager(repo)
     status = mgr.start(
         "demo", repo / "pipelines" / "mini.yaml", use_judge=True,

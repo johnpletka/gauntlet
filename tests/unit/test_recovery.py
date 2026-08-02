@@ -6,21 +6,38 @@ import pytest
 from pydantic import ValidationError
 
 from gauntlet.engine.recovery import (
+    AbortAction,
+    AdoptCommitsAction,
     BranchRelation,
+    CommitKind,
+    ContinueOnRecoveryBranchAction,
     DriverLiveness,
+    EditThenRetryAction,
+    GitCommitObservation,
+    GitCommitPathChange,
     GitDelta,
     GitEntryKind,
     GitEntryObservation,
     GitEntryVersion,
     GitObservation,
+    HumanDecisionAction,
     NoProgressError,
+    PathChangeKind,
     ProgressFingerprint,
+    RebuildProjectionAction,
     RecoveryAction,
     RecoveryActionKind,
     RecoveryAssessment,
     RecoveryCause,
     RecoveryDisposition,
+    ResponseState,
+    RestoreSnapshotAction,
+    ResumeSessionAction,
+    RetryAction,
+    RunStatus,
+    SnapshotAndRestartAction,
     StateObservation,
+    StepStatus,
     fingerprint_data,
     require_progress,
 )
@@ -28,14 +45,60 @@ from gauntlet.engine.recovery import (
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+SHA_C = "c" * 40
+SHA_D = "d" * 40
 
 
 def _action(kind: RecoveryActionKind) -> RecoveryAction:
-    return RecoveryAction(
-        kind=kind,
-        description=f"execute {kind.value}",
-        requires_human_decision=kind is RecoveryActionKind.HUMAN_DECISION,
-    )
+    common = {"description": f"execute {kind.value}"}
+    if kind is RecoveryActionKind.RETRY:
+        return RetryAction(**common, operation="adapter_call", attempt_id="attempt-2")
+    if kind is RecoveryActionKind.RESUME_SESSION:
+        return ResumeSessionAction(**common, session_id="session-1", step_id="implement")
+    if kind is RecoveryActionKind.EDIT_THEN_RETRY:
+        return EditThenRetryAction(
+            **common,
+            artifact_path="runs/demo/plan.md",
+            expected_fingerprint="sha256:artifact",
+        )
+    if kind is RecoveryActionKind.ADOPT_COMMITS:
+        return AdoptCommitsAction(
+            **common,
+            base_sha=SHA_A,
+            tip_sha=SHA_B,
+            commit_shas=(SHA_B,),
+        )
+    if kind is RecoveryActionKind.SNAPSHOT_AND_RESTART:
+        return SnapshotAndRestartAction(
+            **common,
+            target_ref="refs/heads/gauntlet/demo",
+            target_sha=SHA_A,
+            reason="partial work",
+        )
+    if kind is RecoveryActionKind.RESTORE_SNAPSHOT:
+        return RestoreSnapshotAction(**common, snapshot_id="snapshot-1")
+    if kind is RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH:
+        return ContinueOnRecoveryBranchAction(
+            **common,
+            branch_name="gauntlet/recovery/demo",
+            start_sha=SHA_B,
+        )
+    if kind is RecoveryActionKind.REBUILD_PROJECTION:
+        return RebuildProjectionAction(
+            **common,
+            journal_path=".gauntlet/state/demo/events",
+            projection_path="runs/demo/run-1/manifest.json",
+            evidence_fingerprint="sha256:evidence",
+        )
+    if kind is RecoveryActionKind.HUMAN_DECISION:
+        return HumanDecisionAction(
+            **common,
+            decision_id="upstream-conflict-1",
+            prompt="Choose how to resolve the approved artifact conflict",
+        )
+    if kind is RecoveryActionKind.ABORT:
+        return AbortAction(**common, reason="retain evidence and stop")
+    raise AssertionError(f"test action factory missing {kind}")
 
 
 def _progress(**updates) -> ProgressFingerprint:
@@ -44,8 +107,8 @@ def _progress(**updates) -> ProgressFingerprint:
         "current_step": "implement",
         "iteration": "P1",
         "attempt_id": "attempt-2",
-        "run_status": "running",
-        "step_status": "interrupted",
+        "run_status": RunStatus.RUNNING,
+        "step_status": StepStatus.INTERRUPTED,
         "run_branch_sha": SHA_A,
         "index_fingerprint": "sha256:index",
         "worktree_fingerprint": "sha256:worktree",
@@ -56,6 +119,33 @@ def _progress(**updates) -> ProgressFingerprint:
     }
     values.update(updates)
     return ProgressFingerprint(**values)
+
+
+def _commit(
+    sha: str,
+    parent: str,
+    kind: CommitKind,
+    *,
+    path: str = "feature.py",
+) -> GitCommitObservation:
+    metadata = {}
+    if kind is CommitKind.CHECKPOINT:
+        metadata = {"phase_id": "P1", "checkpoint_id": "cp-1", "attempt_id": "a-1"}
+    elif kind is CommitKind.PHASE:
+        metadata = {"phase_id": "P1", "attempt_id": "a-1"}
+    return GitCommitObservation(
+        sha=sha,
+        parents=(parent,),
+        author_name="Fixture",
+        author_email="fixture@gauntlet.local",
+        subject=f"{kind.value} commit",
+        changed_paths=(
+            GitCommitPathChange(kind=PathChangeKind.MODIFIED, path=path),
+        ),
+        kind=kind,
+        classification_evidence=("author, subject, and changed paths inspected",),
+        **metadata,
+    )
 
 
 @pytest.mark.parametrize(
@@ -80,25 +170,13 @@ def _progress(**updates) -> ProgressFingerprint:
             RecoveryActionKind.RESUME_SESSION,
         ),
         (
-            "driver killed",
+            "driver killed with partial work",
             RecoveryCause.PROCESS_LOST,
             RecoveryDisposition.SNAPSHOT_AND_RESTART,
             RecoveryActionKind.SNAPSHOT_AND_RESTART,
         ),
         (
-            "dirty partial work",
-            RecoveryCause.WORKTREE_PARTIAL,
-            RecoveryDisposition.SNAPSHOT_AND_RESTART,
-            RecoveryActionKind.SNAPSHOT_AND_RESTART,
-        ),
-        (
             "commit landed before manifest flush",
-            RecoveryCause.BRANCH_AHEAD,
-            RecoveryDisposition.ADOPT_COMMITS,
-            RecoveryActionKind.ADOPT_COMMITS,
-        ),
-        (
-            "human repair commit",
             RecoveryCause.BRANCH_AHEAD,
             RecoveryDisposition.ADOPT_COMMITS,
             RecoveryActionKind.ADOPT_COMMITS,
@@ -110,7 +188,13 @@ def _progress(**updates) -> ProgressFingerprint:
             RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH,
         ),
         (
-            "manifest inconsistent",
+            "rebuildable manifest projection",
+            RecoveryCause.STATE_INCONSISTENT,
+            RecoveryDisposition.REBUILD_PROJECTION,
+            RecoveryActionKind.REBUILD_PROJECTION,
+        ),
+        (
+            "ambiguous manifest and Git evidence",
             RecoveryCause.STATE_INCONSISTENT,
             RecoveryDisposition.RESTORE_SNAPSHOT,
             RecoveryActionKind.RESTORE_SNAPSHOT,
@@ -145,62 +229,87 @@ def test_incident_classes_have_orthogonal_causes_and_executable_actions(
     )
 
 
-@pytest.mark.parametrize("enum_type", [
-    BranchRelation,
-    DriverLiveness,
-    GitDelta,
-    GitEntryKind,
-    RecoveryCause,
-    RecoveryDisposition,
-    RecoveryActionKind,
-])
+@pytest.mark.parametrize(
+    "enum_type",
+    [
+        BranchRelation,
+        CommitKind,
+        DriverLiveness,
+        GitDelta,
+        GitEntryKind,
+        PathChangeKind,
+        RecoveryCause,
+        RecoveryDisposition,
+        RecoveryActionKind,
+        ResponseState,
+        RunStatus,
+        StepStatus,
+    ],
+)
 def test_recovery_enums_are_closed(enum_type):
     with pytest.raises(ValueError):
         enum_type("future-typo")
 
 
-def test_observations_are_immutable_and_reject_extra_inference():
+def test_state_observations_are_immutable_closed_and_pair_response_evidence():
     state = StateObservation(
-        run_status="running",
-        step_status="interrupted",
+        run_status=RunStatus.RUNNING,
+        step_status=StepStatus.INTERRUPTED,
         attempt_id="a-1",
         liveness=DriverLiveness.ORPHANED,
     )
     with pytest.raises(ValidationError):
-        state.run_status = "done"
+        state.run_status = RunStatus.DONE
+    with pytest.raises(ValidationError):
+        StateObservation(run_status="runnng", liveness=DriverLiveness.NONE)
     with pytest.raises(ValidationError):
         StateObservation(
-            run_status="running",
+            run_status=RunStatus.PARKED,
             liveness=DriverLiveness.NONE,
-            inferred_safe=True,
+            pending_response_id="response-1",
         )
 
 
-def test_git_observation_distinguishes_missing_and_divergent_branches():
-    missing = GitObservation(
-        checked_out_branch="main",
-        head_sha=SHA_A,
-        run_branch="gauntlet/demo",
-        run_branch_sha=None,
-        recorded_sha=SHA_A,
-        branch_relation=BranchRelation.MISSING,
-        index_fingerprint="sha256:index",
-        worktree_fingerprint="sha256:tree",
-    )
-    forked = missing.model_copy(
-        update={
-            "run_branch_sha": SHA_B,
-            "branch_relation": BranchRelation.FORKED,
-        }
-    )
-    assert missing.run_branch_sha is None
-    assert forked.branch_relation is BranchRelation.FORKED
-    assert forked.run_branch_sha == SHA_B
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"kind": GitEntryKind.REGULAR}, "requires mode and object_id"),
+        (
+            {"kind": GitEntryKind.SYMLINK, "mode": "120000", "object_id": SHA_A},
+            "must record its target",
+        ),
+        ({"kind": GitEntryKind.UNKNOWN}, "must explain missing evidence"),
+        (
+            {"kind": GitEntryKind.REGULAR, "mode": "120000", "object_id": SHA_A},
+            "regular entries require mode",
+        ),
+    ],
+)
+def test_present_entry_versions_require_identifying_consistent_metadata(kwargs, message):
+    with pytest.raises(ValidationError, match=message):
+        GitEntryVersion(**kwargs)
 
-    with pytest.raises(ValidationError, match="missing run branch"):
-        GitObservation(
-            **missing.model_dump(exclude={"run_branch_sha"}),
-            run_branch_sha=SHA_B,
+
+def test_entry_deltas_are_validated_against_all_three_state_planes():
+    original = GitEntryVersion(kind=GitEntryKind.REGULAR, mode="100644", object_id=SHA_A)
+    changed = GitEntryVersion(kind=GitEntryKind.REGULAR, mode="100644", object_id=SHA_B)
+
+    with pytest.raises(ValidationError, match="index_delta contradicts"):
+        GitEntryObservation(
+            path="feature.py",
+            head=original,
+            index=original,
+            worktree=original,
+            index_delta=GitDelta.MODIFIED,
+        )
+    with pytest.raises(ValidationError, match="worktree_delta contradicts"):
+        GitEntryObservation(
+            path="feature.py",
+            head=original,
+            index=changed,
+            worktree=original,
+            index_delta=GitDelta.MODIFIED,
+            worktree_delta=GitDelta.UNCHANGED,
         )
 
 
@@ -208,7 +317,7 @@ def test_entry_observation_preserves_symlink_target_without_dereference():
     link = GitEntryVersion(
         kind=GitEntryKind.SYMLINK,
         mode="120000",
-        object_id="abc",
+        object_id=SHA_A,
         symlink_target="../../outside",
     )
     entry = GitEntryObservation(
@@ -219,10 +328,139 @@ def test_entry_observation_preserves_symlink_target_without_dereference():
         protected=True,
     )
     assert entry.worktree.symlink_target == "../../outside"
-    with pytest.raises(ValidationError, match="symlink observation"):
-        GitEntryVersion(kind=GitEntryKind.SYMLINK, mode="120000")
     with pytest.raises(ValidationError, match="repository-relative"):
         GitEntryObservation(path="../outside", worktree=link)
+
+
+def test_branch_ahead_observation_carries_auditable_contiguous_commit_inventory():
+    checkpoint = _commit(SHA_B, SHA_A, CommitKind.CHECKPOINT)
+    bookkeeping = _commit(SHA_C, SHA_B, CommitKind.ENGINE_BOOKKEEPING)
+    observation = GitObservation(
+        checked_out_branch="main",
+        head_sha=SHA_D,
+        run_branch="gauntlet/demo",
+        run_branch_sha=SHA_C,
+        recorded_sha=SHA_A,
+        branch_relation=BranchRelation.CHECKPOINT_AHEAD,
+        run_branch_commits=(checkpoint, bookkeeping),
+        index_fingerprint="sha256:index",
+        worktree_fingerprint="sha256:tree",
+    )
+
+    assert observation.run_branch_commits[0].attempt_id == "a-1"
+    assert observation.run_branch_commits[0].checkpoint_id == "cp-1"
+    assert observation.run_branch_commits[-1].sha == observation.run_branch_sha
+    assert observation.checked_out_branch == "main"
+
+
+@pytest.mark.parametrize(
+    "updates, message",
+    [
+        ({"run_branch_sha": SHA_B}, "equal relation requires identical"),
+        (
+            {
+                "branch_relation": BranchRelation.CHECKPOINT_AHEAD,
+                "run_branch_sha": SHA_B,
+            },
+            "requires inventoried commits",
+        ),
+        (
+            {
+                "branch_relation": BranchRelation.BEHIND,
+                "run_branch_sha": SHA_B,
+            },
+            "merge base at run tip",
+        ),
+    ],
+)
+def test_branch_relations_reject_sha_incompatible_or_incomplete_evidence(updates, message):
+    values = {
+        "checked_out_branch": "main",
+        "head_sha": SHA_A,
+        "run_branch": "gauntlet/demo",
+        "run_branch_sha": SHA_A,
+        "recorded_sha": SHA_A,
+        "branch_relation": BranchRelation.EQUAL,
+        "index_fingerprint": "sha256:index",
+        "worktree_fingerprint": "sha256:tree",
+    }
+    values.update(updates)
+    with pytest.raises(ValidationError, match=message):
+        GitObservation(**values)
+
+
+def test_branch_role_and_parent_chain_labels_cannot_contradict_commit_evidence():
+    operator = _commit(SHA_B, SHA_A, CommitKind.OPERATOR)
+    with pytest.raises(ValidationError, match="checkpoint relation contradicts"):
+        GitObservation(
+            checked_out_branch="main",
+            head_sha=SHA_A,
+            run_branch="gauntlet/demo",
+            run_branch_sha=SHA_B,
+            recorded_sha=SHA_A,
+            branch_relation=BranchRelation.CHECKPOINT_AHEAD,
+            run_branch_commits=(operator,),
+            index_fingerprint="sha256:index",
+            worktree_fingerprint="sha256:tree",
+        )
+    disconnected = _commit(SHA_C, SHA_D, CommitKind.OPERATOR)
+    with pytest.raises(ValidationError, match="contiguous parent chain"):
+        GitObservation(
+            checked_out_branch="main",
+            head_sha=SHA_A,
+            run_branch="gauntlet/demo",
+            run_branch_sha=SHA_C,
+            recorded_sha=SHA_A,
+            branch_relation=BranchRelation.OPERATOR_AHEAD,
+            run_branch_commits=(disconnected,),
+            index_fingerprint="sha256:index",
+            worktree_fingerprint="sha256:tree",
+        )
+
+
+def test_commit_inventory_marks_approved_artifact_changes_explicitly():
+    change = GitCommitPathChange(
+        kind=PathChangeKind.MODIFIED,
+        path="runs/demo/plan.md",
+        protected=True,
+        approved_artifact=True,
+    )
+    commit = GitCommitObservation(
+        sha=SHA_B,
+        parents=(SHA_A,),
+        author_name="Operator",
+        author_email="operator@gauntlet.local",
+        subject="manual plan repair",
+        changed_paths=(change,),
+        kind=CommitKind.OPERATOR,
+        classification_evidence=("non-engine identity",),
+    )
+    assert commit.changed_paths[0].approved_artifact
+
+
+def test_actions_are_typed_and_cannot_be_advertised_without_execution_payloads():
+    with pytest.raises(ValidationError):
+        RestoreSnapshotAction(description="restore")
+    with pytest.raises(ValidationError):
+        ResumeSessionAction(description="resume", session_id="session-1")
+    with pytest.raises(ValidationError):
+        EditThenRetryAction(
+            description="edit",
+            artifact_path="../outside",
+            expected_fingerprint="sha256:x",
+        )
+    with pytest.raises(ValidationError):
+        AdoptCommitsAction(
+            description="adopt",
+            base_sha=SHA_A,
+            tip_sha=SHA_B,
+            commit_shas=(SHA_C,),
+        )
+
+    restore = _action(RecoveryActionKind.RESTORE_SNAPSHOT)
+    rebuild = _action(RecoveryActionKind.REBUILD_PROJECTION)
+    assert restore.snapshot_id == "snapshot-1"
+    assert rebuild.projection_path.endswith("manifest.json")
 
 
 def test_assessment_requires_a_safe_action_and_consistent_recommendation():
@@ -254,7 +492,10 @@ def test_progress_fingerprint_is_deterministic_and_every_plane_matters():
         ("pending_response_id", "response-1"),
         ("latest_cycle_substep", "confirm"),
     ):
-        assert baseline.digest != _progress(**{field: changed}).digest
+        updates = {field: changed}
+        if field == "pending_response_id":
+            updates["pending_response_state"] = ResponseState.PENDING
+        assert baseline.digest != _progress(**updates).digest
 
 
 def test_no_progress_contract_fails_loudly_with_executable_actions():
@@ -267,22 +508,13 @@ def test_no_progress_contract_fails_loudly_with_executable_actions():
     assert "snapshot_and_restart" in str(raised.value)
 
     require_progress(before, _progress(attempt_id="attempt-3"), safe_actions=(action,))
-    require_progress(
-        before,
-        _progress(),
-        safe_actions=(action,),
-        legitimate_wait=True,
-    )
+    require_progress(before, _progress(), safe_actions=(action,), legitimate_wait=True)
 
 
 def test_recovery_action_and_fingerprint_inputs_are_deeply_stable():
-    action = RecoveryAction(
-        kind=RecoveryActionKind.RESTORE_SNAPSHOT,
-        description="restore snapshot",
-        parameters=(("snapshot_id", "snap-1"),),
-    )
-    with pytest.raises(TypeError):
-        action.parameters[0] = ("snapshot_id", "snap-2")
+    action = _action(RecoveryActionKind.RESTORE_SNAPSHOT)
+    with pytest.raises(ValidationError):
+        action.snapshot_id = "snapshot-2"
     assert fingerprint_data({"b": 2, "a": 1}) == fingerprint_data({"a": 1, "b": 2})
 
 
@@ -332,6 +564,28 @@ def test_git_fixture_constructs_worktree_state_matrix(
     assert entry.index_delta is index_delta
     assert entry.worktree_delta is worktree_delta
     assert entry.worktree.kind is kind
+
+
+def test_git_fixture_observes_real_three_stage_conflict_as_conflicted(recovery_git):
+    recovery_git.write("conflict.txt", "base\n")
+    recovery_git.stage("conflict.txt")
+    recovery_git.commit("conflict base")
+    recovery_git.create_branch("side")
+    recovery_git.write("conflict.txt", "main\n")
+    recovery_git.stage("conflict.txt")
+    recovery_git.commit("main change")
+    recovery_git.switch("side")
+    recovery_git.write("conflict.txt", "side\n")
+    recovery_git.stage("conflict.txt")
+    recovery_git.commit("side change")
+    recovery_git.switch("main")
+    recovery_git.merge_conflict("side")
+
+    entry = recovery_git.observe_path("conflict.txt")
+    assert tuple(stage.stage for stage in entry.index_stages) == (1, 2, 3)
+    assert entry.index.kind is GitEntryKind.ABSENT
+    assert entry.index_delta is GitDelta.UNMERGED
+    assert entry.worktree_delta is GitDelta.CONFLICTED
 
 
 def test_git_fixture_constructs_branch_relations_without_checkout_side_effects(

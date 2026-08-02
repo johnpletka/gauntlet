@@ -1,6 +1,6 @@
 # Gauntlet Recovery Redesign Plan
 
-**Status:** Proposed implementation plan; not an approved PRD or run artifact.
+**Status:** Approved by the human operator for phased implementation.
 
 **Prepared from:**
 
@@ -178,8 +178,11 @@ with a shared recovery observation/planning layer.
 
 ### 4.1 Recovery observations
 
-Add immutable observation models, likely in a new
-`src/gauntlet/engine/recovery.py` module:
+Add immutable, fail-closed observation models in
+`src/gauntlet/engine/recovery.py`. Labels are never accepted without the
+evidence needed to prove them: lifecycle fields use closed enums, Git deltas
+must agree with independently identified state planes, and branch relations
+must agree with their SHAs and commit graph evidence.
 
 ```python
 class GitObservation:
@@ -188,14 +191,16 @@ class GitObservation:
     run_branch: str
     run_branch_sha: str | None
     recorded_sha: str | None
-    branch_relation: str
+    branch_relation: BranchRelation
+    merge_base_sha: str | None
+    run_branch_commits: tuple[GitCommitObservation, ...]
     index_fingerprint: str
     worktree_fingerprint: str
     dirty_entries: list[GitEntryObservation]
 
 class StateObservation:
-    run_status: str
-    step_status: str | None
+    run_status: RunStatus
+    step_status: StepStatus | None
     attempt_id: str | None
     liveness: str
     pending_response_id: str | None
@@ -206,8 +211,8 @@ class RecoveryAssessment:
     cause: str
     disposition: str
     evidence: list[str]
-    safe_actions: list[RecoveryAction]
-    recommended_action: str | None
+    safe_actions: tuple[RecoveryAction, ...]
+    recommended_action: RecoveryActionKind | None
     progress_fingerprint: str
 ```
 
@@ -222,6 +227,7 @@ mixed_ahead
 behind
 forked
 missing
+unrecorded
 ```
 
 `cause` and `disposition` are orthogonal. Suggested causes:
@@ -253,9 +259,29 @@ adopt_commits
 snapshot_and_restart
 restore_snapshot
 continue_on_recovery_branch
+rebuild_projection
 human_decision
 abort_only
 ```
+
+Every commit in an ahead or forked run-branch range is inventoried in oldest to
+newest order. A `GitCommitObservation` records its full SHA and parents, author
+identity, subject, changed paths (including rename sources and approved-artifact
+flags), classified role, attempt ID, phase ID, checkpoint ID, and the evidence
+used for that classification. The observation validates a contiguous parent
+chain ending at the run-branch tip; `engine_bookkeeping_ahead`,
+`checkpoint_ahead`, `operator_ahead`, and `mixed_ahead` must agree with the
+inventoried roles. The planner therefore classifies from auditable data instead
+of trusting a bare relation label.
+
+`RecoveryAction` is a discriminated union, not a generic action plus an untyped
+parameter bag. Each action carries the payload required to execute it: session
+and step IDs for session resume, artifact path and expected fingerprint for an
+edit/retry, checkpoint SHA for restart, base/tip/range SHAs for adoption,
+snapshot ID for restore, recovery branch name/start SHA for fork continuation,
+and journal/projection paths plus evidence fingerprint for deterministic
+manifest rebuild. An action missing its execution target is schema-invalid and
+cannot be advertised as safe.
 
 ### 4.2 Recovery planner
 
@@ -520,12 +546,24 @@ requires explicit human approval because it changes machine/worktree layout.
 Each phase ends with the full required test gate and a review handoff. Do not
 start the next phase until the current phase is reviewed and accepted. Follow
 the repository's commit-message and review-fix conventions in `AGENTS.md`.
+This plan itself must complete its own review, be explicitly approved by the
+human, and land as a distinct immutable commit before any P1 implementation
+commit. Approval of a later implementation or review waiver is not retroactive
+plan approval.
 
 ### P1 — Establish recovery invariants and test harness
 
 Deliverables:
 
 - Add `recovery.py` observation/assessment/action models with closed enums.
+- Require identified mode/object metadata for every present Git entry; derive or
+  validate every HEAD/index/worktree delta, including an explicit conflicted
+  worktree state for an unmerged index.
+- Inventory every run-branch range commit with parents, identity, subject,
+  changed paths, ownership role, attempt/phase/checkpoint metadata, and
+  classification evidence; reject relation labels that contradict that range.
+- Use a discriminated recovery-action union whose variants require all execution
+  targets, including a separate deterministic manifest-projection rebuild action.
 - Add the progress-fingerprint model and `NoProgressError` contract without yet
   changing all public behavior.
 - Create fixture helpers capable of constructing Git states across HEAD, index,
@@ -535,10 +573,14 @@ Deliverables:
 - Add a regression test proving an outside-target symlink is never followed.
 - Add a regression test proving prevalidation failure leaves the checked-out
   branch unchanged.
+- Add negative tables for contradictory entry, lifecycle, branch, commit-range,
+  and action evidence, plus a real three-stage merge-conflict fixture.
 
 Acceptance:
 
 - The models can represent every incident in Section 5.
+- The models reject misspelled lifecycle states, contradictory deltas/relations,
+  incomplete commit inventories, and actions without executable targets.
 - Tests fail against the current overlay/checkout behavior where expected.
 - No production rewind behavior changes yet.
 
