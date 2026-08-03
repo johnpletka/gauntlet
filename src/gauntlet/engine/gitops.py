@@ -903,6 +903,20 @@ def create_ref(repo: Path, ref: str, sha: str) -> None:
     _run(repo, "update-ref", ref, sha)
 
 
+def create_ref_exclusive(repo: Path, ref: str, sha: str) -> None:
+    """Atomically create ``ref`` at ``sha`` ONLY if it does not already exist.
+
+    ``git update-ref --stdin`` with the ``create`` verb makes git's own ref
+    store enforce creation semantics (the transaction fails when the ref
+    exists), closing the check-then-write race a bare ``update-ref <ref>
+    <sha>`` leaves open: two writers could both observe an absent ref and the
+    later one would silently replace the earlier — for a recovery snapshot,
+    displacing the only anchor of its unique objects (P2 review F-003).
+    Raises :class:`GitError` when the ref already exists.
+    """
+    _run(repo, "update-ref", "--stdin", stdin=f"create {ref} {sha}\n")
+
+
 def delete_ref(repo: Path, ref: str) -> None:
     """Delete an arbitrary ref, tolerating an already-absent one.
 

@@ -502,9 +502,18 @@ def test_protected_tracked_deletion_is_restored_after_reset(recovery_git):
 
 def test_excluded_engine_state_is_neither_captured_nor_deleted(recovery_git):
     # ``exclude`` (active engine state, e.g. the run root) stays out of the
-    # snapshot AND out of the restore's extraneous-deletion pass.
+    # snapshot AND out of the restore's extraneous-deletion pass — for BOTH
+    # the untracked and the TRACKED case. The tracked case is review F-001:
+    # a force-committed manifest is tracked, so the HEAD-seeded temp index
+    # holds its committed baseline; if that entry reached the worktree tree,
+    # a full restore would materialize the baseline OVER the live control
+    # state (R8 violation). Excluded entries must be absent from the tree.
     g = recovery_git
-    g.write("runs/demo/manifest.json", "{}\n")
+    g.write("runs/demo/manifest.json", "committed baseline\n")
+    g.stage()
+    g.commit("track engine bookkeeping")
+    g.write("runs/demo/manifest.json", "live control state v1\n")  # tracked+dirty
+    g.write("runs/demo/scratch.txt", "untracked engine state\n")
     g.write("work.txt", "dirty\n")
     repo = g.repo
     snapshot = _snap(repo, "excluded", exclude=["runs"])
@@ -513,10 +522,40 @@ def test_excluded_engine_state_is_neither_captured_nor_deleted(recovery_git):
         repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
     ).splitlines()
     assert "runs/demo/manifest.json" not in tree_paths
+    assert "runs/demo/scratch.txt" not in tree_paths
     assert snapshot.excluded_paths == ("runs",)
 
+    # The live engine advances between snapshot and restore; a full restore
+    # must leave the advanced state completely untouched.
+    g.write("runs/demo/manifest.json", "live control state v2\n")
     restore_snapshot(repo, snapshot)
-    assert (repo / "runs/demo/manifest.json").read_text() == "{}\n"
+    assert (repo / "runs/demo/manifest.json").read_text() == "live control state v2\n"
+    assert (repo / "runs/demo/scratch.txt").read_text() == "untracked engine state\n"
+    assert (repo / "work.txt").read_text() == "dirty\n"
+
+
+def test_excluded_root_keeps_protected_carveout_in_tree(recovery_git):
+    # Protected paths UNDER an excluded root (the pilot's runs/*/PR.md shape)
+    # are the sanctioned carve-out: still captured even though their parent is
+    # excluded active engine state.
+    g = recovery_git
+    g.write("runs/demo/manifest.json", "engine\n")
+    g.write("runs/demo/PR.md", "human-owned\n")
+    repo = g.repo
+    snapshot = _snap(
+        repo, "carveout", exclude=["runs"], protected=["runs/*/PR.md"]
+    )
+    tree_paths = git(
+        repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    ).splitlines()
+    assert "runs/demo/PR.md" in tree_paths
+    assert "runs/demo/manifest.json" not in tree_paths
+    assert snapshot.protected_paths == ("runs/demo/PR.md",)
+
+    (repo / "runs/demo/PR.md").unlink()
+    restore_protected(repo, snapshot)
+    assert (repo / "runs/demo/PR.md").read_text() == "human-owned\n"
+    assert (repo / "runs/demo/manifest.json").read_text() == "engine\n"
 
 
 # --- durable ref reachability --------------------------------------------------
@@ -572,7 +611,7 @@ def test_snapshot_ref_keeps_every_required_object_reachable(recovery_git):
 # --- crash-window behaviour ----------------------------------------------------
 
 
-@pytest.mark.parametrize("failing", ["mktree", "create_ref"])
+@pytest.mark.parametrize("failing", ["mktree", "create_ref_exclusive"])
 def test_failure_before_ref_creation_leaves_no_mutation(recovery_git, monkeypatch, failing):
     # A snapshot failure at any point before the ref exists must leave the
     # repository exactly as observed: same branch, HEAD, index bytes, status —
@@ -666,6 +705,40 @@ def test_duplicate_snapshot_ref_fails_closed(recovery_git):
     _snap(repo, "dup")
     with pytest.raises(SnapshotError, match="already exists"):
         _snap(repo, "dup")
+
+
+def test_racing_snapshot_creator_cannot_displace_a_winner(recovery_git, monkeypatch):
+    # Review F-003: ref creation must be create-only at the ref store, not
+    # check-then-write. Deterministic race simulation: another creator lands
+    # the SAME ref in the window between this creator's existence probe and
+    # its ref creation (interposed inside commit_tree, which runs after the
+    # probe and before create_ref_exclusive). The loser must error — and the
+    # winner's snapshot must remain exactly where it was, never overwritten.
+    g = recovery_git
+    _s_staged_only(g)
+    repo = g.repo
+    ref = snapshot_ref("run-test", "snap-race")
+    winner_sha = g.head_sha
+    real_commit_tree = gitops.commit_tree
+
+    def _interposed(repo_path, tree, parents, message, *, identity):
+        gitops.create_ref(repo_path, ref, winner_sha)  # the racing winner
+        return real_commit_tree(repo_path, tree, parents, message, identity=identity)
+
+    monkeypatch.setattr(gitops, "commit_tree", _interposed)
+    with pytest.raises(SnapshotError, match="already exists"):
+        _snap(repo, "race")
+    # The winner's ref is untouched — the loser did not displace it.
+    assert git(repo, "rev-parse", ref).strip() == winner_sha
+
+
+def test_create_ref_exclusive_is_create_only(recovery_git):
+    repo = recovery_git.repo
+    sha = recovery_git.head_sha
+    gitops.create_ref_exclusive(repo, "refs/gauntlet/recovery/x/one", sha)
+    assert git(repo, "rev-parse", "refs/gauntlet/recovery/x/one").strip() == sha
+    with pytest.raises(GitError):
+        gitops.create_ref_exclusive(repo, "refs/gauntlet/recovery/x/one", sha)
 
 
 def test_snapshot_ref_components_are_validated():

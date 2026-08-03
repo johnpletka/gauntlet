@@ -275,8 +275,8 @@ def create_snapshot(
                 index_tree = None  # unmerged index: raw bytes carry the truth
 
         # Worktree tree through a fresh temporary index: seed from HEAD (so
-        # excluded paths keep their committed versions and the tree stays
-        # complete), then let Git itself stage the live worktree — Git records
+        # tracked-but-unchanged files enter the tree without re-hashing races),
+        # then let Git itself stage the live worktree — Git records
         # symlinks as symlinks and preserves executable modes, and gitignore
         # rules apply except where ``protected`` overrides them.
         work_index = tmpdir / "index-worktree"
@@ -288,6 +288,27 @@ def create_snapshot(
             gitops.run_with_temp_index(
                 repo, work_index, "add", "-A", "-f", "--", *protected
             )
+        # Drop excluded entries from the tree entirely (review F-001). The
+        # HEAD seed pulled in committed versions of excluded paths; leaving
+        # them there would make a full restore materialize their snapshot-time
+        # baseline OVER the live active engine state (manifest.json is tracked
+        # after any force-commit) — an R8 violation. Excluded active state is
+        # not captured, period; protected paths under an excluded root are the
+        # one sanctioned carve-out and stay.
+        if exclude:
+            removal_spec = ["--", *exclude]
+            removal_spec += [f":(exclude){pattern}" for pattern in protected]
+            to_remove = _split_z(
+                gitops.run_with_temp_index(
+                    repo, work_index, "ls-files", "-z", *removal_spec
+                )
+            )
+            if to_remove:
+                gitops.run_with_temp_index(
+                    repo, work_index, "update-index", "--force-remove",
+                    "-z", "--stdin",
+                    stdin="".join(f"{rel}\0" for rel in to_remove),
+                )
         worktree_tree = gitops.run_with_temp_index(
             repo, work_index, "write-tree"
         ).strip()
@@ -372,8 +393,19 @@ def create_snapshot(
     )
     # Atomic durability point: the ref appears only after every required
     # object exists. A crash before this line leaves zero mutations; a crash
-    # after it leaves everything needed for restoration reachable.
-    gitops.create_ref(repo, ref, commit)
+    # after it leaves everything needed for restoration reachable. Create-only
+    # semantics are enforced by git's ref store (review F-003): the earlier
+    # _ref_exists probe is a cheap fast-fail, but a racing creator that wins
+    # the gap loses nothing — the loser errors here instead of displacing the
+    # winner's snapshot.
+    try:
+        gitops.create_ref_exclusive(repo, ref, commit)
+    except GitError as exc:
+        if _ref_exists(repo, ref):  # lost the race: the winner's ref stands
+            raise SnapshotError(
+                f"recovery snapshot ref already exists: {ref}"
+            ) from exc
+        raise  # a real ref-store failure is not a duplicate; fail loudly
     return record.model_copy(update={"snapshot_commit": commit})
 
 
