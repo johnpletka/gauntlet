@@ -991,6 +991,93 @@ def test_replay_refuses_same_head_work_created_after_the_kill(
     assert RX.load_intent(run_dir) is not None
 
 
+def test_replay_refuses_new_staging_of_snapshot_captured_work(
+    fixture_repo, monkeypatch
+):
+    """F-001 confirm: matching worktree bytes are not enough to call dirt
+    snapshot residue. Staging the already-captured work after the kill creates
+    a new INDEX plane that the pre-kill snapshot did not contain; replay must
+    retain the intent and leave that staging untouched."""
+    run_dir, man, excludes = _env(fixture_repo)
+    tracked = fixture_repo / "tracked.txt"
+    tracked.write_text("A committed\n")
+    git(fixture_repo, "add", "--", "tracked.txt")
+    git(fixture_repo, "commit", "-qm", "seed tracked")
+    target = gitops.head_sha(fixture_repo)
+    tracked.write_text("B captured only in worktree\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    monkeypatch.setattr(
+        gitops, "reset_hard",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed before apply")),
+    )
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()
+
+    git(fixture_repo, "add", "--", "tracked.txt")  # NEW staging after kill
+    with pytest.raises(RX.RecoveryIntentError, match="never captured"):
+        RX.replay_pending_intent(fixture_repo, run_dir)
+    assert gitops._run(fixture_repo, "show", ":tracked.txt") == (
+        "B captured only in worktree\n"
+    )
+    assert tracked.read_text() == "B captured only in worktree\n"
+    assert RX.load_intent(run_dir) is not None
+
+
+@pytest.mark.parametrize("boundary", ["after_read_tree", "after_bookkeeping_add"])
+def test_bookkeeping_index_sub_boundaries_remain_replayable(
+    fixture_repo, monkeypatch, boundary
+):
+    """F-001: strict index proof must not create a wedge inside the sanctioned
+    bookkeeping rewind. Both deterministic pre-reset index states are recognized
+    and replay converges without accepting arbitrary staging."""
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    bk_rel = (run_dir / "manifest.json").relative_to(fixture_repo).as_posix()
+    git(fixture_repo, "add", "-f", "--", bk_rel)
+    git(fixture_repo, "commit", "-qm", "gauntlet: response test pending")
+    pre_head = gitops.head_sha(fixture_repo)
+    (fixture_repo / "partial.py").write_text("captured partial work\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo,
+        run_dir,
+        man,
+        excludes,
+        target=target,
+        recorded=target,
+        mode=RX.RESET_BOOKKEEPING_PRESERVING,
+        bookkeeping=(bk_rel,),
+        message="gauntlet: response test pending",
+    )
+
+    def interrupted_rewind(repo, target_sha, bookkeeping, message, *, identity):
+        gitops._run(repo, "read-tree", target_sha)
+        if boundary == "after_bookkeeping_add":
+            gitops._run(repo, "add", "-f", "--", *bookkeeping)
+        raise _Boom(f"killed {boundary}")
+
+    monkeypatch.setattr(
+        gitops, "rewind_impl_preserving_bookkeeping", interrupted_rewind
+    )
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()
+    assert gitops.head_sha(fixture_repo) == pre_head
+    assert RX.load_intent(run_dir) is not None
+
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is not None
+    assert RX.load_intent(run_dir) is None
+    assert gitops.commit_parent(fixture_repo, "HEAD") == target
+    assert (run_dir / "manifest.json").exists()
+    assert not (fixture_repo / "partial.py").exists()
+
+
 # --- F-002: every mutating verb reconciles a surviving intent -------------------
 
 
@@ -1075,6 +1162,40 @@ def test_gate_verbs_reconcile_surviving_intents_first(
         assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
     else:
         mgr.reject("demo", "not yet", use_judge=False)
+    assert calls == [verb]
+
+
+@pytest.mark.parametrize("verb", ["approve", "reject"])
+@pytest.mark.parametrize("initial_gate", [True, False])
+def test_gate_verbs_resolve_the_gate_only_after_replay(
+    fixture_repo, monkeypatch, verb, initial_gate
+):
+    """F-002 confirm: the pre-replay manifest cannot select or reject a gate.
+    Replay runs first, the manifest is reloaded, and only the post-replay
+    ``current_step`` is eligible to drive."""
+    mgr = _gated_manager(fixture_repo)
+    run_dir = mgr.layout("demo").active_run_dir()
+    if not initial_gate:
+        man = M.Manifest.load(run_dir / "manifest.json")
+        man.current_step = None
+        man.write_atomic(run_dir / "manifest.json")
+    calls: list[str] = []
+
+    def replay_and_clear_gate(repo, replay_run_dir):
+        calls.append(verb)
+        man = M.Manifest.load(replay_run_dir / "manifest.json")
+        man.current_step = None
+        man.write_atomic(replay_run_dir / "manifest.json")
+        return "replayed"
+
+    monkeypatch.setattr(
+        run_mod.RX, "replay_pending_intent", replay_and_clear_gate
+    )
+    with pytest.raises(ValueError, match="no gate"):
+        if verb == "approve":
+            mgr.approve("demo", use_judge=False)
+        else:
+            mgr.reject("demo", "not yet", use_judge=False)
     assert calls == [verb]
 
 
@@ -1173,7 +1294,7 @@ def test_internal_rewind_surfaces_governed_operator_discard_loudly(fixture_repo)
     plan.write_text("manually amended plan\n")
     git(fixture_repo, "add", "-A")
     git(fixture_repo, "-c", "user.name=Human", "-c", "user.email=h@h.local",
-        "commit", "-qm", "amend the plan by hand")
+        "commit", "-qm", "PLAN.1: amend the plan by hand")
     ahead = gitops.head_sha(fixture_repo)
 
     man = _seed_running(fixture_repo, base)
@@ -1224,6 +1345,43 @@ def test_manual_governed_edit_then_approve_is_untouched(fixture_repo):
     assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
     assert prd.read_text() == "# Real PRD\n\nManually revised after review.\n"
     assert gitops.is_ancestor(fixture_repo, edited, gitops.head_sha(fixture_repo))
+
+
+def test_governed_discard_evidence_survives_kill_before_manifest_persist(
+    fixture_repo, monkeypatch
+):
+    """F-004: the assessment evidence rides the durable intent, so a kill after
+    Git apply cannot turn a governed discard into a silent one. Replay persists
+    the warning before clearing the intent."""
+    mgr = _rollback_manager(fixture_repo)
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    plan.write_text("manual conventional-subject amendment\n")
+    git(fixture_repo, "add", "-A")
+    git(
+        fixture_repo,
+        "-c", "user.name=Human",
+        "-c", "user.email=h@h.local",
+        "commit", "-qm", "PLAN.1: revise the plan before approval",
+    )
+    monkeypatch.setattr(
+        run_mod,
+        "_apply_rollback_manifest_transition",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed before persist")),
+    )
+    with pytest.raises(_Boom):
+        mgr.rollback("demo", phase=1)
+    monkeypatch.undo()
+    run_dir = mgr.layout("demo").active_run_dir()
+    assert RX.load_intent(run_dir) is not None
+
+    mgr.rollback("demo", phase=1)
+    man = mgr.status("demo")
+    assert RX.load_intent(run_dir) is None
+    assert any(
+        RX.GOVERNED_DISCARD_EVIDENCE_PREFIX in warning
+        and "plan.md" in warning
+        for warning in man.warnings
+    ), man.warnings
 
 
 # --- F-005: an unreadable intent fails closed -----------------------------------

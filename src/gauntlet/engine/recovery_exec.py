@@ -44,6 +44,7 @@ import re
 import secrets
 import socket
 import stat
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -108,7 +109,10 @@ RESET_BOOKKEEPING_PRESERVING = "bookkeeping_preserving"
 # these lines to manifest warnings so the discard is loud (R9/FR-10.4) —
 # manual PRD/plan edits are a sanctioned operator workflow and are never
 # refused, only surfaced and snapshot-preserved.
-GOVERNED_DISCARD_EVIDENCE_PREFIX = "rewind discards operator commit "
+GOVERNED_DISCARD_EVIDENCE_PREFIX = (
+    "rewind discards governed-artifact commit "
+)
+GOVERNED_EVIDENCE_PAYLOAD_KEY = "governed_discard_evidence"
 
 # Site-specific replay finishers: after a replayed apply converges the Git
 # state, the intent's site may need its own state transition re-persisted
@@ -622,7 +626,7 @@ class RecoveryPlanner:
                 f"({git_obs.head_sha[:10]}) nor the observed run-branch tip; "
                 "the advertised action and the observation disagree"
             )
-        governed = _governed_operator_discards(git_obs, target)
+        governed = _governed_discards(git_obs, target)
         if governed:
             evidence = evidence + tuple(
                 f"{GOVERNED_DISCARD_EVIDENCE_PREFIX}{c.sha[:10]} "
@@ -651,11 +655,18 @@ class RecoveryPlanner:
         )
 
 
-def _governed_operator_discards(
+def _governed_discards(
     git_obs: GitObservation, target: str
 ) -> list[tuple[GitCommitObservation, list[str]]]:
-    """Operator commits the rewind to ``target`` would discard, with the
-    governed-artifact paths each one modifies. Empty when none."""
+    """Commits the rewind would discard that modify governed artifacts.
+
+    Commit-subject conventions classify phase/fix/checkpoint roles, not
+    ownership. A human or assistant may legitimately use ``PRD.1:`` or
+    ``PLAN.1:`` while manually revising an artifact, so governance auditing
+    must key on the changed path itself rather than ``CommitKind.OPERATOR``.
+    The result is warning-only: manual edits remain sanctioned and rewinds
+    still proceed after the complete snapshot preserves the discarded tip.
+    """
     shas = [c.sha for c in git_obs.run_branch_commits]
     if target in shas:
         discarded = git_obs.run_branch_commits[shas.index(target) + 1:]
@@ -665,8 +676,6 @@ def _governed_operator_discards(
         discarded = git_obs.run_branch_commits
     out: list[tuple[GitCommitObservation, list[str]]] = []
     for commit in discarded:
-        if commit.kind is not CommitKind.OPERATOR:
-            continue
         paths = [ch.path for ch in commit.changed_paths if ch.approved_artifact]
         if paths:
             out.append((commit, paths))
@@ -758,6 +767,7 @@ class RecoveryIntent(BaseModel):
     # The exclusion set the fingerprints were computed under, so the replay
     # observes the identical worktree plane.
     excludes: tuple[str, ...] = ()
+    protected: tuple[str, ...] = ()
     spec: RewindSpec
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -1020,6 +1030,13 @@ class RecoveryExecutor:
                 )
             self._validate(action, spec)  # step 3
             snapshot = self._create_snapshot(snapshot_request)  # step 4 (R2)
+            intent_payload = dict(payload or {})
+            governed_evidence = [
+                item for item in assessment.evidence
+                if item.startswith(GOVERNED_DISCARD_EVIDENCE_PREFIX)
+            ]
+            if governed_evidence:
+                intent_payload[GOVERNED_EVIDENCE_PAYLOAD_KEY] = governed_evidence
             intent = RecoveryIntent(  # step 5
                 intent_id=secrets.token_hex(16),
                 run_id=self.run_id,
@@ -1033,8 +1050,9 @@ class RecoveryExecutor:
                 pre_index_fingerprint=observed.index_fingerprint,
                 pre_worktree_fingerprint=observed.worktree_fingerprint,
                 excludes=tuple(self.excludes or ()),
+                protected=tuple(snapshot_request.protected or ()),
                 spec=spec,
-                payload=payload or {},
+                payload=intent_payload,
             )
             _write_intent(self.run_dir, intent)
             self._apply_spec(spec, snapshot)  # step 6
@@ -1183,8 +1201,113 @@ def _blob_oid(repo: Path, data: bytes) -> str:
     ).decode().strip()
 
 
+def _index_fingerprint_for_tree(
+    repo: Path, treeish: str, *, bookkeeping: tuple[str, ...] = ()
+) -> str:
+    """Index fingerprint produced by ``read-tree`` plus an optional overlay.
+
+    Uses a temporary index, so deriving the legitimate intermediate states of
+    ``rewind_impl_preserving_bookkeeping`` is observational. Its output uses
+    the same ``ls-files --stage -z`` representation as :func:`index_fingerprint`.
+    """
+    with tempfile.TemporaryDirectory(prefix="gauntlet-replay-index-") as tmp:
+        index_path = Path(tmp) / "index"
+        gitops.run_with_temp_index(repo, index_path, "read-tree", treeish)
+        if bookkeeping:
+            gitops.run_with_temp_index(
+                repo, index_path, "add", "-f", "--", *bookkeeping
+            )
+        out = gitops.run_with_temp_index(
+            repo, index_path, "ls-files", "--stage", "-z"
+        )
+    return _sha256(out.encode("utf-8", "surrogateescape"))
+
+
+def _worktree_matches_snapshot(
+    repo: Path,
+    snapshot: git_snapshot.GitRecoverySnapshot,
+    *,
+    excludes: list[str],
+    protected: list[str],
+) -> bool:
+    """Whether the live filesystem plane still equals the captured snapshot.
+
+    Unlike :func:`worktree_fingerprint`, this witness is independent of the
+    real index, which a bookkeeping-preserving rewind deliberately scratches
+    before moving HEAD. A temporary index seeded from the snapshot worktree
+    tree stages the live filesystem with the same exclusions/protected carveout
+    used at snapshot creation; no real Git state is changed.
+    """
+    def remove_control_locks(index_path: Path) -> None:
+        entries = gitops.run_with_temp_index(
+            repo, index_path, "ls-files", "-z"
+        ).split("\0")
+        locks = [
+            rel for rel in entries if rel and (
+                PurePosixPath(rel).name == DRIVING_LOCK_NAME
+                or PurePosixPath(rel).name.startswith(DRIVING_LOCK_NAME + ".")
+            )
+        ]
+        if locks:
+            gitops.run_with_temp_index(
+                repo,
+                index_path,
+                "update-index",
+                "--force-remove",
+                "-z",
+                "--stdin",
+                stdin="".join(f"{rel}\0" for rel in locks),
+            )
+
+    with tempfile.TemporaryDirectory(prefix="gauntlet-replay-worktree-") as tmp:
+        index_path = Path(tmp) / "index"
+        gitops.run_with_temp_index(
+            repo, index_path, "read-tree", snapshot.worktree_tree
+        )
+        # The executor's own ephemeral lock can exist while the snapshot is
+        # built and disappear before replay (or carry a new nonce during a
+        # locked verb). It is control state, never work; normalize it out just
+        # as ``worktree_fingerprint`` / ``_dirty_paths`` already do.
+        remove_control_locks(index_path)
+        expected_tree = gitops.run_with_temp_index(
+            repo, index_path, "write-tree"
+        ).strip()
+        gitops.run_with_temp_index(
+            repo,
+            index_path,
+            "add",
+            "-A",
+            *gitops._exclude_pathspec(excludes),
+        )
+        if protected:
+            protected_dirty = gitops._run(
+                repo,
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                *protected,
+            )
+            if protected_dirty or git_snapshot._patterns_match_temp_index(
+                repo, index_path, protected
+            ):
+                gitops.run_with_temp_index(
+                    repo, index_path, "add", "-A", "-f", "--", *protected
+                )
+        remove_control_locks(index_path)
+        live_tree = gitops.run_with_temp_index(
+            repo, index_path, "write-tree"
+        ).strip()
+    return live_tree == expected_tree
+
+
 def _dirt_is_snapshot_residue(
-    repo: Path, snapshot: git_snapshot.GitRecoverySnapshot, excludes: list[str]
+    repo: Path,
+    snapshot: git_snapshot.GitRecoverySnapshot,
+    excludes: list[str],
+    *,
+    allowed_index_fingerprints: set[str],
 ) -> bool:
     """True iff every dirty path is provably leftover mid-apply state.
 
@@ -1198,6 +1321,8 @@ def _dirt_is_snapshot_residue(
     would destroy state no snapshot covers, so the caller must fail closed
     (post-P3 review F-001).
     """
+    if index_fingerprint(repo) not in allowed_index_fingerprints:
+        return False
     for rel in _dirty_paths(repo, exclude=excludes):
         entry = _tree_entry(repo, snapshot.worktree_tree, rel)
         path = repo / rel
@@ -1251,22 +1376,17 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
     current_branch = gitops.current_branch(repo)
     head = gitops.head_sha(repo)
 
-    def _planes_match_pre(*, index_exempt: bool = False) -> bool:
-        """The repository is byte-provably the assessed pre-apply state.
-
-        ``index_exempt`` applies only to the bookkeeping-preserving mode,
-        whose apply legitimately scratches the REAL index (``read-tree`` +
-        ``add -f``) before its reset — the snapshot's raw index bytes remain
-        the authoritative pre-state record there.
-        """
+    def _planes_match_pre() -> bool:
+        """The repository is byte-provably the assessed pre-apply state."""
         if head != intent.pre_head:
             return False
-        if worktree_fingerprint(repo, exclude=excludes) != (
-            intent.pre_worktree_fingerprint
+        if not _worktree_matches_snapshot(
+            repo,
+            snapshot,
+            excludes=excludes,
+            protected=list(intent.protected),
         ):
             return False
-        if index_exempt:
-            return True
         return index_fingerprint(repo) == intent.pre_index_fingerprint
 
     def _refuse(why: str) -> "RecoveryIntentError":
@@ -1291,6 +1411,41 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
             gitops.clean_untracked(repo, exclude=list(spec.clean_excludes))
         git_snapshot.restore_protected(repo, snapshot)
 
+    head_index_fingerprint = _index_fingerprint_for_tree(repo, head)
+    target_index_fingerprint = _index_fingerprint_for_tree(repo, spec.target_sha)
+    bookkeeping_index_fingerprint = None
+    if spec.reset_mode == RESET_BOOKKEEPING_PRESERVING:
+        bookkeeping_index_fingerprint = _index_fingerprint_for_tree(
+            repo, spec.target_sha, bookkeeping=spec.bookkeeping_paths
+        )
+
+    def _bookkeeping_pre_reset_state() -> bool:
+        """A recognized pre-reset sub-boundary of the bookkeeping rewind.
+
+        The helper mutates the real index in three deterministic steps before
+        its final reset: original pre-index, target ``read-tree``, then target
+        plus the bookkeeping overlay. Recognize exactly those fingerprints,
+        together with the unchanged pre-HEAD/worktree, so a kill between any
+        two Git calls remains replayable without accepting arbitrary staging.
+        """
+        if spec.reset_mode != RESET_BOOKKEEPING_PRESERVING:
+            return False
+        if head != intent.pre_head:
+            return False
+        if not _worktree_matches_snapshot(
+            repo,
+            snapshot,
+            excludes=excludes,
+            protected=list(intent.protected),
+        ):
+            return False
+        assert bookkeeping_index_fingerprint is not None
+        return index_fingerprint(repo) in {
+            intent.pre_index_fingerprint,
+            target_index_fingerprint,
+            bookkeeping_index_fingerprint,
+        }
+
     tree_is_clean = not _dirty_paths(repo, exclude=excludes)
 
     applied_note: str
@@ -1307,9 +1462,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         _finish()
         applied_note = "replayed the full apply from the recorded pre-state"
     elif head == spec.target_sha:
-        if _planes_match_pre(
-            index_exempt=spec.reset_mode == RESET_BOOKKEEPING_PRESERVING
-        ):
+        if _planes_match_pre() or _bookkeeping_pre_reset_state():
             # target == pre-HEAD and nothing moved: the killed apply never
             # ran — run it in full (the reset is the captured-dirt discard).
             _full_apply()
@@ -1317,7 +1470,12 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         elif tree_is_clean:
             _finish()
             applied_note = "finished a mid-apply intent (apply already effected)"
-        elif _dirt_is_snapshot_residue(repo, snapshot, excludes):
+        elif _dirt_is_snapshot_residue(
+            repo,
+            snapshot,
+            excludes,
+            allowed_index_fingerprints={head_index_fingerprint},
+        ):
             gitops.reset_hard(repo, spec.target_sha)
             _finish()
             applied_note = (
@@ -1337,7 +1495,12 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         # The bookkeeping-preserving rewind commit is already in place.
         if tree_is_clean:
             _finish()
-        elif _dirt_is_snapshot_residue(repo, snapshot, excludes):
+        elif _dirt_is_snapshot_residue(
+            repo,
+            snapshot,
+            excludes,
+            allowed_index_fingerprints={head_index_fingerprint},
+        ):
             gitops.reset_hard(repo, head)
             _finish()
         else:
@@ -1354,7 +1517,13 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         # verified before the checkout ran, so a clean/residue-only tree at
         # the run-branch tip is the proven mid-apply state.
         if not (
-            tree_is_clean or _dirt_is_snapshot_residue(repo, snapshot, excludes)
+            tree_is_clean
+            or _dirt_is_snapshot_residue(
+                repo,
+                snapshot,
+                excludes,
+                allowed_index_fingerprints={head_index_fingerprint},
+            )
         ):
             raise _refuse(
                 "the checkout completed but the tree holds work the snapshot "
@@ -1364,9 +1533,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         _finish()
         applied_note = "finished a mid-apply intent (checkout already effected)"
     elif head == intent.pre_head:
-        if not _planes_match_pre(
-            index_exempt=spec.reset_mode == RESET_BOOKKEEPING_PRESERVING
-        ):
+        if not (_planes_match_pre() or _bookkeeping_pre_reset_state()):
             raise _refuse(
                 "HEAD matches the pre-state but the index/worktree planes "
                 "hold work created after the killed transaction"
@@ -1391,8 +1558,47 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
             f"after a process death: {applied_note}; snapshot retained at "
             f"{intent.snapshot_ref}",
         )
+    _persist_governed_replay_evidence(run_dir, intent)
     _clear_intent(run_dir, intent.intent_id)
     return applied_note
+
+
+def _persist_governed_replay_evidence(
+    run_dir: Path, intent: RecoveryIntent
+) -> None:
+    """Persist intent-carried governance evidence before the intent clears.
+
+    The caller may have died after the Git apply but before its in-memory
+    warning reached the manifest. The intent is the durable bridge across that
+    window. Failure to persist leaves the intent in place and fails closed.
+    """
+    raw = intent.payload.get(GOVERNED_EVIDENCE_PAYLOAD_KEY, [])
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise RecoveryIntentError(
+            f"surviving recovery intent {intent.intent_id} carries malformed "
+            "governed-discard evidence; refusing to clear it"
+        )
+    if not raw:
+        return
+    path = run_dir / "manifest.json"
+    try:
+        man = M.Manifest.load(path)
+        changed = False
+        for note in raw:
+            if any(note in warning for warning in man.warnings):
+                continue
+            man.warnings.append(
+                f"replayed recovery intent {intent.intent_id}: {note}; "
+                f"snapshot retained at {intent.snapshot_ref}"
+            )
+            changed = True
+        if changed:
+            man.write_atomic(path)
+    except (OSError, ValueError) as exc:
+        raise RecoveryIntentError(
+            f"surviving recovery intent {intent.intent_id} could not persist "
+            f"its governed-discard evidence to {path} ({exc}); intent retained"
+        ) from exc
 
 
 def _append_manifest_warning(run_dir: Path, note: str) -> None:
@@ -1424,6 +1630,7 @@ __all__ = [
     "DRIVING_LOCK_NAME",
     "EXECUTOR_INTENT_NAME",
     "GOVERNED_DISCARD_EVIDENCE_PREFIX",
+    "GOVERNED_EVIDENCE_PAYLOAD_KEY",
     "REPLAY_FINISHERS",
     "RESET_BOOKKEEPING_PRESERVING",
     "RESET_PLAIN",

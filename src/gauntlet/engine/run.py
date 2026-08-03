@@ -1654,12 +1654,10 @@ class RunManager:
     # ---- gates --------------------------------------------------------------
     def approve(self, slug: str, gate: str | None = None, notes: str | None = None,
                 *, use_judge: bool = True, adapter_factory=None) -> str:
+        explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
-        gate = gate or man.current_step
-        if gate is None:
-            raise ValueError("no gate to approve; run is not parked")
         # Approve drives the rest of the run, so it is a driving verb (FR-10.5):
         # take the worktree lock first, released in `finally` on the next park /
         # done / error.
@@ -1669,6 +1667,9 @@ class RunManager:
             # before the approval drives anything (post-P3 review F-002).
             if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
                 man = Manifest.load(run_dir / "manifest.json")
+            gate = explicit_gate or man.current_step
+            if gate is None:
+                raise ValueError("no gate to approve; run is not parked")
             pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
             # Approving a gate drives the rest of the run, so honor use_judge.
             if use_judge:
@@ -1684,12 +1685,10 @@ class RunManager:
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
                *, use_judge: bool = True, adapter_factory=None) -> str:
+        explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
-        gate = gate or man.current_step
-        if gate is None:
-            raise ValueError("no gate to reject; run is not parked")
         # Reject now re-drives the upstream adversarial_cycle with the rejection
         # note injected as a new round (FR-8.1 + operator playbook), so like
         # `approve` it is a driving verb: take the worktree lock first and honor
@@ -1701,6 +1700,9 @@ class RunManager:
             # before the rejection re-drives anything (post-P3 review F-002).
             if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
                 man = Manifest.load(run_dir / "manifest.json")
+            gate = explicit_gate or man.current_step
+            if gate is None:
+                raise ValueError("no gate to reject; run is not parked")
             pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
             if use_judge:
                 return self._with_judge(man, run_dir, lambda env: self._reject_drive(
