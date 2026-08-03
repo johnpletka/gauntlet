@@ -23,6 +23,8 @@ from gauntlet.engine.recovery import (
     GitEntryObservation,
     GitEntryVersion,
     GitIndexStage,
+    GitRenameObservation,
+    RenamePlane,
     derive_git_delta,
     fingerprint_data,
 )
@@ -186,6 +188,54 @@ class RecoveryGitFixture:
             index_delta=index_delta,
             worktree_delta=worktree_delta,
             index_stages=index_stages,
+            protected=protected,
+        )
+
+    def observe_rename(
+        self,
+        source: str,
+        destination: str,
+        *,
+        plane: RenamePlane,
+        similarity: int = 100,
+        protected: bool = False,
+    ) -> GitEntryObservation:
+        """Observe a rename with both source and destination plane evidence."""
+        source_head = self._tree_version("HEAD", source)
+        source_index, source_stages = self._index_version(source)
+        source_worktree = self._worktree_version(source)
+        if source_stages:
+            raise AssertionError("rename source unexpectedly has unmerged index stages")
+
+        head = self._tree_version("HEAD", destination)
+        index, index_stages = self._index_version(destination)
+        worktree = self._worktree_version(destination)
+        if index_stages:
+            raise AssertionError("rename destination unexpectedly has unmerged index stages")
+
+        if plane is RenamePlane.INDEX:
+            source_before, source_after = source_head, source_index
+            index_delta = GitDelta.RENAMED
+            worktree_delta = derive_git_delta(index, worktree, untracked=True)
+        else:
+            source_before, source_after = source_index, source_worktree
+            index_delta = derive_git_delta(head, index)
+            worktree_delta = GitDelta.RENAMED
+
+        return GitEntryObservation(
+            path=destination,
+            head=head,
+            index=index,
+            worktree=worktree,
+            index_delta=index_delta,
+            worktree_delta=worktree_delta,
+            rename=GitRenameObservation(
+                source_path=source,
+                plane=plane,
+                source_before=source_before,
+                source_after=source_after,
+                similarity=similarity,
+            ),
             protected=protected,
         )
 

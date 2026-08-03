@@ -20,6 +20,7 @@ from gauntlet.engine.recovery import (
     GitEntryObservation,
     GitEntryVersion,
     GitObservation,
+    GitRenameObservation,
     HumanDecisionAction,
     NoProgressError,
     PathChangeKind,
@@ -30,6 +31,7 @@ from gauntlet.engine.recovery import (
     RecoveryAssessment,
     RecoveryCause,
     RecoveryDisposition,
+    RenamePlane,
     ResponseState,
     RestoreSnapshotAction,
     ResumeSessionAction,
@@ -123,7 +125,7 @@ def _progress(**updates) -> ProgressFingerprint:
 
 def _commit(
     sha: str,
-    parent: str,
+    parent: str | tuple[str, ...],
     kind: CommitKind,
     *,
     path: str = "feature.py",
@@ -131,11 +133,11 @@ def _commit(
     metadata = {}
     if kind is CommitKind.CHECKPOINT:
         metadata = {"phase_id": "P1", "checkpoint_id": "cp-1", "attempt_id": "a-1"}
-    elif kind is CommitKind.PHASE:
+    elif kind in {CommitKind.PHASE, CommitKind.FIX}:
         metadata = {"phase_id": "P1", "attempt_id": "a-1"}
     return GitCommitObservation(
         sha=sha,
-        parents=(parent,),
+        parents=(parent,) if isinstance(parent, str) else parent,
         author_name="Fixture",
         author_email="fixture@gauntlet.local",
         subject=f"{kind.value} commit",
@@ -313,6 +315,72 @@ def test_entry_deltas_are_validated_against_all_three_state_planes():
         )
 
 
+def test_rename_requires_paired_source_and_destination_plane_evidence():
+    original = GitEntryVersion(kind=GitEntryKind.REGULAR, mode="100644", object_id=SHA_A)
+
+    with pytest.raises(ValidationError, match="paired source evidence"):
+        GitEntryObservation(
+            path="new.py",
+            index_delta=GitDelta.RENAMED,
+        )
+    with pytest.raises(ValidationError, match="source must be identified and present"):
+        GitRenameObservation(
+            source_path="old.py",
+            plane=RenamePlane.INDEX,
+            source_before=GitEntryVersion(kind=GitEntryKind.ABSENT),
+            source_after=GitEntryVersion(kind=GitEntryKind.ABSENT),
+            similarity=100,
+        )
+    with pytest.raises(ValidationError, match="destination must be added"):
+        GitEntryObservation(
+            path="new.py",
+            rename=GitRenameObservation(
+                source_path="old.py",
+                plane=RenamePlane.INDEX,
+                source_before=original,
+                source_after=GitEntryVersion(kind=GitEntryKind.ABSENT),
+                similarity=100,
+            ),
+            index_delta=GitDelta.RENAMED,
+        )
+
+
+def test_rename_source_has_only_one_destination_in_each_state_plane():
+    original = GitEntryVersion(kind=GitEntryKind.REGULAR, mode="100644", object_id=SHA_A)
+    absent = GitEntryVersion(kind=GitEntryKind.ABSENT)
+
+    def renamed_destination(path: str) -> GitEntryObservation:
+        return GitEntryObservation(
+            path=path,
+            index=original,
+            worktree=original,
+            index_delta=GitDelta.RENAMED,
+            rename=GitRenameObservation(
+                source_path="old.py",
+                plane=RenamePlane.INDEX,
+                source_before=original,
+                source_after=absent,
+                similarity=100,
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="only one destination per plane"):
+        GitObservation(
+            checked_out_branch="main",
+            head_sha=SHA_A,
+            run_branch="gauntlet/demo",
+            run_branch_sha=SHA_A,
+            recorded_sha=SHA_A,
+            branch_relation=BranchRelation.EQUAL,
+            index_fingerprint="sha256:index",
+            worktree_fingerprint="sha256:tree",
+            dirty_entries=(
+                renamed_destination("first.py"),
+                renamed_destination("second.py"),
+            ),
+        )
+
+
 def test_entry_observation_preserves_symlink_target_without_dereference():
     link = GitEntryVersion(
         kind=GitEntryKind.SYMLINK,
@@ -351,6 +419,58 @@ def test_branch_ahead_observation_carries_auditable_contiguous_commit_inventory(
     assert observation.run_branch_commits[0].checkpoint_id == "cp-1"
     assert observation.run_branch_commits[-1].sha == observation.run_branch_sha
     assert observation.checked_out_branch == "main"
+
+
+@pytest.mark.parametrize("kind", [CommitKind.PHASE, CommitKind.FIX])
+def test_single_unmanifested_phase_or_fix_commit_is_implementation_ahead(kind):
+    work = _commit(SHA_B, SHA_A, kind)
+    observation = GitObservation(
+        checked_out_branch="main",
+        head_sha=SHA_A,
+        run_branch="gauntlet/demo",
+        run_branch_sha=SHA_B,
+        recorded_sha=SHA_A,
+        branch_relation=BranchRelation.IMPLEMENTATION_AHEAD,
+        run_branch_commits=(work,),
+        index_fingerprint="sha256:index",
+        worktree_fingerprint="sha256:tree",
+    )
+
+    assert observation.run_branch_commits == (work,)
+
+
+def test_implementation_ahead_accepts_phase_and_bookkeeping_but_mixed_rejects_it():
+    phase = _commit(SHA_B, SHA_A, CommitKind.PHASE)
+    bookkeeping = _commit(SHA_C, SHA_B, CommitKind.ENGINE_BOOKKEEPING)
+    common = {
+        "checked_out_branch": "main",
+        "head_sha": SHA_A,
+        "run_branch": "gauntlet/demo",
+        "run_branch_sha": SHA_C,
+        "recorded_sha": SHA_A,
+        "run_branch_commits": (phase, bookkeeping),
+        "index_fingerprint": "sha256:index",
+        "worktree_fingerprint": "sha256:tree",
+    }
+    GitObservation(**common, branch_relation=BranchRelation.IMPLEMENTATION_AHEAD)
+    with pytest.raises(ValidationError, match="mixed relation contradicts"):
+        GitObservation(**common, branch_relation=BranchRelation.MIXED_AHEAD)
+
+
+def test_unclassified_commit_range_has_an_explicit_fail_closed_relation():
+    unknown = _commit(SHA_B, SHA_A, CommitKind.UNKNOWN)
+    observation = GitObservation(
+        checked_out_branch="main",
+        head_sha=SHA_A,
+        run_branch="gauntlet/demo",
+        run_branch_sha=SHA_B,
+        recorded_sha=SHA_A,
+        branch_relation=BranchRelation.UNCLASSIFIED_AHEAD,
+        run_branch_commits=(unknown,),
+        index_fingerprint="sha256:index",
+        worktree_fingerprint="sha256:tree",
+    )
+    assert observation.branch_relation is BranchRelation.UNCLASSIFIED_AHEAD
 
 
 @pytest.mark.parametrize(
@@ -400,6 +520,20 @@ def test_branch_role_and_parent_chain_labels_cannot_contradict_commit_evidence()
             recorded_sha=SHA_A,
             branch_relation=BranchRelation.CHECKPOINT_AHEAD,
             run_branch_commits=(operator,),
+            index_fingerprint="sha256:index",
+            worktree_fingerprint="sha256:tree",
+        )
+
+    merge = _commit(SHA_B, (SHA_A, SHA_D), CommitKind.PHASE)
+    with pytest.raises(ValidationError, match="cannot contain merge commits"):
+        GitObservation(
+            checked_out_branch="main",
+            head_sha=SHA_A,
+            run_branch="gauntlet/demo",
+            run_branch_sha=SHA_B,
+            recorded_sha=SHA_A,
+            branch_relation=BranchRelation.IMPLEMENTATION_AHEAD,
+            run_branch_commits=(merge,),
             index_fingerprint="sha256:index",
             worktree_fingerprint="sha256:tree",
         )
@@ -564,6 +698,30 @@ def test_git_fixture_constructs_worktree_state_matrix(
     assert entry.index_delta is index_delta
     assert entry.worktree_delta is worktree_delta
     assert entry.worktree.kind is kind
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_git_fixture_observes_rename_as_paired_source_destination_evidence(
+    recovery_git, staged
+):
+    recovery_git.write("old.py", "content\n")
+    recovery_git.stage("old.py")
+    recovery_git.commit("track rename source")
+    recovery_git.rename("old.py", "new.py")
+    plane = RenamePlane.WORKTREE
+    if staged:
+        recovery_git.stage("old.py", "new.py")
+        plane = RenamePlane.INDEX
+
+    entry = recovery_git.observe_rename("old.py", "new.py", plane=plane)
+
+    assert entry.rename is not None
+    assert entry.rename.source_path == "old.py"
+    destination_after = entry.index if staged else entry.worktree
+    assert entry.rename.source_before.object_id == destination_after.object_id
+    assert entry.rename.source_after.kind is GitEntryKind.ABSENT
+    assert entry.index_delta is (GitDelta.RENAMED if staged else GitDelta.UNCHANGED)
+    assert entry.worktree_delta is (GitDelta.UNCHANGED if staged else GitDelta.RENAMED)
 
 
 def test_git_fixture_observes_real_three_stage_conflict_as_conflicted(recovery_git):

@@ -194,6 +194,48 @@ def test_materialize_flags_valid_and_invalid(asset_repo: Path):
     assert len(list(proposals_dir.glob("*.md"))) == 2
 
 
+def test_materialize_canonicalizes_only_numeric_hunk_counts(asset_repo: Path):
+    valid = _capture_diff(
+        asset_repo, "prompts/triage.md",
+        "rubric line one CHANGED\nrubric line two\n",
+    )
+    # Reproduce a common structured-output failure: exact paths, starts, body,
+    # and context, but impossible redundant line counts.
+    wrong_counts = P._HUNK_HEADER_RE.sub(
+        r"@@ -\1,99 +\2,98 @@\3", valid, count=1,
+    )
+    [proposal] = P.materialize_proposals(
+        asset_repo,
+        asset_repo / "runs/demo/run-1/retro/proposals",
+        [{"slug": "counts", "target_path": "prompts/triage.md",
+          "rationale": "model miscount", "diff": wrong_counts}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+
+    assert proposal.valid and proposal.status == P.PENDING
+    assert proposal.diff != wrong_counts
+    assert ",99" not in proposal.diff and ",98" not in proposal.diff
+    assert "rubric line one CHANGED" in proposal.diff
+
+
+def test_materialize_does_not_guess_bare_hunk_structure(asset_repo: Path):
+    bare = (
+        "--- a/prompts/triage.md\n+++ b/prompts/triage.md\n"
+        "@@\n-rubric line one\n+rubric line one CHANGED\n"
+    )
+    [proposal] = P.materialize_proposals(
+        asset_repo,
+        asset_repo / "runs/demo/run-1/retro/proposals",
+        [{"slug": "bare", "target_path": "prompts/triage.md",
+          "rationale": "missing structure", "diff": bare}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+
+    assert not proposal.valid and proposal.status == P.INVALID
+    assert proposal.diff == bare
+    assert "does not apply cleanly" in proposal.invalid_reason
+
+
 def test_materialize_rejects_multi_file_diff(asset_repo: Path):
     # F-005: even when every touched path is allowlisted, a diff editing more
     # than one file violates the single-file proposal contract — one approval

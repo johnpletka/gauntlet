@@ -19,9 +19,12 @@ ever sees it. The tunable assets are:
 
 Rules:
 
-- Emit a **literal unified diff** in `git apply` format (`--- a/<path>`,
-  `+++ b/<path>`, `@@` hunks). Use the asset's exact path (as listed above) for
-  `<path>`; the diff must apply cleanly against the current asset.
+- Emit a **literal unified diff** that passes `git apply --check`: use
+  `--- a/<path>` and `+++ b/<path>`, and give every hunk a complete numeric
+  header such as `@@ -12,3 +12,7 @@`. A bare `@@` header, ellipses, invented
+  context, or placeholder lines are invalid. Copy unchanged context exactly
+  from the current asset. Use the asset's exact path (as listed above) for
+  `<path>`.
 - Prefer the smallest change that addresses a real, evidenced problem. A
   proposal with no supporting evidence in the feedback/retros is noise — omit
   it.

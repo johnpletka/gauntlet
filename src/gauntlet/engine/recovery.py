@@ -33,7 +33,9 @@ class BranchRelation(_ClosedStringEnum):
     EQUAL = "equal"
     ENGINE_BOOKKEEPING_AHEAD = "engine_bookkeeping_ahead"
     CHECKPOINT_AHEAD = "checkpoint_ahead"
+    IMPLEMENTATION_AHEAD = "implementation_ahead"
     OPERATOR_AHEAD = "operator_ahead"
+    UNCLASSIFIED_AHEAD = "unclassified_ahead"
     MIXED_AHEAD = "mixed_ahead"
     BEHIND = "behind"
     FORKED = "forked"
@@ -106,12 +108,20 @@ class GitDelta(_ClosedStringEnum):
     UNKNOWN = "unknown"
 
 
+class RenamePlane(_ClosedStringEnum):
+    """The Git state transition in which a rename was observed."""
+
+    INDEX = "index"
+    WORKTREE = "worktree"
+
+
 class CommitKind(_ClosedStringEnum):
     """Evidence-backed ownership/role of a commit in a recovery range."""
 
     ENGINE_BOOKKEEPING = "engine_bookkeeping"
     CHECKPOINT = "checkpoint"
     PHASE = "phase"
+    FIX = "fix"
     OPERATOR = "operator"
     UNKNOWN = "unknown"
 
@@ -255,6 +265,32 @@ def derive_git_delta(
     return GitDelta.UNCHANGED
 
 
+class GitRenameObservation(_FrozenModel):
+    """Paired source evidence for one destination-path rename.
+
+    A rename label is not trusted by itself.  It identifies the plane in which
+    the source disappeared, records both source versions for that transition,
+    and retains Git's similarity score.  The destination transition is held by
+    the containing :class:`GitEntryObservation` and validated against this
+    evidence there.
+    """
+
+    source_path: str
+    plane: RenamePlane
+    source_before: GitEntryVersion
+    source_after: GitEntryVersion
+    similarity: int = Field(ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _source_transition_is_a_deletion(self) -> "GitRenameObservation":
+        _validate_repo_relative_path(self.source_path, field="rename source_path")
+        if self.source_before.kind in {GitEntryKind.ABSENT, GitEntryKind.UNKNOWN}:
+            raise ValueError("a rename source must be identified and present before")
+        if self.source_after.kind is not GitEntryKind.ABSENT:
+            raise ValueError("a rename source must be absent after its transition")
+        return self
+
+
 class GitIndexStage(_FrozenModel):
     """One conflict-stage entry from an unmerged index."""
 
@@ -278,16 +314,14 @@ class GitEntryObservation(_FrozenModel):
     index_delta: GitDelta = GitDelta.UNCHANGED
     worktree_delta: GitDelta = GitDelta.UNCHANGED
     index_stages: tuple[GitIndexStage, ...] = ()
-    renamed_from: str | None = None
+    rename: GitRenameObservation | None = None
     protected: bool = False
 
     @model_validator(mode="after")
     def _entry_contract(self) -> "GitEntryObservation":
         _validate_repo_relative_path(self.path, field="path")
-        if self.renamed_from is not None:
-            _validate_repo_relative_path(self.renamed_from, field="renamed_from")
-            if self.renamed_from == self.path:
-                raise ValueError("renamed_from must differ from path")
+        if self.rename is not None and self.rename.source_path == self.path:
+            raise ValueError("rename source_path must differ from destination path")
         if self.index_stages:
             stages = tuple(stage.stage for stage in self.index_stages)
             if len(set(stages)) != len(stages):
@@ -298,7 +332,7 @@ class GitEntryObservation(_FrozenModel):
                 raise ValueError("conflict stages require index_delta='unmerged'")
             if self.worktree_delta is not GitDelta.CONFLICTED:
                 raise ValueError("an unmerged path requires worktree_delta='conflicted'")
-            if self.renamed_from is not None:
+            if self.rename is not None:
                 raise ValueError("an unmerged path cannot also be declared renamed")
             return self
         if self.index_delta in {GitDelta.UNMERGED, GitDelta.CONFLICTED}:
@@ -308,17 +342,39 @@ class GitEntryObservation(_FrozenModel):
 
         expected_index = derive_git_delta(self.head, self.index)
         expected_worktree = derive_git_delta(self.index, self.worktree, untracked=True)
-        if self.renamed_from is not None:
-            if GitDelta.RENAMED not in {self.index_delta, self.worktree_delta}:
-                raise ValueError("renamed_from requires a renamed delta")
-            if self.index_delta is not GitDelta.RENAMED and self.index_delta is not expected_index:
-                raise ValueError("index_delta contradicts HEAD/index evidence")
+        renamed_deltas = sum(
+            delta is GitDelta.RENAMED
+            for delta in (self.index_delta, self.worktree_delta)
+        )
+        if self.rename is not None:
+            if renamed_deltas != 1:
+                raise ValueError("paired rename evidence requires exactly one renamed delta")
+            if self.rename.plane is RenamePlane.INDEX:
+                if self.index_delta is not GitDelta.RENAMED:
+                    raise ValueError("index-plane rename requires index_delta='renamed'")
+                if expected_index is not GitDelta.ADDED:
+                    raise ValueError("index rename destination must be added in the index")
+                if self.worktree_delta is not expected_worktree:
+                    raise ValueError("worktree_delta contradicts index/worktree evidence")
+                destination_after = self.index
+            else:
+                if self.worktree_delta is not GitDelta.RENAMED:
+                    raise ValueError("worktree-plane rename requires worktree_delta='renamed'")
+                if expected_worktree is not GitDelta.UNTRACKED:
+                    raise ValueError("worktree rename destination must be newly present")
+                if self.index_delta is not expected_index:
+                    raise ValueError("index_delta contradicts HEAD/index evidence")
+                destination_after = self.worktree
+            if self.rename.source_before.kind is not destination_after.kind:
+                raise ValueError("rename source and destination kinds must agree")
             if (
-                self.worktree_delta is not GitDelta.RENAMED
-                and self.worktree_delta is not expected_worktree
+                self.rename.similarity == 100
+                and self.rename.source_before.object_id != destination_after.object_id
             ):
-                raise ValueError("worktree_delta contradicts index/worktree evidence")
+                raise ValueError("100% rename evidence requires identical object content")
             return self
+        if renamed_deltas:
+            raise ValueError("a renamed delta requires paired source evidence")
         if self.index_delta is not expected_index:
             raise ValueError("index_delta contradicts HEAD/index evidence")
         if self.worktree_delta is GitDelta.IGNORED:
@@ -383,8 +439,8 @@ class GitCommitObservation(_FrozenModel):
                 raise ValueError("checkpoint commits require phase_id and checkpoint_id")
         elif self.checkpoint_id is not None:
             raise ValueError("checkpoint_id is valid only for checkpoint commits")
-        if self.kind is CommitKind.PHASE and not self.phase_id:
-            raise ValueError("phase commits require phase_id")
+        if self.kind in {CommitKind.PHASE, CommitKind.FIX} and not self.phase_id:
+            raise ValueError("phase/fix commits require phase_id")
         return self
 
 
@@ -392,7 +448,9 @@ _AHEAD_RELATIONS = frozenset(
     {
         BranchRelation.ENGINE_BOOKKEEPING_AHEAD,
         BranchRelation.CHECKPOINT_AHEAD,
+        BranchRelation.IMPLEMENTATION_AHEAD,
         BranchRelation.OPERATOR_AHEAD,
+        BranchRelation.UNCLASSIFIED_AHEAD,
         BranchRelation.MIXED_AHEAD,
     }
 )
@@ -455,10 +513,37 @@ class GitObservation(_FrozenModel):
                 and kinds <= {CommitKind.CHECKPOINT, CommitKind.ENGINE_BOOKKEEPING}
             ):
                 raise ValueError("checkpoint relation contradicts commit roles")
+            implementation_kinds = {
+                CommitKind.PHASE,
+                CommitKind.FIX,
+                CommitKind.CHECKPOINT,
+                CommitKind.ENGINE_BOOKKEEPING,
+            }
+            has_implementation = bool(kinds & {CommitKind.PHASE, CommitKind.FIX})
+            if relation is BranchRelation.IMPLEMENTATION_AHEAD and not (
+                has_implementation and kinds <= implementation_kinds
+            ):
+                raise ValueError("implementation relation contradicts commit roles")
             if relation is BranchRelation.OPERATOR_AHEAD and kinds != {CommitKind.OPERATOR}:
                 raise ValueError("operator relation contradicts commit roles")
-            if relation is BranchRelation.MIXED_AHEAD and len(kinds) < 2:
-                raise ValueError("mixed relation requires at least two commit roles")
+            if relation is BranchRelation.UNCLASSIFIED_AHEAD and kinds != {
+                CommitKind.UNKNOWN
+            }:
+                raise ValueError("unclassified relation contradicts commit roles")
+            if relation is BranchRelation.MIXED_AHEAD:
+                specialized = (
+                    kinds == {CommitKind.ENGINE_BOOKKEEPING}
+                    or (
+                        CommitKind.CHECKPOINT in kinds
+                        and kinds
+                        <= {CommitKind.CHECKPOINT, CommitKind.ENGINE_BOOKKEEPING}
+                    )
+                    or (has_implementation and kinds <= implementation_kinds)
+                    or kinds == {CommitKind.OPERATOR}
+                    or kinds == {CommitKind.UNKNOWN}
+                )
+                if len(kinds) < 2 or specialized:
+                    raise ValueError("mixed relation contradicts commit roles")
         elif relation is BranchRelation.BEHIND:
             if self.run_branch_sha == self.recorded_sha:
                 raise ValueError("behind relation requires different SHAs")
@@ -476,6 +561,13 @@ class GitObservation(_FrozenModel):
         paths = tuple(entry.path for entry in self.dirty_entries)
         if len(set(paths)) != len(paths):
             raise ValueError("dirty entry paths must be unique")
+        rename_sources = tuple(
+            (entry.rename.plane, entry.rename.source_path)
+            for entry in self.dirty_entries
+            if entry.rename is not None
+        )
+        if len(set(rename_sources)) != len(rename_sources):
+            raise ValueError("a rename source can have only one destination per plane")
         if any(
             entry.index_delta is GitDelta.UNCHANGED
             and entry.worktree_delta is GitDelta.UNCHANGED
@@ -492,7 +584,9 @@ class GitObservation(_FrozenModel):
         for commit in self.run_branch_commits:
             if commit.sha in seen:
                 raise ValueError("branch range commits must be unique")
-            if previous not in commit.parents:
+            if len(commit.parents) != 1:
+                raise ValueError("linear branch range cannot contain merge commits")
+            if commit.parents != (previous,):
                 raise ValueError("branch range is not a contiguous parent chain")
             seen.add(commit.sha)
             previous = commit.sha
@@ -806,6 +900,7 @@ __all__ = [
     "GitEntryVersion",
     "GitIndexStage",
     "GitObservation",
+    "GitRenameObservation",
     "HumanDecisionAction",
     "NoProgressError",
     "PathChangeKind",
@@ -816,6 +911,7 @@ __all__ = [
     "RecoveryAssessment",
     "RecoveryCause",
     "RecoveryDisposition",
+    "RenamePlane",
     "ResponseState",
     "RestartFromCheckpointAction",
     "RestoreSnapshotAction",

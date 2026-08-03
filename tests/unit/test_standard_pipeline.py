@@ -53,6 +53,13 @@ def test_standard_stage_and_step_shape():
         "implement", "tests", "phase-commit", "acceptance-gate", "impl-cycle",
         "acceptance-recheck", "tests-recheck", "phase-gate",
     ]
+    # The mechanical commit-message drafter must see the ratified plan. Without
+    # it, a cheap drafter can invent "Deferred to P<N>" targets that do not exist;
+    # the post-commit acceptance gate then correctly halts an otherwise complete
+    # one-phase run with no sanctioned pre-commit repair path.
+    phase_commit = by_id["phases"].steps[2]
+    assert phase_commit.type == "commit"
+    assert phase_commit.get("plan_section") == "plan.md"
     # FR-3.2: the deterministic completeness gate runs after commit, before the
     # reviewer cycle, and names its single collector (v1: pytest).
     ag = by_id["phases"].steps[3]

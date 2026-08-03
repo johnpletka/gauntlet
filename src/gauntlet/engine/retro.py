@@ -618,7 +618,11 @@ _BUILTIN_SYNTHESIS = (
     "the triage few-shot corpus (triage-corpus.jsonl, exact path as shown). "
     "Return JSON matching the schema: an array of "
     "proposals with slug, target_path, rationale, and a literal git-applyable "
-    "diff. Return an empty array if the evidence justifies no change."
+    "diff that passes git apply --check. Every hunk must have a complete numeric "
+    "header such as @@ -12,3 +12,7 @@; a bare @@ header, ellipses, invented "
+    "context, and placeholder lines are invalid. Copy unchanged context exactly "
+    "from the current asset. Return an empty array if the evidence justifies no "
+    "change."
 )
 
 

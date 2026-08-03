@@ -222,6 +222,33 @@ stages:
     assert orch.manifest.record("commit").session_id == "draft-sess"
 
 
+def test_commit_draft_receives_configured_plan_section(fixture_repo):
+    (fixture_repo / "work.py").write_text("print('new')\n")
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\nP1 is the only phase. The P1 commit records Deferrals: none.\n"
+    )
+    drafter = RecordingDrafter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage,
+         plan_section: plan.md}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+
+    assert orch.drive() == M.RUN_DONE
+    prompt = drafter.prompts[0]
+    assert "--- plan section: plan.md ---" in prompt
+    assert "P1 is the only phase" in prompt
+    assert "Deferrals: none" in prompt
+
+
 class RedraftUsageAdapter:
     """Bad draft (with usage) then a good one (with usage) — usage must sum."""
 
