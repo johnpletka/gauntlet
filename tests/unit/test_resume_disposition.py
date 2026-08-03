@@ -22,7 +22,7 @@ import pytest
 
 from gauntlet.adapters._structured import validate_schema
 from gauntlet.adapters.base import AdapterCapabilities, AgentResult
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.run import RunManager
 
 from test_resume_response import (
@@ -771,13 +771,19 @@ def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
     # which the clean-handoff invariant deliberately excludes).
     assert not (repo / "feature.py").exists()
     assert "feature.py" not in gitops.status_porcelain(repo)
-    # ...and preserved losslessly in a backup ref carrying that very edit.
+    # ...and preserved losslessly in a complete-format recovery snapshot (P2
+    # pilot: this rewind path migrated off refs/gauntlet/backup/ overlays).
     refs = gitops._run(
-        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/backup"
+        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/recovery"
     ).splitlines()
-    backup = [r for r in refs if "conflict" in r]
-    assert backup, "a dirty conflict park must snapshot the work to a backup ref"
-    tree = gitops._run(repo, "ls-tree", "-r", "--name-only", backup[0])
+    snapshot_refs = [r for r in refs if "conflict" in r]
+    assert snapshot_refs, (
+        "a dirty conflict park must create a durable recovery snapshot"
+    )
+    snapshot = git_snapshot.load_snapshot(repo, snapshot_refs[0])
+    tree = gitops._run(
+        repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
     assert "feature.py" in tree
 
 
@@ -793,11 +799,73 @@ def test_clean_repark_creates_no_backup(tmp_path):
         adapter_factory=lambda n: adapter, clock=_clock(),
     )
     assert status == M.RUN_PARKED
-    # No implementation edit to discard → the guard is a no-op: no backup ref.
+    # No implementation edit to discard → the guard is a no-op: no snapshot
+    # ref (neither the P2 recovery format nor the legacy backup format).
     refs = gitops._run(
-        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/backup"
+        repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/backup", "refs/gauntlet/recovery",
     ).strip()
     assert refs == ""
+
+
+def test_pilot_rewind_creates_durable_snapshot_before_mutation(tmp_path, monkeypatch):
+    # P2 pilot ordering (plan R2/R3): the conflict-park rewind must create the
+    # complete recovery snapshot BEFORE reset/clean run. Making the mutation
+    # verb itself explode proves the ordering: the durable ref already exists
+    # and still carries the dirty work the failed rewind never got to discard.
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(_disposition("new_conflict"), write=True)
+
+    def _boom(repo_path, sha):
+        raise gitops.GitError(["reset", "--hard", sha], 128, "injected crash")
+
+    monkeypatch.setattr("gauntlet.engine.orchestrator.gitops.reset_hard", _boom)
+    with pytest.raises(gitops.GitError):
+        mgr.resume(
+            "demo", response="ambiguous", use_judge=False,
+            adapter_factory=lambda n: adapter, clock=_clock(),
+        )
+    # The builder's edit was never discarded (mutation failed closed)...
+    assert (repo / "feature.py").exists()
+    # ...and the snapshot ref was already durable, loadable, and complete.
+    refs = gitops._run(
+        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/recovery"
+    ).splitlines()
+    assert refs, "the snapshot must be created before any destructive mutation"
+    snapshot = git_snapshot.load_snapshot(repo, refs[0])
+    tree = gitops._run(
+        repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "feature.py" in tree
+
+
+def test_pilot_rewind_snapshot_failure_precedes_any_mutation(tmp_path, monkeypatch):
+    # The converse ordering proof: when snapshot CREATION fails, the rewind
+    # never reaches reset/clean — the dirty worktree survives untouched and no
+    # partial recovery ref exists (fail closed, plan §6 P2 acceptance).
+    repo, mgr = _build_repo(tmp_path / "repo", PIPELINE_SOLO)
+    _drive_to_conflict(repo, mgr, PIPELINE_SOLO)
+    adapter = DispositionAdapter(_disposition("new_conflict"), write=True)
+
+    def _boom(*args, **kwargs):
+        raise git_snapshot.SnapshotError("injected snapshot failure")
+
+    monkeypatch.setattr(
+        "gauntlet.engine.orchestrator.git_snapshot.create_snapshot", _boom
+    )
+    reset_calls: list = []
+    monkeypatch.setattr(
+        "gauntlet.engine.orchestrator.gitops.reset_hard",
+        lambda *a, **k: reset_calls.append(a),
+    )
+    with pytest.raises(git_snapshot.SnapshotError):
+        mgr.resume(
+            "demo", response="ambiguous", use_judge=False,
+            adapter_factory=lambda n: adapter, clock=_clock(),
+        )
+    assert reset_calls == []  # no destructive verb ran after the failure
+    assert (repo / "feature.py").exists()  # the dirty work is untouched
 
 
 def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):

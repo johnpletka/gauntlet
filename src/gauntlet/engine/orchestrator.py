@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
-from gauntlet.engine import gitops, ledger as L, manifest as M
+from gauntlet.engine import git_snapshot, gitops, ledger as L, manifest as M
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
@@ -804,30 +804,41 @@ class Orchestrator:
         run_root = [self.config.run_root]
         if gitops.is_clean(self.repo_root, exclude=run_root):
             return result
-        ts = self.clock().replace(":", "-")
-        backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-conflict-{ts}"
-        # PR #77 review: carry human-owned PR.md state across the reset and
-        # include it in the backup ref so preservation survives a process kill.
-        human_patterns = human_owned_excludes(self.excludes)
-        overlay = gitops.worktree_overlay(
-            self.repo_root, human_patterns
-        )
-        gitops.backup_dirty_worktree(
+        ts = self.clock().replace(":", "-").replace("+", "-")
+        # P2 pilot (recovery redesign, plan §4.4): this rewind path is the
+        # first migrated from the lossy backup/overlay mechanism to a complete
+        # GitRecoverySnapshot. It is the lowest-coupling rewind in the engine —
+        # it discards uncommitted dirt against the CURRENT HEAD (no checkpoint
+        # targeting, no bookkeeping-preserving commit construction, no branch
+        # or manifest rewind) — so it exercises snapshot-before-mutation (R2)
+        # without entangling P3's executor concerns. The snapshot captures the
+        # full dirty state (staged vs worktree separately, modes, symlinks,
+        # raw index bytes) plus human-owned protected paths, and a snapshot
+        # failure raises HERE, before reset/clean touch anything (fail closed).
+        snapshot = git_snapshot.create_snapshot(
             self.repo_root,
-            backup,
-            f"conflict-park partial work for {rec.id} (F-001)",
+            run_id=self.manifest.run_id,
+            snapshot_id=f"{rec.id}-conflict-{ts}",
+            attempt_id=f"{rec.id}#{rec.attempts}",
+            reason=f"conflict-park partial work for {rec.id} (F-001)",
+            run_branch=self.manifest.branch,
             exclude=run_root,
-            include=human_patterns if overlay else None,
+            protected=human_owned_excludes(self.excludes),
+            created_at=self.clock(),
         )
         gitops.reset_hard(self.repo_root, self._head_sha())
         # `reset --hard` leaves untracked files; clear the builder's untracked
         # edits too, sparing the whole run root so the manifest/transcripts/
         # authored artifacts under it survive.
         gitops.clean_untracked(self.repo_root, exclude=run_root)
-        gitops.restore_overlay(self.repo_root, overlay)
+        # Bring human-owned protected state (PR.md edits/deletions) back
+        # exactly, via Git materialization from the snapshot itself — the
+        # in-memory overlay dict this replaces could be lost with the process.
+        git_snapshot.restore_protected(self.repo_root, snapshot)
         note = (
-            f"conflict park left an uncommitted worktree; backed up to {backup} "
-            "and restored the clean tree before handoff (F-001)"
+            "conflict park left an uncommitted worktree; preserved as recovery "
+            f"snapshot {snapshot.ref} and restored the clean tree before "
+            "handoff (F-001)"
         )
         result.notes = f"{result.notes}\n{note}" if result.notes else note
         return result

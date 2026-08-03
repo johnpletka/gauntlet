@@ -10,6 +10,7 @@ treated as data (format-validated before it is used — see ``commit_format``).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -76,17 +77,149 @@ class GitError(RuntimeError):
         self.stderr = stderr
 
 
-def _run(repo: Path, *args: str, stdin: str | None = None) -> str:
+def _run(
+    repo: Path, *args: str, stdin: str | None = None, _env: dict[str, str] | None = None
+) -> str:
     argv = ["git", "-C", str(repo), *args]
     proc = subprocess.run(
         argv,
         input=stdin,
         capture_output=True,
         text=True,
+        env=_env,
     )
     if proc.returncode != 0:
         raise GitError(list(args), proc.returncode, proc.stderr)
     return proc.stdout
+
+
+def _run_bytes(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    """Binary-safe variant of :func:`_run` for object I/O (index bytes, blobs)."""
+    argv = ["git", "-C", str(repo), *args]
+    proc = subprocess.run(argv, input=stdin, capture_output=True)
+    if proc.returncode != 0:
+        raise GitError(
+            list(args), proc.returncode, proc.stderr.decode("utf-8", "replace")
+        )
+    return proc.stdout
+
+
+class TempIndexPathError(ValueError):
+    """A temporary-index path failed the containment validation (fail closed)."""
+
+
+def validate_temp_index_path(repo: Path, index_file: Path) -> None:
+    """Validate a ``GIT_INDEX_FILE`` target before any git command may use it.
+
+    The recovery-snapshot machinery (P2, plan §4.4) is the only sanctioned user
+    of a substitute index. Containment rules, all fail-closed:
+
+    * the path must be absolute — a relative path would resolve against git's
+      cwd, not a location this validation inspected;
+    * it must resolve OUTSIDE the repository worktree — a temp index inside the
+      worktree would itself dirty the tree the snapshot must observe untouched
+      (R3: snapshot creation is observational);
+    * it must resolve OUTSIDE the git dir — nothing under ``.git`` (the real
+      index, refs, packed objects) may ever be the scratch target.
+
+    ``resolve()`` is applied to the parent directory (the leaf may not exist
+    yet) so a symlinked temp path cannot smuggle the file into either tree.
+    """
+    if not index_file.is_absolute():
+        raise TempIndexPathError(
+            f"temporary index path must be absolute: {index_file}"
+        )
+    resolved = index_file.parent.resolve() / index_file.name
+    top = Path(show_toplevel(repo)).resolve()
+    git_dir = Path(_run(repo, "rev-parse", "--absolute-git-dir").strip()).resolve()
+    for forbidden in (top, git_dir):
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise TempIndexPathError(
+                f"temporary index path {index_file} resolves inside {forbidden}; "
+                "a substitute index must live outside the worktree and git dir"
+            )
+
+
+def run_with_temp_index(
+    repo: Path, index_file: Path, *args: str, stdin: str | None = None
+) -> str:
+    """Run ONE git command against a validated substitute index file.
+
+    This is the narrow environment extension P2 requires (plan §4.4): the only
+    variable that can be injected is ``GIT_INDEX_FILE``, its value is a path
+    the caller supplies and :func:`validate_temp_index_path` has contained, and
+    the rest of the environment is inherited untouched. There is deliberately
+    no generic "run git with env overrides" surface.
+    """
+    validate_temp_index_path(repo, index_file)
+    env = {**os.environ, "GIT_INDEX_FILE": str(index_file)}
+    return _run(repo, *args, stdin=stdin, _env=env)
+
+
+def git_index_path(repo: Path) -> Path:
+    """Absolute path of the REAL index file (``rev-parse --git-path index``).
+
+    Read-only discovery for the raw-index snapshot: the snapshot hashes these
+    bytes into a blob and never writes them back except during an explicit
+    exact restoration.
+    """
+    out = _run(repo, "rev-parse", "--git-path", "index").strip()
+    path = Path(out)
+    return path if path.is_absolute() else (repo / path)
+
+
+def hash_object_write(repo: Path, data: bytes) -> str:
+    """Store ``data`` as a blob in the object database; return its object id."""
+    return _run_bytes(
+        repo, "hash-object", "-w", "--stdin", stdin=data
+    ).decode().strip()
+
+
+def cat_file_blob(repo: Path, oid: str) -> bytes:
+    """The raw bytes of blob ``oid`` (binary-safe)."""
+    return _run_bytes(repo, "cat-file", "blob", oid)
+
+
+def object_exists(repo: Path, oid: str) -> bool:
+    """True iff ``oid`` names an object present in the object database."""
+    try:
+        _run(repo, "cat-file", "-e", oid)
+        return True
+    except GitError:
+        return False
+
+
+def mktree(repo: Path, entries: list[str]) -> str:
+    """Build a tree object from ``ls-tree``-format entry lines; return its id.
+
+    Entry names in the recovery-snapshot wrapper tree are fixed engine strings
+    (``metadata.json``, ``index.raw``, ``worktree`` …), never model- or
+    user-derived, so the newline format is safe here.
+    """
+    return _run(repo, "mktree", stdin="".join(f"{e}\n" for e in entries)).strip()
+
+
+def commit_tree(
+    repo: Path,
+    tree: str,
+    parents: list[str],
+    message: str,
+    *,
+    identity: Identity,
+) -> str:
+    """Create a commit object for ``tree`` with explicit parents and identity.
+
+    Pure object creation: no ref moves, no checkout, no index or worktree
+    change. The message arrives on stdin, never argv.
+    """
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit-tree", tree,
+    ]
+    for parent in parents:
+        args += ["-p", parent]
+    return _run(repo, *args, stdin=message).strip()
 
 
 def is_git_repo(repo: Path) -> bool:
@@ -917,6 +1050,12 @@ def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:
 def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes | None]:
     """Worktree state of files matching ``patterns`` that differs from HEAD.
 
+    .. deprecated:: P2
+        Lossy (bytes-or-tombstone only: no modes, symlinks are read *through*,
+        no staged-vs-worktree distinction). Superseded by
+        ``engine.git_snapshot.GitRecoverySnapshot``; the remaining rewind
+        callers migrate in P3, after which this helper is removed.
+
     Captures modified/staged/untracked matches as ``{repo-rel-path: bytes}``
     and tracked deletions as ``{repo-rel-path: None}`` tombstones.
     Used to carry human-owned excluded files (``PR.md``, FR-9.8) across a
@@ -947,7 +1086,14 @@ def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes | None]
 
 
 def restore_overlay(repo: Path, overlay: dict[str, bytes | None]) -> None:
-    """Restore :func:`worktree_overlay` bytes/deletions after a rewind."""
+    """Restore :func:`worktree_overlay` bytes/deletions after a rewind.
+
+    .. deprecated:: P2
+        Writes with ``Path.write_bytes`` (can write through a pre-existing
+        symlink, loses modes/entry kinds). Superseded by
+        ``engine.git_snapshot.restore_protected``; remaining callers migrate
+        in P3.
+    """
     for rel, data in overlay.items():
         path = repo / rel
         if data is None:
@@ -976,6 +1122,13 @@ def backup_dirty_worktree(
     modified bytes or deletion durable without changing the engine's normal
     dirty-check/commit policy (PR #77 review).
     Returns the backup commit SHA.
+
+    .. deprecated:: P2
+        MUTATES THE REAL INDEX (``git add -A``) and collapses HEAD, index, and
+        worktree into one tree, so staged-vs-worktree divergence and unmerged
+        stages are unrepresentable (plan §3). Superseded by
+        ``engine.git_snapshot.create_snapshot``; the remaining rewind callers
+        migrate in P3, after which this helper is removed.
     """
     _run(repo, "add", "-A", *_exclude_pathspec(exclude))
     if include:
