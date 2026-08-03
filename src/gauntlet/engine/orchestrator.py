@@ -46,6 +46,7 @@ from gauntlet.engine.execution import (
     StepResult,
     engine_bookkeeping_candidates,
     get_spec,
+    governed_artifact_paths,
     human_owned_excludes,
     run_bookkeeping_excludes,
     run_bookkeeping_paths,
@@ -689,24 +690,41 @@ class Orchestrator:
             # spares the whole run root so the reset never wipes the run
             # pointer, manifests, the authored prd.md, or prior declared
             # artifacts — the re-run regenerates its own outputs over them.
-            self._apply_recovery_rewind(
-                rec,
-                site="orchestrator.reset_to_base",
-                target_sha=target,
-                cause=RX.RecoveryCause.PROCESS_LOST,
-                reason=f"interrupted {rec.id} partial work",
-                snapshot_id=f"{rec.id}-reset-{ts}",
-                reset_mode=(
-                    RX.RESET_BOOKKEEPING_PRESERVING if preserving else RX.RESET_PLAIN
-                ),
-                bookkeeping_paths=paths if preserving else (),
-                rewind_message=message,
-                clean_excludes=(self.config.run_root,),
-                # The rewind restored the on-disk manifest to the target's tree
-                # + the preserved bookkeeping; re-persist the authoritative
-                # in-memory state over it (step 7 of the transaction).
-                persist=lambda _result: self._persist(),
-            )
+            try:
+                self._apply_recovery_rewind(
+                    rec,
+                    site="orchestrator.reset_to_base",
+                    target_sha=target,
+                    cause=RX.RecoveryCause.PROCESS_LOST,
+                    reason=f"interrupted {rec.id} partial work",
+                    snapshot_id=f"{rec.id}-reset-{ts}",
+                    reset_mode=(
+                        RX.RESET_BOOKKEEPING_PRESERVING if preserving
+                        else RX.RESET_PLAIN
+                    ),
+                    bookkeeping_paths=paths if preserving else (),
+                    rewind_message=message,
+                    clean_excludes=(self.config.run_root,),
+                    # The rewind restored the on-disk manifest to the target's
+                    # tree + the preserved bookkeeping; re-persist the
+                    # authoritative in-memory state over it (transaction step 7).
+                    persist=lambda _result: self._persist(),
+                )
+            except RX.RecoveryPreconditionError as exc:
+                # A refused rewind plan (e.g. the range holds an operator
+                # commit modifying a governed artifact, R9/FR-10.4 — post-P3
+                # review F-004) is a fail-closed PARK, not a crash: nothing
+                # was mutated, the evidence names the conflict, and the
+                # operator resolves it through the artifact's own loop or the
+                # explicit rollback verb.
+                return StepResult(
+                    status=INTERRUPTED,
+                    halt_reason=M.HALT_REASON_PRECONDITION,
+                    notes=(
+                        "reset_to_base refused fail-closed before any "
+                        f"mutation: {exc}"
+                    ),
+                )
             # Idempotently flush the checkpoint (still `pending` here — the
             # re-run consumes it and lands the `consumed` checkpoint).
             self._reconcile_response_checkpoint()
@@ -754,14 +772,25 @@ class Orchestrator:
         in-memory overlay a process kill could lose (PR #77 review).
         """
         repo = self.repo_root
+        # These in-drive rewinds never switch branches: they observe and
+        # mutate the CURRENT checkout — the run branch during a real drive
+        # (resume checks it out first), but possibly another branch when the
+        # engine is embedded directly. Observing the checked-out branch is
+        # what makes the commit inventory (and its governance evidence,
+        # F-004) reflect the range the rewind actually discards.
+        checked_out = gitops.current_branch(repo)
+        observe_branch = (
+            self.manifest.branch if checked_out == "HEAD" else checked_out
+        )
         git_obs = RX.observe_git(
             repo,
-            run_branch=self.manifest.branch,
+            run_branch=observe_branch,
             recorded_sha=rec.base_sha,
             excludes=self.excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(
                 repo, self.run_dir
             ),
+            approved_artifacts=governed_artifact_paths(repo, self.artifact_root),
         )
         state_obs = RX.observe_state(
             self.manifest, rec, liveness=RX.DriverLiveness.ALIVE
@@ -772,9 +801,11 @@ class Orchestrator:
                 repo, manifest=self.manifest, record=rec, excludes=self.excludes
             )
 
+        # The action names the ref this rewind actually mutates (F-003).
+        target_ref = "HEAD" if checked_out == "HEAD" else f"refs/heads/{checked_out}"
         action = RX.SnapshotAndRestartAction(
             description=f"snapshot the worktree and restart from {target_sha[:10]}",
-            target_ref=f"refs/heads/{self.manifest.branch}",
+            target_ref=target_ref,
             target_sha=target_sha,
             reason=reason,
         )
@@ -785,6 +816,15 @@ class Orchestrator:
             action=action,
             cause=cause,
         )
+        # Loud governance audit (R9/FR-10.4): a discarded operator commit
+        # touching a governed artifact (prd.md/plan.md) is surfaced as a
+        # manifest warning — never refused; manual PRD/plan edits are a
+        # sanctioned operator workflow, and the snapshot preserves the state.
+        for note in assessment.evidence:
+            if note.startswith(RX.GOVERNED_DISCARD_EVIDENCE_PREFIX):
+                warn = f"[{site}] {note}"
+                if warn not in self.manifest.warnings:
+                    self.manifest.warnings.append(warn)
         spec = RX.RewindSpec(
             site=site,
             target_sha=target_sha,

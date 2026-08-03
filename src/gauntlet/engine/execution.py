@@ -294,6 +294,30 @@ def engine_bookkeeping_candidates(repo_root: Path, run_dir: Path) -> list[str]:
     return paths
 
 
+def governed_artifact_paths(repo_root: Path, artifact_root: Path) -> list[str]:
+    """Repo-relative paths of the run's governed artifacts (R9 / FR-10.4).
+
+    The PRD and plan are ratified through their review loops and human gates,
+    and hand-editing + committing them is a SANCTIONED operator workflow.
+    Recovery observation flags any commit-range change to these paths so a
+    rewind that would discard an operator's edit is surfaced LOUDLY (planner
+    evidence promoted to manifest warnings) with the state preserved in the
+    recovery snapshot — never refused (post-P3 review F-004, per operator
+    direction). Existence-independent: a classifier walks history, where the
+    path may predate or outlive the file on disk. Approval-STATE awareness is
+    the P5 taxonomy's refinement.
+    """
+    root = repo_root.resolve()
+    art = artifact_root.resolve()
+    paths: list[str] = []
+    for name in ("prd.md", "plan.md"):
+        try:
+            paths.append((art / name).relative_to(root).as_posix())
+        except ValueError:
+            pass
+    return paths
+
+
 def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
     """Repo-relative paths of the two on-disk run-bookkeeping files.
 

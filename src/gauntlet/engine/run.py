@@ -29,6 +29,7 @@ from gauntlet.engine import gitops, manifest as M, prd_stub, recovery_exec as RX
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     engine_bookkeeping_candidates,
+    governed_artifact_paths,
     human_owned_excludes,
     run_bookkeeping_excludes,
 )
@@ -1664,6 +1665,10 @@ class RunManager:
         # done / error.
         handle = self._acquire_worktree_lock(slug, man.run_id)
         try:
+            # A surviving recovery intent from a killed transaction converges
+            # before the approval drives anything (post-P3 review F-002).
+            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
+                man = Manifest.load(run_dir / "manifest.json")
             pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
             # Approving a gate drives the rest of the run, so honor use_judge.
             if use_judge:
@@ -1692,6 +1697,10 @@ class RunManager:
         user = resolve_operator_identity(self.repo_root)
         handle = self._acquire_worktree_lock(slug, man.run_id)
         try:
+            # A surviving recovery intent from a killed transaction converges
+            # before the rejection re-drives anything (post-P3 review F-002).
+            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
+                man = Manifest.load(run_dir / "manifest.json")
             pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
             if use_judge:
                 return self._with_judge(man, run_dir, lambda env: self._reject_drive(
@@ -1797,6 +1806,11 @@ class RunManager:
         self._reap_orphaned_judge(run_dir, layout.slug)
 
     def abort(self, slug: str) -> str:
+        # Deliberately NOT a recovery-intent replay point (contrast resume/
+        # rollback/approve/reject, post-P3 review F-002): abort's R1 contract
+        # is "abort while retaining all snapshots and evidence" — it mutates
+        # only the run status, never Git state, so a surviving intent stays in
+        # place as preserved evidence for a later explicit resume/rollback.
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
@@ -2734,6 +2748,15 @@ class RunManager:
         # resume/abort.
         handle = self._acquire_worktree_lock(slug, man.run_id)
         try:
+            # Converge any surviving recovery intent BEFORE the guards run
+            # (post-P3 review F-002): a rollback killed between its Git apply
+            # and its manifest persist leaves the branch reset but the
+            # manifest un-rewound — the tier-2 agreement guard would then
+            # refuse ("behind") forever, so a retried rollback could never
+            # reach the executor's own survivor replay. Reload the manifest
+            # after a replay: the site finisher rewrote it.
+            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
+                man = Manifest.load(run_dir / "manifest.json")
             return self._rollback_locked(layout, run_dir, man, phase)
         finally:
             self._release_worktree_lock(handle)
@@ -2827,6 +2850,7 @@ class RunManager:
             recorded_sha=last_recorded,
             excludes=excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(repo, run_dir),
+            approved_artifacts=governed_artifact_paths(repo, layout.slug_dir),
         )
         state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
 
@@ -2854,6 +2878,14 @@ class RunManager:
             ),
             evidence=(f"operator-requested rollback to P{phase} (FR-9.9)",),
         )
+        # Governed-artifact discards are audited loudly (R9/FR-10.4): the
+        # planner records each as evidence, and the persist step below turns
+        # them into manifest warnings. Never a refusal — hand-editing and
+        # committing the PRD/plan is a sanctioned operator workflow.
+        governed_notes = [
+            e for e in assessment.evidence
+            if e.startswith(RX.GOVERNED_DISCARD_EVIDENCE_PREFIX)
+        ]
         spec = RX.RewindSpec(
             site="run.rollback",
             checkout_branch=man.branch,
@@ -2882,6 +2914,12 @@ class RunManager:
                     "manifest flush); preserved in recovery snapshot "
                     f"{result.snapshot.ref}:\n{absorbed}"
                 )
+            for note in governed_notes:
+                # Loud governance audit (R9/FR-10.4, post-P3 review F-004):
+                # this rollback discarded an operator commit that modified a
+                # governed artifact; the state is preserved in the snapshot
+                # and the discard is part of the audit trail.
+                man.warnings.append(f"rollback: {note}")
             _apply_rollback_manifest_transition(
                 man, run_dir, target=target, phase=phase, at=_utc_stamp()
             )

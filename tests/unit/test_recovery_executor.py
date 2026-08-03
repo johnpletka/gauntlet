@@ -925,3 +925,328 @@ def test_no_direct_destructive_git_calls_remain_in_converted_rewind_paths():
     # And the deprecated lossy helpers are gone from gitops entirely.
     for name in ("backup_dirty_worktree", "worktree_overlay", "restore_overlay"):
         assert not hasattr(gitops, name)
+
+
+# =============================================================================
+# P3.1 — post-review regressions (F-001..F-005)
+# =============================================================================
+
+
+# --- F-001: same-HEAD work created after a kill is never replayed away ----------
+
+
+@pytest.mark.parametrize(
+    "contaminate", ["tracked_edit", "staged_new_file", "untracked_file"]
+)
+def test_replay_refuses_same_head_work_created_after_the_kill(
+    fixture_repo, monkeypatch, contaminate
+):
+    """F-001: the intent's independently re-derivable index/worktree plane
+    witnesses mean a same-HEAD repository that gained tracked, staged, or
+    untracked work after the kill is provably NOT the assessed pre-state —
+    replay fails closed with the new work intact, instead of resetting it
+    away under a snapshot that never captured it."""
+    run_dir, man, excludes = _env(fixture_repo)
+    (fixture_repo / "tracked.txt").write_text("committed\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "seed tracked")
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "tracked.txt").write_text("dirty edit\n")
+    (fixture_repo / "junk.txt").write_text("untracked partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    monkeypatch.setattr(
+        gitops, "reset_hard",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed before apply")),
+    )
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()
+    assert RX.load_intent(run_dir) is not None
+
+    # New work lands WITHOUT moving HEAD — the exact case a bare-HEAD replay
+    # check cannot see.
+    if contaminate == "tracked_edit":
+        (fixture_repo / "tracked.txt").write_text("NEW work after the kill\n")
+        marker = fixture_repo / "tracked.txt"
+        expected = "NEW work after the kill\n"
+    elif contaminate == "staged_new_file":
+        (fixture_repo / "newfile.txt").write_text("NEW staged work\n")
+        git(fixture_repo, "add", "--", "newfile.txt")
+        marker = fixture_repo / "newfile.txt"
+        expected = "NEW staged work\n"
+    else:
+        (fixture_repo / "brand-new.txt").write_text("NEW untracked work\n")
+        marker = fixture_repo / "brand-new.txt"
+        expected = "NEW untracked work\n"
+
+    with pytest.raises(RX.RecoveryIntentError, match="never captured"):
+        RX.replay_pending_intent(fixture_repo, run_dir)
+    # Fail closed: the new work is untouched and the intent stays as evidence.
+    assert marker.read_text() == expected
+    assert gitops.head_sha(fixture_repo) == target
+    assert RX.load_intent(run_dir) is not None
+
+
+# --- F-002: every mutating verb reconciles a surviving intent -------------------
+
+
+def test_killed_rollback_converges_when_retried_via_rollback(
+    fixture_repo, monkeypatch
+):
+    """F-002: a rollback killed between its Git apply and its manifest persist
+    leaves the branch reset but the manifest un-rewound. Retrying ROLLBACK
+    itself (not resume) must converge: the entry replay re-runs the manifest
+    transition through the site finisher BEFORE the tier-2 agreement guard —
+    which would otherwise refuse 'behind' forever."""
+    mgr = _rollback_manager(fixture_repo)
+    man = mgr.status("demo")
+    p1_target = next(c.sha for c in man.commits if c.phase == "P1")
+    monkeypatch.setattr(
+        run_mod, "_apply_rollback_manifest_transition",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed before persist")),
+    )
+    with pytest.raises(_Boom):
+        mgr.rollback("demo", phase=1)
+    monkeypatch.undo()
+    run_dir = mgr.layout("demo").active_run_dir()
+    assert gitops.head_sha(fixture_repo) == p1_target  # branch already reset
+    assert RX.load_intent(run_dir) is not None
+    stale = mgr.status("demo")
+    assert [c.phase for c in stale.commits] == ["P1", "P2"]  # not yet rewound
+
+    target = mgr.rollback("demo", phase=1)  # the retried verb converges
+    assert target == p1_target
+    man = mgr.status("demo")
+    assert [c.phase for c in man.commits] == ["P1"]
+    assert man.record("impl2").status == M.PENDING
+    assert RX.load_intent(run_dir) is None
+    assert any("replayed after a process death" in w for w in man.warnings)
+
+
+_GATED_PIPELINE = """
+name: p
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: gate, type: human_gate, show: [prd.md]}
+      - {id: after, type: shell, run: "true"}
+"""
+
+
+def _gated_manager(repo) -> RunManager:
+    (repo / ".gauntlet").mkdir()
+    (repo / ".gauntlet" / "config.yaml").write_text(_ROLLBACK_CONFIG)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add config")
+    mgr = RunManager(repo)
+    mgr.new("demo")
+    mgr.layout("demo").prd_path.write_text("# Real PRD\n\nA human-authored PRD.\n")
+    (repo / "pipelines").mkdir(exist_ok=True)
+    path = repo / "pipelines" / "p.yaml"
+    path.write_text(_GATED_PIPELINE)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add pipeline + prd")
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    return mgr
+
+
+@pytest.mark.parametrize("verb", ["approve", "reject"])
+def test_gate_verbs_reconcile_surviving_intents_first(
+    fixture_repo, monkeypatch, verb
+):
+    """F-002: approve and reject are driving verbs — each must call the
+    intent-reconciliation hook (under the lock, before any drive) exactly
+    like resume and rollback."""
+    mgr = _gated_manager(fixture_repo)
+    calls: list[str] = []
+    real = RX.replay_pending_intent
+
+    def spying(repo, run_dir):
+        calls.append(verb)
+        return real(repo, run_dir)
+
+    monkeypatch.setattr(run_mod.RX, "replay_pending_intent", spying)
+    if verb == "approve":
+        assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
+    else:
+        mgr.reject("demo", "not yet", use_judge=False)
+    assert calls == [verb]
+
+
+# --- F-003: the action's target_ref is resolved and validated -------------------
+
+
+def test_planner_refuses_an_unresolvable_target_ref(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    head = gitops.head_sha(fixture_repo)
+    git_obs = RX.observe_git(
+        fixture_repo, run_branch="main", recorded_sha=head, excludes=excludes
+    )
+    state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
+    fp = RX.build_progress_fingerprint(fixture_repo, manifest=man, excludes=excludes)
+    action = RX.SnapshotAndRestartAction(
+        description="rewind under a phantom ref",
+        target_ref="refs/heads/does-not-exist",
+        target_sha=head,
+        reason="test",
+    )
+    with pytest.raises(RX.RecoveryPreconditionError, match="does not resolve"):
+        RX.RecoveryPlanner(fixture_repo).assess_rewind(
+            git_obs=git_obs, state_obs=state_obs, fingerprint=fp, action=action,
+            cause=RecoveryCause.WORKTREE_PARTIAL,
+        )
+
+
+def test_executor_refuses_a_target_ref_naming_a_different_ref(fixture_repo):
+    """F-003: the advertised action and the mutation must name the same ref.
+    The ref resolves to the observed tip at assessment time, then moves; the
+    executor re-resolves it under the lock and refuses before any snapshot."""
+    run_dir, man, excludes = _env(fixture_repo)
+    (fixture_repo / "work.txt").write_text("committed\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "second commit")
+    head = gitops.head_sha(fixture_repo)
+    parent = gitops.commit_parent(fixture_repo, head)
+    git(fixture_repo, "branch", "other")  # == head, so the planner accepts it
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+
+    git_obs = RX.observe_git(
+        fixture_repo, run_branch="main", recorded_sha=head, excludes=excludes
+    )
+    state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
+
+    def fp():
+        return RX.build_progress_fingerprint(
+            fixture_repo, manifest=man, excludes=excludes
+        )
+
+    action = RX.SnapshotAndRestartAction(
+        description="rewind advertised under the WRONG ref",
+        target_ref="refs/heads/other",
+        target_sha=head,
+        reason="test",
+    )
+    assessment = RX.RecoveryPlanner(fixture_repo).assess_rewind(
+        git_obs=git_obs, state_obs=state_obs, fingerprint=fp(), action=action,
+        cause=RecoveryCause.WORKTREE_PARTIAL,
+    )
+    spec = RX.RewindSpec(
+        site="test.rewind", target_sha=head, reset_mode=RX.RESET_PLAIN,
+        clean=True, clean_excludes=("runs",),
+    )
+    executor = RX.RecoveryExecutor(
+        fixture_repo, run_dir, run_id=man.run_id, run_root="runs",
+        excludes=excludes,
+    )
+    # The advertised ref moves between assessment and apply: HEAD (the actual
+    # rewind tip) and the action's ref now disagree.
+    git(fixture_repo, "branch", "-f", "other", parent)
+    with pytest.raises(RX.RecoveryPreconditionError, match="disagree"):
+        executor.apply(
+            assessment, action, spec=spec,
+            snapshot_request=RX.SnapshotRequest(
+                snapshot_id=f"t{next(_ids)}", reason="test", run_branch="main",
+                exclude=list(excludes), protected=[],
+            ),
+            fingerprint=fp,
+        )
+    assert _recovery_refs(fixture_repo) == []  # refused before the snapshot
+    assert (fixture_repo / "dirty.txt").read_text() == "partial\n"
+
+
+# --- F-004: governed-artifact discards are loud, never refused ------------------
+
+
+def test_internal_rewind_surfaces_governed_operator_discard_loudly(fixture_repo):
+    """F-004 (scoped per operator direction): a hand-committed prd.md/plan.md
+    edit is a SANCTIONED workflow, so an operator-invoked rewind that
+    discards one proceeds — with the discard promoted to a manifest warning
+    and the commit preserved through the snapshot's parent chain."""
+    base = gitops.head_sha(fixture_repo)
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("manually amended plan\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=Human", "-c", "user.email=h@h.local",
+        "commit", "-qm", "amend the plan by hand")
+    ahead = gitops.head_sha(fixture_repo)
+
+    man = _seed_running(fixture_repo, base)
+    orch = _orchestrator(
+        fixture_repo, manifest=man, interrupted="reset_to_base",
+        adapters={"builder": FakeAdapter(writes={"clean.py": "out\n"})},
+    )
+    assert orch.drive() == M.RUN_DONE  # proceeds — never refused
+    governed = [
+        w for w in orch.manifest.warnings
+        if RX.GOVERNED_DISCARD_EVIDENCE_PREFIX in w and "plan.md" in w
+    ]
+    assert governed, orch.manifest.warnings
+    # The discarded commit stays reachable through the snapshot.
+    refs = _recovery_refs(fixture_repo)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[0])
+    assert gitops.is_ancestor(fixture_repo, ahead, snapshot.snapshot_commit)
+
+
+def test_rollback_surfaces_governed_operator_discard_loudly(fixture_repo):
+    mgr = _rollback_manager(fixture_repo)
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    plan.write_text("manually amended plan\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=Human", "-c", "user.email=h@h.local",
+        "commit", "-qm", "tweak the plan wording by hand")
+
+    mgr.rollback("demo", phase=1)
+    man = mgr.status("demo")
+    assert any(
+        RX.GOVERNED_DISCARD_EVIDENCE_PREFIX in w and "plan.md" in w
+        for w in man.warnings
+    ), man.warnings
+
+
+def test_manual_governed_edit_then_approve_is_untouched(fixture_repo):
+    """The sanctioned operator workflow end-to-end (operator direction on
+    F-004): hand-edit a governed artifact while parked at a human gate,
+    commit it, approve — nothing refuses, nothing rewinds, the edit stays."""
+    mgr = _gated_manager(fixture_repo)
+    prd = mgr.layout("demo").prd_path
+    prd.write_text("# Real PRD\n\nManually revised after review.\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "-c", "user.name=Human", "-c", "user.email=h@h.local",
+        "commit", "-qm", "revise the PRD by hand before approving")
+    edited = gitops.head_sha(fixture_repo)
+
+    assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
+    assert prd.read_text() == "# Real PRD\n\nManually revised after review.\n"
+    assert gitops.is_ancestor(fixture_repo, edited, gitops.head_sha(fixture_repo))
+
+
+# --- F-005: an unreadable intent fails closed -----------------------------------
+
+
+def test_unreadable_intent_fails_closed(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    path = RX.intent_path(run_dir)
+    path.write_text("{}")
+    if os.geteuid() == 0:  # pragma: no cover - CI-as-root cannot drop perms
+        pytest.skip("root bypasses file permissions")
+    os.chmod(path, 0)
+    try:
+        with pytest.raises(RX.RecoveryIntentError, match="could not be read"):
+            RX.load_intent(run_dir)
+        with pytest.raises(RX.RecoveryIntentError, match="could not be read"):
+            RX.replay_pending_intent(fixture_repo, run_dir)
+    finally:
+        os.chmod(path, 0o644)
+
+
+def test_malformed_intent_fails_closed(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    RX.intent_path(run_dir).write_text("not json at all")
+    with pytest.raises(RX.RecoveryIntentError, match="malformed"):
+        RX.load_intent(run_dir)

@@ -53,7 +53,7 @@ from typing import Any, Callable, Iterator
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gauntlet.engine import git_snapshot, gitops, manifest as M
-from gauntlet.engine.gitops import ENGINE_IDENTITY
+from gauntlet.engine.gitops import ENGINE_IDENTITY, GitError
 from gauntlet.engine.recovery import (
     AbortAction,
     BranchRelation,
@@ -88,15 +88,27 @@ INTENT_SCHEMA_VERSION = 1
 # here would be circular. test_recovery_executor pins the two equal.
 DRIVING_LOCK_NAME = ".driving.lock"
 
-# Commit-subject conventions (mirrors gitops: checkpoint/engine subjects are
-# matched at fixed field position, never against free prose).
+# Commit-subject conventions, matched at fixed field position (the subject
+# line), never against free prose. The stage-label alternation MIRRORS the
+# enforced commit format (commit_format._HEADER_RE): artifact-mode cycles
+# legitimately land `PRD.1:`/`PLAN.1:` fix commits, and classifying those as
+# operator work would make governance checks refuse the engine's own
+# review-loop history (post-P3 review F-004).
+_STAGE_LABEL = r"(?:P\d+|PRD|PLAN|REVIEW)"
 _WIP_RE = re.compile(r"^(P\d+) wip:")
-_PHASE_RE = re.compile(r"^(P\d+):")
-_FIX_RE = re.compile(r"^(P\d+)\.\w+:")
+_PHASE_RE = re.compile(rf"^({_STAGE_LABEL}):")
+_FIX_RE = re.compile(rf"^({_STAGE_LABEL})\.(?:\d+|r\d+):")
 _ENGINE_RE = re.compile(r"^gauntlet: ")
 
 RESET_PLAIN = "plain"
 RESET_BOOKKEEPING_PRESERVING = "bookkeeping_preserving"
+
+# Assessment-evidence marker for a rewind that discards an operator commit
+# modifying a governed artifact (prd.md/plan.md). The converted sites promote
+# these lines to manifest warnings so the discard is loud (R9/FR-10.4) —
+# manual PRD/plan edits are a sanctioned operator workflow and are never
+# refused, only surfaced and snapshot-preserved.
+GOVERNED_DISCARD_EVIDENCE_PREFIX = "rewind discards operator commit "
 
 # Site-specific replay finishers: after a replayed apply converges the Git
 # state, the intent's site may need its own state transition re-persisted
@@ -566,9 +578,24 @@ class RecoveryPlanner:
 
         Validates that the action's target is provably reachable from the
         observed state: the current HEAD itself, the recorded boundary, an
-        inventoried range commit, or an ancestor of the observed tips. An
-        action whose target the observation cannot substantiate is refused —
-        it must never be advertised as safe.
+        inventoried range commit, or an ancestor of the observed tips. The
+        action's ``target_ref`` must resolve to an observed tip — an action
+        naming one ref while the mutation would rewind another can never be
+        advertised as safe (post-P3 review F-003).
+
+        Artifact governance (R9/FR-10.4, post-P3 review F-004): commits the
+        rewind would discard are checked against the observation's
+        governed-artifact flags, and every operator commit modifying a
+        governed artifact (prd.md/plan.md) in the discard range is recorded
+        as explicit assessment evidence — the converted sites surface it as
+        a manifest warning. Deliberately observation-and-audit, NEVER a
+        refusal: manually editing and committing the PRD/plan is a sanctioned
+        operator workflow (that is what the human gates ratify), so a rewind
+        the operator invokes must proceed — loudly, with the discarded state
+        preserved in the durable snapshot — rather than wedge their own
+        edit behind a guard. Engine review-loop commits (phase/fix/
+        checkpoint/bookkeeping shapes) are not governance events;
+        approval-STATE awareness is the P5 taxonomy's refinement.
         """
         target = action.target_sha
         known = {git_obs.head_sha, git_obs.recorded_sha, git_obs.run_branch_sha}
@@ -581,6 +608,29 @@ class RecoveryPlanner:
                     f"state nor an ancestor of the observed tip {tip[:10]}; "
                     "refusing to plan a rewind onto unproven history"
                 )
+        try:
+            resolved_ref = gitops.rev_parse(self.repo, action.target_ref)
+        except GitError as exc:
+            raise RecoveryPreconditionError(
+                f"action target_ref {action.target_ref!r} does not resolve; "
+                "an action without a real executable ref cannot be safe"
+            ) from exc
+        if resolved_ref not in {git_obs.head_sha, git_obs.run_branch_sha}:
+            raise RecoveryPreconditionError(
+                f"action target_ref {action.target_ref!r} resolves to "
+                f"{resolved_ref[:10]}, which is neither the observed HEAD "
+                f"({git_obs.head_sha[:10]}) nor the observed run-branch tip; "
+                "the advertised action and the observation disagree"
+            )
+        governed = _governed_operator_discards(git_obs, target)
+        if governed:
+            evidence = evidence + tuple(
+                f"{GOVERNED_DISCARD_EVIDENCE_PREFIX}{c.sha[:10]} "
+                f"({c.subject!r}) modifying governed artifact(s) "
+                f"{', '.join(paths)} — preserved in the recovery snapshot, "
+                "surfaced loudly, never silently (R9/FR-10.4)"
+                for c, paths in governed
+            )
         return RecoveryAssessment(
             cause=cause,
             disposition=RecoveryDisposition.SNAPSHOT_AND_RESTART,
@@ -599,6 +649,28 @@ class RecoveryPlanner:
             recommended_action=RecoveryActionKind.SNAPSHOT_AND_RESTART,
             progress_fingerprint=fingerprint.digest,
         )
+
+
+def _governed_operator_discards(
+    git_obs: GitObservation, target: str
+) -> list[tuple[GitCommitObservation, list[str]]]:
+    """Operator commits the rewind to ``target`` would discard, with the
+    governed-artifact paths each one modifies. Empty when none."""
+    shas = [c.sha for c in git_obs.run_branch_commits]
+    if target in shas:
+        discarded = git_obs.run_branch_commits[shas.index(target) + 1:]
+    elif target == git_obs.run_branch_sha:
+        discarded = ()
+    else:
+        discarded = git_obs.run_branch_commits
+    out: list[tuple[GitCommitObservation, list[str]]] = []
+    for commit in discarded:
+        if commit.kind is not CommitKind.OPERATOR:
+            continue
+        paths = [ch.path for ch in commit.changed_paths if ch.approved_artifact]
+        if paths:
+            out.append((commit, paths))
+    return out
 
 
 # --- the transaction ------------------------------------------------------------
@@ -675,6 +747,17 @@ class RecoveryIntent(BaseModel):
     pre_head: str = Field(min_length=40)
     pre_run_branch_sha: str | None = None
     pre_fingerprint_digest: str = Field(min_length=1)
+    # Independently comparable pre-state witnesses for each durable Git plane
+    # (post-P3 review F-001): a replaying process cannot reconstruct the full
+    # run-state fingerprint, but it CAN re-derive these — so a same-HEAD
+    # repository whose index or worktree gained new work after the kill is
+    # provably NOT the assessed pre-state and the replay fails closed instead
+    # of resetting the new work away.
+    pre_index_fingerprint: str = Field(min_length=1)
+    pre_worktree_fingerprint: str = Field(min_length=1)
+    # The exclusion set the fingerprints were computed under, so the replay
+    # observes the identical worktree plane.
+    excludes: tuple[str, ...] = ()
     spec: RewindSpec
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -710,12 +793,21 @@ def intent_path(run_dir: Path) -> Path:
 
 
 def load_intent(run_dir: Path) -> RecoveryIntent | None:
-    """The surviving intent, or ``None``. Malformed intents fail closed."""
+    """The surviving intent, or ``None``. Unreadable/malformed intents fail
+    closed: only a provably ABSENT intent returns ``None`` — a permission or
+    I/O failure is indistinguishable from a surviving transaction, so it must
+    block further mutation, never be silently treated as "no intent"
+    (post-P3 review F-005)."""
     path = intent_path(run_dir)
     try:
         text = path.read_text()
-    except (OSError, FileNotFoundError):
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise RecoveryIntentError(
+            f"recovery intent {path} exists but could not be read ({exc}); "
+            "refusing every further mutation until it is inspected"
+        ) from exc
     try:
         return RecoveryIntent(**json.loads(text))
     except (ValueError, TypeError) as exc:
@@ -926,7 +1018,7 @@ class RecoveryExecutor:
                     f"{observed.digest}); the repository or run state moved — "
                     "re-assess before mutating (fail closed)"
                 )
-            self._validate(spec)  # step 3
+            self._validate(action, spec)  # step 3
             snapshot = self._create_snapshot(snapshot_request)  # step 4 (R2)
             intent = RecoveryIntent(  # step 5
                 intent_id=secrets.token_hex(16),
@@ -938,6 +1030,9 @@ class RecoveryExecutor:
                 pre_head=snapshot.head_sha,
                 pre_run_branch_sha=snapshot.run_branch_sha,
                 pre_fingerprint_digest=observed.digest,
+                pre_index_fingerprint=observed.index_fingerprint,
+                pre_worktree_fingerprint=observed.worktree_fingerprint,
+                excludes=tuple(self.excludes or ()),
                 spec=spec,
                 payload=payload or {},
             )
@@ -991,7 +1086,7 @@ class RecoveryExecutor:
 
     # -- step 3: validation ----------------------------------------------------
 
-    def _validate(self, spec: RewindSpec) -> None:
+    def _validate(self, action: RecoveryAction, spec: RewindSpec) -> None:
         repo = self.repo_root
         if not gitops.ref_is_valid_commit(repo, spec.target_sha):
             raise RecoveryPreconditionError(
@@ -1006,6 +1101,25 @@ class RecoveryExecutor:
             tip = gitops.rev_parse(repo, f"refs/heads/{spec.checkout_branch}")
         else:
             tip = gitops.head_sha(repo)
+        # The action's target_ref must resolve, under the lock, to exactly the
+        # tip this transaction is about to rewind — the advertised action and
+        # the mutation can never name different refs (post-P3 review F-003).
+        target_ref = getattr(action, "target_ref", None)
+        if target_ref:
+            try:
+                resolved_ref = gitops.rev_parse(repo, target_ref)
+            except GitError as exc:
+                raise RecoveryPreconditionError(
+                    f"action target_ref {target_ref!r} does not resolve; "
+                    "refusing to mutate under an unexecutable action"
+                ) from exc
+            if resolved_ref != tip:
+                raise RecoveryPreconditionError(
+                    f"action target_ref {target_ref!r} resolves to "
+                    f"{resolved_ref[:10]} but this transaction rewinds tip "
+                    f"{tip[:10]}; the action and the mutation disagree on "
+                    "which ref is being rewound"
+                )
         if spec.target_sha != tip and not gitops.is_ancestor(
             repo, spec.target_sha, tip
         ):
@@ -1052,78 +1166,117 @@ class RecoveryExecutor:
         return replay_intent(self.repo_root, self.run_dir, intent)
 
 
+def _tree_entry(repo: Path, tree: str, rel: str) -> tuple[str, str] | None:
+    """``(mode, oid)`` of ``rel`` in ``tree``, or ``None`` when absent."""
+    out = gitops._run(repo, "ls-tree", "-z", tree, "--", rel)
+    if not out:
+        return None
+    meta = out.rstrip("\0").split("\t", 1)[0]
+    mode, _kind, oid = meta.split()
+    return mode, oid
+
+
+def _blob_oid(repo: Path, data: bytes) -> str:
+    """The git blob id of ``data`` WITHOUT writing it (read-only witness)."""
+    return gitops._run_bytes(
+        repo, "hash-object", "--stdin", stdin=data
+    ).decode().strip()
+
+
+def _dirt_is_snapshot_residue(
+    repo: Path, snapshot: git_snapshot.GitRecoverySnapshot, excludes: list[str]
+) -> bool:
+    """True iff every dirty path is provably leftover mid-apply state.
+
+    A killed apply can leave the worktree between reset and clean (untracked
+    files the snapshot captured) or mid protected-restore. Every such path's
+    live content is byte-identical to the snapshot's worktree tree — Git
+    materialized it from there, or it survives from the captured pre-state —
+    and a captured protected deletion may already be re-applied. Anything
+    else (a path absent from the snapshot, or content the snapshot never
+    held) is NEW work created after the kill: replaying reset/clean over it
+    would destroy state no snapshot covers, so the caller must fail closed
+    (post-P3 review F-001).
+    """
+    for rel in _dirty_paths(repo, exclude=excludes):
+        entry = _tree_entry(repo, snapshot.worktree_tree, rel)
+        path = repo / rel
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if rel in snapshot.protected_deletions:
+                continue  # the protected-deletion restore already ran
+            return False
+        if entry is None:
+            return False  # a path the snapshot never captured: new work
+        mode, oid = entry
+        if stat.S_ISLNK(info.st_mode):
+            if mode != "120000":
+                return False
+            if _blob_oid(repo, os.readlink(path).encode()) != oid:
+                return False
+        elif stat.S_ISREG(info.st_mode):
+            if mode not in ("100644", "100755"):
+                return False
+            if _blob_oid(repo, path.read_bytes()) != oid:
+                return False
+        else:
+            return False
+    return True
+
+
 def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
     """Idempotently converge a surviving intent to its intended end state.
 
-    Decision table (fail closed on anything unrecognized):
+    Decision table, keyed on the intent's independently re-derivable plane
+    witnesses (post-P3 review F-001) — fail closed on anything unrecognized:
 
-    * repository still in the pre-apply state (fingerprint digest matches) →
-      run the full apply;
-    * recognized mid-apply state (checked out, HEAD at the target, or — for a
-      bookkeeping-preserving rewind — HEAD advanced from the target by engine
-      bookkeeping only) → finish the apply (clean + protected restore);
-    * anything else → :class:`RecoveryIntentError`; the intent stays in place
-      as evidence and every further mutation keeps failing closed.
+    * repository provably in the pre-apply state (HEAD **and** index **and**
+      worktree fingerprints match the intent) → run the full apply;
+    * proven mid-apply state — HEAD at the target (or the bookkeeping-
+      preserving rewind commit) with a tree that is clean or carries ONLY
+      dirt byte-identical to the snapshot's captured planes → finish the
+      apply (re-reset, clean, protected restore);
+    * anything else — including a same-HEAD repository holding tracked,
+      staged, or untracked work created after the kill → raise
+      :class:`RecoveryIntentError`; the intent stays in place as evidence
+      and every further mutation keeps failing closed.
 
     After convergence the intent's site finisher (if registered) re-persists
     the site's state transition; the intent clears only after that returns.
     """
     spec = intent.spec
     snapshot = git_snapshot.load_snapshot(repo, intent.snapshot_ref)
+    excludes = list(intent.excludes)
     current_branch = gitops.current_branch(repo)
     head = gitops.head_sha(repo)
 
-    def _finish() -> None:
-        if spec.clean:
-            gitops.clean_untracked(repo, exclude=list(spec.clean_excludes))
-        git_snapshot.restore_protected(repo, snapshot)
+    def _planes_match_pre(*, index_exempt: bool = False) -> bool:
+        """The repository is byte-provably the assessed pre-apply state.
 
-    def _fingerprint_matches() -> bool:
-        # The pre-state witness: index + worktree + HEAD content identity. Run
-        # id / statuses are process-local at replay time, so the comparison
-        # uses the durable planes the digest folds in via a fresh digest of
-        # the SAME shape the executor fingerprinted. A conservative check:
-        # the pre-head must match too.
-        return head == intent.pre_head
+        ``index_exempt`` applies only to the bookkeeping-preserving mode,
+        whose apply legitimately scratches the REAL index (``read-tree`` +
+        ``add -f``) before its reset — the snapshot's raw index bytes remain
+        the authoritative pre-state record there.
+        """
+        if head != intent.pre_head:
+            return False
+        if worktree_fingerprint(repo, exclude=excludes) != (
+            intent.pre_worktree_fingerprint
+        ):
+            return False
+        if index_exempt:
+            return True
+        return index_fingerprint(repo) == intent.pre_index_fingerprint
 
-    applied_note: str
-    if spec.checkout_branch is not None and current_branch != spec.checkout_branch:
-        # Crash before (or during) checkout: only proceed when the repository
-        # is provably still in the assessed pre-apply state.
-        if not _fingerprint_matches():
-            raise RecoveryIntentError(
-                f"surviving intent {intent.intent_id} ({intent.site}): the "
-                f"repository is on {current_branch!r} with HEAD "
-                f"{head[:10]} != recorded pre-state {intent.pre_head[:10]}; "
-                "refusing to replay over an unrecognized state — inspect "
-                f"{intent_path(run_dir)} and snapshot {intent.snapshot_ref}"
-            )
-        gitops.checkout_branch(repo, spec.checkout_branch)
-        head = gitops.head_sha(repo)
-
-    if head == spec.target_sha:
-        # HEAD is already at the target — which is also true when the killed
-        # apply never ran (a target == pre-head dirt discard), so the reset
-        # itself must re-run: it is idempotent, and it is what discards the
-        # captured index/worktree dirt the snapshot preserved.
-        gitops.reset_hard(repo, spec.target_sha)
-        _finish()
-        applied_note = "finished a mid-apply intent (HEAD already at target)"
-    elif spec.reset_mode == RESET_BOOKKEEPING_PRESERVING and (
-        gitops.advance_is_engine_bookkeeping(
-            repo, spec.target_sha, bookkeeping=list(spec.bookkeeping_paths),
-            tip=head,
+    def _refuse(why: str) -> "RecoveryIntentError":
+        return RecoveryIntentError(
+            f"surviving intent {intent.intent_id} ({intent.site}): {why}; "
+            "refusing to replay over an unrecognized state — inspect "
+            f"{intent_path(run_dir)} and snapshot {intent.snapshot_ref}"
         )
-    ):
-        # The bookkeeping-preserving rewind commit is already in place;
-        # discard any residual dirt against it (idempotent), then finish.
-        gitops.reset_hard(repo, head)
-        _finish()
-        applied_note = (
-            "finished a mid-apply intent (bookkeeping-preserving rewind "
-            "already effected)"
-        )
-    elif head in (intent.pre_head, intent.pre_run_branch_sha):
+
+    def _full_apply() -> None:
         if spec.reset_mode == RESET_BOOKKEEPING_PRESERVING:
             gitops.rewind_impl_preserving_bookkeeping(
                 repo, spec.target_sha, list(spec.bookkeeping_paths),
@@ -1132,14 +1285,100 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         else:
             gitops.reset_hard(repo, spec.target_sha)
         _finish()
+
+    def _finish() -> None:
+        if spec.clean:
+            gitops.clean_untracked(repo, exclude=list(spec.clean_excludes))
+        git_snapshot.restore_protected(repo, snapshot)
+
+    tree_is_clean = not _dirty_paths(repo, exclude=excludes)
+
+    applied_note: str
+    if spec.checkout_branch is not None and current_branch != spec.checkout_branch:
+        # Crash before the checkout: only proceed when every plane is
+        # provably still the assessed pre-apply state.
+        if not _planes_match_pre():
+            raise _refuse(
+                f"the repository is on {current_branch!r} and its HEAD/"
+                "index/worktree planes do not match the recorded pre-state"
+            )
+        gitops.checkout_branch(repo, spec.checkout_branch)
+        gitops.reset_hard(repo, spec.target_sha)
+        _finish()
+        applied_note = "replayed the full apply from the recorded pre-state"
+    elif head == spec.target_sha:
+        if _planes_match_pre(
+            index_exempt=spec.reset_mode == RESET_BOOKKEEPING_PRESERVING
+        ):
+            # target == pre-HEAD and nothing moved: the killed apply never
+            # ran — run it in full (the reset is the captured-dirt discard).
+            _full_apply()
+            applied_note = "replayed the full apply from the recorded pre-state"
+        elif tree_is_clean:
+            _finish()
+            applied_note = "finished a mid-apply intent (apply already effected)"
+        elif _dirt_is_snapshot_residue(repo, snapshot, excludes):
+            gitops.reset_hard(repo, spec.target_sha)
+            _finish()
+            applied_note = (
+                "finished a mid-apply intent (residual captured dirt discarded)"
+            )
+        else:
+            raise _refuse(
+                "HEAD is at the target but the tree holds work the snapshot "
+                "never captured (created after the killed transaction)"
+            )
+    elif spec.reset_mode == RESET_BOOKKEEPING_PRESERVING and (
+        gitops.advance_is_engine_bookkeeping(
+            repo, spec.target_sha, bookkeeping=list(spec.bookkeeping_paths),
+            tip=head,
+        )
+    ):
+        # The bookkeeping-preserving rewind commit is already in place.
+        if tree_is_clean:
+            _finish()
+        elif _dirt_is_snapshot_residue(repo, snapshot, excludes):
+            gitops.reset_hard(repo, head)
+            _finish()
+        else:
+            raise _refuse(
+                "the bookkeeping-preserving rewind is in place but the tree "
+                "holds work the snapshot never captured"
+            )
+        applied_note = (
+            "finished a mid-apply intent (bookkeeping-preserving rewind "
+            "already effected)"
+        )
+    elif head == intent.pre_run_branch_sha and spec.checkout_branch is not None:
+        # Crash between the checkout and the reset: the pre-state was fully
+        # verified before the checkout ran, so a clean/residue-only tree at
+        # the run-branch tip is the proven mid-apply state.
+        if not (
+            tree_is_clean or _dirt_is_snapshot_residue(repo, snapshot, excludes)
+        ):
+            raise _refuse(
+                "the checkout completed but the tree holds work the snapshot "
+                "never captured"
+            )
+        gitops.reset_hard(repo, spec.target_sha)
+        _finish()
+        applied_note = "finished a mid-apply intent (checkout already effected)"
+    elif head == intent.pre_head:
+        if not _planes_match_pre(
+            index_exempt=spec.reset_mode == RESET_BOOKKEEPING_PRESERVING
+        ):
+            raise _refuse(
+                "HEAD matches the pre-state but the index/worktree planes "
+                "hold work created after the killed transaction"
+            )
+        _full_apply()
         applied_note = "replayed the full apply from the recorded pre-state"
     else:
-        raise RecoveryIntentError(
-            f"surviving intent {intent.intent_id} ({intent.site}): HEAD "
-            f"{head[:10]} is neither the pre-state ({intent.pre_head[:10]}) "
-            f"nor the target ({spec.target_sha[:10]}); the repository moved "
-            "since the killed transaction — refusing to replay. Inspect "
-            f"{intent_path(run_dir)} and snapshot {intent.snapshot_ref}"
+        raise _refuse(
+            f"HEAD {head[:10]} is neither the pre-state "
+            f"({intent.pre_head[:10]}) nor the target "
+            f"({spec.target_sha[:10]}); the repository moved since the "
+            "killed transaction"
         )
 
     finisher = REPLAY_FINISHERS.get(intent.site)
@@ -1184,6 +1423,7 @@ def replay_pending_intent(repo: Path, run_dir: Path) -> str | None:
 __all__ = [
     "DRIVING_LOCK_NAME",
     "EXECUTOR_INTENT_NAME",
+    "GOVERNED_DISCARD_EVIDENCE_PREFIX",
     "REPLAY_FINISHERS",
     "RESET_BOOKKEEPING_PRESERVING",
     "RESET_PLAIN",

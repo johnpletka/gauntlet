@@ -384,16 +384,26 @@ def _apply_cycle_rewind(
     files (PR.md) are protected paths in the snapshot and restored from it,
     so their preservation survives a process kill (PR #77 review).
     """
-    from gauntlet.engine.execution import engine_bookkeeping_candidates
+    from gauntlet.engine.execution import (
+        engine_bookkeeping_candidates,
+        governed_artifact_paths,
+    )
 
     repo = ctx.repo_root
     rec = ctx.record
+    # The cycle never switches branches: it observes and mutates the CURRENT
+    # checkout (the run branch during a real drive), so the commit inventory
+    # — and its governance evidence (F-004) — reflects the range the rewind
+    # actually discards.
+    checked_out = gitops.current_branch(repo)
+    observe_branch = ctx.manifest.branch if checked_out == "HEAD" else checked_out
     git_obs = RX.observe_git(
         repo,
-        run_branch=ctx.manifest.branch,
+        run_branch=observe_branch,
         recorded_sha=recorded_sha,
         excludes=ctx.excludes,
         bookkeeping_candidates=engine_bookkeeping_candidates(repo, ctx.run_dir),
+        approved_artifacts=governed_artifact_paths(repo, ctx.artifact_root),
     )
     state_obs = RX.observe_state(
         ctx.manifest, rec, liveness=RX.DriverLiveness.ALIVE
@@ -404,9 +414,11 @@ def _apply_cycle_rewind(
             repo, manifest=ctx.manifest, record=rec, excludes=ctx.excludes
         )
 
+    # The action names the ref this rewind actually mutates (F-003).
+    target_ref = "HEAD" if checked_out == "HEAD" else f"refs/heads/{checked_out}"
     action = RX.SnapshotAndRestartAction(
         description=f"snapshot the worktree and restart from {target_sha[:10]}",
-        target_ref=f"refs/heads/{ctx.manifest.branch}",
+        target_ref=target_ref,
         target_sha=target_sha,
         reason=reason,
     )
@@ -417,6 +429,14 @@ def _apply_cycle_rewind(
         action=action,
         cause=cause,
     )
+    # Loud governance audit (R9/FR-10.4): a discarded operator commit touching
+    # a governed artifact is surfaced as a manifest warning — never refused
+    # (manual PRD/plan edits are sanctioned); the snapshot preserves the state.
+    for note in assessment.evidence:
+        if note.startswith(RX.GOVERNED_DISCARD_EVIDENCE_PREFIX):
+            warn = f"[{site}] {note}"
+            if warn not in ctx.manifest.warnings:
+                ctx.manifest.warnings.append(warn)
     spec = RX.RewindSpec(
         site=site,
         target_sha=target_sha,
