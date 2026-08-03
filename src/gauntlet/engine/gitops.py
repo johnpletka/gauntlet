@@ -329,7 +329,7 @@ def is_dirty_vs(
 
 
 def advance_is_engine_bookkeeping(
-    repo: Path, base_sha: str, *, bookkeeping: list[str]
+    repo: Path, base_sha: str, *, bookkeeping: list[str], tip: str | None = None
 ) -> bool:
     """True iff ``base_sha..HEAD`` is nothing but engine bookkeeping (#62/#65).
 
@@ -351,8 +351,13 @@ def advance_is_engine_bookkeeping(
        An allowlist, not the dirty-check exclusions: those exclusions also
        hide human-owned paths (every slug's ``PR.md``) that must never be
        classified as engine bookkeeping (PR #76 review F-001).
+
+    ``tip`` names the range end explicitly (default: HEAD). The pre-checkout
+    rollback validation (P3, plan §6: validate everything before checkout)
+    classifies ``base..refs/heads/<run-branch>`` without touching the
+    operator's checkout, so it must not read a bare HEAD.
     """
-    head = head_sha(repo)
+    head = tip if tip is not None else head_sha(repo)
     if head == base_sha:
         return True
     if not is_ancestor(repo, base_sha, head):
@@ -367,6 +372,38 @@ def advance_is_engine_bookkeeping(
     changed = _run(repo, "diff", "--name-only", base_sha, head).splitlines()
     allowed = set(bookkeeping)
     return all(path in allowed for path in changed if path)
+
+
+def dirty_paths_matching(repo: Path, patterns: list[str]) -> list[str]:
+    """Paths matching ``patterns`` with any uncommitted index/worktree state.
+
+    The read-only probe the rollback checkout guard uses for human-owned
+    excluded files (``PR.md``): they are hidden from the generic dirty guard
+    by policy, but a branch checkout can still refuse or clobber their
+    uncommitted state, so the guard needs to *detect* them without capturing
+    bytes (the durable preservation is the recovery snapshot's job now).
+    ``-z`` porcelain so special characters never arrive quoted; rename
+    entries report the live (destination) path.
+    """
+    if not patterns:
+        return []
+    out = _run(
+        repo, "status", "--porcelain", "-z", "--untracked-files=all",
+        "--", *patterns,
+    )
+    fields = out.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if not entry:
+            continue
+        status, rel = entry[:2], entry[3:]
+        paths.append(rel)
+        if "R" in status or "C" in status:
+            i += 1  # skip the rename/copy source field
+    return sorted(set(paths))
 
 
 def worktree_tree_hash(repo: Path) -> str:
@@ -1059,96 +1096,3 @@ def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:
     for pattern in exclude or []:
         args += ["-e", pattern]
     _run(repo, *args)
-
-
-def worktree_overlay(repo: Path, patterns: list[str]) -> dict[str, bytes | None]:
-    """Worktree state of files matching ``patterns`` that differs from HEAD.
-
-    .. deprecated:: P2
-        Lossy (bytes-or-tombstone only: no modes, symlinks are read *through*,
-        no staged-vs-worktree distinction). Superseded by
-        ``engine.git_snapshot.GitRecoverySnapshot``; the remaining rewind
-        callers migrate in P3, after which this helper is removed.
-
-    Captures modified/staged/untracked matches as ``{repo-rel-path: bytes}``
-    and tracked deletions as ``{repo-rel-path: None}`` tombstones.
-    Used to carry human-owned excluded files (``PR.md``, FR-9.8) across a
-    rewind: they are invisible to the dirty checks by policy, so a
-    ``reset --hard`` would otherwise silently destroy their uncommitted edits
-    (PR #77 review). Restore with :func:`restore_overlay` after the rewind;
-    callers also include these paths in the durable backup ref so a crash
-    between reset and restore cannot strand the only copy in process memory.
-    """
-    if not patterns:
-        return {}
-    out = _run(
-        repo, "status", "--porcelain", "--untracked-files=all", "--", *patterns
-    )
-    overlay: dict[str, bytes | None] = {}
-    for line in out.splitlines():
-        status = line[:2]
-        rel = line[3:]
-        if " -> " in rel:  # rename entry: the new path is the live one
-            rel = rel.split(" -> ", 1)[1]
-        rel = rel.strip().strip('"')
-        path = repo / rel
-        if "D" in status and not path.exists() and not path.is_symlink():
-            overlay[rel] = None
-        elif path.is_file():
-            overlay[rel] = path.read_bytes()
-    return overlay
-
-
-def restore_overlay(repo: Path, overlay: dict[str, bytes | None]) -> None:
-    """Restore :func:`worktree_overlay` bytes/deletions after a rewind.
-
-    .. deprecated:: P2
-        Writes with ``Path.write_bytes`` (can write through a pre-existing
-        symlink, loses modes/entry kinds). Superseded by
-        ``engine.git_snapshot.restore_protected``; remaining callers migrate
-        in P3.
-    """
-    for rel, data in overlay.items():
-        path = repo / rel
-        if data is None:
-            if path.is_file() or path.is_symlink():
-                path.unlink()
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-
-def backup_dirty_worktree(
-    repo: Path,
-    ref: str,
-    message: str,
-    *,
-    exclude: list[str] | None = None,
-    include: list[str] | None = None,
-) -> str:
-    """Snapshot the full dirty worktree (tracked + untracked) to a backup ref.
-
-    Captures partial work that ``reset --hard`` would otherwise destroy
-    (review F-003 / F-010 safety). ``exclude`` (the run root) is left out so the
-    snapshot — and the subsequent reset — never touch the run bookkeeping.
-    ``include`` is staged after the exclusion pass, allowing a caller to put
-    human-owned excluded paths into the *backup ref only*. This makes their
-    modified bytes or deletion durable without changing the engine's normal
-    dirty-check/commit policy (PR #77 review).
-    Returns the backup commit SHA.
-
-    .. deprecated:: P2
-        MUTATES THE REAL INDEX (``git add -A``) and collapses HEAD, index, and
-        worktree into one tree, so staged-vs-worktree divergence and unmerged
-        stages are unrepresentable (plan §3). Superseded by
-        ``engine.git_snapshot.create_snapshot``; the remaining rewind callers
-        migrate in P3, after which this helper is removed.
-    """
-    _run(repo, "add", "-A", *_exclude_pathspec(exclude))
-    if include:
-        _run(repo, "add", "-A", "--", *include)
-    tree = _run(repo, "write-tree").strip()
-    parent = head_sha(repo)
-    backup = _run(repo, "commit-tree", tree, "-p", parent, "-m", message).strip()
-    _run(repo, "update-ref", ref, backup)
-    return backup

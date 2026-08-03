@@ -234,7 +234,10 @@ def _assert_sanctioned_human_park(mgr: RunManager) -> None:
         assert step.parked_reason == M.PARKED_REASON_RESPONSE
         assert step.type == "agent_task" and step.id == "implement"
         assert "UPSTREAM CONFLICT" in notes
-        assert "backed up to refs/gauntlet/backup/" in notes
+        # P2/P3: the conflict-park rewind preserves the dirty tree as a
+        # complete recovery snapshot (refs/gauntlet/recovery/), no longer a
+        # legacy backup ref.
+        assert "preserved as recovery snapshot refs/gauntlet/recovery/" in notes
         assert "restored the clean tree" in notes
 
 

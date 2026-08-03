@@ -1,0 +1,927 @@
+"""P3 — every rewind behind the recovery executor (plan §4.2/§4.3, §6 P3).
+
+Deterministic tests against real throwaway Git repositories, in two layers:
+
+* **Executor transaction** — the canonical ordering (lock → re-observe
+  fingerprint → validate → durable snapshot → intent → apply → persist →
+  clear), fault injection at each transaction boundary, idempotent intent
+  replay, and the fail-closed refusals (fingerprint mismatch, foreign lock,
+  unrecognized replay state). Asserted ONCE, table-driven, at the executor.
+* **Site routing** — each of the five converted rewind sites (rollback,
+  interrupted ``reset_to_base``, conflict-park cleanup, fix-resume reset,
+  reviewer-mutation revert) drives the SAME transaction: a shared order
+  probe records the executor's phases while each site's own driver triggers
+  its rewind, and a shared snapshot-failure table proves every site aborts
+  before any destructive verb.
+
+The post-`177d721` PR #77 review regressions are encoded structurally:
+
+* **F-002** — staged B plus worktree C survive a rewind as separate planes
+  (the real-index-mutating single-tree backup is gone);
+* **F-003** — a protected symlink is preserved and restored as a symlink,
+  never read through or written through (the byte-overlay is gone);
+* **F-004** — rollback prevalidation failures leave the checkout untouched
+  (asserted in test_run_lifecycle: the P1 strict xfail now passes).
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+import os
+from pathlib import Path
+
+import pytest
+import yaml
+
+from conftest import FakeAdapter, git
+
+from gauntlet.engine import cycle as cycle_mod
+from gauntlet.engine import git_snapshot, gitops, manifest as M
+from gauntlet.engine import recovery_exec as RX
+from gauntlet.engine import run as run_mod
+from gauntlet.engine.config import RunConfig
+from gauntlet.engine.execution import (
+    PARKED,
+    StepContext,
+    StepResult,
+    get_spec,
+    run_bookkeeping_excludes,
+)
+from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
+from gauntlet.engine.orchestrator import Orchestrator
+from gauntlet.engine.pipeline import Pipeline
+from gauntlet.engine.recovery import RecoveryCause
+from gauntlet.engine.run import RunManager
+from gauntlet.logging.redact import RedactingWriter
+
+_ids = itertools.count(1)
+
+
+# --- executor-level harness -----------------------------------------------------
+
+
+def _env(repo: Path):
+    """A run-instance dir + manifest on the fixture repo's ``main`` branch."""
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ".gitignore").write_text("*\n")  # real layout: self-ignoring
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="main", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+    )
+    man.write_atomic(run_dir / "manifest.json")
+    excludes = [run_dir.relative_to(repo).as_posix(), "runs/*/PR.md"]
+    return run_dir, man, excludes
+
+
+def _plan(
+    repo: Path,
+    run_dir: Path,
+    man: Manifest,
+    excludes: list[str],
+    *,
+    target: str,
+    recorded: str | None = None,
+    rec: StepRecord | None = None,
+    mode: str = RX.RESET_PLAIN,
+    bookkeeping: tuple[str, ...] = (),
+    message: str | None = None,
+    clean: bool = True,
+    checkout: str | None = None,
+    protected: list[str] | None = None,
+):
+    """Build (executor, assessment, action, spec, snapshot request, fp)."""
+    git_obs = RX.observe_git(
+        repo, run_branch=man.branch, recorded_sha=recorded or target,
+        excludes=excludes,
+    )
+    state_obs = RX.observe_state(man, rec, liveness=RX.DriverLiveness.NONE)
+
+    def fp():
+        return RX.build_progress_fingerprint(
+            repo, manifest=man, record=rec, excludes=excludes
+        )
+
+    action = RX.SnapshotAndRestartAction(
+        description="test rewind",
+        target_ref=f"refs/heads/{man.branch}",
+        target_sha=target,
+        reason="test rewind",
+    )
+    assessment = RX.RecoveryPlanner(repo).assess_rewind(
+        git_obs=git_obs, state_obs=state_obs, fingerprint=fp(), action=action,
+        cause=RecoveryCause.WORKTREE_PARTIAL,
+    )
+    spec = RX.RewindSpec(
+        site="test.rewind",
+        checkout_branch=checkout,
+        target_sha=target,
+        reset_mode=mode,
+        bookkeeping_paths=bookkeeping,
+        rewind_message=message,
+        clean=clean,
+        clean_excludes=("runs",),
+    )
+    request = RX.SnapshotRequest(
+        snapshot_id=f"t{next(_ids)}",
+        reason="test rewind",
+        run_branch=man.branch,
+        exclude=list(excludes),
+        protected=protected if protected is not None else ["PR.md", "runs/*/PR.md"],
+    )
+    executor = RX.RecoveryExecutor(
+        repo, run_dir, run_id=man.run_id, run_root="runs", excludes=excludes,
+    )
+    return executor, assessment, action, spec, request, fp
+
+
+def _recovery_refs(repo: Path) -> list[str]:
+    return gitops._run(
+        repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/recovery/",
+    ).splitlines()
+
+
+# --- the shared order probe -----------------------------------------------------
+
+
+@pytest.fixture
+def order_probe(monkeypatch):
+    """Record the executor's transaction phases in execution order.
+
+    Wraps the REAL functions (behavior unchanged) so a single fixture asserts
+    the canonical precondition → snapshot → intent → apply → clear ordering
+    for the executor and for every converted site.
+    """
+    events: list[str] = []
+
+    def wrap(module, name, label):
+        real = getattr(module, name)
+
+        def wrapped(*args, **kwargs):
+            events.append(label)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, wrapped)
+
+    wrap(RX, "build_progress_fingerprint", "observe")
+    wrap(git_snapshot, "create_snapshot", "snapshot")
+    wrap(RX, "_write_intent", "intent")
+    wrap(gitops, "reset_hard", "apply")
+    wrap(gitops, "rewind_impl_preserving_bookkeeping", "apply")
+    wrap(gitops, "checkout_branch", "apply")
+    wrap(RX, "_clear_intent", "clear")
+    return events
+
+
+def _assert_canonical_order(events: list[str]) -> None:
+    """precondition (re-observe) → snapshot → intent → apply → clear."""
+    assert "snapshot" in events, f"no snapshot recorded: {events}"
+    i_snap = events.index("snapshot")
+    i_int = events.index("intent")
+    i_apply = min(i for i, e in enumerate(events) if e == "apply")
+    i_clear = events.index("clear")
+    observed_before = [i for i, e in enumerate(events) if e == "observe" and i < i_snap]
+    # At least two observations precede the snapshot: the assessment's and the
+    # executor's re-observation under the lock (step 2).
+    assert len(observed_before) >= 2, f"missing re-observation: {events}"
+    assert i_snap < i_int < i_apply < i_clear, f"order violated: {events}"
+
+
+# --- canonical ordering + end state, table-driven over spec shapes --------------
+
+
+def _shape_plain(repo, run_dir, man, excludes):
+    (repo / "tracked.txt").write_text("committed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "seed tracked")
+    target = gitops.head_sha(repo)
+    (repo / "tracked.txt").write_text("dirty edit\n")
+    (repo / "junk.txt").write_text("untracked partial\n")
+    kwargs = dict(target=target, mode=RX.RESET_PLAIN)
+
+    def verify():
+        assert (repo / "tracked.txt").read_text() == "committed\n"
+        assert not (repo / "junk.txt").exists()
+
+    return kwargs, verify
+
+
+def _shape_bookkeeping(repo, run_dir, man, excludes):
+    target = gitops.head_sha(repo)
+    (repo / "impl.py").write_text("work above target\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "operator work above the target")
+    bk_rel = (run_dir / "manifest.json").relative_to(repo).as_posix()
+    kwargs = dict(
+        target=target,
+        recorded=target,
+        mode=RX.RESET_BOOKKEEPING_PRESERVING,
+        bookkeeping=(bk_rel,),
+        message="gauntlet: rewind implementation for re-run (test)",
+    )
+
+    def verify():
+        head = gitops.head_sha(repo)
+        assert head != target  # the rewind commit sits on the target...
+        assert gitops.commit_parent(repo, head) == target
+        assert not (repo / "impl.py").exists()  # ...implementation rewound
+        assert (run_dir / "manifest.json").exists()  # bookkeeping preserved
+
+    return kwargs, verify
+
+
+def _shape_checkout(repo, run_dir, man, excludes):
+    (repo / "phase.py").write_text("run branch work\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "run branch tip")
+    tip = gitops.head_sha(repo)
+    target = gitops.commit_parent(repo, tip)
+    git(repo, "checkout", "-qb", "elsewhere")  # operator on another branch
+    kwargs = dict(
+        target=target, recorded=tip, checkout="main", clean=False,
+    )
+
+    def verify():
+        assert gitops.current_branch(repo) == "main"
+        assert gitops.head_sha(repo) == target
+        assert gitops.rev_parse(repo, "refs/heads/elsewhere") == tip
+
+    return kwargs, verify
+
+
+_SHAPES = {
+    "plain_reset": _shape_plain,
+    "bookkeeping_preserving": _shape_bookkeeping,
+    "checkout_then_reset": _shape_checkout,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_SHAPES), ids=sorted(_SHAPES))
+def test_transaction_order_and_end_state(fixture_repo, order_probe, shape):
+    run_dir, man, excludes = _env(fixture_repo)
+    kwargs, verify = _SHAPES[shape](fixture_repo, run_dir, man, excludes)
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, **kwargs
+    )
+    result = executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    _assert_canonical_order(order_probe)
+    verify()
+    assert result.applied
+    assert RX.load_intent(run_dir) is None  # cleared only after durability
+    assert _recovery_refs(fixture_repo)  # the snapshot ref is durable
+
+
+# --- fail-closed refusals -------------------------------------------------------
+
+
+def test_fingerprint_mismatch_between_assess_and_apply_aborts(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    # The repository moves between assessment and apply: a concurrent edit.
+    (fixture_repo / "dirty.txt").write_text("changed since assessment\n")
+    with pytest.raises(RX.RecoveryPreconditionError, match="fingerprint changed"):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    # Zero mutation: the moved state is untouched, no snapshot, no intent.
+    assert (fixture_repo / "dirty.txt").read_text() == "changed since assessment\n"
+    assert _recovery_refs(fixture_repo) == []
+    assert RX.load_intent(run_dir) is None
+
+
+def test_validation_failure_aborts_before_snapshot(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    bad_spec = spec.model_copy(update={"checkout_branch": "no-such-branch"})
+    with pytest.raises(RX.RecoveryPreconditionError, match="missing"):
+        executor.apply(
+            assessment, action, spec=bad_spec, snapshot_request=request,
+            fingerprint=fp,
+        )
+    assert (fixture_repo / "dirty.txt").read_text() == "partial\n"
+    assert _recovery_refs(fixture_repo) == []
+    assert RX.load_intent(run_dir) is None
+
+
+def test_planner_refuses_a_target_outside_observed_history(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    head = gitops.head_sha(fixture_repo)
+    git_obs = RX.observe_git(
+        fixture_repo, run_branch="main", recorded_sha=head, excludes=excludes
+    )
+    state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
+    fp = RX.build_progress_fingerprint(fixture_repo, manifest=man, excludes=excludes)
+    action = RX.SnapshotAndRestartAction(
+        description="rewind to unproven history",
+        target_ref="refs/heads/main",
+        target_sha="deadbeef" * 5,
+        reason="test",
+    )
+    with pytest.raises(RX.RecoveryPreconditionError, match="unproven history"):
+        RX.RecoveryPlanner(fixture_repo).assess_rewind(
+            git_obs=git_obs, state_obs=state_obs, fingerprint=fp, action=action,
+            cause=RecoveryCause.WORKTREE_PARTIAL,
+        )
+
+
+# --- worktree lock (transaction step 1) -----------------------------------------
+
+
+def _write_lock(repo: Path, pid: int) -> Path:
+    lock = repo / "runs" / RX.DRIVING_LOCK_NAME
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(json.dumps({
+        "nonce": "abc", "slug": "demo", "run_id": "run-1", "pid": pid,
+        "pgid": pid, "started_at": "t", "host": "h", "proc_identity": None,
+    }))
+    return lock
+
+
+def test_foreign_live_lock_fails_closed(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+    _write_lock(fixture_repo, os.getppid())  # a live pid that is not us
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    with pytest.raises(RX.RecoveryLockError, match="held by live pid"):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    assert (fixture_repo / "dirty.txt").read_text() == "partial\n"
+    assert _recovery_refs(fixture_repo) == []
+
+
+def test_own_process_lock_is_verified_held_and_left_in_place(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+    lock = _write_lock(fixture_repo, os.getpid())  # the RunManager-held case
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    assert lock.exists()  # verification never releases the verb's own lock
+
+
+def test_ephemeral_lock_is_taken_and_released(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dirty.txt").write_text("partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    assert not (fixture_repo / "runs" / RX.DRIVING_LOCK_NAME).exists()
+
+
+def test_lock_name_matches_run_manager() -> None:
+    assert RX.DRIVING_LOCK_NAME == run_mod.DRIVING_LOCK_NAME
+
+
+# --- fault injection at each transaction boundary -------------------------------
+
+# Each row kills the transaction at one boundary by making one call explode.
+# The invariant (plan §6 P3 acceptance): the repository is either untouched
+# or carries a durable snapshot plus a replayable intent; replay converges to
+# the intended end state and is idempotent.
+_BOUNDARIES = [
+    # (boundary, module attr to break, expectation)
+    ("before_snapshot", (RX.RecoveryExecutor, "_validate"), "untouched_nothing"),
+    ("during_snapshot", (git_snapshot, "create_snapshot"), "untouched_nothing"),
+    ("before_intent_persist", (RX, "_write_intent"), "untouched_snapshot_only"),
+    ("after_intent_before_apply", (gitops, "reset_hard"), "replayable"),
+    ("mid_apply_after_reset", (gitops, "clean_untracked"), "replayable"),
+    ("after_apply_before_persist", ("persist", None), "replayable"),
+    ("before_intent_clear", (RX, "_clear_intent"), "replayable"),
+]
+
+
+class _Boom(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    "boundary,breakpoint,expectation",
+    _BOUNDARIES,
+    ids=[row[0] for row in _BOUNDARIES],
+)
+def test_fault_injection_at_each_boundary(
+    fixture_repo, monkeypatch, boundary, breakpoint, expectation
+):
+    run_dir, man, excludes = _env(fixture_repo)
+    (fixture_repo / "tracked.txt").write_text("committed\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "seed tracked")
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "tracked.txt").write_text("dirty edit\n")
+    (fixture_repo / "junk.txt").write_text("untracked partial\n")
+
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+
+    persist = None
+    holder, name = breakpoint
+    if holder == "persist":
+        def persist(_result):
+            raise _Boom("killed before the state transition persisted")
+    else:
+        real = getattr(holder, name)
+
+        def exploding(*args, **kwargs):
+            if name in ("_validate",):
+                real(*args, **kwargs)  # the boundary is AFTER this step ran
+            raise _Boom(f"killed at {boundary}")
+
+        monkeypatch.setattr(holder, name, exploding)
+
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request,
+            fingerprint=fp, persist=persist,
+        )
+    monkeypatch.undo()  # the "next process" runs the real code
+
+    intent = RX.load_intent(run_dir)
+    if expectation == "untouched_nothing":
+        assert (fixture_repo / "tracked.txt").read_text() == "dirty edit\n"
+        assert (fixture_repo / "junk.txt").exists()
+        assert intent is None
+        if boundary == "before_snapshot":
+            assert _recovery_refs(fixture_repo) == []
+        assert RX.replay_pending_intent(fixture_repo, run_dir) is None
+        return
+    if expectation == "untouched_snapshot_only":
+        # The snapshot ref is durable garbage — harmless — but with no intent
+        # there is nothing to replay and nothing was mutated.
+        assert (fixture_repo / "tracked.txt").read_text() == "dirty edit\n"
+        assert (fixture_repo / "junk.txt").exists()
+        assert intent is None
+        assert _recovery_refs(fixture_repo)
+        assert RX.replay_pending_intent(fixture_repo, run_dir) is None
+        return
+
+    # replayable: a durable snapshot AND a replayable intent survive.
+    assert intent is not None
+    assert _recovery_refs(fixture_repo)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, intent.snapshot_ref)
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "junk.txt" in tree  # the partial work is preserved, not lost
+
+    # The next mutating command replays the intent idempotently...
+    note = RX.replay_pending_intent(fixture_repo, run_dir)
+    assert note is not None
+    assert gitops.head_sha(fixture_repo) == target
+    assert (fixture_repo / "tracked.txt").read_text() == "committed\n"
+    assert not (fixture_repo / "junk.txt").exists()
+    assert RX.load_intent(run_dir) is None  # ...exactly once: then cleared
+    # ...and a cleared intent is never replayed again.
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is None
+    assert gitops.head_sha(fixture_repo) == target
+
+
+def test_replay_refuses_an_unrecognized_repository_state(fixture_repo, monkeypatch):
+    run_dir, man, excludes = _env(fixture_repo)
+    (fixture_repo / "tracked.txt").write_text("committed\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "seed tracked")
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "junk.txt").write_text("partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    monkeypatch.setattr(
+        gitops, "reset_hard",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed")),
+    )
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()
+    # Someone (or something) moves the repository past both the pre-state and
+    # the target before the replay runs.
+    (fixture_repo / "other.txt").write_text("new work\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "unrelated progress")
+    moved_head = gitops.head_sha(fixture_repo)
+    with pytest.raises(RX.RecoveryIntentError, match="refusing to replay"):
+        RX.replay_pending_intent(fixture_repo, run_dir)
+    # Fail closed: nothing mutated, and the intent stays in place as evidence.
+    assert gitops.head_sha(fixture_repo) == moved_head
+    assert RX.load_intent(run_dir) is not None
+
+
+def test_cleared_intent_is_never_replayed(fixture_repo):
+    run_dir, man, excludes = _env(fixture_repo)
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "junk.txt").write_text("partial\n")
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    assert RX.load_intent(run_dir) is None
+    # New work lands after the completed transaction; a (non-existent) replay
+    # must never touch it.
+    (fixture_repo / "after.txt").write_text("post-transaction work\n")
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is None
+    assert (fixture_repo / "after.txt").read_text() == "post-transaction work\n"
+
+
+# --- post-177d721 F-002: staged B + worktree C are separate recoverable planes --
+
+
+def test_f002_staged_and_worktree_planes_survive_a_rewind(fixture_repo):
+    """Structurally impossible to lose: the executor's snapshot goes through
+    the P2 temporary-index machinery, so staged B and worktree C are captured
+    as distinct planes (the PR #77 ``git add -A``-on-the-real-index backup
+    that collapsed them no longer exists) and both restore exactly."""
+    run_dir, man, excludes = _env(fixture_repo)
+    (fixture_repo / "dual.txt").write_text("A committed\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "track A")
+    target = gitops.head_sha(fixture_repo)
+    (fixture_repo / "dual.txt").write_text("B staged\n")
+    git(fixture_repo, "add", "--", "dual.txt")
+    (fixture_repo / "dual.txt").write_text("C unstaged\n")
+
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+    executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    ref = _recovery_refs(fixture_repo)[0]
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    assert snapshot.index_tree is not None
+    assert gitops._run(
+        fixture_repo, "show", f"{snapshot.index_tree}:dual.txt"
+    ) == "B staged\n"
+    assert gitops._run(
+        fixture_repo, "show", f"{snapshot.worktree_tree}:dual.txt"
+    ) == "C unstaged\n"
+    # And the full restoration reproduces the divergence exactly.
+    git_snapshot.restore_snapshot(fixture_repo, snapshot)
+    assert gitops._run(fixture_repo, "show", ":dual.txt") == "B staged\n"
+    assert (fixture_repo / "dual.txt").read_text() == "C unstaged\n"
+
+
+# --- post-177d721 F-003: protected symlinks are never followed ------------------
+
+
+def test_f003_protected_symlink_survives_rewind_without_being_followed(
+    fixture_repo, tmp_path
+):
+    """Structurally impossible to escape: the byte-overlay that read through
+    (and wrote through) symlinks is gone; the executor preserves the symlink
+    ENTRY in the snapshot and Git rematerializes it on restore. Neither
+    outside target is ever read or written."""
+    run_dir, man, excludes = _env(fixture_repo)
+    original = tmp_path / "outside-original.txt"
+    changed = tmp_path / "outside-changed.txt"
+    original.write_text("outside original\n")
+    changed.write_text("outside changed\n")
+    pr = fixture_repo / "PR.md"
+    pr.symlink_to(original)
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "track PR symlink")
+    target = gitops.head_sha(fixture_repo)
+    pr.unlink()
+    pr.symlink_to(changed)  # the human's uncommitted retarget
+
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target, protected=["PR.md"]
+    )
+    executor.apply(
+        assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+    )
+    # The protected restore brought back the retargeted symlink AS A SYMLINK.
+    assert pr.is_symlink()
+    assert os.readlink(pr) == str(changed)
+    # Neither outside file was read into the snapshot or written through.
+    assert original.read_text() == "outside original\n"
+    assert changed.read_text() == "outside changed\n"
+    ref = _recovery_refs(fixture_repo)[0]
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    entry = gitops._run(
+        fixture_repo, "ls-tree", snapshot.worktree_tree, "--", "PR.md"
+    )
+    assert entry.split()[0] == "120000"  # captured as a symlink entry
+
+
+# --- the five converted sites route through the one transaction -----------------
+
+_BUILDER_CFG = {"agents": {"builder": {"adapter": "claude-code"}}}
+
+_SITE_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+      - {id: commit, type: commit, message: "P1: implement\\n\\nthe body."}
+"""
+
+
+def _orchestrator(repo, *, manifest, interrupted="park", adapters=None):
+    cfg = RunConfig.model_validate({**_BUILDER_CFG, "interrupted_step": interrupted})
+    pipeline = Pipeline.model_validate(yaml.safe_load(_SITE_PIPELINE))
+    artifact_root = repo / "runs" / "demo"
+    run_dir = artifact_root / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    adapters = adapters or {}
+    return Orchestrator(
+        repo_root=repo, run_dir=run_dir, artifact_root=artifact_root,
+        config=cfg, pipeline=pipeline, manifest=manifest,
+        adapter_factory=(lambda name: adapters[name]) if adapters else None,
+    )
+
+
+def _seed_running(repo, base_sha) -> Manifest:
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="demo", version=1, hash="sha256:x"),
+    )
+    man.upsert(StepRecord(
+        id="implement", type="agent_task", agent="builder", status=M.RUNNING,
+        base_sha=base_sha, attempts=1, started="t0",
+    ))
+    return man
+
+
+def _drive_reset_to_base(repo) -> None:
+    base = gitops.head_sha(repo)
+    (repo / "partial.py").write_text("half written")
+    man = _seed_running(repo, base)
+    orch = _orchestrator(
+        repo, manifest=man, interrupted="reset_to_base",
+        adapters={"builder": FakeAdapter(writes={"clean.py": "out\n"})},
+    )
+    assert orch.drive() == M.RUN_DONE
+    assert not (repo / "partial.py").exists()
+
+
+def _drive_conflict_park(repo) -> None:
+    base = gitops.head_sha(repo)
+    man = _seed_running(repo, base)
+    orch = _orchestrator(repo, manifest=man)
+    rec = man.record("implement")
+    step = orch.pipeline.stages[0].steps[0]
+    (repo / "leak.py").write_text("builder edit before conflict")
+    result = orch._restore_clean_after_conflict_park(
+        step, get_spec("agent_task"), rec,
+        StepResult(status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE),
+    )
+    assert "preserved as recovery snapshot" in (result.notes or "")
+    assert not (repo / "leak.py").exists()
+
+
+_ROLLBACK_CONFIG = """
+base_branch: main
+run_root: runs
+agents:
+  builder: {adapter: claude-code}
+"""
+
+_ROLLBACK_PIPELINE = """
+name: p
+version: 1
+stages:
+  - id: p1
+    steps:
+      - {id: impl1, type: agent_task, agent: builder, prompt_text: a}
+      - {id: c1, type: commit, message: "P1: phase one\\n\\nbody one."}
+  - id: p2
+    steps:
+      - {id: impl2, type: agent_task, agent: builder, prompt_text: b}
+      - {id: c2, type: commit, message: "P2: phase two\\n\\nbody two."}
+"""
+
+
+def _rollback_manager(repo) -> RunManager:
+    (repo / ".gauntlet").mkdir()
+    (repo / ".gauntlet" / "config.yaml").write_text(_ROLLBACK_CONFIG)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add config")
+    mgr = RunManager(repo)
+    mgr.new("demo")
+    mgr.layout("demo").prd_path.write_text("# Real PRD\n\nA human-authored PRD.\n")
+    (repo / "pipelines").mkdir(exist_ok=True)
+    path = repo / "pipelines" / "p.yaml"
+    path.write_text(_ROLLBACK_PIPELINE)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add pipeline + prd")
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False, adapter_factory=factory) == M.RUN_DONE
+    return mgr
+
+
+def _drive_rollback(repo) -> None:
+    mgr = _rollback_manager(repo)
+    target = mgr.rollback("demo", phase=1)
+    assert gitops.head_sha(repo) == target
+
+
+def _cycle_ctx(repo):
+    run_dir = repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ".gitignore").write_text("*\n")
+    (run_dir / "manifest.json").write_text('{"run_id": "r"}\n')
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    rec = StepRecord(id="cycle", type="adversarial_cycle")
+    man.upsert(rec)
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "steps": [
+            {"id": "cycle", "type": "adversarial_cycle", "mode": "artifact",
+             "artifact": "prd.md", "phase": "P5", "reviewer": "r",
+             "triager": "t", "fixer": "f"},
+        ]}],
+    })
+    return StepContext(
+        repo_root=repo, run_dir=run_dir, artifact_root=repo,
+        config=RunConfig.model_validate({"agents": {}}), pipeline=pipeline,
+        manifest=man, record=rec, writer=RedactingWriter(),
+        excludes=run_bookkeeping_excludes(repo, run_dir, repo),
+    )
+
+
+def _drive_fix_resume(repo) -> None:
+    handoff = gitops.head_sha(repo)
+    (repo / "work.py").write_text("partial fixer edit")
+    ctx = _cycle_ctx(repo)
+    note = cycle_mod._reset_dirty_to_handoff(ctx, handoff, 1)
+    assert note is not None and "recovery snapshot" in note
+    assert not (repo / "work.py").exists()
+
+
+def _drive_mutation_revert(repo) -> None:
+    handoff = gitops.head_sha(repo)
+    ctx = _cycle_ctx(repo)
+    (repo / "sneaky.py").write_text("reviewer mutation")
+    guard = cycle_mod._MutationGuard(
+        None, ctx, "revert", "P5", 1, handoff, "reviewer", []
+    )
+    guard.check()
+    assert not (repo / "sneaky.py").exists()
+    assert guard.synthetic_findings
+    assert "refs/gauntlet/recovery/" in guard.synthetic_findings[0]["claim"]
+
+
+_SITES = {
+    "rollback": _drive_rollback,
+    "reset_to_base": _drive_reset_to_base,
+    "conflict_park": _drive_conflict_park,
+    "fix_resume": _drive_fix_resume,
+    "mutation_revert": _drive_mutation_revert,
+}
+
+
+@pytest.mark.parametrize("site", sorted(_SITES), ids=sorted(_SITES))
+def test_every_site_produces_the_canonical_ordering(fixture_repo, order_probe, site):
+    """One shared harness (not five copies): each converted site's own driver
+    triggers its rewind while the order probe records the executor phases;
+    every site must produce precondition → snapshot → intent → apply →
+    clear, with the durable ref present and the intent cleared."""
+    _SITES[site](fixture_repo)
+    _assert_canonical_order(order_probe)
+    assert _recovery_refs(fixture_repo)
+
+
+@pytest.mark.parametrize("site", sorted(_SITES), ids=sorted(_SITES))
+def test_snapshot_failure_aborts_every_site_before_mutation(
+    fixture_repo, monkeypatch, site
+):
+    """R2 at every site: when snapshot creation fails, no checkout, reset, or
+    clean runs — the rewind fails closed with the dirty state untouched."""
+    resets: list = []
+    monkeypatch.setattr(
+        git_snapshot, "create_snapshot",
+        lambda *a, **k: (_ for _ in ()).throw(
+            git_snapshot.SnapshotError("injected snapshot failure")
+        ),
+    )
+    monkeypatch.setattr(gitops, "reset_hard", lambda *a, **k: resets.append(a))
+    monkeypatch.setattr(
+        gitops, "rewind_impl_preserving_bookkeeping",
+        lambda *a, **k: resets.append(a),
+    )
+    monkeypatch.setattr(gitops, "clean_untracked", lambda *a, **k: resets.append(a))
+    with pytest.raises(git_snapshot.SnapshotError):
+        _SITES[site](fixture_repo)
+    assert resets == []  # no destructive verb ran after the failure
+
+
+# --- a killed rollback is replayed by the next mutating command -----------------
+
+
+def test_killed_rollback_replays_via_resume_and_converges(fixture_repo, monkeypatch):
+    """End-to-end intent replay through a real verb: rollback dies between the
+    Git apply and its manifest persist; the next mutating command (resume)
+    replays the intent — re-running the manifest rewind through the registered
+    site finisher — exactly once, then drives normally."""
+    mgr = _rollback_manager(fixture_repo)
+    man = mgr.status("demo")
+    p1_target = next(c.sha for c in man.commits if c.phase == "P1")
+
+    monkeypatch.setattr(
+        run_mod, "_apply_rollback_manifest_transition",
+        lambda *a, **k: (_ for _ in ()).throw(_Boom("killed before persist")),
+    )
+    with pytest.raises(_Boom):
+        mgr.rollback("demo", phase=1)
+    monkeypatch.undo()
+
+    run_dir = mgr.layout("demo").active_run_dir()
+    # The Git apply completed; the manifest transition did not; the intent is
+    # durable and replayable.
+    assert gitops.head_sha(fixture_repo) == p1_target
+    assert RX.load_intent(run_dir) is not None
+    stale = mgr.status("demo")
+    assert [c.phase for c in stale.commits] == ["P1", "P2"]  # not yet rewound
+
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"g{calls['n']}.py": "y\n"})
+
+    status = mgr.resume("demo", use_judge=False, adapter_factory=factory)
+    assert status == M.RUN_DONE
+    man = mgr.status("demo")
+    # The replayed finisher rewound the manifest; the resume then re-ran P2.
+    assert RX.load_intent(run_dir) is None
+    assert any("replayed after a process death" in w for w in man.warnings)
+    assert [c.phase for c in man.commits] == ["P1", "P2"]
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "P2: phase two"
+    # A second resume finds nothing to replay and nothing to do.
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is None
+
+
+# --- reset --hard / checkout / clean stay out of the converted callers ----------
+
+
+def test_no_direct_destructive_git_calls_remain_in_converted_rewind_paths():
+    """Plan §9: after P3, no reset/clean path outside the recovery executor.
+
+    Static check over the exact converted call sites: the rewind functions in
+    orchestrator.py, cycle.py, and run.py's rollback must not invoke
+    reset_hard / clean_untracked / rewind_impl_preserving_bookkeeping
+    directly — those verbs belong to recovery_exec (and the narrowly
+    documented non-recovery users that remain: the checkpoint squash's
+    reset_soft, branch lifecycle, and the verifier's disposable worktrees).
+    """
+    import inspect
+
+    from gauntlet.engine import orchestrator as orch_mod
+
+    for func in (
+        orch_mod.Orchestrator._resume_disposition,
+        orch_mod.Orchestrator._restore_clean_after_conflict_park,
+        cycle_mod._reset_dirty_to_handoff,
+        cycle_mod._MutationGuard._revert,
+        run_mod.RunManager._rollback_locked,
+    ):
+        source = inspect.getsource(func)
+        for verb in (
+            "gitops.reset_hard(",
+            "gitops.clean_untracked(",
+            "gitops.rewind_impl_preserving_bookkeeping(",
+            "gitops.checkout_branch(",
+        ):
+            assert verb not in source, (
+                f"{func.__qualname__} still calls {verb} directly; every "
+                "rewind mutation must route through RecoveryExecutor (P3)"
+            )
+
+    # And the deprecated lossy helpers are gone from gitops entirely.
+    for name in ("backup_dirty_worktree", "worktree_overlay", "restore_overlay"):
+        assert not hasattr(gitops, name)

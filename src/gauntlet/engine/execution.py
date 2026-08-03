@@ -263,8 +263,10 @@ def human_owned_excludes(exclude: list[str] | None) -> list[str]:
     bookkeeping-preserving mechanisms, but a human-owned file is invisible to
     the dirty checks *by policy* while ``reset --hard`` is not policy-scoped —
     an uncommitted edit to a tracked ``PR.md`` would be silently destroyed,
-    unbacked-up (PR #77 review). Every rewind site captures these files'
-    worktree bytes first (``gitops.worktree_overlay``) and restores them after.
+    unbacked-up (PR #77 review). Every rewind site passes these patterns as
+    the ``protected`` set of its durable recovery snapshot
+    (``git_snapshot.create_snapshot``), and the executor restores them from
+    the snapshot after the rewind (``git_snapshot.restore_protected``).
     """
     return [
         e for e in (exclude or []) if e.rsplit("/", 1)[-1] == "PR.md"

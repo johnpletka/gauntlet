@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 from gauntlet.adapters.base import Usage
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.engine.orchestrator import Orchestrator
@@ -298,9 +298,18 @@ stages:
     assert orch.drive() == M.RUN_DONE
     assert adapter.calls  # re-ran after reset
     assert not (fixture_repo / "partial.py").exists()  # partial work discarded
-    # a backup ref preserved the discarded partial work (F-010-style safety)
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs
+    # a complete recovery snapshot preserved the discarded partial work
+    # (F-010-style safety; P3: refs/gauntlet/recovery/ via the executor)
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    assert refs
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[0])
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "partial.py" in tree
 
 
 def test_resume_dirty_artifact_under_runroot_is_detected(fixture_repo):
@@ -416,8 +425,8 @@ def test_reset_interrupted_override_forces_reset_under_park_policy(fixture_repo)
     assert orch.drive() == M.RUN_DONE
     assert adapter.calls  # re-ran after the reset
     assert not (fixture_repo / "partial.py").exists()  # partial work discarded
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs  # ...but backed up first
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/recovery/")
+    assert "refs/gauntlet/recovery/" in refs  # ...but snapshotted first
 
 
 def test_reset_interrupted_override_preserves_wip_checkpoints(fixture_repo):
@@ -468,12 +477,14 @@ def test_reset_policy_preserves_uncommitted_pr_md_edits(fixture_repo):
     assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
     refs = gitops._run(
         fixture_repo, "for-each-ref", "--format=%(refname)",
-        "refs/gauntlet/backup/",
+        "refs/gauntlet/recovery/",
     ).splitlines()
-    backup = next(ref for ref in refs if "/implement-" in ref)
-    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") == (
-        "PR draft v2 — human edited, uncommitted\n"
-    )
+    ref = next(r for r in refs if "/implement-" in r)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    assert "runs/demo/PR.md" in snapshot.protected_paths
+    assert gitops._run(
+        fixture_repo, "show", f"{snapshot.worktree_tree}:runs/demo/PR.md"
+    ) == "PR draft v2 — human edited, uncommitted\n"
 
 
 def test_reset_policy_preserves_and_backs_up_pr_md_deletion(fixture_repo):
@@ -502,10 +513,17 @@ def test_reset_policy_preserves_and_backs_up_pr_md_deletion(fixture_repo):
     assert not pr.exists()
     refs = gitops._run(
         fixture_repo, "for-each-ref", "--format=%(refname)",
-        "refs/gauntlet/backup/",
+        "refs/gauntlet/recovery/",
     ).splitlines()
-    backup = next(ref for ref in refs if "/implement-" in ref)
-    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") is None
+    ref = next(r for r in refs if "/implement-" in r)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    # The deletion is durably represented: recorded as a protected deletion,
+    # and the path is absent from the snapshot's worktree tree.
+    assert "runs/demo/PR.md" in snapshot.protected_deletions
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "runs/demo/PR.md" not in tree
 
 
 def test_interrupted_park_notes_name_the_reset_verb(fixture_repo):

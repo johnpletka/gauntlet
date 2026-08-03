@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.run import EntryContractError, RollbackGuardError, RunManager
 
 from conftest import FakeAdapter, git
@@ -414,9 +414,16 @@ def test_rollback_to_phase_one_rewinds_branch_and_manifest(fixture_repo):
     assert man.record("impl2").status == M.PENDING
     assert man.record("c2").status == M.PENDING
     assert man.record("impl1").status == M.DONE  # phase 1 kept
-    # a backup ref preserved the pre-rollback tip
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert p2_sha in refs or "refs/gauntlet/backup/" in refs
+    # a recovery snapshot preserved the pre-rollback tip (P3: the executor's
+    # durable snapshot anchors the discarded tip through its parent chain)
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    assert refs
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
+    assert snapshot.run_branch_sha == p2_sha
+    assert gitops.is_ancestor(fixture_repo, p2_sha, snapshot.snapshot_commit)
 
 
 def test_rollback_reverses_auto_approval_and_flips_policy(fixture_repo):
@@ -481,9 +488,10 @@ def test_rollback_tolerates_engine_bookkeeping_above_last_recorded(fixture_repo)
     man = mgr.status("demo")
     assert [c.phase for c in man.commits] == ["P1"]
     assert man.record("impl2").status == M.PENDING
-    # The pre-rollback tip (incl. the bookkeeping commit) is backed up.
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs
+    # The pre-rollback tip (incl. the bookkeeping commit) is preserved in the
+    # recovery snapshot's parent chain.
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/recovery/")
+    assert "refs/gauntlet/recovery/" in refs
 
 
 def test_rollback_engine_shaped_pr_md_commit_is_not_bookkeeping(fixture_repo):
@@ -516,10 +524,12 @@ def test_rollback_engine_shaped_pr_md_commit_is_not_bookkeeping(fixture_repo):
     # (the bookkeeping fast path records no warning and needs no absorption).
     assert any("absorbed 1 unmanifested commit" in w for w in man.warnings)
     refs = gitops._run(
-        fixture_repo, "for-each-ref", "--format=%(objectname)",
-        "refs/gauntlet/backup/",
-    )
-    assert ahead in refs  # the discarded state is reachable, by construction
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
+    # the discarded state is reachable, by construction
+    assert gitops.is_ancestor(fixture_repo, ahead, snapshot.snapshot_commit)
 
 
 def test_rollback_absorbs_strictly_ahead_commits_with_backup(fixture_repo):
@@ -552,10 +562,11 @@ def test_rollback_absorbs_strictly_ahead_commits_with_backup(fixture_repo):
         for w in man.warnings
     )
     refs = gitops._run(
-        fixture_repo, "for-each-ref", "--format=%(objectname)",
-        "refs/gauntlet/backup/",
-    )
-    assert ahead in refs
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
+    assert gitops.is_ancestor(fixture_repo, ahead, snapshot.snapshot_commit)
 
 
 def test_rollback_rewinds_the_run_branch_not_the_checkout(fixture_repo):
@@ -655,12 +666,13 @@ def test_rollback_preserves_uncommitted_pr_md_edits(fixture_repo):
     assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
     refs = gitops._run(
         fixture_repo, "for-each-ref", "--format=%(refname)",
-        "refs/gauntlet/backup/",
+        "refs/gauntlet/recovery/",
     ).splitlines()
-    backup = refs[-1]
-    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") == (
-        "PR draft v2 — human edited, uncommitted\n"
-    )
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
+    assert "runs/demo/PR.md" in snapshot.protected_paths
+    assert gitops._run(
+        fixture_repo, "show", f"{snapshot.worktree_tree}:runs/demo/PR.md"
+    ) == "PR draft v2 — human edited, uncommitted\n"
 
 
 def test_rollback_preserves_and_backs_up_pr_md_deletion(fixture_repo):
@@ -686,10 +698,15 @@ def test_rollback_preserves_and_backs_up_pr_md_deletion(fixture_repo):
     assert not pr.exists()
     refs = gitops._run(
         fixture_repo, "for-each-ref", "--format=%(refname)",
-        "refs/gauntlet/backup/",
+        "refs/gauntlet/recovery/",
     ).splitlines()
-    backup = refs[-1]
-    assert gitops.file_at_commit(fixture_repo, backup, "runs/demo/PR.md") is None
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
+    # The deletion is durably represented in the snapshot record itself.
+    assert "runs/demo/PR.md" in snapshot.protected_deletions
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "runs/demo/PR.md" not in tree
 
 
 def test_rollback_refuses_branch_forked_from_manifest(fixture_repo):
@@ -735,12 +752,12 @@ def test_rollback_refuses_unknown_phase(fixture_repo):
         mgr.rollback("demo", phase=9)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P3 moves all rollback validation before checkout",
-)
 def test_rollback_prevalidation_failure_leaves_checkout_unchanged(fixture_repo):
-    """P1 contract: a refused rollback is observational before mutation."""
+    """post-177d721 F-004 regression (structural, P3): every rollback guard and
+    the target resolution run BEFORE any checkout, so a refused rollback is
+    observational — the operator's checked-out branch and HEAD are untouched.
+    Previously the checkout to the run branch happened before the phase-target
+    resolution, so an unknown phase mutated the checkout and then refused."""
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo, LINEAR)

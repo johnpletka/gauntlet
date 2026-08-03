@@ -23,7 +23,17 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
-from gauntlet.engine import git_snapshot, gitops, ledger as L, manifest as M
+
+# git_snapshot is not called directly here since P3 (the executor owns
+# snapshot creation), but the module attribute stays importable so the pilot
+# ordering tests can keep patching `orchestrator.git_snapshot.create_snapshot`.
+from gauntlet.engine import (
+    git_snapshot,  # noqa: F401 — see comment above
+    gitops,
+    ledger as L,
+    manifest as M,
+    recovery_exec as RX,
+)
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
@@ -639,26 +649,7 @@ class Orchestrator:
             rec.base_sha = None
             return None  # agent never progressed; safe to re-run
         if (self.interrupted_override or self.config.interrupted_step) == "reset_to_base":
-            ts = self.clock().replace(":", "-")
-            backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
-            # Human-owned excluded files (PR.md) are hidden from the dirty
-            # check by policy, but the reset below is not policy-scoped. Carry
-            # their worktree state across the rewind and include it in the
-            # backup ref so the preservation is durable (PR #77 review).
-            human_patterns = human_owned_excludes(self.excludes)
-            overlay = gitops.worktree_overlay(
-                self.repo_root, human_patterns
-            )
-            # Snapshot the partial work (tracked + untracked) before discarding.
-            gitops.backup_dirty_worktree(
-                self.repo_root, backup, f"interrupted {rec.id} partial work",
-                exclude=self.excludes,
-                include=human_patterns if overlay else None,
-            )
-            # Flush the authoritative in-memory manifest to disk BEFORE the
-            # rewind, so the bookkeeping the rewind preserves carries the latest
-            # response state (e.g. a still-`pending` entry the re-run consumes).
-            self._persist()
+            ts = self.clock().replace(":", "-").replace("+", "-")
             # FR-11.2: rewind to the latest intra-phase checkpoint commit that is
             # a descendant of base_sha (a `P<N> wip:` milestone) rather than all
             # the way to base_sha, so completed milestones survive the rewind and
@@ -670,44 +661,54 @@ class Orchestrator:
                 rec, self._expected_phase(step, item)
             )
             rec.resumed_from_checkpoint = checkpoint_subject
+            # Flush the authoritative in-memory manifest to disk BEFORE the
+            # rewind, so the bookkeeping the rewind preserves carries the latest
+            # response state (e.g. a still-`pending` entry the re-run consumes).
+            self._persist()
             # F-001: the rewind target predates the engine bookkeeping commits
             # stacked on top of it — notably the pending-response checkpoint
             # (FR-2.2/FR-7.1). A plain `reset --hard target` would delete the
             # force-committed manifest from disk AND orphan that checkpoint, so a
             # kill in the gap before it was re-persisted would lose the human
-            # response. Instead, rewind the implementation to the target in a
-            # single reset whose target commit still carries the manifest — the
-            # response is never, even for an instant, absent from both disk and
-            # reachable history. Label that commit with the canonical
-            # response-checkpoint subject so it stands in as the pending
-            # checkpoint itself (the post-rewind reconcile below is then a no-op
-            # rather than stacking a duplicate).
+            # response. The bookkeeping-preserving mode rewinds the
+            # implementation in a single reset whose target commit still carries
+            # the manifest, labelled with the canonical response-checkpoint
+            # subject so it stands in as the pending checkpoint itself (the
+            # post-rewind reconcile below is then a no-op, not a duplicate).
             paths = self._bookkeeping_paths()
-            if paths and gitops.head_sha(self.repo_root) != target:
-                message = (
-                    self._response_checkpoint_message()
-                    or f"gauntlet: rewind implementation to {target[:10]} "
-                    f"for re-run ({rec.id})"
-                )
-                gitops.rewind_impl_preserving_bookkeeping(
-                    self.repo_root, target, paths, message,
-                    identity=ENGINE_IDENTITY,
-                )
-            else:
-                # Nothing to preserve above the target (HEAD == target, or no
-                # bookkeeping on disk): the plain rewind is already crash-safe.
-                gitops.reset_hard(self.repo_root, target)
-            # `clean` is broader than the dirty check on purpose: it spares the
-            # whole run root so the reset never wipes the run pointer, manifests,
-            # the authored prd.md, or prior declared artifacts — the re-run
-            # regenerates its own outputs over them.
-            gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
-            gitops.restore_overlay(self.repo_root, overlay)
-            # The rewind restored the on-disk manifest to base_sha's tree + the
-            # overlaid bookkeeping; re-persist the authoritative in-memory state
-            # over it and idempotently flush the checkpoint (still `pending` here
-            # — the re-run consumes it and lands the `consumed` checkpoint).
-            self._persist()
+            preserving = bool(paths) and gitops.head_sha(self.repo_root) != target
+            message = (
+                self._response_checkpoint_message()
+                or f"gauntlet: rewind implementation to {target[:10]} "
+                f"for re-run ({rec.id})"
+            ) if preserving else None
+            # P3 (plan §4.3): the executor owns the mutation ordering — lock,
+            # fingerprint re-check, validation, durable snapshot (a snapshot
+            # failure aborts before any destructive verb), intent, then the
+            # rewind. `clean` is broader than the dirty check on purpose: it
+            # spares the whole run root so the reset never wipes the run
+            # pointer, manifests, the authored prd.md, or prior declared
+            # artifacts — the re-run regenerates its own outputs over them.
+            self._apply_recovery_rewind(
+                rec,
+                site="orchestrator.reset_to_base",
+                target_sha=target,
+                cause=RX.RecoveryCause.PROCESS_LOST,
+                reason=f"interrupted {rec.id} partial work",
+                snapshot_id=f"{rec.id}-reset-{ts}",
+                reset_mode=(
+                    RX.RESET_BOOKKEEPING_PRESERVING if preserving else RX.RESET_PLAIN
+                ),
+                bookkeeping_paths=paths if preserving else (),
+                rewind_message=message,
+                clean_excludes=(self.config.run_root,),
+                # The rewind restored the on-disk manifest to the target's tree
+                # + the preserved bookkeeping; re-persist the authoritative
+                # in-memory state over it (step 7 of the transaction).
+                persist=lambda _result: self._persist(),
+            )
+            # Idempotently flush the checkpoint (still `pending` here — the
+            # re-run consumes it and lands the `consumed` checkpoint).
             self._reconcile_response_checkpoint()
             return None  # tree restored to base; checkpoints preserved; re-run cleanly
         return StepResult(
@@ -719,12 +720,105 @@ class Orchestrator:
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
                 "interrupted_step=park). To discard the interrupted attempt "
-                "and re-run cleanly (partial work is backed up to "
-                "refs/gauntlet/backup/ first, and committed checkpoints are "
-                f"preserved): `gauntlet resume {self.manifest.slug} "
+                "and re-run cleanly (partial work is preserved as a recovery "
+                "snapshot under refs/gauntlet/recovery/ first, and committed "
+                f"checkpoints are preserved): `gauntlet resume {self.manifest.slug} "
                 "--reset-interrupted`."
                 + self._dirty_verdict_detail(rec.base_sha)
             ),
+        )
+
+    def _apply_recovery_rewind(
+        self,
+        rec: StepRecord,
+        *,
+        site: str,
+        target_sha: str,
+        cause: "RX.RecoveryCause",
+        reason: str,
+        snapshot_id: str,
+        reset_mode: str,
+        bookkeeping_paths: tuple[str, ...] | list[str] = (),
+        rewind_message: str | None = None,
+        clean_excludes: tuple[str, ...] = (),
+        snapshot_exclude: list[str] | None = None,
+        persist=None,
+    ) -> "RX.RecoveryResult":
+        """Route one orchestrator rewind through the shared transaction (P3).
+
+        Assessment is read-only (observation + planner); every mutation —
+        snapshot, intent, checkout/reset/clean, protected restore — happens
+        inside :meth:`RecoveryExecutor.apply` under the canonical ordering.
+        Human-owned excluded files (PR.md) are protected paths in the durable
+        snapshot and restored from it after the rewind, replacing the
+        in-memory overlay a process kill could lose (PR #77 review).
+        """
+        repo = self.repo_root
+        git_obs = RX.observe_git(
+            repo,
+            run_branch=self.manifest.branch,
+            recorded_sha=rec.base_sha,
+            excludes=self.excludes,
+            bookkeeping_candidates=engine_bookkeeping_candidates(
+                repo, self.run_dir
+            ),
+        )
+        state_obs = RX.observe_state(
+            self.manifest, rec, liveness=RX.DriverLiveness.ALIVE
+        )
+
+        def fingerprint() -> "RX.ProgressFingerprint":
+            return RX.build_progress_fingerprint(
+                repo, manifest=self.manifest, record=rec, excludes=self.excludes
+            )
+
+        action = RX.SnapshotAndRestartAction(
+            description=f"snapshot the worktree and restart from {target_sha[:10]}",
+            target_ref=f"refs/heads/{self.manifest.branch}",
+            target_sha=target_sha,
+            reason=reason,
+        )
+        assessment = RX.RecoveryPlanner(repo).assess_rewind(
+            git_obs=git_obs,
+            state_obs=state_obs,
+            fingerprint=fingerprint(),
+            action=action,
+            cause=cause,
+        )
+        spec = RX.RewindSpec(
+            site=site,
+            target_sha=target_sha,
+            reset_mode=reset_mode,
+            bookkeeping_paths=tuple(bookkeeping_paths),
+            rewind_message=rewind_message,
+            clean=True,
+            clean_excludes=tuple(clean_excludes),
+        )
+        executor = RX.RecoveryExecutor(
+            repo,
+            self.run_dir,
+            run_id=self.manifest.run_id,
+            run_root=self.config.run_root,
+            excludes=self.excludes,
+            clock=self.clock,
+        )
+        return executor.apply(
+            assessment,
+            action,
+            spec=spec,
+            snapshot_request=RX.SnapshotRequest(
+                snapshot_id=snapshot_id,
+                reason=reason,
+                attempt_id=f"{rec.id}#{rec.attempts}",
+                run_branch=self.manifest.branch,
+                exclude=(
+                    snapshot_exclude if snapshot_exclude is not None
+                    else self.excludes
+                ),
+                protected=human_owned_excludes(self.excludes),
+            ),
+            fingerprint=fingerprint,
+            persist=persist,
         )
 
     def _dirty_verdict_detail(self, base_sha: str) -> str:
@@ -805,36 +899,28 @@ class Orchestrator:
         if gitops.is_clean(self.repo_root, exclude=run_root):
             return result
         ts = self.clock().replace(":", "-").replace("+", "-")
-        # P2 pilot (recovery redesign, plan §4.4): this rewind path is the
-        # first migrated from the lossy backup/overlay mechanism to a complete
-        # GitRecoverySnapshot. It is the lowest-coupling rewind in the engine —
-        # it discards uncommitted dirt against the CURRENT HEAD (no checkpoint
-        # targeting, no bookkeeping-preserving commit construction, no branch
-        # or manifest rewind) — so it exercises snapshot-before-mutation (R2)
-        # without entangling P3's executor concerns. The snapshot captures the
-        # full dirty state (staged vs worktree separately, modes, symlinks,
-        # raw index bytes) plus human-owned protected paths, and a snapshot
-        # failure raises HERE, before reset/clean touch anything (fail closed).
-        snapshot = git_snapshot.create_snapshot(
-            self.repo_root,
-            run_id=self.manifest.run_id,
-            snapshot_id=f"{rec.id}-conflict-{ts}",
-            attempt_id=f"{rec.id}#{rec.attempts}",
+        # P2 piloted this rewind on GitRecoverySnapshot; P3 routes it through
+        # the shared executor transaction (plan §4.3): the snapshot captures
+        # the full dirty state (staged vs worktree separately, modes,
+        # symlinks, raw index bytes) plus human-owned protected paths, a
+        # snapshot failure aborts before reset/clean touch anything (fail
+        # closed, R2), and the reset-to-HEAD + clean + protected restore run
+        # under the executor's lock/fingerprint/intent ordering. Resetting to
+        # HEAD (NOT base_sha) discards only the builder's uncommitted edits
+        # while preserving every checkpoint. `clean` spares the whole run root
+        # so the manifest/transcripts/authored artifacts under it survive.
+        result_rewind = self._apply_recovery_rewind(
+            rec,
+            site="orchestrator.conflict_park",
+            target_sha=self._head_sha(),
+            cause=RX.RecoveryCause.WORKTREE_PARTIAL,
             reason=f"conflict-park partial work for {rec.id} (F-001)",
-            run_branch=self.manifest.branch,
-            exclude=run_root,
-            protected=human_owned_excludes(self.excludes),
-            created_at=self.clock(),
+            snapshot_id=f"{rec.id}-conflict-{ts}",
+            reset_mode=RX.RESET_PLAIN,
+            clean_excludes=(self.config.run_root,),
+            snapshot_exclude=run_root,
         )
-        gitops.reset_hard(self.repo_root, self._head_sha())
-        # `reset --hard` leaves untracked files; clear the builder's untracked
-        # edits too, sparing the whole run root so the manifest/transcripts/
-        # authored artifacts under it survive.
-        gitops.clean_untracked(self.repo_root, exclude=run_root)
-        # Bring human-owned protected state (PR.md edits/deletions) back
-        # exactly, via Git materialization from the snapshot itself — the
-        # in-memory overlay dict this replaces could be lost with the process.
-        git_snapshot.restore_protected(self.repo_root, snapshot)
+        snapshot = result_rewind.snapshot
         note = (
             "conflict park left an uncommitted worktree; preserved as recovery "
             f"snapshot {snapshot.ref} and restored the clean tree before "

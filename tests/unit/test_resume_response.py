@@ -775,8 +775,8 @@ def test_resume_reset_interrupted_discards_and_reruns(tmp_path):
     assert status == M.RUN_DONE
     assert len(adapter.prompts) == 1
     assert not (repo / "partial.py").exists()  # discarded...
-    refs = gitops._run(repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs  # ...but backed up first
+    refs = gitops._run(repo, "for-each-ref", "refs/gauntlet/recovery/")
+    assert "refs/gauntlet/recovery/" in refs  # ...but snapshotted first (P3)
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.DONE
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED

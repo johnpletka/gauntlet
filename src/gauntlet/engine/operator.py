@@ -407,9 +407,10 @@ def _control_reset_interrupted(slug: str) -> Action:
     # interrupted attempt non-destructively (backup ref first, committed
     # checkpoints preserved) and re-runs the step.
     consequence = (
-        "backs up the interrupted attempt's partial work to "
-        "refs/gauntlet/backup/, rewinds to the latest committed checkpoint, "
-        "and re-runs the step cleanly (one-shot; config policy unchanged)"
+        "preserves the interrupted attempt's partial work as a recovery "
+        "snapshot under refs/gauntlet/recovery/, rewinds to the latest "
+        "committed checkpoint, and re-runs the step cleanly (one-shot; "
+        "config policy unchanged)"
     )
     return Action("resume --reset-interrupted", "control",
                   ["gauntlet", "resume", slug, "--reset-interrupted"], [], True,

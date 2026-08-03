@@ -556,9 +556,10 @@ def test_mutation_policy_revert_restores_handoff_and_adds_finding(cycle_repo):
     assert "F-R1-MUTATION-1" in ids
     mut = findings["findings"][ids.index("F-R1-MUTATION-1")]
     assert mut["category"] == "principle-violation"
-    # partial work preserved on a backup ref (never silently destroyed)
+    # partial work preserved as a recovery snapshot (never silently
+    # destroyed; P3: refs/gauntlet/recovery/ via the executor)
     refs = subprocess.run(
-        ["git", "-C", str(cycle_repo), "for-each-ref", "refs/gauntlet/backup"],
+        ["git", "-C", str(cycle_repo), "for-each-ref", "refs/gauntlet/recovery"],
         capture_output=True, text=True, check=True,
     ).stdout
     assert "mutation" in refs

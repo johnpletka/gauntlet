@@ -48,6 +48,7 @@ from gauntlet.adapters.base import (
 from gauntlet.engine import ensemble
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
+from gauntlet.engine import recovery_exec as RX
 from gauntlet.engine import verify
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
@@ -362,6 +363,96 @@ def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | Non
     return None
 
 
+def _apply_cycle_rewind(
+    ctx: StepContext,
+    *,
+    site: str,
+    target_sha: str,
+    recorded_sha: str,
+    cause: "RX.RecoveryCause",
+    reason: str,
+    snapshot_id: str,
+    reset_mode: str,
+    bookkeeping_paths: tuple[str, ...] = (),
+    rewind_message: str | None = None,
+) -> "RX.RecoveryResult":
+    """Route one cycle rewind through the shared recovery transaction (P3).
+
+    Assessment is read-only; the executor owns the mutation ordering (lock →
+    fingerprint re-check → validation → durable snapshot → intent →
+    reset/clean → protected restore → intent clear). Human-owned excluded
+    files (PR.md) are protected paths in the snapshot and restored from it,
+    so their preservation survives a process kill (PR #77 review).
+    """
+    from gauntlet.engine.execution import engine_bookkeeping_candidates
+
+    repo = ctx.repo_root
+    rec = ctx.record
+    git_obs = RX.observe_git(
+        repo,
+        run_branch=ctx.manifest.branch,
+        recorded_sha=recorded_sha,
+        excludes=ctx.excludes,
+        bookkeeping_candidates=engine_bookkeeping_candidates(repo, ctx.run_dir),
+    )
+    state_obs = RX.observe_state(
+        ctx.manifest, rec, liveness=RX.DriverLiveness.ALIVE
+    )
+
+    def fingerprint() -> "RX.ProgressFingerprint":
+        return RX.build_progress_fingerprint(
+            repo, manifest=ctx.manifest, record=rec, excludes=ctx.excludes
+        )
+
+    action = RX.SnapshotAndRestartAction(
+        description=f"snapshot the worktree and restart from {target_sha[:10]}",
+        target_ref=f"refs/heads/{ctx.manifest.branch}",
+        target_sha=target_sha,
+        reason=reason,
+    )
+    assessment = RX.RecoveryPlanner(repo).assess_rewind(
+        git_obs=git_obs,
+        state_obs=state_obs,
+        fingerprint=fingerprint(),
+        action=action,
+        cause=cause,
+    )
+    spec = RX.RewindSpec(
+        site=site,
+        target_sha=target_sha,
+        reset_mode=reset_mode,
+        bookkeeping_paths=bookkeeping_paths,
+        rewind_message=rewind_message,
+        # Clean with the SAME narrow excludes as mutation detection (P4.r1
+        # F-006): a stray file under the run root but outside the live
+        # bookkeeping must be removed, or it rides into the next fix commit.
+        # The live run dir survives regardless (self-.gitignore; no -x).
+        clean=True,
+        clean_excludes=tuple(ctx.excludes or ()),
+    )
+    executor = RX.RecoveryExecutor(
+        repo,
+        ctx.run_dir,
+        run_id=ctx.manifest.run_id,
+        run_root=ctx.config.run_root,
+        excludes=ctx.excludes,
+    )
+    return executor.apply(
+        assessment,
+        action,
+        spec=spec,
+        snapshot_request=RX.SnapshotRequest(
+            snapshot_id=snapshot_id,
+            reason=reason,
+            attempt_id=f"{rec.id}#{rec.attempts}",
+            run_branch=ctx.manifest.branch,
+            exclude=ctx.excludes,
+            protected=human_owned_excludes(ctx.excludes),
+        ),
+        fingerprint=fingerprint,
+    )
+
+
 def _reset_dirty_to_handoff(
     ctx: StepContext, handoff: str, rnd: int, *, force: bool = False
 ) -> str | None:
@@ -392,30 +483,19 @@ def _reset_dirty_to_handoff(
     """
     if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not force:
         return None
-    backup = (
-        f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
-        f"{ctx.record.id}-r{rnd}-fix-resume"
-    )
-    # PR #77 review: carry human-owned PR.md state across the reset and include
-    # it in the backup ref so preservation survives a process kill.
-    human_patterns = human_owned_excludes(ctx.excludes)
-    overlay = gitops.worktree_overlay(
-        ctx.repo_root, human_patterns
-    )
-    gitops.backup_dirty_worktree(
-        ctx.repo_root, backup,
+    reason = (
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
-        f"round {rnd} (P5 re-enter at fix)",
-        exclude=ctx.excludes,
-        include=human_patterns if overlay else None,
+        f"round {rnd} (P5 re-enter at fix)"
     )
     paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
-    if (
-        paths
+    preserving = (
+        bool(paths)
         and gitops.head_sha(ctx.repo_root) != handoff
         and gitops.any_tracked_at(ctx.repo_root, "HEAD", paths)
-    ):
-        # Flush first so the overlaid bookkeeping carries the latest state.
+    )
+    message: str | None = None
+    if preserving:
+        # Flush first so the preserved bookkeeping carries the latest state.
         _persist_manifest(ctx)
         paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
         entry = (
@@ -430,17 +510,24 @@ def _reset_dirty_to_handoff(
             else f"gauntlet: rewind implementation to {handoff[:10]} "
             f"for fix re-run ({ctx.record.id})"
         )
-        gitops.rewind_impl_preserving_bookkeeping(
-            ctx.repo_root, handoff, paths, message,
-            identity=gitops.ENGINE_IDENTITY,
-        )
-    else:
-        gitops.reset_hard(ctx.repo_root, handoff)
-    gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
-    gitops.restore_overlay(ctx.repo_root, overlay)
+    result = _apply_cycle_rewind(
+        ctx,
+        site="cycle.fix_resume",
+        target_sha=handoff,
+        recorded_sha=handoff,
+        cause=RX.RecoveryCause.WORKTREE_PARTIAL,
+        reason=reason,
+        snapshot_id=f"{ctx.record.id}-r{rnd}-fix-resume",
+        reset_mode=(
+            RX.RESET_BOOKKEEPING_PRESERVING if preserving else RX.RESET_PLAIN
+        ),
+        bookkeeping_paths=tuple(paths) if preserving else (),
+        rewind_message=message,
+    )
     return (
         f"resume: reset round-{rnd} worktree to the handoff "
-        f"(backed up at {backup}) before re-running the fix sub-step (FR-4.1)"
+        f"(preserved as recovery snapshot {result.snapshot.ref}) before "
+        "re-running the fix sub-step (FR-4.1)"
     )
 
 
@@ -2232,29 +2319,22 @@ class _MutationGuard:
 
     def _revert(self, status: str) -> None:
         ctx = self.ctx
-        backup = (
-            f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
-            f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}"
+        # P3 (plan §4.3): the revert routes through the shared recovery
+        # transaction — durable complete-format snapshot (which preserves the
+        # reviewer's edits AND human-owned PR.md state past a process kill)
+        # before the reset, then reset to the round handoff + narrow clean +
+        # protected restore under the executor's lock/fingerprint/intent
+        # ordering.
+        result = _apply_cycle_rewind(
+            ctx,
+            site="cycle.reviewer_mutation_revert",
+            target_sha=self.handoff,
+            recorded_sha=self.handoff,
+            cause=RX.RecoveryCause.POLICY_DENIED,
+            reason=f"reviewer mutation during {ctx.record.id} round {self.rnd}",
+            snapshot_id=f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}",
+            reset_mode=RX.RESET_PLAIN,
         )
-        # PR #77 review: carry human-owned PR.md state across the revert and
-        # include it in the backup ref so preservation survives a process kill.
-        human_patterns = human_owned_excludes(ctx.excludes)
-        overlay = gitops.worktree_overlay(
-            ctx.repo_root, human_patterns
-        )
-        gitops.backup_dirty_worktree(
-            ctx.repo_root, backup,
-            f"reviewer mutation during {ctx.record.id} round {self.rnd}",
-            exclude=ctx.excludes,
-            include=human_patterns if overlay else None,
-        )
-        gitops.reset_hard(ctx.repo_root, self.handoff)
-        # Clean with the SAME narrow excludes as detection (P4.r1 F-006): a
-        # reviewer file under the run root but outside the live bookkeeping
-        # must be removed, or it rides into the next fix commit. The live run
-        # dir survives regardless (self-.gitignore; clean has no -x).
-        gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
-        gitops.restore_overlay(ctx.repo_root, overlay)
         if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
             residue = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
             raise _ParkCycle(StepResult(  # fail closed on residue
@@ -2268,7 +2348,7 @@ class _MutationGuard:
             "category": "principle-violation",
             "location": "worktree",
             "claim": "reviewer modified the worktree during a read-only review "
-            f"step (reverted; snapshot kept at {backup})",
+            f"step (reverted; snapshot kept at {result.snapshot.ref})",
             "evidence": "git status at detection (policy revert, FR-9.6):\n"
             + status,
             "suggested_fix": None,

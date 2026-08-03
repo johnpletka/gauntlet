@@ -1109,11 +1109,12 @@ def resume(
     reset_interrupted: bool = typer.Option(
         False, "--reset-interrupted",
         help="One-shot: discard an INTERRUPTED step's partial work and re-run "
-             "it cleanly (#72). Backs the partial work up to "
-             "refs/gauntlet/backup/ first and rewinds only to the latest "
-             "committed checkpoint (never past committed milestones). Applies "
-             "to this resume only — the configured interrupted_step policy is "
-             "unchanged. A no-op when nothing is interrupted-dirty.",
+             "it cleanly (#72). Preserves the partial work as a complete "
+             "recovery snapshot under refs/gauntlet/recovery/ first and "
+             "rewinds only to the latest committed checkpoint (never past "
+             "committed milestones). Applies to this resume only — the "
+             "configured interrupted_step policy is unchanged. A no-op when "
+             "nothing is interrupted-dirty.",
     ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).

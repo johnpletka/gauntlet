@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from gauntlet.engine import gitops, manifest as M, prd_stub
+from gauntlet.engine import gitops, manifest as M, prd_stub, recovery_exec as RX
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     engine_bookkeeping_candidates,
@@ -1255,6 +1255,14 @@ class RunManager:
         # id from the manifest so a concurrent verb's refusal names the holder.
         handle = self._acquire_worktree_lock(slug, man.run_id)
         try:
+            # P3 (plan §4.3): a recovery transaction killed between its intent
+            # persist and its intent clear left a durable, replayable intent.
+            # Resume is a mutating command, so it converges that intent FIRST —
+            # idempotently, under the lock — before driving anything new; an
+            # unrecognized repository state fails closed with named evidence.
+            replayed = RX.replay_pending_intent(self.repo_root, run_dir)
+            if replayed is not None:
+                man = Manifest.load(run_dir / "manifest.json")  # finisher wrote
             pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")
             if phash != man.pipeline.hash:
                 raise RuntimeError(
@@ -2732,19 +2740,19 @@ class RunManager:
 
     def _rollback_locked(self, layout, run_dir, man: Manifest, phase: int) -> str:
         # Rollback rewinds the RUN BRANCH (FR-9.9) — never whatever branch
-        # happens to be checked out (PR #77 review, blocking finding): with
-        # the descendant-absorption tier below, a checked-out merged base
-        # branch IS a descendant of the last recorded commit, so reading bare
-        # HEAD would pass the guards and hard-reset THAT branch while the run
-        # branch stood still. Verify and check out `man.branch` explicitly
-        # before any guard reads a SHA (same contract as resume's F-1 guard).
+        # happens to be checked out (PR #77 review, blocking finding). P3
+        # moves EVERY guard and resolution BEFORE the checkout (plan §6 P3 /
+        # post-177d721 F-004): the guards read the run-branch REF explicitly,
+        # so a refused rollback leaves the operator's checkout, index, and
+        # worktree untouched — prevalidation is observational.
         repo = self.repo_root
         if not gitops.branch_exists(repo, man.branch):
             raise RollbackGuardError(
                 f"refusing rollback: run branch {man.branch!r} is missing; "
-                "restore it (e.g. from refs/gauntlet/backup/) first"
+                "restore it (e.g. from refs/gauntlet/backup/ or "
+                "refs/gauntlet/recovery/) first"
             )
-        # Guard 1: clean work tree — checked BEFORE the checkout (switching
+        # Guard 1: clean work tree — checked BEFORE any checkout (switching
         # branches over uncommitted work could carry or clobber it). Only the
         # engine's own bookkeeping is excluded (review F-001), so an
         # uncommitted real artifact still blocks.
@@ -2753,151 +2761,162 @@ class RunManager:
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )
-        current_branch = gitops.current_branch(repo)
-        if current_branch != man.branch:
-            # PR #77 confirm review: PR.md is intentionally excluded from the
-            # generic dirty guard, but a checkout can still refuse when those
-            # edits conflict with the run branch. Fail before switching branches
-            # with a precise, sanctioned resolution instead of leaking a raw git
-            # error or risking a carry-over onto the wrong branch.
-            checkout_overlay = gitops.worktree_overlay(
-                repo, human_owned_excludes(excludes)
-            )
-            if checkout_overlay:
-                raise RollbackGuardError(
-                    "refusing rollback: the current branch has uncommitted "
-                    "human-owned PR.md state; commit or move those edits before "
-                    f"switching to run branch {man.branch!r}"
-                )
-            gitops.checkout_branch(repo, man.branch)
         # Guard 2: branch tip must AGREE with the manifest's last recorded
-        # commit before a rewind (FR-9.9). Three tiers (#62/#72):
+        # commit before a rewind (FR-9.9). Three tiers (#62/#72), all read
+        # from the branch REF — no checkout needed:
         # - tip == last recorded, or ahead by ONLY engine bookkeeping commits
         #   (response checkpoints — never appended to man.commits): proceed.
         # - tip a strict DESCENDANT of the last recorded commit (unmanifested
         #   real commits — e.g. a builder killed after committing wip but
         #   before a manifest flush, then `recover`ed): absorb them. The
-        #   backup ref + manifest snapshot below capture the tip first, so the
-        #   reset is reversible, and the absorption is recorded as a manifest
-        #   warning. Refusing this case gave the exact recovery verb meant for
-        #   a killed phase no path forward except forbidden git surgery (#72).
+        #   recovery snapshot + manifest snapshot capture the tip first, so
+        #   the reset is reversible, and the absorption is recorded as a
+        #   manifest warning. Refusing this case gave the exact recovery verb
+        #   meant for a killed phase no path forward except forbidden git
+        #   surgery (#72).
         # - anything else (fork, or tip BEHIND — recorded commits missing):
         #   refuse, exactly as before. That is the p3-F-003 protection: a
-        #   rewind must never silently discard a state the backup cannot
+        #   rewind must never silently discard a state the snapshot cannot
         #   represent as a linear ancestor range.
         if not man.commits:
             raise RollbackGuardError("no recorded commits to roll back to")
         last_recorded = man.commits[-1].sha
-        # The run branch is checked out above, so HEAD here is explicitly its
-        # tip — never an unrelated checkout's.
-        head = gitops.head_sha(self.repo_root)
+        tip = gitops.rev_parse(repo, f"refs/heads/{man.branch}")
         absorbed: str | None = None
-        if head != last_recorded and not gitops.advance_is_engine_bookkeeping(
+        if tip != last_recorded and not gitops.advance_is_engine_bookkeeping(
             self.repo_root, last_recorded,
             bookkeeping=engine_bookkeeping_candidates(self.repo_root, run_dir),
+            tip=tip,
         ):
-            if not gitops.is_ancestor(self.repo_root, last_recorded, head):
+            if not gitops.is_ancestor(self.repo_root, last_recorded, tip):
                 raise RollbackGuardError(
                     "refusing rollback: branch has diverged from the manifest "
-                    f"(HEAD {head[:10]} is not a descendant of the last "
+                    f"(tip {tip[:10]} is not a descendant of the last "
                     f"recorded {last_recorded[:10]}); the branch and manifest "
                     "must agree before a rewind (FR-9.9)"
                 )
-            absorbed = gitops.log_range(self.repo_root, last_recorded, head)
-        # Resolve the target: the last commit whose phase prefix is P<phase>.
+            absorbed = gitops.log_range(self.repo_root, last_recorded, tip)
+        # Resolve the target: the last commit whose phase prefix is P<phase> —
+        # BEFORE any checkout, so an unknown phase refuses observationally.
         target = self._phase_boundary_sha(man, phase)
         if target is None:
             raise RollbackGuardError(
                 f"no recorded phase-{phase} commit boundary to roll back to"
             )
-
-        # Capture human-owned state before the backup/reset. It is excluded from
-        # the normal dirty guard by policy, but must be both restored after the
-        # reset and represented durably in the backup ref (PR #77 review).
+        current_branch = gitops.current_branch(repo)
         human_patterns = human_owned_excludes(excludes)
-        overlay = gitops.worktree_overlay(self.repo_root, human_patterns)
-
-        # Backup ref + manifest snapshot before any rewind (F-010).
-        ts = _utc_stamp()
-        backup_ref = f"refs/gauntlet/backup/{man.run_id}/{ts}"
-        if overlay:
-            gitops.backup_dirty_worktree(
-                self.repo_root,
-                backup_ref,
-                f"rollback {man.slug} to phase P{phase}",
-                exclude=excludes,
-                include=human_patterns,
-            )
-        else:
-            gitops.create_ref(self.repo_root, backup_ref, head)
-        shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.snapshot-{ts}.json")
-        if absorbed is not None:
-            # Loud absorption (#72): the discarded-but-backed-up range is part
-            # of the audit trail, never a silent side effect of the reset.
-            n = len(absorbed.splitlines())
-            man.warnings.append(
-                f"rollback absorbed {n} unmanifested commit(s) above the last "
-                f"recorded commit {last_recorded[:10]} (branch was ahead of the "
-                f"manifest — e.g. a builder killed before a manifest flush); "
-                f"backed up at {backup_ref}:\n{absorbed}"
+        if current_branch != man.branch and gitops.dirty_paths_matching(
+            repo, human_patterns
+        ):
+            # PR #77 confirm review: PR.md is intentionally excluded from the
+            # generic dirty guard, but a checkout can still refuse when those
+            # edits conflict with the run branch. Fail before switching
+            # branches with a precise, sanctioned resolution instead of
+            # leaking a raw git error or risking a carry-over onto the wrong
+            # branch.
+            raise RollbackGuardError(
+                "refusing rollback: the current branch has uncommitted "
+                "human-owned PR.md state; commit or move those edits before "
+                f"switching to run branch {man.branch!r}"
             )
 
-        gitops.reset_hard(self.repo_root, target)
-        gitops.restore_overlay(self.repo_root, overlay)
-        self._rewind_manifest(man, run_dir, target)
-        # Reversal circuit breaker (pipeline-effectiveness FR-4.2): rolling back
-        # past a phase boundary IS the human reversal of any auto-approved gate at
-        # or beyond it. Record the reversal on each such `auto_approval` and flip
-        # the run's effective auto-approval policy to `always` for the remainder
-        # of the run, so a later resume never re-auto-approves a gate the human
-        # just rolled back — a human has signalled distrust (§9).
-        from gauntlet.engine import gates
-
-        reversed_n = gates.record_reversals(
-            man, min_phase_num=phase, user="operator",
-            at=_utc_stamp(),
-            notes=f"gauntlet rollback to phase P{phase} boundary",
+        # --- read-only assessment (plan §4.2) --------------------------------
+        git_obs = RX.observe_git(
+            repo,
+            run_branch=man.branch,
+            recorded_sha=last_recorded,
+            excludes=excludes,
+            bookkeeping_candidates=engine_bookkeeping_candidates(repo, run_dir),
         )
-        if reversed_n:
-            man.warnings.append(
-                f"auto-approval disabled for the remainder of the run: {reversed_n} "
-                f"auto-approved gate(s) reversed by rollback to P{phase} (FR-4.2)"
+        state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
+
+        def fingerprint() -> "RX.ProgressFingerprint":
+            return RX.build_progress_fingerprint(
+                repo, manifest=man, excludes=excludes
             )
-        man.write_atomic(run_dir / "manifest.json")
+
+        reason = f"rollback {man.slug} to phase P{phase}"
+        action = RX.SnapshotAndRestartAction(
+            description=f"snapshot every plane, then reset {man.branch} to "
+            f"the P{phase} boundary {target[:10]}",
+            target_ref=f"refs/heads/{man.branch}",
+            target_sha=target,
+            reason=reason,
+        )
+        assessment = RX.RecoveryPlanner(repo).assess_rewind(
+            git_obs=git_obs,
+            state_obs=state_obs,
+            fingerprint=fingerprint(),
+            action=action,
+            cause=(
+                RX.RecoveryCause.BRANCH_AHEAD if absorbed is not None
+                else RX.RecoveryCause.NONE
+            ),
+            evidence=(f"operator-requested rollback to P{phase} (FR-9.9)",),
+        )
+        spec = RX.RewindSpec(
+            site="run.rollback",
+            checkout_branch=man.branch,
+            target_sha=target,
+            reset_mode=RX.RESET_PLAIN,
+            clean=False,  # rollback never cleans untracked files (unchanged)
+        )
+
+        # Manifest snapshot before any rewind (F-010); lives in the ignored
+        # run-instance dir, so it does not perturb the assessed fingerprint.
+        ts = _utc_stamp()
+        shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.snapshot-{ts}.json")
+
+        def persist(result: "RX.RecoveryResult") -> None:
+            # Step 7 of the transaction: the manifest-side state transition.
+            # Also re-runnable by the registered replay finisher when a crash
+            # lands between apply and this persist.
+            if absorbed is not None:
+                # Loud absorption (#72): the discarded-but-preserved range is
+                # part of the audit trail, never a silent reset side effect.
+                n = len(absorbed.splitlines())
+                man.warnings.append(
+                    f"rollback absorbed {n} unmanifested commit(s) above the "
+                    f"last recorded commit {last_recorded[:10]} (branch was "
+                    "ahead of the manifest — e.g. a builder killed before a "
+                    "manifest flush); preserved in recovery snapshot "
+                    f"{result.snapshot.ref}:\n{absorbed}"
+                )
+            _apply_rollback_manifest_transition(
+                man, run_dir, target=target, phase=phase, at=_utc_stamp()
+            )
+
+        executor = RX.RecoveryExecutor(
+            repo,
+            run_dir,
+            run_id=man.run_id,
+            run_root=self.config.run_root,
+            excludes=excludes,
+        )
+        executor.apply(
+            assessment,
+            action,
+            spec=spec,
+            snapshot_request=RX.SnapshotRequest(
+                snapshot_id=f"rollback-P{phase}-{ts.replace(':', '-').replace('+', '-')}",
+                reason=reason,
+                run_branch=man.branch,
+                exclude=excludes,
+                protected=human_patterns,
+            ),
+            fingerprint=fingerprint,
+            persist=persist,
+            payload={
+                "phase": phase,
+                "absorbed": absorbed,
+                "last_recorded": last_recorded,
+            },
+        )
         return target
 
     def _rewind_manifest(self, man: Manifest, run_dir: Path, target: str) -> None:
-        """Rewind the manifest to match the reset branch (review F-002).
-
-        Drop commits after the target, and reset to `pending` EVERY step record
-        (any type, any iteration) that executes after the target phase boundary
-        in pipeline order — not just the steps that produced dropped commits.
-        Otherwise a later resume skips work `git reset --hard` removed and the
-        branch and manifest disagree (FR-9.9).
-        """
-        keep: list = []
-        for commit in man.commits:
-            keep.append(commit)
-            if commit.sha == target:
-                break
-        man.commits = keep
-        target_step = keep[-1].step_id
-
-        pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-        order = [s.id for s in pipeline.all_steps()]
-        try:
-            cutoff = order.index(target_step)
-        except ValueError:  # pragma: no cover - defensive
-            cutoff = len(order) - 1
-        keep_ids = set(order[: cutoff + 1])
-        for rec in man.steps:
-            if rec.id not in keep_ids:
-                rec.status = M.PENDING
-                rec.base_sha = None
-                rec.session_id = None
-                rec.ended = None
-        man.status = M.RUN_PARKED
-        man.current_step = None
+        """Rewind the manifest to match the reset branch (review F-002)."""
+        _rewind_manifest_state(man, run_dir, target)
 
     # ---- internals ----------------------------------------------------------
     def _phase_boundary_sha(self, man: Manifest, phase: int) -> str | None:
@@ -3132,3 +3151,120 @@ class RunManager:
                 for key, default_ref in CYCLE_PROMPT_DEFAULTS.items():
                     record(step.get(key) or default_ref)
         return hashes
+
+
+# --- rollback state transition + replay finisher (P3, plan §4.3 step 7) --------
+
+
+def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
+    """Rewind the manifest to match the reset branch (review F-002).
+
+    Drop commits after the target, and reset to `pending` EVERY step record
+    (any type, any iteration) that executes after the target phase boundary
+    in pipeline order — not just the steps that produced dropped commits.
+    Otherwise a later resume skips work `git reset --hard` removed and the
+    branch and manifest disagree (FR-9.9). Idempotent: a manifest already
+    rewound to ``target`` is unchanged.
+
+    Module-level (not a RunManager method) so the registered recovery-intent
+    replay finisher can re-run it from a fresh process after a crash between
+    the executor's apply and this persist.
+    """
+    keep: list = []
+    for commit in man.commits:
+        keep.append(commit)
+        if commit.sha == target:
+            break
+    man.commits = keep
+    target_step = keep[-1].step_id
+
+    pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+    order = [s.id for s in pipeline.all_steps()]
+    try:
+        cutoff = order.index(target_step)
+    except ValueError:  # pragma: no cover - defensive
+        cutoff = len(order) - 1
+    keep_ids = set(order[: cutoff + 1])
+    for rec in man.steps:
+        if rec.id not in keep_ids:
+            rec.status = M.PENDING
+            rec.base_sha = None
+            rec.session_id = None
+            rec.ended = None
+    man.status = M.RUN_PARKED
+    man.current_step = None
+
+
+def _apply_rollback_manifest_transition(
+    man: Manifest, run_dir: Path, *, target: str, phase: int, at: str
+) -> None:
+    """Rollback's step-7 state transition: manifest rewind + circuit breaker.
+
+    Reversal circuit breaker (pipeline-effectiveness FR-4.2): rolling back
+    past a phase boundary IS the human reversal of any auto-approved gate at
+    or beyond it. Record the reversal on each such ``auto_approval`` and flip
+    the run's effective auto-approval policy to ``always`` for the remainder
+    of the run, so a later resume never re-auto-approves a gate the human
+    just rolled back — a human has signalled distrust (§9).
+    """
+    from gauntlet.engine import gates
+
+    _rewind_manifest_state(man, run_dir, target)
+    reversed_n = gates.record_reversals(
+        man, min_phase_num=phase, user="operator", at=at,
+        notes=f"gauntlet rollback to phase P{phase} boundary",
+    )
+    if reversed_n:
+        man.warnings.append(
+            f"auto-approval disabled for the remainder of the run: {reversed_n} "
+            f"auto-approved gate(s) reversed by rollback to P{phase} (FR-4.2)"
+        )
+    man.write_atomic(run_dir / "manifest.json")
+
+
+def _rollback_replay_finisher(
+    repo: Path, run_dir: Path, intent: "RX.RecoveryIntent"
+) -> None:
+    """Re-persist rollback's manifest transition after a replayed apply.
+
+    Registered under the ``run.rollback`` site so a rollback killed between
+    the executor's Git apply and the manifest persist converges FULLY on
+    replay: the branch reset was already re-effected by the executor's replay;
+    this re-runs the manifest rewind + circuit breaker idempotently. Without
+    it, a replayed rollback would leave the branch behind the manifest — a
+    state the rollback guards then refuse, wedging the run (fail closed is
+    for uncertain states, not for ones the intent proves).
+    """
+    man = Manifest.load(run_dir / "manifest.json")
+    target = intent.spec.target_sha
+    if man.commits and man.commits[-1].sha == target:
+        return  # already rewound: the crash landed after persist, before clear
+    if not any(c.sha == target for c in man.commits):
+        man.warnings.append(
+            f"replayed rollback intent {intent.intent_id}: target "
+            f"{target[:10]} is not a recorded commit; manifest left untouched "
+            f"— reconcile manually (snapshot at {intent.snapshot_ref})"
+        )
+        man.write_atomic(run_dir / "manifest.json")
+        return
+    absorbed = intent.payload.get("absorbed")
+    last_recorded = intent.payload.get("last_recorded") or ""
+    if absorbed:
+        n = len(str(absorbed).splitlines())
+        man.warnings.append(
+            f"rollback absorbed {n} unmanifested commit(s) above the last "
+            f"recorded commit {str(last_recorded)[:10]} (branch was ahead of "
+            f"the manifest); preserved in recovery snapshot "
+            f"{intent.snapshot_ref}:\n{absorbed}"
+        )
+    man.warnings.append(
+        f"rollback intent {intent.intent_id} was replayed after a process "
+        f"death; snapshot retained at {intent.snapshot_ref}"
+    )
+    _apply_rollback_manifest_transition(
+        man, run_dir, target=target, phase=int(intent.payload.get("phase", 0)),
+        at=_utc_stamp(),
+    )
+
+
+RX.REPLAY_FINISHERS.setdefault("run.rollback", _rollback_replay_finisher)

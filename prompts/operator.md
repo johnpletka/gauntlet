@@ -86,8 +86,9 @@ behind that output. Drive every decision off the reported state class:
   A plain `resume` re-parks (fast, zero agent work) when the killed attempt left
   the tree or branch dirty vs the step's recorded base — the park message shows
   the dirty verdict (uncommitted paths and/or the offending commit range). The
-  sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it backs the
-  partial work up to `refs/gauntlet/backup/`, rewinds only to the latest
+  sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it preserves
+  the partial work as a complete recovery snapshot under
+  `refs/gauntlet/recovery/`, rewinds only to the latest
   committed `P<N> wip:` checkpoint (committed milestones survive), and re-runs
   the step cleanly. One-shot — the configured `interrupted_step` policy is
   unchanged. Never reach for `git reset` on a run branch instead.
