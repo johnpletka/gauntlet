@@ -39,6 +39,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
     from gauntlet.engine.config import ConfigLoadError, ConfigNotFoundError
     from gauntlet.engine.operator import RunResolutionError, StatusContractError
     from gauntlet.engine.planphases import PlanPhasesError
+    from gauntlet.engine.recovery import NoProgressError
     from gauntlet.engine.review import ReviewFailClosed
     from gauntlet.engine.run import (
         AbortGuardError,
@@ -61,6 +62,10 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         RunResolutionError,
         StatusContractError,
         PlanPhasesError,
+        # R5 (plan §4.5): a mutating verb that returned to an identical
+        # progress fingerprint without a legitimate live wait — exits nonzero
+        # naming what is unchanged and the executable safe actions.
+        NoProgressError,
         ReviewFailClosed,
     )
 
@@ -716,7 +721,17 @@ def status(
         except (OSError, ValueError):
             pipeline = None
 
-        rstate = operator.compute_run_state(man, driver.state)
+        # P4 (plan §4.2 / R4): status → assess → render. The shared recovery
+        # assessment — the same observe_git/fingerprint machinery the mutating
+        # verbs consume — refines the rendered next actions with the proven
+        # branch relation (adoption / checkpoint continuation / recovery-ref
+        # workflow). Fail-soft: an unobservable repo renders the pure table.
+        assessment = operator.compute_status_assessment(
+            mgr.repo_root, man, driver.state, run_instance_dir=run_instance_dir
+        )
+        rstate = operator.compute_run_state(
+            man, driver.state, assessment=assessment
+        )
         # FR-8.2 / F-001: when parked at a gate, name the cycle a reject would
         # ACTUALLY re-drive — resolved from the pipeline snapshot with the same
         # rule as the reject path (same non-foreach stage), not the manifest-order
@@ -737,6 +752,7 @@ def status(
                 rstate = operator.compute_run_state(
                     man, driver.state,
                     gate_cycle_id=upstream_cycle_id_for_gate(pipeline, gate_rec0.id),
+                    assessment=assessment,
                 )
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 

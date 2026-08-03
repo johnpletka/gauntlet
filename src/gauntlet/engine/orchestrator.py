@@ -212,6 +212,14 @@ class Orchestrator:
         Idempotent and resumable: steps already ``done``/``skipped`` in the
         manifest are not re-run. Returns the resulting run status.
         """
+        # Flush the latest response step's checkpoint against the PRE-DRIVE
+        # persisted state FIRST (crash recovery, FR-7.1/F-002) — before the
+        # RUNNING write-ahead dirties the manifest. P4: the terminal persist
+        # now carries the mapped run status in the same write as the consumed
+        # flip, so the prior invocation's `consumed` checkpoint holds the
+        # PARKED state; flushing after the RUNNING flip would re-commit that
+        # same checkpoint message on every later resume (a duplicate).
+        self._reconcile_response_checkpoint()
         self.manifest.status = M.RUN_RUNNING
         self._persist()
         # Apply any planned `--response` transition BEFORE the stage walk and
@@ -474,7 +482,12 @@ class Orchestrator:
         if resuming:
             short = self._resume_disposition(step, spec, rec, item)
             if short is not None:
-                self._finalize(rec, short)
+                # P4 (#62 bug 2): the short-circuit finalization hole — this
+                # path used to return with the terminal step state mutated
+                # only in memory, relying on a later drive-level persist. The
+                # step's terminal status and the mapped run status now land in
+                # the same single durable transition as every other outcome.
+                self._finalize_terminal(rec, short)
                 return short
 
         # NOTE: `rec.attempts` is NO LONGER incremented here. FR-6 redefines it
@@ -509,6 +522,11 @@ class Orchestrator:
         # session — the judge's env snapshot then sees it already restored.
         prior_step_id = os.environ.get("GAUNTLET_STEP_ID")
         os.environ["GAUNTLET_STEP_ID"] = step.id
+        # The write-ahead persists a RUNNING step under a RUNNING run — one
+        # coherent pair (P4/#62): an on_fail retry re-entering after a FAILED
+        # terminal persist must not write-ahead a running step under a failed
+        # run status.
+        self.manifest.status = M.RUN_RUNNING
         self._persist()  # WRITE-AHEAD: before any side effect
 
         try:
@@ -565,8 +583,7 @@ class Orchestrator:
             # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
             # `--response` resume never re-runs over — and commits — stale edits.
             result = self._restore_clean_after_conflict_park(step, spec, rec, result)
-            consumed = self._finalize(rec, result)
-            self._persist()  # WRITE-AHEAD: after the side effect, terminal state
+            consumed = self._finalize_terminal(rec, result)
             # The consume flip, the FAILED attempt-increment, and the status all
             # landed in the single `_persist` above — one atomic on-disk transaction
             # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
@@ -1611,19 +1628,43 @@ class Orchestrator:
         self._persist()
         return self.manifest.status
 
+    def _finalize_terminal(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
+        """Finalize a step AND its mapped run status in ONE durable write (P4).
+
+        Issue #62 bug 2: the step's terminal status used to land in one
+        `_persist` while the run status landed in a later drive-level one — a
+        kill in the gap persisted ``RUN_RUNNING`` plus a terminal step, a shape
+        the classifier called ``unknown``. Folding the run-status mapping into
+        the same atomic manifest write closes the gap: every persisted state is
+        either (running step, running run) — recoverable by liveness — or
+        (terminal step, mapped run status). A DONE/SKIPPED step maps to
+        ``RUN_RUNNING`` (the stage walk continues; the final ``RUN_DONE`` is
+        the drive-level completion transition), which a dead driver reads as
+        ``orphaned`` → plain resume continues from the next step.
+        """
+        consumed = self._finalize(rec, result)
+        self.manifest.status = {
+            PARKED: M.RUN_PARKED,
+            HALTED: M.RUN_PARKED,  # FR-3.3: a halt parks the run for a human
+            INTERRUPTED: M.RUN_PARKED,  # F-003: a mid-edit interruption parks
+            FAILED: M.RUN_FAILED,
+        }.get(result.status, M.RUN_RUNNING)
+        self._persist()
+        return consumed
+
     # ---- response handling (FR-2, FR-2.2, FR-7.1) ---------------------------
     def _apply_response_action(self) -> None:
         """Apply a planned `--response` transition at the start of a resume.
 
-        Order matters for crash recovery (FR-7.1): FIRST flush the latest
-        response step's CURRENT state to git, so a crash between an atomic
-        manifest write and its checkpoint commit can never leave that state
-        unreachable in history — and, for a recovered `pending` entry, so a
-        distinct `pending` commit always precedes the later `consumed` one
-        (F-002). THEN, only for a brand-new response, append the `pending` entry
-        and commit it before the stage walk re-executes the parked step.
+        Order matters for crash recovery (FR-7.1): the latest response step's
+        CURRENT state is flushed to git first — by ``drive()``, against the
+        pre-drive persisted state (P4) — so a crash between an atomic manifest
+        write and its checkpoint commit can never leave that state unreachable
+        in history, and a recovered `pending` entry's distinct `pending` commit
+        always precedes the later `consumed` one (F-002). Here, only for a
+        brand-new response, append the `pending` entry and commit it before
+        the stage walk re-executes the parked step.
         """
-        self._reconcile_response_checkpoint()
         action = self.response_action
         if action is None or action.kind in ("none", "recover"):
             return

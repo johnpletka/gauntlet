@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gauntlet.engine import gitops, manifest as M, prd_stub, recovery_exec as RX
+from gauntlet.engine.recovery import AbortAction, NoProgressError
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     engine_bookkeeping_candidates,
@@ -1223,6 +1224,10 @@ class RunManager:
         ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
         ``notify`` mode the wrapper is a no-op.
         """
+        # R5 (plan §4.5): fingerprint the persisted state before and after the
+        # whole verb — an unchanged repeat that is not a legitimate live wait
+        # raises NoProgressError (nonzero) instead of exiting 0 re-parked.
+        before = self._capture_progress(slug)
         status = self._resume_once(
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
@@ -1231,10 +1236,12 @@ class RunManager:
         # NOTE: reset_interrupted is deliberately NOT forwarded to the
         # auto-resume continuation — it is a one-shot operator decision for
         # THIS resume, never a standing policy (#72).
-        return self._auto_resume_if_scheduled(
+        status = self._auto_resume_if_scheduled(
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock, sleep=auto_sleep,
         )
+        self._require_progress_after(slug, before, verb="resume")
+        return status
 
     def _resume_once(self, slug: str, *, response: str | None = None,
                      use_judge: bool = True, adapter_factory=None,
@@ -1273,33 +1280,44 @@ class RunManager:
                 )
             # F-1: resume continues the SAME branch the run committed to. Never
             # recreate it from base (the old checkout_or_create_branch) — that
-            # would silently drop the manifest's recorded commits. Fail closed if
-            # the branch is gone or its tip no longer contains every recorded
-            # commit (reset / recreated / divergent), like rollback's guard.
+            # would silently drop the manifest's recorded commits. P4 (plan
+            # §5.4/R6): the branch↔manifest relationship is now assessed by the
+            # SAME observation machinery status renders — an inventoried,
+            # proven relation — and reconciled by class: bookkeeping tolerated,
+            # checkpoint/implementation/operator ranges ADOPTED (loud manifest
+            # audit, no rewind), behind/forked/missing refused with the
+            # assessment's executable recovery actions named. Everything is
+            # validated against the branch REF *before* checkout, so a refusal
+            # never rewinds the worktree onto a stale/reset branch.
             repo = self.repo_root
-            if not gitops.branch_exists(repo, man.branch):
+            git_obs = self._observe_resume_branch(layout, run_dir, man)
+            relation = RX.BranchRelation
+            if git_obs.branch_relation is relation.MISSING:
                 raise RunBranchStateError(
                     f"resume: run branch {man.branch!r} is missing; recreating "
                     "it from base would drop the manifest's recorded commits. "
-                    "Restore the branch (e.g. from refs/gauntlet/backup/) first."
+                    "Restore the branch (e.g. from refs/gauntlet/backup/) "
+                    "first." + self._relation_action_detail(git_obs, man)
                 )
-            # Validate the branch REF *before* checking it out — checking out
-            # first would rewind the worktree onto a stale/reset branch even
-            # though we are about to refuse. The last recorded commit must be
-            # reachable from the branch tip: tip == last (normal interrupt) or
-            # slightly ahead (killed between commit and manifest persist) is
-            # fine; behind/divergent means recorded commits are missing.
-            if man.commits:
-                last = man.commits[-1].sha
-                if not gitops.is_ancestor(repo, last, man.branch):
-                    raise RunBranchStateError(
-                        f"resume: branch {man.branch!r} is missing the "
-                        f"manifest's recorded commit {last[:10]} (reset or "
-                        "recreated); the branch and manifest disagree. "
-                        "Reconcile (restore the branch, or `gauntlet rollback`) "
-                        "before resuming."
-                    )
+            if git_obs.branch_relation in (relation.BEHIND, relation.FORKED):
+                last = git_obs.recorded_sha or ""
+                raise RunBranchStateError(
+                    f"resume: branch {man.branch!r} is missing the "
+                    f"manifest's recorded commit {last[:10]} (reset or "
+                    "recreated); the branch and manifest disagree. "
+                    "Reconcile (restore the branch, or `gauntlet rollback`) "
+                    "before resuming."
+                    + self._relation_action_detail(git_obs, man)
+                )
             gitops.checkout_branch(repo, man.branch)
+            # Linear branch-ahead reconciliation (P4, plan §5.4 / issue #72):
+            # adopt a proven checkpoint/implementation/operator range into the
+            # manifest — loud, manifest-only, never a Git mutation — so a
+            # builder killed after committing but before the manifest flush
+            # resumes without rollback or git surgery.
+            adoption_notes = RX.reconcile_branch_ahead(man, git_obs, verb="resume")
+            if adoption_notes:
+                man.write_atomic(run_dir / "manifest.json")
             # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
             # FR-7.1 idempotent recovery). All validation and operator-identity
             # resolution happen HERE, before driving; the orchestrator only
@@ -1314,6 +1332,167 @@ class RunManager:
             )
         finally:
             self._release_worktree_lock(handle)
+
+    def _observe_resume_branch(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> "RX.GitObservation":
+        """The P1 Git observation resume reconciles against (P4, plan §5.4).
+
+        The recorded boundary is the in-flight attempt's ``base_sha`` when a
+        step is mid-attempt (that is what the resume disposition diffs
+        against), else the manifest's last recorded commit. Read-only; a
+        merge commit inside the range fails closed through
+        :class:`RX.RecoveryObservationError` with named evidence.
+        """
+        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        return RX.observe_git(
+            self.repo_root,
+            run_branch=man.branch,
+            recorded_sha=RX.reconciliation_boundary(man),
+            excludes=excludes,
+            bookkeeping_candidates=engine_bookkeeping_candidates(
+                self.repo_root, run_dir
+            ),
+            approved_artifacts=governed_artifact_paths(
+                self.repo_root, layout.slug_dir
+            ),
+        )
+
+    # ---- R5: no successful no-op loops (P4, plan §4.5) ----------------------
+    def _progress_fingerprint_for(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> "RX.ProgressFingerprint":
+        """The plan §4.5 fingerprint at the public-verb boundary."""
+        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        record = None
+        for rec in man.steps:  # the last non-terminal step anchors the attempt
+            if rec.status not in (M.DONE, M.SKIPPED):
+                record = rec
+        return RX.build_progress_fingerprint(
+            self.repo_root, manifest=man, record=record, excludes=excludes
+        )
+
+    def _capture_progress(self, slug: str) -> "RX.ProgressFingerprint | None":
+        """Best-effort pre-verb fingerprint; ``None`` disables the guard.
+
+        Advisory capture: a repo-less run tree or an unreadable manifest must
+        never mask the verb's own behavior, so any observation failure simply
+        skips the R5 guard for this invocation.
+        """
+        try:
+            layout = self.layout(slug)
+            run_dir = layout.active_run_dir()
+            man = Manifest.load(run_dir / "manifest.json")
+            return self._progress_fingerprint_for(layout, run_dir, man)
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+            return None
+
+    def _require_progress_after(
+        self,
+        slug: str,
+        before: "RX.ProgressFingerprint | None",
+        *,
+        verb: str,
+        exempt_human_waits: bool = True,
+    ) -> None:
+        """Raise :class:`NoProgressError` on an unchanged fingerprint (R5).
+
+        A mutating public verb (resume/recover/rollback) that returns to an
+        identical progress fingerprint without entering a legitimate live wait
+        must exit nonzero naming what is unchanged and listing executable safe
+        actions — never print only ``run status: parked`` and exit zero on an
+        unchanged repeat (plan §4.5). Legitimate waits are exempt: a terminal
+        run, a quota/usage-window park (a provider deadline; FR-3.2/FR-10.3),
+        an armed scheduled resume (FR-3.4), and — for resume — a park awaiting
+        a human decision (a gate or ``--response`` park; R7 decisions are
+        semantic, and their surfaces already name the exact verb).
+        """
+        if before is None:
+            return
+        try:
+            layout = self.layout(slug)
+            run_dir = layout.active_run_dir()
+            man = Manifest.load(run_dir / "manifest.json")
+            after = self._progress_fingerprint_for(layout, run_dir, man)
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+            return
+        if after.digest != before.digest:
+            return  # progress
+        if man.status in (M.RUN_DONE, M.RUN_ABORTED):
+            return  # terminal — nothing left to progress toward
+        state, parked_rec, _failure = RX.classify_composite(
+            man, RX.DriverLiveness.NONE.value
+        )
+        if exempt_human_waits and state in (
+            RX.STATE_PARKED_GATE, RX.STATE_PARKED_FOR_RESPONSE
+        ):
+            return
+        if parked_rec is not None:
+            reason = M.normalize_parked_reason(
+                parked_rec.parked_reason, parked_rec.type, parked_rec.status
+            )
+            if reason in (
+                M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_USAGE_WINDOW
+            ):
+                return  # a quota/window deadline is a legitimate live wait
+            if parked_rec.scheduled_resume is not None:
+                return  # an armed auto-resume schedule is a legitimate wait
+        try:
+            git_obs = self._observe_resume_branch(layout, run_dir, man)
+        except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
+            git_obs = None
+        actions: tuple = ()
+        try:
+            assessment = RX.RecoveryPlanner(self.repo_root).assess(
+                manifest=man,
+                liveness=RX.DriverLiveness.NONE.value,
+                git_obs=git_obs,
+                fingerprint=after,
+            )
+            actions = assessment.safe_actions
+        except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
+            actions = ()
+        if not actions:
+            actions = (
+                AbortAction(
+                    description=(
+                        f"`gauntlet abort {slug}` aborts the run, retaining "
+                        "every snapshot and all evidence"
+                    ),
+                    reason=f"{verb} made no progress and no safer action resolved",
+                ),
+            )
+        raise NoProgressError(before, after, tuple(actions))
+
+    @staticmethod
+    def _relation_action_detail(git_obs: "RX.GitObservation", man: Manifest) -> str:
+        """Executable recovery actions for a refused branch relation (plan §5.4).
+
+        The refusal must offer the SAME actions the read-only status surface
+        renders for this relation (R4) — not only "reconcile manually" — so
+        both derive from :func:`RX.relation_recovery_actions` through the one
+        operator renderer.
+        """
+        from gauntlet.engine import operator
+
+        try:
+            state, _, _ = RX.classify_composite(man, RX.DriverLiveness.NONE.value)
+            assessment = RX.RecoveryAssessment(
+                cause=RX.RecoveryCause.BRANCH_DIVERGED,
+                disposition=RX.RecoveryDisposition.CONTINUE_ON_RECOVERY_BRANCH,
+                safe_actions=RX.relation_recovery_actions(git_obs, man),
+                recommended_action=RX.relation_recovery_actions(git_obs, man)[0].kind,
+                progress_fingerprint="sha256:refusal",
+            )
+            rendered = operator.render_assessment_actions(
+                assessment, state, man.slug
+            )
+        except Exception:  # advisory detail must never mask the refusal
+            return ""
+        commands = [a.command for a in rendered if a.kind != "observe"]
+        if not commands:
+            return ""
+        return " Safe actions: " + "; ".join(f"`{c}`" for c in commands)
 
     @staticmethod
     def _parked_usage_limit_step(man: Manifest) -> "M.StepRecord | None":
@@ -1876,6 +2055,7 @@ class RunManager:
         # any recover read or write; reuse the proven path for every load below.
         manifest_path = self._guard_run_file(run_dir, "manifest.json")
         man = Manifest.load(manifest_path)
+        before_fp = self._capture_progress(slug)  # R5 guard input
 
         # FR-5.6 step 1: capture the lock once and run the full FR-5.1 gate.
         captured = self._read_lock()
@@ -1960,6 +2140,11 @@ class RunManager:
         # reloads the manifest fresh and re-checks the running guard, so it never
         # overwrites a concurrently-completed run.
         self._finalize_recovery(run_dir, intent, outcome)
+        # R5: a recover that changed nothing (the finalize refused because the
+        # target transitioned concurrently) must not exit 0 unchanged.
+        self._require_progress_after(
+            slug, before_fp, verb="recover", exempt_human_waits=False
+        )
         return Manifest.load(manifest_path).status
 
     @staticmethod
@@ -2260,43 +2445,55 @@ class RunManager:
         unmanifested: str | None = None
         # Every git call below is best-effort too (PR #77 review / Copilot):
         # the driver is already dead by the time this runs, so a failing
-        # `update-ref`/`log` must degrade to a warning — never escape and
-        # leave the manifest unfinalized with the intent stranded.
+        # `update-ref`/`log`/observation must degrade to a warning — never
+        # escape and leave the manifest unfinalized with the intent stranded.
         try:
             backup = (
                 f"refs/gauntlet/backup/{man.run_id}/recover-"
                 f"{intent.ts.replace(':', '-')}"
             )
             gitops.create_ref(self.repo_root, backup, branch_head)
-            if man.commits:
-                last = man.commits[-1].sha
-                if branch_head != last:
-                    if gitops.is_ancestor(self.repo_root, last, branch_head):
-                        unmanifested = gitops.log_range(
-                            self.repo_root, last, branch_head
-                        )
-                        n = len(unmanifested.splitlines())
-                        man.warnings.append(
-                            f"recover: branch {man.branch!r} is {n} commit(s) "
-                            f"ahead of the manifest's last recorded {last[:10]} "
-                            f"(the driver was killed before a manifest flush); "
-                            f"killed state backed up at {backup}. Reconcile "
-                            f"with `gauntlet rollback {man.slug} --phase N` "
-                            f"(absorbs the unmanifested commits after backup) "
-                            f"or `gauntlet resume {man.slug} "
-                            "--reset-interrupted` (discards the interrupted "
-                            "attempt, checkpoint-preserving)."
-                        )
-                    else:
-                        man.warnings.append(
-                            f"recover: branch {man.branch!r} tip "
-                            f"{branch_head[:10]} has FORKED from the "
-                            f"manifest's last recorded {last[:10]} (not a "
-                            f"descendant); killed state backed up at {backup}. "
-                            "Resume/rollback will refuse — restore the branch "
-                            "before proceeding."
-                        )
-        except gitops.GitError as exc:
+            # P4 (plan §4.2/§5.4): the divergence evidence comes from the SAME
+            # observation machinery resume reconciles with and status renders
+            # — the proven, inventoried branch relation — so recover's warning
+            # names exactly what the next resume will do with the range.
+            obs_layout = self.layout(man.slug)
+            git_obs = self._observe_resume_branch(
+                obs_layout, obs_layout.run_dir(man.run_id), man
+            )
+            relation = git_obs.branch_relation
+            boundary = git_obs.recorded_sha
+            if relation in RX.ADOPTABLE_AHEAD_RELATIONS and boundary is not None:
+                unmanifested = gitops.log_range(
+                    self.repo_root, boundary, branch_head
+                )
+                n = len(git_obs.run_branch_commits)
+                man.warnings.append(
+                    f"recover: branch {man.branch!r} is {n} commit(s) "
+                    f"ahead of the recorded boundary {boundary[:10]} "
+                    f"(relation {relation.value}; the driver was killed "
+                    f"before a manifest flush); killed state backed up at "
+                    f"{backup}. A plain `gauntlet resume {man.slug}` adopts "
+                    "the range into the manifest (plan §5.4/R6); "
+                    f"`gauntlet rollback {man.slug} --phase N` absorbs it "
+                    f"after snapshot, and `gauntlet resume {man.slug} "
+                    "--reset-interrupted` discards the interrupted attempt "
+                    "(checkpoint-preserving)."
+                )
+            elif relation in (
+                RX.BranchRelation.BEHIND,
+                RX.BranchRelation.FORKED,
+            ):
+                man.warnings.append(
+                    f"recover: branch {man.branch!r} tip "
+                    f"{branch_head[:10]} has diverged from the recorded "
+                    f"boundary {boundary[:10] if boundary else '?'} "
+                    f"(relation {relation.value}); killed state backed up at "
+                    f"{backup}. Resume/rollback will refuse until the branch "
+                    "is restored."
+                    + self._relation_action_detail(git_obs, man)
+                )
+        except (gitops.GitError, RX.RecoveryExecError) as exc:
             man.warnings.append(
                 f"recover: branch↔manifest reconciliation incomplete (git "
                 f"failed after resolving {man.branch!r} at {branch_head[:10]}: "
@@ -2745,6 +2942,7 @@ class RunManager:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
         man = Manifest.load(run_dir / "manifest.json")
+        before_fp = self._capture_progress(slug)  # R5 guard input
         # Rollback is a worktree-mutating verb: take the drive lock so a live
         # driver can never race the rewind (PR #77 review), exactly like
         # resume/abort.
@@ -2759,9 +2957,16 @@ class RunManager:
             # after a replay: the site finisher rewrote it.
             if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
                 man = Manifest.load(run_dir / "manifest.json")
-            return self._rollback_locked(layout, run_dir, man, phase)
+            target = self._rollback_locked(layout, run_dir, man, phase)
         finally:
             self._release_worktree_lock(handle)
+        # R5: a repeated rollback to the same boundary that changes nothing —
+        # branch, manifest, index, and worktree all identical — is a no-op
+        # loop, not a success (plan §4.5). Rollback is never a human wait.
+        self._require_progress_after(
+            slug, before_fp, verb="rollback", exempt_human_waits=False
+        )
+        return target
 
     def _rollback_locked(self, layout, run_dir, man: Manifest, phase: int) -> str:
         # Rollback rewinds the RUN BRANCH (FR-9.9) — never whatever branch

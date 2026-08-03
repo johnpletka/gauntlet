@@ -62,43 +62,40 @@ LIVENESS_INDETERMINATE = "indeterminate"
 LIVENESS_NONE = "none"
 
 # --- composite run-state classes (§6.3, the eleven-class total set) ----------
-STATE_IN_PROGRESS = "in_progress"
-STATE_ORPHANED = "orphaned"
-STATE_INDETERMINATE = "indeterminate"
-STATE_PARKED_GATE = "parked_gate"
-STATE_PARKED_FOR_RESPONSE = "parked_for_response"
-# A step parked by a provider usage limit / overload (harness-efficiency FR-3.2).
-# Distinct from parked_for_response: it needs NO human decision — a plain
-# `gauntlet resume` continues the preserved session (FR-3.3).
-STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
-# A step parked pre-launch because the provider usage window had insufficient
-# headroom for the next step (harness-efficiency FR-10.3, ``enforce: true``).
-# Like the usage-limit park it needs NO human decision — a plain `gauntlet
-# resume` retries once the window replenishes (the projected time is surfaced in
-# the quota block).
-STATE_PARKED_USAGE_WINDOW = "parked_usage_window"
-# A step parked because an agent-authored structured artifact failed validation
-# after the bounded in-session repair loop (harness-efficiency FR-2.2). Like the
-# usage-limit park it needs NO human decision in the `--response` sense — a plain
-# `gauntlet resume` re-runs ONLY the validator against the (possibly hand-edited)
-# artifact and completes the step if it now passes (FR-2.2).
-STATE_PARKED_ARTIFACT_INVALID = "parked_artifact_invalid"
-STATE_FAILED = "failed"
-STATE_HALTED = "halted"
-STATE_INTERRUPTED = "interrupted"
-STATE_DONE = "done"
-STATE_ABORTED = "aborted"
-STATE_UNKNOWN = "unknown"
+# P4 (plan §4.2 / R4): the classification core and the state → mutating-action
+# table live in `recovery_exec` — the SAME module the mutating resume path and
+# the recovery planner consume — so this read-only surface and the mutating
+# verbs cannot drift. The names are re-exported here unchanged; the values are
+# the §6.1 `state` enum verbatim. Per-state semantics:
+#   parked_usage_limit — a provider usage-limit park (FR-3.2); NO human
+#     decision — a plain `gauntlet resume` continues the session (FR-3.3).
+#   parked_usage_window — an enforce-mode pre-step window park (FR-10.3); a
+#     plain `resume` retries once the window replenishes.
+#   parked_artifact_invalid — a validated artifact failed its repair loop
+#     (FR-2.2); a plain `resume` re-runs ONLY the validator (hand-edit
+#     sanctioned).
+from gauntlet.engine.recovery_exec import (  # noqa: E402  (grouped re-export)
+    STATE_ABORTED,
+    STATE_DONE,
+    STATE_FAILED,
+    STATE_HALTED,
+    STATE_INDETERMINATE,
+    STATE_INTERRUPTED,
+    STATE_IN_PROGRESS,
+    STATE_ORPHANED,
+    STATE_PARKED_ARTIFACT_INVALID,
+    STATE_PARKED_FOR_RESPONSE,
+    STATE_PARKED_GATE,
+    STATE_PARKED_USAGE_LIMIT,
+    STATE_PARKED_USAGE_WINDOW,
+    STATE_UNKNOWN,
+)
+from gauntlet.engine import recovery_exec as RX  # noqa: E402
+from gauntlet.engine import recovery as RXM  # noqa: E402  (P1 models)
 
-# Step statuses that mean "a terminal failure of this step" — the failure
-# descriptor selection space (§6.3a). Their values double as the failed-class
-# composite states (failed→failed, halted→halted, interrupted→interrupted).
-_FAILURE_STATUSES = (M.FAILED, M.HALTED, M.INTERRUPTED)
-
-# The normalized (PRD FR-7.2) park reason that classifies a parked step as
-# `parked_for_response` (§6.3a — the *reason* defines the response). Legacy
-# on-disk values map to it through `manifest.normalize_parked_reason`.
-_RESPONSE_REASON = M.PARKED_REASON_RESPONSE
+# The failure-status set and the park-reason normalization now live with the
+# classification core in `recovery_exec` (P4/R4); nothing here keys on them
+# directly any more.
 
 # Composite step types whose evidence lives in role sub-directories, not a
 # direct ``steps/<leaf>/transcript.md`` (FR-3.1a). Mirrors the cycle/retro
@@ -418,60 +415,182 @@ def _control_reset_interrupted(slug: str) -> Action:
                   consequence=consequence)
 
 
+# The observe-only prefix rows per composite state — a rendering concern, not a
+# recovery decision, so they stay here while the mutating rows derive from the
+# shared `recovery_exec` table (P4/R4).
+_OBSERVE_PREFIX: dict[str, tuple[str, ...]] = {
+    STATE_IN_PROGRESS: ("logs", "json"),
+    STATE_INDETERMINATE: ("logs", "json"),
+    STATE_UNKNOWN: ("logs", "json"),
+    STATE_PARKED_ARTIFACT_INVALID: ("logs",),
+    STATE_FAILED: ("logs",),
+    STATE_HALTED: ("logs",),
+    STATE_INTERRUPTED: ("logs",),
+}
+
+
 def _actions_for(
     state: str, slug: str, failure: "FailureDescriptor | None" = None,
     *, gate_cycle_id: str | None = None,
 ) -> list[Action]:
-    """The §6.3 next-action column for a composite ``state`` (total)."""
-    if state == STATE_IN_PROGRESS:
-        return [_observe_logs(slug), _observe_status_json(slug)]
-    if state == STATE_ORPHANED:
-        return [_control_resume(slug)]
-    if state == STATE_PARKED_GATE:
-        # FR-8.2: gate decisions carry a one-line consequence; a reject names the
-        # upstream cycle it re-runs (gate_cycle_id, resolved from the manifest).
-        return [
-            _decide_approve(slug, gate_cycle_id=gate_cycle_id),
-            _decide_reject(slug, gate_cycle_id=gate_cycle_id),
-        ]
-    if state == STATE_PARKED_FOR_RESPONSE:
-        return [_decide_resume_response(slug)]
-    if state == STATE_PARKED_USAGE_LIMIT:
-        # FR-3.3: a plain `resume` continues the preserved session — no decision.
-        return [_control_resume(slug)]
-    if state == STATE_PARKED_USAGE_WINDOW:
-        # FR-10.3: parked pre-step to stay within the window — a plain `resume`
-        # retries once it replenishes (no human decision, no session to continue).
-        return [_control_resume(slug)]
-    if state == STATE_PARKED_ARTIFACT_INVALID:
-        # FR-2.2: a plain `resume` re-runs only the validator against the
-        # (possibly hand-edited) artifact — inspect the error, then resume.
-        return [_observe_logs(slug), _control_resume(slug)]
-    if state == STATE_FAILED:
-        # A re-runnable PRECONDITION failure (FR-9.3 clean-handoff): plain
-        # `resume` re-runs the guard once the operator fixes the named
-        # precondition. A terminal failure cannot be re-run by a plain resume
-        # (it would only repeat) — recommend a `--response` decision instead, so
-        # the hint matches what `resume` actually does (no more contradiction).
-        if failure is not None and failure.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
-            return [_observe_logs(slug), _control_resume(slug)]
-        return [_observe_logs(slug), _decide_resume_response(slug)]
-    if state == STATE_HALTED:
-        return [_observe_logs(slug), _control_resume(slug)]
-    if state == STATE_INTERRUPTED:
-        # A plain resume re-parks when the interrupted step left the tree/
-        # branch dirty vs its base; offer the sanctioned discard-and-re-run
-        # path alongside it so the operator is never pointed into a loop with
-        # no exit (#72).
-        return [
-            _observe_logs(slug),
-            _control_resume(slug),
-            _control_reset_interrupted(slug),
-        ]
-    if state in (STATE_DONE, STATE_ABORTED):
-        return []
-    # indeterminate and unknown: read-only inspection only, never a mutating verb.
-    return [_observe_logs(slug), _observe_status_json(slug)]
+    """The §6.3 next-action column for a composite ``state`` (total).
+
+    P4 (R4): the mutating rows are DERIVED from
+    :func:`recovery_exec.mutating_action_kinds` — the same table the resume
+    path chooses its default action from — so the read-only view can never
+    recommend a verb the mutating path rejects (or vice versa). The rendering
+    per kind: RETRY → plain ``resume`` (FR-3.3: a usage park's resume
+    continues the preserved session; FR-2.2: an artifact park's resume re-runs
+    only the validator; a re-runnable FR-9.3 precondition failure re-runs the
+    guard); HUMAN_DECISION → the gate approve/reject pair (FR-8.2, with the
+    reject consequence naming the cycle it re-drives) or ``resume
+    --response``; SNAPSHOT_AND_RESTART → ``resume --reset-interrupted`` (#72).
+    Indeterminate and unknown states expose read-only inspection only.
+    """
+    actions = _render_observe_prefix(state, slug)
+    failure_kind = failure.failure_kind if failure is not None else None
+    for kind in RX.mutating_action_kinds(state, failure_kind=failure_kind):
+        if kind is RXM.RecoveryActionKind.RETRY:
+            actions.append(_control_resume(slug))
+        elif kind is RXM.RecoveryActionKind.HUMAN_DECISION:
+            if state == STATE_PARKED_GATE:
+                actions.append(_decide_approve(slug, gate_cycle_id=gate_cycle_id))
+                actions.append(_decide_reject(slug, gate_cycle_id=gate_cycle_id))
+            else:
+                actions.append(_decide_resume_response(slug))
+        elif kind is RXM.RecoveryActionKind.SNAPSHOT_AND_RESTART:
+            actions.append(_control_reset_interrupted(slug))
+    return actions
+
+
+def _render_observe_prefix(state: str, slug: str) -> list[Action]:
+    tokens = _OBSERVE_PREFIX.get(state, ())
+    out: list[Action] = []
+    for token in tokens:
+        out.append(_observe_logs(slug) if token == "logs" else _observe_status_json(slug))
+    return out
+
+
+def render_assessment_actions(
+    assessment: "RXM.RecoveryAssessment",
+    state: str,
+    slug: str,
+    *,
+    gate_cycle_id: str | None = None,
+) -> list[Action]:
+    """Render the planner's ``safe_actions`` as §6.1 CLI action rows (P4/R4).
+
+    The read-only surface renders EXACTLY what the mutating path will do: for
+    the base composite states the planner's actions come from the same table
+    :func:`_actions_for` consumes (identical rows), and for the
+    branch-relation refinements (plan §5.4) the adopted/checkpoint/recovery-
+    branch actions render with their consequence spelled out. Every rendered
+    row is additive against the v1 ``next_actions`` contract (same object
+    shape; `kind: recover` is already in the schema enum).
+    """
+    actions = _render_observe_prefix(state, slug)
+    for act in assessment.safe_actions:
+        kind = act.kind
+        if kind is RXM.RecoveryActionKind.RETRY:
+            actions.append(_control_resume(slug))
+        elif kind is RXM.RecoveryActionKind.HUMAN_DECISION:
+            if state == STATE_PARKED_GATE:
+                actions.append(_decide_approve(slug, gate_cycle_id=gate_cycle_id))
+                actions.append(_decide_reject(slug, gate_cycle_id=gate_cycle_id))
+            else:
+                actions.append(_decide_resume_response(slug))
+        elif kind is RXM.RecoveryActionKind.SNAPSHOT_AND_RESTART:
+            actions.append(_control_reset_interrupted(slug))
+        elif kind in (
+            RXM.RecoveryActionKind.RESTART_FROM_CHECKPOINT,
+            RXM.RecoveryActionKind.ADOPT_COMMITS,
+        ):
+            # Plain resume IS the adoption vehicle (plan §5.4/R6): the row
+            # renders the same executable command with the adoption spelled
+            # out as its consequence.
+            resume = _control_resume(slug)
+            resume.consequence = act.description
+            actions.append(resume)
+        elif kind is RXM.RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH:
+            # Non-destructive ref restoration (plan §5.4): `git branch -f`
+            # onto history the assessment proved exists — creates a missing
+            # branch, fast-forwards a behind one, or names a fork-preserving
+            # recovery branch. Never a reset/checkout/clean.
+            actions.append(
+                Action(
+                    "restore run branch",
+                    "recover",
+                    ["git", "branch", "-f", act.branch_name, act.start_sha],
+                    [],
+                    True,
+                    f"git branch -f {act.branch_name} {act.start_sha[:10]}",
+                    consequence=act.description,
+                )
+            )
+        elif kind is RXM.RecoveryActionKind.ABORT:
+            actions.append(
+                Action(
+                    "abort", "control", ["gauntlet", "abort", slug], [], True,
+                    f"gauntlet abort {slug}", consequence=act.description,
+                )
+            )
+        # Kinds the P4 planner does not emit (resume_session, edit_then_retry,
+        # restore_snapshot, rebuild_projection) have no rendering yet; adding
+        # one later is additive.
+    return actions
+
+
+def compute_status_assessment(
+    repo_root: Path,
+    man: Manifest,
+    liveness: str,
+    *,
+    run_instance_dir: Path,
+) -> "RXM.RecoveryAssessment | None":
+    """Build the shared recovery assessment for the read-only status surface.
+
+    The single I/O point behind ``status → assess → render`` (plan §4.2): the
+    same ``observe_git`` / ``ProgressFingerprint`` machinery the mutating
+    verbs consume, evaluated read-only. Fail-soft: any observation failure
+    (no repo, unreadable refs, a merge inside the inventoried range) returns
+    ``None`` and the caller renders the pure state table instead — status
+    must never crash or mutate because advisory git evidence was
+    unavailable.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine.execution import (
+        engine_bookkeeping_candidates,
+        governed_artifact_paths,
+        run_bookkeeping_excludes,
+    )
+
+    try:
+        artifact_root = run_instance_dir.parent
+        excludes = run_bookkeeping_excludes(
+            repo_root, run_instance_dir, artifact_root
+        )
+        git_obs = RX.observe_git(
+            repo_root,
+            run_branch=man.branch,
+            recorded_sha=RX.reconciliation_boundary(man),
+            excludes=excludes,
+            bookkeeping_candidates=engine_bookkeeping_candidates(
+                repo_root, run_instance_dir
+            ),
+            approved_artifacts=governed_artifact_paths(repo_root, artifact_root),
+        )
+        record = RX._attempt_record(man)
+        fingerprint = RX.build_progress_fingerprint(
+            repo_root, manifest=man, record=record, excludes=excludes
+        )
+        return RX.RecoveryPlanner(repo_root).assess(
+            manifest=man,
+            liveness=liveness,
+            git_obs=git_obs,
+            fingerprint=fingerprint,
+        )
+    except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
+        return None
 
 
 # --- step / run-instance resolution (FR-3.1a) --------------------------------
@@ -641,106 +760,37 @@ def resolve_transcript_dir(run_instance_dir: Path, rec: StepRecord) -> Path:
 def _classify(man: Manifest, liveness: str) -> tuple[str, ParkedDescriptor | None, FailureDescriptor | None]:
     """The total ``(run_status, liveness, descriptor) -> state`` function.
 
-    Any unrecognized ``run_status``, or an internally contradictory manifest
-    (zero/multiple parked steps, an invalid ``(type, reason)``, a failed run
-    with no failure step, or a descriptor present under a ``—`` status), maps
-    to ``unknown`` → read-only inspection only (the §6.3 P4 clause).
+    P4 (R4): the classification core is :func:`recovery_exec.classify_composite`
+    — the SAME function the mutating resume/recover paths consume — so the two
+    surfaces cannot disagree. This wrapper only renders the returned raw step
+    records into the §6.1 descriptors (a corrupt iteration still fails closed
+    through :func:`render_step_id`). Any unrecognized ``run_status`` or an
+    internally contradictory manifest maps to ``unknown`` → read-only
+    inspection only; the historical kill-window shape (``RUN_RUNNING`` + one
+    ended interrupted/halted/failed step) maps to the corresponding
+    RECOVERABLE state by liveness (plan §5.3), never ``unknown``.
     """
-    status = man.status
-    parked_steps = [s for s in man.steps if s.status == M.PARKED]
-    failure_steps = [s for s in man.steps if s.status in _FAILURE_STATUSES]
-
-    # P3: only `running` is untrustworthy from the manifest, so liveness governs.
-    if status == M.RUN_RUNNING:
-        if parked_steps or failure_steps:
-            return STATE_UNKNOWN, None, None  # descriptor under a `—` status
-        if liveness == LIVENESS_ALIVE:
-            return STATE_IN_PROGRESS, None, None
-        if liveness in (LIVENESS_ORPHANED, LIVENESS_NONE):
-            return STATE_ORPHANED, None, None
-        return STATE_INDETERMINATE, None, None  # indeterminate → read-only
-
-    # P2: done/aborted are engine-written and authoritative; a parked/failure
-    # descriptor under them is contradictory.
-    if status in (M.RUN_DONE, M.RUN_ABORTED):
-        if parked_steps or failure_steps:
-            return STATE_UNKNOWN, None, None
-        return (STATE_DONE if status == M.RUN_DONE else STATE_ABORTED), None, None
-
-    # P2: parked — a genuine human/response park OR a budget/timeout halt / a
-    # mid-step interruption. The engine records the latter by parking the *run*
-    # (RUN_PARKED) while the *step* keeps its HALTED/INTERRUPTED status
-    # (orchestrator._set_run_status, FR-3.3), so a real halted/interrupted run is
-    # RUN_PARKED with a single halt/interrupt step and no PARKED step. Classify
-    # by which the unique non-terminal step is; a mix, or zero/multiple of
-    # either, is a contradiction → unknown.
-    if status == M.RUN_PARKED:
-        halt_steps = [s for s in man.steps if s.status in (M.HALTED, M.INTERRUPTED)]
-        if len(halt_steps) == 1 and not parked_steps:
-            hs = halt_steps[0]
-            return hs.status, None, FailureDescriptor(
-                render_step_id(hs), hs.status, halt_reason=hs.halt_reason
-            )
-        if len(parked_steps) != 1 or halt_steps:
-            return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
-        ps = parked_steps[0]
-        # Normalize any legacy on-disk parked_reason to the PRD enum (FR-7.2): a
-        # pre-P3 `upstream_conflict`/`cycle_escalation` reads as `response`, and a
-        # pre-P3 gate (null reason) reads as `gate`. The descriptor carries the
-        # NORMALIZED value so `status --json` never emits a legacy value.
-        reason = M.normalize_parked_reason(ps.parked_reason, ps.type, ps.status)
-        if reason == _RESPONSE_REASON:
-            return (
-                STATE_PARKED_FOR_RESPONSE,
-                ParkedDescriptor(render_step_id(ps), ps.type, reason),
-                None,
-            )
-        if reason == M.PARKED_REASON_USAGE_LIMIT:
-            # FR-3.2: a usage-limit park — a plain `resume` continues the session,
-            # no human decision required (distinct from the response parks above).
-            return (
-                STATE_PARKED_USAGE_LIMIT,
-                ParkedDescriptor(render_step_id(ps), ps.type, reason),
-                None,
-            )
-        if reason == M.PARKED_REASON_ARTIFACT_INVALID:
-            # FR-2.2: an in-step validation failure that exhausted its repair loop
-            # — a plain `resume` re-runs only the validator (hand-edit sanctioned).
-            return (
-                STATE_PARKED_ARTIFACT_INVALID,
-                ParkedDescriptor(render_step_id(ps), ps.type, reason),
-                None,
-            )
-        if reason == M.PARKED_REASON_USAGE_WINDOW:
-            # FR-10.3: an enforce-mode pre-step park for insufficient window
-            # headroom — a plain `resume` retries once the window replenishes.
-            return (
-                STATE_PARKED_USAGE_WINDOW,
-                ParkedDescriptor(render_step_id(ps), ps.type, reason),
-                None,
-            )
-        if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
-            return (
-                STATE_PARKED_GATE,
-                ParkedDescriptor(render_step_id(ps), ps.type, reason),
-                None,
-            )
-        # A non-gate step parked with no reason or an unknown reason value has no
-        # defined operator response → contradiction (fail closed, read-only
-        # inspection). Every PRD park reason is handled above.
-        return STATE_UNKNOWN, None, None
-
-    # P2: failed — the last failure step in manifest order is authoritative (§6.3a).
-    if status == M.RUN_FAILED:
-        if not failure_steps:
-            return STATE_UNKNOWN, None, None  # failed run with no failure step
-        fs = failure_steps[-1]
-        return fs.status, None, FailureDescriptor(
-            render_step_id(fs), fs.status, fs.failure_kind, halt_reason=fs.halt_reason
+    state, parked_rec, failure_rec = RX.classify_composite(man, liveness)
+    parked = None
+    failure = None
+    if parked_rec is not None:
+        # The descriptor carries the NORMALIZED park reason (FR-7.2), so
+        # `status --json` never emits a legacy on-disk value.
+        reason = M.normalize_parked_reason(
+            parked_rec.parked_reason, parked_rec.type, parked_rec.status
         )
-
-    # P4: any unrecognized run_status.
-    return STATE_UNKNOWN, None, None
+        parked = ParkedDescriptor(render_step_id(parked_rec), parked_rec.type, reason)
+    if failure_rec is not None:
+        failure = FailureDescriptor(
+            render_step_id(failure_rec),
+            failure_rec.status,
+            # failure_kind matters only on a FAILED step (it selects the
+            # re-runnable vs terminal next action); halted/interrupted never
+            # carry one.
+            failure_rec.failure_kind if failure_rec.status == M.FAILED else None,
+            halt_reason=failure_rec.halt_reason,
+        )
+    return state, parked, failure
 
 
 def _current_step(
@@ -768,7 +818,11 @@ _UNRESOLVED: Any = object()
 
 
 def compute_run_state(
-    man: Manifest, liveness: str, *, gate_cycle_id: str | None = _UNRESOLVED
+    man: Manifest,
+    liveness: str,
+    *,
+    gate_cycle_id: str | None = _UNRESOLVED,
+    assessment: "RXM.RecoveryAssessment | None" = None,
 ) -> RunState:
     """The single computed composite state both the footer and ``--json`` render.
 
@@ -796,15 +850,26 @@ def compute_run_state(
             gate_cycle_id = cyc.id if cyc is not None else None
     else:
         gate_cycle_id = None
+    # P4 (plan §4.2): with a threaded-in recovery assessment (the CLI status
+    # path), render ITS safe actions — the same actions the mutating verbs
+    # will take, including the branch-relation refinements. Without one
+    # (pure callers, web store), the fallback table derives from the SAME
+    # shared kind table, so the two renderings agree on every base state.
+    if assessment is not None:
+        next_actions = render_assessment_actions(
+            assessment, state, man.slug, gate_cycle_id=gate_cycle_id
+        )
+    else:
+        next_actions = _actions_for(
+            state, man.slug, failure, gate_cycle_id=gate_cycle_id
+        )
     return RunState(
         state=state,
         slug=man.slug,
         current_step=_current_step(man, state, parked, failure),
         parked=parked,
         failure=failure,
-        next_actions=_actions_for(
-            state, man.slug, failure, gate_cycle_id=gate_cycle_id
-        ),
+        next_actions=next_actions,
     )
 
 

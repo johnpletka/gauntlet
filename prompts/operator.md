@@ -83,9 +83,17 @@ behind that output. Drive every decision off the reported state class:
   halt means the *agent* genuinely exceeded its budget, not that the laptop lid
   closed. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
-  A plain `resume` re-parks (fast, zero agent work) when the killed attempt left
-  the tree or branch dirty vs the step's recorded base — the park message shows
-  the dirty verdict (uncommitted paths and/or the offending commit range). The
+  A plain `resume` first reconciles a run branch left *ahead* of the manifest
+  by proven commit class: engine bookkeeping is tolerated, a committed
+  `P<N> wip:` checkpoint or phase/fix commit is **adopted** into the manifest
+  (the audit warning names the range) and the run continues from it, and an
+  operator commit becomes the next attempt's base — a hand-committed
+  `prd.md`/`plan.md` edit is surfaced loudly through the artifact's own gate,
+  never refused or discarded. It re-parks (fast, zero agent work) only when
+  the killed attempt left *uncommitted* work vs the step's recorded base — the
+  park message shows the dirty verdict (uncommitted paths). Repeating a resume
+  that changes nothing exits nonzero, naming the unchanged state and the
+  executable safe actions — never a silent re-park loop. The
   sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it preserves
   the partial work as a complete recovery snapshot under
   `refs/gauntlet/recovery/`, rewinds only to the latest
@@ -114,7 +122,8 @@ Work top-down; stop at the first branch that matches.
    to see the failing step's transcript and dir, diagnose, then `resume`. An
    `interrupted` step that re-parks on a dirty base has a sanctioned exit:
    `resume --reset-interrupted` (§1); a branch left ahead of the manifest by a
-   killed builder is reconciled by `rollback` or that same verb (§4/§4a).
+   killed builder is adopted by a plain `resume` (§1), or rewound instead by
+   `rollback` / that same verb (§4/§4a).
 4. **Does the manifest say running?** Then trust *liveness*, not the manifest:
    - `in_progress` → it is genuinely working; wait and observe. If it looks
      stalled, read the stall classification before acting: the driver heartbeat
@@ -166,10 +175,11 @@ Recover also reconciles the branch↔manifest pair it leaves behind: it snapshot
 the killed branch tip to a backup ref (`refs/gauntlet/backup/<run_id>/recover-…`)
 and, when the killed driver had committed work the manifest never recorded (a
 builder killed before a flush), records that unmanifested range on the §6.4
-audit record and as a manifest warning naming the two ways out: `rollback`
-(absorbs the unmanifested commits to a phase boundary, after backup) or
+audit record and as a manifest warning naming the ways out: a plain `resume`
+(adopts the recognized range into the manifest and continues), `rollback`
+(absorbs the unmanifested commits to a phase boundary, after backup), or
 `resume --reset-interrupted` (discards the interrupted attempt,
-checkpoint-preserving). Both are native verbs; neither needs git surgery.
+checkpoint-preserving). All are native verbs; none needs git surgery.
 
 ## 4a. Rollback (rewinding to a phase boundary)
 

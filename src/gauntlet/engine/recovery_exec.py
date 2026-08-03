@@ -57,12 +57,15 @@ from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.gitops import ENGINE_IDENTITY, GitError
 from gauntlet.engine.recovery import (
     AbortAction,
+    AdoptCommitsAction,
     BranchRelation,
     CommitKind,
+    ContinueOnRecoveryBranchAction,
     DriverLiveness,
     GitCommitObservation,
     GitCommitPathChange,
     GitObservation,
+    HumanDecisionAction,
     PathChangeKind,
     ProgressFingerprint,
     RecoveryAction,
@@ -71,6 +74,8 @@ from gauntlet.engine.recovery import (
     RecoveryCause,
     RecoveryDisposition,
     ResponseState,
+    RestartFromCheckpointAction,
+    RetryAction,
     RunStatus,
     SnapshotAndRestartAction,
     StateObservation,
@@ -568,6 +573,197 @@ class RecoveryPlanner:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
 
+    def assess(
+        self,
+        *,
+        manifest: "M.Manifest",
+        liveness: str,
+        git_obs: GitObservation | None,
+        fingerprint: ProgressFingerprint,
+    ) -> RecoveryAssessment:
+        """The one general recovery assessment (P4, plan §4.2 / R4).
+
+        Consumed by all four public workflows: ``status`` renders it,
+        ``resume`` chooses/apply its default action from it, ``recover``
+        derives its finalization reconciliation from the same observation, and
+        ``rollback`` (already) plans its rewind on the same machinery. Pure
+        over its inputs: no checkout, staging, reset, cleanup, or file writes.
+
+        The composite state and the mutating-action set come from the SAME
+        table operator.py renders (:func:`classify_composite` /
+        :func:`mutating_action_kinds`), and the branch-relation refinement
+        (adoption / checkpoint continuation / recovery-ref workflow, plan
+        §5.4) comes from the same inventory :func:`reconcile_branch_ahead`
+        applies — so the read-only view and the mutating path cannot disagree.
+        """
+        state, parked, failure = classify_composite(manifest, liveness)
+        failure_kind = failure.failure_kind if failure is not None else None
+        rec = _attempt_record(manifest)
+        attempt_id = f"{rec.id}#{rec.attempts}" if rec is not None else None
+        slug = manifest.slug
+
+        cause = _STATE_CAUSE[state]
+        disposition = _STATE_DISPOSITION[state]
+        if state == STATE_FAILED and failure_kind in M.RERUNNABLE_FAILURE_KINDS:
+            cause = RecoveryCause.PRECONDITION_UNSATISFIED
+            disposition = RecoveryDisposition.RETRY
+
+        actions: list[RecoveryAction] = []
+        for kind in mutating_action_kinds(state, failure_kind=failure_kind):
+            if kind is RecoveryActionKind.RETRY:
+                actions.append(
+                    RetryAction(
+                        description=(
+                            f"plain `gauntlet resume {slug}` re-drives the run "
+                            "from its persisted state"
+                        ),
+                        operation="resume",
+                        attempt_id=attempt_id,
+                    )
+                )
+            elif kind is RecoveryActionKind.HUMAN_DECISION:
+                step = parked or failure
+                step_id = step.id if step is not None else slug
+                if state == STATE_PARKED_GATE:
+                    actions.append(
+                        HumanDecisionAction(
+                            description=(
+                                f"decide the parked gate: `gauntlet approve "
+                                f"{slug}` or `gauntlet reject {slug} --notes`"
+                            ),
+                            decision_id=f"gate:{step_id}",
+                            prompt="approve or reject the parked human gate",
+                        )
+                    )
+                else:
+                    actions.append(
+                        HumanDecisionAction(
+                            description=(
+                                f"`gauntlet resume {slug} --response "
+                                '"<decision>"` injects a human decision'
+                            ),
+                            decision_id=f"response:{step_id}",
+                            prompt="supply the decision that unblocks the step",
+                        )
+                    )
+            elif kind is RecoveryActionKind.SNAPSHOT_AND_RESTART:
+                target_sha = None
+                if rec is not None and rec.base_sha:
+                    target_sha = rec.base_sha
+                elif git_obs is not None and git_obs.run_branch_sha:
+                    target_sha = git_obs.run_branch_sha
+                if target_sha is None:
+                    continue  # no executable payload → cannot advertise it
+                branch = (
+                    git_obs.run_branch if git_obs is not None else manifest.branch
+                )
+                actions.append(
+                    SnapshotAndRestartAction(
+                        description=(
+                            f"`gauntlet resume {slug} --reset-interrupted` "
+                            "snapshots the partial work and re-runs from the "
+                            "latest committed checkpoint"
+                        ),
+                        target_ref=f"refs/heads/{branch}",
+                        target_sha=target_sha,
+                        reason="discard the interrupted attempt after snapshot",
+                    )
+                )
+
+        evidence = [f"composite_state={state}", f"liveness={liveness}"]
+        if git_obs is not None:
+            relation = git_obs.branch_relation
+            evidence.append(f"branch_relation={relation.value}")
+            adoption_applies = rec is None or rec.type == "agent_task"
+            if (
+                relation in _ADOPTABLE_AHEAD
+                and git_obs.run_branch_commits
+                and adoption_applies  # step-owned recovery defers, like resume
+            ):
+                boundary = git_obs.recorded_sha
+                tip = git_obs.run_branch_sha
+                evidence.append(
+                    f"run branch ahead of the recorded boundary by "
+                    f"{boundary[:10]}..{tip[:10]} "
+                    f"({len(git_obs.run_branch_commits)} commit(s))"
+                )
+                for commit, paths in _governed_range_edits(git_obs):
+                    evidence.append(
+                        f"commit {commit.sha[:10]} ({commit.subject!r}) "
+                        f"modifies governed artifact(s) {', '.join(paths)} — "
+                        "sanctioned; ratified through the artifact's own "
+                        "gate/response loop (R9/FR-10.4)"
+                    )
+                relation_action: RecoveryAction
+                if relation is BranchRelation.CHECKPOINT_AHEAD:
+                    checkpoint = _latest_checkpoint(git_obs)
+                    assert checkpoint is not None
+                    relation_action = RestartFromCheckpointAction(
+                        description=(
+                            f"plain `gauntlet resume {slug}` adopts checkpoint "
+                            f"{checkpoint.sha[:10]} ({checkpoint.subject!r}) as "
+                            "the attempt boundary and continues from it"
+                        ),
+                        checkpoint_sha=checkpoint.sha,
+                        step_id=rec.id if rec is not None else slug,
+                    )
+                    cause = RecoveryCause.BRANCH_AHEAD
+                    disposition = RecoveryDisposition.RESTART_FROM_CHECKPOINT
+                else:
+                    relation_action = AdoptCommitsAction(
+                        description=(
+                            f"plain `gauntlet resume {slug}` adopts "
+                            f"{boundary[:10]}..{tip[:10]} into the manifest "
+                            "and continues (loud manifest audit; nothing "
+                            "rewound or discarded)"
+                        ),
+                        base_sha=boundary,
+                        tip_sha=tip,
+                        commit_shas=tuple(
+                            c.sha for c in git_obs.run_branch_commits
+                        ),
+                    )
+                    cause = RecoveryCause.BRANCH_AHEAD
+                    disposition = RecoveryDisposition.ADOPT_COMMITS
+                actions = [
+                    a for a in actions if a.kind is not RecoveryActionKind.RETRY
+                ]
+                actions.insert(0, relation_action)
+            elif relation in _DIVERGED_RELATIONS:
+                evidence.append(
+                    "the run branch and the recorded boundary disagree "
+                    f"({relation.value}); a plain resume refuses until the "
+                    "branch is restored"
+                )
+                cause = RecoveryCause.BRANCH_DIVERGED
+                disposition = RecoveryDisposition.CONTINUE_ON_RECOVERY_BRANCH
+                actions = list(relation_recovery_actions(git_obs, manifest))
+
+        if state in _NONTERMINAL_DEAD_DRIVER_STATES and not actions:
+            # R1: every persisted nonterminal state with a dead driver exposes
+            # at least one safe executable action — abort is the floor.
+            actions.append(
+                AbortAction(
+                    description=(
+                        f"`gauntlet abort {slug}` aborts the run, retaining "
+                        "every snapshot and all evidence"
+                    ),
+                    reason="no more specific safe action is executable",
+                )
+            )
+        kinds = [a.kind for a in actions]
+        recommended = kinds[0] if kinds else None
+        if not actions and disposition is not RecoveryDisposition.CONTINUE:
+            disposition = RecoveryDisposition.CONTINUE  # nothing executable
+        return RecoveryAssessment(
+            cause=cause,
+            disposition=disposition,
+            evidence=tuple(evidence),
+            safe_actions=tuple(actions),
+            recommended_action=recommended,
+            progress_fingerprint=fingerprint.digest,
+        )
+
     def assess_rewind(
         self,
         *,
@@ -680,6 +876,501 @@ def _governed_discards(
         if paths:
             out.append((commit, paths))
     return out
+
+
+# --- the one recovery assessment (P4, plan §4.2 / R4) ---------------------------
+#
+# The composite run-state classification and the state → mutating-action table
+# live HERE — not in operator.py — so the read-only status surface and the
+# mutating resume path consume one decision core and can never drift (R4).
+# operator.py renders these (adding its observe-only rows); resume chooses its
+# default action from the same table; recover's finalization derives its
+# branch↔manifest reconciliation notes from the same observation machinery.
+
+# Composite run-state classes (PRD operator-aids §6.3). operator.py re-exports
+# these as its STATE_* names; the values are the §6.1 `state` enum verbatim.
+STATE_IN_PROGRESS = "in_progress"
+STATE_ORPHANED = "orphaned"
+STATE_INDETERMINATE = "indeterminate"
+STATE_PARKED_GATE = "parked_gate"
+STATE_PARKED_FOR_RESPONSE = "parked_for_response"
+STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
+STATE_PARKED_USAGE_WINDOW = "parked_usage_window"
+STATE_PARKED_ARTIFACT_INVALID = "parked_artifact_invalid"
+STATE_FAILED = "failed"
+STATE_HALTED = "halted"
+STATE_INTERRUPTED = "interrupted"
+STATE_DONE = "done"
+STATE_ABORTED = "aborted"
+STATE_UNKNOWN = "unknown"
+
+# Step statuses that mean "a terminal failure of this step" (§6.3a).
+_FAILURE_STATUSES = (M.FAILED, M.HALTED, M.INTERRUPTED)
+
+_LIVENESS_ALIVE = DriverLiveness.ALIVE.value
+_LIVENESS_ORPHANED = DriverLiveness.ORPHANED.value
+_LIVENESS_NONE = DriverLiveness.NONE.value
+
+
+def classify_composite(
+    man: "M.Manifest", liveness: str
+) -> "tuple[str, M.StepRecord | None, M.StepRecord | None]":
+    """The total ``(run_status, liveness, descriptor) -> state`` function (§6.3).
+
+    Returns ``(state, parked_record, failure_record)`` — raw step records, so
+    this core stays free of operator.py's rendering machinery (operator wraps
+    them into its descriptors). Any unrecognized ``run_status`` or an
+    internally contradictory manifest maps to ``unknown`` → read-only
+    inspection only.
+
+    P4 (plan §5.3, historical-shape recognition): ``RUN_RUNNING`` plus exactly
+    one ENDED interrupted/halted/failed step is the kill-window shape a
+    pre-P4 engine could persist (step terminal state flushed, run status not
+    yet) — and remains reachable for one write even post-P4 (the resume
+    write-ahead precedes a terminal re-persist). It maps to the corresponding
+    RECOVERABLE state by liveness instead of ``unknown``:
+    alive → ``in_progress`` (the driver is mid-transition); orphaned/none →
+    the step's own failure class; indeterminate → ``indeterminate``.
+    """
+    status = man.status
+    parked_steps = [s for s in man.steps if s.status == M.PARKED]
+    failure_steps = [s for s in man.steps if s.status in _FAILURE_STATUSES]
+
+    # `running` is untrustworthy from the manifest, so liveness governs.
+    if status == M.RUN_RUNNING:
+        if parked_steps or failure_steps:
+            # Plan §5.3: the recognized historical kill-window shape.
+            if (
+                len(failure_steps) == 1
+                and not parked_steps
+                and failure_steps[0].ended
+            ):
+                fs = failure_steps[0]
+                if liveness == _LIVENESS_ALIVE:
+                    return STATE_IN_PROGRESS, None, None
+                if liveness in (_LIVENESS_ORPHANED, _LIVENESS_NONE):
+                    return fs.status, None, fs
+                return STATE_INDETERMINATE, None, None
+            return STATE_UNKNOWN, None, None  # descriptor under a `—` status
+        if liveness == _LIVENESS_ALIVE:
+            return STATE_IN_PROGRESS, None, None
+        if liveness in (_LIVENESS_ORPHANED, _LIVENESS_NONE):
+            return STATE_ORPHANED, None, None
+        return STATE_INDETERMINATE, None, None  # indeterminate → read-only
+
+    # done/aborted are engine-written and authoritative; a parked/failure
+    # descriptor under them is contradictory.
+    if status in (M.RUN_DONE, M.RUN_ABORTED):
+        if parked_steps or failure_steps:
+            return STATE_UNKNOWN, None, None
+        return (STATE_DONE if status == M.RUN_DONE else STATE_ABORTED), None, None
+
+    # parked — a genuine human/response park OR a budget/timeout halt / a
+    # mid-step interruption (the engine parks the RUN while the STEP keeps its
+    # HALTED/INTERRUPTED status — orchestrator._set_run_status, FR-3.3).
+    if status == M.RUN_PARKED:
+        halt_steps = [s for s in man.steps if s.status in (M.HALTED, M.INTERRUPTED)]
+        if len(halt_steps) == 1 and not parked_steps:
+            return halt_steps[0].status, None, halt_steps[0]
+        if len(parked_steps) != 1 or halt_steps:
+            return STATE_UNKNOWN, None, None  # zero/multiple/mixed → contradiction
+        ps = parked_steps[0]
+        reason = M.normalize_parked_reason(ps.parked_reason, ps.type, ps.status)
+        if reason == M.PARKED_REASON_RESPONSE:
+            return STATE_PARKED_FOR_RESPONSE, ps, None
+        if reason == M.PARKED_REASON_USAGE_LIMIT:
+            return STATE_PARKED_USAGE_LIMIT, ps, None
+        if reason == M.PARKED_REASON_ARTIFACT_INVALID:
+            return STATE_PARKED_ARTIFACT_INVALID, ps, None
+        if reason == M.PARKED_REASON_USAGE_WINDOW:
+            return STATE_PARKED_USAGE_WINDOW, ps, None
+        if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
+            return STATE_PARKED_GATE, ps, None
+        return STATE_UNKNOWN, None, None
+
+    # failed — the last failure step in manifest order is authoritative (§6.3a).
+    if status == M.RUN_FAILED:
+        if not failure_steps:
+            return STATE_UNKNOWN, None, None
+        fs = failure_steps[-1]
+        return fs.status, None, fs
+
+    return STATE_UNKNOWN, None, None  # any unrecognized run_status
+
+
+# The state → mutating-action-kind table (§6.3 next-action column, mutating
+# rows only). Consumed by BOTH operator._actions_for (rendered as CLI rows,
+# after its observe-only prefix) and RecoveryPlanner.assess (as payload-complete
+# P1 actions) — one table, zero drift (R4). `failed` is resolved by
+# `mutating_action_kinds` because it depends on the failure kind.
+_MUTATING_KINDS: dict[str, tuple[RecoveryActionKind, ...]] = {
+    STATE_IN_PROGRESS: (),
+    STATE_ORPHANED: (RecoveryActionKind.RETRY,),
+    STATE_INDETERMINATE: (),
+    STATE_PARKED_GATE: (RecoveryActionKind.HUMAN_DECISION,),
+    STATE_PARKED_FOR_RESPONSE: (RecoveryActionKind.HUMAN_DECISION,),
+    STATE_PARKED_USAGE_LIMIT: (RecoveryActionKind.RETRY,),
+    STATE_PARKED_USAGE_WINDOW: (RecoveryActionKind.RETRY,),
+    STATE_PARKED_ARTIFACT_INVALID: (RecoveryActionKind.RETRY,),
+    STATE_HALTED: (RecoveryActionKind.RETRY,),
+    STATE_INTERRUPTED: (
+        RecoveryActionKind.RETRY,
+        RecoveryActionKind.SNAPSHOT_AND_RESTART,
+    ),
+    STATE_DONE: (),
+    STATE_ABORTED: (),
+    STATE_UNKNOWN: (),
+}
+
+
+def mutating_action_kinds(
+    state: str, *, failure_kind: str | None = None
+) -> tuple[RecoveryActionKind, ...]:
+    """The mutating action kinds for a composite state (the shared table)."""
+    if state == STATE_FAILED:
+        if failure_kind in M.RERUNNABLE_FAILURE_KINDS:
+            return (RecoveryActionKind.RETRY,)
+        return (RecoveryActionKind.HUMAN_DECISION,)
+    return _MUTATING_KINDS.get(state, ())
+
+
+# States whose composite class means "the driver is finished/absent and the
+# state is nonterminal" — the R1 rows every assessment must arm with at least
+# one safe mutating action.
+_NONTERMINAL_DEAD_DRIVER_STATES = frozenset(
+    {
+        STATE_ORPHANED,
+        STATE_PARKED_GATE,
+        STATE_PARKED_FOR_RESPONSE,
+        STATE_PARKED_USAGE_LIMIT,
+        STATE_PARKED_USAGE_WINDOW,
+        STATE_PARKED_ARTIFACT_INVALID,
+        STATE_FAILED,
+        STATE_HALTED,
+        STATE_INTERRUPTED,
+    }
+)
+
+_STATE_CAUSE: dict[str, RecoveryCause] = {
+    STATE_IN_PROGRESS: RecoveryCause.NONE,
+    STATE_ORPHANED: RecoveryCause.PROCESS_LOST,
+    STATE_INDETERMINATE: RecoveryCause.NONE,
+    STATE_PARKED_GATE: RecoveryCause.NONE,
+    STATE_PARKED_FOR_RESPONSE: RecoveryCause.NONE,
+    STATE_PARKED_USAGE_LIMIT: RecoveryCause.QUOTA_EXHAUSTED,
+    STATE_PARKED_USAGE_WINDOW: RecoveryCause.QUOTA_EXHAUSTED,
+    STATE_PARKED_ARTIFACT_INVALID: RecoveryCause.ARTIFACT_INVALID,
+    STATE_FAILED: RecoveryCause.INTERNAL_ERROR,
+    STATE_HALTED: RecoveryCause.INTERNAL_ERROR,
+    STATE_INTERRUPTED: RecoveryCause.PROCESS_LOST,
+    STATE_DONE: RecoveryCause.NONE,
+    STATE_ABORTED: RecoveryCause.NONE,
+    STATE_UNKNOWN: RecoveryCause.STATE_INCONSISTENT,
+}
+
+_STATE_DISPOSITION: dict[str, RecoveryDisposition] = {
+    STATE_IN_PROGRESS: RecoveryDisposition.CONTINUE,
+    STATE_ORPHANED: RecoveryDisposition.RETRY,
+    STATE_INDETERMINATE: RecoveryDisposition.CONTINUE,
+    STATE_PARKED_GATE: RecoveryDisposition.HUMAN_DECISION,
+    STATE_PARKED_FOR_RESPONSE: RecoveryDisposition.HUMAN_DECISION,
+    STATE_PARKED_USAGE_LIMIT: RecoveryDisposition.RETRY,
+    STATE_PARKED_USAGE_WINDOW: RecoveryDisposition.RETRY,
+    STATE_PARKED_ARTIFACT_INVALID: RecoveryDisposition.EDIT_THEN_RETRY,
+    STATE_FAILED: RecoveryDisposition.HUMAN_DECISION,  # RETRY when re-runnable
+    STATE_HALTED: RecoveryDisposition.RETRY,
+    STATE_INTERRUPTED: RecoveryDisposition.RETRY,
+    STATE_DONE: RecoveryDisposition.CONTINUE,
+    STATE_ABORTED: RecoveryDisposition.CONTINUE,
+    STATE_UNKNOWN: RecoveryDisposition.CONTINUE,  # read-only inspection only
+}
+
+# Ahead relations resume reconciles by adoption (plan §5.4 / R6); behind /
+# forked / missing instead get an explicit recovery-ref workflow.
+_ADOPTABLE_AHEAD = frozenset(
+    {
+        BranchRelation.CHECKPOINT_AHEAD,
+        BranchRelation.IMPLEMENTATION_AHEAD,
+        BranchRelation.OPERATOR_AHEAD,
+        BranchRelation.MIXED_AHEAD,
+        BranchRelation.UNCLASSIFIED_AHEAD,
+    }
+)
+_DIVERGED_RELATIONS = frozenset(
+    {BranchRelation.BEHIND, BranchRelation.FORKED, BranchRelation.MISSING}
+)
+# Public names for the verb layer (resume/recover consume these classes).
+ADOPTABLE_AHEAD_RELATIONS = _ADOPTABLE_AHEAD
+DIVERGED_RELATIONS = _DIVERGED_RELATIONS
+
+
+def _attempt_record(man: "M.Manifest") -> "M.StepRecord | None":
+    """The step record whose ``base_sha`` anchors the in-flight attempt.
+
+    The last record with a stamped attempt boundary that is still in a
+    non-terminal-for-the-run state (running / interrupted): that is the record
+    whose boundary a plain resume's disposition will diff against, so it is
+    the one an adoption re-anchors.
+    """
+    target = None
+    for rec in man.steps:
+        if rec.base_sha and rec.status in (M.RUNNING, M.INTERRUPTED):
+            target = rec
+    return target
+
+
+def reconciliation_boundary(man: "M.Manifest") -> str | None:
+    """The recorded Git boundary a resume reconciles the run branch against.
+
+    The in-flight attempt's ``base_sha`` when a step is mid-attempt (that is
+    what the resume disposition diffs against), else the manifest's last
+    recorded commit (the rollback/branch-guard boundary), else ``None``
+    (nothing recorded — an unrecorded relation, never reconciled).
+    """
+    rec = _attempt_record(man)
+    if rec is not None and rec.base_sha:
+        return rec.base_sha
+    if man.commits:
+        return man.commits[-1].sha
+    return None
+
+
+def relation_recovery_actions(
+    git_obs: GitObservation, man: "M.Manifest"
+) -> tuple[RecoveryAction, ...]:
+    """Executable recovery actions for a behind/forked/missing run branch.
+
+    Plan §5.4: these relations must offer a recovery-ref/restore/continue
+    workflow, "not only reconcile manually". Every action is non-destructive:
+    it creates or fast-forwards a ref onto history that provably exists, or
+    aborts retaining all evidence.
+    """
+    relation = git_obs.branch_relation
+    actions: list[RecoveryAction] = []
+    recorded = git_obs.recorded_sha
+    if relation is BranchRelation.MISSING and recorded is not None:
+        actions.append(
+            ContinueOnRecoveryBranchAction(
+                description=(
+                    f"recreate the missing run branch {git_obs.run_branch!r} at "
+                    f"the last recorded commit {recorded[:10]} (the commit "
+                    "object still exists; creating the ref discards nothing)"
+                ),
+                branch_name=git_obs.run_branch,
+                start_sha=recorded,
+            )
+        )
+    elif relation is BranchRelation.BEHIND and recorded is not None:
+        actions.append(
+            ContinueOnRecoveryBranchAction(
+                description=(
+                    f"fast-forward {git_obs.run_branch!r} back to the recorded "
+                    f"tip {recorded[:10]} (a pure fast-forward — every recorded "
+                    "commit is preserved in git and re-anchored)"
+                ),
+                branch_name=git_obs.run_branch,
+                start_sha=recorded,
+            )
+        )
+    elif relation is BranchRelation.FORKED and git_obs.run_branch_sha is not None:
+        tip = git_obs.run_branch_sha
+        actions.append(
+            ContinueOnRecoveryBranchAction(
+                description=(
+                    f"preserve the forked tip {tip[:10]} on a recovery branch, "
+                    f"then restore {git_obs.run_branch!r} to the recorded "
+                    f"boundary {recorded[:10] if recorded else '?'} and resume"
+                ),
+                branch_name=f"{git_obs.run_branch}-fork-{tip[:10]}",
+                start_sha=tip,
+            )
+        )
+    actions.append(
+        AbortAction(
+            description="abort the run, retaining every snapshot and all evidence",
+            reason=f"run branch relation {relation.value} left unreconciled",
+        )
+    )
+    return tuple(actions)
+
+
+def _latest_checkpoint(
+    git_obs: GitObservation,
+) -> GitCommitObservation | None:
+    """The newest checkpoint commit in the inventoried ahead range."""
+    found = None
+    for commit in git_obs.run_branch_commits:
+        if commit.kind is CommitKind.CHECKPOINT:
+            found = commit
+    return found
+
+
+def _governed_range_edits(
+    git_obs: GitObservation,
+) -> list[tuple[GitCommitObservation, list[str]]]:
+    """Commits in the inventoried range that modify governed artifacts."""
+    out: list[tuple[GitCommitObservation, list[str]]] = []
+    for commit in git_obs.run_branch_commits:
+        paths = [c.path for c in commit.changed_paths if c.approved_artifact]
+        if paths:
+            out.append((commit, paths))
+    return out
+
+
+def _phase_ordinal(label: str | None) -> int | None:
+    """``P<N>`` → ``N``; every other stage label (PRD/PLAN/REVIEW/None) → None."""
+    if label and re.fullmatch(r"P\d+", label):
+        return int(label[1:])
+    return None
+
+
+def reconcile_branch_ahead(
+    man: "M.Manifest",
+    git_obs: GitObservation,
+    *,
+    verb: str = "resume",
+) -> list[str]:
+    """Adopt a provably-linear ahead range into the manifest (plan §5.4 / R6).
+
+    Manifest-only — never a Git mutation, so no executor transaction is
+    required (every Git-mutating rewind stays behind :class:`RecoveryExecutor`).
+    Returns the audit notes appended to ``man.warnings`` (every adoption is
+    loud); the caller owns the atomic persist. The reconciliation classes:
+
+    * ``engine_bookkeeping_ahead`` — tolerated, unchanged (not adopted; the
+      dirty checks already treat pure bookkeeping advance as clean);
+    * ``checkpoint_ahead`` — continue from the newest ``P<N> wip:`` checkpoint:
+      it becomes the in-flight attempt's boundary instead of re-parking;
+    * ``implementation_ahead`` — recognized phase/fix commits are adopted into
+      ``manifest.commits`` (the builder committed, the flush never landed) and
+      the attempt boundary moves to the tip; a range whose phase ordinal
+      precedes the last recorded phase is NOT treated as fresh implementation
+      (that shape is manual history surgery) — it falls through to the
+      operator-adoption path, loudly;
+    * ``operator_ahead`` / ``mixed_ahead`` / ``unclassified_ahead`` — adopted
+      as the next attempt's base. A commit modifying a governed artifact
+      (prd.md/plan.md) is surfaced LOUDLY as the sanctioned upstream path —
+      the artifact's own review loop and human gate ratify it (R9/FR-10.4) —
+      and is NEVER refused or silently discarded (operator direction on the
+      post-P3 F-004 review: hand-editing and committing governed artifacts is
+      a normal workflow).
+    """
+    relation = git_obs.branch_relation
+    if relation not in _ADOPTABLE_AHEAD or not git_obs.run_branch_commits:
+        return []
+    rec = _attempt_record(man)
+    if rec is not None and rec.type != "agent_task":
+        # Step types that OWN their recovery reconcile the range themselves:
+        # a killed `commit` step adopts its already-landed `P<N>:` commit from
+        # the git log on re-entry, and an `adversarial_cycle` re-enters
+        # through its own checkpoint-aware recovery. Re-anchoring their
+        # attempt boundary here would erase exactly the evidence those
+        # mechanisms key on (head-moved-off-base), so the verb-level adoption
+        # defers — fail toward the narrower, step-owned reconciliation.
+        return []
+    tip = git_obs.run_branch_sha
+    boundary = git_obs.recorded_sha
+    assert tip is not None and boundary is not None  # proven by the relation
+    notes: list[str] = []
+    known_shas = {c.sha for c in man.commits}
+
+    def note(text: str) -> None:
+        if text not in man.warnings:
+            man.warnings.append(text)
+        notes.append(text)
+
+    range_label = f"{boundary[:10]}..{tip[:10]}"
+    governed = _governed_range_edits(git_obs)
+
+    adopt_as_implementation = relation is BranchRelation.IMPLEMENTATION_AHEAD
+    if adopt_as_implementation:
+        last_phase = None
+        for commit in man.commits:
+            ordinal = _phase_ordinal(commit.phase.split(".")[0])
+            if ordinal is not None:
+                last_phase = ordinal if last_phase is None else max(last_phase, ordinal)
+        for commit in git_obs.run_branch_commits:
+            ordinal = _phase_ordinal(commit.phase_id)
+            if (
+                commit.kind in (CommitKind.PHASE, CommitKind.FIX)
+                and ordinal is not None
+                and last_phase is not None
+                and ordinal < last_phase
+            ):
+                adopt_as_implementation = False
+                note(
+                    f"{verb}: commit {commit.sha[:10]} ({commit.subject!r}) in "
+                    f"{range_label} carries phase P{ordinal}, which precedes "
+                    f"the last recorded phase P{last_phase} — not fresh "
+                    "implementation work; the range is adopted as operator "
+                    "work instead (plan §5.4)"
+                )
+
+    if relation is BranchRelation.CHECKPOINT_AHEAD:
+        checkpoint = _latest_checkpoint(git_obs)
+        assert checkpoint is not None  # proven by the relation label
+        if rec is not None:
+            rec.base_sha = checkpoint.sha
+        note(
+            f"{verb}: adopted checkpoint {checkpoint.sha[:10]} "
+            f"({checkpoint.subject!r}) as the attempt boundary for "
+            f"{rec.id if rec is not None else 'the next attempt'} — the run "
+            f"branch was ahead of the manifest by {range_label} "
+            "(committed checkpoint work continues instead of re-parking; "
+            "plan §5.4/R6)"
+        )
+        return notes
+
+    if adopt_as_implementation:
+        adopted: list[str] = []
+        for commit in git_obs.run_branch_commits:
+            if commit.kind not in (CommitKind.PHASE, CommitKind.FIX):
+                continue
+            if commit.sha in known_shas:
+                continue
+            phase_label = commit.subject.split(":", 1)[0].strip()
+            man.commits.append(
+                M.CommitRecord(
+                    step_id=(rec.id if rec is not None else verb),
+                    phase=phase_label,
+                    sha=commit.sha,
+                )
+            )
+            adopted.append(f"{commit.sha[:10]} ({commit.subject!r})")
+        if rec is not None:
+            rec.base_sha = tip
+        note(
+            f"{verb}: adopted {len(adopted)} implementation commit(s) in "
+            f"{range_label} into the manifest — the builder committed but the "
+            "manifest flush never landed (issue #72, plan §5.4/R6): "
+            + "; ".join(adopted)
+        )
+        for commit, paths in governed:
+            note(
+                f"{verb}: adopted commit {commit.sha[:10]} modifies governed "
+                f"artifact(s) {', '.join(paths)} — surfaced through the "
+                "artifact's own review loop and human gate (R9/FR-10.4), "
+                "never refused or silently discarded"
+            )
+        return notes
+
+    # operator / mixed / unclassified (or demoted implementation) adoption.
+    for commit, paths in governed:
+        note(
+            f"{verb}: operator commit {commit.sha[:10]} ({commit.subject!r}) "
+            f"modifies governed artifact(s) {', '.join(paths)}; the edit is "
+            "SANCTIONED and preserved — it reaches ratification through the "
+            "artifact's own gate/response loop (R9/FR-10.4), never refused, "
+            "never silently discarded"
+        )
+    if rec is not None:
+        rec.base_sha = tip
+    note(
+        f"{verb}: adopted operator work {range_label} as the next attempt's "
+        f"base (relation {relation.value}); nothing was rewound or discarded "
+        "(plan §5.4/R6)"
+    )
+    return notes
 
 
 # --- the transaction ------------------------------------------------------------
@@ -1629,6 +2320,25 @@ def replay_pending_intent(repo: Path, run_dir: Path) -> str | None:
 __all__ = [
     "DRIVING_LOCK_NAME",
     "EXECUTOR_INTENT_NAME",
+    "STATE_ABORTED",
+    "STATE_DONE",
+    "STATE_FAILED",
+    "STATE_HALTED",
+    "STATE_INDETERMINATE",
+    "STATE_INTERRUPTED",
+    "STATE_IN_PROGRESS",
+    "STATE_ORPHANED",
+    "STATE_PARKED_ARTIFACT_INVALID",
+    "STATE_PARKED_FOR_RESPONSE",
+    "STATE_PARKED_GATE",
+    "STATE_PARKED_USAGE_LIMIT",
+    "STATE_PARKED_USAGE_WINDOW",
+    "STATE_UNKNOWN",
+    "classify_composite",
+    "mutating_action_kinds",
+    "reconcile_branch_ahead",
+    "reconciliation_boundary",
+    "relation_recovery_actions",
     "GOVERNED_DISCARD_EVIDENCE_PREFIX",
     "GOVERNED_EVIDENCE_PAYLOAD_KEY",
     "REPLAY_FINISHERS",

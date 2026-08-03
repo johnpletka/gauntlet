@@ -11,6 +11,13 @@ that the parent SIGKILLs at a precise point in the kill-timing matrix:
   normally, so the kill (which the parent times via a later blocking ``tests``
   shell step in the pipeline) lands *after* the agent step is recorded done but
   before the commit step completes — the between-step recovery path.
+- ``boundary:<n>:<when>:<sig>`` (P4, plan §5.3 / issue #62): a completing run
+  that self-signals ``<sig>`` (``term``/``kill``) exactly ``<when>``
+  (``before``/``after``) the ``<n>``-th orchestrator manifest persist — a real
+  process death AT a durable persist boundary, deterministic by construction
+  (no sentinel/polling race). If the run completes before persist ``n`` fires,
+  the child writes ``.crash_boundary_done`` and exits 0, telling the parent
+  the boundary matrix is exhausted.
 
 The parent then resumes and asserts the engine recovers without lost/duplicated
 effects.
@@ -18,6 +25,7 @@ effects.
 
 from __future__ import annotations
 
+import signal
 import sys
 import time
 from pathlib import Path
@@ -58,10 +66,49 @@ class CompletingAdapter:
         return AgentResult(text="implemented", exit_code=0)
 
 
+def _arm_persist_boundary_kill(repo: Path, spec: str) -> None:
+    """Self-signal at the n-th orchestrator persist (``boundary:<n>:<when>:<sig>``).
+
+    Wraps ``Orchestrator._persist`` — the single durable manifest-write point —
+    so the process dies exactly before/after one specific durable boundary.
+    ``signal.raise_signal`` delivers synchronously; SIGTERM keeps its default
+    disposition (terminate), SIGKILL is uncatchable by construction.
+    """
+    from gauntlet.engine.orchestrator import Orchestrator
+
+    _, idx, when, sig_name = spec.split(":")
+    target = int(idx)
+    sig = signal.SIGKILL if sig_name == "kill" else signal.SIGTERM
+    real = Orchestrator._persist
+    count = {"n": 0}
+
+    def wrapped(self):
+        count["n"] += 1
+        if when == "before" and count["n"] == target:
+            signal.raise_signal(sig)
+        real(self)
+        if when == "after" and count["n"] == target:
+            signal.raise_signal(sig)
+
+    Orchestrator._persist = wrapped
+
+    def done_marker() -> None:
+        if count["n"] < target:
+            (repo / ".crash_boundary_done").write_text(str(count["n"]))
+
+    import atexit
+
+    atexit.register(done_marker)
+
+
 def main() -> int:
     repo, slug = Path(sys.argv[1]), sys.argv[2]
     mode = sys.argv[3] if len(sys.argv) > 3 else "mid_step"
-    adapter = CompletingAdapter() if mode == "between_step" else SleepyAdapter()
+    if mode.startswith("boundary:"):
+        _arm_persist_boundary_kill(repo, mode)
+        adapter = CompletingAdapter()
+    else:
+        adapter = CompletingAdapter() if mode == "between_step" else SleepyAdapter()
     mgr = RunManager(repo)
     pipeline = repo / "pipelines" / "crash.yaml"
     mgr.start(slug, pipeline, use_judge=False, adapter_factory=lambda n: adapter)
