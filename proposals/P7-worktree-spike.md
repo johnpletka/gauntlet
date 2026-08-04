@@ -1,16 +1,37 @@
 # P7 design spike: the dedicated run worktree
 
-> **Status: PROPOSED — awaiting human ratification.** This document is the
+> **Status: RATIFIED by the maintainer (2026-08-04).** This document is the
 > design spike that `RECOVERY-REDESIGN-PLAN.md` §4.7 and §6 P7 require *before*
-> any implementation. It changes no engine code, no run/worktree layout, and no
-> public verb. Every experiment below ran in throwaway temp directories; the
-> only tracked change in this commit is this file.
+> any implementation, and this approval is the "explicit human permission for
+> the chosen worktree/state-root layout" that §6 P7 gates on. The spike itself
+> changes no engine code, no run/worktree layout, and no public verb; every
+> experiment ran in throwaway temp directories.
 >
-> **What ratification is being asked for:** the state-root/worktree-root layout
-> in §4 and §6, the lock model in §8, the acknowledgement of the two upstream
-> conflicts in §14 (FR-4.1/FR-4.5 evidence location, and the governed artifact
-> authoring surface), and the scope question in §14.3 (`gauntlet review`). P7
-> implementation may not begin until those are ratified.
+> **What was ratified**, as the recommendations are written here:
+>
+> 1. **§4** — the state-root/worktree-root split: the run-instance dir does not
+>    move (it stays in the operator's checkout under `run_root`), the run
+>    worktree is code-only plus a two-file bookkeeping export dir.
+> 2. **§6** — the worktree root at
+>    `<git-common-dir>/gauntlet/worktrees/<slug>/<run-id>`, fixed, no config knob.
+> 3. **§8** — the three-layer lock model (per-run driving lock, repo-global git
+>    lock, `git worktree lock` marker).
+> 4. **§14.1** — accept the pre-existing residual risk rather than revise FR-4.
+>    **No `PRD-gauntlet.md` change is authorized or required by this approval.**
+> 5. **§14.2** — the operator's checkout remains the governed-artifact authoring
+>    surface, synced into the run worktree under R2/R9.
+> 6. **§14.3** — `gauntlet review` is **out of scope** for P7, deliberately.
+> 7. **§14.4** — `gauntlet <verb>` invoked from inside a run worktree refuses.
+> 8. **§13** — the P7a→P7d phasing, including `worktree.mode` defaulting to
+>    `same_tree` until a dogfood run justifies P7d.
+> 9. **§18** — the operator-surface delta ships in the same commit series as the
+>    behaviour change it describes.
+>
+> **What this approval does NOT authorize:** any edit to `PRD-gauntlet.md` or
+> `RECOVERY-REDESIGN-PLAN.md`; the §15 deferrals (D1–D6), each of which needs
+> its own ratification — most importantly **D1, `refs/gauntlet/state/<run>`
+> anchoring**, which P7 must not absorb; and any change to a public verb's name
+> or semantics beyond the additive `resume --same-tree` flag.
 >
 > **Revision 2** (after the first review round) adds §18 — Decision 11, the
 > operator surface — plus the §9.7 defect it uncovered and the §14.3 scope
