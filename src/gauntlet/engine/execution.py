@@ -65,6 +65,15 @@ class StepResult:
     # when unreported). Both ``None`` for every non-usage-limit outcome.
     retry_after_s: int | None = None
     quota_reset_at: str | None = None
+    # Engine-computed backoff deadline in seconds for a ``provider_unavailable``
+    # park (plan §5.2, P5): the NEXT dependency-retry delay after the persisted
+    # budget was exhausted. DISTINCT from ``retry_after_s`` (which is reserved
+    # for a provider's STRUCTURED hint, never synthesized): ``_finalize``
+    # derives ``quota_reset_at`` from it when neither an explicit reset time nor
+    # a structured hint exists, so every dependency park carries the concrete
+    # deadline the P4.1 F-006 no-progress exemption requires. ``None`` for every
+    # other outcome.
+    backoff_s: int | None = None
     # Which cycle sub-step produced the preserved ``session_id`` on a usage-limit
     # park (harness-efficiency FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``,
     # ``"r2-triage"``. Carried onto the StepRecord by ``_finalize`` so a resume
@@ -304,8 +313,10 @@ def governed_artifact_paths(repo_root: Path, artifact_root: Path) -> list[str]:
     evidence promoted to manifest warnings) with the state preserved in the
     recovery snapshot — never refused (post-P3 review F-004, per operator
     direction). Existence-independent: a classifier walks history, where the
-    path may predate or outlive the file on disk. Approval-STATE awareness is
-    the P5 taxonomy's refinement.
+    path may predate or outlive the file on disk. Approval-state routing landed
+    with the P5 taxonomy (plan §5.1): pre-approval defects park back into the
+    artifact's own author/fix loop at their sites, post-approval edits stay on
+    this loud governance path.
     """
     root = repo_root.resolve()
     art = artifact_root.resolve()

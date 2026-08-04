@@ -49,8 +49,19 @@ PARKED_REASON_ARTIFACT_INVALID = "artifact_invalid"
 PARKED_REASON_RESPONSE = "response"
 # A park at a human ratification gate (``human_gate``): awaiting approve/reject.
 PARKED_REASON_GATE = "gate"
+# A transport/dependency park (plan §5.2, P5): the provider itself was
+# unreachable or failing — typed timeout / connection / DNS / 5xx /
+# service-unavailable / overload — and the bounded in-process dependency
+# retries (persisted on ``StepRecord.dependency_attempts``) were exhausted.
+# DISTINCT from ``usage_limit`` (a quota wall): no human decision is at stake
+# and a PLAIN ``gauntlet resume`` retries the step — NEVER ``--response``
+# (R7; issue #63). The park always records a concrete backoff/Retry-After
+# deadline on ``quota_reset_at`` so it is a legitimate wait, not a wedge
+# (P4.1 F-006).
+PARKED_REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 # The complete PRD parked_reason enum (the only values written / emitted).
+# ``provider_unavailable`` was APPENDED by P5 (additive; schema_version stays 1).
 PARKED_REASONS = frozenset(
     {
         PARKED_REASON_USAGE_LIMIT,
@@ -58,6 +69,7 @@ PARKED_REASONS = frozenset(
         PARKED_REASON_ARTIFACT_INVALID,
         PARKED_REASON_RESPONSE,
         PARKED_REASON_GATE,
+        PARKED_REASON_PROVIDER_UNAVAILABLE,
     }
 )
 
@@ -187,10 +199,21 @@ def reason_fields_disjoint(
 # just-finished execution's `failure_kind`, so any non-precondition finalization
 # clears a stale value.
 FAILURE_KIND_CLEAN_HANDOFF = "clean_handoff_precondition"
+# An UNKNOWN adapter failure whose attempt provably produced no Git/worktree
+# side effects (plan §5.2, P5): the engine assessed the tree against the
+# attempt's ``base_sha`` — not the exception name — and found it unchanged, so
+# re-running cannot re-run over partial work. Such a failure is plain-resumable
+# (no ``--response``, R7); a deterministic repeat then trips the R5 no-progress
+# guard rather than looping. A side-effecting unknown failure stays terminal —
+# its recovery goes through the snapshot/reconciliation paths (P3 executor).
+FAILURE_KIND_SIDE_EFFECT_FREE = "side_effect_free_unknown"
 # Failure kinds a plain (response-less) `gauntlet resume` may safely re-execute
 # once the operator has fixed the named precondition — they cost nothing and
-# re-run the guard, not the adapter.
-RERUNNABLE_FAILURE_KINDS = frozenset({FAILURE_KIND_CLEAN_HANDOFF})
+# re-run the guard, not the adapter — plus the P5 side-effect-free unknown
+# failure, whose retry provably cannot re-run over partial work.
+RERUNNABLE_FAILURE_KINDS = frozenset(
+    {FAILURE_KIND_CLEAN_HANDOFF, FAILURE_KIND_SIDE_EFFECT_FREE}
+)
 
 # --- human-response lifecycle states (FR-2, FR-7.1) --------------------------
 # A `--response` entry is born ``pending`` (appended before the agent launches)
@@ -293,6 +316,14 @@ class RevalidationRecord(BaseModel):
     hash_at_resume: str | None = None
     changed_while_parked: bool = False
     passed_on_resume: bool = False
+    # P5 (plan §5.1, issue #63/#64 class): WHICH validator judged the artifact
+    # invalid (``plan_phases``, ``phase_lint``, a ``schema:<ref>``, or the
+    # drive-level ``gauntlet-phases`` parse) and its exact diagnostic, so the
+    # park is self-explaining without a transcript read and the audit trail
+    # records the precise check a hand-edit answered. Additive/nullable —
+    # pre-P5 manifests load unchanged.
+    validator: str | None = None
+    diagnostic: str | None = None
 
 
 class Suspension(BaseModel):
@@ -404,6 +435,26 @@ class StepRecord(BaseModel):
     # Additive/nullable — ``None`` on every other outcome, so older manifests load
     # unchanged.
     revalidation: RevalidationRecord | None = None
+    # Orthogonal recovery taxonomy (plan §4.1/§6 P5): WHY this step needs
+    # recovery (a ``RecoveryCause`` value) and WHAT strategy applies (a
+    # ``RecoveryDisposition`` value), stamped by ``_finalize`` on every
+    # terminal/parked outcome from the outcome's own evidence
+    # (``recovery_exec.outcome_classification``). CURRENT-STATE like the reason
+    # fields: cleared (None) on DONE/SKIPPED. The planner treats a recorded pair
+    # as refining evidence over the coarse state→cause map; a pre-P5 manifest
+    # carries ``None`` and classifies exactly as before (plan §8 — additive,
+    # nullable, never required).
+    recovery_cause: str | None = None
+    recovery_disposition: str | None = None
+    # Persisted dependency-retry budget (plan §5.2, P5): how many bounded
+    # in-process retries this step's CURRENT failure episode has consumed for
+    # transport/dependency failures (timeout / connection / 5xx / overload).
+    # Incremented and flushed WRITE-AHEAD before each retry sleep, so a crash
+    # between retries never resets the budget; reset to 0 when a new episode
+    # starts (a plain resume of a ``provider_unavailable`` park) and on any
+    # finalization that is not a ``provider_unavailable`` park. Additive —
+    # older manifests load with 0.
+    dependency_attempts: int = 0
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)

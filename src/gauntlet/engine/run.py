@@ -1431,14 +1431,20 @@ class RunManager:
             reason = M.normalize_parked_reason(
                 parked_rec.parked_reason, parked_rec.type, parked_rec.status
             )
-            # A quota/window park is a legitimate live wait ONLY when it
-            # carries a concrete deadline — a recorded reset/replenishment
-            # time or an armed auto-resume schedule (post-review F-006). An
-            # unchanged usage park with NO deadline is indistinguishable from
-            # a wedge, which is exactly the successful no-op loop R5 forbids:
-            # it falls through and raises with the retry/abort actions named.
+            # A quota/window/dependency park is a legitimate live wait ONLY
+            # when it carries a concrete deadline — a recorded reset/
+            # replenishment/backoff time or an armed auto-resume schedule
+            # (post-review F-006; extended to provider_unavailable parks by
+            # P5, plan §5.2). An unchanged park with NO deadline is
+            # indistinguishable from a wedge, which is exactly the successful
+            # no-op loop R5 forbids: it falls through and raises with the
+            # retry/abort actions named.
             if (
-                reason in (M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_USAGE_WINDOW)
+                reason in (
+                    M.PARKED_REASON_USAGE_LIMIT,
+                    M.PARKED_REASON_USAGE_WINDOW,
+                    M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                )
                 and parked_rec.quota_reset_at is not None
             ):
                 return

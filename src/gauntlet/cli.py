@@ -859,7 +859,9 @@ def status(
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
     if rstate.state in (
-        operator.STATE_PARKED_USAGE_LIMIT, operator.STATE_PARKED_USAGE_WINDOW
+        operator.STATE_PARKED_USAGE_LIMIT,
+        operator.STATE_PARKED_USAGE_WINDOW,
+        operator.STATE_PARKED_PROVIDER_UNAVAILABLE,
     ) and rstate.parked is not None:
         pr = next(
             (r for r in man.steps

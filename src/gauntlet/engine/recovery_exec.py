@@ -627,6 +627,40 @@ class RecoveryPlanner:
         if state == STATE_FAILED and failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             cause = RecoveryCause.PRECONDITION_UNSATISFIED
             disposition = RecoveryDisposition.RETRY
+        # P5 refinement (plan §6 P5): a record that carries the orthogonal
+        # cause/disposition pair stamped at outcome time is EVIDENCE — it
+        # refines the coarse state→cause map above. Values are validated
+        # against the closed enums; an unrecognized persisted value is ignored
+        # (fail closed to the coarse map, never a guessed refinement). Pre-P5
+        # manifests carry None and classify exactly as before (plan §8).
+        refined_note: str | None = None
+        refine_rec = parked or failure
+        if refine_rec is not None and (
+            refine_rec.recovery_cause or refine_rec.recovery_disposition
+        ):
+            try:
+                refined_cause = (
+                    RecoveryCause(refine_rec.recovery_cause)
+                    if refine_rec.recovery_cause else cause
+                )
+                refined_disposition = (
+                    RecoveryDisposition(refine_rec.recovery_disposition)
+                    if refine_rec.recovery_disposition else disposition
+                )
+            except ValueError:
+                refined_note = (
+                    "recorded recovery classification "
+                    f"({refine_rec.recovery_cause!r}/"
+                    f"{refine_rec.recovery_disposition!r}) is not a known "
+                    "cause/disposition; ignored (fail closed to the state map)"
+                )
+            else:
+                cause, disposition = refined_cause, refined_disposition
+                refined_note = (
+                    f"recorded outcome classification: cause={cause.value}, "
+                    f"disposition={disposition.value} (stamped at finalize, "
+                    "plan §6 P5)"
+                )
 
         actions: list[RecoveryAction] = []
         for kind in mutating_action_kinds(
@@ -709,6 +743,8 @@ class RecoveryPlanner:
                 disposition = RecoveryDisposition.ABORT_ONLY
 
         evidence = [f"composite_state={state}", f"liveness={liveness}"]
+        if refined_note is not None:
+            evidence.append(refined_note)
         # Branch-relation refinement applies ONLY to a proven-dead driver in a
         # nonterminal state (post-review F-002): while a driver is verifiably
         # alive — or unprovably so — a branch legitimately runs ahead of the
@@ -852,8 +888,12 @@ class RecoveryPlanner:
         the operator invokes must proceed — loudly, with the discarded state
         preserved in the durable snapshot — rather than wedge their own
         edit behind a guard. Engine review-loop commits (phase/fix/
-        checkpoint/bookkeeping shapes) are not governance events;
-        approval-STATE awareness is the P5 taxonomy's refinement.
+        checkpoint/bookkeeping shapes) are not governance events.
+        Approval-state routing landed with the P5 taxonomy (plan §5.1): a
+        PRE-approval artifact defect parks back into the artifact's own
+        author/fix loop at its site (the FR-2.2 validators / phase_lint),
+        while a POST-approval edit stays on this loud, never-refused
+        governance path.
         """
         target = action.target_sha
         known = {git_obs.head_sha, git_obs.recorded_sha, git_obs.run_branch_sha}
@@ -955,6 +995,10 @@ STATE_PARKED_FOR_RESPONSE = "parked_for_response"
 STATE_PARKED_USAGE_LIMIT = "parked_usage_limit"
 STATE_PARKED_USAGE_WINDOW = "parked_usage_window"
 STATE_PARKED_ARTIFACT_INVALID = "parked_artifact_invalid"
+# P5 (plan §5.2): a transport/dependency park — provider outage / timeout /
+# connection failure after the bounded persisted retries. Plain resume retries;
+# never `--response` (R7). Appended additively (schema_version stays 1).
+STATE_PARKED_PROVIDER_UNAVAILABLE = "parked_provider_unavailable"
 STATE_FAILED = "failed"
 STATE_HALTED = "halted"
 STATE_INTERRUPTED = "interrupted"
@@ -1042,6 +1086,8 @@ def classify_composite(
             return STATE_PARKED_ARTIFACT_INVALID, ps, None
         if reason == M.PARKED_REASON_USAGE_WINDOW:
             return STATE_PARKED_USAGE_WINDOW, ps, None
+        if reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE:
+            return STATE_PARKED_PROVIDER_UNAVAILABLE, ps, None
         if reason == M.PARKED_REASON_GATE and ps.type == "human_gate":
             return STATE_PARKED_GATE, ps, None
         return STATE_UNKNOWN, None, None
@@ -1070,6 +1116,7 @@ _MUTATING_KINDS: dict[str, tuple[RecoveryActionKind, ...]] = {
     STATE_PARKED_USAGE_LIMIT: (RecoveryActionKind.RETRY,),
     STATE_PARKED_USAGE_WINDOW: (RecoveryActionKind.RETRY,),
     STATE_PARKED_ARTIFACT_INVALID: (RecoveryActionKind.RETRY,),
+    STATE_PARKED_PROVIDER_UNAVAILABLE: (RecoveryActionKind.RETRY,),
     STATE_HALTED: (RecoveryActionKind.RETRY,),
     STATE_INTERRUPTED: (
         RecoveryActionKind.RETRY,
@@ -1113,6 +1160,7 @@ _NONTERMINAL_DEAD_DRIVER_STATES = frozenset(
         STATE_PARKED_USAGE_LIMIT,
         STATE_PARKED_USAGE_WINDOW,
         STATE_PARKED_ARTIFACT_INVALID,
+        STATE_PARKED_PROVIDER_UNAVAILABLE,
         STATE_FAILED,
         STATE_HALTED,
         STATE_INTERRUPTED,
@@ -1128,6 +1176,7 @@ _STATE_CAUSE: dict[str, RecoveryCause] = {
     STATE_PARKED_USAGE_LIMIT: RecoveryCause.QUOTA_EXHAUSTED,
     STATE_PARKED_USAGE_WINDOW: RecoveryCause.QUOTA_EXHAUSTED,
     STATE_PARKED_ARTIFACT_INVALID: RecoveryCause.ARTIFACT_INVALID,
+    STATE_PARKED_PROVIDER_UNAVAILABLE: RecoveryCause.PROVIDER_UNAVAILABLE,
     STATE_FAILED: RecoveryCause.INTERNAL_ERROR,
     STATE_HALTED: RecoveryCause.INTERNAL_ERROR,
     STATE_INTERRUPTED: RecoveryCause.PROCESS_LOST,
@@ -1145,6 +1194,7 @@ _STATE_DISPOSITION: dict[str, RecoveryDisposition] = {
     STATE_PARKED_USAGE_LIMIT: RecoveryDisposition.RETRY,
     STATE_PARKED_USAGE_WINDOW: RecoveryDisposition.RETRY,
     STATE_PARKED_ARTIFACT_INVALID: RecoveryDisposition.EDIT_THEN_RETRY,
+    STATE_PARKED_PROVIDER_UNAVAILABLE: RecoveryDisposition.RETRY,
     STATE_FAILED: RecoveryDisposition.HUMAN_DECISION,  # RETRY when re-runnable
     STATE_HALTED: RecoveryDisposition.RETRY,
     STATE_INTERRUPTED: RecoveryDisposition.RETRY,
@@ -1152,6 +1202,104 @@ _STATE_DISPOSITION: dict[str, RecoveryDisposition] = {
     STATE_ABORTED: RecoveryDisposition.CONTINUE,
     STATE_UNKNOWN: RecoveryDisposition.CONTINUE,  # read-only inspection only
 }
+
+# --- P5: the orthogonal outcome taxonomy (plan §4.1 / §6 P5) -----------------
+# The (status, parked_reason, halt_reason, failure_kind) → (cause, disposition)
+# map ``_finalize`` stamps onto every terminal/parked StepRecord it writes.
+# This is the EVIDENCE the coarse ``_STATE_CAUSE`` state map is refined by in
+# :meth:`RecoveryPlanner.assess` — recorded at outcome time, when the engine
+# knows exactly what happened, instead of re-derived from the composite state
+# alone. Pure and total: any unrecognized shape maps to (None, None) — nothing
+# is stamped, and classification falls back to the coarse map (fail closed,
+# never a guessed refinement).
+
+_PARK_OUTCOME: dict[str, tuple[RecoveryCause, RecoveryDisposition]] = {
+    M.PARKED_REASON_USAGE_LIMIT: (
+        RecoveryCause.QUOTA_EXHAUSTED, RecoveryDisposition.RETRY),
+    M.PARKED_REASON_USAGE_WINDOW: (
+        RecoveryCause.QUOTA_EXHAUSTED, RecoveryDisposition.RETRY),
+    M.PARKED_REASON_PROVIDER_UNAVAILABLE: (
+        RecoveryCause.PROVIDER_UNAVAILABLE, RecoveryDisposition.RETRY),
+    M.PARKED_REASON_ARTIFACT_INVALID: (
+        RecoveryCause.ARTIFACT_INVALID, RecoveryDisposition.EDIT_THEN_RETRY),
+    M.PARKED_REASON_RESPONSE: (
+        RecoveryCause.NONE, RecoveryDisposition.HUMAN_DECISION),
+    M.PARKED_REASON_GATE: (
+        RecoveryCause.NONE, RecoveryDisposition.HUMAN_DECISION),
+}
+
+_HALT_OUTCOME: dict[str, tuple[RecoveryCause, RecoveryDisposition]] = {
+    # The adapter/step deadline tripped: the dependency did not answer in time
+    # (plan §5.2's timeout class); a plain resume re-runs the step.
+    M.HALT_REASON_TIMEOUT: (
+        RecoveryCause.PROVIDER_UNAVAILABLE, RecoveryDisposition.RETRY),
+    # Engine policy guards (budget cap, judge deny): the run's own policy, not
+    # an infrastructure or artifact fault.
+    M.HALT_REASON_BUDGET: (
+        RecoveryCause.POLICY_DENIED, RecoveryDisposition.RETRY),
+    M.HALT_REASON_JUDGE_DENY: (
+        RecoveryCause.POLICY_DENIED, RecoveryDisposition.RETRY),
+    M.HALT_REASON_SIGNAL_KILL: (
+        RecoveryCause.PROCESS_LOST, RecoveryDisposition.RETRY),
+    M.HALT_REASON_ADAPTER_ERROR: (
+        RecoveryCause.INTERNAL_ERROR, RecoveryDisposition.RETRY),
+    M.HALT_REASON_PRECONDITION: (
+        RecoveryCause.PRECONDITION_UNSATISFIED, RecoveryDisposition.RETRY),
+    M.HALT_REASON_OPERATOR_RECOVER: (
+        RecoveryCause.PROCESS_LOST, RecoveryDisposition.RETRY),
+}
+
+
+def outcome_classification(
+    status: str,
+    *,
+    parked_reason: str | None = None,
+    halt_reason: str | None = None,
+    failure_kind: str | None = None,
+) -> tuple[str | None, str | None]:
+    """The recorded (cause, disposition) for one finalized step outcome (P5).
+
+    Returns enum VALUES (plain strings, the manifest's storage form) or
+    ``(None, None)`` for a shape with nothing to record (DONE/SKIPPED, or an
+    unrecognized reason — fail closed to the coarse map, never a guess).
+    """
+    if status == M.PARKED:
+        pair = _PARK_OUTCOME.get(parked_reason or "")
+        return (pair[0].value, pair[1].value) if pair else (None, None)
+    if status == M.FAILED:
+        if failure_kind == M.FAILURE_KIND_CLEAN_HANDOFF:
+            return (
+                RecoveryCause.PRECONDITION_UNSATISFIED.value,
+                RecoveryDisposition.RETRY.value,
+            )
+        if failure_kind == M.FAILURE_KIND_SIDE_EFFECT_FREE:
+            # An unknown adapter failure whose attempt provably left no
+            # Git/worktree side effects (plan §5.2): retry is safe.
+            return (
+                RecoveryCause.INTERNAL_ERROR.value,
+                RecoveryDisposition.RETRY.value,
+            )
+        if halt_reason == M.HALT_REASON_JUDGE_DENY:
+            return (
+                RecoveryCause.POLICY_DENIED.value,
+                RecoveryDisposition.HUMAN_DECISION.value,
+            )
+        if halt_reason == M.HALT_REASON_PRECONDITION:
+            return (
+                RecoveryCause.PRECONDITION_UNSATISFIED.value,
+                RecoveryDisposition.HUMAN_DECISION.value,
+            )
+        return (
+            RecoveryCause.INTERNAL_ERROR.value,
+            RecoveryDisposition.HUMAN_DECISION.value,
+        )
+    if status == M.HALTED:
+        pair = _HALT_OUTCOME.get(halt_reason or "")
+        return (pair[0].value, pair[1].value) if pair else (None, None)
+    if status == M.INTERRUPTED:
+        return (RecoveryCause.PROCESS_LOST.value, RecoveryDisposition.RETRY.value)
+    return (None, None)
+
 
 # Ahead relations resume reconciles by adoption (plan §5.4 / R6); behind /
 # forked / missing instead get an explicit recovery-ref workflow.
@@ -2417,11 +2565,13 @@ __all__ = [
     "STATE_PARKED_ARTIFACT_INVALID",
     "STATE_PARKED_FOR_RESPONSE",
     "STATE_PARKED_GATE",
+    "STATE_PARKED_PROVIDER_UNAVAILABLE",
     "STATE_PARKED_USAGE_LIMIT",
     "STATE_PARKED_USAGE_WINDOW",
     "STATE_UNKNOWN",
     "classify_composite",
     "mutating_action_kinds",
+    "outcome_classification",
     "reconcile_branch_ahead",
     "reconciliation_boundary",
     "relation_recovery_actions",

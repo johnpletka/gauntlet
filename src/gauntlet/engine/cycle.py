@@ -1294,6 +1294,7 @@ def _run_sub(
     cycle-level ``effort:``; it wins over the role profile's own effort (``None``
     uses the profile's value). Mapped to the adapter's accepted flag at build.
     """
+    from gauntlet.engine import depretry
     from gauntlet.engine.steptypes import open_step_stream
 
     adapter = ctx.build_adapter(agent_name, effort=effort)
@@ -1305,7 +1306,10 @@ def _run_sub(
     logger.log_prompt(prompt)
     attempt_prompt = prompt
     last_exc: MalformedOutputError | None = None
-    for attempt in range(1, 2 + max_retries):
+    attempt = 0
+    malformed = 0
+    while True:
+        attempt += 1
         # Live-observability streaming (live-run-observability FR-2): open a
         # fresh stream per attempt (open_stream truncates), so events.jsonl
         # reflects the current attempt; a failed attempt's authoritative evidence
@@ -1329,6 +1333,14 @@ def _run_sub(
             if after_attempt is not None:
                 after_attempt()
             last_exc = exc
+            malformed += 1
+            if malformed > max_retries:
+                # Fail closed after the bounded schema re-asks — with the
+                # authoritative failure evidence in THIS leaf's dir (P5,
+                # issue #63): `gauntlet logs` must resolve the failing leaf,
+                # never a successful sibling.
+                _log_leaf_failure(logger, exc, agent_name, None)
+                raise last_exc
             attempt_prompt = (
                 f"{prompt}\n\nYour previous response was rejected: {exc}. "
                 "Respond again with only the corrected JSON."
@@ -1341,20 +1353,51 @@ def _run_sub(
             _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
                 after_attempt()
-            # FR-3.2: a TRANSIENT sub-agent failure (usage limit / overload) is
-            # the observed real cycle-death mode. Park the whole CYCLE step with
-            # parked_reason=usage_limit (worktree untouched, the failing
-            # sub-agent's session preserved) instead of failing it — a plain
-            # `gauntlet resume` re-drives the cycle. The write-ahead sub-step
-            # checkpoints (FR-4.1) already recorded on the record let that resume
-            # re-enter at the first INCOMPLETE sub-step (`substep` records which
-            # sub-step owns the preserved session). Raised as a _ParkCycle so the
-            # round-loop wrapper returns it uniformly for any sub-role.
+            # FR-3.2: a TRANSIENT sub-agent failure is the observed real
+            # cycle-death mode. A usage-limit kind parks the whole CYCLE step
+            # with parked_reason=usage_limit (worktree untouched, the failing
+            # sub-agent's session preserved) — a plain `gauntlet resume`
+            # re-drives the cycle, re-entering at the first INCOMPLETE
+            # sub-step via the write-ahead checkpoints (FR-4.1). A
+            # transport/dependency kind (plan §5.2, P5) first gets bounded,
+            # PERSISTED in-process retries with backoff; on exhaustion it
+            # parks provider_unavailable with a concrete deadline — plain
+            # resume retries only the incomplete work (checkpoints + the
+            # triage fragment), never `--response` (R7, issue #63).
             if isinstance(exc, AgentFailedError) and (
                 exc.failure_info is not None and exc.failure_info.is_transient
             ):
                 info = exc.failure_info
                 sess = exc.partial.session_id if exc.partial else None
+                if depretry.is_dependency_failure(info):
+                    delay = depretry.consume_retry(
+                        ctx, info, site=substep or agent_name
+                    )
+                    if delay is not None:
+                        depretry.wait(delay)
+                        continue  # bounded, persisted retry (plan §5.2)
+                    _log_leaf_failure(logger, exc, agent_name, info)
+                    raise _ParkCycle(
+                        StepResult(
+                            status=PARKED,
+                            parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                            parked_substep=substep,
+                            retry_after_s=info.retry_after_s,
+                            backoff_s=depretry.park_deadline_s(
+                                ctx.record, ctx.config, info
+                            ),
+                            notes=(
+                                f"provider-unavailable park (plan §5.2): "
+                                f"{agent_name} sub-agent hit {info.kind} "
+                                f"[{info.marker}] after "
+                                f"{ctx.record.dependency_attempts} persisted "
+                                "in-process retries; completed sub-steps and "
+                                "fan-out leaves are checkpointed — a plain "
+                                "`gauntlet resume` retries only the "
+                                "incomplete work (no `--response`, R7)"
+                            ),
+                        )
+                    ) from exc
                 raise _ParkCycle(
                     StepResult(
                         status=PARKED,
@@ -1370,6 +1413,13 @@ def _run_sub(
                         ),
                     )
                 ) from exc
+            if not isinstance(exc, SessionNotFoundError):
+                # Authoritative failure evidence in THIS leaf's dir (issue
+                # #63): a terminal/timeout leaf must never be silent while a
+                # successful sibling's transcript stands in for it.
+                _log_leaf_failure(
+                    logger, exc, agent_name, getattr(exc, "failure_info", None)
+                )
             raise
         finally:
             # Close the per-attempt stream regardless of outcome (a StreamSinkError
@@ -1381,7 +1431,6 @@ def _run_sub(
         if after_attempt is not None:
             after_attempt()
         return result
-    raise last_exc  # fail closed after bounded retries
 
 
 def _resume_review(
@@ -1442,6 +1491,25 @@ def _log_partial(
         suffix=f"-attempt{attempt}",
     )
     logger.log_text(f"attempt{attempt}-error.txt", str(exc))
+
+
+def _log_leaf_failure(logger: Any, exc: Exception, agent_name: str, info: Any) -> None:
+    """Authoritative failure evidence IN the failing leaf's dir (P5, issue #63).
+
+    Writes the leaf's own ``transcript.md``/``events.jsonl`` (the exact files
+    ``gauntlet logs`` reads) plus the ``failure.json`` marker the failing-leaf
+    selection keys on — so a failed fan-out leaf (a timed-out triage call, an
+    exhausted schema re-ask) can never be silent while a successful sibling's
+    transcript is surfaced in its place.
+    """
+    partial = getattr(exc, "partial", None)
+    logger.log_failure(
+        error=str(exc),
+        agent=agent_name,
+        failure_kind=info.kind if info is not None else None,
+        marker=info.marker if info is not None else None,
+        partial_events=partial.raw_events if partial is not None else None,
+    )
 
 
 # --- round pieces ----------------------------------------------------------------

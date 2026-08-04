@@ -579,6 +579,19 @@ class RunConfig(BaseModel):
     # with an exhaustion note (FR-3.4) — a persistent limit is not a hot loop.
     max_auto_resume_attempts: int = 3
 
+    # --- dependency retry policy (recovery-redesign plan §5.2, P5) -----------
+    # Bounded in-process retries for typed transport/dependency failures
+    # (timeout / connection / DNS / 5xx / overload) before the step parks
+    # ``provider_unavailable``. The consumed budget is PERSISTED on
+    # ``StepRecord.dependency_attempts`` write-ahead, so a crash between
+    # retries never resets it. Delays are exponential (base * 2^attempt) with
+    # deterministic jitter, honoring a structured Retry-After; a delay past
+    # ``dependency_retry_max_delay_s`` parks immediately with that deadline
+    # recorded instead of hot-waiting in process.
+    dependency_retry_attempts: int = 3
+    dependency_retry_base_s: float = 2.0
+    dependency_retry_max_delay_s: float = 30.0
+
     # Live run observability (live-run-observability PRD, FR-6.1): stream each
     # CLI agent's NDJSON stdout to events.jsonl incrementally as it arrives,
     # instead of one buffered write at step end. Default OFF for all of v1 — the

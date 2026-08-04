@@ -55,6 +55,15 @@ behind that output. Drive every decision off the reported state class:
   `providers.<name>` window with `enforce: true`) parked *before* launching a
   step predicted not to fit the remaining window. Nothing is in flight; zero
   work is lost. Action: `gauntlet resume <slug>` when headroom returns.
+- **`parked_provider_unavailable`** — a transport/dependency failure (provider
+  timeout, connection/DNS failure, 5xx/overload) exhausted the engine's bounded
+  in-process retries (the consumed budget is persisted on the step, so crashes
+  never reset it). This is infrastructure, not content: no decision is at
+  stake. Action: plain `gauntlet resume <slug>` after the retry deadline
+  `status` prints — **never** `--response` (retry intent is not a human
+  decision). For a cycle fan-out, completed sub-steps and per-finding leaves
+  are checkpointed; the resume retries only the incomplete work, and
+  `gauntlet logs <slug>` points at the failing leaf's own evidence.
 - **`parked_artifact_invalid`** — an agent-authored structured artifact (e.g.
   the plan's `gauntlet-phases` block) failed validation after bounded in-session
   repair attempts; the exact validator error is in the step `notes`. Action:

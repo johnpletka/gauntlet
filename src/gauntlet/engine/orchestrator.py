@@ -228,6 +228,11 @@ class Orchestrator:
         # raise PlanPhasesError, and the parked step it re-arms must be in place
         # before the walk re-executes it.
         self._apply_response_action()
+        # P5 (plan §5.1): a surviving drive-level plan-parse park re-arms so the
+        # stage walk re-runs ONLY the parse — continuing when the plan was
+        # fixed, re-parking (identical fingerprint → the verb's R5 guard exits
+        # nonzero) when it was not.
+        self._reconcile_plan_parse_park()
         try:
             for stage in self.pipeline.stages:
                 status = self._run_stage(stage)
@@ -235,18 +240,135 @@ class Orchestrator:
                     return self._set_run_status(status)
             return self._set_run_status(DONE)
         except PlanPhasesError as exc:
-            # A malformed `gauntlet-phases` block in plan.md is a builder-authored
-            # artifact defect, not an orchestrator fault — and `_plan_context`
-            # parses it while building the context for *any* step (a gate, a
-            # foreach), so an uncaught raise here kills `drive()` mid-walk and
-            # leaves the write-ahead RUN_RUNNING status persisted: `gauntlet
-            # status` then reads as a live run that is actually dead. Fail closed
-            # (CLAUDE.md §2): record the precise parse error and park for a human
-            # via HALTED -> RUN_PARKED, the same terminal-park path a budget/
-            # timeout halt takes. The human fixes plan.md and `gauntlet resume`
-            # re-drives — reaching the plan gate and parking normally.
-            self.manifest.warnings.append(f"plan.md gauntlet-phases unparseable: {exc}")
-            return self._set_run_status(HALTED)
+            # A malformed `gauntlet-phases` block in plan.md is an ARTIFACT
+            # defect (plan §5.1, P5): it lands as one coherent step/run
+            # transition classified artifact_invalid — never the pre-P5 bare
+            # HALTED-with-a-warning (which left no parked/halted step for the
+            # classifier and read as `unknown`), and never a persisted
+            # RUN_RUNNING after a parser exception. The park records the
+            # responsible artifact, the validator, the exact diagnostic, and a
+            # content fingerprint; a plain resume re-runs ONLY this parse
+            # against the (hand-edited) bytes — an UNCHANGED artifact repeats
+            # the identical fingerprint and exits nonzero through the R5
+            # no-progress guard instead of looping.
+            return self._park_plan_artifact_invalid(exc)
+
+    def _park_plan_artifact_invalid(self, exc: PlanPhasesError) -> str:
+        """Park a malformed plan.md phase list as ``artifact_invalid`` (§5.1, P5).
+
+        The parse ran while resolving ``plan.phases`` for the stage walk, so
+        the park attaches to the step the walk stopped at (the record a resume
+        re-enters), carrying the full evidence set: artifact path, validator,
+        verbatim diagnostic, and the plan's content fingerprint. The phases
+        stage only runs AFTER the plan gate, so the defective plan.md here is
+        an APPROVED artifact: the note surfaces the governance posture loudly —
+        a manual edit is sanctioned and ratified through the artifact's own
+        loop (R9/FR-10.4), never refused. Step terminalization and the run
+        park land in one durable write (:meth:`_finalize_terminal`).
+        """
+        import hashlib
+
+        plan_path = self.artifact_root / "plan.md"
+        try:
+            text = plan_path.read_text()
+        except OSError:
+            text = ""
+        digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        rec = self._walk_stop_record()
+        try:
+            artifact_rel = plan_path.resolve().relative_to(
+                self.repo_root.resolve()
+            ).as_posix()
+        except ValueError:
+            artifact_rel = "plan.md"
+        result = StepResult(
+            status=PARKED,
+            parked_reason=M.PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=M.RevalidationRecord(
+                artifact=artifact_rel,
+                hash_at_park=digest,
+                validator="plan_phases",
+                diagnostic=str(exc),
+            ),
+            notes=(
+                f"artifact_invalid park (plan §5.1): {artifact_rel} "
+                f"gauntlet-phases block is unparseable — {exc}\n"
+                f"Content fingerprint {digest}. plan.md is an APPROVED "
+                "artifact here: editing it is a sanctioned governance event, "
+                "surfaced loudly and ratified through the artifact's own loop "
+                "(R9/FR-10.4) — never refused. Fix the block, then a plain "
+                "`gauntlet resume` re-runs ONLY this parse and continues; an "
+                "unchanged file exits nonzero (no-progress) instead of "
+                "re-parking in a loop."
+            ),
+        )
+        self._finalize_terminal(rec, result)
+        return self.manifest.status
+
+    def _reconcile_plan_parse_park(self) -> None:
+        """Re-arm a drive-level plan-parse park for the validator-only re-run.
+
+        A ``_park_plan_artifact_invalid`` park lands on the walk-stop step —
+        a step that does NOT own a ``validate:``/``output:`` pair (those parks
+        belong to the FR-2.2 in-step path and are left alone). Resetting it to
+        PENDING lets the stage walk re-reach the ``plan.phases`` resolution:
+        the parse (the validator) re-runs against the current bytes BEFORE any
+        step executes, so a still-broken plan re-parks with fresh evidence and
+        a fixed plan simply continues — nothing but the validator ran either
+        way (plan §5.1).
+        """
+        for rec in self.manifest.steps:
+            if (
+                rec.status != M.PARKED
+                or rec.parked_reason != M.PARKED_REASON_ARTIFACT_INVALID
+                or rec.revalidation is None
+                or rec.revalidation.validator != "plan_phases"
+            ):
+                continue
+            step = self._pipeline_step_by_id(rec.id)
+            if step is not None and step.get("validate") and step.get("output"):
+                continue  # the step's own FR-2.2 validator park — not ours
+            rec.status = M.PENDING
+            rec.parked_reason = None
+            rec.revalidation = None
+            rec.recovery_cause = None
+            rec.recovery_disposition = None
+            rec.ended = None
+            self._persist()
+            return
+
+    def _pipeline_step_by_id(self, step_id: str) -> Step | None:
+        for stage in self.pipeline.stages:
+            for step in stage.steps:
+                if step.id == step_id:
+                    return step
+        return None
+
+    def _walk_stop_record(self) -> StepRecord:
+        """The record the stage walk stopped at — where a resume re-enters.
+
+        The first step, in declared stage/step order, with no record at all or
+        with any non-``done``/``skipped`` record. Falls back to the last known
+        record (or a record for the first pipeline step) so a park always has
+        a step to land on — a run-level park with NO step descriptor is the
+        exact unclassifiable shape P5 removes.
+        """
+        for stage in self.pipeline.stages:
+            for step in stage.steps:
+                recs = [r for r in self.manifest.steps if r.id == step.id]
+                if not recs:
+                    return self.manifest.upsert(
+                        StepRecord(id=step.id, type=step.type, agent=step.agent)
+                    )
+                live = [r for r in recs if r.status not in (M.DONE, M.SKIPPED)]
+                if live:
+                    return live[-1]
+        if self.manifest.steps:
+            return self.manifest.steps[-1]
+        first = self.pipeline.stages[0].steps[0]
+        return self.manifest.upsert(
+            StepRecord(id=first.id, type=first.type, agent=first.agent)
+        )
 
     def approve_gate(self, step_id: str, notes: str | None = None) -> str:
         rec = self._find_parked_gate(step_id)
@@ -506,6 +628,12 @@ class Orchestrator:
         if rec.status == M.FAILED and rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             rec.base_sha = None
             rec.failure_kind = None
+        # A plain resume of a provider_unavailable park starts a NEW dependency
+        # retry episode (plan §5.2): the operator/deadline chose to retry, so
+        # the persisted budget resets. A crash mid-retries (step still RUNNING)
+        # deliberately does NOT reset — the budget survives the crash.
+        if rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE:
+            rec.dependency_attempts = 0
         rec.status = M.RUNNING
         rec.started = rec.started or self.clock()
         self.manifest.current_step = step.id
@@ -558,14 +686,15 @@ class Orchestrator:
                         notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
                     )
                 except AgentFailedError as exc:
-                    # FR-3.2: a TRANSIENT failure (usage limit / overload) is not
-                    # a step failure — park (not FAILED) with
-                    # parked_reason=usage_limit, preserving the worktree (no reset
-                    # on this park kind) and the CLI session so a plain `gauntlet
-                    # resume` continues it (FR-3.3). A TERMINAL or unclassified
-                    # failure fails closed → FAILED (a human decides), exactly as
-                    # an unclassified handler fault would.
-                    result = self._agent_failure_result(exc)
+                    # FR-3.2: a TRANSIENT failure is not a step failure — park
+                    # (not FAILED): usage limits park `usage_limit` preserving
+                    # the worktree and CLI session (a plain `gauntlet resume`
+                    # continues it, FR-3.3); exhausted transport/dependency
+                    # retries park `provider_unavailable` with a concrete
+                    # backoff deadline (plan §5.2, P5). A TERMINAL or
+                    # unclassified failure fails closed → FAILED, with the
+                    # attempt's Git side effects assessed rather than assumed.
+                    result = self._agent_failure_result(exc, step, spec, rec)
                 except Exception as exc:  # fail closed: a handler fault halts it
                     result = StepResult(
                         status=FAILED,
@@ -1126,20 +1255,55 @@ class Orchestrator:
         except Exception:
             pass
 
-    def _agent_failure_result(self, exc: AgentFailedError) -> StepResult:
+    def _agent_failure_result(
+        self, exc: AgentFailedError, step: Step, spec, rec: StepRecord
+    ) -> StepResult:
         """Turn a classified adapter failure into a park (transient) or FAILED.
 
-        FR-3.2: a ``transient_*`` classification parks the step with
+        FR-3.2: a ``transient_usage_limit`` classification parks the step with
         ``parked_reason=usage_limit``, the failing call's ``session_id`` preserved
         (so a plain ``gauntlet resume`` continues it, FR-3.3) and its usage
-        accounted (the failed call still cost tokens). The worktree is left
-        untouched — this park kind bypasses the reset/conflict-restore paths (both
-        key on other reasons). An absent/terminal ``failure_info`` fails closed to
-        FAILED (never auto-continued past an unknown error, §7).
+        accounted (the failed call still cost tokens). A transport/dependency
+        kind (plan §5.2, P5 — timeout / connection / DNS / 5xx / overload,
+        reached only after the call-site's bounded persisted retries were
+        exhausted) parks ``provider_unavailable`` with a concrete backoff /
+        Retry-After deadline recorded, so a plain resume retries it — never
+        ``--response`` (R7, issue #63). The worktree is left untouched on both
+        park kinds.
+
+        An absent/terminal ``failure_info`` fails closed to FAILED — but the
+        engine assesses the attempt's Git/worktree side effects rather than
+        deciding retryability from the exception name (plan §5.2): an attempt
+        that provably left no side effects is stamped
+        ``failure_kind=side_effect_free_unknown`` so a plain resume may re-run
+        it (a deterministic repeat then trips the R5 no-progress guard); a
+        side-effecting or unprovable attempt stays terminal — its recovery goes
+        through the snapshot/reconciliation verbs.
         """
+        from gauntlet.engine import depretry
+
         info = exc.failure_info
         partial = exc.partial
         if info is not None and info.is_transient:
+            if depretry.is_dependency_failure(info):
+                deadline_s = depretry.park_deadline_s(rec, self.config, info)
+                return StepResult(
+                    status=PARKED,
+                    parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                    session_id=partial.session_id if partial else None,
+                    usage=partial.usage if partial else None,
+                    retry_after_s=info.retry_after_s,
+                    backoff_s=deadline_s,
+                    notes=(
+                        f"provider-unavailable park (plan §5.2): {info.kind} "
+                        f"[{info.marker}] after "
+                        f"{rec.dependency_attempts} bounded in-process "
+                        f"retr{'y' if rec.dependency_attempts == 1 else 'ies'} "
+                        f"(persisted); retry deadline ~{deadline_s}s. A plain "
+                        "`gauntlet resume` retries the step — no `--response` "
+                        "decision is at stake (R7)"
+                    ),
+                )
             after = (
                 f"; provider retry hint ~{info.retry_after_s}s"
                 if info.retry_after_s else ""
@@ -1156,13 +1320,61 @@ class Orchestrator:
                     "continues the session" + after
                 ),
             )
+        side_effects = self._attempt_side_effects(step, spec, rec)
+        if side_effects is None:
+            assessment_note = (
+                "side-effect assessment: unprovable (no recorded attempt "
+                "boundary or git unavailable) — fail closed, terminal"
+            )
+            failure_kind = None
+        elif side_effects:
+            assessment_note = (
+                "side-effect assessment: the attempt left Git/worktree "
+                "changes — terminal; recover through the snapshot-backed "
+                "verbs, never a blind re-run (plan §5.2)"
+            )
+            failure_kind = None
+        else:
+            assessment_note = (
+                "side-effect assessment: no Git/worktree side effects — a "
+                "plain `gauntlet resume` may safely retry this unknown "
+                "failure (plan §5.2; an unchanged repeat raises the R5 "
+                "no-progress guard instead of looping)"
+            )
+            failure_kind = M.FAILURE_KIND_SIDE_EFFECT_FREE
         return StepResult(
             status=FAILED,
             halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+            failure_kind=failure_kind,
             usage=partial.usage if partial else None,
             session_id=partial.session_id if partial else None,
-            notes=f"agent failed (terminal, FR-3.1): {exc}",
+            notes=f"agent failed (terminal, FR-3.1): {exc}\n{assessment_note}",
         )
+
+    def _attempt_side_effects(
+        self, step: Step, spec, rec: StepRecord
+    ) -> bool | None:
+        """Did this attempt produce Git/worktree side effects? (plan §5.2, P5)
+
+        ``False`` — provably side-effect-free: the step type cannot touch the
+        worktree at all, or the tree is clean against the attempt's recorded
+        ``base_sha`` (engine bookkeeping tolerated, same rule as the resume
+        disposition). ``True`` — the tree moved. ``None`` — unprovable (no
+        recorded boundary / git failure) → the caller fails closed to terminal.
+        """
+        if not spec.step_touches_worktree(step):
+            return False  # by construction: no repo access, no side effects
+        if rec.base_sha is None:
+            return None
+        try:
+            return gitops.is_dirty_vs(
+                self.repo_root, rec.base_sha, exclude=self.excludes,
+                bookkeeping=engine_bookkeeping_candidates(
+                    self.repo_root, self.run_dir
+                ),
+            )
+        except gitops.GitError:
+            return None
 
     def _quota_reset_at(self, retry_after_s: int | None) -> str | None:
         """Absolute UTC reset time = now + ``retry_after_s`` (FR-3.2 "when reported").
@@ -1268,9 +1480,35 @@ class Orchestrator:
         # clock) so both the agent_task and cycle park paths get it uniformly;
         # an explicit ``quota_reset_at`` on the result (rare) still wins.
         rec.retry_after_s = result.retry_after_s
-        rec.quota_reset_at = result.quota_reset_at or self._quota_reset_at(
-            result.retry_after_s
+        # The park deadline: an explicit reset time wins, else the provider's
+        # structured retry hint, else (P5, plan §5.2) the engine-computed
+        # backoff deadline of a provider_unavailable park — so a dependency
+        # park always carries the concrete deadline the P4.1 F-006 no-progress
+        # exemption requires (retry_after_s itself stays structured-only).
+        rec.quota_reset_at = (
+            result.quota_reset_at
+            or self._quota_reset_at(result.retry_after_s)
+            or self._quota_reset_at(result.backoff_s)
         )
+        # P5 (plan §6): stamp the orthogonal recovery cause/disposition from the
+        # outcome's own evidence — current-state, cleared (None) on DONE/SKIPPED.
+        # The planner treats a recorded pair as refining evidence over the
+        # coarse state→cause map; old manifests without the fields classify
+        # exactly as before (plan §8).
+        rec.recovery_cause, rec.recovery_disposition = RX.outcome_classification(
+            rec.status,
+            parked_reason=rec.parked_reason,
+            halt_reason=rec.halt_reason,
+            failure_kind=rec.failure_kind,
+        )
+        # The persisted dependency-retry budget (plan §5.2) is episode-scoped:
+        # it survives ONLY into a provider_unavailable park (the episode it
+        # counts); any other finalization ends the episode and resets it.
+        if not (
+            rec.status == M.PARKED
+            and rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+        ):
+            rec.dependency_attempts = 0
         # The parked sub-step is current-state alongside the usage-limit stamps
         # (FR-3.3): set on a usage-limit cycle park so resume continues the
         # preserved session in the matching sub-step, cleared on any other

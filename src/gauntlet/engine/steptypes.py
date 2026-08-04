@@ -19,7 +19,11 @@ import re
 import subprocess
 from pathlib import Path
 
-from gauntlet.adapters.base import AdapterError, SessionNotFoundError
+from gauntlet.adapters.base import (
+    AdapterError,
+    AgentFailedError,
+    SessionNotFoundError,
+)
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
 from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
@@ -226,6 +230,38 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
 
 
 # --- phase_lint --------------------------------------------------------------
+def _phase_lint_park(artifact: str, text: str, diagnostic: str) -> StepResult:
+    """An ``artifact_invalid`` park for a plan.md structural defect (§5.1, P5).
+
+    One coherent transition carrying artifact + validator + verbatim diagnostic
+    + content fingerprint, replacing the pre-P5 HALTED/precondition halt (which
+    issue #64 showed re-lints the unchanged artifact in a zero-cost loop and
+    renders under the wrong meaning line). The revalidation record's hash is
+    what folds into the progress fingerprint, so an unchanged plain resume
+    exits nonzero (R5) while an edited plan re-lints and continues.
+    """
+    return StepResult(
+        status=PARKED,
+        parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+        revalidation=RevalidationRecord(
+            artifact=artifact,
+            hash_at_park=_sha256(text),
+            validator="phase_lint",
+            diagnostic=diagnostic,
+        ),
+        notes=(
+            f"phase lint: {diagnostic}\n"
+            f"Parked artifact_invalid (plan §5.1): a PRE-approval plan defect. "
+            f"Fix {artifact} (a hand-edit is sanctioned and audited via the "
+            "revalidation hashes) or reject the plan gate to route the defect "
+            "list back into the plan cycle's author/fix loop. A plain "
+            "`gauntlet resume` re-runs ONLY this lint against the edited "
+            "bytes; an unchanged artifact exits nonzero (no-progress) instead "
+            "of re-linting in a loop (issue #64)."
+        ),
+    )
+
+
 def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     """Structurally validate plan.md's ``gauntlet-phases`` block at the plan gate.
 
@@ -237,35 +273,35 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     no-agent check closes that gap: it runs the *same* parser the foreach uses,
     so a plan can only pass the gate if the engine can actually execute it.
 
-    Fail closed (CLAUDE.md §2): a missing/empty/malformed block HALTS — which
-    parks the run for a human (HALTED -> RUN_PARKED) with the precise reason —
-    rather than letting a known-unrunnable plan reach human approval.
+    Fail closed (CLAUDE.md §2): a missing/empty/malformed block parks the run
+    ``artifact_invalid`` (plan §5.1, P5) — one coherent step/run transition
+    recording the artifact, the validator, the exact diagnostic, and a content
+    fingerprint — rather than letting a known-unrunnable plan reach human
+    approval. This is a PRE-approval defect: the note routes it back into the
+    artifact's author loop (hand-edit sanctioned; or reject the plan gate so
+    the plan cycle re-runs with the defect list injected). A plain resume
+    re-runs ONLY this deterministic lint against the edited bytes; an
+    UNCHANGED artifact exits nonzero through the R5 no-progress guard instead
+    of re-linting in a zero-cost loop (issue #64).
     """
     artifact = step.get("artifact", "plan.md")
     path = ctx.artifact_root / artifact
     if not path.exists():
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=f"phase lint: {artifact} is missing at the plan gate",
+        return _phase_lint_park(
+            artifact, "", f"{artifact} is missing at the plan gate"
         )
     text = path.read_text()
     try:
         phases = extract_phases(text)
     except PlanPhasesError as exc:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=f"phase lint: {artifact} gauntlet-phases block is invalid — {exc}",
+        return _phase_lint_park(
+            artifact, text, f"{artifact} gauntlet-phases block is invalid — {exc}"
         )
     if not phases:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} declares no gauntlet-phases block; the "
-                "phases stage would have nothing to fan out over (FR-5.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} declares no gauntlet-phases block; the phases stage "
+            "would have nothing to fan out over (FR-5.1)",
         )
     # FR-1.1: the implement step slices each phase's prose section out of plan.md
     # by its ATX heading (`phase`-mode context). A phase declared in the list but
@@ -275,15 +311,12 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     # never reaches human approval.
     missing = missing_phase_sections(text, phases)
     if missing:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} has no locatable prose section for "
-                f"phase(s) {', '.join(missing)}; every phase in the "
-                "gauntlet-phases list needs a matching '## <id> …' heading so "
-                "`phase`-mode context can slice it (FR-1.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} has no locatable prose section for phase(s) "
+            f"{', '.join(missing)}; every phase in the gauntlet-phases list "
+            "needs a matching '## <id> …' heading so `phase`-mode context can "
+            "slice it (FR-1.1)",
         )
     # FR-3.1: every phase must carry a well-formed `acceptance:` list of testable
     # clauses (the acceptance_gate's input). A clause-less/malformed phase fails
@@ -291,14 +324,10 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     # unmappable-at-gate plan never reaches human approval.
     acc_errors = acceptance_clause_errors(phases)
     if acc_errors:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} has acceptance-clause defects — "
-                + "; ".join(acc_errors)
-                + " (FR-3.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} has acceptance-clause defects — "
+            + "; ".join(acc_errors) + " (FR-3.1)",
         )
     # FR-3.4: the phase-size lint. A phase carrying more than `max_frs_per_phase`
     # (default 3) distinct FR references is oversized — the scope where partial
@@ -340,10 +369,7 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
             + " — oversized phases hide partial delivery (FR-3.4)"
         )
         if size_mode == SIZE_LINT_PARK:
-            return StepResult(
-                status=HALTED, halt_reason=HALT_REASON_PRECONDITION,
-                notes=f"phase lint: {detail}",
-            )
+            return _phase_lint_park(artifact, text, detail)
         # warn mode: not a blocker — surface the finding in the notes so it lands
         # in RUN.md / status without stopping the plan gate.
         return StepResult(
@@ -840,8 +866,16 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     # adapter invocation. Done here, before the adapter is even built, so a
     # hand-edit-then-resume never re-runs the author. `parked_reason` is still the
     # park's value at handler time (the orchestrator clears it only in _finalize),
-    # exactly like the usage-limit resume discriminator below.
-    if ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID:
+    # exactly like the usage-limit resume discriminator below. Scoped to a step
+    # that OWNS a validator (P5, plan §5.1): a drive-level plan-parse park
+    # (`_park_plan_artifact_invalid`) can legitimately land on an agent_task
+    # with no `validate:`/`output:` — the stage walk already re-validated the
+    # plan before re-reaching this handler, so that step runs normally.
+    if (
+        ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID
+        and step.get("validate")
+        and step.get("output")
+    ):
         return _revalidate_on_resume(step, ctx, agent_name)
     # FR-10: while this invocation is consuming a pending `--response`, bind the
     # resume-disposition schema invocation-locally and let the structured
@@ -905,33 +939,67 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         distinct attempt (e.g. ``-repair1``) so a repair never overwrites the
         initial attempt's prompt/events (lossless, FR-4).
         """
+        from gauntlet.engine import depretry
+
         logger.log_text(f"prompt{log_suffix}.md", call_prompt)
-        # Live-observability streaming (live-run-observability FR-2): when enabled
-        # and the adapter is line-streamable, thread a per-line sink so the events
-        # file grows during the step. sink is passed ONLY when streaming — the
-        # buffered path's call shape (and existing fakes) stay untouched. The
-        # suffix keeps a repair attempt's stream off the initial attempt's file.
-        stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
-        kwargs: dict = {"session": session, "schema": schema, "cwd": ctx.repo_root}
-        if stream is not None:
-            kwargs["sink"] = stream.append_line
-        try:
-            return adapter.run(call_prompt, **kwargs)
-        except AdapterError as exc:
-            # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
-            # partial evidence the adapter salvaged before it is re-raised (the
-            # orchestrator classifies transient-vs-terminal, FR-3.1).
-            if exc.partial is not None:
-                logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
-            logger.log_text(f"failure{log_suffix}.txt", str(exc))
-            raise
-        finally:
-            # A streaming sink fault surfaces as a StreamSinkError (not an
-            # AdapterError) that propagates past the except above; the
-            # orchestrator records the step FAILED (fail closed, FR-6.2). Close
-            # the stream either way so it is never left half-open.
+        while True:
+            # Live-observability streaming (live-run-observability FR-2): when
+            # enabled and the adapter is line-streamable, thread a per-line sink
+            # so the events file grows during the step. sink is passed ONLY when
+            # streaming — the buffered path's call shape (and existing fakes)
+            # stay untouched. The suffix keeps a repair attempt's stream off the
+            # initial attempt's file. Opened fresh per dependency retry.
+            stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
+            kwargs: dict = {
+                "session": session, "schema": schema, "cwd": ctx.repo_root,
+            }
             if stream is not None:
-                stream.close()
+                kwargs["sink"] = stream.append_line
+            try:
+                return adapter.run(call_prompt, **kwargs)
+            except AdapterError as exc:
+                # FR-4.2 is lossless for failures too (P4.r1 F-007): persist
+                # whatever partial evidence the adapter salvaged before it is
+                # re-raised (the orchestrator classifies transient-vs-terminal,
+                # FR-3.1).
+                if exc.partial is not None:
+                    logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
+                logger.log_text(f"failure{log_suffix}.txt", str(exc))
+                # P5 (plan §5.2): a typed transport/dependency failure gets a
+                # bounded, PERSISTED in-process retry with backoff + jitter
+                # before it can park — the budget lives on the step record and
+                # is flushed write-ahead, so a crash between retries never
+                # resets it.
+                info = getattr(exc, "failure_info", None)
+                if isinstance(exc, AgentFailedError) and depretry.is_dependency_failure(info):
+                    delay = depretry.consume_retry(
+                        ctx, info, site=f"{ctx.record.id}{log_suffix}"
+                    )
+                    if delay is not None:
+                        depretry.wait(delay)
+                        continue
+                # Authoritative failure evidence in THIS step's dir (issue
+                # #63): the files `gauntlet logs` reads must name the failure,
+                # never fall back to a sibling. A SessionNotFoundError is not
+                # a failure — the caller falls back to a full re-run (FR-3.3).
+                if not isinstance(exc, SessionNotFoundError):
+                    logger.log_failure(
+                        error=str(exc),
+                        agent=ctx.record.agent,
+                        failure_kind=info.kind if info is not None else None,
+                        marker=info.marker if info is not None else None,
+                        partial_events=(
+                            exc.partial.raw_events if exc.partial else None
+                        ),
+                    )
+                raise
+            finally:
+                # A streaming sink fault surfaces as a StreamSinkError (not an
+                # AdapterError) that propagates past the except above; the
+                # orchestrator records the step FAILED (fail closed, FR-6.2).
+                # Close the stream either way so it is never left half-open.
+                if stream is not None:
+                    stream.close()
 
     fallback_note = ""
     try:
@@ -1170,7 +1238,8 @@ def _validate_output(step, ctx, invoke, logger, validate_name, output, out_path,
         status=PARKED,
         parked_reason=PARKED_REASON_ARTIFACT_INVALID,
         revalidation=RevalidationRecord(
-            artifact=output, hash_at_park=_sha256(out_path.read_text())
+            artifact=output, hash_at_park=_sha256(out_path.read_text()),
+            validator=validate_name, diagnostic=error,
         ),
         notes=(
             f"artifact {output!r} failed validation ({validate_name}) after "
@@ -1227,7 +1296,8 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
             status=PARKED,
             parked_reason=PARKED_REASON_ARTIFACT_INVALID,
             revalidation=RevalidationRecord(
-                artifact=output, hash_at_park=hash_at_resume
+                artifact=output, hash_at_park=hash_at_resume,
+                validator=validate_name, diagnostic=error,
             ),
             notes=(
                 f"artifact {output!r} still fails validation ({validate_name}) on "
@@ -1244,6 +1314,7 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
         hash_at_resume=hash_at_resume,
         changed_while_parked=changed,
         passed_on_resume=True,
+        validator=validate_name,
     )
     # Valid on resume — complete the step with no adapter call. Commit the
     # now-valid deliverable if the step opted into commit_output (the normal path

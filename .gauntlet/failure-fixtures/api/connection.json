@@ -1,0 +1,5 @@
+{
+  "exception_class": "APIConnectionError",
+  "message": "litellm.APIConnectionError: APIConnectionError - Connection error (nodename nor servname provided, or not known)",
+  "retry_after": null
+}

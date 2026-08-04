@@ -49,7 +49,7 @@ from gauntlet.engine.run import (
     _LockRecord,
     safe_run_segment,
 )
-from gauntlet.logging.transcript import STREAM_MARKER_SUFFIX
+from gauntlet.logging.transcript import FAILURE_MARKER_NAME, STREAM_MARKER_SUFFIX
 from gauntlet.procident import ProcessIdentity, read_process_identity
 
 if TYPE_CHECKING:
@@ -86,6 +86,7 @@ from gauntlet.engine.recovery_exec import (  # noqa: E402  (grouped re-export)
     STATE_PARKED_ARTIFACT_INVALID,
     STATE_PARKED_FOR_RESPONSE,
     STATE_PARKED_GATE,
+    STATE_PARKED_PROVIDER_UNAVAILABLE,
     STATE_PARKED_USAGE_LIMIT,
     STATE_PARKED_USAGE_WINDOW,
     STATE_UNKNOWN,
@@ -96,6 +97,10 @@ from gauntlet.engine import recovery as RXM  # noqa: E402  (P1 models)
 # The failure-status set and the park-reason normalization now live with the
 # classification core in `recovery_exec` (P4/R4); nothing here keys on them
 # directly any more.
+
+# The failing-leaf evidence marker (P5, issue #63) — the single name is owned
+# by the transcript logger; re-bound here for the leaf-selection reads.
+_FAILURE_NAME = FAILURE_MARKER_NAME
 
 # Composite step types whose evidence lives in role sub-directories, not a
 # direct ``steps/<leaf>/transcript.md`` (FR-3.1a). Mirrors the cycle/retro
@@ -114,6 +119,7 @@ _MEANING: dict[str, str] = {
     STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
     STATE_PARKED_USAGE_WINDOW: "parked before a step to stay within the provider usage window — `resume` retries once it replenishes",
     STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
+    STATE_PARKED_PROVIDER_UNAVAILABLE: "a provider/transport failure exhausted the bounded retries — `resume` retries after the recorded deadline (no decision needed)",
     STATE_FAILED: "a step failed",
     STATE_HALTED: "a guard halted the step (reason unrecorded — see steps[].halt_reason in status --json)",
     STATE_INTERRUPTED: "the run was killed mid-step",
@@ -423,6 +429,7 @@ _OBSERVE_PREFIX: dict[str, tuple[str, ...]] = {
     STATE_INDETERMINATE: ("logs", "json"),
     STATE_UNKNOWN: ("logs", "json"),
     STATE_PARKED_ARTIFACT_INVALID: ("logs",),
+    STATE_PARKED_PROVIDER_UNAVAILABLE: ("logs",),
     STATE_FAILED: ("logs",),
     STATE_HALTED: ("logs",),
     STATE_INTERRUPTED: ("logs",),
@@ -806,6 +813,15 @@ def resolve_transcript_dir(run_instance_dir: Path, rec: StepRecord) -> Path:
     if triage.is_dir():
         findings = sorted(_subdirs(triage))
         if findings:
+            # P5 (plan §5.2, issue #63): a FAILING leaf — one carrying the
+            # failure-evidence marker `log_failure` writes — wins over the
+            # most-recent sibling, so `gauntlet logs` never surfaces a
+            # successful leaf's transcript in place of the failure. Multiple
+            # failing leaves resolve to the lexicographically-greatest
+            # (deterministic; each remains addressable via `--step`).
+            failing = [d for d in findings if (d / _FAILURE_NAME).is_file()]
+            if failing:
+                return failing[-1]
             return findings[-1]  # lexicographically-greatest finding-id
     review = step_dir / f"r{rnd}-review"
     if review.is_dir():
@@ -1044,7 +1060,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -1120,9 +1136,10 @@ _STATUS_SCHEMA_JSON = r'''{
         "interrupted",
         "done",
         "aborted",
-        "unknown"
+        "unknown",
+        "parked_provider_unavailable"
       ],
-      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor)."
+      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor). `parked_provider_unavailable` (recovery-redesign P5, plan §5.2) was APPENDED additively: a transport/dependency park after the bounded persisted retries; a plain `resume` retries after the recorded deadline."
     },
     "current_step": {
       "type": ["string", "null"],
@@ -1158,7 +1175,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["reset_at"],
-      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time), a usage_window park (projected replenishment time), or a provider_unavailable park (the recorded backoff/Retry-After retry deadline, recovery-redesign P5); null otherwise.",
       "properties": {
         "reset_at": {
           "type": ["string", "null"],
@@ -1196,7 +1213,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid, parked_provider_unavailable}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -1204,13 +1221,13 @@ _STATUS_SCHEMA_JSON = r'''{
         },
         "type": {
           "type": "string",
-          "enum": ["human_gate", "agent_task", "adversarial_cycle"],
-          "description": "The parked step's type."
+          "enum": ["human_gate", "agent_task", "adversarial_cycle", "phase_lint", "shell", "commit", "acceptance_gate", "retrospective"],
+          "description": "The parked step's type. `phase_lint` and the remaining built-in types were APPENDED additively by recovery-redesign P5: a plan/lint defect now parks artifact_invalid on the responsible step (plan §5.1), and a drive-level plan-parse park lands on the step the stage walk stopped at, whatever its type."
         },
         "reason": {
           "type": "string",
-          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate"],
-          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
+          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", "provider_unavailable"],
+          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park; `provider_unavailable` (APPENDED by recovery-redesign P5, plan §5.2) for a transport/dependency park after the bounded persisted retries — plain-resumable, never `--response`. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
         }
       }
     },
@@ -1379,7 +1396,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason", "recovery_cause", "recovery_disposition"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -1415,8 +1432,18 @@ _STATUS_SCHEMA_JSON = r'''{
           },
           "parked_reason": {
             "type": ["string", "null"],
-            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", null],
-            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim."
+            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", "provider_unavailable", null],
+            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim. `provider_unavailable` was APPENDED by recovery-redesign P5 (plan §5.2)."
+          },
+          "recovery_cause": {
+            "type": ["string", "null"],
+            "enum": ["none", "provider_unavailable", "quota_exhausted", "process_lost", "artifact_invalid", "precondition_unsatisfied", "worktree_partial", "branch_ahead", "branch_diverged", "state_inconsistent", "policy_denied", "internal_error", null],
+            "description": "Orthogonal recovery cause (recovery-redesign plan §4.1, APPENDED by P5): WHY this step needs recovery, stamped by the engine on every terminal/parked outcome from the outcome's own evidence. null on non-terminal steps and on manifests predating P5."
+          },
+          "recovery_disposition": {
+            "type": ["string", "null"],
+            "enum": ["continue", "retry", "resume_session", "edit_then_retry", "restart_from_checkpoint", "adopt_commits", "snapshot_and_restart", "restore_snapshot", "continue_on_recovery_branch", "rebuild_projection", "human_decision", "abort_only", null],
+            "description": "Orthogonal recovery disposition (recovery-redesign plan §4.1, APPENDED by P5): WHAT recovery strategy applies, stamped alongside recovery_cause. null on non-terminal steps and on manifests predating P5."
           }
         }
       }
@@ -1475,7 +1502,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid", "parked_provider_unavailable"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},
@@ -1931,7 +1958,11 @@ def status_payload(
     # else null.
     quota = None
     if (
-        rstate.state in (STATE_PARKED_USAGE_LIMIT, STATE_PARKED_USAGE_WINDOW)
+        rstate.state in (
+            STATE_PARKED_USAGE_LIMIT,
+            STATE_PARKED_USAGE_WINDOW,
+            STATE_PARKED_PROVIDER_UNAVAILABLE,
+        )
         and rstate.parked is not None
     ):
         parked_rec = by_rendered.get(rstate.parked.step_id)
@@ -2016,6 +2047,10 @@ def status_payload(
                 "parked_reason": M.normalize_parked_reason(
                     rec.parked_reason, rec.type, rec.status
                 ),
+                # P5 (plan §6): the orthogonal recovery taxonomy, additive and
+                # always-present (null when unstamped / pre-P5).
+                "recovery_cause": rec.recovery_cause,
+                "recovery_disposition": rec.recovery_disposition,
             }
             for rec in man.steps
         ],
@@ -2765,6 +2800,14 @@ def render_footer(
         lines.append(
             f"window replenishes: {quota_reset_at}" if quota_reset_at
             else "window replenishes: unknown"
+        )
+    # A provider_unavailable park (plan §5.2, P5) names the recorded backoff /
+    # Retry-After deadline — the datum that makes the wait legitimate (F-006)
+    # and tells the operator when a plain `resume` should retry.
+    if rstate.state == STATE_PARKED_PROVIDER_UNAVAILABLE:
+        lines.append(
+            f"retry deadline: {quota_reset_at}" if quota_reset_at
+            else "retry deadline: unrecorded (a repeated resume will refuse as no-progress)"
         )
 
     if current_step_freshness is not None:
