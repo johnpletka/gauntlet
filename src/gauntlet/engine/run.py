@@ -669,6 +669,31 @@ class RunManager:
         # bypasses the per-verb `finally`.
         self._held_lock: _LockHandle | None = None
 
+    @property
+    def operator_root(self) -> Path:
+        """The operator's own checkout, named deliberately (P7a, spike §9.4).
+
+        A handful of verbs act on the human's tree ON PURPOSE and must keep
+        doing so after P7c: ``finish`` merges the run branch into the base
+        *there*, ``clean`` deletes the branch from *there*, `base_branch:
+        current` resolves against the branch the human is standing on, and the
+        governed proposal apply patches assets *there*. Those are the opposite
+        of the sites P7 is fixing, so they get an explicit name rather than the
+        ambiguous ``repo_root`` — ``tests/unit/test_root_scope.py`` bans the
+        ambiguous one from every work-scoped call, which makes this list
+        greppable and auditable instead of implicit.
+        """
+        return self.repo_root
+
+    @property
+    def work_root(self) -> Path:
+        """The tree a run's agents edit and the engine commits in.
+
+        Identical to the operator's checkout in the pre-P7 same-tree layout;
+        P7c resolves it per-run to that run's dedicated worktree.
+        """
+        return self.repo_root
+
     def layout(self, slug: str) -> RunLayout:
         return RunLayout(self.repo_root, self.config, slug)
 
@@ -750,7 +775,7 @@ class RunManager:
         """
         raw = (self.config.base_branch or "").strip()
         if raw.lower() in _BASE_CURRENT_SENTINELS:
-            cur = gitops.current_branch(self.repo_root)
+            cur = gitops.current_branch(self.operator_root)
             if cur == "HEAD":
                 raise EntryContractError(
                     "base_branch is 'current' but HEAD is detached; check out a "
@@ -772,7 +797,7 @@ class RunManager:
           ``base``; adopting it could rewind the tree or stack on stale work.
           The human resolves it (`gauntlet clean`, merge, or rename).
         """
-        repo = self.repo_root
+        repo = self.work_root
         if not gitops.branch_exists(repo, branch):
             gitops.checkout_or_create_branch(repo, branch, base)
             return
@@ -1160,7 +1185,7 @@ class RunManager:
             # the refusal message would be less actionable (see the
             # status_porcelain docstring).
             dirt = gitops.status_porcelain(
-                self.repo_root, exclude=preflight_excludes, untracked_all=True
+                self.work_root, exclude=preflight_excludes, untracked_all=True
             )
             if dirt:
                 listing = "\n  ".join(dirt.splitlines()[:8])
@@ -1299,7 +1324,7 @@ class RunManager:
             # assessment's executable recovery actions named. Everything is
             # validated against the branch REF *before* checkout, so a refusal
             # never rewinds the worktree onto a stale/reset branch.
-            repo = self.repo_root
+            repo = self.work_root
             git_obs = self._observe_resume_branch(layout, run_dir, man)
             relation = RX.BranchRelation
             if git_obs.branch_relation is relation.MISSING:
@@ -2763,7 +2788,9 @@ class RunManager:
         committed run dir (prd.md, manifest, transcripts are the audit trail).
         """
         layout = self.layout(slug)
-        repo = self.repo_root
+        # OPERATOR tree by design: `clean` deletes the run branch, and what
+        # can block that is the human standing on it (P7a, spike §9.4).
+        repo = self.operator_root
         # FR-6: reap an orphaned judge while the active-run pointer still
         # resolves the run dir (clean clears it below). Driver-gone-only +
         # identity-verified; a live run's judge and the shared console are left
@@ -2840,7 +2867,10 @@ class RunManager:
         # delete on the word of an older projection that still says `done`.
         self._reconcile_projection(run_dir, slug)
         man = Manifest.load(run_dir / "manifest.json")
-        repo = self.repo_root
+        # OPERATOR tree by design: `finish` merges the run branch INTO the
+        # operator's base and leaves the human on a sensible branch — the
+        # one verb whose whole purpose is to touch their checkout (P7a).
+        repo = self.operator_root
         branch, base = man.branch, man.base_branch
         # FR-6: a completed run's driver is gone, so reap its orphaned judge
         # here (identity-verified, driver-gone-only); never the shared console.
@@ -3071,7 +3101,7 @@ class RunManager:
                 results.append({"proposal": proposal.name, "action": "rejected"})
                 continue
             excludes = run_bookkeeping_excludes(self.repo_root, run_dir, run_dir.parent)
-            if not gitops.is_clean(self.repo_root, exclude=excludes):
+            if not gitops.is_clean(self.operator_root, exclude=excludes):
                 raise P.ProposalError(
                     "refusing to apply a proposal: worktree is dirty; commit or "
                     "discard changes first (governed apply needs a clean tree)"
@@ -3139,7 +3169,9 @@ class RunManager:
         # post-177d721 F-004): the guards read the run-branch REF explicitly,
         # so a refused rollback leaves the operator's checkout, index, and
         # worktree untouched — prevalidation is observational.
-        repo = self.repo_root
+        # WORK tree: rollback rewinds the RUN's branch and tree; it must never
+        # reach into the operator's checkout (P7 acceptance A1).
+        repo = self.work_root
         if not gitops.branch_exists(repo, man.branch):
             raise RollbackGuardError(
                 f"refusing rollback: run branch {man.branch!r} is missing; "
@@ -3151,7 +3183,7 @@ class RunManager:
         # engine's own bookkeeping is excluded (review F-001), so an
         # uncommitted real artifact still blocks.
         excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
-        if not gitops.is_clean(self.repo_root, exclude=excludes):
+        if not gitops.is_clean(self.work_root, exclude=excludes):
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard first"
             )

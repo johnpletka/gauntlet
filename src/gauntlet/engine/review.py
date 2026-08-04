@@ -1702,6 +1702,9 @@ def _build_review_orchestrator(
         # failing closed on an uncontained state dir (execution.py's
         # StateDirNotContained).
         state_outside_worktree=True,
+        # A review run has no governed prd.md/plan.md at all — declared
+        # separately from the state dir so the two can never be conflated.
+        artifacts_outside_worktree=True,
         config=config,
         pipeline=pipeline,
         manifest=man,

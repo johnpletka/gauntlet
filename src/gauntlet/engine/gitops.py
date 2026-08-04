@@ -77,6 +77,103 @@ class GitError(RuntimeError):
         self.stderr = stderr
 
 
+# --- root scope classification (P7a, spike §9) --------------------------------
+#
+# Every helper here takes a `repo` path, and that single parameter has silently
+# meant three different things since the bootstrap. Once a run gets its own
+# worktree (P7c) the three diverge, and passing the wrong one is invisible in a
+# same-tree test: the operation succeeds, against the wrong tree.
+#
+# So the scope is DATA, not documentation. `tests/unit/test_root_scope.py`
+# parses every `gitops.*` call in the engine and fails when a WORK-scoped helper
+# is handed anything but a work-tree root — and fails when a helper is missing
+# from this table, so the classification cannot silently rot as helpers are
+# added.
+#
+#   WORK   — operates on or observes a WORKING TREE: its index, its HEAD, its
+#            checked-out branch, its file contents. HEAD and the index are
+#            per-worktree (proved in spike E1), so even a read like `head_sha`
+#            is work-scoped: from the operator's checkout it answers about the
+#            operator's branch, not the run's.
+#   REPO   — a property of the REPOSITORY, identical from any worktree: refs,
+#            the object database, the commit graph, diffs between two SHAs.
+#   COMMON — the shared git dir / worktree administration itself.
+ROOT_SCOPE_WORK = "work"
+ROOT_SCOPE_REPO = "repo"
+ROOT_SCOPE_COMMON = "common"
+
+ROOT_SCOPE: dict[str, str] = {
+    # --- WORK: the tree the agent edits and the engine commits in -------------
+    "head_sha": ROOT_SCOPE_WORK,          # per-worktree HEAD
+    "current_branch": ROOT_SCOPE_WORK,    # per-worktree HEAD
+    "status_porcelain": ROOT_SCOPE_WORK,
+    "is_clean": ROOT_SCOPE_WORK,
+    "is_dirty_vs": ROOT_SCOPE_WORK,
+    "dirty_paths_matching": ROOT_SCOPE_WORK,
+    "worktree_tree_hash": ROOT_SCOPE_WORK,
+    "diff_head": ROOT_SCOPE_WORK,
+    "diff_worktree_vs": ROOT_SCOPE_WORK,
+    "commit_all": ROOT_SCOPE_WORK,
+    "commit_paths": ROOT_SCOPE_WORK,
+    "commit_run_bookkeeping": ROOT_SCOPE_WORK,
+    "commit_tracked_bookkeeping": ROOT_SCOPE_WORK,
+    "checkout_branch": ROOT_SCOPE_WORK,
+    "checkout_or_create_branch": ROOT_SCOPE_WORK,
+    "recreate_branch": ROOT_SCOPE_WORK,
+    "merge_branch": ROOT_SCOPE_WORK,
+    "merge_abort": ROOT_SCOPE_WORK,
+    "reset_hard": ROOT_SCOPE_WORK,
+    "reset_soft": ROOT_SCOPE_WORK,
+    "unstage": ROOT_SCOPE_WORK,
+    "clean_untracked": ROOT_SCOPE_WORK,
+    "rewind_impl_preserving_bookkeeping": ROOT_SCOPE_WORK,
+    "apply_patch": ROOT_SCOPE_WORK,
+    "apply_patch_check": ROOT_SCOPE_WORK,
+    "git_index_path": ROOT_SCOPE_WORK,    # per-worktree index (spike E1/E7)
+    "is_tracked": ROOT_SCOPE_WORK,        # reads the index
+    "path_is_ignored": ROOT_SCOPE_WORK,
+    "path_is_untracked": ROOT_SCOPE_WORK,
+    "wip_checkpoints": ROOT_SCOPE_WORK,   # walks from the tree's own HEAD
+    "run_with_temp_index": ROOT_SCOPE_WORK,
+    "validate_temp_index_path": ROOT_SCOPE_WORK,
+    "show_toplevel": ROOT_SCOPE_WORK,
+    # --- REPO: identical from any worktree -----------------------------------
+    "is_git_repo": ROOT_SCOPE_REPO,
+    "rev_parse": ROOT_SCOPE_REPO,
+    "branch_exists": ROOT_SCOPE_REPO,
+    "delete_branch": ROOT_SCOPE_REPO,
+    "tag_exists": ROOT_SCOPE_REPO,
+    "ref_is_valid_commit": ROOT_SCOPE_REPO,
+    "is_ancestor": ROOT_SCOPE_REPO,
+    "merge_base": ROOT_SCOPE_REPO,
+    "create_ref": ROOT_SCOPE_REPO,
+    "create_ref_exclusive": ROOT_SCOPE_REPO,
+    "delete_ref": ROOT_SCOPE_REPO,
+    "hash_object_write": ROOT_SCOPE_REPO,
+    "cat_file_blob": ROOT_SCOPE_REPO,
+    "object_exists": ROOT_SCOPE_REPO,
+    "mktree": ROOT_SCOPE_REPO,
+    "commit_tree": ROOT_SCOPE_REPO,
+    "commit_subject": ROOT_SCOPE_REPO,
+    "commit_parent": ROOT_SCOPE_REPO,
+    "commit_message": ROOT_SCOPE_REPO,
+    "log_range": ROOT_SCOPE_REPO,
+    "range_diff": ROOT_SCOPE_REPO,
+    "range_diff_path": ROOT_SCOPE_REPO,
+    "diff_range_empty": ROOT_SCOPE_REPO,
+    "any_tracked_at": ROOT_SCOPE_REPO,
+    "file_at_commit": ROOT_SCOPE_REPO,
+    "advance_is_engine_bookkeeping": ROOT_SCOPE_REPO,
+    "remote_url": ROOT_SCOPE_REPO,
+    "remote_default_branch": ROOT_SCOPE_REPO,
+    # --- COMMON: the shared git dir / worktree administration ----------------
+    "git_common_dir": ROOT_SCOPE_COMMON,
+    "add_worktree": ROOT_SCOPE_COMMON,
+    "remove_worktree": ROOT_SCOPE_COMMON,
+    "prune_worktrees": ROOT_SCOPE_COMMON,
+}
+
+
 def _run(
     repo: Path, *args: str, stdin: str | None = None, _env: dict[str, str] | None = None
 ) -> str:

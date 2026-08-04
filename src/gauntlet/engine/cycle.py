@@ -408,7 +408,7 @@ def _apply_cycle_rewind(
         ),
         approved_artifacts=governed_artifact_paths(
             repo, ctx.artifact_root,
-            state_outside_worktree=ctx.state_outside_worktree,
+            artifacts_outside_worktree=ctx.artifacts_outside_worktree,
         ),
     )
     state_obs = RX.observe_state(

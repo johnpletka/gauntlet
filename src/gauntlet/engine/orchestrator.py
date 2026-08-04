@@ -158,6 +158,7 @@ class Orchestrator:
         ledger_path: Path | None = None,
         interrupted_override: str | None = None,
         state_outside_worktree: bool = False,
+        artifacts_outside_worktree: bool = False,
         work_root: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
@@ -174,6 +175,8 @@ class Orchestrator:
         # does. The flag makes that difference declared rather than inferred
         # from a swallowed ValueError — see execution.StateDirNotContained.
         self.state_outside_worktree = state_outside_worktree
+        # Independent of the above (review F-002) — see StepContext.
+        self.artifacts_outside_worktree = artifacts_outside_worktree
         self.config = config
         self.pipeline = pipeline
         self.manifest = manifest
@@ -1005,7 +1008,7 @@ class Orchestrator:
             ),
             approved_artifacts=governed_artifact_paths(
                 repo, self.artifact_root,
-                state_outside_worktree=self.state_outside_worktree,
+                artifacts_outside_worktree=self.artifacts_outside_worktree,
             ),
         )
         state_obs = RX.observe_state(
@@ -1705,6 +1708,7 @@ class Orchestrator:
             artifacts=dict(self.artifacts),
             excludes=self.excludes,
             state_outside_worktree=self.state_outside_worktree,
+            artifacts_outside_worktree=self.artifacts_outside_worktree,
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,

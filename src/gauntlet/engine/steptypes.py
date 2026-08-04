@@ -603,7 +603,7 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
     # `test_command` env, else the engine interpreter.
     command = resolve_command(collector, ctx.config)
     try:
-        copy = verify.make_disposable_copy(ctx.repo_root)
+        copy = verify.make_disposable_copy(ctx.work_root)
     except verify.CopyCreationError as exc:
         return _acceptance_gate_halt(
             f"acceptance gate ({collector_kind}): could not create a disposable "
@@ -621,7 +621,7 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             f"{phase_id} — {exc}"
         )
     finally:
-        verify.discard_disposable_copy(ctx.repo_root, copy)
+        verify.discard_disposable_copy(ctx.work_root, copy)
     missing_ids = sorted(cited - enumerated)
     if missing_ids:
         return _acceptance_gate_halt(
@@ -1393,7 +1393,7 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
             "enforced header format",
         )
     try:
-        rel = out_path.resolve().relative_to(ctx.repo_root.resolve()).as_posix()
+        rel = out_path.resolve().relative_to(ctx.work_root.resolve()).as_posix()
     except ValueError:
         return StepResult(
             status=FAILED,
@@ -1402,7 +1402,7 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
     dirty = {
         ln[3:].strip()
         for ln in gitops.status_porcelain(
-            ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+            ctx.work_root, exclude=ctx.excludes, untracked_all=True
         ).splitlines()
         if ln.strip()
     }
@@ -1428,7 +1428,7 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
     # bubble out as the orchestrator's generic "handler error: ...".
     try:
         sha = gitops.commit_paths(
-            ctx.repo_root, message, [rel], identity=ctx.config.identity(agent_name),
+            ctx.work_root, message, [rel], identity=ctx.config.identity(agent_name),
         )
     except gitops.GitError as exc:
         return StepResult(
@@ -1894,7 +1894,9 @@ def _disposition_value(structured) -> str | None:
 
 # --- commit (FR-9.2/9.7) -----------------------------------------------------
 def handle_commit(step: Step, ctx: StepContext) -> StepResult:
-    repo = ctx.repo_root
+    # The tree the phase was built in (P7a). The commit-message drafter already
+    # reads this tree; the commit itself must land in the same one.
+    repo = ctx.work_root
     # Narrow exclusion (review F-001): commit real artifacts (plan.md, outputs);
     # keep only the engine's own bookkeeping out of the commit and the checks.
     exclude = ctx.excludes
@@ -2220,7 +2222,7 @@ def _change_context(ctx: StepContext, *, diff_base=None) -> str:
     base — pass ``diff_base`` (the squash base) so the drafted message reflects
     the whole phase, not an empty residual tree.
     """
-    repo = ctx.repo_root
+    repo = ctx.work_root
     if diff_base:
         diff = gitops.diff_worktree_vs(repo, diff_base, exclude=ctx.excludes)
         label = f"diff (tracked, vs phase base {diff_base[:10]})"

@@ -197,7 +197,7 @@ def snapshot_ref(run_id: str, snapshot_id: str) -> str:
 
 
 def create_snapshot(
-    repo: Path,
+    work_root: Path,
     *,
     run_id: str,
     reason: str,
@@ -237,21 +237,21 @@ def create_snapshot(
     ref = snapshot_ref(run_id, snapshot_id)
     # Defense in depth: our component regex is stricter than git's rules, but
     # let git veto anything it would reject before we build objects for it.
-    gitops._run(repo, "check-ref-format", ref)
-    if _ref_exists(repo, ref):
+    gitops._run(work_root, "check-ref-format", ref)
+    if _ref_exists(work_root, ref):
         raise SnapshotError(f"recovery snapshot ref already exists: {ref}")
 
-    head = gitops.head_sha(repo)
-    branch = gitops.current_branch(repo)
+    head = gitops.head_sha(work_root)
+    branch = gitops.current_branch(work_root)
     checked_out_branch = None if branch == "HEAD" else branch
     run_branch_sha: str | None = None
-    if run_branch is not None and gitops.branch_exists(repo, run_branch):
-        run_branch_sha = gitops.rev_parse(repo, f"refs/heads/{run_branch}")
+    if run_branch is not None and gitops.branch_exists(work_root, run_branch):
+        run_branch_sha = gitops.rev_parse(work_root, f"refs/heads/{run_branch}")
 
-    index_path = gitops.git_index_path(repo)
+    index_path = gitops.git_index_path(work_root)
     raw_index_bytes = index_path.read_bytes() if index_path.exists() else None
     raw_index_oid = (
-        gitops.hash_object_write(repo, raw_index_bytes)
+        gitops.hash_object_write(work_root, raw_index_bytes)
         if raw_index_bytes is not None
         else None
     )
@@ -269,7 +269,7 @@ def create_snapshot(
             index_copy.write_bytes(raw_index_bytes)
             try:
                 index_tree = gitops.run_with_temp_index(
-                    repo, index_copy, "write-tree"
+                    work_root, index_copy, "write-tree"
                 ).strip()
             except GitError:
                 index_tree = None  # unmerged index: raw bytes carry the truth
@@ -280,13 +280,13 @@ def create_snapshot(
         # symlinks as symlinks and preserves executable modes, and gitignore
         # rules apply except where ``protected`` overrides them.
         work_index = tmpdir / "index-worktree"
-        gitops.run_with_temp_index(repo, work_index, "read-tree", head)
+        gitops.run_with_temp_index(work_root, work_index, "read-tree", head)
         gitops.run_with_temp_index(
-            repo, work_index, "add", "-A", *_exclude_pathspec(exclude)
+            work_root, work_index, "add", "-A", *_exclude_pathspec(exclude)
         )
-        if protected and _patterns_match_temp_index(repo, work_index, protected):
+        if protected and _patterns_match_temp_index(work_root, work_index, protected):
             gitops.run_with_temp_index(
-                repo, work_index, "add", "-A", "-f", "--", *protected
+                work_root, work_index, "add", "-A", "-f", "--", *protected
             )
         # Drop excluded entries from the tree entirely (review F-001). The
         # HEAD seed pulled in committed versions of excluded paths; leaving
@@ -300,17 +300,17 @@ def create_snapshot(
             removal_spec += [f":(exclude){pattern}" for pattern in protected]
             to_remove = _split_z(
                 gitops.run_with_temp_index(
-                    repo, work_index, "ls-files", "-z", *removal_spec
+                    work_root, work_index, "ls-files", "-z", *removal_spec
                 )
             )
             if to_remove:
                 gitops.run_with_temp_index(
-                    repo, work_index, "update-index", "--force-remove",
+                    work_root, work_index, "update-index", "--force-remove",
                     "-z", "--stdin",
                     stdin="".join(f"{rel}\0" for rel in to_remove),
                 )
         worktree_tree = gitops.run_with_temp_index(
-            repo, work_index, "write-tree"
+            work_root, work_index, "write-tree"
         ).strip()
 
         protected_paths: tuple[str, ...] = ()
@@ -320,7 +320,7 @@ def create_snapshot(
                 sorted(
                     _split_z(
                         gitops.run_with_temp_index(
-                            repo, work_index, "ls-files", "-z", "--", *protected
+                            work_root, work_index, "ls-files", "-z", "--", *protected
                         )
                     )
                 )
@@ -332,7 +332,7 @@ def create_snapshot(
                 sorted(
                     _split_z(
                         gitops._run(
-                            repo,
+                            work_root,
                             "diff-tree", "-r", "-z", "--name-only",
                             "--diff-filter=D", head, worktree_tree,
                             "--", *protected,
@@ -364,7 +364,7 @@ def create_snapshot(
     )
 
     metadata_oid = gitops.hash_object_write(
-        repo, record.metadata_json().encode("utf-8")
+        work_root, record.metadata_json().encode("utf-8")
     )
     entries = [
         f"100644 blob {metadata_oid}\t{METADATA_ENTRY}",
@@ -374,7 +374,7 @@ def create_snapshot(
         entries.append(f"100644 blob {raw_index_oid}\t{RAW_INDEX_ENTRY}")
     if index_tree is not None:
         entries.append(f"040000 tree {index_tree}\t{INDEX_TREE_ENTRY}")
-    wrapper_tree = gitops.mktree(repo, entries)
+    wrapper_tree = gitops.mktree(work_root, entries)
 
     parents = [head]
     if run_branch_sha is not None and run_branch_sha != head:
@@ -389,7 +389,7 @@ def create_snapshot(
         "backups.\n"
     )
     commit = gitops.commit_tree(
-        repo, wrapper_tree, parents, message, identity=ENGINE_IDENTITY
+        work_root, wrapper_tree, parents, message, identity=ENGINE_IDENTITY
     )
     # Atomic durability point: the ref appears only after every required
     # object exists. A crash before this line leaves zero mutations; a crash
@@ -399,9 +399,9 @@ def create_snapshot(
     # the gap loses nothing — the loser errors here instead of displacing the
     # winner's snapshot.
     try:
-        gitops.create_ref_exclusive(repo, ref, commit)
+        gitops.create_ref_exclusive(work_root, ref, commit)
     except GitError as exc:
-        if _ref_exists(repo, ref):  # lost the race: the winner's ref stands
+        if _ref_exists(work_root, ref):  # lost the race: the winner's ref stands
             raise SnapshotError(
                 f"recovery snapshot ref already exists: {ref}"
             ) from exc
@@ -409,16 +409,16 @@ def create_snapshot(
     return record.model_copy(update={"snapshot_commit": commit})
 
 
-def _ref_exists(repo: Path, ref: str) -> bool:
+def _ref_exists(work_root: Path, ref: str) -> bool:
     try:
-        gitops._run(repo, "rev-parse", "--verify", "--quiet", ref)
+        gitops._run(work_root, "rev-parse", "--verify", "--quiet", ref)
         return True
     except GitError:
         return False
 
 
 def _patterns_match_temp_index(
-    repo: Path, work_index: Path, patterns: list[str]
+    work_root: Path, work_index: Path, patterns: list[str]
 ) -> bool:
     """True iff ``patterns`` still match anything the scoped force-add can act on.
 
@@ -433,12 +433,12 @@ def _patterns_match_temp_index(
     gitignored files.
     """
     in_index = gitops.run_with_temp_index(
-        repo, work_index, "ls-files", "-z", "--", *patterns
+        work_root, work_index, "ls-files", "-z", "--", *patterns
     )
     if in_index:
         return True
     others = gitops.run_with_temp_index(
-        repo, work_index, "ls-files", "-z", "--others", "--", *patterns
+        work_root, work_index, "ls-files", "-z", "--others", "--", *patterns
     )
     return bool(others)
 
@@ -482,7 +482,7 @@ def load_snapshot(repo: Path, ref: str) -> GitRecoverySnapshot:
 
 
 def restore_snapshot(
-    repo: Path, snapshot: GitRecoverySnapshot, *, exact_index: bool = True
+    work_root: Path, snapshot: GitRecoverySnapshot, *, exact_index: bool = True
 ) -> None:
     """Restore the full captured worktree state; idempotent.
 
@@ -497,11 +497,11 @@ def restore_snapshot(
     LAST, bringing back staged-vs-worktree divergence and unmerged conflict
     stages precisely as captured.
     """
-    _require_objects(repo, snapshot)
+    _require_objects(work_root, snapshot)
     with _temp_workspace() as tmpdir:
         work_index = tmpdir / "index-restore"
         gitops.run_with_temp_index(
-            repo, work_index, "read-tree", snapshot.worktree_tree
+            work_root, work_index, "read-tree", snapshot.worktree_tree
         )
         # Remove what the snapshot says should not exist: every non-ignored
         # file absent from the snapshot tree (skipping the creation-time
@@ -509,26 +509,26 @@ def restore_snapshot(
         # recorded protected deletions (which hide under those exclusions).
         extraneous = _split_z(
             gitops.run_with_temp_index(
-                repo, work_index, "ls-files", "-z", "--others",
+                work_root, work_index, "ls-files", "-z", "--others",
                 "--exclude-standard",
                 *_exclude_pathspec(list(snapshot.excluded_paths)),
             )
         )
         for rel in extraneous:
-            _safe_unlink(repo, rel)
+            _safe_unlink(work_root, rel)
         for rel in snapshot.protected_deletions:
-            _safe_unlink(repo, rel)
+            _safe_unlink(work_root, rel)
         tree_paths = _split_z(
-            gitops.run_with_temp_index(repo, work_index, "ls-files", "-z")
+            gitops.run_with_temp_index(work_root, work_index, "ls-files", "-z")
         )
         for rel in tree_paths:
-            _prepare_destination(repo, rel)
-        gitops.run_with_temp_index(repo, work_index, "checkout-index", "-f", "-a")
+            _prepare_destination(work_root, rel)
+        gitops.run_with_temp_index(work_root, work_index, "checkout-index", "-f", "-a")
     if exact_index:
-        _restore_raw_index(repo, snapshot)
+        _restore_raw_index(work_root, snapshot)
 
 
-def restore_protected(repo: Path, snapshot: GitRecoverySnapshot) -> None:
+def restore_protected(work_root: Path, snapshot: GitRecoverySnapshot) -> None:
     """Restore ONLY the snapshot's protected entries; idempotent.
 
     The scoped counterpart used after a sanctioned rewind (e.g. the pilot
@@ -539,33 +539,33 @@ def restore_protected(repo: Path, snapshot: GitRecoverySnapshot) -> None:
     """
     if not (snapshot.protected_paths or snapshot.protected_deletions):
         return
-    _require_objects(repo, snapshot)
+    _require_objects(work_root, snapshot)
     for rel in snapshot.protected_deletions:
-        _safe_unlink(repo, rel)
+        _safe_unlink(work_root, rel)
     if not snapshot.protected_paths:
         return
     with _temp_workspace() as tmpdir:
         work_index = tmpdir / "index-protected"
         gitops.run_with_temp_index(
-            repo, work_index, "read-tree", snapshot.worktree_tree
+            work_root, work_index, "read-tree", snapshot.worktree_tree
         )
         for rel in snapshot.protected_paths:
-            _prepare_destination(repo, rel)
+            _prepare_destination(work_root, rel)
         gitops.run_with_temp_index(
-            repo, work_index, "checkout-index", "-f", "-z", "--stdin",
+            work_root, work_index, "checkout-index", "-f", "-z", "--stdin",
             stdin="".join(f"{rel}\0" for rel in snapshot.protected_paths),
         )
 
 
-def _require_objects(repo: Path, snapshot: GitRecoverySnapshot) -> None:
-    if not gitops.object_exists(repo, snapshot.worktree_tree):
+def _require_objects(work_root: Path, snapshot: GitRecoverySnapshot) -> None:
+    if not gitops.object_exists(work_root, snapshot.worktree_tree):
         raise SnapshotError(
             f"snapshot {snapshot.ref} worktree tree {snapshot.worktree_tree} "
             "is missing; cannot restore"
         )
 
 
-def _restore_raw_index(repo: Path, snapshot: GitRecoverySnapshot) -> None:
+def _restore_raw_index(work_root: Path, snapshot: GitRecoverySnapshot) -> None:
     """Restore the real index bytes exactly (staging state + conflict stages).
 
     Written atomically beside the index (temp file + ``os.replace``) so a
@@ -573,19 +573,19 @@ def _restore_raw_index(repo: Path, snapshot: GitRecoverySnapshot) -> None:
     data goes stale against the freshly materialized worktree, which only
     makes Git re-verify content — porcelain semantics are unchanged.
     """
-    index_path = gitops.git_index_path(repo)
+    index_path = gitops.git_index_path(work_root)
     if snapshot.raw_index_oid is None:
         if index_path.exists():
             index_path.unlink()
         return
-    data = gitops.cat_file_blob(repo, snapshot.raw_index_oid)
+    data = gitops.cat_file_blob(work_root, snapshot.raw_index_oid)
     tmp = index_path.parent / f"{index_path.name}.gauntlet-restore-{os.getpid()}"
     tmp.write_bytes(data)
     os.replace(tmp, index_path)
 
 
-def _safe_unlink(repo: Path, rel: str) -> None:
-    """Remove one repo-relative file without ever following a symlink.
+def _safe_unlink(work_root: Path, rel: str) -> None:
+    """Remove one work_root-relative file without ever following a symlink.
 
     Validates containment, refuses to traverse a symlinked parent component
     (deleting through it would reach outside the observed path), and prunes
@@ -593,7 +593,7 @@ def _safe_unlink(repo: Path, rel: str) -> None:
     """
     _validate_rel_path(rel, field="restore path")
     parts = PurePosixPath(rel).parts
-    current = repo
+    current = work_root
     for part in parts[:-1]:
         current = current / part
         try:
@@ -602,7 +602,7 @@ def _safe_unlink(repo: Path, rel: str) -> None:
             return  # nothing to remove
         if stat.S_ISLNK(info.st_mode):
             return  # never operate through a symlinked component
-    target = repo / rel
+    target = work_root / rel
     try:
         info = target.lstat()
     except FileNotFoundError:
@@ -613,11 +613,11 @@ def _safe_unlink(repo: Path, rel: str) -> None:
             "file or symlink entry"
         )
     target.unlink()
-    _prune_empty_dirs(repo, target.parent)
+    _prune_empty_dirs(work_root, target.parent)
 
 
-def _prune_empty_dirs(repo: Path, directory: Path) -> None:
-    root = repo.resolve()
+def _prune_empty_dirs(work_root: Path, directory: Path) -> None:
+    root = work_root.resolve()
     current = directory
     while True:
         try:
@@ -633,8 +633,8 @@ def _prune_empty_dirs(repo: Path, directory: Path) -> None:
         current = current.parent
 
 
-def _prepare_destination(repo: Path, rel: str) -> None:
-    """Make ``repo/rel`` safe for Git to materialize into.
+def _prepare_destination(work_root: Path, rel: str) -> None:
+    """Make ``work_root/rel`` safe for Git to materialize into.
 
     Guarantees ``checkout-index`` can never write *through* a pre-existing
     symlink: any symlinked parent component is unlinked (a tree path can
@@ -645,7 +645,7 @@ def _prepare_destination(repo: Path, rel: str) -> None:
     """
     _validate_rel_path(rel, field="restore path")
     parts = PurePosixPath(rel).parts
-    current = repo
+    current = work_root
     for part in parts[:-1]:
         current = current / part
         try:
@@ -655,7 +655,7 @@ def _prepare_destination(repo: Path, rel: str) -> None:
         if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
             current.unlink()
             break
-    target = repo / rel
+    target = work_root / rel
     try:
         info = target.lstat()
     except FileNotFoundError:

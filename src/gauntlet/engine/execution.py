@@ -199,6 +199,12 @@ class StepContext:
     # so the bookkeeping builders return empty by design instead of failing
     # closed. False for every `gauntlet run` — see `StateDirNotContained`.
     state_outside_worktree: bool = False
+    # INDEPENDENT of the above (review F-002): declares that the GOVERNED
+    # artifacts (prd.md / plan.md) legitimately live outside the work tree, so
+    # R9's approved-artifact evidence is empty by design. A review run has none;
+    # a `gauntlet run` always does. Sharing one flag with the state declaration
+    # would let an external state dir silently switch off governance.
+    artifacts_outside_worktree: bool = False
     # The tree this step edits and commits in (P7a). Defaults to `repo_root`
     # via __post_init__, which is the pre-P7 same-tree layout; P7c points it at
     # the run's dedicated worktree. Every worktree-mutating or -observing call
@@ -472,7 +478,10 @@ def engine_bookkeeping_candidates(
 
 
 def governed_artifact_paths(
-    repo_root: Path, artifact_root: Path, *, state_outside_worktree: bool = False
+    repo_root: Path,
+    artifact_root: Path,
+    *,
+    artifacts_outside_worktree: bool = False,
 ) -> list[str]:
     """Repo-relative paths of the run's governed artifacts (R9 / FR-10.4).
 
@@ -494,6 +503,14 @@ def governed_artifact_paths(
     approved-artifact edit inside a rewind range stops being flagged at all, so
     R9's "never silently adopt" degrades to "never notice". A review run has no
     governed prd/plan and correctly gets an empty list — declared, not inferred.
+
+    The declaration is DELIBERATELY SEPARATE from the bookkeeping builders'
+    ``state_outside_worktree`` (review F-002). Those are independent facts: the
+    ratified P7 layout (spike §4.4) keeps the run-instance state dir out of the
+    run worktree while the governed prd.md/plan.md remain fully in scope for R9.
+    Sharing one flag would mean that declaring an external state dir silently
+    switched OFF governed-artifact validation — the exact silent suppression
+    :class:`StateDirNotContained` exists to prevent, reintroduced one layer up.
     """
     root = repo_root.resolve()
     art = artifact_root.resolve()
@@ -501,7 +518,7 @@ def governed_artifact_paths(
     for name in ("prd.md", "plan.md"):
         rel = _tree_rel(
             art / name, root, field="governed artifact",
-            state_outside_worktree=state_outside_worktree,
+            state_outside_worktree=artifacts_outside_worktree,
         )
         if rel is not None:
             paths.append(rel)

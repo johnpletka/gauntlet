@@ -157,7 +157,7 @@ def test_declared_external_state_returns_empty_without_raising(trees):
         run_bookkeeping_paths(work, external, state_outside_worktree=True) == []
     )
     assert (
-        governed_artifact_paths(work, external, state_outside_worktree=True)
+        governed_artifact_paths(work, external, artifacts_outside_worktree=True)
         == []
     )
 
@@ -178,7 +178,7 @@ def test_the_flag_does_not_suppress_a_contained_result(trees):
         "runs/demo/run-1/RUN.md",
     ]
     assert governed_artifact_paths(
-        work, slug_dir, state_outside_worktree=True
+        work, slug_dir, artifacts_outside_worktree=True
     ) == ["runs/demo/prd.md", "runs/demo/plan.md"]
 
 
@@ -195,3 +195,33 @@ def test_review_declares_the_external_state_dir_at_the_call_site():
 
     source = inspect.getsource(review._build_review_orchestrator)
     assert "state_outside_worktree=True" in source
+
+
+def test_state_and_artifact_declarations_are_independent(trees):
+    """Declaring an external STATE dir must not disable governed-artifact checks.
+
+    Review F-002: the ratified P7 layout (spike §4.4) keeps the run-instance
+    state dir out of the run worktree while prd.md/plan.md stay fully in scope
+    for R9. One shared flag would mean that declaring the former silently
+    switched off the latter — the exact silent suppression
+    `StateDirNotContained` exists to prevent, one layer up.
+    """
+    work, slug_dir, run_dir, external = trees
+    # Declaring external STATE says nothing about the artifacts: a contained
+    # governed artifact is still reported...
+    assert run_bookkeeping_paths(
+        work, external, state_outside_worktree=True
+    ) == []
+    assert governed_artifact_paths(work, slug_dir) == [
+        "runs/demo/prd.md",
+        "runs/demo/plan.md",
+    ]
+    # ...and an UNCONTAINED governed artifact still fails closed even when the
+    # state dir has been declared external.
+    with pytest.raises(StateDirNotContained):
+        governed_artifact_paths(work, external)
+    # The two flags cannot be passed to each other's builder.
+    with pytest.raises(TypeError):
+        governed_artifact_paths(work, external, state_outside_worktree=True)
+    with pytest.raises(TypeError):
+        run_bookkeeping_paths(work, external, artifacts_outside_worktree=True)

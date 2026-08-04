@@ -431,7 +431,7 @@ def _relation_from_kinds(kinds: set[CommitKind]) -> BranchRelation:
 
 
 def observe_git(
-    repo: Path,
+    work_root: Path,
     *,
     run_branch: str,
     recorded_sha: str | None,
@@ -446,12 +446,12 @@ def observe_git(
     forked branch is fully inventoried commit-by-commit so the relation label
     is proven by auditable data, exactly as the P1 model validators demand.
     """
-    branch = gitops.current_branch(repo)
+    branch = gitops.current_branch(work_root)
     checked_out = None if branch == "HEAD" else branch
-    head = gitops.head_sha(repo)
+    head = gitops.head_sha(work_root)
     run_branch_sha: str | None = None
-    if gitops.branch_exists(repo, run_branch):
-        run_branch_sha = gitops.rev_parse(repo, f"refs/heads/{run_branch}")
+    if gitops.branch_exists(work_root, run_branch):
+        run_branch_sha = gitops.rev_parse(work_root, f"refs/heads/{run_branch}")
 
     bookkeeping = frozenset(bookkeeping_candidates or [])
     approved = frozenset(approved_artifacts or [])
@@ -464,18 +464,18 @@ def observe_git(
         relation = BranchRelation.UNRECORDED
     elif run_branch_sha == recorded_sha:
         relation = BranchRelation.EQUAL
-    elif gitops.is_ancestor(repo, recorded_sha, run_branch_sha):
+    elif gitops.is_ancestor(work_root, recorded_sha, run_branch_sha):
         commits = _inventory_range(
-            repo, recorded_sha, run_branch_sha,
+            work_root, recorded_sha, run_branch_sha,
             bookkeeping_candidates=bookkeeping, approved_artifacts=approved,
         )
         relation = _relation_from_kinds({c.kind for c in commits})
-    elif gitops.is_ancestor(repo, run_branch_sha, recorded_sha):
+    elif gitops.is_ancestor(work_root, run_branch_sha, recorded_sha):
         relation = BranchRelation.BEHIND
         merge_base = run_branch_sha
     else:
         relation = BranchRelation.FORKED
-        merge_base = gitops.merge_base(repo, run_branch_sha, recorded_sha)
+        merge_base = gitops.merge_base(work_root, run_branch_sha, recorded_sha)
         if merge_base is None:
             raise RecoveryObservationError(
                 f"run branch {run_branch!r} shares no history with the recorded "
@@ -483,7 +483,7 @@ def observe_git(
                 "assessed for recovery"
             )
         commits = _inventory_range(
-            repo, merge_base, run_branch_sha,
+            work_root, merge_base, run_branch_sha,
             bookkeeping_candidates=bookkeeping, approved_artifacts=approved,
         )
 
@@ -496,8 +496,8 @@ def observe_git(
         branch_relation=relation,
         merge_base_sha=merge_base,
         run_branch_commits=commits,
-        index_fingerprint=index_fingerprint(repo),
-        worktree_fingerprint=worktree_fingerprint(repo, exclude=excludes),
+        index_fingerprint=index_fingerprint(work_root),
+        worktree_fingerprint=worktree_fingerprint(work_root, exclude=excludes),
     )
 
 
@@ -1969,8 +1969,14 @@ class RecoveryExecutor:
         excludes: list[str] | None = None,
         clock: Callable[[], str] | None = None,
         lock_guard: WorktreeLockGuard | None = None,
+        work_root: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
+        # The tree this executor rewinds (P7a). Every rewind here mutates a
+        # WORKING tree — checkout, reset, clean, index restore — and P7
+        # acceptance A1 is exactly "that tree is never the operator's". `None`
+        # is the pre-P7 same-tree layout; P7c passes the run's worktree.
+        self.work_root = work_root or repo_root
         self.run_dir = run_dir
         self.run_id = run_id
         self.excludes = excludes
@@ -2224,7 +2230,7 @@ class RecoveryExecutor:
     # -- step 3: validation ----------------------------------------------------
 
     def _validate(self, action: RecoveryAction, spec: RewindSpec) -> None:
-        repo = self.repo_root
+        repo = self.work_root
         if not gitops.ref_is_valid_commit(repo, spec.target_sha):
             raise RecoveryPreconditionError(
                 f"rewind target {spec.target_sha[:10]} does not resolve to a "
@@ -2274,7 +2280,7 @@ class RecoveryExecutor:
     def _apply_spec(
         self, spec: RewindSpec, snapshot: git_snapshot.GitRecoverySnapshot
     ) -> None:
-        repo = self.repo_root
+        repo = self.work_root
         if (
             spec.checkout_branch is not None
             and gitops.current_branch(repo) != spec.checkout_branch
@@ -2321,7 +2327,7 @@ def _blob_oid(repo: Path, data: bytes) -> str:
 
 
 def _index_fingerprint_for_tree(
-    repo: Path, treeish: str, *, bookkeeping: tuple[str, ...] = ()
+    work_root: Path, treeish: str, *, bookkeeping: tuple[str, ...] = ()
 ) -> str:
     """Index fingerprint produced by ``read-tree`` plus an optional overlay.
 
@@ -2331,19 +2337,19 @@ def _index_fingerprint_for_tree(
     """
     with tempfile.TemporaryDirectory(prefix="gauntlet-replay-index-") as tmp:
         index_path = Path(tmp) / "index"
-        gitops.run_with_temp_index(repo, index_path, "read-tree", treeish)
+        gitops.run_with_temp_index(work_root, index_path, "read-tree", treeish)
         if bookkeeping:
             gitops.run_with_temp_index(
-                repo, index_path, "add", "-f", "--", *bookkeeping
+                work_root, index_path, "add", "-f", "--", *bookkeeping
             )
         out = gitops.run_with_temp_index(
-            repo, index_path, "ls-files", "--stage", "-z"
+            work_root, index_path, "ls-files", "--stage", "-z"
         )
     return _sha256(out.encode("utf-8", "surrogateescape"))
 
 
 def _worktree_matches_snapshot(
-    repo: Path,
+    work_root: Path,
     snapshot: git_snapshot.GitRecoverySnapshot,
     *,
     excludes: list[str],
@@ -2359,7 +2365,7 @@ def _worktree_matches_snapshot(
     """
     def remove_control_locks(index_path: Path) -> None:
         entries = gitops.run_with_temp_index(
-            repo, index_path, "ls-files", "-z"
+            work_root, index_path, "ls-files", "-z"
         ).split("\0")
         locks = [
             rel for rel in entries if rel and (
@@ -2369,7 +2375,7 @@ def _worktree_matches_snapshot(
         ]
         if locks:
             gitops.run_with_temp_index(
-                repo,
+                work_root,
                 index_path,
                 "update-index",
                 "--force-remove",
@@ -2381,7 +2387,7 @@ def _worktree_matches_snapshot(
     with tempfile.TemporaryDirectory(prefix="gauntlet-replay-worktree-") as tmp:
         index_path = Path(tmp) / "index"
         gitops.run_with_temp_index(
-            repo, index_path, "read-tree", snapshot.worktree_tree
+            work_root, index_path, "read-tree", snapshot.worktree_tree
         )
         # The executor's own ephemeral lock can exist while the snapshot is
         # built and disappear before replay (or carry a new nonce during a
@@ -2389,10 +2395,10 @@ def _worktree_matches_snapshot(
         # as ``worktree_fingerprint`` / ``_dirty_paths`` already do.
         remove_control_locks(index_path)
         expected_tree = gitops.run_with_temp_index(
-            repo, index_path, "write-tree"
+            work_root, index_path, "write-tree"
         ).strip()
         gitops.run_with_temp_index(
-            repo,
+            work_root,
             index_path,
             "add",
             "-A",
@@ -2400,7 +2406,7 @@ def _worktree_matches_snapshot(
         )
         if protected:
             protected_dirty = gitops._run(
-                repo,
+                work_root,
                 "status",
                 "--porcelain",
                 "-z",
@@ -2409,14 +2415,14 @@ def _worktree_matches_snapshot(
                 *protected,
             )
             if protected_dirty or git_snapshot._patterns_match_temp_index(
-                repo, index_path, protected
+                work_root, index_path, protected
             ):
                 gitops.run_with_temp_index(
-                    repo, index_path, "add", "-A", "-f", "--", *protected
+                    work_root, index_path, "add", "-A", "-f", "--", *protected
                 )
         remove_control_locks(index_path)
         live_tree = gitops.run_with_temp_index(
-            repo, index_path, "write-tree"
+            work_root, index_path, "write-tree"
         ).strip()
     return live_tree == expected_tree
 
@@ -2469,7 +2475,7 @@ def _dirt_is_snapshot_residue(
     return True
 
 
-def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
+def replay_intent(work_root: Path, run_dir: Path, intent: RecoveryIntent) -> str:
     """Idempotently converge a surviving intent to its intended end state.
 
     Decision table, keyed on the intent's independently re-derivable plane
@@ -2490,23 +2496,23 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
     the site's state transition; the intent clears only after that returns.
     """
     spec = intent.spec
-    snapshot = git_snapshot.load_snapshot(repo, intent.snapshot_ref)
+    snapshot = git_snapshot.load_snapshot(work_root, intent.snapshot_ref)
     excludes = list(intent.excludes)
-    current_branch = gitops.current_branch(repo)
-    head = gitops.head_sha(repo)
+    current_branch = gitops.current_branch(work_root)
+    head = gitops.head_sha(work_root)
 
     def _planes_match_pre() -> bool:
         """The repository is byte-provably the assessed pre-apply state."""
         if head != intent.pre_head:
             return False
         if not _worktree_matches_snapshot(
-            repo,
+            work_root,
             snapshot,
             excludes=excludes,
             protected=list(intent.protected),
         ):
             return False
-        return index_fingerprint(repo) == intent.pre_index_fingerprint
+        return index_fingerprint(work_root) == intent.pre_index_fingerprint
 
     def _refuse(why: str) -> "RecoveryIntentError":
         return RecoveryIntentError(
@@ -2518,24 +2524,24 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
     def _full_apply() -> None:
         if spec.reset_mode == RESET_BOOKKEEPING_PRESERVING:
             gitops.rewind_impl_preserving_bookkeeping(
-                repo, spec.target_sha, list(spec.bookkeeping_paths),
+                work_root, spec.target_sha, list(spec.bookkeeping_paths),
                 spec.rewind_message, identity=ENGINE_IDENTITY,
             )
         else:
-            gitops.reset_hard(repo, spec.target_sha)
+            gitops.reset_hard(work_root, spec.target_sha)
         _finish()
 
     def _finish() -> None:
         if spec.clean:
-            gitops.clean_untracked(repo, exclude=list(spec.clean_excludes))
-        git_snapshot.restore_protected(repo, snapshot)
+            gitops.clean_untracked(work_root, exclude=list(spec.clean_excludes))
+        git_snapshot.restore_protected(work_root, snapshot)
 
-    head_index_fingerprint = _index_fingerprint_for_tree(repo, head)
-    target_index_fingerprint = _index_fingerprint_for_tree(repo, spec.target_sha)
+    head_index_fingerprint = _index_fingerprint_for_tree(work_root, head)
+    target_index_fingerprint = _index_fingerprint_for_tree(work_root, spec.target_sha)
     bookkeeping_index_fingerprint = None
     if spec.reset_mode == RESET_BOOKKEEPING_PRESERVING:
         bookkeeping_index_fingerprint = _index_fingerprint_for_tree(
-            repo, spec.target_sha, bookkeeping=spec.bookkeeping_paths
+            work_root, spec.target_sha, bookkeeping=spec.bookkeeping_paths
         )
 
     def _bookkeeping_pre_reset_state() -> bool:
@@ -2552,20 +2558,20 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         if head != intent.pre_head:
             return False
         if not _worktree_matches_snapshot(
-            repo,
+            work_root,
             snapshot,
             excludes=excludes,
             protected=list(intent.protected),
         ):
             return False
         assert bookkeeping_index_fingerprint is not None
-        return index_fingerprint(repo) in {
+        return index_fingerprint(work_root) in {
             intent.pre_index_fingerprint,
             target_index_fingerprint,
             bookkeeping_index_fingerprint,
         }
 
-    tree_is_clean = not _dirty_paths(repo, exclude=excludes)
+    tree_is_clean = not _dirty_paths(work_root, exclude=excludes)
 
     applied_note: str
     if spec.checkout_branch is not None and current_branch != spec.checkout_branch:
@@ -2576,8 +2582,8 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
                 f"the repository is on {current_branch!r} and its HEAD/"
                 "index/worktree planes do not match the recorded pre-state"
             )
-        gitops.checkout_branch(repo, spec.checkout_branch)
-        gitops.reset_hard(repo, spec.target_sha)
+        gitops.checkout_branch(work_root, spec.checkout_branch)
+        gitops.reset_hard(work_root, spec.target_sha)
         _finish()
         applied_note = "replayed the full apply from the recorded pre-state"
     elif head == spec.target_sha:
@@ -2590,12 +2596,12 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
             _finish()
             applied_note = "finished a mid-apply intent (apply already effected)"
         elif _dirt_is_snapshot_residue(
-            repo,
+            work_root,
             snapshot,
             excludes,
             allowed_index_fingerprints={head_index_fingerprint},
         ):
-            gitops.reset_hard(repo, spec.target_sha)
+            gitops.reset_hard(work_root, spec.target_sha)
             _finish()
             applied_note = (
                 "finished a mid-apply intent (residual captured dirt discarded)"
@@ -2607,7 +2613,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
             )
     elif spec.reset_mode == RESET_BOOKKEEPING_PRESERVING and (
         gitops.advance_is_engine_bookkeeping(
-            repo, spec.target_sha, bookkeeping=list(spec.bookkeeping_paths),
+            work_root, spec.target_sha, bookkeeping=list(spec.bookkeeping_paths),
             tip=head,
         )
     ):
@@ -2615,12 +2621,12 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         if tree_is_clean:
             _finish()
         elif _dirt_is_snapshot_residue(
-            repo,
+            work_root,
             snapshot,
             excludes,
             allowed_index_fingerprints={head_index_fingerprint},
         ):
-            gitops.reset_hard(repo, head)
+            gitops.reset_hard(work_root, head)
             _finish()
         else:
             raise _refuse(
@@ -2638,7 +2644,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
         if not (
             tree_is_clean
             or _dirt_is_snapshot_residue(
-                repo,
+                work_root,
                 snapshot,
                 excludes,
                 allowed_index_fingerprints={head_index_fingerprint},
@@ -2648,7 +2654,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
                 "the checkout completed but the tree holds work the snapshot "
                 "never captured"
             )
-        gitops.reset_hard(repo, spec.target_sha)
+        gitops.reset_hard(work_root, spec.target_sha)
         _finish()
         applied_note = "finished a mid-apply intent (checkout already effected)"
     elif head == intent.pre_head:
@@ -2669,7 +2675,7 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
 
     finisher = REPLAY_FINISHERS.get(intent.site)
     if finisher is not None:
-        finisher(repo, run_dir, intent)
+        finisher(work_root, run_dir, intent)
     else:
         _append_manifest_warning(
             run_dir,
