@@ -520,12 +520,17 @@ def test_retry_budget_does_not_reset_across_resume(tmp_path):
 
     # Resume the failed run: the exhausted budget stays exhausted, so the step
     # fails exactly ONE more time (no fresh reroutes) — attempts advances by 1,
-    # not by another full budget of 3.
-    status = mgr.resume(
-        "demo", use_judge=False,
-        adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
-    )
-    assert status == M.RUN_FAILED
+    # not by another full budget of 3. Since P5.1 (review F-002) the identical
+    # re-failure then raises NoProgressError (the failure counter is
+    # bookkeeping, not progress — R5), instead of returning RUN_FAILED with a
+    # clean exit while nothing changed.
+    from gauntlet.engine.recovery import NoProgressError
+
+    with pytest.raises(NoProgressError):
+        mgr.resume(
+            "demo", use_judge=False,
+            adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
+        )
     assert mgr.status("demo").record("tests").attempts == 4
 
 
