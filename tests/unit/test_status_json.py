@@ -224,6 +224,9 @@ def test_section_6_2_example_validates():
         "suspension": None,
         # PRD §6 gate block: always present, body populated in P8; null for now.
         "gate": None,
+        # Additive P6 field (recovery-redesign plan §4.6): journal ↔ projection
+        # agreement — always present, null when the projection is healthy.
+        "projection": None,
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done",
              "duration_s": 620.0, "notes": None,
