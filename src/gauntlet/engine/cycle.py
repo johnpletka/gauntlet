@@ -402,8 +402,14 @@ def _apply_cycle_rewind(
         run_branch=observe_branch,
         recorded_sha=recorded_sha,
         excludes=ctx.excludes,
-        bookkeeping_candidates=engine_bookkeeping_candidates(repo, ctx.run_dir),
-        approved_artifacts=governed_artifact_paths(repo, ctx.artifact_root),
+        bookkeeping_candidates=engine_bookkeeping_candidates(
+            repo, ctx.run_dir,
+            state_outside_worktree=ctx.state_outside_worktree,
+        ),
+        approved_artifacts=governed_artifact_paths(
+            repo, ctx.artifact_root,
+            state_outside_worktree=ctx.state_outside_worktree,
+        ),
     )
     state_obs = RX.observe_state(
         ctx.manifest, rec, liveness=RX.DriverLiveness.ALIVE
@@ -507,7 +513,10 @@ def _reset_dirty_to_handoff(
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
         f"round {rnd} (P5 re-enter at fix)"
     )
-    paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
+    paths = run_bookkeeping_paths(
+        ctx.repo_root, ctx.run_dir,
+        state_outside_worktree=ctx.state_outside_worktree,
+    )
     preserving = (
         bool(paths)
         and gitops.head_sha(ctx.repo_root) != handoff
@@ -517,7 +526,10 @@ def _reset_dirty_to_handoff(
     if preserving:
         # Flush first so the preserved bookkeeping carries the latest state.
         _persist_manifest(ctx)
-        paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
+        paths = run_bookkeeping_paths(
+            ctx.repo_root, ctx.run_dir,
+            state_outside_worktree=ctx.state_outside_worktree,
+        )
         entry = (
             ctx.record.human_responses[-1] if ctx.record.human_responses else None
         )
@@ -777,7 +789,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 ctx.repo_root,
                 f"gauntlet: flush run bookkeeping before "
                 f"{phase or ctx.record.id} round-{rnd} review handoff",
-                run_bookkeeping_paths(ctx.repo_root, ctx.run_dir),
+                run_bookkeeping_paths(
+                    ctx.repo_root, ctx.run_dir,
+                    state_outside_worktree=ctx.state_outside_worktree,
+                ),
                 identity=gitops.ENGINE_IDENTITY,
             )
             if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):

@@ -157,10 +157,16 @@ class Orchestrator:
         response_action: "ResponseAction | None" = None,
         ledger_path: Path | None = None,
         interrupted_override: str | None = None,
+        state_outside_worktree: bool = False,
     ) -> None:
         self.repo_root = repo_root
         self.run_dir = run_dir
         self.artifact_root = artifact_root
+        # `gauntlet review` drives this orchestrator with an out-of-repo state
+        # dir by design (review.resolve_state_dir); a `gauntlet run` never
+        # does. The flag makes that difference declared rather than inferred
+        # from a swallowed ValueError — see execution.StateDirNotContained.
+        self.state_outside_worktree = state_outside_worktree
         self.config = config
         self.pipeline = pipeline
         self.manifest = manifest
@@ -185,7 +191,10 @@ class Orchestrator:
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
         # dirty checks / commits — real run artifacts stay visible (review F-001).
-        self.excludes = run_bookkeeping_excludes(repo_root, run_dir, artifact_root)
+        self.excludes = run_bookkeeping_excludes(
+            repo_root, run_dir, artifact_root,
+            state_outside_worktree=state_outside_worktree,
+        )
         self._ignore_run_dir()
         self._seed_artifacts()
 
@@ -829,7 +838,10 @@ class Orchestrator:
         # still seen as a mid-edit interruption (review F-001).
         if not gitops.is_dirty_vs(
             self.repo_root, rec.base_sha, exclude=self.excludes,
-            bookkeeping=engine_bookkeeping_candidates(self.repo_root, self.run_dir),
+            bookkeeping=engine_bookkeeping_candidates(
+                self.repo_root, self.run_dir,
+                state_outside_worktree=self.state_outside_worktree,
+            ),
         ):
             # Clean re-entry: the agent left no partial edits, and any HEAD
             # advance past base_sha is engine bookkeeping only (is_dirty_vs
@@ -981,9 +993,13 @@ class Orchestrator:
             recorded_sha=rec.base_sha,
             excludes=self.excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(
-                repo, self.run_dir
+                repo, self.run_dir,
+                state_outside_worktree=self.state_outside_worktree,
             ),
-            approved_artifacts=governed_artifact_paths(repo, self.artifact_root),
+            approved_artifacts=governed_artifact_paths(
+                repo, self.artifact_root,
+                state_outside_worktree=self.state_outside_worktree,
+            ),
         )
         state_obs = RX.observe_state(
             self.manifest, rec, liveness=RX.DriverLiveness.ALIVE
@@ -1417,7 +1433,8 @@ class Orchestrator:
             return gitops.is_dirty_vs(
                 self.repo_root, rec.base_sha, exclude=self.excludes,
                 bookkeeping=engine_bookkeeping_candidates(
-                    self.repo_root, self.run_dir
+                    self.repo_root, self.run_dir,
+                    state_outside_worktree=self.state_outside_worktree,
                 ),
             )
         except gitops.GitError:
@@ -1679,6 +1696,7 @@ class Orchestrator:
             judge_env=self.judge_env,
             artifacts=dict(self.artifacts),
             excludes=self.excludes,
+            state_outside_worktree=self.state_outside_worktree,
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
@@ -2043,7 +2061,10 @@ class Orchestrator:
         definition of what every engine bookkeeping commit (and the F-001 /
         fix-rerun rewinds) force-stages.
         """
-        return run_bookkeeping_paths(self.repo_root, self.run_dir)
+        return run_bookkeeping_paths(
+            self.repo_root, self.run_dir,
+            state_outside_worktree=self.state_outside_worktree,
+        )
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)

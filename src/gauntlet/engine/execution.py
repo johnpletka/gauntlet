@@ -127,6 +127,11 @@ class StepContext:
     # repo-relative paths of the engine's own bookkeeping (review F-001); commit
     # and dirty checks exclude these but not real run artifacts.
     excludes: list[str] = field(default_factory=list)
+    # Declares that `run_dir`/`artifact_root` legitimately live OUTSIDE the tree
+    # the engine commits in (a `gauntlet review` run's out-of-repo state dir),
+    # so the bookkeeping builders return empty by design instead of failing
+    # closed. False for every `gauntlet run` — see `StateDirNotContained`.
+    state_outside_worktree: bool = False
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
@@ -212,7 +217,62 @@ def usage_from_result(result: AgentResult) -> Usage | None:
     return result.usage
 
 
-def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path) -> list[str]:
+class StateDirNotContained(ValueError):
+    """A run-instance dir declared in-tree does not resolve inside the work tree.
+
+    The bookkeeping builders below all answer the same question — "what is this
+    path, relative to the tree the engine commits in?" — and every one of them
+    used to swallow the failure (``except ValueError: pass``) and return a
+    quietly shorter list. That silence is load-bearing in the wrong direction
+    (P7 spike §9.3): an empty ``engine_bookkeeping_candidates`` makes
+    :func:`gitops.advance_is_engine_bookkeeping` classify *nothing* as
+    bookkeeping, so every resume of an interrupted step re-parks (the #62/#65
+    regression), and an empty ``run_bookkeeping_paths`` makes
+    ``_commit_manifest_checkpoint`` a silent no-op, dropping the FR-2.2 audit
+    trail with no diagnostic anywhere.
+
+    Being outside the tree is nevertheless a LEGITIMATE, designed state for one
+    caller: a ``gauntlet review`` run keeps its state out-of-repo under
+    ``review.state_dir``/XDG on purpose, mints no branch, and commits no
+    bookkeeping — so an empty result is exactly right there. The distinction
+    the old code could not express is *declared* versus *accidental*, which is
+    what the ``state_outside_worktree`` flag now carries: callers that expect
+    containment fail closed and loudly, and the one caller that expects an
+    external state dir says so at the call site.
+    """
+
+
+def _tree_rel(
+    path: Path, root: Path, *, field: str, state_outside_worktree: bool
+) -> str | None:
+    """``path`` relative to ``root``, or ``None`` when legitimately outside.
+
+    Raises :class:`StateDirNotContained` when the caller declared containment
+    and the path is not contained — the fail-closed half of the contract
+    described on that class.
+    """
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        if state_outside_worktree:
+            return None
+        raise StateDirNotContained(
+            f"{field} {str(path)!r} does not resolve inside the work tree "
+            f"{str(root)!r}. The engine commits its bookkeeping in that tree, "
+            "so an uncontained path would silently disable the bookkeeping "
+            "allowlist (re-parking every interrupted resume) and the manifest "
+            "checkpoint commit. If the state dir is deliberately out-of-tree "
+            "(a `gauntlet review` run), pass state_outside_worktree=True."
+        ) from None
+
+
+def run_bookkeeping_excludes(
+    repo_root: Path,
+    run_dir: Path,
+    artifact_root: Path,
+    *,
+    state_outside_worktree: bool = False,
+) -> list[str]:
     """Repo-relative paths of the engine's own live bookkeeping (review F-001).
 
     The run-instance dir (manifest/transcripts/steps/judge-audit) must be
@@ -242,10 +302,12 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
     """
     excludes: list[str] = []
     root = repo_root.resolve()
-    try:
-        excludes.append(run_dir.resolve().relative_to(root).as_posix())
-    except ValueError:
-        pass
+    run_rel = _tree_rel(
+        run_dir, root, field="run dir",
+        state_outside_worktree=state_outside_worktree,
+    )
+    if run_rel is not None:
+        excludes.append(run_rel)
     art = artifact_root.resolve()
     if art != root:
         try:
@@ -253,6 +315,11 @@ def run_bookkeeping_excludes(repo_root: Path, run_dir: Path, artifact_root: Path
             excludes.append(f"{run_root_rel}/*/PR.md")
             return excludes
         except ValueError:
+            # The artifact root's PARENT (the run root) is outside the tree.
+            # Not independently declarable: an external state dir is also an
+            # external artifact root, so `state_outside_worktree` already
+            # covers the only legitimate case and the run-dir leg above has
+            # already failed closed for every other one.
             pass
     # Fallback (artifact_root at/outside the repo root — no sibling slugs can
     # exist): the original single-file exclude.
@@ -282,7 +349,9 @@ def human_owned_excludes(exclude: list[str] | None) -> list[str]:
     ]
 
 
-def engine_bookkeeping_candidates(repo_root: Path, run_dir: Path) -> list[str]:
+def engine_bookkeeping_candidates(
+    repo_root: Path, run_dir: Path, *, state_outside_worktree: bool = False
+) -> list[str]:
     """Every path an engine bookkeeping COMMIT may touch (PR #76 review F-001).
 
     The exact allowlist — existence-independent, because a commit classifier
@@ -292,18 +361,26 @@ def engine_bookkeeping_candidates(repo_root: Path, run_dir: Path) -> list[str]:
     engine must never commit, so classifying a commit as engine bookkeeping by
     the *exclusion* list would let an engine-shaped commit touching ``PR.md``
     pass — and rollback would then hard-reset a human-owned change away.
+
+    An empty result here is consequential, not neutral — see
+    :class:`StateDirNotContained` — so an uncontained ``run_dir`` raises unless
+    the caller declares ``state_outside_worktree``.
     """
     root = repo_root.resolve()
     paths: list[str] = []
     for name in ("manifest.json", "RUN.md"):
-        try:
-            paths.append((run_dir / name).resolve().relative_to(root).as_posix())
-        except ValueError:
-            pass
+        rel = _tree_rel(
+            run_dir / name, root, field="bookkeeping path",
+            state_outside_worktree=state_outside_worktree,
+        )
+        if rel is not None:
+            paths.append(rel)
     return paths
 
 
-def governed_artifact_paths(repo_root: Path, artifact_root: Path) -> list[str]:
+def governed_artifact_paths(
+    repo_root: Path, artifact_root: Path, *, state_outside_worktree: bool = False
+) -> list[str]:
     """Repo-relative paths of the run's governed artifacts (R9 / FR-10.4).
 
     The PRD and plan are ratified through their review loops and human gates,
@@ -317,19 +394,30 @@ def governed_artifact_paths(repo_root: Path, artifact_root: Path) -> list[str]:
     with the P5 taxonomy (plan §5.1): pre-approval defects park back into the
     artifact's own author/fix loop at their sites, post-approval edits stay on
     this loud governance path.
+
+    Same declared-containment contract as the bookkeeping builders
+    (:class:`StateDirNotContained`), and here the silent-empty consequence is a
+    SAFETY one rather than a liveness one: with no governed paths, an
+    approved-artifact edit inside a rewind range stops being flagged at all, so
+    R9's "never silently adopt" degrades to "never notice". A review run has no
+    governed prd/plan and correctly gets an empty list — declared, not inferred.
     """
     root = repo_root.resolve()
     art = artifact_root.resolve()
     paths: list[str] = []
     for name in ("prd.md", "plan.md"):
-        try:
-            paths.append((art / name).relative_to(root).as_posix())
-        except ValueError:
-            pass
+        rel = _tree_rel(
+            art / name, root, field="governed artifact",
+            state_outside_worktree=state_outside_worktree,
+        )
+        if rel is not None:
+            paths.append(rel)
     return paths
 
 
-def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
+def run_bookkeeping_paths(
+    repo_root: Path, run_dir: Path, *, state_outside_worktree: bool = False
+) -> list[str]:
     """Repo-relative paths of the two on-disk run-bookkeeping files.
 
     The manifest is authoritative; RUN.md is its derived index. Returns only
@@ -340,6 +428,9 @@ def run_bookkeeping_paths(repo_root: Path, run_dir: Path) -> list[str]:
     what counts as bookkeeping.
     """
     return [
-        rel for rel in engine_bookkeeping_candidates(repo_root, run_dir)
+        rel
+        for rel in engine_bookkeeping_candidates(
+            repo_root, run_dir, state_outside_worktree=state_outside_worktree
+        )
         if (repo_root.resolve() / rel).exists()
     ]

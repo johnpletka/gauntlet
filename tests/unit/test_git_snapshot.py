@@ -779,6 +779,46 @@ def test_temp_index_path_containment(recovery_git, tmp_path):
     assert _index_bytes(repo) == before_bytes
 
 
+def test_temp_index_containment_covers_the_shared_git_dir_from_a_linked_worktree(
+    recovery_git, tmp_path
+):
+    """A linked worktree must not widen the temp-index containment rule (P7 §9.2).
+
+    ``--absolute-git-dir`` inside a linked worktree names only that worktree's
+    private admin dir, so a check built on it alone ACCEPTS a scratch path in
+    the shared ``.git`` — where the real index, refs and objects live, and the
+    very path this same call refuses from the main worktree. The guard must
+    consider ``--git-common-dir`` too.
+    """
+    repo = recovery_git.repo
+    linked = tmp_path / "linked-wt"
+    gitops.add_worktree(repo, linked, "HEAD")
+    try:
+        common = gitops.git_common_dir(linked)
+        private = Path(
+            git(linked, "rev-parse", "--absolute-git-dir").strip()
+        ).resolve()
+        # Precondition: this fixture really is a linked worktree (the two dirs
+        # differ). Without it the test would pass vacuously in a main worktree.
+        assert private != common
+        assert common == gitops.git_common_dir(repo)
+
+        # The shared git dir is refused from BOTH trees — the asymmetry is gone.
+        with pytest.raises(TempIndexPathError):
+            gitops.validate_temp_index_path(linked, common / "sneaky-index")
+        with pytest.raises(TempIndexPathError):
+            gitops.validate_temp_index_path(repo, common / "sneaky-index")
+        # The worktree's own admin dir and its tree stay refused as before.
+        with pytest.raises(TempIndexPathError):
+            gitops.validate_temp_index_path(linked, private / "sneaky-index")
+        with pytest.raises(TempIndexPathError):
+            gitops.validate_temp_index_path(linked, linked / "scratch-index")
+        # A genuinely external path is still accepted from the linked worktree.
+        gitops.validate_temp_index_path(linked, tmp_path / "outside-index")
+    finally:
+        gitops.remove_worktree(repo, linked)
+
+
 def test_temp_index_symlinked_parent_is_resolved_before_containment(recovery_git, tmp_path):
     # A symlink outside the repo pointing INTO it must not smuggle the temp
     # index inside: containment is checked on the resolved location.

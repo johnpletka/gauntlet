@@ -120,7 +120,16 @@ def validate_temp_index_path(repo: Path, index_file: Path) -> None:
       worktree would itself dirty the tree the snapshot must observe untouched
       (R3: snapshot creation is observational);
     * it must resolve OUTSIDE the git dir — nothing under ``.git`` (the real
-      index, refs, packed objects) may ever be the scratch target.
+      index, refs, packed objects) may ever be the scratch target. BOTH git
+      dirs are checked: in a *linked* worktree ``--absolute-git-dir`` names only
+      that worktree's private admin dir (``.git/worktrees/<name>``), while the
+      real index, refs and object database live in the SHARED
+      ``--git-common-dir``. Checking only the former accepts a scratch path
+      inside the shared ``.git`` — the identical path this same function
+      rejects when called against the main worktree, because there the shared
+      dir happens to sit under the toplevel. The two dirs coincide in a main
+      worktree, so this costs nothing there and closes the gap everywhere else
+      (P7 spike §9.2, experiment E7).
 
     ``resolve()`` is applied to the parent directory (the leaf may not exist
     yet) so a symlinked temp path cannot smuggle the file into either tree.
@@ -132,7 +141,8 @@ def validate_temp_index_path(repo: Path, index_file: Path) -> None:
     resolved = index_file.parent.resolve() / index_file.name
     top = Path(show_toplevel(repo)).resolve()
     git_dir = Path(_run(repo, "rev-parse", "--absolute-git-dir").strip()).resolve()
-    for forbidden in (top, git_dir):
+    common_dir = git_common_dir(repo)
+    for forbidden in (top, git_dir, common_dir):
         if resolved == forbidden or forbidden in resolved.parents:
             raise TempIndexPathError(
                 f"temporary index path {index_file} resolves inside {forbidden}; "
@@ -154,6 +164,25 @@ def run_with_temp_index(
     validate_temp_index_path(repo, index_file)
     env = {**os.environ, "GIT_INDEX_FILE": str(index_file)}
     return _run(repo, *args, stdin=stdin, _env=env)
+
+
+def git_common_dir(repo: Path) -> Path:
+    """Absolute path of the SHARED git dir (``rev-parse --git-common-dir``).
+
+    In a main worktree this is the same directory ``--absolute-git-dir``
+    reports. In a *linked* worktree the two differ: ``--absolute-git-dir`` is
+    the worktree's private admin dir under ``.git/worktrees/<name>``, and this
+    is the shared dir holding the object database, the refs and the main
+    index. Any containment rule about "the git dir" must consider both.
+
+    ``--git-common-dir`` answers relatively (``.git``) when invoked from a main
+    worktree's top level, so the result is joined onto ``repo`` when it is not
+    already absolute — the same idiom :func:`git_index_path` uses, chosen over
+    ``--path-format=absolute`` so no minimum git version is implied.
+    """
+    out = _run(repo, "rev-parse", "--git-common-dir").strip()
+    path = Path(out)
+    return (path if path.is_absolute() else (repo / path)).resolve()
 
 
 def git_index_path(repo: Path) -> Path:

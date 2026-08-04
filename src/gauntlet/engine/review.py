@@ -1695,6 +1695,13 @@ def _build_review_orchestrator(
         repo_root=repo_root,
         run_dir=resolution.state_dir,
         artifact_root=resolution.state_dir,
+        # A review run's state dir is out-of-repo BY DESIGN (resolve_state_dir:
+        # `review.state_dir` override or the XDG default), it mints no branch,
+        # and it commits no manifest bookkeeping — so the empty bookkeeping
+        # allowlists are correct here, and saying so keeps every OTHER caller
+        # failing closed on an uncontained state dir (execution.py's
+        # StateDirNotContained).
+        state_outside_worktree=True,
         config=config,
         pipeline=pipeline,
         manifest=man,
