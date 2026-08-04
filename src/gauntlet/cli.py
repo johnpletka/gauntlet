@@ -694,16 +694,35 @@ def status(
     # (F-002). Shared with `status --interactive` via `_resolve_run_instance_dir`.
     run_instance_dir = _resolve_run_instance_dir(mgr, slug)
 
-    # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
-    # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
-    # empty on error), never an interleaved traceback.
+    # P6 (plan §4.6/§5.5, R4/R8): the journal is the authoritative state and
+    # manifest.json its projection. Status classifies from the AUTHORITATIVE
+    # state — the on-disk projection when healthy, else the journal head
+    # parsed in memory (read-only: no quarantine, no rewrite) — and renders
+    # the pending reconciliation/rebuild, so the read-only surface and the
+    # mutating verbs can never disagree. A run with neither a loadable
+    # manifest nor a journal (a pre-P6 corrupt manifest) errors exactly as
+    # before (FR-4.3 — exit non-zero, stderr only).
     try:
-        man = Manifest.load(run_instance_dir / "manifest.json")
+        view = operator.load_projection_view(
+            mgr.repo_root, run_instance_dir, slug=slug
+        )
     except (OSError, ValueError) as exc:
         typer.echo(
             f"error: cannot load manifest for {slug!r}: {exc}", err=True
         )
         raise typer.Exit(1) from exc
+    if view.manifest is None:
+        try:
+            Manifest.load(run_instance_dir / "manifest.json")
+        except (OSError, ValueError) as exc:
+            typer.echo(
+                f"error: cannot load manifest for {slug!r}: {exc} "
+                "(and no journal state exists to classify from)",
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+        raise typer.Exit(1)  # defensive: view without manifest or error
+    man = view.manifest
 
     run_root = mgr.repo_root / mgr.config.run_root
     driver = operator.driver_info(run_root, slug)
@@ -758,6 +777,19 @@ def status(
                     man, driver.state,
                     gate_cycle_id=upstream_cycle_id_for_gate(pipeline, gate_rec0.id),
                     assessment=assessment,
+                )
+        # P6 (R4): a pending projection catch-up/rebuild renders as the FIRST
+        # next action — built from the same shared assessment the mutating
+        # verbs apply (RX.projection_rebuild_assessment), so status can never
+        # advertise a repair resume refuses (plan §5.5).
+        if view.rebuild_pending:
+            if view.action is not None:
+                rstate.next_actions.insert(
+                    0, operator.projection_rebuild_action(slug, view.action)
+                )
+            else:
+                rstate.next_actions.insert(
+                    0, operator.projection_catchup_action(slug, view.detail)
                 )
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
@@ -842,6 +874,7 @@ def status(
                 gate=gate_ctx,
                 now=now,
                 current_step_timeout_s=current_step_timeout_s,
+                projection=view.payload_block(),
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -853,6 +886,8 @@ def status(
     for rec in man.steps:
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
+    if view.detail:  # P6: journal ↔ projection divergence, loudly (plan §4.6)
+        typer.echo(f"  projection: {view.detail}")
 
     # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
     # usage limit — the reset time, all sourced from the manifest so no parked

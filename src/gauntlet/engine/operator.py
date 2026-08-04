@@ -91,6 +91,7 @@ from gauntlet.engine.recovery_exec import (  # noqa: E402  (grouped re-export)
     STATE_PARKED_USAGE_WINDOW,
     STATE_UNKNOWN,
 )
+from gauntlet.engine import journal as JR  # noqa: E402  (P6 projection view)
 from gauntlet.engine import recovery_exec as RX  # noqa: E402
 from gauntlet.engine import recovery as RXM  # noqa: E402  (P1 models)
 
@@ -566,10 +567,55 @@ def render_assessment_actions(
                     f"gauntlet abort {slug}", consequence=act.description,
                 )
             )
-        # Kinds the P4 planner does not emit (resume_session, edit_then_retry,
-        # restore_snapshot, rebuild_projection) have no rendering yet; adding
-        # one later is additive.
+        elif kind is RXM.RecoveryActionKind.REBUILD_PROJECTION:
+            # P6 (plan §5.5): a plain resume IS the rebuild vehicle — it
+            # reconciles the projection through the shared executor action
+            # before driving. The row renders the same executable command
+            # with the rebuild spelled out as its consequence (R4).
+            actions.append(projection_rebuild_action(slug, act))
+        # Kinds the planner does not emit (resume_session, edit_then_retry,
+        # restore_snapshot) have no rendering yet; adding one later is
+        # additive.
     return actions
+
+
+def projection_catchup_action(slug: str, detail: str | None) -> Action:
+    """The §6.1 action row for a stale projection catch-up (P6, R8).
+
+    A plain resume's projection reconciliation rewrites ``manifest.json``
+    from the journal head before anything else runs — the branch-reset /
+    kill-window repair, loudly audited.
+    """
+    return Action(
+        "catch up manifest projection",
+        "recover",
+        ["gauntlet", "resume", slug],
+        [],
+        True,
+        f"gauntlet resume {slug}",
+        consequence=detail
+        or "rewrites the stale manifest.json from the authoritative journal head",
+    )
+
+
+def projection_rebuild_action(slug: str, act: "RXM.RebuildProjectionAction") -> Action:
+    """The §6.1 action row for a pending manifest-projection rebuild (P6).
+
+    Rendered by the read-only surface from the SAME
+    :func:`RX.projection_rebuild_assessment` the mutating verbs apply
+    (R4): the executable command is a plain ``gauntlet resume``, whose
+    projection reconciliation applies exactly this action through
+    :meth:`RecoveryExecutor.apply_rebuild` before anything else runs.
+    """
+    return Action(
+        "rebuild manifest projection",
+        "recover",
+        ["gauntlet", "resume", slug],
+        [],
+        True,
+        f"gauntlet resume {slug}",
+        consequence=act.description,
+    )
 
 
 def compute_status_assessment(
@@ -655,6 +701,127 @@ def compute_status_assessment(
         )
     except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
         return None
+
+
+# --- P6: read-only journal/projection view (plan §4.6/§5.5, R4/R8) -----------
+
+
+@dataclass
+class ProjectionView:
+    """What read-only status knows about journal ↔ projection agreement.
+
+    ``manifest`` is the AUTHORITATIVE state to classify from: the on-disk
+    projection when healthy (or when the run predates the journal), else the
+    journal-head state parsed in memory — so a branch reset or kill window
+    that left the projection stale/corrupt/missing never makes ``status``
+    disagree with what a mutating verb will do (R4). ``None`` only when
+    neither source yields a loadable manifest (a pre-P6 run with a corrupt
+    manifest — exactly the pre-P6 failure, reported as before).
+
+    ``assessment``/``action`` carry the shared rebuild plan
+    (:func:`RX.projection_rebuild_assessment`) when a rebuild is pending, so
+    the rendered action and the applied action have one construction point.
+    """
+
+    manifest: "Manifest | None"
+    health: str  # journal.HEALTH_*: ok | no_journal | stale | unjournaled | corrupt | missing
+    journal_seq: int | None
+    rebuild_pending: bool
+    assessment: "RXM.RecoveryAssessment | None" = None
+    action: "RXM.RebuildProjectionAction | None" = None
+    detail: str | None = None
+
+    def payload_block(self) -> dict | None:
+        """The additive §6.1 ``projection`` object (null when healthy)."""
+        if self.health in (JR.HEALTH_OK, JR.HEALTH_NO_JOURNAL):
+            return None
+        return {
+            "health": self.health,
+            "journal_seq": self.journal_seq,
+            "rebuild_pending": self.rebuild_pending,
+        }
+
+
+def load_projection_view(
+    repo_root: Path, run_instance_dir: Path, *, slug: str | None = None
+) -> ProjectionView:
+    """Load the run's authoritative state, read-only (P6, plan §4.6).
+
+    Never writes: no quarantine, no genesis, no projection rewrite — those
+    happen on the next mutating verb. The journal head is compared against
+    the on-disk projection; when the projection is stale (an older journaled
+    state — a kill window or a branch reset, R8) or missing/corrupt, the
+    head state is parsed in memory and classification proceeds from it, with
+    the pending reconciliation reported via :meth:`ProjectionView.payload_block`
+    and — for missing/corrupt — the shared rebuild assessment (R4).
+    """
+    manifest_path = run_instance_dir / "manifest.json"
+    status = JR.projection_status(run_instance_dir, mutate=False)
+
+    def _head_manifest() -> "Manifest | None":
+        if status.head_state_json is None:
+            return None
+        try:
+            return Manifest.model_validate_json(status.head_state_json)
+        except ValueError:
+            return None
+
+    if status.health in (JR.HEALTH_OK, JR.HEALTH_NO_JOURNAL, JR.HEALTH_UNJOURNALED):
+        # Healthy, pre-P6, or an unjournaled-but-valid on-disk state (the
+        # newest claim; adopted on the next mutating contact): classify from
+        # the on-disk projection, exactly as before P6.
+        try:
+            man: "Manifest | None" = Manifest.load(manifest_path)
+        except (OSError, ValueError):
+            man = _head_manifest()
+        detail = None
+        if status.health == JR.HEALTH_UNJOURNALED:
+            detail = (
+                "manifest.json changed outside the journaled write path "
+                "(stale driver or hand-edit); the next mutating command "
+                "adopts it as a journal transition"
+            )
+        return ProjectionView(
+            manifest=man,
+            health=status.health if man is not None else JR.HEALTH_NO_JOURNAL,
+            journal_seq=status.head_seq,
+            rebuild_pending=False,
+            detail=detail,
+        )
+
+    if status.health == JR.HEALTH_STALE:
+        return ProjectionView(
+            manifest=_head_manifest(),
+            health=status.health,
+            journal_seq=status.head_seq,
+            rebuild_pending=True,
+            detail=(
+                "manifest.json holds an older journaled state (kill window "
+                "or branch reset, R8); the next mutating command catches it "
+                f"up from the journal head (seq {status.head_seq})"
+            ),
+        )
+
+    # corrupt / missing: the shared rebuild assessment (plan §5.5, R4).
+    planned = RX.projection_rebuild_assessment(
+        repo_root, run_instance_dir, slug=slug
+    )
+    assessment = action = None
+    if planned is not None:
+        assessment, action = planned
+    return ProjectionView(
+        manifest=_head_manifest(),
+        health=status.health,
+        journal_seq=status.head_seq,
+        rebuild_pending=planned is not None,
+        assessment=assessment,
+        action=action,
+        detail=(
+            f"manifest.json is {status.health}; a plain resume rebuilds it "
+            f"from the journal head (seq {status.head_seq}), preserving the "
+            "malformed original as evidence (plan §5.5)"
+        ),
+    )
 
 
 # --- step / run-instance resolution (FR-3.1a) --------------------------------
@@ -1060,7 +1227,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -1098,6 +1265,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "current_step_freshness",
     "suspension",
     "gate",
+    "projection",
     "steps",
     "next_actions"
   ],
@@ -1387,6 +1555,27 @@ _STATUS_SCHEMA_JSON = r'''{
               "reasoning": {"type": ["string", "null"]}
             }
           }
+        }
+      }
+    },
+    "projection": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["health", "journal_seq", "rebuild_pending"],
+      "description": "Journal-vs-projection agreement (recovery-redesign P6, plan §4.6/R8): the append-only run journal is the authoritative state and manifest.json is its regenerated projection. Always present; null when the on-disk projection matches the journal head (or the run predates the journal). Non-null names the divergence: `stale` (an older journaled state — a kill window or a branch reset; the next mutating command catches it up from the journal head), `unjournaled` (a valid state the journal has never seen — a stale-driver write or a hand-edit; adopted as a journal transition by the next mutating command), or `corrupt`/`missing` (the next mutating command rebuilds the projection from the journal head, preserving the malformed original as recovery evidence — plan §5.5). Advisory: drives no automatic action.",
+      "properties": {
+        "health": {
+          "type": "string",
+          "enum": ["stale", "unjournaled", "corrupt", "missing"],
+          "description": "How the on-disk projection diverges from the journal head."
+        },
+        "journal_seq": {
+          "type": ["integer", "null"],
+          "description": "The journal head's monotonic sequence number (the authoritative state), or null when unavailable."
+        },
+        "rebuild_pending": {
+          "type": "boolean",
+          "description": "true when the next mutating command will rewrite manifest.json from the journal head (catch-up or full rebuild with evidence preservation)."
         }
       }
     },
@@ -1900,6 +2089,7 @@ def status_payload(
     gate: dict | None = None,
     now: datetime | None = None,
     current_step_timeout_s: float | None = None,
+    projection: dict | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -2032,6 +2222,11 @@ def status_payload(
         # `suspension`), so this serializer stays pure. `None` for every non-gate
         # state — the caller passes it only for a `parked_gate`.
         "gate": gate,
+        # P6 (plan §4.6): journal ↔ projection agreement. Always present; null
+        # when the on-disk manifest matches the journal head (or the run
+        # predates the journal). Non-null names the divergence and whether a
+        # rebuild is pending — the caller threads `ProjectionView.payload_block()`.
+        "projection": projection,
         "steps": [
             {
                 "id": rec.id,

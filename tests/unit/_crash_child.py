@@ -19,6 +19,14 @@ that the parent SIGKILLs at a precise point in the kill-timing matrix:
   the child writes ``.crash_boundary_done`` and exits 0, telling the parent
   the boundary matrix is exhausted.
 
+  ``when`` gained a third value in P6: ``mid`` kills the process exactly
+  BETWEEN the journal event append and the projection replace inside the
+  ``n``-th ``Manifest.write_atomic`` — the one new durable sub-boundary the
+  P6 journal introduces (plan §4.6: the event is write-ahead; the projection
+  lands second). ``mid`` counts write_atomic calls (a superset of the
+  orchestrator persists: every projection write in the process), so its
+  matrix covers every event-append/projection-write boundary in a real run.
+
 The parent then resumes and asserts the engine recovers without lost/duplicated
 effects.
 """
@@ -79,18 +87,38 @@ def _arm_persist_boundary_kill(repo: Path, spec: str) -> None:
     _, idx, when, sig_name = spec.split(":")
     target = int(idx)
     sig = signal.SIGKILL if sig_name == "kill" else signal.SIGTERM
-    real = Orchestrator._persist
     count = {"n": 0}
 
-    def wrapped(self):
-        count["n"] += 1
-        if when == "before" and count["n"] == target:
-            signal.raise_signal(sig)
-        real(self)
-        if when == "after" and count["n"] == target:
-            signal.raise_signal(sig)
+    if when == "mid":
+        # P6: die exactly between the journal event append and the projection
+        # replace — `Manifest.write_atomic` appends the event first, then
+        # calls the module-level `_replace_atomic`; killing at the entry of
+        # the n-th replace leaves the journal exactly one state ahead of the
+        # on-disk projection (the one new durable sub-boundary P6 adds).
+        from gauntlet.engine import manifest as Mmod
 
-    Orchestrator._persist = wrapped
+        real_replace = Mmod._replace_atomic
+
+        def wrapped_replace(path, payload):
+            if path.name == "manifest.json":
+                count["n"] += 1
+                if count["n"] == target:
+                    signal.raise_signal(sig)
+            real_replace(path, payload)
+
+        Mmod._replace_atomic = wrapped_replace
+    else:
+        real = Orchestrator._persist
+
+        def wrapped(self):
+            count["n"] += 1
+            if when == "before" and count["n"] == target:
+                signal.raise_signal(sig)
+            real(self)
+            if when == "after" and count["n"] == target:
+                signal.raise_signal(sig)
+
+        Orchestrator._persist = wrapped
 
     def done_marker() -> None:
         if count["n"] < target:

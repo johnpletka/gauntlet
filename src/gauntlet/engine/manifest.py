@@ -755,33 +755,59 @@ class Manifest(BaseModel):
         self.steps.append(rec)
         return rec
 
-    # ---- atomic persistence (FR-8.2) ----------------------------------------
+    # ---- atomic persistence (FR-8.2; journaled write-ahead since P6) --------
     def write_atomic(self, path: Path) -> None:
-        """Write the manifest atomically: temp file in the same dir + replace.
+        """Persist the manifest as one durable, journaled transition.
 
-        ``os.replace`` is atomic on POSIX within a filesystem, so a reader (or a
-        resume after kill) always sees a whole manifest — the prior one until
-        the instant the new one lands. ``fsync`` before replace so the bytes are
-        durable, not just in the page cache, before the rename is visible.
+        This is the single atomic-persist primitive every write-ahead site
+        uses, so P6 anchors the authoritative state journal here (plan §4.6):
+        the exact payload about to land is first appended to the append-only
+        journal under the run-instance state dir (``journal.record_transition``
+        — write-ahead, the journal is the authority), then the projection file
+        is atomically replaced (:func:`_replace_atomic`). One logical
+        transition, two ordered durable writes, no new kill window: a kill
+        between them leaves ``manifest.json`` exactly one journaled state
+        behind, which the next mutating contact catches up idempotently
+        (``journal.reconcile_projection``) — never a torn file, never an
+        unclassifiable state.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = self.model_dump_json(indent=2)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            # On any failure (including KeyboardInterrupt) leave the prior
-            # manifest untouched and clean up the temp file.
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+        # Lazy import: journal is stdlib-only and imports nothing from this
+        # module, but the low-level model module must not pull it (or anything)
+        # in at import time.
+        from gauntlet.engine import journal
+
+        journal.record_transition(path, payload)
+        _replace_atomic(path, payload)
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
         return cls.model_validate_json(path.read_text())
+
+
+def _replace_atomic(path: Path, payload: str) -> None:
+    """Atomically replace ``path`` with ``payload`` (temp + fsync + replace).
+
+    ``os.replace`` is atomic on POSIX within a filesystem, so a reader (or a
+    resume after kill) always sees a whole manifest — the prior one until the
+    instant the new one lands. ``fsync`` before replace so the bytes are
+    durable, not just in the page cache, before the rename is visible. Module
+    level (not a method) so the P6 crash harness can kill a real process at
+    the exact event-append/projection-write boundary.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # On any failure (including KeyboardInterrupt) leave the prior
+        # manifest untouched and clean up the temp file.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise

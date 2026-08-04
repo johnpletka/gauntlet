@@ -1,0 +1,1080 @@
+"""Append-only authoritative state journal (P6, plan §4.6 / R8).
+
+The journal — not ``manifest.json`` — is the authoritative record of a run's
+state transitions. It lives under the ignored run-instance state dir
+(``<run_dir>/journal/``, the same precedent as ``heartbeat.json`` and
+``suspensions.jsonl``), so branch reset/clean/rollback never touch it: a
+``git reset --hard`` that materializes an OLD committed ``manifest.json``
+no longer rewinds the state machine (R8) — the next contact rebuilds the
+projection from the journal head.
+
+Design (deliberately boring, plan §2 "determinism over cleverness"):
+
+* **One atomic event file per authoritative transition.** Every
+  :meth:`~gauntlet.engine.manifest.Manifest.write_atomic` — the single
+  atomic-persist primitive every write-ahead site already uses — first
+  appends one event here (write-ahead: the journal is authoritative), then
+  replaces the projection. The event rides the SAME logical transition the
+  manifest persists today; no new kill window is introduced — a kill between
+  event append and projection replace leaves the projection exactly one
+  journaled state behind, which the next contact reconciles idempotently.
+* **State-carrying events embed the exact projection payload.** Each
+  transition event stores ``state_json`` — the verbatim serialized manifest
+  the engine wrote — plus its SHA-256. A projection rebuild therefore
+  reproduces ``manifest.json`` byte-for-byte by construction (no serializer
+  round-trip drift), for every field the engine ever persisted.
+* **Audit events** (``RecoverySnapshotCreated`` / ``RecoveryActionPlanned``
+  / ``RecoveryActionApplied``) carry no state; they are appended by the
+  recovery executor as evidence and deduplicated by idempotency key. The
+  authoritative state chain is the state-carrying events alone.
+* **Idempotent finalization (deliverable 3).** A torn/partial event file is
+  quarantined deterministically (renamed ``*.torn`` — preserved as evidence,
+  never deleted) on the next mutating contact; a duplicated idempotency key
+  keeps the first occurrence and quarantines the rest (``*.dup``); a
+  projection behind the journal head is caught up by rewriting the head
+  bytes. Nothing is ever double-applied: state events are absolute
+  snapshots, so replay is last-valid-state-wins.
+* **Migration (deliverable 4, plan §8).** A pre-P6 run (manifest only, no
+  journal) gets a deterministic ``JournalGenesis`` event embedding the
+  on-disk manifest bytes verbatim on first mutating contact. Old runs stay
+  loadable/classifiable exactly as before — read-only status never writes.
+
+This module is deliberately free of every other gauntlet import (no gitops,
+no manifest, no pydantic): journal/projection writes are plain file
+mutations — every GIT mutation stays behind ``RecoveryExecutor`` (plan §9),
+and the static checks can prove this module cannot reach a destructive git
+verb. The step/run lifecycle literals used by the kind derivation are pinned
+to ``manifest.py``'s constants by a unit drift guard.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+JOURNAL_DIRNAME = "journal"
+JOURNAL_SCHEMA_VERSION = 1
+
+# Event vocabulary (plan §4.6) + the deliverable-4 genesis event.
+EVENT_KINDS = (
+    "JournalGenesis",
+    "AttemptStarted",
+    "AgentCallStarted",
+    "AgentCallFinished",
+    "CheckpointObserved",
+    "ArtifactValidationFailed",
+    "DependencyUnavailable",
+    "AttemptInterrupted",
+    "RecoverySnapshotCreated",
+    "RecoveryActionPlanned",
+    "RecoveryActionApplied",
+    "StepCompleted",
+    "RunStatusChanged",
+)
+
+# Lifecycle literals, pinned 1:1 to manifest.py's constants by
+# tests/unit/test_journal_p6.py (drift guard) — imported nowhere so this
+# module stays free of engine imports (see module docstring).
+_RUNNING = "running"
+_DONE = "done"
+_FAILED = "failed"
+_INTERRUPTED = "interrupted"
+_PARKED = "parked"
+_HALTED = "halted"
+_SKIPPED = "skipped"
+_REASON_ARTIFACT_INVALID = "artifact_invalid"
+_DEPENDENCY_REASONS = frozenset(
+    {"usage_limit", "usage_window", "provider_unavailable"}
+)
+
+# evt-<seq 8 digits>-<Kind>-<key12>.json — sorting lexicographically sorts by
+# sequence. Quarantined files gain a ``.torn`` / ``.dup`` suffix (no longer
+# ``*.json``), so they drop out of every scan while remaining evidence.
+_EVENT_NAME_RE = re.compile(
+    r"^evt-(?P<seq>\d{8})-(?P<kind>[A-Za-z]+)-(?P<key>[0-9a-f]{12})\.json$"
+)
+# Any file that *claims* a sequence number — including quarantined ones and
+# leftover temp files — reserves it, so a quarantined event's seq is never
+# reused (reuse would make the append-only ordering ambiguous).
+_SEQ_CLAIM_RE = re.compile(r"^evt-(?P<seq>\d{8})-")
+
+
+class JournalError(RuntimeError):
+    """A journal invariant failed; every raise here fails closed."""
+
+
+def _sha256_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_new_file_atomic(path: Path, text: str) -> None:
+    """Create ``path`` atomically and exclusively (append-only discipline).
+
+    temp + ``os.link`` (fails if the name exists — never a silent overwrite)
+    + directory fsync, so a crash leaves either no file or a whole file.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".evt-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    _fsync_dir(path.parent)
+
+
+def _write_projection(path: Path, text: str) -> None:
+    """Atomically (re)write the projection file (temp + fsync + replace).
+
+    The projection is derived data (the journal is authoritative), so a
+    replace — unlike the exclusive event append — is correct here.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    _fsync_dir(path.parent)
+
+
+# --- best-effort observed HEAD (envelope evidence, never a decision input) ----
+
+
+def _observed_head_sha(start: Path) -> str | None:
+    """The containing repository's HEAD commit, read without spawning git.
+
+    Pure-python and best-effort: this is observational envelope evidence (the
+    plan §4.6 "observed branch SHA"), recorded per event but never consumed
+    by a decision, so a non-repo dir (unit tests), a packed ref, or any read
+    failure simply yields ``None`` rather than an error or a subprocess per
+    persist.
+    """
+    try:
+        current = start.resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        git_path = candidate / ".git"
+        if not git_path.exists():
+            continue
+        git_dir = git_path
+        try:
+            if git_path.is_file():  # worktree: "gitdir: <path>"
+                text = git_path.read_text().strip()
+                if not text.startswith("gitdir:"):
+                    return None
+                git_dir = (candidate / text.split(":", 1)[1].strip()).resolve()
+            head = (git_dir / "HEAD").read_text().strip()
+            if not head.startswith("ref:"):
+                return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+            ref = head.split(":", 1)[1].strip()
+            ref_file = git_dir / ref
+            if ref_file.exists():
+                sha = ref_file.read_text().strip()
+                return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+            packed = git_dir / "packed-refs"
+            if packed.exists():
+                for line in packed.read_text().splitlines():
+                    if line.endswith(" " + ref):
+                        sha = line.split(" ", 1)[0]
+                        if re.fullmatch(r"[0-9a-f]{40}", sha):
+                            return sha
+            return None
+        except OSError:
+            return None
+    return None
+
+
+# --- reading ------------------------------------------------------------------
+
+
+def journal_dir(run_dir: Path) -> Path:
+    return run_dir / JOURNAL_DIRNAME
+
+
+def _event_paths(jdir: Path) -> list[Path]:
+    """Valid-named event files, ascending by sequence. Missing dir → empty."""
+    try:
+        names = os.listdir(jdir)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [jdir / n for n in sorted(names) if _EVENT_NAME_RE.match(n)]
+
+
+def _next_seq(jdir: Path) -> int:
+    """1 + the highest sequence any file (incl. quarantined) claims."""
+    highest = 0
+    try:
+        names = os.listdir(jdir)
+    except (FileNotFoundError, NotADirectoryError):
+        return 1
+    for name in names:
+        match = _SEQ_CLAIM_RE.match(name)
+        if match:
+            highest = max(highest, int(match.group("seq")))
+    return highest + 1
+
+
+def _parse_event(path: Path) -> dict | None:
+    """Parse + validate one event file; ``None`` for a torn/invalid file.
+
+    Fail closed: an event is valid only when its envelope is complete, its
+    filename agrees with its body (seq, kind, key prefix), and — for a
+    state-carrying event — the embedded state's hash verifies. Anything
+    else is torn/foreign and must never contribute to the state chain.
+    """
+    match = _EVENT_NAME_RE.match(path.name)
+    if not match:
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    required = (
+        "schema_version", "seq", "event_id", "run_id", "ts",
+        "idempotency_key", "kind", "payload",
+    )
+    if any(key not in data for key in required):
+        return None
+    if data.get("kind") not in EVENT_KINDS:
+        return None
+    if data.get("seq") != int(match.group("seq")):
+        return None
+    if data.get("kind") != match.group("kind"):
+        return None
+    key = data.get("idempotency_key")
+    if not isinstance(key, str) or not key:
+        return None
+    if _key12(key) != match.group("key"):
+        return None
+    state = data.get("state_json")
+    if state is not None:
+        if not isinstance(state, str):
+            return None
+        if data.get("state_sha256") != _sha256_text(state):
+            return None
+    return data
+
+
+def _quarantine(path: Path, suffix: str, notes: list[str]) -> None:
+    """Rename an invalid/duplicate event aside — preserved, never deleted."""
+    target = path.with_name(path.name + suffix)
+    try:
+        if not target.exists():
+            os.rename(path, target)
+        else:  # extremely defensive: never clobber prior evidence
+            os.rename(path, path.with_name(f"{path.name}{suffix}.{os.getpid()}"))
+        _fsync_dir(path.parent)
+        notes.append(f"quarantined {path.name} as {suffix.lstrip('.')} evidence")
+    except OSError as exc:
+        raise JournalError(
+            f"could not quarantine invalid journal event {path} ({exc}); "
+            "refusing to continue over an unreconciled journal"
+        ) from exc
+
+
+def _key12(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _dedupe(jdir: Path, *, mutate: bool, notes: list[str]) -> list[Path]:
+    """Event paths with duplicate idempotency keys resolved deterministically.
+
+    The filename carries a 12-hex digest of the key, so the scan is
+    name-only; a filename collision is confirmed against the full keys
+    before anything is quarantined. The FIRST (lowest-sequence) occurrence
+    wins; later duplicates are replay artifacts and are quarantined
+    (``mutate=True``) or skipped (read-only) — never double-applied.
+    """
+    paths = _event_paths(jdir)
+    seen: dict[str, Path] = {}
+    kept: list[Path] = []
+    for path in paths:
+        key12 = _EVENT_NAME_RE.match(path.name).group("key")
+        prior = seen.get(key12)
+        if prior is None:
+            seen[key12] = path
+            kept.append(path)
+            continue
+        first = _parse_event(prior)
+        second = _parse_event(path)
+        if (
+            first is not None
+            and second is not None
+            and first["idempotency_key"] != second["idempotency_key"]
+        ):
+            kept.append(path)  # a 12-hex name collision, not a duplicate
+            continue
+        if mutate:
+            _quarantine(path, ".dup", notes)
+        else:
+            notes.append(f"duplicate journal event {path.name} (read-only skip)")
+    return kept
+
+
+@dataclass
+class _Head:
+    """The newest valid state-carrying event, plus reconciliation notes."""
+
+    event: dict | None
+    path: Path | None
+    notes: list[str] = field(default_factory=list)
+
+
+def _head_state(jdir: Path, *, mutate: bool) -> _Head:
+    """Walk backwards to the newest valid state-carrying event.
+
+    Torn files encountered on the way are quarantined (mutating contexts)
+    or skipped (read-only); valid audit events are skipped. State events
+    are absolute snapshots, so a torn or quarantined newer event can never
+    corrupt the chain — the previous state event is authoritative.
+    """
+    notes: list[str] = []
+    for path in reversed(_dedupe(jdir, mutate=mutate, notes=notes)):
+        event = _parse_event(path)
+        if event is None:
+            if mutate:
+                _quarantine(path, ".torn", notes)
+            else:
+                notes.append(f"torn journal event {path.name} (read-only skip)")
+            continue
+        if event.get("state_json") is not None:
+            return _Head(event=event, path=path, notes=notes)
+    return _Head(event=None, path=None, notes=notes)
+
+
+def read_events(run_dir: Path) -> list[dict]:
+    """All valid events, ascending. Read-only (torn/dup files are skipped)."""
+    notes: list[str] = []
+    out = []
+    for path in _dedupe(journal_dir(run_dir), mutate=False, notes=notes):
+        event = _parse_event(path)
+        if event is not None:
+            out.append(event)
+    return out
+
+
+def evidence_fingerprint(projection_path: Path) -> str:
+    """The rebuild-precondition witness for the on-disk projection.
+
+    ``sha256:...`` of the current bytes, or the literal ``"absent"`` when the
+    file is missing — the value :class:`RebuildProjectionAction` carries and
+    the executor re-verifies under the lock before mutating anything.
+    """
+    try:
+        return _sha256_text(projection_path.read_text())
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError:
+        return "unreadable"
+
+
+# --- appending ----------------------------------------------------------------
+
+
+def _default_clock() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _envelope_context(state: dict) -> tuple[str | None, Any, str | None]:
+    """(step, iteration, attempt_id) for the manifest's current step, if any."""
+    step_id = state.get("current_step")
+    if not step_id:
+        return None, None, None
+    record = None
+    for rec in state.get("steps") or []:
+        if isinstance(rec, dict) and rec.get("id") == step_id:
+            record = rec  # last matching record = the active attempt's row
+    if record is None:
+        return step_id, None, None
+    attempts = record.get("attempts")
+    attempt = f"{step_id}#{attempts}" if isinstance(attempts, int) else None
+    return step_id, record.get("iteration"), attempt
+
+
+def _append_event(
+    jdir: Path,
+    *,
+    kind: str,
+    run_id: str,
+    idempotency_key: str,
+    payload: dict,
+    step: str | None = None,
+    iteration: Any = None,
+    attempt_id: str | None = None,
+    state_json: str | None = None,
+    clock: Callable[[], str] | None = None,
+    seq: int | None = None,
+) -> dict:
+    if kind not in EVENT_KINDS:
+        raise JournalError(f"unknown journal event kind {kind!r}")
+    jdir.mkdir(parents=True, exist_ok=True)
+    clock = clock or _default_clock
+    while True:
+        use_seq = seq if seq is not None else _next_seq(jdir)
+        event: dict[str, Any] = {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "seq": use_seq,
+            "event_id": hashlib.sha256(
+                f"{run_id}:{use_seq}:{kind}:{idempotency_key}".encode()
+            ).hexdigest()[:16],
+            "run_id": run_id,
+            "step": step,
+            "iteration": iteration,
+            "attempt_id": attempt_id,
+            "ts": clock(),
+            "observed_branch_sha": _observed_head_sha(jdir),
+            "idempotency_key": idempotency_key,
+            "kind": kind,
+            "payload": payload,
+        }
+        if state_json is not None:
+            event["state_json"] = state_json
+            event["state_sha256"] = _sha256_text(state_json)
+        name = f"evt-{use_seq:08d}-{kind}-{_key12(idempotency_key)}.json"
+        try:
+            _write_new_file_atomic(
+                jdir / name, json.dumps(event, sort_keys=True, indent=1)
+            )
+            return event
+        except FileExistsError:
+            if seq is not None:
+                raise JournalError(
+                    f"journal event seq {seq} already exists in {jdir}"
+                ) from None
+            continue  # a concurrent claim took this seq; re-derive and retry
+
+
+def append_audit(
+    run_dir: Path,
+    kind: str,
+    payload: dict,
+    *,
+    run_id: str,
+    idempotency_key: str,
+    clock: Callable[[], str] | None = None,
+) -> bool:
+    """Append a state-less audit event, deduplicated by idempotency key.
+
+    Best-effort by contract: audit events are recovery evidence, never a
+    gate — the durable authority for a recovery transaction is its intent
+    file + snapshot ref (recovery_exec), and the authoritative state chain
+    is the state-carrying events. A replayed transaction re-appending the
+    same key is skipped (exactly-once in the journal); an I/O failure is
+    swallowed (plan §9: optional evidence gathering must never prevent
+    finalization). Returns whether an event was appended.
+    """
+    jdir = journal_dir(run_dir)
+    key12 = _key12(idempotency_key)
+    try:
+        for path in _event_paths(jdir):
+            if _EVENT_NAME_RE.match(path.name).group("key") == key12:
+                existing = _parse_event(path)
+                if (
+                    existing is not None
+                    and existing["idempotency_key"] == idempotency_key
+                ):
+                    return False  # already recorded — never double-applied
+        _append_event(
+            jdir,
+            kind=kind,
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            payload=payload,
+            clock=clock,
+        )
+        return True
+    except (OSError, JournalError):
+        return False
+
+
+# --- the write_atomic hook (one durable transition per outcome) ---------------
+
+
+def record_transition(
+    manifest_path: Path, payload: str, *, clock: Callable[[], str] | None = None
+) -> None:
+    """Journal one manifest persist, write-ahead of the projection replace.
+
+    Called by :meth:`Manifest.write_atomic` with the exact serialized payload
+    it is about to write, BEFORE the projection file is replaced — so the
+    journal (the authority) always leads and a kill between the two leaves a
+    projection exactly one journaled state behind (reconciled idempotently
+    by the next contact; no new kill window, no unclassifiable state).
+
+    A persist whose payload is byte-identical to the journal head is not a
+    transition: nothing is appended (the projection rewrite is harmless).
+    A pre-P6 run dir (existing manifest, empty journal) gets its migration
+    genesis first, embedding the on-disk bytes verbatim (deliverable 4).
+    """
+    run_dir = manifest_path.parent
+    jdir = journal_dir(run_dir)
+    head = _head_state(jdir, mutate=True)
+    if head.event is None:
+        genesis = ensure_genesis(run_dir, clock=clock)
+        if genesis is not None:
+            head = _Head(event=genesis, path=None)
+    if (
+        head.event is not None
+        and head.event.get("state_sha256") == _sha256_text(payload)
+    ):
+        return  # same state re-persisted — not a transition
+    try:
+        state = json.loads(payload)
+    except ValueError as exc:  # write_atomic serialized it; cannot happen
+        raise JournalError(f"unserializable manifest payload: {exc}") from exc
+    prev_state = None
+    if head.event is not None and head.event.get("state_json") is not None:
+        try:
+            prev_state = json.loads(head.event["state_json"])
+        except ValueError:
+            prev_state = None  # genesis may embed pre-P6 corrupt bytes
+    if not isinstance(prev_state, dict):
+        prev_state = None
+    kind, changes = derive_kind(prev_state, state)
+    step, iteration, attempt = _envelope_context(state)
+    prev_event_id = head.event["event_id"] if head.event is not None else ""
+    _append_event(
+        jdir,
+        kind=kind,
+        run_id=str(state.get("run_id") or "unknown"),
+        idempotency_key=_sha256_text(
+            f"transition:{prev_event_id}:{kind}:{_sha256_text(payload)}"
+        ),
+        payload={"changes": changes},
+        step=step,
+        iteration=iteration,
+        attempt_id=attempt,
+        state_json=payload,
+        clock=clock,
+    )
+
+
+# --- kind derivation (plan §4.6 vocabulary over one persisted transition) -----
+
+# Precedence when one persist carries several sub-transitions (e.g. the P4
+# one-write terminalization lands a step outcome AND the mapped run status):
+# the most consequential classification names the event; every detected
+# sub-transition is preserved in the payload's ``changes`` list.
+_KIND_RANK = {
+    "StepCompleted": 0,
+    "AttemptInterrupted": 1,
+    "ArtifactValidationFailed": 2,
+    "DependencyUnavailable": 3,
+    "AgentCallFinished": 4,
+    "CheckpointObserved": 5,
+    "AttemptStarted": 6,
+    "AgentCallStarted": 6,
+    "RunStatusChanged": 7,
+}
+
+
+def derive_kind(prev: dict | None, cur: dict) -> tuple[str, list[str]]:
+    """Classify one persisted transition into the §4.6 event vocabulary.
+
+    Pure and total over (previous state, new state): the journal rides the
+    exact transitions the engine already persists, so the kind is derived
+    from the observable state delta — never from a side channel a call site
+    could forget to thread through. Any residual change (warnings, human
+    responses, usage accumulation) classifies as ``RunStatusChanged`` with
+    the exact changed keys named in ``changes``.
+    """
+    changes: list[str] = []
+    best: tuple[int, str] | None = None
+
+    def consider(kind: str) -> None:
+        nonlocal best
+        rank = _KIND_RANK[kind]
+        if best is None or rank < best[0]:
+            best = (rank, kind)
+
+    prev_steps: dict[tuple, dict] = {}
+    for rec in (prev or {}).get("steps") or []:
+        if isinstance(rec, dict):
+            prev_steps[(rec.get("id"), rec.get("iteration"))] = rec
+    for rec in cur.get("steps") or []:
+        if not isinstance(rec, dict):
+            continue
+        old = prev_steps.get((rec.get("id"), rec.get("iteration")))
+        old_status = old.get("status") if old else None
+        new_status = rec.get("status")
+        iteration = rec.get("iteration")
+        label = f"{rec.get('id')}" + (
+            f"[{iteration}]" if iteration is not None else ""
+        )
+        if old_status != new_status:
+            changes.append(
+                f"step {label}: {old_status or '(new)'} -> {new_status}"
+            )
+            if new_status in (_DONE, _SKIPPED):
+                consider("StepCompleted")
+            elif new_status == _INTERRUPTED:
+                consider("AttemptInterrupted")
+            elif new_status == _PARKED:
+                reason = rec.get("parked_reason")
+                if reason == _REASON_ARTIFACT_INVALID:
+                    consider("ArtifactValidationFailed")
+                elif reason in _DEPENDENCY_REASONS:
+                    consider("DependencyUnavailable")
+                else:  # response / gate parks: the call reached a human
+                    consider("AgentCallFinished")
+            elif new_status in (_FAILED, _HALTED):
+                consider("AgentCallFinished")
+            elif new_status == _RUNNING:
+                # First entry of the attempt vs a re-entry (a resumed call
+                # within the same attempt): the prior record's ``started``
+                # stamp is the discriminator.
+                if old is not None and old.get("started"):
+                    consider("AgentCallStarted")
+                else:
+                    consider("AttemptStarted")
+        old_checkpoints = len((old or {}).get("checkpoints") or [])
+        new_checkpoints = len(rec.get("checkpoints") or [])
+        if old is not None and new_checkpoints > old_checkpoints:
+            last = (rec.get("checkpoints") or [])[-1]
+            if isinstance(last, dict):
+                changes.append(
+                    f"step {label}: checkpoint r{last.get('round')}-"
+                    f"{last.get('sub_step')}"
+                )
+            consider("CheckpointObserved")
+
+    prev_commits = len((prev or {}).get("commits") or [])
+    cur_commits = len(cur.get("commits") or [])
+    if cur_commits > prev_commits:
+        for entry in (cur.get("commits") or [])[prev_commits:]:
+            if isinstance(entry, dict):
+                changes.append(
+                    f"commit recorded: {entry.get('phase')} "
+                    f"{str(entry.get('sha'))[:10]}"
+                )
+        consider("CheckpointObserved")
+
+    prev_status = (prev or {}).get("status")
+    if prev_status != cur.get("status"):
+        changes.append(f"run: {prev_status or '(new)'} -> {cur.get('status')}")
+        consider("RunStatusChanged")
+
+    if best is None:
+        changed_keys = sorted(
+            key
+            for key in set(cur) | set(prev or {})
+            if (prev or {}).get(key) != cur.get(key)
+        )
+        changes.append(f"state recorded; changed keys: {changed_keys}")
+        return "RunStatusChanged", changes
+    return best[1], changes
+
+
+# --- migration genesis (deliverable 4, plan §8) -------------------------------
+
+
+def ensure_genesis(
+    run_dir: Path, *, clock: Callable[[], str] | None = None
+) -> dict | None:
+    """Migrate a pre-P6 run: one deterministic genesis event on first contact.
+
+    When the journal holds NO state event and ``manifest.json`` exists, the
+    on-disk bytes are embedded verbatim as a ``JournalGenesis`` state event —
+    same input bytes ⇒ same event bytes, modulo the injected clock and the
+    observed HEAD. Nothing is rewritten: approved artifacts, run history,
+    and the manifest itself are untouched (read-only status never calls
+    this). Returns the appended event, or ``None`` when there is nothing to
+    migrate (fresh run, or a journal already seeded).
+    """
+    manifest_path = run_dir / "manifest.json"
+    jdir = journal_dir(run_dir)
+    if _head_state(jdir, mutate=False).event is not None:
+        return None
+    try:
+        text = manifest_path.read_text()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        state = json.loads(text)
+    except ValueError:
+        # A pre-P6 run whose manifest is ALREADY corrupt: there is no valid
+        # state to seed the journal with, and embedding the corrupt bytes as
+        # the authoritative head would later "rebuild" a hand-fixed manifest
+        # BACK to corruption. Leave the journal empty — the run keeps its
+        # exact pre-P6 behavior (the load raises; once repaired, the next
+        # contact seeds the genesis from the repaired bytes).
+        return None
+    if not isinstance(state, dict):
+        return None
+    run_id = str(state.get("run_id") or "unknown")
+    step, iteration, attempt = _envelope_context(state)
+    return _append_event(
+        jdir,
+        kind="JournalGenesis",
+        run_id=run_id,
+        idempotency_key=_sha256_text(f"genesis:{run_id}:{_sha256_text(text)}"),
+        payload={
+            "migrated_from": "manifest.json",
+            "note": (
+                "pre-P6 run migrated on first mutating contact (plan §8): the "
+                "on-disk manifest bytes are embedded verbatim; legacy attempt "
+                "identity stays derived as <step_id>#<attempts>"
+            ),
+        },
+        step=step,
+        iteration=iteration,
+        attempt_id=attempt,
+        state_json=text,
+        clock=clock,
+    )
+
+
+# --- reconciliation (mutating verbs) and read-only projection status ----------
+
+HEALTH_OK = "ok"
+HEALTH_NO_JOURNAL = "no_journal"
+HEALTH_GENESIS = "genesis"
+HEALTH_CAUGHT_UP = "caught_up"
+HEALTH_ADOPTED = "adopted"
+HEALTH_STALE = "stale"
+HEALTH_UNJOURNALED = "unjournaled"
+HEALTH_CORRUPT = "corrupt"
+HEALTH_MISSING = "missing"
+
+
+@dataclass
+class ProjectionStatus:
+    """One read of journal-vs-projection agreement (shared by both surfaces).
+
+    ``health`` for the read-only surface: ``ok`` / ``no_journal`` /
+    ``stale`` (projection matches an OLDER journaled state — branch reset or
+    kill window) / ``unjournaled`` (a valid projection the journal has never
+    seen — stale-driver write or hand-edit; adopted on the next mutating
+    contact) / ``corrupt`` / ``missing``. The mutating
+    :func:`reconcile_projection` returns the resolved counterparts
+    (``genesis`` / ``caught_up`` / ``adopted``) or ``rebuild_required``.
+    """
+
+    health: str
+    run_id: str | None
+    head_seq: int | None
+    head_state_json: str | None
+    evidence_fingerprint: str
+    notes: list[str] = field(default_factory=list)
+
+
+def projection_status(run_dir: Path, *, mutate: bool = False) -> ProjectionStatus:
+    """Compare the on-disk projection against the journal head.
+
+    ``mutate=False`` (status, R4's read-only half) performs no quarantine,
+    no genesis, no writes — it only reports. ``mutate=True`` quarantines
+    torn/duplicate events while locating the head (the deterministic
+    deliverable-3 reconciliation), but still writes no projection — that is
+    :func:`reconcile_projection`'s job.
+    """
+    manifest_path = run_dir / "manifest.json"
+    jdir = journal_dir(run_dir)
+    head = _head_state(jdir, mutate=mutate)
+    notes = list(head.notes)
+    fingerprint = evidence_fingerprint(manifest_path)
+
+    try:
+        on_disk: str | None = manifest_path.read_text()
+    except (FileNotFoundError, NotADirectoryError):
+        on_disk = None
+    except OSError as exc:
+        notes.append(f"projection unreadable: {exc}")
+        on_disk = None
+
+    if head.event is None:
+        return ProjectionStatus(
+            health=HEALTH_NO_JOURNAL,
+            run_id=None,
+            head_seq=None,
+            head_state_json=None,
+            evidence_fingerprint=fingerprint,
+            notes=notes,
+        )
+
+    head_seq = head.event["seq"]
+    head_state = head.event["state_json"]
+    head_run_id = head.event["run_id"]
+    if on_disk is None:
+        health = HEALTH_MISSING
+    elif on_disk == head_state:
+        health = HEALTH_OK
+    else:
+        parsed_ok = False
+        run_id_matches = False
+        try:
+            parsed = json.loads(on_disk)
+            parsed_ok = isinstance(parsed, dict)
+            run_id_matches = (
+                parsed_ok and str(parsed.get("run_id")) == head_run_id
+            )
+        except ValueError:
+            pass
+        if not parsed_ok or not run_id_matches:
+            health = HEALTH_CORRUPT
+        else:
+            on_disk_sha = _sha256_text(on_disk)
+            matched_older = False
+            for path in reversed(_dedupe(jdir, mutate=False, notes=[])):
+                event = _parse_event(path)
+                if event is None or event.get("state_json") is None:
+                    continue
+                if event.get("state_sha256") == on_disk_sha:
+                    matched_older = True
+                    notes.append(
+                        f"projection matches journal seq {event['seq']} "
+                        f"(head is seq {head_seq})"
+                    )
+                    break
+            health = HEALTH_STALE if matched_older else HEALTH_UNJOURNALED
+    return ProjectionStatus(
+        health=health,
+        run_id=head_run_id,
+        head_seq=head_seq,
+        head_state_json=head_state,
+        evidence_fingerprint=fingerprint,
+        notes=notes,
+    )
+
+
+@dataclass
+class ReconcileOutcome:
+    """What :func:`reconcile_projection` did (or could not do)."""
+
+    health: str  # ok | no_journal | genesis | caught_up | adopted | rebuild_required
+    run_id: str | None
+    head_seq: int | None
+    evidence_fingerprint: str
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def rebuild_required(self) -> bool:
+        return self.health == "rebuild_required"
+
+
+def reconcile_projection(
+    run_dir: Path, *, clock: Callable[[], str] | None = None
+) -> ReconcileOutcome:
+    """Idempotently reconcile journal and projection on a mutating contact.
+
+    The deliverable-3 finalization point, mirroring the executor-intent
+    replay discipline: torn/duplicate events are quarantined by idempotency
+    key; a pre-P6 run gets its genesis; a projection behind the head (kill
+    window, or a branch reset that materialized an old committed manifest —
+    R8) is caught up by rewriting the exact head bytes; a valid projection
+    the journal has never seen (stale-driver write or sanctioned hand-edit)
+    is ADOPTED as a new journal transition — the journal keeps the full
+    history, so nothing is lost either way. A missing/corrupt projection is
+    NOT repaired here: that is :class:`RebuildProjectionAction`'s job, under
+    the executor's transaction ordering with the malformed original
+    preserved as evidence first (plan §5.5).
+    """
+    status = projection_status(run_dir, mutate=True)
+    notes = list(status.notes)
+    manifest_path = run_dir / "manifest.json"
+
+    if status.health == HEALTH_NO_JOURNAL:
+        genesis = ensure_genesis(run_dir, clock=clock)
+        if genesis is not None:
+            notes.append(
+                f"journal genesis appended from the existing manifest "
+                f"(seq {genesis['seq']}; pre-P6 migration, plan §8)"
+            )
+            return ReconcileOutcome(
+                health=HEALTH_GENESIS,
+                run_id=genesis["run_id"],
+                head_seq=genesis["seq"],
+                evidence_fingerprint=status.evidence_fingerprint,
+                notes=notes,
+            )
+        return ReconcileOutcome(  # fresh run (no manifest yet): nothing to do
+            health=HEALTH_NO_JOURNAL,
+            run_id=None,
+            head_seq=None,
+            evidence_fingerprint=status.evidence_fingerprint,
+            notes=notes,
+        )
+
+    if status.health == HEALTH_OK:
+        return ReconcileOutcome(
+            health=HEALTH_OK,
+            run_id=status.run_id,
+            head_seq=status.head_seq,
+            evidence_fingerprint=status.evidence_fingerprint,
+            notes=notes,
+        )
+
+    if status.health == HEALTH_STALE:
+        _write_projection(manifest_path, status.head_state_json)
+        notes.append(
+            "projection catch-up: manifest.json held an older journaled "
+            f"state (kill window or branch reset, R8); rewrote it from the "
+            f"journal head (seq {status.head_seq})"
+        )
+        return ReconcileOutcome(
+            health=HEALTH_CAUGHT_UP,
+            run_id=status.run_id,
+            head_seq=status.head_seq,
+            evidence_fingerprint=evidence_fingerprint(manifest_path),
+            notes=notes,
+        )
+
+    if status.health == HEALTH_UNJOURNALED:
+        # A valid same-run manifest the journal has never seen: adopting it
+        # (rather than overwriting) is the non-lossy resolution for BOTH
+        # producers of this shape — a stale pre-P6 driver that wrote the
+        # projection directly, and a hand-edit. Loud, and fully reversible:
+        # every prior state stays in the journal.
+        text = manifest_path.read_text()
+        state = json.loads(text)
+        prev_state = None
+        try:
+            prev_state = json.loads(status.head_state_json)
+        except ValueError:
+            prev_state = None
+        if not isinstance(prev_state, dict):
+            prev_state = None
+        kind, changes = derive_kind(prev_state, state)
+        step, iteration, attempt = _envelope_context(state)
+        _append_event(
+            journal_dir(run_dir),
+            kind=kind,
+            run_id=str(state.get("run_id") or "unknown"),
+            idempotency_key=_sha256_text(
+                f"adopt:{status.head_seq}:{_sha256_text(text)}"
+            ),
+            payload={
+                "changes": changes,
+                "adopted_outside_engine": True,
+                "note": (
+                    "manifest.json changed outside the journaled write path "
+                    "(stale driver or hand-edit); adopted as a transition — "
+                    "the prior state remains in the journal"
+                ),
+            },
+            step=step,
+            iteration=iteration,
+            attempt_id=attempt,
+            state_json=text,
+            clock=clock,
+        )
+        notes.append(
+            "adopted an unjournaled manifest.json state as a journal "
+            "transition (stale-driver write or hand-edit); the prior state "
+            "remains journaled"
+        )
+        return ReconcileOutcome(
+            health=HEALTH_ADOPTED,
+            run_id=status.run_id,
+            head_seq=(status.head_seq or 0) + 1,
+            evidence_fingerprint=status.evidence_fingerprint,
+            notes=notes,
+        )
+
+    # corrupt / missing: rebuild through the executor action (plan §5.5).
+    notes.append(
+        f"projection {status.health}: rebuild from the journal head "
+        f"(seq {status.head_seq}) is required; the malformed original is "
+        "preserved as evidence by the executor before any rewrite"
+    )
+    return ReconcileOutcome(
+        health="rebuild_required",
+        run_id=status.run_id,
+        head_seq=status.head_seq,
+        evidence_fingerprint=status.evidence_fingerprint,
+        notes=notes,
+    )
+
+
+def rebuild_source(run_dir: Path) -> tuple[str, int, str]:
+    """(head state bytes, seq, event id) the projection rebuild writes.
+
+    Read-only; raises :class:`JournalError` when the journal holds no state
+    event (nothing to rebuild from — a pre-P6 run with a corrupt manifest is
+    exactly as unrecoverable as it was pre-P6, and says so).
+    """
+    head = _head_state(journal_dir(run_dir), mutate=False)
+    if head.event is None:
+        raise JournalError(
+            f"no state-carrying journal event under {journal_dir(run_dir)}; "
+            "the projection cannot be rebuilt (pre-P6 run or empty journal)"
+        )
+    return head.event["state_json"], head.event["seq"], head.event["event_id"]
+
+
+def write_projection_from_head(run_dir: Path) -> tuple[int, str]:
+    """Rewrite manifest.json from the journal head; returns (seq, event id).
+
+    The executor's apply step for :class:`RebuildProjectionAction` — a single
+    atomic file replace, idempotent by construction (re-running converges on
+    the same bytes). Evidence preservation and precondition checks belong to
+    the executor, not here.
+    """
+    text, seq, event_id = rebuild_source(run_dir)
+    _write_projection(run_dir / "manifest.json", text)
+    return seq, event_id
+
+
+__all__ = [
+    "EVENT_KINDS",
+    "JOURNAL_DIRNAME",
+    "JOURNAL_SCHEMA_VERSION",
+    "HEALTH_ADOPTED",
+    "HEALTH_CAUGHT_UP",
+    "HEALTH_CORRUPT",
+    "HEALTH_GENESIS",
+    "HEALTH_MISSING",
+    "HEALTH_NO_JOURNAL",
+    "HEALTH_OK",
+    "HEALTH_STALE",
+    "HEALTH_UNJOURNALED",
+    "JournalError",
+    "ProjectionStatus",
+    "ReconcileOutcome",
+    "append_audit",
+    "derive_kind",
+    "ensure_genesis",
+    "evidence_fingerprint",
+    "journal_dir",
+    "projection_status",
+    "read_events",
+    "rebuild_source",
+    "reconcile_projection",
+    "record_transition",
+    "write_projection_from_head",
+]

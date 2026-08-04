@@ -262,7 +262,9 @@ src/gauntlet/
   engine/         # pipeline state machine, step types, manifest; plus
                   #   heartbeat.py (suspend detection / deadline credit),
                   #   ledger.py (machine-global usage ledger + window admission),
-                  #   validators.py (in-step artifact validation + repair)
+                  #   validators.py (in-step artifact validation + repair),
+                  #   journal.py (append-only authoritative state journal;
+                  #   manifest.json is its regenerated projection — P6, R8)
   adapters/       # ClaudeCodeAdapter, CodexAdapter, ApiAdapter (LiteLLM);
                   #   failure_markers.py (pinned transient-vs-terminal
                   #   classification: usage-limit/overload parks, FR-3.1)

@@ -158,7 +158,7 @@ def _kill_at_boundary(tmp_path: Path, n: int, when: str, sig: str):
 
 
 @pytest.mark.parametrize("sig", ["kill", "term"])
-@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("when", ["before", "after", "mid"])
 def test_kill_at_every_persist_boundary_classifies_and_converges(
     tmp_path, sig, when
 ):
@@ -167,22 +167,46 @@ def test_kill_at_every_persist_boundary_classifies_and_converges(
     leaves a state the classifier reads as recoverable — never ``unknown``,
     never a dead-driver nonterminal row without a mutating next action, and
     never a state whose only remedy is hand-editing manifest.json — and one
-    plain resume converges to exactly one set of effects."""
+    plain resume converges to exactly one set of effects.
+
+    P6 extends the matrix with ``mid`` (plan §4.6): the process dies exactly
+    BETWEEN the journal event append and the projection replace inside every
+    ``write_atomic`` — the one new durable sub-boundary the journal adds.
+    The projection is then exactly one journaled state behind; the read-only
+    view classifies from the authoritative journal head (R4/R8) and one
+    plain resume catches the projection up and converges."""
     n = 0
     covered = 0
     while True:
         n += 1
-        assert n < 30, "runaway boundary loop — persist count exploded"
+        assert n < 40, "runaway boundary loop — persist count exploded"
         repo, mgr, exhausted = _kill_at_boundary(tmp_path, n, when, sig)
         if exhausted:
             break
         run_dir = mgr.layout("demo").active_run_dir()
         manifest_path = run_dir / "manifest.json"
-        if not manifest_path.exists():
+        from gauntlet.engine import journal as J
+
+        if not manifest_path.exists() and not J.read_events(run_dir):
             # Killed before the first durable persist: the run never began
             # durably — there is no state to recover (or corrupt).
             continue
-        man = Manifest.load(manifest_path)  # atomic write ⇒ never torn
+        # P6 (R4/R8): classification reads the AUTHORITATIVE state — the
+        # projection when it matches the journal head, else the journal head
+        # itself (a mid-boundary kill leaves the projection one state
+        # behind; a first-persist mid kill leaves no projection at all).
+        view = op.load_projection_view(repo, run_dir, slug="demo")
+        assert view.manifest is not None, (
+            f"boundary {when}-persist-{n} ({sig}) left no classifiable "
+            "authoritative state (journal + projection both unusable)"
+        )
+        man = view.manifest
+        if when == "mid" and manifest_path.exists():
+            Manifest.load(manifest_path)  # atomic ⇒ never torn, still loadable
+            # The projection is either the head (the kill landed after the
+            # replace of an earlier persist) or exactly one journaled state
+            # behind it — never foreign, never corrupt (no new kill window).
+            assert view.health in ("ok", "stale"), view.health
         liveness = op.driver_liveness(repo / "runs", "demo")
         assert liveness in (op.LIVENESS_ORPHANED, op.LIVENESS_NONE)
         rstate = op.compute_run_state(man, liveness)

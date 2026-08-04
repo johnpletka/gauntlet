@@ -53,11 +53,12 @@ from typing import Any, Callable, Iterator
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from gauntlet.engine import git_snapshot, gitops, manifest as M
+from gauntlet.engine import git_snapshot, gitops, journal as J, manifest as M
 from gauntlet.engine.gitops import ENGINE_IDENTITY, GitError
 from gauntlet.engine.recovery import (
     AbortAction,
     AdoptCommitsAction,
+    RebuildProjectionAction,
     BranchRelation,
     CommitKind,
     ContinueOnRecoveryBranchAction,
@@ -957,6 +958,69 @@ class RecoveryPlanner:
             recommended_action=RecoveryActionKind.SNAPSHOT_AND_RESTART,
             progress_fingerprint=fingerprint.digest,
         )
+
+
+def projection_rebuild_assessment(
+    repo_root: Path, run_dir: Path, *, slug: str | None = None
+) -> tuple[RecoveryAssessment, RebuildProjectionAction] | None:
+    """The one assessment for a missing/corrupt manifest projection (plan §5.5).
+
+    Consumed by BOTH surfaces (R4): read-only ``status`` renders the returned
+    action (``operator.load_projection_view``), and the mutating verbs apply
+    the SAME action through :meth:`RecoveryExecutor.apply_rebuild`
+    (``RunManager._reconcile_projection``) — one construction point, zero
+    drift. Returns ``None`` when no rebuild is pending (healthy projection,
+    or a pre-P6 run with no journal to rebuild from — old runs keep their
+    exact pre-P6 behavior, plan §8).
+
+    The action carries the plan §4.6 execution payload: the journal and
+    projection paths (repo-relative) and the evidence fingerprint of the
+    on-disk projection bytes (``"absent"`` when deleted), which the executor
+    re-verifies under the lock before mutating anything.
+    """
+    status = J.projection_status(run_dir, mutate=False)
+    if status.health not in (J.HEALTH_CORRUPT, J.HEALTH_MISSING):
+        return None
+    try:
+        run_rel = run_dir.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None  # a run dir outside the repo cannot carry a contained path
+    action = RebuildProjectionAction(
+        description=(
+            "rebuild manifest.json from the authoritative journal head "
+            f"(seq {status.head_seq}); the malformed original is preserved "
+            "as recovery evidence first — a plain resume applies this "
+            "(plan §5.5; never hand-edit manifest.json)"
+        ),
+        journal_path=(run_rel / J.JOURNAL_DIRNAME).as_posix(),
+        projection_path=(run_rel / "manifest.json").as_posix(),
+        evidence_fingerprint=status.evidence_fingerprint,
+    )
+    label = slug or status.run_id or "<run>"
+    assessment = RecoveryAssessment(
+        cause=RecoveryCause.STATE_INCONSISTENT,
+        disposition=RecoveryDisposition.REBUILD_PROJECTION,
+        evidence=(
+            f"manifest projection is {status.health} "
+            f"(fingerprint {status.evidence_fingerprint})",
+            f"journal head seq {status.head_seq} for run "
+            f"{status.run_id!r} is the authoritative state (plan §4.6/R8)",
+            *status.notes,
+        ),
+        safe_actions=(
+            action,
+            AbortAction(
+                description=(
+                    f"`gauntlet abort {label}` aborts the run, retaining "
+                    "every snapshot and all evidence"
+                ),
+                reason="operator abort instead of rebuilding the projection",
+            ),
+        ),
+        recommended_action=RecoveryActionKind.REBUILD_PROJECTION,
+        progress_fingerprint=status.evidence_fingerprint,
+    )
+    return assessment, action
 
 
 def _governed_discards(
@@ -1965,6 +2029,19 @@ class RecoveryExecutor:
                 )
             self._validate(action, spec)  # step 3
             snapshot = self._create_snapshot(snapshot_request)  # step 4 (R2)
+            # P6 journal audit (plan §4.6): recovery evidence, deduplicated by
+            # idempotency key and best-effort by contract — the durable
+            # authority for this transaction is the intent file + snapshot
+            # ref, never these events (plan §9: optional evidence gathering
+            # must not prevent finalization).
+            J.append_audit(
+                self.run_dir,
+                "RecoverySnapshotCreated",
+                {"snapshot_ref": snapshot.ref, "site": spec.site,
+                 "reason": snapshot_request.reason},
+                run_id=self.run_id,
+                idempotency_key=f"snapshot:{snapshot.ref}",
+            )
             intent_payload = dict(payload or {})
             governed_evidence = [
                 item for item in assessment.evidence
@@ -1990,6 +2067,16 @@ class RecoveryExecutor:
                 payload=intent_payload,
             )
             _write_intent(self.run_dir, intent)
+            J.append_audit(
+                self.run_dir,
+                "RecoveryActionPlanned",
+                {"intent_id": intent.intent_id, "site": spec.site,
+                 "action_kind": intent.action_kind,
+                 "target_sha": spec.target_sha,
+                 "snapshot_ref": snapshot.ref},
+                run_id=self.run_id,
+                idempotency_key=f"planned:{intent.intent_id}",
+            )
             self._apply_spec(spec, snapshot)  # step 6
             result = RecoveryResult(
                 snapshot=snapshot,
@@ -2002,8 +2089,103 @@ class RecoveryExecutor:
             )
             if persist is not None:  # step 7
                 persist(result)
+            J.append_audit(
+                self.run_dir,
+                "RecoveryActionApplied",
+                {"intent_id": intent.intent_id, "site": spec.site,
+                 "target_sha": spec.target_sha,
+                 "snapshot_ref": snapshot.ref},
+                run_id=self.run_id,
+                idempotency_key=f"applied:{intent.intent_id}",
+            )
             _clear_intent(self.run_dir, intent.intent_id)  # step 8
             return result
+
+    def apply_rebuild(
+        self,
+        assessment: RecoveryAssessment,
+        action: RebuildProjectionAction,
+    ) -> str:
+        """Rebuild the manifest projection from the journal head (plan §5.5).
+
+        The same transaction ordering as :meth:`apply`, degenerated to the
+        file plane this action mutates: (1) hold the lock; (2) converge any
+        surviving Git-transaction intent first; (3) re-verify the evidence
+        fingerprint under the lock — the projection bytes must still be
+        exactly what the assessment observed; (4) preserve the malformed
+        original as durable recovery evidence (the R2 preservation for this
+        action — no Git plane is touched, so no Git snapshot applies); (5)
+        atomically write the journal head bytes; (6) record the applied
+        action as a journal audit event and a loud manifest warning (which
+        itself lands as a fresh journaled transition, so the progress
+        fingerprint provably moves — R5). Steps 5/8 of the Git transaction
+        (intent persist/clear) degenerate away: the rewrite is one atomic
+        replace and re-running it converges on the same bytes, so a kill at
+        any point leaves either the old or the new projection — both
+        recognized states, replayed by the next contact.
+        """
+        if action.kind is not RecoveryActionKind.REBUILD_PROJECTION:
+            raise RecoveryPreconditionError(
+                f"apply_rebuild applies rebuild_projection actions only; "
+                f"got {action.kind}"
+            )
+        if action not in assessment.safe_actions:
+            raise RecoveryPreconditionError(
+                "the action to apply must be one of the assessment's safe_actions"
+            )
+        projection = self.repo_root / action.projection_path
+        with self.lock_guard.hold():  # step 1
+            survivor = load_intent(self.run_dir)
+            if survivor is not None:  # step 2: converge the Git plane first
+                self._replay(survivor)
+            observed = J.evidence_fingerprint(projection)  # step 3
+            if observed != action.evidence_fingerprint:
+                raise RecoveryPreconditionError(
+                    "projection evidence fingerprint changed between "
+                    f"assessment and apply ({action.evidence_fingerprint} -> "
+                    f"{observed}); the projection moved — re-assess before "
+                    "mutating (fail closed)"
+                )
+            preserved: Path | None = None
+            if projection.exists():  # step 4 (R2): preserve, never hand-edit
+                stamp = self.clock().replace(":", "-").replace("+", "-")
+                preserved = projection.with_name(
+                    f"manifest.corrupt-{stamp}.json"
+                )
+                data = projection.read_bytes()
+                preserved.write_bytes(data)
+                _fsync_dir(preserved.parent)
+            seq, event_id = J.write_projection_from_head(self.run_dir)  # step 5
+            note = (
+                f"rebuilt manifest.json from the authoritative journal head "
+                f"(seq {seq}, event {event_id}); the "
+                + (
+                    f"malformed original is preserved as {preserved.name}"
+                    if preserved is not None
+                    else "projection was missing (nothing to preserve)"
+                )
+                + " — plan §5.5, R8"
+            )
+            J.append_audit(  # step 6: applied-action evidence, deduplicated
+                self.run_dir,
+                "RecoveryActionApplied",
+                {
+                    "action_kind": RecoveryActionKind.REBUILD_PROJECTION.value,
+                    "journal_seq": seq,
+                    "head_event_id": event_id,
+                    "evidence_fingerprint": action.evidence_fingerprint,
+                    "preserved_as": preserved.name if preserved else None,
+                },
+                run_id=self.run_id,
+                idempotency_key=(
+                    f"rebuild:{action.evidence_fingerprint}:{event_id}"
+                ),
+            )
+            # Loud, durable audit (plan §5.5): the warning is appended through
+            # the normal journaled persist, so the rebuild provably advances
+            # the progress fingerprint (R5) and the audit survives crashes.
+            _append_manifest_warning(self.run_dir, note)
+            return note
 
     # -- step 4: the durable pre-mutation snapshot -----------------------------
 
@@ -2494,6 +2676,20 @@ def replay_intent(repo: Path, run_dir: Path, intent: RecoveryIntent) -> str:
             f"{intent.snapshot_ref}",
         )
     _persist_governed_replay_evidence(run_dir, intent)
+    # P6 journal audit: the applied-action event shares the original apply's
+    # idempotency key, so a transaction killed after its own event appends
+    # nothing here (deduplicated — exactly once), while one killed before it
+    # gains the missing evidence. Best-effort, never a gate.
+    J.append_audit(
+        run_dir,
+        "RecoveryActionApplied",
+        {"intent_id": intent.intent_id, "site": intent.site,
+         "target_sha": intent.spec.target_sha,
+         "snapshot_ref": intent.snapshot_ref, "replayed": True,
+         "note": applied_note},
+        run_id=intent.run_id,
+        idempotency_key=f"applied:{intent.intent_id}",
+    )
     _clear_intent(run_dir, intent.intent_id)
     return applied_note
 
@@ -2608,6 +2804,7 @@ __all__ = [
     "load_intent",
     "observe_git",
     "observe_state",
+    "projection_rebuild_assessment",
     "replay_intent",
     "replay_pending_intent",
     "worktree_fingerprint",

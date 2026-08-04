@@ -25,7 +25,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from gauntlet.engine import gitops, manifest as M, prd_stub, recovery_exec as RX
+from gauntlet.engine import (
+    gitops,
+    journal as J,
+    manifest as M,
+    prd_stub,
+    recovery_exec as RX,
+)
 from gauntlet.engine.recovery import AbortAction, NoProgressError
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
@@ -1250,6 +1256,10 @@ class RunManager:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
+        # P6: the journal is authoritative — reconcile the manifest projection
+        # FIRST (catch-up / adoption / executor rebuild, plan §4.6/§5.5/R8),
+        # so every load below reads the authoritative state.
+        self._reconcile_projection(run_dir, slug)
         # FR-5.6 crash reconciliation runs on this mutating entry point BEFORE the
         # lock is touched: finalization compares a surviving intent's nonce against
         # the lock the wedged driver left, and acquiring the lock first (which
@@ -1865,6 +1875,7 @@ class RunManager:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        self._reconcile_projection(run_dir, slug)  # P6: journal-first (plan §4.6)
         man = Manifest.load(run_dir / "manifest.json")
         # Approve drives the rest of the run, so it is a driving verb (FR-10.5):
         # take the worktree lock first, released in `finally` on the next park /
@@ -1896,6 +1907,7 @@ class RunManager:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        self._reconcile_projection(run_dir, slug)  # P6: journal-first (plan §4.6)
         man = Manifest.load(run_dir / "manifest.json")
         # Reject now re-drives the upstream adversarial_cycle with the rejection
         # note injected as a new round (FR-8.1 + operator playbook), so like
@@ -2023,6 +2035,7 @@ class RunManager:
         # place as preserved evidence for a later explicit resume/rollback.
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        self._reconcile_projection(run_dir, slug)  # P6: journal-first (plan §4.6)
         man = Manifest.load(run_dir / "manifest.json")
         # Terminal history is read-only (review F-002): never rewrite a
         # done/aborted/failed run's status. Fail closed so neither a stray CLI
@@ -2074,6 +2087,9 @@ class RunManager:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
 
+        # P6: journal-first projection reconciliation on this mutating verb
+        # (plan §4.6/§5.5/R8), before the intent reconcile reads the manifest.
+        self._reconcile_projection(run_dir, slug)
         # FR-5.6 step 0: reconcile any surviving intent from a prior interrupted
         # `recover` FIRST (this is a mutating context). A finalize-able intent is
         # finalized here; a stale one discarded — so the fresh recovery below sees
@@ -2531,6 +2547,76 @@ class RunManager:
             return branch_head, None
         return branch_head, unmanifested
 
+    def _reconcile_projection(self, run_dir: Path, slug: str) -> None:
+        """P6: reconcile the manifest projection with the journal (plan §4.6).
+
+        Runs at the start of every mutating verb, before the manifest is
+        loaded or the FR-5.6 intent reconciliation reads it — the journal is
+        the authoritative state (R8), and ``manifest.json`` is its projection:
+
+        * a pre-P6 run (no journal) gets its deterministic genesis event
+          (plan §8) and otherwise behaves exactly as before;
+        * a projection behind the journal head (a kill between event append
+          and projection write, or a branch reset that materialized an old
+          committed manifest — R8) is caught up idempotently, loudly;
+        * a valid projection the journal has never seen (stale-driver write
+          or hand-edit) is adopted as a journal transition, loudly — never
+          silently overwritten, never refused;
+        * a missing/corrupt projection is rebuilt from the journal head
+          through the shared executor action (plan §5.5): the SAME
+          :func:`RX.projection_rebuild_assessment` the read-only status
+          surface renders (R4), applied under the executor's ordering with
+          the malformed original preserved as evidence first.
+
+        Read-only ``status`` never calls this — it detects and reports via
+        :func:`operator.load_projection_view`.
+        """
+        outcome = J.reconcile_projection(run_dir)
+        if outcome.rebuild_required:
+            planned = RX.projection_rebuild_assessment(self.repo_root, run_dir)
+            if planned is None:
+                raise J.JournalError(
+                    f"manifest projection under {run_dir} is "
+                    "missing/corrupt and no rebuild action could be planned; "
+                    "inspect the journal dir before retrying"
+                )
+            assessment, action = planned
+            executor = RX.RecoveryExecutor(
+                self.repo_root,
+                run_dir,
+                run_id=outcome.run_id or "unknown",
+                run_root=self.config.run_root,
+            )
+            # The executor's lock guard deliberately never reclaims a stale
+            # (dead-driver) lock — reclaim policy, with its identity
+            # verification, belongs to the RunManager. A killed driver is
+            # exactly the shape that leaves BOTH a stale lock and a
+            # behind/missing projection, so take the verb lock here (which
+            # reclaims a verified-dead holder) and let the guard verify it
+            # as our own.
+            handle = self._acquire_worktree_lock(slug, outcome.run_id)
+            try:
+                executor.apply_rebuild(assessment, action)
+            finally:
+                self._release_worktree_lock(handle)
+            return
+        if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_ADOPTED):
+            # Loud, durable audit: the reconciliation notes land as manifest
+            # warnings through the normal journaled persist (a fresh
+            # transition — so the R5 progress fingerprint provably moves).
+            try:
+                man = Manifest.load(run_dir / "manifest.json")
+            except (OSError, ValueError):
+                return
+            changed = False
+            for note in outcome.notes:
+                warn = f"[projection] {note}"
+                if warn not in man.warnings:
+                    man.warnings.append(warn)
+                    changed = True
+            if changed:
+                man.write_atomic(run_dir / "manifest.json")
+
     def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
         """Finalize or discard a surviving recovery intent (FR-5.6, mutating).
 
@@ -2970,6 +3056,9 @@ class RunManager:
     def rollback(self, slug: str, phase: int) -> str:
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        # P6: reconcile the projection with the authoritative journal before
+        # anything reads it (plan §4.6/§5.5/R8).
+        self._reconcile_projection(run_dir, slug)
         man = Manifest.load(run_dir / "manifest.json")
         before_fp = self._capture_progress(slug)  # R5 guard input
         # Rollback is a worktree-mutating verb: take the drive lock so a live
