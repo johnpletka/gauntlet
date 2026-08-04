@@ -2554,68 +2554,103 @@ class RunManager:
         loaded or the FR-5.6 intent reconciliation reads it — the journal is
         the authoritative state (R8), and ``manifest.json`` is its projection:
 
-        * a pre-P6 run (no journal) gets its deterministic genesis event
-          (plan §8) and otherwise behaves exactly as before;
+        * a pre-P6 run (no journal) gets its deterministic genesis event from
+          a LOADABLE manifest (plan §8) and otherwise behaves exactly as
+          before;
         * a projection behind the journal head (a kill between event append
           and projection write, or a branch reset that materialized an old
           committed manifest — R8) is caught up idempotently, loudly;
-        * a valid projection the journal has never seen (stale-driver write
-          or hand-edit) is adopted as a journal transition, loudly — never
-          silently overwritten, never refused;
+        * a projection the journal has never recorded (an out-of-band write)
+          is preserved as durable evidence and replaced from the head, loudly
+          — never silently adopted as authority (post-P6 review F-001);
         * a missing/corrupt projection is rebuilt from the journal head
           through the shared executor action (plan §5.5): the SAME
           :func:`RX.projection_rebuild_assessment` the read-only status
           surface renders (R4), applied under the executor's ordering with
           the malformed original preserved as evidence first.
 
+        Ordering (post-P6 review F-003): the check is READ-ONLY first, and any
+        WRITE happens under the worktree lock — observe → lock → re-observe →
+        apply, the same discipline the recovery executor uses. A lock held by
+        a **live** driver means the divergence is that driver's own in-flight
+        transition (the event landed, its projection write is microseconds
+        away): skip silently rather than race it or refuse the verb — whichever
+        verb genuinely needs the lock still fails closed on its own terms.
+
         Read-only ``status`` never calls this — it detects and reports via
         :func:`operator.load_projection_view`.
         """
-        outcome = J.reconcile_projection(run_dir)
-        if outcome.rebuild_required:
-            planned = RX.projection_rebuild_assessment(self.repo_root, run_dir)
-            if planned is None:
-                raise J.JournalError(
-                    f"manifest projection under {run_dir} is "
-                    "missing/corrupt and no rebuild action could be planned; "
-                    "inspect the journal dir before retrying"
-                )
-            assessment, action = planned
-            executor = RX.RecoveryExecutor(
-                self.repo_root,
-                run_dir,
-                run_id=outcome.run_id or "unknown",
-                run_root=self.config.run_root,
-            )
-            # The executor's lock guard deliberately never reclaims a stale
-            # (dead-driver) lock — reclaim policy, with its identity
-            # verification, belongs to the RunManager. A killed driver is
-            # exactly the shape that leaves BOTH a stale lock and a
-            # behind/missing projection, so take the verb lock here (which
-            # reclaims a verified-dead holder) and let the guard verify it
-            # as our own.
-            handle = self._acquire_worktree_lock(slug, outcome.run_id)
-            try:
-                executor.apply_rebuild(assessment, action)
-            finally:
-                self._release_worktree_lock(handle)
+        # Read-only pre-check: a healthy projection is the overwhelmingly
+        # common case and must cost no lock and no write.
+        pre = J.projection_status(
+            run_dir, mutate=False, validate=M.validate_projection_text
+        )
+        genesis_pending = (
+            pre.health == J.HEALTH_NO_JOURNAL
+            and (run_dir / "manifest.json").exists()
+        )
+        if pre.health == J.HEALTH_OK or (
+            pre.health == J.HEALTH_NO_JOURNAL and not genesis_pending
+        ):
             return
-        if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_ADOPTED):
-            # Loud, durable audit: the reconciliation notes land as manifest
-            # warnings through the normal journaled persist (a fresh
-            # transition — so the R5 progress fingerprint provably moves).
-            try:
-                man = Manifest.load(run_dir / "manifest.json")
-            except (OSError, ValueError):
+        try:
+            handle = self._acquire_worktree_lock(slug, pre.run_id)
+        except WorktreeLockError:
+            # A live driver owns the projection; its own write lands next.
+            return
+        try:
+            outcome = J.reconcile_projection(
+                run_dir, validate=M.validate_projection_text
+            )
+            if outcome.rebuild_required:
+                planned = RX.projection_rebuild_assessment(
+                    self.repo_root, run_dir, slug=slug
+                )
+                if planned is None:
+                    raise J.JournalError(
+                        f"manifest projection under {run_dir} is "
+                        "missing/corrupt and no rebuild action could be "
+                        "planned; inspect the journal dir before retrying"
+                    )
+                assessment, action = planned
+                # The executor's own guard verifies (never reclaims) the
+                # lock — reclaim policy with its identity verification
+                # belongs here; the guard sees the lock as this process's.
+                RX.RecoveryExecutor(
+                    self.repo_root,
+                    run_dir,
+                    run_id=outcome.run_id or "unknown",
+                    run_root=self.config.run_root,
+                ).apply_rebuild(assessment, action)
                 return
-            changed = False
-            for note in outcome.notes:
-                warn = f"[projection] {note}"
-                if warn not in man.warnings:
-                    man.warnings.append(warn)
-                    changed = True
-            if changed:
-                man.write_atomic(run_dir / "manifest.json")
+            if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_RESTORED):
+                # Loud, durable audit: the reconciliation notes land as
+                # manifest warnings through the normal journaled persist (a
+                # fresh transition — so the R5 fingerprint provably moves).
+                man = Manifest.load(run_dir / "manifest.json")
+                changed = False
+                for note in outcome.notes:
+                    warn = f"[projection] {note}"
+                    if warn not in man.warnings:
+                        man.warnings.append(warn)
+                        changed = True
+                if changed:
+                    man.write_atomic(run_dir / "manifest.json")
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _reconcile_projection_safe(self, layout: "RunLayout") -> None:
+        """Reconcile the projection when a run dir resolves; else skip (P6).
+
+        For a cleanup verb that legitimately runs after the active-run pointer
+        is gone or stale: no run dir means there is no projection to
+        reconcile, which is not an error for that verb.
+        """
+        try:
+            run_dir = layout.active_run_dir()
+        except (FileNotFoundError, UnsafeRunSegment):
+            return
+        self._reconcile_projection(run_dir, layout.slug)
 
     def _reconcile_recovery_intent(self, run_dir: Path) -> str | None:
         """Finalize or discard a surviving recovery intent (FR-5.6, mutating).
@@ -2734,6 +2769,11 @@ class RunManager:
         # identity-verified; a live run's judge and the shared console are left
         # untouched.
         self._reap_orphaned_judge_safe(layout)
+        # P6 (post-review F-003): clean deletes the run branch off the run's
+        # recorded base, so reconcile the projection with the authoritative
+        # journal first. Safe-wrapped: `clean` legitimately runs when the
+        # pointer is already stale and there is no run dir to reconcile.
+        self._reconcile_projection_safe(layout)
         branch = f"{self.config.branch_prefix}{slug}"
         if not gitops.branch_exists(repo, branch):
             cleared = self._clear_active_pointer(layout)
@@ -2793,6 +2833,12 @@ class RunManager:
         """
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        # P6 (post-review F-003): finish merges and DELETES a branch off the
+        # run's recorded status, so it must read the authoritative state, not
+        # a projection left stale by a branch reset or a kill window —
+        # otherwise it could refuse a journal-complete run, or merge and
+        # delete on the word of an older projection that still says `done`.
+        self._reconcile_projection(run_dir, slug)
         man = Manifest.load(run_dir / "manifest.json")
         repo = self.repo_root
         branch, base = man.branch, man.base_branch

@@ -1790,19 +1790,51 @@ def drive_review(
     return _outcome(state_dir, man, status, resolution=resolution)
 
 
+def _authoritative_review_manifest(state_dir: Path) -> Manifest | None:
+    """The review run's authoritative state, read-only (P6, plan §4.6).
+
+    A review run's manifest is journaled by the same
+    :meth:`Manifest.write_atomic` primitive as a heavyweight run's, so its
+    journal head — not the projection — is the authority. Read-only: this
+    performs no reconciliation and no writes (that is
+    :func:`resume_review`'s job, on the mutating path); it just prefers the
+    head when the projection is missing, unloadable, or behind it, so
+    discovery and resume never disagree about whether a run exists.
+    """
+    from gauntlet.engine import journal as J
+
+    status = J.projection_status(
+        state_dir, mutate=False, validate=M.validate_projection_text
+    )
+    if status.health in (J.HEALTH_OK, J.HEALTH_NO_JOURNAL):
+        try:
+            return Manifest.load(state_dir / "manifest.json")
+        except (OSError, ValueError):
+            return None
+    if status.head_state_json is None:
+        return None
+    try:
+        return Manifest.model_validate_json(status.head_state_json)
+    except ValueError:
+        return None
+
+
 def load_review_run(state_dir: Path) -> Manifest | None:
     """The bound, non-terminal review run at ``state_dir``, if one exists.
 
     A review run is *resumable* once its cycle has been wired (``pipeline.yaml``
     snapshotted, FR-9.1) and it is not in a terminal state. Returns the manifest
     then, else ``None`` — so the CLI can refuse to clobber a parked run and route
-    a ``--response`` to it instead."""
+    a ``--response`` to it instead.
+
+    Reads the AUTHORITATIVE state (P6): a run whose projection was left behind
+    by a kill between the journal append and the projection write is still
+    discovered — never silently treated as absent and clobbered."""
     manifest_path = state_dir / "manifest.json"
     if not (manifest_path.is_file() and (state_dir / "pipeline.yaml").is_file()):
         return None
-    try:
-        man = Manifest.load(manifest_path)
-    except (OSError, ValueError):
+    man = _authoritative_review_manifest(state_dir)
+    if man is None:
         return None
     if man.pipeline.hash == "" or man.status in _TERMINAL_STATUSES:
         return None
@@ -1832,8 +1864,21 @@ def resume_review(
     from gauntlet.engine.pipeline import load_pipeline
     from gauntlet.logging.redact import RedactingWriter
 
+    from gauntlet.engine import journal as J
+
     environ = environ if environ is not None else dict(os.environ)
     manifest_path = state_dir / "manifest.json"
+    # P6 (plan §4.6, post-review F-004): a review run's manifest rides the
+    # same journaled write path as a heavyweight run's, so reconcile the
+    # projection against the authoritative journal before reading it — a
+    # resume must never re-drive from a state the journal has superseded
+    # (a kill between the event append and the projection write), and an
+    # out-of-band write is preserved rather than adopted. Review state dirs
+    # may live OUTSIDE the repository, where the contained-path
+    # RebuildProjectionAction cannot be expressed; that rebuild half stays
+    # deferred (documented in FUTURE.md) — such a run degrades to exactly
+    # its pre-P6 behavior, never worse.
+    J.reconcile_projection(state_dir, validate=M.validate_projection_text)
     man = Manifest.load(manifest_path)
     pipeline, phash = load_pipeline(state_dir / "pipeline.yaml")
     if phash != man.pipeline.hash:

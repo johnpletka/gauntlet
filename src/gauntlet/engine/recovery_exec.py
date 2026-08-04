@@ -978,7 +978,9 @@ def projection_rebuild_assessment(
     on-disk projection bytes (``"absent"`` when deleted), which the executor
     re-verifies under the lock before mutating anything.
     """
-    status = J.projection_status(run_dir, mutate=False)
+    status = J.projection_status(
+        run_dir, mutate=False, validate=M.validate_projection_text
+    )
     if status.health not in (J.HEALTH_CORRUPT, J.HEALTH_MISSING):
         return None
     try:

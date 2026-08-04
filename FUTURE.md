@@ -99,3 +99,21 @@ restarts when target repo == engine repo; running the driver from an
 installed snapshot; or a source-tree-hash park as a detection floor.
 Candidate for a small PRD or a `pipeline-effectiveness` follow-up — an engine
 lifecycle change, so it wants adversarial review, not a quick patch.
+
+**From the recovery-redesign run (P6 review) — recorded 2026-08-04:**
+
+**Journal rebuild for out-of-repository state dirs** — P6 makes the
+append-only journal authoritative for every run whose manifest goes through
+`Manifest.write_atomic`, including lightweight `gauntlet review` runs. Review
+runs now reconcile (genesis, catch-up, out-of-band preserve/restore,
+torn/duplicate quarantine) on their mutating resume path and read the
+authoritative head during discovery. The remaining half is the
+missing/corrupt-projection **rebuild**: `RebuildProjectionAction` requires
+repo-relative contained `journal_path`/`projection_path` (the P1 containment
+validator), so a review state dir outside the repository cannot express one
+and `projection_rebuild_assessment` returns `None` there. Such a run degrades
+to exactly its pre-P6 behavior (an unloadable manifest is as unrecoverable as
+it was before the journal existed) — never worse. Closing it means either a
+contained non-repo-relative action payload or a separate file-plane rebuild
+verb; both change a P1 model or add a verb, so they want the recovery plan's
+own review loop rather than an in-phase patch.

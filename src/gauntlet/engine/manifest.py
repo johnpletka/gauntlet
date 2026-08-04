@@ -778,12 +778,31 @@ class Manifest(BaseModel):
         # in at import time.
         from gauntlet.engine import journal
 
-        journal.record_transition(path, payload)
+        journal.record_transition(path, payload, validate=validate_projection_text)
         _replace_atomic(path, payload)
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
         return cls.model_validate_json(path.read_text())
+
+
+def validate_projection_text(text: str) -> bool:
+    """Can the engine actually LOAD this manifest text? (P6.1, review F-002)
+
+    The journal's injected state validator: only bytes that pass the full
+    model validation may become an authoritative journal state (a genesis
+    migration) or be reasoned about as a candidate projection. Bytes that
+    merely happen to be JSON would otherwise wedge a run — every later
+    ``Manifest.load`` of the authoritative head would raise, with nothing
+    valid left to rebuild from. Kept here (not in :mod:`journal`) so the
+    journal module stays free of engine imports; injected at every call site
+    that can promote bytes to authority.
+    """
+    try:
+        Manifest.model_validate_json(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _replace_atomic(path: Path, payload: str) -> None:

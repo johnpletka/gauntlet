@@ -756,7 +756,9 @@ def load_projection_view(
     and — for missing/corrupt — the shared rebuild assessment (R4).
     """
     manifest_path = run_instance_dir / "manifest.json"
-    status = JR.projection_status(run_instance_dir, mutate=False)
+    status = JR.projection_status(
+        run_instance_dir, mutate=False, validate=M.validate_projection_text
+    )
 
     def _head_manifest() -> "Manifest | None":
         if status.head_state_json is None:
@@ -766,43 +768,52 @@ def load_projection_view(
         except ValueError:
             return None
 
-    if status.health in (JR.HEALTH_OK, JR.HEALTH_NO_JOURNAL, JR.HEALTH_UNJOURNALED):
-        # Healthy, pre-P6, or an unjournaled-but-valid on-disk state (the
-        # newest claim; adopted on the next mutating contact): classify from
-        # the on-disk projection, exactly as before P6.
+    if status.health in (JR.HEALTH_OK, JR.HEALTH_NO_JOURNAL):
+        # Healthy, or a pre-P6 run with no journal: classify from the on-disk
+        # projection, exactly as before P6.
         try:
             man: "Manifest | None" = Manifest.load(manifest_path)
         except (OSError, ValueError):
             man = _head_manifest()
-        detail = None
-        if status.health == JR.HEALTH_UNJOURNALED:
-            detail = (
-                "manifest.json changed outside the journaled write path "
-                "(stale driver or hand-edit); the next mutating command "
-                "adopts it as a journal transition"
-            )
         return ProjectionView(
             manifest=man,
             health=status.health if man is not None else JR.HEALTH_NO_JOURNAL,
             journal_seq=status.head_seq,
             rebuild_pending=False,
-            detail=detail,
         )
 
-    if status.health == JR.HEALTH_STALE:
+    if status.health in (JR.HEALTH_STALE, JR.HEALTH_UNJOURNALED):
+        # The journal is the authority in BOTH shapes (post-P6 review F-001):
+        # a stale projection is an older journaled state, and an unjournaled
+        # one was written outside the journaled path (a branch reset onto a
+        # pre-journal committed manifest, a stale driver, or a hand-edit) —
+        # neither redefines authority, so status classifies from the head,
+        # exactly as the next mutating command will resolve it (R4).
+        if status.health == JR.HEALTH_STALE:
+            detail = (
+                "manifest.json holds an older journaled state (kill window "
+                "or branch reset, R8); the next mutating command catches it "
+                f"up from the journal head (seq {status.head_seq})"
+            )
+        else:
+            detail = (
+                "manifest.json holds a state the journal has never recorded "
+                "(an out-of-band write — a branch reset onto a pre-journal "
+                "committed manifest, a stale driver, or a hand-edit); the "
+                "next mutating command preserves those bytes as evidence and "
+                f"restores the journal head (seq {status.head_seq}). Nothing "
+                "is discarded"
+            )
         return ProjectionView(
             manifest=_head_manifest(),
             health=status.health,
             journal_seq=status.head_seq,
             rebuild_pending=True,
-            detail=(
-                "manifest.json holds an older journaled state (kill window "
-                "or branch reset, R8); the next mutating command catches it "
-                f"up from the journal head (seq {status.head_seq})"
-            ),
+            detail=detail,
         )
 
-    # corrupt / missing: the shared rebuild assessment (plan §5.5, R4).
+    # corrupt (unparseable OR schema-invalid — review F-002) / missing: the
+    # shared rebuild assessment (plan §5.5, R4).
     planned = RX.projection_rebuild_assessment(
         repo_root, run_instance_dir, slug=slug
     )
@@ -1562,7 +1573,7 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["health", "journal_seq", "rebuild_pending"],
-      "description": "Journal-vs-projection agreement (recovery-redesign P6, plan §4.6/R8): the append-only run journal is the authoritative state and manifest.json is its regenerated projection. Always present; null when the on-disk projection matches the journal head (or the run predates the journal). Non-null names the divergence: `stale` (an older journaled state — a kill window or a branch reset; the next mutating command catches it up from the journal head), `unjournaled` (a valid state the journal has never seen — a stale-driver write or a hand-edit; adopted as a journal transition by the next mutating command), or `corrupt`/`missing` (the next mutating command rebuilds the projection from the journal head, preserving the malformed original as recovery evidence — plan §5.5). Advisory: drives no automatic action.",
+      "description": "Journal-vs-projection agreement (recovery-redesign P6, plan §4.6/R8): the append-only run journal is the authoritative state and manifest.json is its regenerated projection. Always present; null when the on-disk projection matches the journal head (or the run predates the journal). Non-null names the divergence: `stale` (an older journaled state — a kill window or a branch reset; the next mutating command catches it up from the journal head), `unjournaled` (a state the journal has never recorded — an out-of-band write: a branch reset onto a pre-journal committed manifest, a stale driver, or a hand-edit; the next mutating command preserves those bytes as evidence and restores the journal head, never adopting them as authority), or `corrupt`/`missing` (the next mutating command rebuilds the projection from the journal head, preserving the malformed original as recovery evidence — plan §5.5). Advisory: drives no automatic action.",
       "properties": {
         "health": {
           "type": "string",

@@ -647,6 +647,72 @@ def test_faulty_event_is_reconciled_deterministically(tmp_path, fault):
     assert path.read_bytes() == pre
 
 
+def test_torn_first_plus_valid_retry_keeps_the_valid_event(tmp_path):
+    """P6.1 F-005: when a torn file and a VALID retry share an idempotency
+    key, the valid retry must win. The pre-fix rule kept the lowest sequence
+    unparsed, so the retry was quarantined as a duplicate of a file that was
+    itself then quarantined as torn — losing both and rolling authority back
+    a state."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    path = run_dir / "manifest.json"
+    man = _rich_manifest()
+    man.write_atomic(path)
+    man.warnings.append("second transition")
+    man.write_atomic(path)
+    head = _state_events(run_dir)[-1]
+    jdir = J.journal_dir(run_dir)
+    head_path = next(
+        p for p in jdir.iterdir()
+        if J._EVENT_NAME_RE.match(p.name)
+        and json.loads(p.read_text())["event_id"] == head["event_id"]
+    )
+    key = head["idempotency_key"]
+
+    # A torn file claiming the SAME key at a LOWER sequence than the valid
+    # head (the shape a partially-flushed append + retry produces).
+    torn_seq = head["seq"] - 1
+    torn_name = f"evt-{torn_seq:08d}-{head['kind']}-{J._key12(key)}.json"
+    (jdir / torn_name).write_bytes(b'{"schema_version": 1, "seq": ')
+
+    outcome = J.reconcile_projection(run_dir, validate=M.validate_projection_text)
+    assert outcome.health == J.HEALTH_OK
+    # The valid event survived; only the torn file was quarantined.
+    assert head_path.exists()
+    assert (jdir / (torn_name + ".torn")).exists()
+    assert _state_events(run_dir)[-1]["event_id"] == head["event_id"]
+    assert path.read_text() == head["state_json"]  # authority did not roll back
+
+
+def test_digest_collision_between_distinct_keys_is_not_a_duplicate(tmp_path):
+    """Dedup keys on the FULL idempotency key: two valid events whose 12-hex
+    filename digests collide but whose keys differ are both retained."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    _rich_manifest().write_atomic(run_dir / "manifest.json")
+    jdir = J.journal_dir(run_dir)
+    head = _state_events(run_dir)[-1]
+    forged = dict(head)
+    forged["seq"] = head["seq"] + 1
+    forged["idempotency_key"] = head["idempotency_key"] + "-distinct"
+    forged["event_id"] = "forged-distinct-id"
+    # Deliberately reuse the ORIGINAL key's 12-hex digest in the filename to
+    # simulate a collision; _parse_event tolerates it only if the name digest
+    # matches its own key, so name it by its own key and assert on grouping.
+    name = (
+        f"evt-{forged['seq']:08d}-{forged['kind']}-"
+        f"{J._key12(forged['idempotency_key'])}.json"
+    )
+    (jdir / name).write_text(json.dumps(forged, sort_keys=True, indent=1))
+    kept = J._dedupe(jdir, mutate=True, notes=[])
+    assert len(kept) == len(_event_paths_all(jdir))
+    assert not list(jdir.glob("*.dup"))
+
+
+def _event_paths_all(jdir):
+    return [p for p in sorted(jdir.iterdir()) if J._EVENT_NAME_RE.match(p.name)]
+
+
 def test_quarantined_seq_is_never_reused(tmp_path):
     run_dir = tmp_path / "run-1"
     run_dir.mkdir()
@@ -661,31 +727,207 @@ def test_quarantined_seq_is_never_reused(tmp_path):
     assert new_seq > torn_seq  # append-only ordering stays unambiguous
 
 
-def test_unjournaled_valid_manifest_is_adopted_loudly_not_overwritten(
-    tmp_path,
-):
-    """A valid same-run manifest the journal has never seen (stale-driver
-    write or hand-edit) is adopted as a new transition — data is never lost
-    in either direction, and the journal retains the prior state."""
+def test_unjournaled_manifest_is_preserved_and_authority_restored(tmp_path):
+    """P6.1 F-001: a state the journal never recorded is an OUT-OF-BAND write
+    — it is preserved verbatim as evidence and the journal head is restored,
+    never adopted as the newest authority. Nothing is discarded (the bytes
+    stay on disk, every journaled state stays in the journal) and the
+    resolution is idempotent."""
     run_dir = tmp_path / "run-1"
     run_dir.mkdir()
     path = run_dir / "manifest.json"
     man = _rich_manifest()
     man.write_atomic(path)
-    prior_head = _state_events(run_dir)[-1]
-    # Simulate a direct (unjournaled) write: bytes change, journal does not.
+    head_before = _state_events(run_dir)[-1]
+    authoritative = path.read_text()
+
     edited = Manifest.load(path)
-    edited.warnings.append("hand-edited out of band")
+    edited.warnings.append("written outside the journaled path")
     text = edited.model_dump_json(indent=2)
     path.write_text(text)
 
     outcome = J.reconcile_projection(run_dir)
-    assert outcome.health == J.HEALTH_ADOPTED
-    head = _state_events(run_dir)[-1]
-    assert head["state_json"] == text
-    assert head["payload"].get("adopted_outside_engine") is True
-    assert head["seq"] > prior_head["seq"]
-    assert path.read_text() == text  # the newest claim survives
+    assert outcome.health == J.HEALTH_RESTORED
+    # Authority did NOT move: the head is still the last journaled state.
+    head_after = _state_events(run_dir)[-1]
+    assert head_after["event_id"] == head_before["event_id"]
+    assert path.read_text() == authoritative
+    # The out-of-band bytes are preserved verbatim, under a deterministic name.
+    preserved = run_dir / outcome.preserved_as
+    assert preserved.read_text() == text
+    assert any("preserved" in n for n in outcome.notes)
+    # Idempotent: repeating changes nothing and adds no second copy.
+    again = J.reconcile_projection(run_dir)
+    assert again.health == J.HEALTH_OK
+    assert len(list(run_dir.glob("manifest.unjournaled-*.json"))) == 1
+
+
+def test_migrated_run_reset_to_pre_genesis_manifest_keeps_authority(
+    fixture_repo,
+):
+    """P6.1 F-001, the reported hole: a MIGRATED (pre-P6) run whose branch is
+    reset onto a committed manifest that predates the genesis event. Those
+    bytes match no journal event, so the pre-fix adoption path made the reset
+    redefine authoritative state — exactly the R8 loss P6 exists to remove.
+    Authority must survive: the completed step stays completed and resume
+    does not re-run it."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    # Commit state S0, then advance the manifest to S1 and drop the journal:
+    # a genuine pre-P6 run whose git history holds a state (S0) that the
+    # migration genesis (which embeds S1) will never have recorded.
+    gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: pre-P6 checkpoint",
+        ["runs/demo/run-1/manifest.json"], identity=gitops.ENGINE_IDENTITY,
+    )
+    s1 = Manifest.load(run_dir / "manifest.json")
+    s1.warnings.append("pre-P6 progress after the last committed snapshot")
+    s1.write_atomic(run_dir / "manifest.json")
+    import shutil
+
+    shutil.rmtree(J.journal_dir(run_dir))  # pre-P6: no journal at all
+
+    # First contact migrates (genesis) and completes the run.
+    status, adapter = _resume(mgr)
+    assert status == M.RUN_DONE
+    assert len(adapter.calls) == 1
+    genesis = _state_events(run_dir)[0]
+    assert genesis["kind"] == "JournalGenesis"
+
+    # The reset materializes the PRE-genesis committed manifest.
+    git(fixture_repo, "reset", "-q", "--hard", "HEAD")
+    reset_bytes = (run_dir / "manifest.json").read_text()
+    assert Manifest.load(run_dir / "manifest.json").record(
+        "implement"
+    ).status == M.RUNNING
+    assert all(
+        e["state_json"] != reset_bytes for e in _state_events(run_dir)
+    ), "fixture must produce a genuinely UNJOURNALED (pre-genesis) state"
+
+    # Read-only surface: authority is the journal head, not the reset bytes.
+    view = op.load_projection_view(fixture_repo, run_dir, slug="demo")
+    assert view.health == J.HEALTH_UNJOURNALED and view.rebuild_pending
+    assert view.manifest.record("implement").status == M.DONE
+
+    # Mutating surface agrees: no lost attempts, no re-run of completed work.
+    second = FakeAdapter(writes={"clean.py": "out\n"})
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: second
+    ) == M.RUN_DONE
+    assert second.calls == []
+    final = Manifest.load(run_dir / "manifest.json")
+    assert final.record("implement").status == M.DONE
+    assert final.status == M.RUN_DONE
+    assert any("out-of-band" in w for w in final.warnings)
+    preserved = list(run_dir.glob("manifest.unjournaled-*.json"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text() == reset_bytes  # nothing discarded
+
+
+# --- F-002: only LOADABLE states may become authoritative --------------------
+
+
+def test_schema_invalid_projection_is_corrupt_not_a_candidate_state(tmp_path):
+    """P6.1 F-002: bytes that JSON-decode but the model cannot load are
+    CORRUPT — never a candidate state to adopt or reason about."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    path = run_dir / "manifest.json"
+    _rich_manifest().write_atomic(path)
+    path.write_text(json.dumps({"run_id": "run-1", "not": "a manifest"}))
+
+    lenient = J.projection_status(run_dir, mutate=False)
+    assert lenient.health == J.HEALTH_UNJOURNALED  # JSON-only view: a state
+    strict = J.projection_status(
+        run_dir, mutate=False, validate=M.validate_projection_text
+    )
+    assert strict.health == J.HEALTH_CORRUPT  # the engine cannot load it
+
+
+def test_schema_invalid_pre_p6_manifest_gets_no_genesis(tmp_path):
+    """P6.1 F-002: a pre-P6 manifest that is JSON but not a Manifest must not
+    seed the journal — an unloadable head would wedge the run permanently,
+    with nothing valid to rebuild from."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(json.dumps({"run_id": "run-1"}))
+    assert J.ensure_genesis(run_dir, validate=M.validate_projection_text) is None
+    outcome = J.reconcile_projection(
+        run_dir, validate=M.validate_projection_text
+    )
+    assert outcome.health == J.HEALTH_NO_JOURNAL  # exactly the pre-P6 shape
+    assert not J.journal_dir(run_dir).exists() or not _state_events(run_dir)
+    # Repaired bytes seed the genesis on the next contact.
+    text = _rich_manifest().model_dump_json(indent=2)
+    (run_dir / "manifest.json").write_text(text)
+    assert J.reconcile_projection(
+        run_dir, validate=M.validate_projection_text
+    ).health == J.HEALTH_GENESIS
+    assert _state_events(run_dir)[-1]["state_json"] == text
+
+
+def test_engine_write_path_never_journals_an_unloadable_state(tmp_path):
+    """Guard-rail for F-002: the engine's own persist path validates with the
+    full model, so every journaled state is loadable by construction."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    _rich_manifest().write_atomic(run_dir / "manifest.json")
+    for event in _state_events(run_dir):
+        Manifest.model_validate_json(event["state_json"])
+
+
+# --- F-006: authoritative writes fail closed on a durability failure ---------
+
+
+def test_state_append_fails_closed_when_the_directory_flush_fails(
+    tmp_path, monkeypatch
+):
+    """P6.1 F-006: a state event whose directory entry cannot be flushed is
+    NOT reported durable — the append raises rather than letting the
+    projection outlive its own authority."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    man = _rich_manifest()
+    man.write_atomic(run_dir / "manifest.json")
+    before = (run_dir / "manifest.json").read_text()
+
+    real_open = J.os.open
+
+    def flaky_open(path, flags, *a, **kw):
+        if str(path) == str(J.journal_dir(run_dir)):
+            raise OSError(5, "simulated I/O error")
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(J.os, "open", flaky_open)
+    man.warnings.append("a new transition")
+    with pytest.raises(J.JournalError, match="durable"):
+        man.write_atomic(run_dir / "manifest.json")
+    monkeypatch.undo()
+    # The projection never advanced past the authority (fail closed).
+    assert (run_dir / "manifest.json").read_text() == before
+
+
+def test_audit_events_stay_best_effort_on_a_flush_failure(tmp_path, monkeypatch):
+    """The converse of F-006: optional evidence must never block a
+    finalization (plan §9), so an audit append swallows the same failure."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    _rich_manifest().write_atomic(run_dir / "manifest.json")
+    real_open = J.os.open
+
+    def flaky_open(path, flags, *a, **kw):
+        if str(path) == str(J.journal_dir(run_dir)):
+            raise OSError(5, "simulated I/O error")
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(J.os, "open", flaky_open)
+    # The event file itself is written; only its directory flush failed, and
+    # an optional evidence write never raises into the calling transaction.
+    assert J.append_audit(
+        run_dir, "RecoverySnapshotCreated", {"snapshot_ref": "refs/x"},
+        run_id="run-1", idempotency_key="snapshot:refs/x",
+    ) is True
+    monkeypatch.undo()
+    assert any(e["kind"] == "RecoverySnapshotCreated" for e in _events(run_dir))
 
 
 # =============================================================================
@@ -766,6 +1008,46 @@ def test_genesis_is_deterministic_modulo_clock(tmp_path):
         assert len(paths) == 1
         files.append((paths[0].name, paths[0].read_bytes()))
     assert files[0] == files[1]  # same input -> same event name and bytes
+
+
+# =============================================================================
+# F-003: destructive verbs read the AUTHORITATIVE state
+# =============================================================================
+
+
+def test_finish_refuses_on_a_stale_projection_that_claims_done(fixture_repo):
+    """P6.1 F-003: `finish` merges and DELETES the run branch off the run's
+    recorded status, so it must not act on a projection left stale by a
+    branch reset — an older committed manifest saying `done` while the
+    journal says the run is still running."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    # Commit a manifest that claims the run is DONE, then journal a NEWER
+    # authoritative state that says it is still running.
+    done = Manifest.load(run_dir / "manifest.json")
+    done.status = M.RUN_DONE
+    done.steps[0].status = M.DONE
+    done.steps[0].ended = "t1"
+    done.write_atomic(run_dir / "manifest.json")
+    gitops.commit_run_bookkeeping(
+        fixture_repo, "gauntlet: checkpoint (claims done)",
+        ["runs/demo/run-1/manifest.json"], identity=gitops.ENGINE_IDENTITY,
+    )
+    running = Manifest.load(run_dir / "manifest.json")
+    running.status = M.RUN_RUNNING
+    running.steps[0].status = M.RUNNING
+    running.steps[0].ended = None
+    running.write_atomic(run_dir / "manifest.json")
+
+    git(fixture_repo, "reset", "-q", "--hard", "HEAD")  # stale `done` returns
+    assert Manifest.load(run_dir / "manifest.json").status == M.RUN_DONE
+
+    from gauntlet.engine.run import FinishError
+
+    with pytest.raises(FinishError, match="not done"):
+        mgr.finish("demo")
+    # The branch was neither merged nor deleted.
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert Manifest.load(run_dir / "manifest.json").status == M.RUN_RUNNING
 
 
 # =============================================================================
