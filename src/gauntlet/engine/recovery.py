@@ -713,6 +713,11 @@ class ContinueOnRecoveryBranchAction(_ActionBase):
     )
     branch_name: str = Field(min_length=1)
     start_sha: str
+    # How the ref restoration executes (P4.1, post-review F-003): a plain
+    # forced branch move is invalid for the CHECKED-OUT branch (git refuses),
+    # so a behind run branch the operator is standing on restores via a pure
+    # fast-forward merge instead. Additive with a back-compatible default.
+    via: Literal["branch_force", "ff_merge"] = "branch_force"
     requires_snapshot: Literal[True] = True
     requires_human_decision: Literal[False] = False
 

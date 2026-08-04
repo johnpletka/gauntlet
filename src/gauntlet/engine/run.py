@@ -1431,10 +1431,17 @@ class RunManager:
             reason = M.normalize_parked_reason(
                 parked_rec.parked_reason, parked_rec.type, parked_rec.status
             )
-            if reason in (
-                M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_USAGE_WINDOW
+            # A quota/window park is a legitimate live wait ONLY when it
+            # carries a concrete deadline — a recorded reset/replenishment
+            # time or an armed auto-resume schedule (post-review F-006). An
+            # unchanged usage park with NO deadline is indistinguishable from
+            # a wedge, which is exactly the successful no-op loop R5 forbids:
+            # it falls through and raises with the retry/abort actions named.
+            if (
+                reason in (M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_USAGE_WINDOW)
+                and parked_rec.quota_reset_at is not None
             ):
-                return  # a quota/window deadline is a legitimate live wait
+                return
             if parked_rec.scheduled_resume is not None:
                 return  # an armed auto-resume schedule is a legitimate wait
         try:
@@ -1740,14 +1747,30 @@ class RunManager:
                 )
                 if step is not None and Orchestrator._is_terminal_failure(step, failed):
                     detail = (failed.notes or "no further detail recorded").strip()
+                    # F-007: recommend --response only for a step type the
+                    # --response validator will actually accept; a terminally
+                    # failed shell step / rejected gate gets the executable
+                    # exit (abort) instead of a command that will be refused.
+                    if failed.type in M.RESPONDABLE_STEP_TYPES:
+                        way_out = (
+                            "If a human decision can unblock it (e.g. "
+                            "reclassifying a finding the fixer could not act "
+                            f'on), inject one: `gauntlet resume {man.slug} '
+                            '--response "<decision>"`. Otherwise `gauntlet '
+                            "abort` the run."
+                        )
+                    else:
+                        way_out = (
+                            f"Step type {failed.type!r} accepts no `--response` "
+                            f"decision; `gauntlet abort {man.slug}` is the "
+                            "executable exit (all snapshots and evidence are "
+                            "retained)."
+                        )
                     raise ValueError(
                         f"run '{man.slug}' failed terminally at step "
                         f"'{failed.id}': {detail} A plain `gauntlet resume` cannot "
-                        "re-run a terminal failure — it would only repeat it. If a "
-                        "human decision can unblock it (e.g. reclassifying a "
-                        "finding the fixer could not act on), inject one: "
-                        f'`gauntlet resume {man.slug} --response "<decision>"`. '
-                        "Otherwise `gauntlet abort` the run."
+                        f"re-run a terminal failure — it would only repeat it. "
+                        + way_out
                     )
             return ResponseAction(kind="none")
 

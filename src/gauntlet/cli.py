@@ -40,6 +40,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
     from gauntlet.engine.operator import RunResolutionError, StatusContractError
     from gauntlet.engine.planphases import PlanPhasesError
     from gauntlet.engine.recovery import NoProgressError
+    from gauntlet.engine.recovery_exec import RecoveryExecError
     from gauntlet.engine.review import ReviewFailClosed
     from gauntlet.engine.run import (
         AbortGuardError,
@@ -66,6 +67,10 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         # progress fingerprint without a legitimate live wait — exits nonzero
         # naming what is unchanged and the executable safe actions.
         NoProgressError,
+        # Fail-closed recovery refusals (locks, unrepresentable observations
+        # such as a merge inside the inventoried range, surviving intents):
+        # operational conditions with named evidence, not bugs.
+        RecoveryExecError,
         ReviewFailClosed,
     )
 

@@ -429,9 +429,20 @@ _OBSERVE_PREFIX: dict[str, tuple[str, ...]] = {
 }
 
 
+def _control_abort(slug: str) -> Action:
+    # F-007: the executable exit for a terminal failure resume cannot re-run
+    # and `--response` cannot target (a non-respondable step type). Evidence
+    # and snapshots are retained.
+    return Action(
+        "abort", "control", ["gauntlet", "abort", slug], [], True,
+        f"gauntlet abort {slug}",
+        consequence="aborts the run, retaining every snapshot and all evidence",
+    )
+
+
 def _actions_for(
     state: str, slug: str, failure: "FailureDescriptor | None" = None,
-    *, gate_cycle_id: str | None = None,
+    *, gate_cycle_id: str | None = None, failure_step_type: str | None = None,
 ) -> list[Action]:
     """The §6.3 next-action column for a composite ``state`` (total).
 
@@ -444,12 +455,16 @@ def _actions_for(
     only the validator; a re-runnable FR-9.3 precondition failure re-runs the
     guard); HUMAN_DECISION → the gate approve/reject pair (FR-8.2, with the
     reject consequence naming the cycle it re-drives) or ``resume
-    --response``; SNAPSHOT_AND_RESTART → ``resume --reset-interrupted`` (#72).
-    Indeterminate and unknown states expose read-only inspection only.
+    --response``; SNAPSHOT_AND_RESTART → ``resume --reset-interrupted`` (#72);
+    ABORT → ``gauntlet abort`` (F-007: a terminally failed non-respondable
+    step's only executable exit). Indeterminate and unknown states expose
+    read-only inspection only.
     """
     actions = _render_observe_prefix(state, slug)
     failure_kind = failure.failure_kind if failure is not None else None
-    for kind in RX.mutating_action_kinds(state, failure_kind=failure_kind):
+    for kind in RX.mutating_action_kinds(
+        state, failure_kind=failure_kind, step_type=failure_step_type
+    ):
         if kind is RXM.RecoveryActionKind.RETRY:
             actions.append(_control_resume(slug))
         elif kind is RXM.RecoveryActionKind.HUMAN_DECISION:
@@ -460,6 +475,8 @@ def _actions_for(
                 actions.append(_decide_resume_response(slug))
         elif kind is RXM.RecoveryActionKind.SNAPSHOT_AND_RESTART:
             actions.append(_control_reset_interrupted(slug))
+        elif kind is RXM.RecoveryActionKind.ABORT:
+            actions.append(_control_abort(slug))
     return actions
 
 
@@ -512,18 +529,26 @@ def render_assessment_actions(
             resume.consequence = act.description
             actions.append(resume)
         elif kind is RXM.RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH:
-            # Non-destructive ref restoration (plan §5.4): `git branch -f`
-            # onto history the assessment proved exists — creates a missing
-            # branch, fast-forwards a behind one, or names a fork-preserving
-            # recovery branch. Never a reset/checkout/clean.
+            # Non-destructive ref restoration (plan §5.4), checkout-aware
+            # (post-review F-003): `git branch -f` onto history the assessment
+            # proved exists — invalid for the checked-out branch, where the
+            # action instead carries `via="ff_merge"` and renders a pure
+            # fast-forward merge (git refuses a non-ff, so nothing can be
+            # discarded). Never a reset/checkout/clean.
+            if act.via == "ff_merge":
+                argv = ["git", "merge", "--ff-only", act.start_sha]
+                command = f"git merge --ff-only {act.start_sha[:10]}"
+            else:
+                argv = ["git", "branch", "-f", act.branch_name, act.start_sha]
+                command = f"git branch -f {act.branch_name} {act.start_sha[:10]}"
             actions.append(
                 Action(
                     "restore run branch",
                     "recover",
-                    ["git", "branch", "-f", act.branch_name, act.start_sha],
+                    argv,
                     [],
                     True,
-                    f"git branch -f {act.branch_name} {act.start_sha[:10]}",
+                    command,
                     consequence=act.description,
                 )
             )
@@ -569,6 +594,13 @@ def compute_status_assessment(
         excludes = run_bookkeeping_excludes(
             repo_root, run_instance_dir, artifact_root
         )
+        record = RX._attempt_record(man)
+        fingerprint = RX.build_progress_fingerprint(
+            repo_root, manifest=man, record=record, excludes=excludes
+        )
+    except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
+        return None  # unobservable environment: render the pure state table
+    try:
         git_obs = RX.observe_git(
             repo_root,
             run_branch=man.branch,
@@ -579,10 +611,35 @@ def compute_status_assessment(
             ),
             approved_artifacts=governed_artifact_paths(repo_root, artifact_root),
         )
-        record = RX._attempt_record(man)
-        fingerprint = RX.build_progress_fingerprint(
-            repo_root, manifest=man, record=record, excludes=excludes
+    except RX.RecoveryObservationError as exc:
+        # F-004: the repository state EXISTS but cannot be represented by the
+        # recovery contracts (e.g. a merge commit inside the inventoried
+        # range). Resume fails closed on the identical observation, so status
+        # must not fall back to the mutating base table — render a fail-closed
+        # assessment whose only mutating action is an evidence-retaining abort.
+        return RXM.RecoveryAssessment(
+            cause=RXM.RecoveryCause.STATE_INCONSISTENT,
+            disposition=RXM.RecoveryDisposition.ABORT_ONLY,
+            evidence=(
+                f"recovery observation failed closed: {exc}",
+                "resume/rollback refuse on the same evidence; reconcile the "
+                "named state manually, or abort retaining all evidence",
+            ),
+            safe_actions=(
+                RXM.AbortAction(
+                    description=(
+                        f"`gauntlet abort {man.slug}` aborts the run, "
+                        "retaining every snapshot and all evidence"
+                    ),
+                    reason="the repository state cannot be assessed for recovery",
+                ),
+            ),
+            recommended_action=RXM.RecoveryActionKind.ABORT,
+            progress_fingerprint=fingerprint.digest,
         )
+    except (gitops.GitError, OSError, ValueError):
+        return None
+    try:
         return RX.RecoveryPlanner(repo_root).assess(
             manifest=man,
             liveness=liveness,
@@ -860,8 +917,19 @@ def compute_run_state(
             assessment, state, man.slug, gate_cycle_id=gate_cycle_id
         )
     else:
+        # F-007: the failed step's TYPE selects between `resume --response`
+        # (respondable types) and abort (a shell step / terminally rejected
+        # gate, where resume's validators reject --response).
+        failure_step_type = None
+        if failure is not None:
+            frec = next(
+                (r for r in man.steps if render_step_id(r) == failure.step_id),
+                None,
+            )
+            failure_step_type = frec.type if frec is not None else None
         next_actions = _actions_for(
-            state, man.slug, failure, gate_cycle_id=gate_cycle_id
+            state, man.slug, failure, gate_cycle_id=gate_cycle_id,
+            failure_step_type=failure_step_type,
         )
     return RunState(
         state=state,

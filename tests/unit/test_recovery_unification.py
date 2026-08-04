@@ -496,46 +496,71 @@ def test_repeated_resume_on_unchanged_interrupted_park_raises(fixture_repo):
     assert exc.value.safe_actions  # executable actions, not just prose
 
 
-def test_quota_park_repeat_is_a_legitimate_wait_and_exits_cleanly(fixture_repo):
-    """A usage-limit re-park is a provider deadline, not a no-op loop: the
-    repeat resume returns parked (exit 0) even though the fingerprint is
-    unchanged (R5 exemption; FR-3.2/FR-3.3)."""
+def _transient_adapter(retry_after_s=None):
     from gauntlet.adapters.failure_markers import FAILURE_TRANSIENT_USAGE_LIMIT
-    from gauntlet.adapters.base import FailureInfo
+    from gauntlet.adapters.base import AdapterCapabilities, FailureInfo
 
-    def transient_adapter():
-        class _A:
-            name = "fake"
-            from gauntlet.adapters.base import AdapterCapabilities
-            capabilities = AdapterCapabilities(
-                repo_write=True, structured_output="native", resume=True
+    class _A:
+        name = "fake"
+        capabilities = AdapterCapabilities(
+            repo_write=True, structured_output="native", resume=True
+        )
+        timeout_s = 600.0
+
+        def run(self, prompt, *, session=None, schema=None, cwd=None,
+                extra_flags=None):
+            raise AgentFailedError(
+                "usage limit hit",
+                partial=AgentResult(text="", session_id="s1", exit_code=1),
+                failure_info=FailureInfo(
+                    kind=FAILURE_TRANSIENT_USAGE_LIMIT,
+                    marker="claude_usage_limit_message",
+                    retry_after_s=retry_after_s,
+                ),
             )
-            timeout_s = 600.0
+    return _A()
 
-            def run(self, prompt, *, session=None, schema=None, cwd=None,
-                    extra_flags=None):
-                raise AgentFailedError(
-                    "usage limit hit",
-                    partial=AgentResult(text="", session_id="s1", exit_code=1),
-                    failure_info=FailureInfo(
-                        kind=FAILURE_TRANSIENT_USAGE_LIMIT,
-                        marker="claude_usage_limit_message",
-                    ),
-                )
-        return _A()
 
+def test_quota_park_with_deadline_is_a_legitimate_wait_and_exits_cleanly(
+    fixture_repo,
+):
+    """A usage-limit re-park CARRYING a concrete reset deadline is a provider
+    wait, not a no-op loop: the repeat resume returns parked (exit 0) even
+    though the fingerprint is unchanged (R5 exemption; FR-3.2/FR-3.3,
+    post-review F-006: the deadline is what makes the wait legitimate)."""
     mgr, man, base, run_dir = _seed(fixture_repo)
     first = mgr.resume(
-        "demo", use_judge=False, adapter_factory=lambda n: transient_adapter()
+        "demo", use_judge=False,
+        adapter_factory=lambda n: _transient_adapter(retry_after_s=1234),
     )
     assert first == M.RUN_PARKED  # RUNNING → usage-limit park (progress)
     second = mgr.resume(
-        "demo", use_judge=False, adapter_factory=lambda n: transient_adapter()
+        "demo", use_judge=False,
+        adapter_factory=lambda n: _transient_adapter(retry_after_s=1234),
     )
-    assert second == M.RUN_PARKED  # unchanged repeat, but a legitimate wait
+    assert second == M.RUN_PARKED  # unchanged repeat, but a deadline wait
     final = Manifest.load(run_dir / "manifest.json")
     rec = final.record("implement")
     assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.quota_reset_at is not None  # the exemption's evidence
+
+
+def test_quota_park_without_deadline_raises_on_unchanged_repeat(fixture_repo):
+    """Post-review F-006: an unchanged usage-limit park with NO recorded
+    reset time and no armed schedule is indistinguishable from a wedge — the
+    repeat raises NoProgressError instead of exiting 0 forever."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    first = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: _transient_adapter()
+    )
+    assert first == M.RUN_PARKED  # the park itself is progress
+    final = Manifest.load(run_dir / "manifest.json")
+    assert final.record("implement").quota_reset_at is None  # no deadline
+    with pytest.raises(NoProgressError):
+        mgr.resume(
+            "demo", use_judge=False,
+            adapter_factory=lambda n: _transient_adapter(),
+        )
 
 
 def test_gate_park_resume_repeat_stays_exit_clean(fixture_repo):
@@ -683,6 +708,223 @@ def test_terminal_step_and_run_status_land_in_one_persist(fixture_repo, monkeypa
                     "a terminal step status was persisted under RUN_RUNNING: "
                     f"{run_status} {steps}"
                 )
+
+
+# =============================================================================
+# P4.1 post-review fixes (F-002..F-007)
+# =============================================================================
+
+
+def test_live_driver_gets_no_branch_reconciliation_actions(fixture_repo):
+    """F-002: a verifiably ALIVE driver legitimately runs the branch ahead of
+    the manifest mid-step. The assessment must not advertise adoption resumes
+    or raw ref restores that would race (or bypass the lock of) the live
+    process — live and indeterminate rows stay observe-only."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    _commit(fixture_repo, "P1 wip: milestone", {"m.py": "wip\n"},
+            author=("Builder", "b@g.local"))
+    man2 = Manifest.load(run_dir / "manifest.json")
+    for liveness, expected_state in (
+        (op.LIVENESS_ALIVE, op.STATE_IN_PROGRESS),
+        (op.LIVENESS_INDETERMINATE, op.STATE_INDETERMINATE),
+    ):
+        assessment = op.compute_status_assessment(
+            fixture_repo, man2, liveness, run_instance_dir=run_dir
+        )
+        assert assessment is not None
+        rstate = op.compute_run_state(man2, liveness, assessment=assessment)
+        assert rstate.state == expected_state
+        assert {a.kind for a in rstate.next_actions} == {"observe"}, (
+            f"{liveness}: {[a.command for a in rstate.next_actions]}"
+        )
+        assert any("advisory only" in e for e in assessment.evidence)
+
+
+@pytest.mark.parametrize("checked_out", ["run_branch", "other_branch"])
+def test_behind_action_executes_and_resume_converges(fixture_repo, checked_out):
+    """F-003: the advertised behind-branch restore is genuinely executable
+    from BOTH checkout positions — `git merge --ff-only` when standing on the
+    run branch (a forced branch move is invalid there), `git branch -f`
+    otherwise — and a subsequent plain resume converges."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    tip = _commit(fixture_repo, "P1: land the phase", {"phase.py": "done\n"},
+                  author=("Builder", "b@g.local"))
+    man.commits.append(M.CommitRecord(step_id="implement", phase="P1", sha=tip))
+    man.steps[0].base_sha = tip
+    man.write_atomic(run_dir / "manifest.json")
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qf", "gauntlet/demo", base)  # now BEHIND
+    if checked_out == "run_branch":
+        git(fixture_repo, "checkout", "-q", "gauntlet/demo")
+
+    rstate, assessment = _status_actions(fixture_repo, run_dir)
+    restore = next(a for a in rstate.next_actions if a.kind == "recover")
+    if checked_out == "run_branch":
+        assert restore.argv[:3] == ["git", "merge", "--ff-only"]
+    else:
+        assert restore.argv[:3] == ["git", "branch", "-f"]
+
+    # Execute exactly the advertised argv, then resume to convergence.
+    subprocess.run(
+        ["git", "-C", str(fixture_repo), *restore.argv[1:]],
+        check=True, capture_output=True,
+    )
+    assert gitops.rev_parse(fixture_repo, "refs/heads/gauntlet/demo") == tip
+    assert _resume(mgr) == M.RUN_DONE
+
+
+def test_missing_branch_action_executes_and_resume_converges(fixture_repo):
+    """F-003: the advertised missing-branch restore executes and the next
+    plain resume converges."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qD", "gauntlet/demo")
+    rstate, _ = _status_actions(fixture_repo, run_dir)
+    restore = next(a for a in rstate.next_actions if a.kind == "recover")
+    assert restore.argv[:3] == ["git", "branch", "-f"]
+    subprocess.run(
+        ["git", "-C", str(fixture_repo), *restore.argv[1:]],
+        check=True, capture_output=True,
+    )
+    assert _resume(mgr) == M.RUN_DONE
+
+
+def test_fork_action_description_matches_its_payload(fixture_repo):
+    """F-003: the fork action promises exactly what it does — preserve the
+    forked tip on a recovery branch — and names the snapshot-backed verb for
+    the run branch itself, never a bare reset."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    _shape_forked(fixture_repo, man, run_dir, base)
+    rstate, assessment = _status_actions(fixture_repo, run_dir)
+    act = next(
+        a for a in assessment.safe_actions
+        if a.kind is op.RXM.RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH
+    )
+    assert "creates a ref only" in act.description
+    assert "stays forked" in act.description
+    assert "rollback" in act.description
+    # Executing it preserves the tip and mutates nothing else.
+    fork_tip = gitops.head_sha(fixture_repo)
+    rendered = next(a for a in rstate.next_actions if a.kind == "recover")
+    subprocess.run(
+        ["git", "-C", str(fixture_repo), *rendered.argv[1:]],
+        check=True, capture_output=True,
+    )
+    assert gitops.rev_parse(fixture_repo, f"refs/heads/{act.branch_name}") == fork_tip
+
+
+def test_unobservable_range_renders_fail_closed_like_resume(fixture_repo):
+    """F-004: a merge commit inside the inventoried range makes the observer
+    refuse. Status must render the SAME fail-closed posture resume takes —
+    an evidence-retaining abort, never the mutating base table."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    _commit(fixture_repo, "side work", {"side.py": "x\n"})
+    side = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "reset", "-q", "--hard", base)
+    _commit(fixture_repo, "mainline work", {"mainline.py": "y\n"})
+    git(fixture_repo, "merge", "-q", "--no-ff", "-m", "merge the side line", side)
+
+    man2 = Manifest.load(run_dir / "manifest.json")
+    assessment = op.compute_status_assessment(
+        fixture_repo, man2, op.LIVENESS_NONE, run_instance_dir=run_dir
+    )
+    assert assessment is not None
+    assert assessment.cause is op.RXM.RecoveryCause.STATE_INCONSISTENT
+    rstate = op.compute_run_state(man2, op.LIVENESS_NONE, assessment=assessment)
+    mutating = [a for a in rstate.next_actions if a.kind != "observe"]
+    assert [a.argv[:2] for a in mutating] == [["gauntlet", "abort"]]
+
+    with pytest.raises(RX.RecoveryObservationError):
+        _resume(mgr)  # the mutating path refuses on the identical evidence
+
+
+def test_fingerprint_registers_cycle_checkpoint_and_revalidation_progress():
+    """F-005: a new durable cycle sub-step checkpoint, or a revalidation
+    record whose content hashes moved (a hand-edited artifact), changes the
+    progress fingerprint — commit-less durable progress is never a no-op."""
+    import copy
+
+    from gauntlet.engine.recovery import ProgressFingerprint
+
+    base_kwargs = dict(
+        run_id="run-1", run_status=op.RXM.RunStatus.PARKED,
+        index_fingerprint="sha256:i", worktree_fingerprint="sha256:w",
+    )
+    plain = ProgressFingerprint(**base_kwargs)
+    with_substep = ProgressFingerprint(**base_kwargs, latest_cycle_substep="r2-fix")
+    assert plain.digest != with_substep.digest
+    a = ProgressFingerprint(**base_kwargs, artifact_fingerprint="sha256:v1")
+    b = ProgressFingerprint(**base_kwargs, artifact_fingerprint="sha256:v2")
+    assert a.digest != b.digest
+
+    # And build_progress_fingerprint derives both from the step record.
+    rec = StepRecord(
+        id="cyc", type="adversarial_cycle", status=M.PARKED,
+        checkpoints=[M.Checkpoint(sub_step="fix", round=2, handoff_sha="a" * 40)],
+        revalidation=M.RevalidationRecord(
+            artifact="artifacts/plan.md", hash_at_park="sha256:p",
+        ),
+    )
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/none", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_PARKED, steps=[rec],
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=F", "-c", "user.email=f@l",
+             "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty",
+             "-m", "seed"],
+            check=True, capture_output=True,
+        )
+        # the manifest's branch is absent here → run_branch_sha stays None
+        fp1 = RX.build_progress_fingerprint(repo, manifest=man, record=rec)
+        assert fp1.latest_cycle_substep == "r2-fix"
+        assert fp1.artifact_fingerprint is not None
+        rec2 = copy.deepcopy(rec)
+        rec2.revalidation.hash_at_resume = "sha256:edited"
+        rec2.revalidation.changed_while_parked = True
+        fp2 = RX.build_progress_fingerprint(repo, manifest=man, record=rec2)
+        assert fp1.digest != fp2.digest  # the hand-edit registers as progress
+
+
+def test_failed_nonrespondable_step_advertises_abort_not_response(fixture_repo):
+    """F-007: a terminally failed step whose type rejects `--response` (a
+    shell step) must not advertise it — the executable exit is abort, on both
+    surfaces."""
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_FAILED,
+        steps=[StepRecord(id="tests", type="shell", status=M.FAILED,
+                          started="t0", ended="t1")],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    assert rstate.state == op.STATE_FAILED
+    cmds = [a.command for a in rstate.next_actions]
+    assert cmds == ["gauntlet logs demo", "gauntlet abort demo"]
+    assert not any("--response" in c for c in cmds)
+
+
+def test_failed_respondable_step_keeps_response_action():
+    """F-007 guard-rail: respondable failed types keep the exact pre-P4.1
+    `--response` recommendation."""
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_FAILED,
+        steps=[StepRecord(id="cyc", type="adversarial_cycle", status=M.FAILED,
+                          started="t0", ended="t1")],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    assert [a.command for a in rstate.next_actions] == [
+        "gauntlet logs demo",
+        'gauntlet resume demo --response "<your decision>"',
+    ]
 
 
 # =============================================================================

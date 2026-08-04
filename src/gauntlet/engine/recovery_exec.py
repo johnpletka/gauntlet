@@ -80,6 +80,7 @@ from gauntlet.engine.recovery import (
     SnapshotAndRestartAction,
     StateObservation,
     StepStatus,
+    fingerprint_data,
 )
 
 # The executor's durable transaction intent, distinct from `recover`'s
@@ -532,16 +533,33 @@ def build_progress_fingerprint(
     excludes: list[str] | None = None,
     latest_cycle_substep: str | None = None,
 ) -> ProgressFingerprint:
-    """The plan §4.5 fingerprint over run/step/branch/index/worktree state."""
+    """The plan §4.5 fingerprint over run/step/branch/index/worktree state.
+
+    ``artifact_fingerprint`` and ``latest_cycle_substep`` are derived from the
+    step record's own durable state (post-review F-005): the artifact input is
+    the FR-2.2 revalidation record (whose content hashes the validator updates
+    against the live artifact bytes on every resume, so a hand-edit that still
+    fails validation registers as progress), and the cycle input is the newest
+    persisted sub-step checkpoint — a cycle that completed one more durable
+    sub-step without landing a commit is progress, never a no-op. An explicit
+    ``latest_cycle_substep`` argument still wins when a caller has richer
+    in-flight knowledge.
+    """
     run_branch_sha = None
     if gitops.branch_exists(repo, manifest.branch):
         run_branch_sha = gitops.rev_parse(repo, f"refs/heads/{manifest.branch}")
     pending_id = None
     pending_state = None
+    artifact_fp = None
     if record is not None and record.human_responses:
         entry = record.human_responses[-1]
         pending_id = entry.response_id
         pending_state = ResponseState(entry.state)
+    if record is not None and record.revalidation is not None:
+        artifact_fp = fingerprint_data(record.revalidation.model_dump(mode="json"))
+    if latest_cycle_substep is None and record is not None and record.checkpoints:
+        last = record.checkpoints[-1]
+        latest_cycle_substep = f"r{last.round}-{last.sub_step}"
     return ProgressFingerprint(
         run_id=manifest.run_id,
         current_step=manifest.current_step,
@@ -552,6 +570,7 @@ def build_progress_fingerprint(
         run_branch_sha=run_branch_sha,
         index_fingerprint=index_fingerprint(repo),
         worktree_fingerprint=worktree_fingerprint(repo, exclude=excludes),
+        artifact_fingerprint=artifact_fp,
         pending_response_id=pending_id,
         pending_response_state=pending_state,
         latest_cycle_substep=latest_cycle_substep,
@@ -598,6 +617,7 @@ class RecoveryPlanner:
         """
         state, parked, failure = classify_composite(manifest, liveness)
         failure_kind = failure.failure_kind if failure is not None else None
+        failure_type = failure.type if failure is not None else None
         rec = _attempt_record(manifest)
         attempt_id = f"{rec.id}#{rec.attempts}" if rec is not None else None
         slug = manifest.slug
@@ -609,7 +629,9 @@ class RecoveryPlanner:
             disposition = RecoveryDisposition.RETRY
 
         actions: list[RecoveryAction] = []
-        for kind in mutating_action_kinds(state, failure_kind=failure_kind):
+        for kind in mutating_action_kinds(
+            state, failure_kind=failure_kind, step_type=failure_type
+        ):
             if kind is RecoveryActionKind.RETRY:
                 actions.append(
                     RetryAction(
@@ -669,14 +691,50 @@ class RecoveryPlanner:
                         reason="discard the interrupted attempt after snapshot",
                     )
                 )
+            elif kind is RecoveryActionKind.ABORT:
+                # F-007: a terminal failure of a non-respondable step — its
+                # only executable exit that resume's validators will accept.
+                actions.append(
+                    AbortAction(
+                        description=(
+                            f"`gauntlet abort {slug}` aborts the run, retaining "
+                            "every snapshot and all evidence"
+                        ),
+                        reason=(
+                            f"step type {failure_type!r} accepts neither a plain "
+                            "re-run nor `--response`; abort is the executable exit"
+                        ),
+                    )
+                )
+                disposition = RecoveryDisposition.ABORT_ONLY
 
         evidence = [f"composite_state={state}", f"liveness={liveness}"]
+        # Branch-relation refinement applies ONLY to a proven-dead driver in a
+        # nonterminal state (post-review F-002): while a driver is verifiably
+        # alive — or unprovably so — a branch legitimately runs ahead of the
+        # manifest mid-step, and advertising an adoption resume or a raw ref
+        # restore would race (or bypass the lock of) the active process. Live
+        # and indeterminate rows keep their observe-only base actions; the
+        # branch evidence is still recorded, as evidence.
+        driver_gone = str(liveness) in (_LIVENESS_ORPHANED, _LIVENESS_NONE)
+        refinable = driver_gone and state in _NONTERMINAL_DEAD_DRIVER_STATES
         if git_obs is not None:
             relation = git_obs.branch_relation
             evidence.append(f"branch_relation={relation.value}")
+            if not refinable and relation not in (
+                BranchRelation.EQUAL,
+                BranchRelation.UNRECORDED,
+                BranchRelation.ENGINE_BOOKKEEPING_AHEAD,
+            ):
+                evidence.append(
+                    "branch evidence is advisory only: no proven-dead driver "
+                    "in a nonterminal state, so no reconciliation action is "
+                    "advertised (F-002)"
+                )
             adoption_applies = rec is None or rec.type == "agent_task"
             if (
-                relation in _ADOPTABLE_AHEAD
+                refinable
+                and relation in _ADOPTABLE_AHEAD
                 and git_obs.run_branch_commits
                 and adoption_applies  # step-owned recovery defers, like resume
             ):
@@ -729,7 +787,7 @@ class RecoveryPlanner:
                     a for a in actions if a.kind is not RecoveryActionKind.RETRY
                 ]
                 actions.insert(0, relation_action)
-            elif relation in _DIVERGED_RELATIONS:
+            elif refinable and relation in _DIVERGED_RELATIONS:
                 evidence.append(
                     "the run branch and the recorded boundary disagree "
                     f"({relation.value}); a plain resume refuses until the "
@@ -1024,12 +1082,22 @@ _MUTATING_KINDS: dict[str, tuple[RecoveryActionKind, ...]] = {
 
 
 def mutating_action_kinds(
-    state: str, *, failure_kind: str | None = None
+    state: str, *, failure_kind: str | None = None, step_type: str | None = None
 ) -> tuple[RecoveryActionKind, ...]:
-    """The mutating action kinds for a composite state (the shared table)."""
+    """The mutating action kinds for a composite state (the shared table).
+
+    ``step_type`` is the failed step's type (post-review F-007): a terminal
+    failure of a step that is not ``--response``-respondable (a shell step, a
+    terminally rejected human_gate) must never advertise ``resume --response``
+    — the resume validator rejects it — so its executable safe action is an
+    abort that retains all evidence (R1). ``None`` (type unknown to a pure
+    caller) keeps the human-decision rendering.
+    """
     if state == STATE_FAILED:
         if failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             return (RecoveryActionKind.RETRY,)
+        if step_type is not None and step_type not in M.RESPONDABLE_STEP_TYPES:
+            return (RecoveryActionKind.ABORT,)
         return (RecoveryActionKind.HUMAN_DECISION,)
     return _MUTATING_KINDS.get(state, ())
 
@@ -1148,6 +1216,7 @@ def relation_recovery_actions(
     relation = git_obs.branch_relation
     actions: list[RecoveryAction] = []
     recorded = git_obs.recorded_sha
+    on_run_branch = git_obs.checked_out_branch == git_obs.run_branch
     if relation is BranchRelation.MISSING and recorded is not None:
         actions.append(
             ContinueOnRecoveryBranchAction(
@@ -1158,9 +1227,14 @@ def relation_recovery_actions(
                 ),
                 branch_name=git_obs.run_branch,
                 start_sha=recorded,
+                via="branch_force",
             )
         )
     elif relation is BranchRelation.BEHIND and recorded is not None:
+        # F-003: `git branch -f` is invalid for the CHECKED-OUT branch, so the
+        # advertised command is checkout-aware — a pure fast-forward merge when
+        # the operator is standing on the run branch (git refuses a non-ff, so
+        # it can never discard anything), a forced ref move otherwise.
         actions.append(
             ContinueOnRecoveryBranchAction(
                 description=(
@@ -1170,19 +1244,29 @@ def relation_recovery_actions(
                 ),
                 branch_name=git_obs.run_branch,
                 start_sha=recorded,
+                via="ff_merge" if on_run_branch else "branch_force",
             )
         )
     elif relation is BranchRelation.FORKED and git_obs.run_branch_sha is not None:
         tip = git_obs.run_branch_sha
+        # F-003: the payload PRESERVES the forked tip only — the description
+        # promises exactly that. Restoring the run branch onto the recorded
+        # boundary afterwards is a rewind (it discards the fork from the run
+        # branch), which stays behind the snapshot-backed verbs
+        # (`gauntlet rollback`, `resume --reset-interrupted`) — never a bare
+        # advertised git command.
         actions.append(
             ContinueOnRecoveryBranchAction(
                 description=(
-                    f"preserve the forked tip {tip[:10]} on a recovery branch, "
-                    f"then restore {git_obs.run_branch!r} to the recorded "
-                    f"boundary {recorded[:10] if recorded else '?'} and resume"
+                    f"preserve the forked tip {tip[:10]} on recovery branch "
+                    f"{git_obs.run_branch}-fork-{tip[:10]} (creates a ref only; "
+                    "discards nothing). The run branch itself stays forked — "
+                    "reconcile it afterwards through a snapshot-backed verb "
+                    "(`gauntlet rollback`), never a bare reset"
                 ),
                 branch_name=f"{git_obs.run_branch}-fork-{tip[:10]}",
                 start_sha=tip,
+                via="branch_force",
             )
         )
     actions.append(
@@ -1258,6 +1342,8 @@ def reconcile_branch_ahead(
     relation = git_obs.branch_relation
     if relation not in _ADOPTABLE_AHEAD or not git_obs.run_branch_commits:
         return []
+    if man.status in (M.RUN_DONE, M.RUN_ABORTED):
+        return []  # a finished run has no next attempt to reconcile toward
     rec = _attempt_record(man)
     if rec is not None and rec.type != "agent_task":
         # Step types that OWN their recovery reconcile the range themselves:
