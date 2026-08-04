@@ -15,6 +15,7 @@ import pytest
 from gauntlet.adapters import failure_markers as fm
 from gauntlet.adapters.base import (
     FAILURE_TERMINAL,
+    FAILURE_TRANSIENT_DEPENDENCY,
     FAILURE_TRANSIENT_OVERLOAD,
     FAILURE_TRANSIENT_USAGE_LIMIT,
     FailureInfo,
@@ -36,11 +37,17 @@ def test_every_rule_has_a_fixture_that_classifies_to_it(rule):
 
 
 # The full required coverage matrix (plan.md:33 — "one per adapter per kind"):
-# every classifier-carrying adapter × every transient kind.
+# every classifier-carrying adapter × every transient kind. The
+# `transient_dependency` kind was ADDED by recovery-redesign P5 (plan §5.2) —
+# typed transport/dependency envelopes per adapter.
 _REQUIRED_ADAPTER_KINDS = frozenset(
     (adapter, kind)
     for adapter in ("claude-code", "codex", "api")
-    for kind in (FAILURE_TRANSIENT_USAGE_LIMIT, FAILURE_TRANSIENT_OVERLOAD)
+    for kind in (
+        FAILURE_TRANSIENT_USAGE_LIMIT,
+        FAILURE_TRANSIENT_OVERLOAD,
+        FAILURE_TRANSIENT_DEPENDENCY,
+    )
 )
 
 # (adapter, kind) pairs that have NO live-captured fixture yet — a TRACKED phase
@@ -55,6 +62,11 @@ _UNCAPTURED_PENDING_LIVE = frozenset({
     ("codex", FAILURE_TRANSIENT_OVERLOAD),
     ("api", FAILURE_TRANSIENT_USAGE_LIMIT),
     ("api", FAILURE_TRANSIENT_OVERLOAD),
+    # P5 dependency pins (plan §5.2): the api pair carries the LIVE issue-#63
+    # timeout capture (api/timeout.json), so only the CLI adapters remain
+    # synthesized — no live CLI transport-failure envelope has been observed.
+    ("claude-code", FAILURE_TRANSIENT_DEPENDENCY),
+    ("codex", FAILURE_TRANSIENT_DEPENDENCY),
 })
 
 

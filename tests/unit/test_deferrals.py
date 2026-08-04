@@ -26,7 +26,8 @@ from gauntlet.engine.deferrals import (
     parse_body_deferrals,
     phantom_deferrals,
 )
-from gauntlet.engine.execution import DONE, HALTED, StepContext
+from gauntlet.engine.execution import DONE, HALTED, PARKED, StepContext
+from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import (
     HALT_REASON_PRECONDITION,
     CommitRecord,
@@ -419,8 +420,9 @@ def test_size_lint_parks_above_bound_in_park_mode(fixture_repo):
     (ctx.artifact_root / "plan.md").write_text(
         _plan_with_frs(["FR-1.1", "FR-1.2", "FR-1.3", "FR-1.4"]))
     result = handle_phase_lint(_lint_step(size_lint="park"), ctx)
-    assert result.status == HALTED
-    assert result.halt_reason == HALT_REASON_PRECONDITION
+    # P5 (plan §5.1): a plan defect parks artifact_invalid, not a bare HALTED.
+    assert result.status == PARKED
+    assert result.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
     assert "max_frs_per_phase=3" in result.notes and "P1 carries 4" in result.notes
 
 
@@ -485,8 +487,9 @@ def test_size_lint_flags_oversized_declared_frs(fixture_repo):
     assert "FR-1.4" in result.notes
 
     result = handle_phase_lint(_lint_step(size_lint="park"), ctx)
-    assert result.status == HALTED
-    assert result.halt_reason == HALT_REASON_PRECONDITION
+    # P5 (plan §5.1): a plan defect parks artifact_invalid, not a bare HALTED.
+    assert result.status == PARKED
+    assert result.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
 
 
 def test_size_lint_falls_back_to_prose_when_frs_absent(fixture_repo):

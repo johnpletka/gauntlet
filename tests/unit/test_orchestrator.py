@@ -969,10 +969,17 @@ stages:
     # (which would leave the write-ahead RUN_RUNNING persisted); it parks.
     assert orch.drive() == M.RUN_PARKED
     # The persisted manifest reflects the park — never a stale "running" that
-    # `gauntlet status` would report as a live run.
+    # `gauntlet status` would report as a live run. Since P5 (plan §5.1) the
+    # park is a classified artifact_invalid STEP transition (with validator,
+    # diagnostic, and content fingerprint) instead of a bare warning + HALTED.
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
-    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+    rec = reloaded.record("implement")
+    assert rec is not None and rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert rec.revalidation is not None
+    assert rec.revalidation.validator == "plan_phases"
+    assert "gauntlet-phases" in (rec.notes or "")
 
 
 def test_malformed_plan_does_not_block_steps_that_ignore_phases(fixture_repo):
@@ -997,10 +1004,15 @@ stages:
     assert orch.drive() == M.RUN_PARKED
     # The phases-agnostic step ran instead of being pre-empted by the parse...
     assert orch.manifest.record("noop").status == M.DONE
-    # ...and the run still failed closed at the foreach, with the reason persisted.
+    # ...and the run still failed closed at the foreach, with the reason
+    # persisted as a classified artifact_invalid park on the stopped step
+    # (P5, plan §5.1) rather than a bare warning.
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
-    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+    rec = reloaded.record("implement")
+    assert rec is not None and rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert "gauntlet-phases" in (rec.notes or "")
 
 
 AGENT_STEP = """

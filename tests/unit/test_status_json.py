@@ -227,10 +227,12 @@ def test_section_6_2_example_validates():
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done",
              "duration_s": 620.0, "notes": None,
-             "halt_reason": None, "parked_reason": None},
+             "halt_reason": None, "parked_reason": None,
+             "recovery_cause": None, "recovery_disposition": None},
             {"id": "impl-cycle", "iteration": 0, "status": "parked",
              "duration_s": None, "notes": "awaiting human decision",
-             "halt_reason": None, "parked_reason": "gate"},
+             "halt_reason": None, "parked_reason": "gate",
+             "recovery_cause": "none", "recovery_disposition": "human_decision"},
         ],
         "next_actions": [
             {"label": "approve", "kind": "decide",

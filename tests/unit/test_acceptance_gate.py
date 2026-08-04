@@ -26,7 +26,8 @@ from gauntlet.engine.collectors import (
     run_bounded_enumeration,
 )
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.execution import DONE, HALTED, StepContext
+from gauntlet.engine.execution import DONE, HALTED, PARKED, StepContext
+from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import (
     HALT_REASON_PRECONDITION,
     Manifest,
@@ -137,8 +138,12 @@ def test_phase_lint_parks_on_clause_less_phase(fixture_repo):
     step = Step.model_validate({"id": "plan-lint", "type": "phase_lint",
                                 "artifact": "plan.md"})
     result = handle_phase_lint(step, ctx)
-    assert result.status == HALTED
-    assert result.halt_reason == HALT_REASON_PRECONDITION
+    # P5 (plan §5.1, issue #64): an artifact defect parks artifact_invalid
+    # (validator + diagnostic + content fingerprint) instead of a bare HALTED.
+    assert result.status == PARKED
+    assert result.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert result.revalidation is not None
+    assert result.revalidation.validator == "phase_lint"
     assert "acceptance" in result.notes and "P1" in result.notes
 
 
