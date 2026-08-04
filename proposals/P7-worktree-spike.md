@@ -7,10 +7,14 @@
 > only tracked change in this commit is this file.
 >
 > **What ratification is being asked for:** the state-root/worktree-root layout
-> in §4 and §6, the lock model in §8, and the acknowledgement of the two
-> upstream conflicts in §14 (FR-4.1/FR-4.5 evidence location, and the governed
-> artifact authoring surface). P7 implementation may not begin until those are
-> ratified.
+> in §4 and §6, the lock model in §8, the acknowledgement of the two upstream
+> conflicts in §14 (FR-4.1/FR-4.5 evidence location, and the governed artifact
+> authoring surface), and the scope question in §14.3 (`gauntlet review`). P7
+> implementation may not begin until those are ratified.
+>
+> **Revision 2** (after the first review round) adds §18 — Decision 11, the
+> operator surface — plus the §9.7 defect it uncovered and the §14.3 scope
+> question. No experiment or recommendation from revision 1 changed.
 
 ---
 
@@ -28,9 +32,11 @@
 | 8 | Failure/cleanup lifecycle | Nine failure classes mapped to R1 safe executable actions in §11, each backed by an experiment. | n/a |
 | 9 | Test strategy | An autouse *operator-checkout invariance* fixture converts acceptance criterion A1 into a property asserted on every existing verb test, plus a `tree_kind ∈ {main, linked}` parametrization of the snapshot matrix and five new `_crash_child` worktree-lifecycle boundaries. | n/a |
 | 10 | Phasing | P7a plumbing (pure refactor) → P7b lock/state relocation → P7c dedicated worktree behind `worktree.mode`, default `same_tree` → P7d flip the default after a dogfood run. The fallback is an operator-chosen `--same-tree`, never a silent automatic fallback. | Each stage independently revertible; P7c is a config flip |
+| 11 | **Operator surface** (§18, added after the first review round) | The routine operator loop is CLI-mediated and survives unchanged, but `prompts/operator.md` + the `gauntlet-operator` skill need a five-part delta shipped **in the same phase as the behaviour change**, and one live defect (§9.7) breaks the playbook's single sanctioned hand-edit. | Low — documentation, but it must not lag the code |
 
 **Blocking unknowns are in §14. Two of them are upstream conflicts that P7 may
-not resolve on its own authority.**
+not resolve on its own authority; a third (§14.3) is a scope question this spike
+originally left silent.**
 
 ---
 
@@ -61,8 +67,8 @@ Experiment index (§ references point at where each transcript is quoted):
 | E5 | nested repo, bare, mirror, submodule, worktree-of-worktree | §7 |
 | E6 | lifecycle failures: dirty removal, `worktree lock`, creation failure, stale admin entry, prune expiry, `worktree repair` | §11 |
 | E7 | Gauntlet's *own* `gitops` helpers executed against a linked worktree | §9.1, §9.2 |
-| E8 | candidate state roots vs status/clean/removal; reset isolation; cross-run prune cross-talk | §5, §6, §11.6 |
-| E9 | existing target paths, symlinked roots, concurrent `worktree add` | §6.3, §11.1 |
+| E8 | candidate state roots vs status/clean/removal; reset isolation; cross-run prune cross-talk | §5, §6, §8.2, §9.4, §11 row 5 |
+| E9 | existing target paths, symlinked roots, concurrent `worktree add` | §6.3, §8.2, §11 row 1 |
 | E10 | the recommended layout end-to-end under the git common dir | §6.2 |
 
 ---
@@ -933,8 +939,53 @@ even their reflog untouched.
 | [cli.py:234](src/gauntlet/cli.py:234), [cli.py:590](src/gauntlet/cli.py:590), [cli.py:616](src/gauntlet/cli.py:616), [cli.py:727](src/gauntlet/cli.py:727), [cli.py:968](src/gauntlet/cli.py:968), [cli.py:1026](src/gauntlet/cli.py:1026), [cli.py:1529](src/gauntlet/cli.py:1529) `run_root = repo_root / config.run_root` | console/serve/logs roots | **O** — unchanged, which is the §4.4 dividend |
 | [config.py:509-520](src/gauntlet/engine/config.py:509) `branch_prefix`/`run_root`/`asset_root` | all repo-relative | unchanged; no new knob (§6.4) |
 
-**Count: 24 sites.** Three fail silently today (§9.3), one is a containment
-regression (§9.2), one is a new operator-error class (`cli.py:203`).
+### 9.7 The operator-visible artifact path (**!**, the fourth silent-degrade site)
+
+Discovered while checking this spike against `prompts/operator.md` (§18). It is
+the same `except ValueError` family as §9.3, in a different module, with a
+different victim: the operator.
+
+The `artifact_invalid` park is the playbook's **one sanctioned hand-edit** — the
+single state that tells a human "edit this file yourself, then resume". Two
+sites produce the path it names, and neither survives the split:
+
+- [orchestrator.py:277-283](src/gauntlet/engine/orchestrator.py:277)
+  (`plan_phases` validator):
+
+  ```python
+  artifact_rel = plan_path.resolve().relative_to(self.repo_root.resolve()).as_posix()
+  except ValueError:
+      artifact_rel = "plan.md"
+  ```
+
+  Under §4.4's layout `plan.md` lives in the operator's checkout while
+  `repo_root` becomes **W**, so `relative_to` raises and the park note degrades
+  to a bare `"plan.md"` with no directory. That string is also stored as
+  `RevalidationRecord.artifact` and echoed by the resume's governance-audit note
+  ([orchestrator.py:354](src/gauntlet/engine/orchestrator.py:354)), so the
+  audit trail loses the path too.
+- [steptypes.py:287-288](src/gauntlet/engine/steptypes.py:287) (`phase_lint`
+  validator) takes `step.get("artifact", "plan.md")` — a bare name resolved
+  against `ctx.artifact_root`. It is *already* ambiguous today ("Fix plan.md" —
+  which one?) and becomes actively misleading with two trees.
+
+**Important nuance, because it changes the severity:** the bytes the engine
+reads, validates and hashes come from `self.artifact_root / "plan.md"`
+([orchestrator.py:271](src/gauntlet/engine/orchestrator.py:271),
+[orchestrator.py:340](src/gauntlet/engine/orchestrator.py:340)), and under §4.4
+the artifact root stays in the operator's checkout. So the engine reads the
+*right* file. What breaks is only the path it **displays** — the instruction to
+the human. That makes this a usability-and-audit defect, not a correctness one,
+but it lands squarely on the one workflow the playbook explicitly licenses.
+
+Fix: both sites must emit a path the operator can act on without knowing which
+tree they are in — an absolute path, or one explicitly rooted at the operator
+checkout — and the `except ValueError` must fail closed rather than degrade to a
+bare filename.
+
+**Count: 25 sites.** Four fail silently today (§9.3 ×3, §9.7 ×1 — two sub-sites),
+one is a containment regression (§9.2), one is a new operator-error class
+(`cli.py:203`).
 
 ---
 
@@ -1098,7 +1149,7 @@ during a dogfood run.
 |---|---|---|
 | **P7a — plumbing (no behaviour change)** | Introduce an explicit `RunPaths` carrying `work_root` (**W**), `state_root` (**O**) and `git_common_dir` (**G**); thread it through the 24 sites in §9 with `work_root = repo_root` so nothing changes. Fix the two latent defects that are correct to fix regardless of P7: the `--git-common-dir` containment gap (§9.2) and the three `except ValueError: pass` clauses (§9.3). | Fully — it is a refactor plus two bug fixes |
 | **P7b — lock and liveness relocation** | Move `.driving.lock` to the per-run path; add the repo-global git lock; teach `driver_info` to read both paths. Still one tree. | Yes — dual-path reading is the rollback |
-| **P7c — dedicated worktree behind a flag** | `worktree.mode: same_tree \| dedicated`, **default `same_tree`**. Lifecycle (create/lock/discover/recreate/teardown), the §11 recovery actions, the export dir, the `git worktree lock` marker, the additive `status --json` `worktree` block, and the `cli.py:203` "you are inside a run worktree" refusal. | Yes — a config flip |
+| **P7c — dedicated worktree behind a flag** | `worktree.mode: same_tree \| dedicated`, **default `same_tree`**. Lifecycle (create/lock/discover/recreate/teardown), the §11 recovery actions, the export dir, the `git worktree lock` marker, the additive `status --json` `worktree` block, the `cli.py:203` "you are inside a run worktree" refusal, **and the §18 operator-surface delta in the same commit series** — the playbook must never describe a tree the engine no longer uses. | Yes — a config flip |
 | **P7d — flip the default** | After a dogfood run that exercises at least §11 rows 2, 5 and 10, `dedicated` becomes the default for **new** runs. Legacy runs stay `same_tree` forever (§10). | Yes — a config flip |
 
 **Where the fail-closed fallback lives.** Explicitly *not* an automatic fallback.
@@ -1157,7 +1208,32 @@ its own. Three options:
 Option A is a change to how an approved artifact reaches the run branch, so it
 needs explicit ratification before P7c.
 
-### 14.3 Non-blocking decision needed
+### 14.3 SCOPE QUESTION — does `gauntlet review` change too?
+
+This spike scoped itself to `gauntlet run` and never said so; that omission is
+corrected here. `gauntlet review` — the lightweight surface documented in
+`prompts/operator.md` §7 — **also** moves the operator's checkout:
+`ReviewLifecycle._adopt_target` calls
+`gitops.checkout_branch(self.repo_root, target)`
+([review.py:620](src/gauntlet/engine/review.py:620)), and its `REVIEW.x` fix
+commits land in place on the branch under review.
+
+**Recommendation: out of scope, deliberately.** A review run is *about* your
+branch and is expected to land commits on it in place; giving it a private tree
+would mean the fixes appear somewhere you cannot see, which inverts its purpose.
+Its state already lives out-of-repo under
+`${XDG_STATE_HOME:-~/.local/state}/gauntlet/reviews/…`, so it has no run-instance
+dir in the tree to protect.
+
+But it is a decision, not an omission, and it has one measurable interaction:
+if a `gauntlet run` holds `gauntlet/<slug>` in a dedicated worktree and an
+operator then runs `gauntlet review gauntlet/<slug>`, `_adopt_target`'s checkout
+hits git's own refusal (E2-B) and `ReviewFailClosed` fires — safe, but with a
+message that will not explain *why* the branch cannot be checked out. If review
+stays out of scope, P7 should still teach that error path to name the holding
+worktree.
+
+### 14.4 Non-blocking decision needed
 
 Should `gauntlet <verb>` invoked from *inside* a run worktree hard-error
 (§9.6, `cli.py:203`)? Recommended: yes, with a message naming the operator
@@ -1206,6 +1282,15 @@ Stated explicitly so the implementation phase has a boundary:
   shared across worktrees (E1).
 - **`same_tree` mode is not removed.** It remains the mode for every legacy run
   and the documented fallback for adopters whose layout cannot host a worktree.
+- **`gauntlet review` is unchanged** — it keeps operating on the operator's
+  branch in place (§14.3, pending that scope confirmation).
+- **The operator's triage loop is unchanged in shape.** Every verb the playbook
+  drives (`status`, `logs`, `resume`, `approve`, `reject`, `recover`,
+  `rollback`, `abort`, `report`) keeps its name, arguments and meaning.
+
+**Deliberately NOT on this list:** `prompts/operator.md` and the
+`gauntlet-operator` skill. Those *do* change, and §18 treats the change as a
+P7c deliverable rather than an exception.
 
 ---
 
@@ -1226,11 +1311,86 @@ The three §6 P7 acceptance criteria, and the minimum that satisfies each:
 3. the `recreate_worktree` recovery action,
 4. the `worktree_unavailable` park with `--same-tree` as the operator action,
 5. the submodule fail-closed park,
-6. the autouse operator-fingerprint invariant across the existing verb tests.
+6. the autouse operator-fingerprint invariant across the existing verb tests,
+7. the §18 operator-surface delta — the §9.7 path fix, the two new playbook
+   state rows, and the "diff the run branch, do not check it out" guidance.
+   Without it the shipped playbook instructs a human to act on the wrong tree.
 
 Not in the SVV: any config knob, XDG/sibling roots, ref anchoring, automatic
 submodule init, cross-run garbage collection, bare-repo support as a feature,
 and flipping the default (P7d is a separate gate after a dogfood run).
+
+---
+
+## 18. Decision 11 — the operator surface
+
+> Added after the first review round, in response to the question: *can the
+> `gauntlet-operator` skill still pick up a run in progress, monitor it, present
+> options at human gates, and alter files as needed under this layout?*
+>
+> **Answer: yes for the routine loop, which is entirely CLI-mediated — but five
+> specific additions are required, and one live defect (§9.7) breaks the
+> playbook's single sanctioned hand-edit.**
+
+### 18.1 Why most of the playbook survives untouched
+
+`.claude/skills/gauntlet-operator/SKILL.md` is deliberately thin: it routes to
+`prompts/operator.md` and teaches one reflex — *"let the tool tell you the
+state, never infer it."* That playbook drives the run almost exclusively through
+verbs (`status`, `logs`, `resume`, `approve`, `reject`, `recover`, `rollback`,
+`abort`, `report`), none of which P7 renames or re-specifies (§16).
+
+That indirection is what makes the skill robust here: it does not encode where
+files live, so a layout change does not invalidate its decision tree. §1's
+composite-state map, §2's triage tree, §3's gate decisions, §4's recovery
+narrowness and §6's guardrails all hold verbatim.
+
+Two things the skill ships as: the repo's own copy and a scaffold template at
+`src/gauntlet/scaffold/skills/gauntlet-operator/SKILL.md` (which differs only by
+a `{{PLAYBOOK_PATH}}` placeholder), plus the playbook itself at
+`src/gauntlet/scaffold/prompts/operator.md`. **Every change below lands in both
+copies**, or adopters get instructions that do not match their engine.
+
+### 18.2 The five required additions
+
+| # | playbook site | what breaks | required change |
+|---|---|---|---|
+| 1 | §1 `parked_artifact_invalid` — "the **one sanctioned hand-edit**" | The park names the file to edit via §9.7's degrading path computation. With two trees the operator is told to fix `plan.md` with no indication of which tree. The engine still reads and hashes the right bytes (`artifact_root` stays in the operator checkout), so this is a *direction* failure, not a corruption one | Emit an unambiguous, operator-resolvable path at both park sites; state in §1 that the artifact is edited in **your checkout**, never in the run worktree, and that resume syncs it |
+| 2 | §1 `failed` (re-runnable precondition) and §1 `interrupted` | Both instruct "commit or stash them" / show "the dirty verdict (uncommitted paths)". Those paths now live in the run's private tree. `git status` in the operator's repo reports **clean** while the verb refuses on dirtiness — a contradiction the operator cannot resolve from their own tree | Print the run-worktree path in `status`/`logs`; make every dirty-verdict message say *which* tree; give the operator the exact `git -C <run worktree> …` form |
+| 3 | §4a rollback — "**Dirty worktree** → refuses; commit or discard first" | Same contradiction, on the verb where it is most alarming | Same fix; the refusal must name the tree it inspected |
+| 4 | §1's state list (described as a **total** function over states) | Two new states have no row: `worktree_unavailable` (§13's fail-closed park) and a run whose worktree is missing (§11 row 2). An unlisted state sends the operator to "unknown → read-only, escalate" | Add both rows with their R1 actions: `gauntlet resume <slug> --same-tree` and the recreate action respectively |
+| 5 | §3 gates — "approve only after you have actually reviewed what it is gating" | Reviewing a phase gate means reading the diff. Today the run branch is checked out in the operator's tree, so `git log`/`git diff` "just work". Under P7 `git checkout gauntlet/<slug>` **hard-refuses** (E2-B) — a new wall in a habitual workflow | Add explicit guidance: `git log/diff/show gauntlet/<slug>` works fine read-only from your checkout and is now the *better* habit (it disturbs nothing); if you want a browsable copy, make your own worktree; never `git checkout` the run branch |
+
+### 18.3 One change that makes a guardrail stronger
+
+§6's "**Never modify files a reviewer or builder owns**" is currently a rule the
+operator must hold in their head, because the builder's files are sitting in the
+operator's own editor. Under P7 the builder's tree is a different directory that
+the operator has no reason to open. The guardrail becomes structural rather than
+behavioural, and §6 should say so — it is the single clearest operator-facing
+benefit of the whole phase.
+
+### 18.4 What this costs, honestly
+
+A visibility regression worth naming, because it cuts against §18.3's benefit:
+with the run worktree under `<git-common-dir>/gauntlet/worktrees/…` (§6.2), an
+operator who likes watching the agent's work appear in their file tree loses
+that. The path is not one anyone would guess or casually browse to.
+
+Mitigations, in order of value: `gauntlet status` prints the run-worktree path
+(required by addition 2 above anyway); `git diff gauntlet/<slug>` from the
+operator's checkout shows committed progress without disturbing anything; and
+`gauntlet logs` already surfaces the live transcript, which is usually what the
+operator actually wanted.
+
+This is a real trade, not a free win, and it should be weighed at ratification
+rather than discovered during the first dogfood run.
+
+### 18.5 Scope note
+
+`gauntlet review` (playbook §7) is a separate surface that also moves the
+operator's checkout. Its disposition is §14.3's scope question, not something
+this decision resolves.
 
 ---
 
