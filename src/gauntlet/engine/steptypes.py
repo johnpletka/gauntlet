@@ -194,7 +194,9 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
         proc = subprocess.run(
             command,
             shell=True,
-            cwd=ctx.repo_root,
+            # The tree this step acts on (P7a): a shell step runs the repo's
+            # own tests/tooling against the work tree, not the repository.
+            cwd=ctx.work_root,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -961,7 +963,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             # initial attempt's file. Opened fresh per dependency retry.
             stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
             kwargs: dict = {
-                "session": session, "schema": schema, "cwd": ctx.repo_root,
+                # The tree the agent edits (P7a).
+                "session": session, "schema": schema, "cwd": ctx.work_root,
             }
             if stream is not None:
                 kwargs["sink"] = stream.append_line
@@ -2113,7 +2116,9 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     usage = _UsageAccumulator()  # sum across ALL draft attempts, incl. rejected
     session_id = None
     for _attempt in range(1 + max_redrafts):
-        result = adapter.run(prompt, cwd=ctx.repo_root)
+        # The commit-message drafter reads the staged diff of the tree the
+        # phase was built in (P7a).
+        result = adapter.run(prompt, cwd=ctx.work_root)
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()

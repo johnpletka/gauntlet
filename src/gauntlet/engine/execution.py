@@ -112,6 +112,73 @@ class StepResult:
 AdapterFactory = Callable[[str], Any]
 
 
+@dataclass(frozen=True)
+class RunPaths:
+    """The three roots a run acts on, resolved once and named separately (P7a).
+
+    ``repo_root`` has meant three things at once since the bootstrap — *the git
+    repository*, *the tree the agent edits*, and *where run artifacts live* —
+    and every site that conflated them is a site P7c would have to find again
+    (spike §9 catalogues 25 of them). This type is where that policy lives, so
+    the split is expressed once rather than re-derived per call site:
+
+    * ``work_root`` — **the tree the agents edit and the engine commits in.**
+      Everything that mutates or observes a working tree takes this: status /
+      clean / checkout / commit, the agent's cwd, the shell step's cwd, the
+      verifier's disposable-copy parent, the judge's path boundary.
+    * ``repo_root`` — **the git repository**, for everything that is a property
+      of the repository rather than of a tree: ref existence and resolution,
+      the object database, branch graph queries, snapshot refs (which E1 proved
+      are shared across every worktree).
+    * ``state_root`` — the run-instance dir: the P6 journal (authoritative),
+      the manifest projection, transcripts, heartbeat and recovery intent.
+
+    **Today ``work_root`` IS ``repo_root``**, so this commit changes no
+    behaviour; :meth:`same_tree` is the invariant that says so. P7c constructs a
+    ``RunPaths`` whose ``work_root`` is a dedicated worktree, and nothing else
+    has to move.
+
+    ``state_outside_worktree`` is deliberately a DECLARATION and not derived
+    from comparing the paths: deriving it would auto-silence exactly the
+    fail-closed contract :class:`StateDirNotContained` exists to enforce.
+    """
+
+    repo_root: Path
+    work_root: Path
+    state_root: Path
+    artifact_root: Path
+    state_outside_worktree: bool = False
+
+    @classmethod
+    def same_tree(
+        cls,
+        repo_root: Path,
+        state_root: Path,
+        artifact_root: Path,
+        *,
+        state_outside_worktree: bool = False,
+    ) -> "RunPaths":
+        """The pre-P7 layout: the agent edits the operator's own checkout."""
+        return cls(
+            repo_root=repo_root,
+            work_root=repo_root,
+            state_root=state_root,
+            artifact_root=artifact_root,
+            state_outside_worktree=state_outside_worktree,
+        )
+
+    @property
+    def dedicated_worktree(self) -> bool:
+        """True once ``work_root`` is a tree distinct from the operator's."""
+        return self.work_root != self.repo_root
+
+    def git_common_dir(self) -> Path:
+        """The shared git dir, identical from every worktree (spike E1/E8)."""
+        from gauntlet.engine import gitops
+
+        return gitops.git_common_dir(self.work_root)
+
+
 @dataclass
 class StepContext:
     repo_root: Path
@@ -132,6 +199,11 @@ class StepContext:
     # so the bookkeeping builders return empty by design instead of failing
     # closed. False for every `gauntlet run` — see `StateDirNotContained`.
     state_outside_worktree: bool = False
+    # The tree this step edits and commits in (P7a). Defaults to `repo_root`
+    # via __post_init__, which is the pre-P7 same-tree layout; P7c points it at
+    # the run's dedicated worktree. Every worktree-mutating or -observing call
+    # in a handler takes THIS, never `repo_root` — see RunPaths.
+    work_root: Path | None = None
     iteration_item: Any | None = None
     iteration_index: int | None = None
     adapter_factory: AdapterFactory | None = None
@@ -141,6 +213,27 @@ class StepContext:
     # kill/park between sub-steps. ``None`` for a standalone handler invocation
     # (no orchestrator); such callers fall back to writing the manifest directly.
     persist: Callable[[], None] | None = None
+
+    def __post_init__(self) -> None:
+        # `work_root=None` means "the same tree as the repo" — the pre-P7
+        # layout and every existing construction site, including the tests
+        # that build a StepContext directly. Normalising here (rather than
+        # defaulting each reader) keeps `ctx.work_root` non-optional for
+        # handlers, so a handler can never silently fall back to `repo_root`
+        # after P7c repoints it.
+        if self.work_root is None:
+            object.__setattr__(self, "work_root", self.repo_root)
+
+    @property
+    def paths(self) -> "RunPaths":
+        """This step's roots as the single :class:`RunPaths` policy object."""
+        return RunPaths(
+            repo_root=self.repo_root,
+            work_root=self.work_root or self.repo_root,
+            state_root=self.run_dir,
+            artifact_root=self.artifact_root,
+            state_outside_worktree=self.state_outside_worktree,
+        )
 
     def build_adapter(self, agent_name: str, *, effort: str | None = None) -> Any:
         """Resolve an agent profile to an adapter instance (override in tests).

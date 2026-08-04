@@ -299,7 +299,7 @@ def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
     manual commit during the park moves HEAD off every tip, so reuse would build on
     a stale base; the round then restarts fresh.
     """
-    head = gitops.head_sha(ctx.repo_root)
+    head = gitops.head_sha(ctx.work_root)
     tips = {c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id}
     tips.update(
         c.result_sha for c in ctx.record.checkpoints
@@ -352,7 +352,7 @@ def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | Non
             "checkpointed (manual commit during the park?); re-running the cycle "
             "from a clean handoff"
         )
-    if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not (
+    if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes) and not (
         _dirty_expected_at_reentry(ctx)
     ):
         return (
@@ -389,7 +389,7 @@ def _apply_cycle_rewind(
         governed_artifact_paths,
     )
 
-    repo = ctx.repo_root
+    repo = ctx.work_root
     rec = ctx.record
     # The cycle never switches branches: it observes and mutates the CURRENT
     # checkout (the run branch during a real drive), so the commit inventory
@@ -507,27 +507,27 @@ def _reset_dirty_to_handoff(
     still carries the on-disk bookkeeping — the same mechanism as the
     orchestrator's F-001 dirty-base rewind.
     """
-    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not force:
+    if gitops.is_clean(ctx.work_root, exclude=ctx.excludes) and not force:
         return None
     reason = (
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
         f"round {rnd} (P5 re-enter at fix)"
     )
     paths = run_bookkeeping_paths(
-        ctx.repo_root, ctx.run_dir,
+        ctx.work_root, ctx.run_dir,
         state_outside_worktree=ctx.state_outside_worktree,
     )
     preserving = (
         bool(paths)
-        and gitops.head_sha(ctx.repo_root) != handoff
-        and gitops.any_tracked_at(ctx.repo_root, "HEAD", paths)
+        and gitops.head_sha(ctx.work_root) != handoff
+        and gitops.any_tracked_at(ctx.work_root, "HEAD", paths)
     )
     message: str | None = None
     if preserving:
         # Flush first so the preserved bookkeeping carries the latest state.
         _persist_manifest(ctx)
         paths = run_bookkeeping_paths(
-            ctx.repo_root, ctx.run_dir,
+            ctx.work_root, ctx.run_dir,
             state_outside_worktree=ctx.state_outside_worktree,
         )
         entry = (
@@ -786,16 +786,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # rather than reusing — correct, if slightly less efficient.
             _persist_manifest(ctx)  # commit the CURRENT state, not a stale flush
             gitops.commit_tracked_bookkeeping(
-                ctx.repo_root,
+                ctx.work_root,
                 f"gauntlet: flush run bookkeeping before "
                 f"{phase or ctx.record.id} round-{rnd} review handoff",
                 run_bookkeeping_paths(
-                    ctx.repo_root, ctx.run_dir,
+                    ctx.work_root, ctx.run_dir,
                     state_outside_worktree=ctx.state_outside_worktree,
                 ),
                 identity=gitops.ENGINE_IDENTITY,
             )
-            if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
                 return finish(_clean_handoff_failure(ctx, rnd))
 
         # ---- 1. review (single reviewer OR ensemble panel) --------------------
@@ -1126,7 +1126,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 )
             except _ParkCycle as park:
                 return finish(park.result)
-            if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
                 return finish(StepResult(
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
@@ -1137,7 +1137,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 return finish(StepResult(
                     status=FAILED, notes=f"fix-round commit message invalid: {err.reason}"))
             fix_sha = gitops.commit_all(
-                ctx.repo_root, message,
+                ctx.work_root, message,
                 identity=ctx.config.identity(fixer), exclude=ctx.excludes,
             )
             # An ordered-prefix rerun (F-001) that reset a stale fix commit off HEAD
@@ -1334,7 +1334,7 @@ def _run_sub(
         # The verifier sub-step (FR-2.1) overrides ``cwd`` to the disposable copy
         # and passes network-deny/setting-source ``extra_flags``; every other
         # sub-agent runs in the real run worktree with no extra flags (unchanged).
-        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.repo_root}
+        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.work_root}
         if extra_flags:
             run_kwargs["extra_flags"] = list(extra_flags)
         if session is not None:
@@ -1953,11 +1953,11 @@ def _run_verifier(
         )) from exc
 
     # 2. Witness the real worktree BEFORE (FR-2.5 / P5-A4).
-    before = gitops.worktree_tree_hash(ctx.repo_root)
+    before = gitops.worktree_tree_hash(ctx.work_root)
 
     # 3. Disposable copy (FR-2.1/2.3). Failure parks — never "skipped, proceed".
     try:
-        copy = verify.make_disposable_copy(ctx.repo_root)
+        copy = verify.make_disposable_copy(ctx.work_root)
     except verify.CopyCreationError as exc:
         raise _ParkCycle(StepResult(
             status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
@@ -1978,7 +1978,7 @@ def _run_verifier(
         # on unproven confinement).
         verifier_step_id = f"verify:r{rnd}:{secrets.token_hex(8)}"
         lease = verify.register_boundary(ctx.judge_env, verifier_step_id, copy.path)
-        verify.confirm_boundary_enforced(lease, ctx.repo_root)
+        verify.confirm_boundary_enforced(lease, ctx.work_root)
         scratch_home = verify.make_scratch_home(copy.root)
         # Pin the claude-code verifier posture: confined allowed_tools (no network),
         # permission mode, --setting-sources project (so the judge hook fires), and
@@ -2027,10 +2027,10 @@ def _run_verifier(
     finally:
         if lease is not None:
             verify.clear_boundary(lease)
-        verify.discard_disposable_copy(ctx.repo_root, copy)
+        verify.discard_disposable_copy(ctx.work_root, copy)
 
     # 4. The real worktree must be byte-identical after verification (P5-A4).
-    after = gitops.worktree_tree_hash(ctx.repo_root)
+    after = gitops.worktree_tree_hash(ctx.work_root)
     if after != before:
         raise _ParkCycle(StepResult(
             status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
@@ -2048,7 +2048,7 @@ def _run_verifier(
 
 
 def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
-    head = gitops.head_sha(ctx.repo_root)
+    head = gitops.head_sha(ctx.work_root)
     explicit = step.get("phase")
     if ctx.manifest.commits:
         last = ctx.manifest.commits[-1]
@@ -2313,7 +2313,7 @@ def _review_prompt(
             # Rounds 2+ are regression-scoped (see the round-1 vs 2+ note above):
             # the handoff is the fix commit, so `handoff^` diffs only that fix.
             base = f"{handoff}^"
-        diff = gitops.range_diff(ctx.repo_root, base, handoff)
+        diff = gitops.range_diff(ctx.work_root, base, handoff)
         section = (
             f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}"
         )
@@ -2357,8 +2357,8 @@ def _review_prompt(
         # tree is clean at every handoff, FR-9.3), so the diff is deterministic
         # and lossless-by-path: unchanged context is one `git show` away.
         if rnd > 1 and prev_review_sha is not None:
-            rel = Path(path).resolve().relative_to(ctx.repo_root.resolve()).as_posix()
-            diff = gitops.range_diff_path(ctx.repo_root, prev_review_sha, handoff, rel)
+            rel = Path(path).resolve().relative_to(ctx.work_root.resolve()).as_posix()
+            diff = gitops.range_diff_path(ctx.work_root, prev_review_sha, handoff, rel)
             parts.append(
                 f"\n--- artifact under review: {name} (diff since round {rnd - 1}; "
                 f"read the full file at {rel} for unchanged context) ---\n{diff}"
@@ -2402,10 +2402,10 @@ class _MutationGuard:
 
     def check(self) -> None:
         ctx = self.ctx
-        if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+        if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
             return
         self.seq += 1
-        status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+        status = gitops.status_porcelain(ctx.work_root, exclude=ctx.excludes)
         if self.policy == "halt":
             raise _ParkCycle(StepResult(
                 status=PARKED,
@@ -2438,8 +2438,8 @@ class _MutationGuard:
             snapshot_id=f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}",
             reset_mode=RX.RESET_PLAIN,
         )
-        if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            residue = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+        if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
+            residue = gitops.status_porcelain(ctx.work_root, exclude=ctx.excludes)
             raise _ParkCycle(StepResult(  # fail closed on residue
                 status=PARKED,
                 notes="reviewer-mutation revert left residue the engine could "
@@ -2470,12 +2470,12 @@ class _MutationGuard:
             f"git status at detection:\n{status}\n"
         )
         sha = gitops.commit_all(
-            ctx.repo_root, message,
+            ctx.work_root, message,
             identity=ctx.config.identity(self.reviewer), exclude=ctx.excludes,
         )
         self.commits.append((f"{self.phase}.r{self.rnd}", sha))
         # Triage must see the mutation, not just git history (F-005).
-        diff = gitops.range_diff(ctx.repo_root, f"{sha}^", sha)
+        diff = gitops.range_diff(ctx.work_root, f"{sha}^", sha)
         self.synthetic_findings.append({
             "id": self._finding_id(),
             "severity": "major",
@@ -2843,10 +2843,10 @@ def _confirm_prompt(
     plus the prior findings and triage verdicts — scoped, cheap, unambiguous."""
     template = _template(ctx, step, "confirm_prompt", "prompts/cycle-confirm.md",
                          _BUILTIN_CONFIRM)
-    diff = gitops.range_diff(ctx.repo_root, handoff, fix_sha)
+    diff = gitops.range_diff(ctx.work_root, handoff, fix_sha)
     # Commit list with authors: reviewer-attributed PN.rX mutation commits in
     # the range stay distinguishable from fixer commits (FR-9.6 / F-005).
-    commit_list = gitops.log_range(ctx.repo_root, handoff, fix_sha)
+    commit_list = gitops.log_range(ctx.work_root, handoff, fix_sha)
     return (
         template
         + f"\n\n--- commits in range ({handoff[:10]}..{fix_sha[:10]}) ---\n{commit_list}"
@@ -3089,7 +3089,7 @@ def _clean_handoff_failure(ctx: StepContext, rnd: int) -> StepResult:
     genuine defect, so it stays terminal — re-running the guard would not fix it.
     """
     status = gitops.status_porcelain(
-        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+        ctx.work_root, exclude=ctx.excludes, untracked_all=True
     )
     paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
     listed = ", ".join(paths) if paths else "(no paths reported)"
@@ -3141,12 +3141,12 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
         return False
     try:
         rel = (ctx.artifact_root / name).resolve().relative_to(
-            ctx.repo_root.resolve()
+            ctx.work_root.resolve()
         ).as_posix()
     except ValueError:
         return False
     status = gitops.status_porcelain(
-        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
+        ctx.work_root, exclude=ctx.excludes, untracked_all=True
     )
     paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
     return paths == [rel]
@@ -3176,7 +3176,7 @@ def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):
             notes=f"artifact-mode baseline commit message invalid: {err.reason}",
         )
     sha = gitops.commit_all(
-        ctx.repo_root, message,
+        ctx.work_root, message,
         identity=ctx.config.identity(fixer), exclude=ctx.excludes,
     )
     return sha

@@ -158,8 +158,15 @@ class Orchestrator:
         ledger_path: Path | None = None,
         interrupted_override: str | None = None,
         state_outside_worktree: bool = False,
+        work_root: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
+        # The tree this run's agents edit and the engine commits in (P7a).
+        # `None` means the pre-P7 same-tree layout, where it IS the repo root;
+        # P7c passes the run's dedicated worktree. Resolved once here so no
+        # handler has to decide, and so `work_root is repo_root` stops being an
+        # assumption 25 call sites each re-made independently (spike §9).
+        self.work_root = work_root or repo_root
         self.run_dir = run_dir
         self.artifact_root = artifact_root
         # `gauntlet review` drives this orchestrator with an out-of-repo state
@@ -192,7 +199,7 @@ class Orchestrator:
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
         # dirty checks / commits — real run artifacts stay visible (review F-001).
         self.excludes = run_bookkeeping_excludes(
-            repo_root, run_dir, artifact_root,
+            self.work_root, run_dir, artifact_root,
             state_outside_worktree=state_outside_worktree,
         )
         self._ignore_run_dir()
@@ -837,9 +844,9 @@ class Orchestrator:
         # partial *artifact* under the run root (not just a repo-root file) is
         # still seen as a mid-edit interruption (review F-001).
         if not gitops.is_dirty_vs(
-            self.repo_root, rec.base_sha, exclude=self.excludes,
+            self.work_root, rec.base_sha, exclude=self.excludes,
             bookkeeping=engine_bookkeeping_candidates(
-                self.repo_root, self.run_dir,
+                self.work_root, self.run_dir,
                 state_outside_worktree=self.state_outside_worktree,
             ),
         ):
@@ -882,7 +889,7 @@ class Orchestrator:
             # subject so it stands in as the pending checkpoint itself (the
             # post-rewind reconcile below is then a no-op, not a duplicate).
             paths = self._bookkeeping_paths()
-            preserving = bool(paths) and gitops.head_sha(self.repo_root) != target
+            preserving = bool(paths) and gitops.head_sha(self.work_root) != target
             message = (
                 self._response_checkpoint_message()
                 or f"gauntlet: rewind implementation to {target[:10]} "
@@ -976,7 +983,7 @@ class Orchestrator:
         snapshot and restored from it after the rewind, replacing the
         in-memory overlay a process kill could lose (PR #77 review).
         """
-        repo = self.repo_root
+        repo = self.work_root
         # These in-drive rewinds never switch branches: they observe and
         # mutate the CURRENT checkout — the run branch during a real drive
         # (resume checks it out first), but possibly another branch when the
@@ -1080,12 +1087,12 @@ class Orchestrator:
         """
         parts: list[str] = []
         try:
-            porcelain = gitops.status_porcelain(self.repo_root, exclude=self.excludes)
+            porcelain = gitops.status_porcelain(self.work_root, exclude=self.excludes)
             if porcelain:
                 parts.append(f"uncommitted changes:\n{porcelain}")
-            head = gitops.head_sha(self.repo_root)
+            head = gitops.head_sha(self.work_root)
             if head != base_sha:
-                rng = gitops.log_range(self.repo_root, base_sha, head)
+                rng = gitops.log_range(self.work_root, base_sha, head)
                 parts.append(
                     f"commits in {base_sha[:10]}..{head[:10]}:\n"
                     + (rng or "(none — HEAD is behind or forked from the base)")
@@ -1145,7 +1152,7 @@ class Orchestrator:
         # use). A clean result here means the builder honored the
         # classify-don't-implement contract — nothing to restore.
         run_root = [self.config.run_root]
-        if gitops.is_clean(self.repo_root, exclude=run_root):
+        if gitops.is_clean(self.work_root, exclude=run_root):
             return result
         ts = self.clock().replace(":", "-").replace("+", "-")
         # P2 piloted this rewind on GitRecoverySnapshot; P3 routes it through
@@ -1431,9 +1438,9 @@ class Orchestrator:
             return None
         try:
             return gitops.is_dirty_vs(
-                self.repo_root, rec.base_sha, exclude=self.excludes,
+                self.work_root, rec.base_sha, exclude=self.excludes,
                 bookkeeping=engine_bookkeeping_candidates(
-                    self.repo_root, self.run_dir,
+                    self.work_root, self.run_dir,
                     state_outside_worktree=self.state_outside_worktree,
                 ),
             )
@@ -1686,6 +1693,7 @@ class Orchestrator:
     ) -> StepContext:
         return StepContext(
             repo_root=self.repo_root,
+            work_root=self.work_root,
             run_dir=self.run_dir,
             artifact_root=self.artifact_root,
             config=self.config,
@@ -1772,7 +1780,7 @@ class Orchestrator:
         )
 
     def _head_sha(self) -> str:
-        return gitops.head_sha(self.repo_root)
+        return gitops.head_sha(self.work_root)
 
     # ---- evidence-tiered gates (FR-4, P8) -----------------------------------
     def _maybe_auto_approve(
@@ -1912,7 +1920,7 @@ class Orchestrator:
         today's reset-to-base behavior. Only reached with a non-null ``base_sha``
         (the caller guards it).
         """
-        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha, phase=phase)
+        wips = gitops.wip_checkpoints(self.work_root, base=rec.base_sha, phase=phase)
         if wips:
             sha, subject = wips[0]  # newest first
             return sha, subject
@@ -2051,7 +2059,7 @@ class Orchestrator:
         if not paths:
             return None
         return gitops.commit_run_bookkeeping(
-            self.repo_root, message, paths, identity=ENGINE_IDENTITY
+            self.work_root, message, paths, identity=ENGINE_IDENTITY
         )
 
     def _bookkeeping_paths(self) -> list[str]:
@@ -2062,7 +2070,7 @@ class Orchestrator:
         fix-rerun rewinds) force-stages.
         """
         return run_bookkeeping_paths(
-            self.repo_root, self.run_dir,
+            self.work_root, self.run_dir,
             state_outside_worktree=self.state_outside_worktree,
         )
 

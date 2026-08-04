@@ -395,7 +395,12 @@ def test_only_artifact_dirty_sees_nested_untracked_artifact(fixture_repo):
     collapsed = [ln[3:] for ln in gitops.status_porcelain(fixture_repo).splitlines()]
     assert collapsed == [c for c in collapsed if c.endswith("/")]  # all dirs
     assert ".gauntlet/runs/estimation-improvements/prd.md" not in collapsed
-    ctx = SimpleNamespace(repo_root=fixture_repo, artifact_root=slug_dir, excludes=[])
+    # `work_root` is the tree the guard inspects (P7a); it equals repo_root in
+    # the same-tree layout, which is what a real StepContext resolves here.
+    ctx = SimpleNamespace(
+        repo_root=fixture_repo, work_root=fixture_repo,
+        artifact_root=slug_dir, excludes=[],
+    )
     assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is True
 
 
@@ -406,7 +411,12 @@ def test_only_artifact_dirty_false_when_a_second_path_is_dirty(fixture_repo):
     slug_dir.mkdir(parents=True)
     (slug_dir / "prd.md").write_text("PRD\n")
     (fixture_repo / "stray.txt").write_text("unexpected uncommitted work\n")
-    ctx = SimpleNamespace(repo_root=fixture_repo, artifact_root=slug_dir, excludes=[])
+    # `work_root` is the tree the guard inspects (P7a); it equals repo_root in
+    # the same-tree layout, which is what a real StepContext resolves here.
+    ctx = SimpleNamespace(
+        repo_root=fixture_repo, work_root=fixture_repo,
+        artifact_root=slug_dir, excludes=[],
+    )
     assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is False
 
 
