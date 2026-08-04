@@ -310,13 +310,22 @@ class Orchestrator:
 
         A ``_park_plan_artifact_invalid`` park lands on the walk-stop step —
         a step that does NOT own a ``validate:``/``output:`` pair (those parks
-        belong to the FR-2.2 in-step path and are left alone). Resetting it to
-        PENDING lets the stage walk re-reach the ``plan.phases`` resolution:
-        the parse (the validator) re-runs against the current bytes BEFORE any
-        step executes, so a still-broken plan re-parks with fresh evidence and
-        a fixed plan simply continues — nothing but the validator ran either
+        belong to the FR-2.2 in-step path and are left alone). The validator
+        (the same parse the foreach runs) re-runs here against the current
+        bytes: still broken → the park stays armed (the walk re-parks with
+        fresh evidence, and an unchanged file trips the R5 guard at the verb);
+        now valid → the sanctioned hand-edit of the APPROVED plan is adopted
+        LOUDLY (P5.1 review F-004): a durable manifest warning retains BOTH
+        content fingerprints (park → adoption) so the governance event is
+        auditable — surfaced and preserved per R9/FR-10.4 and the standing
+        operator direction, never refused, never silent — before the step is
+        re-armed and the walk continues. Nothing but the validator ran either
         way (plan §5.1).
         """
+        import hashlib
+
+        from gauntlet.engine.planphases import load_plan_phases
+
         for rec in self.manifest.steps:
             if (
                 rec.status != M.PARKED
@@ -328,6 +337,29 @@ class Orchestrator:
             step = self._pipeline_step_by_id(rec.id)
             if step is not None and step.get("validate") and step.get("output"):
                 continue  # the step's own FR-2.2 validator park — not ours
+            plan_path = self.artifact_root / "plan.md"
+            try:
+                phases = load_plan_phases(plan_path)
+            except PlanPhasesError:
+                return  # still invalid: the walk re-parks with fresh evidence
+            if phases is None:
+                return  # block/plan removed entirely — that is not a repair
+            try:
+                text = plan_path.read_text()
+            except OSError:
+                text = ""
+            digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+            prior = rec.revalidation
+            note = (
+                f"resume: {prior.artifact} (an APPROVED artifact) was "
+                f"hand-edited while parked artifact_invalid and now passes the "
+                f"{prior.validator} validator ({prior.hash_at_park} -> "
+                f"{digest}); the edit is SANCTIONED and adopted LOUDLY "
+                "(R9/FR-10.4, standing operator direction) — both fingerprints "
+                "retained here as the governance audit trail"
+            )
+            if note not in self.manifest.warnings:
+                self.manifest.warnings.append(note)
             rec.status = M.PENDING
             rec.parked_reason = None
             rec.revalidation = None
@@ -594,7 +626,22 @@ class Orchestrator:
     def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:
         spec = get_spec(step.type)
         rec = self.manifest.record(step.id, iteration)
-        resuming = rec is not None and rec.status in (M.RUNNING, M.INTERRUPTED)
+        # A TIMEOUT-halted step re-enters through the same disposition as an
+        # interruption (P5.1 review F-001): the CLI child was killed mid-turn
+        # by its deadline, so a repo-writing agent may have left partial edits
+        # exactly like a signal kill. Without this, the advertised plain
+        # resume would re-run the agent OVER that partial work with no dirty
+        # check and no snapshot (plan §5.2: side-effecting failures go
+        # through snapshot/reconciliation, never a blind re-run). A clean
+        # timeout re-runs as before; budget/judge/precondition halts keep
+        # their existing direct re-entry (their handlers checkpointed).
+        resuming = rec is not None and (
+            rec.status in (M.RUNNING, M.INTERRUPTED)
+            or (
+                rec.status == M.HALTED
+                and rec.halt_reason == M.HALT_REASON_TIMEOUT
+            )
+        )
         if rec is None:
             rec = StepRecord(
                 id=step.id, type=step.type, agent=step.agent, iteration=iteration

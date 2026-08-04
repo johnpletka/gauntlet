@@ -290,7 +290,17 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
         return _phase_lint_park(
             artifact, "", f"{artifact} is missing at the plan gate"
         )
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except (OSError, ValueError) as exc:
+        # P5.1 review F-006: an unreadable/wrong-kind artifact (permissions, a
+        # directory where a file belongs, undecodable bytes) is a REPAIRABLE
+        # artifact defect, not a terminal handler fault — a bare exception here
+        # would land FAILED on a non-respondable step whose only exit is
+        # abort, wedging a run a file repair should resume.
+        return _phase_lint_park(
+            artifact, "", f"{artifact} is unreadable at the plan gate: {exc}"
+        )
     try:
         phases = extract_phases(text)
     except PlanPhasesError as exc:
@@ -1275,7 +1285,26 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
             ),
         )
     out_path = ctx.artifact_root / output
-    text = out_path.read_text() if out_path.exists() else ""
+    try:
+        text = out_path.read_text() if out_path.exists() else ""
+    except (OSError, ValueError) as exc:
+        # P5.1 review F-006: an unreadable/wrong-kind artifact on the
+        # revalidation path re-parks artifact_invalid (repairable, resumable)
+        # instead of surfacing as a terminal handler fault.
+        return StepResult(
+            status=PARKED,
+            parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=RevalidationRecord(
+                artifact=output, hash_at_park=_sha256(""),
+                validator=validate_name,
+                diagnostic=f"artifact is unreadable: {exc}",
+            ),
+            notes=(
+                f"artifact {output!r} is unreadable on resume ({exc}); repair "
+                "the file, then `gauntlet resume` re-runs the validator "
+                "(FR-2.2)"
+            ),
+        )
     hash_at_resume = _sha256(text)
     prior = ctx.record.revalidation
     hash_at_park = prior.hash_at_park if prior is not None else hash_at_resume

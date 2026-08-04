@@ -34,7 +34,7 @@ import hashlib
 import json
 import re
 import secrets
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2664,8 +2664,14 @@ def _triage(
             }
             # Wait for EVERY submitted call before deciding: a failure must not
             # abandon in-flight verdicts (they belong in the fragment). Collect
-            # each finding's outcome; never re-raise inside the pool.
-            for fut in futures:
+            # each finding's outcome; never re-raise inside the pool. Each
+            # SUCCESSFUL leaf is folded into `done` and the checkpoint fragment
+            # persisted the moment its future completes (P5.1 review F-003):
+            # per-leaf completion must be DURABLE while sibling leaves are
+            # still running, so a kill mid-round loses at most the in-flight
+            # leaves — never a completed verdict (plan §5.2: persist
+            # successful leaves, retry only incomplete leaves).
+            for fut in as_completed(futures):
                 i = futures[fut]
                 try:
                     outcomes[i] = ("ok", fut.result())
@@ -2673,19 +2679,22 @@ def _triage(
                     outcomes[i] = ("park", park)
                 except (MalformedOutputError, AdapterError) as exc:
                     outcomes[i] = ("error", exc)
+                if outcomes[i][0] == "ok":
+                    payload = outcomes[i][1]
+                    done[payload["finding_id"]] = payload["verdict"]
+                    needs_human_by_id[payload["finding_id"]] = payload["needs_human"]
+                    _persist_triage_fragment(ctx, rnd, findings, done)
         # Deterministic merge order (finding order), independent of completion
         # order, so the round total matches the sequential run.
         for acc in task_usages:
             usage.merge(acc)
-        # Fold successful verdicts into `done`; keep the FIRST problematic outcome
-        # in finding order so a re-raise/park is deterministic across runs.
+        # Keep the FIRST problematic outcome in finding order so a re-raise/
+        # park is deterministic across runs (successful verdicts were already
+        # folded into `done` — and persisted — as each future completed).
         first_problem: Any = None
         for i, finding in enumerate(pending):
             kind, payload = outcomes[i]
-            if kind == "ok":
-                done[payload["finding_id"]] = payload["verdict"]
-                needs_human_by_id[payload["finding_id"]] = payload["needs_human"]
-            elif first_problem is None:
+            if kind != "ok" and first_problem is None:
                 first_problem = payload
         if first_problem is not None:
             # FR-9.2: persist the completed verdicts (incl. any resume-seeded ones)

@@ -560,11 +560,21 @@ def build_progress_fingerprint(
     if latest_cycle_substep is None and record is not None and record.checkpoints:
         last = record.checkpoints[-1]
         latest_cycle_substep = f"r{last.round}-{last.sub_step}"
+    # The FAILED retry counter is bookkeeping, not progress (P5.1 review
+    # F-002): every re-failure increments ``attempts``, so folding it into the
+    # attempt identity would mint a fresh fingerprint per identical failure
+    # and let a deterministic re-runnable failure bypass the R5 no-progress
+    # guard forever. A FAILED record's attempt identity is therefore the step
+    # alone; every other status keeps the attempt-boundary counter.
+    attempt_id = None
+    if record is not None:
+        counter = "" if record.status == M.FAILED else f"#{record.attempts}"
+        attempt_id = f"{record.id}{counter}"
     return ProgressFingerprint(
         run_id=manifest.run_id,
         current_step=manifest.current_step,
         iteration=record.iteration if record is not None else None,
-        attempt_id=f"{record.id}#{record.attempts}" if record is not None else None,
+        attempt_id=attempt_id,
         run_status=RunStatus(manifest.status),
         step_status=StepStatus(record.status) if record is not None else None,
         run_branch_sha=run_branch_sha,

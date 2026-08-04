@@ -43,6 +43,7 @@ from gauntlet.adapters.base import (
     FAILURE_TRANSIENT_USAGE_LIMIT,
     AgentFailedError,
     AgentResult,
+    AgentTimeoutError,
     FailureInfo,
 )
 from gauntlet.engine import depretry, gitops, manifest as M
@@ -391,6 +392,15 @@ def test_artifact_defect_parks_edit_recovers_unchanged_raises(
     assert done.status == M.RUN_DONE
     if site == "drive_foreach":
         assert adapter.calls  # the phases fan-out actually ran the agent
+        # P5.1 review F-004: the post-approval hand-edit is adopted LOUDLY —
+        # a durable manifest warning retains BOTH content fingerprints
+        # (park → adoption) as the governance audit trail, never silently.
+        note = next(
+            w for w in done.warnings
+            if "hand-edited while parked artifact_invalid" in w
+        )
+        assert "APPROVED" in note and reval.hash_at_park in note
+        assert "SANCTIONED" in note and "->" in note
 
 
 def test_changed_but_still_invalid_artifact_reparks_exit_clean(fixture_repo):
@@ -936,6 +946,168 @@ def test_p5_call_sites_stay_free_of_direct_destructive_git_verbs():
                 f"{func.__qualname__} calls {verb} directly; every rewind "
                 "mutation must route through RecoveryExecutor (plan §9)"
             )
+
+
+# =============================================================================
+# P5.1 post-review fixes (F-001, F-002, F-003, F-006)
+# =============================================================================
+
+
+class TimeoutAdapter:
+    """Optionally writes partial work, then raises the CLI hard-timeout error."""
+
+    name = "fake"
+    capabilities = FakeAdapter.capabilities
+    timeout_s = 600.0
+
+    def __init__(self, *, writes: dict[str, str] | None = None):
+        self.writes = writes or {}
+        self.calls: list[dict] = []
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None,
+            extra_flags=None, sink=None):
+        self.calls.append({"prompt": prompt})
+        for rel, content in self.writes.items():
+            (Path(cwd) / rel).write_text(content)
+        raise AgentTimeoutError(
+            "agent timed out after 600s",
+            partial=AgentResult(text="", session_id="s1", exit_code=1),
+        )
+
+
+def test_timeout_over_partial_work_parks_interrupted_never_reruns(fixture_repo):
+    """F-001: a repo-writing agent killed by its hard timeout MID-EDIT must
+    not be blindly re-run over the partial work. The timeout halt re-enters
+    through the interruption disposition: the dirty tree parks INTERRUPTED
+    (snapshot-backed reset advertised) and the agent is NOT re-invoked."""
+    mgr, man, run_dir = _seed(fixture_repo, AGENT_PIPELINE)
+    adapter = TimeoutAdapter(writes={"partial.py": "half written\n"})
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_PARKED
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.HALTED and rec.halt_reason == M.HALT_REASON_TIMEOUT
+
+    would_succeed = FakeAdapter()
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: would_succeed
+    ) == M.RUN_PARKED
+    assert would_succeed.calls == []  # NEVER re-run over the partial work
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.INTERRUPTED  # the F-003 disposition, with its exits
+    assert "--reset-interrupted" in (rec.notes or "")
+    assert (fixture_repo / "partial.py").exists()  # nothing discarded
+
+
+def test_clean_timeout_still_reruns_via_plain_resume(fixture_repo):
+    """F-001 complement: a timeout that provably left NO partial work keeps
+    the existing behavior — plain resume re-runs the step cleanly."""
+    mgr, man, run_dir = _seed(fixture_repo, AGENT_PIPELINE)
+    adapter = TimeoutAdapter()
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_PARKED
+    recovered = FakeAdapter(writes={"clean.py": "out\n"})
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: recovered
+    ) == M.RUN_DONE
+    assert recovered.calls  # the clean re-run actually happened
+
+
+def test_repeated_side_effect_free_failure_raises_no_progress(fixture_repo):
+    """F-002: the FAILED retry counter is bookkeeping, not progress — a
+    deterministic side-effect-free failure repeated unchanged raises
+    NoProgressError (nonzero, actions named) instead of minting a fresh
+    fingerprint per failure and exiting successfully forever (R5)."""
+    mgr, man, run_dir = _seed(fixture_repo, AGENT_PIPELINE)
+    adapter = UnknownFailureAdapter(fail_times=None)
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_FAILED  # first failure: a real transition (progress)
+    with pytest.raises(NoProgressError) as exc:
+        mgr.resume("demo", use_judge=False, adapter_factory=lambda n: adapter)
+    assert exc.value.safe_actions  # executable retry/abort actions named
+    assert len(adapter.calls) == 2  # each resume ran once; the loop then stopped
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.FAILED
+    assert rec.failure_kind == M.FAILURE_KIND_SIDE_EFFECT_FREE
+
+
+def test_fanout_leaf_completion_is_durable_before_the_pool_drains(
+    fixture_repo, monkeypatch
+):
+    """F-003: each successful leaf's verdict is persisted to the checkpoint
+    fragment the moment its future completes — NOT after the whole pool
+    drains — so a kill mid-round can lose only in-flight leaves, never a
+    completed verdict."""
+    from test_cycle import F, REVIEW, SeqAdapter, V
+
+    from gauntlet.engine import cycle as cycle_mod
+
+    snapshots: list[list[str]] = []
+    real_persist = cycle_mod._persist_triage_fragment
+
+    def spy(ctx, rnd, findings, done):
+        snapshots.append(sorted(done))
+        real_persist(ctx, rnd, findings, done)
+
+    monkeypatch.setattr(cycle_mod, "_persist_triage_fragment", spy)
+    repo = _cycle_fixture(fixture_repo)
+    timeout_exc = AgentFailedError(
+        "api call failed: Timeout",
+        partial=AgentResult(text="", exit_code=1),
+        failure_info=FailureInfo(
+            kind=FAILURE_TRANSIENT_DEPENDENCY, marker="api_timeout"
+        ),
+    )
+    reviewer = SeqAdapter(REVIEW(F("F-001"), F("F-002"), F("F-003")))
+    triager = SeqAdapter(V("F-001"), timeout_exc, V("F-003"))
+    status, man, run_dir = _run_cycle(
+        repo, {"reviewer": reviewer, "triage": triager, "builder": SeqAdapter()}
+    )
+    assert status == M.RUN_PARKED
+    # The FIRST persist carried exactly the first completed leaf — durable
+    # while its siblings were still pending/in flight.
+    assert snapshots[0] == ["F-001"]
+    assert snapshots[-1] == ["F-001", "F-003"]
+
+
+def test_unreadable_plan_at_lint_parks_artifact_invalid_and_recovers(
+    fixture_repo,
+):
+    """F-006: an unreadable/wrong-kind plan.md (here: a directory) at the
+    plan gate is a REPAIRABLE artifact defect — it parks artifact_invalid
+    (not a terminal abort-only failure), and repairing the file resumes."""
+    mgr, man, run_dir = _seed(fixture_repo, LINT_PIPELINE)
+    plan_path = fixture_repo / "runs" / "demo" / "plan.md"
+    plan_path.mkdir()  # exists, but read_text raises IsADirectoryError
+    adapter = FakeAdapter()
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_PARKED
+    rec = Manifest.load(run_dir / "manifest.json").record("plan-lint")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert "unreadable" in (rec.revalidation.diagnostic or "")
+    plan_path.rmdir()
+    plan_path.write_text(VALID_PLAN)
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_DONE
+
+
+def test_unreadable_schema_asset_is_a_named_misconfiguration(tmp_path):
+    """F-006: a malformed SCHEMA file is a pipeline-asset misconfiguration
+    (UnknownValidatorError naming the asset), never an artifact defect —
+    editing the artifact cannot repair a broken schema."""
+    from gauntlet.engine.validators import UnknownValidatorError, validate_artifact
+
+    (tmp_path / "schemas").mkdir()
+    (tmp_path / "schemas" / "bad.json").write_text("{not json")
+    with pytest.raises(UnknownValidatorError, match="could not be read/parsed"):
+        validate_artifact(
+            "schema:schemas/bad.json", "{}", repo_root=tmp_path, asset_root="."
+        )
 
 
 def test_jitter_and_backoff_are_deterministic():
