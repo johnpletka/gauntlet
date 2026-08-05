@@ -197,6 +197,65 @@ def doctor() -> None:
     typer.echo("\nenvironment OK")
 
 
+def _echo_worktree_line(mgr, man) -> None:
+    """Render the run's tree on the human `status` footer (F-012).
+
+    Silent for a `same_tree` run: "this run drives your own checkout" is the
+    pre-P7 default and printing it on every status would be noise. Loud for
+    every other case, including the ones an operator must act on — a missing
+    tree, and an unreadable worktree list.
+    """
+    from gauntlet.engine import worktree as WT
+
+    try:
+        mode = mgr._effective_worktree_mode(man)
+        if mode != WT.MODE_DEDICATED:
+            return
+        state = WT.describe(mgr.operator_root, mode=mode, branch=man.branch)
+    except Exception:
+        typer.echo("  worktree: unknown (could not read git's worktree list)")
+        return
+    if state.missing:
+        typer.echo(
+            f"  worktree: MISSING at {state.path} — `gauntlet resume "
+            f"{man.slug}` recreates it from the branch and journal"
+        )
+    elif state.path is not None:
+        typer.echo(f"  worktree: {state.path}")
+    else:
+        typer.echo(
+            "  worktree: none registered (this run is configured dedicated "
+            "but has no tree yet)"
+        )
+
+
+def _status_work_root(mgr, man) -> Path:
+    """The tree a run drives, for read-only surfaces (F-007).
+
+    Read-only and fail-soft by design: `status` is what an operator reaches for
+    when things are already wrong, so an unresolvable mode or an unobservable
+    worktree falls back to the operator's checkout rather than failing the
+    whole command. The `worktree` block reports the observation honestly
+    (including `null` for "unknown"), so the operator still sees that something
+    could not be read — the assessment just declines to guess.
+    """
+    from gauntlet.engine import worktree as WT
+
+    try:
+        mode = mgr._effective_worktree_mode(man)
+        if mode != WT.MODE_DEDICATED:
+            return mgr.operator_root
+        entry = WT.observe(
+            mgr.operator_root, man.branch,
+            common_dir=mgr._git_common_dir(),
+        )
+    except Exception:
+        return mgr.operator_root
+    if entry is None or not entry.path.is_dir():
+        return mgr.operator_root
+    return entry.path
+
+
 def _refuse_inside_run_worktree(cwd: Path) -> None:
     """Refuse any verb invoked from INSIDE a run worktree (spike §14.4).
 
@@ -809,7 +868,10 @@ def status(
         # branch relation (adoption / checkpoint continuation / recovery-ref
         # workflow). Fail-soft: an unobservable repo renders the pure table.
         assessment = operator.compute_status_assessment(
-            mgr.repo_root, man, driver.state, run_instance_dir=run_instance_dir
+            mgr.repo_root, man, driver.state, run_instance_dir=run_instance_dir,
+            # F-007/R4: assess the tree this run actually drives, so status and
+            # the mutating verbs can never describe different trees.
+            work_root=_status_work_root(mgr, man),
         )
         rstate = operator.compute_run_state(
             man, driver.state, assessment=assessment
@@ -954,6 +1016,11 @@ def status(
         typer.echo(f"  {rec.id}{it}: {rec.status}")
     if view.detail:  # P6: journal ↔ projection divergence, loudly (plan §4.6)
         typer.echo(f"  projection: {view.detail}")
+    # F-012 / spike §18.2 addition 2: the HUMAN surface must name the tree too.
+    # Only `--json` carried it, so an operator reading plain `status` had no way
+    # to discover that a dirty verdict referred to a tree they were not
+    # standing in.
+    _echo_worktree_line(mgr, man)
 
     # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
     # usage limit — the reset time, all sourced from the manifest so no parked

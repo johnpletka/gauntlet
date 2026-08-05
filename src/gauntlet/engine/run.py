@@ -732,7 +732,28 @@ class RunManager:
             pass
         if self._journal_says_adopted(man):
             return WT.MODE_DEDICATED
-        return man.worktree_mode or WT.MODE_SAME_TREE
+        recorded = man.worktree_mode
+        if recorded is None:
+            return WT.MODE_SAME_TREE  # rule 4: a pre-P7c run
+        if recorded not in WT.MODES:
+            # F-006, fail closed. `Manifest.worktree_mode` is a plain string on
+            # disk, so a corrupt manifest — or one written by a FORWARD version
+            # that knows a third mode — can carry a value this engine does not
+            # understand. Returning it verbatim was silently safe-looking and
+            # actively dangerous: `_run_paths` treats anything that is not
+            # exactly `dedicated` as same-tree, so an unrecognized value made
+            # resume check out and mutate the OPERATOR's tree. "I do not know
+            # which tree this run drives" must stop the verb, not pick one.
+            raise WorktreeUnavailableError(
+                f"run {man.run_id!r} records worktree mode {recorded!r}, which "
+                f"this engine does not recognize (known: {sorted(WT.MODES)}). "
+                "Refusing to guess which tree it drives — guessing wrong means "
+                "driving the operator's checkout. If the manifest is corrupt, "
+                "restore it from the journal (`gauntlet status` names the "
+                "projection state); if it was written by a newer Gauntlet, use "
+                "that version."
+            )
+        return recorded
 
     def _journal_says_adopted(self, man: Manifest) -> bool:
         """True when the journal records an adoption with no later release.
@@ -811,13 +832,43 @@ class RunManager:
         prior = self._paths
         dedicated = mode == WT.MODE_DEDICATED and not same_tree
         work_root = self.repo_root
+        if same_tree and mode == WT.MODE_DEDICATED:
+            # F-010: skipping `ensure` is not enough to make the fallback
+            # EXECUTABLE. If a registered worktree still holds the run branch,
+            # the same-tree drive's `checkout_branch` in the operator's tree
+            # hard-refuses (E2-B) — and the headline case reaches exactly that
+            # state, because the submodule park raises AFTER `ensure` has
+            # created and locked the tree. Offering an action that cannot run
+            # is worse than offering none.
+            #
+            # So release the engine's OWN tree first, through the guarded path:
+            # dirty work is snapshotted, never force-discarded (R2). A tree we
+            # do not own is left alone and refused loudly — `--same-tree` is a
+            # fallback, not an override.
+            self._release_for_same_tree_fallback(run_dir, man, slug=slug, branch=branch)
         if dedicated:
-            wt = WT.ensure(
+            common = self._git_common_dir()
+            # F-008: when the tree is registered-but-absent (spike §11 row 2)
+            # this is a RECREATE, not a fresh create, and acceptance A3 says the
+            # reconstruction must be verified — "the tree came back" and "the
+            # tree came back CORRECT" are different claims. `WT.recreate` is the
+            # only path that checks the recreated HEAD, so the missing-tree case
+            # must route through it with the branch SHA the run's own state
+            # recorded. Previously nothing in production called it, so the
+            # advertised check never ran.
+            expect = None
+            state = WT.describe(self.operator_root, mode=mode, branch=branch)
+            if state.missing:
+                expect = self._recorded_branch_sha(run_dir, man, branch)
+            factory = WT.recreate if state.missing else WT.ensure
+            kwargs = {"expect_head": expect} if state.missing else {}
+            wt = factory(
                 self.operator_root,
-                self._git_common_dir(),
+                common,
                 slug=slug,
                 run_id=run_id,
                 branch=branch,
+                **kwargs,
             )
             work_root = wt.path
             self._record_worktree_adopted(run_dir, wt, slug=slug, run_id=run_id)
@@ -893,6 +944,61 @@ class RunManager:
             man.write_atomic(run_dir / "manifest.json")
         except (OSError, ValueError):
             pass  # the raise below still names the reason and the action
+
+    def _release_for_same_tree_fallback(
+        self, run_dir: Path, man: Manifest | None, *, slug: str, branch: str
+    ) -> None:
+        """Free the run branch so a `--same-tree` resume can actually check it out.
+
+        The executable half of the §13 fallback (F-010). Removes only a tree
+        this engine owns at this run's derived path; anything else is a refusal
+        with the holder named, because silently removing a worktree a human
+        made would be exactly the "never adopt what you cannot explain" rule
+        (§11 row 6) inverted.
+        """
+        try:
+            entry = WT.observe(
+                self.operator_root, branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            return
+        if entry is None:
+            return  # nothing holds the branch — the fallback is already clear
+        ref = WT.release(
+            self.operator_root,
+            entry.path,
+            slug=slug,
+            run_id=(man.run_id if man is not None else "unknown"),
+        )
+        self._record_worktree_released(
+            run_dir, entry.path, slug=slug,
+            run_id=(man.run_id if man is not None else "unknown"),
+            snapshot_ref=ref,
+        )
+
+    def _recorded_branch_sha(
+        self, run_dir: Path, man: Manifest | None, branch: str
+    ) -> str | None:
+        """The branch SHA this run's authoritative state last recorded (A3).
+
+        Preference order, most authoritative first: the journal's own
+        ``WorktreeAdopted`` ``branch_sha`` (written when the tree was last
+        healthy), then the manifest's last recorded commit. ``None`` when
+        neither is available — an unverifiable recreate is still better than
+        refusing to recreate at all, and the caller simply skips the check
+        rather than inventing an expectation.
+        """
+        try:
+            for evt in reversed(J.read_events(run_dir)):
+                if evt.get("kind") == "WorktreeAdopted":
+                    sha = (evt.get("payload") or {}).get("branch_sha")
+                    if sha:
+                        return str(sha)
+        except (OSError, ValueError, J.JournalError):
+            pass
+        if man is not None and man.commits:
+            return man.commits[-1].sha
+        return None
 
     def _sync_governed_artifacts(self, paths: RunPaths, layout: "RunLayout") -> None:
         """Publish the operator's governed artifacts into the run worktree.
@@ -979,6 +1085,88 @@ class RunManager:
             },
             run_id=run_id,
             idempotency_key=f"worktree-released:{run_id}:{path}",
+        )
+
+    def _refuse_on_untracked_merge_collision(
+        self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
+    ) -> None:
+        """Refuse a finish whose merge git would reject on an untracked file.
+
+        Only reachable under `dedicated`, and only for the governed artifacts —
+        the exact set the operator authors in their checkout and the run branch
+        commits from the synced copy.
+        """
+        if self._effective_worktree_mode(man) != WT.MODE_DEDICATED:
+            return
+        collisions: list[str] = []
+        for rel in governed_artifact_paths(self.operator_root, layout.slug_dir):
+            local = self.operator_root / rel
+            if not local.exists():
+                continue
+            try:
+                if not gitops.any_tracked_at(
+                    operator_root, f"refs/heads/{man.branch}", [rel]
+                ):
+                    continue
+                if gitops.is_tracked(operator_root, rel):
+                    continue  # already tracked here — an ordinary merge
+            except gitops.GitError:
+                continue
+            collisions.append(rel)
+        if not collisions:
+            return
+        listing = "\n  ".join(collisions)
+        raise FinishError(
+            "refusing finish: your checkout has untracked file(s) that the "
+            f"merge of {man.branch!r} into {base!r} would overwrite:\n"
+            f"  {listing}\n"
+            "These are the governed artifacts you authored. A dedicated run "
+            "commits them on its own branch (from the copy synced into the run "
+            "worktree), so your local copies are now redundant duplicates of "
+            "what is about to be merged in.\n"
+            "Resolve by either:\n"
+            f"  git -C {self.operator_root} add {' '.join(collisions)} && "
+            "git commit -m 'author prd'   # keep yours as a commit on the base\n"
+            f"  rm {' '.join(str(self.operator_root / c) for c in collisions)}"
+            "   # take the run branch's copy\n"
+            "then `gauntlet finish` again. (The engine does not delete your "
+            "files to make a verb succeed.)"
+        )
+
+    def _refuse_if_run_worktree_dirty(self, man: Manifest, *, verb: str) -> None:
+        """Refuse when the RUN's own tree has uncommitted work (F-011/F-012).
+
+        A no-op for a `same_tree` run (the caller's own operator-tree guard
+        already covers that tree) and for a run whose worktree is absent. The
+        message names the tree it inspected and gives the exact `git -C` form,
+        because under `dedicated` the operator's `git status` reads CLEAN while
+        the verb refuses on dirtiness — a contradiction they cannot resolve from
+        where they are standing (spike §18.2 addition 2/3).
+        """
+        try:
+            entry = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            return
+        if entry is None or not entry.path.is_dir():
+            return
+        work_root = entry.path  # the RUN's tree — a work root by construction
+        try:
+            dirt = gitops.status_porcelain(work_root, untracked_all=True)
+        except gitops.GitError:
+            return
+        if not dirt:
+            return
+        listing = "\n  ".join(dirt.splitlines()[:8])
+        raise FinishError(
+            f"refusing {verb}: the RUN WORKTREE has uncommitted changes.\n"
+            f"  Tree inspected: {entry.path}\n  {listing}\n"
+            f"  Inspect it with: git -C {entry.path} status\n"
+            f"Your own checkout is clean — this work is in the run's private "
+            f"tree, and {verb} would remove that tree. Commit or discard it "
+            "there first (a snapshot would preserve it, but only as a recovery "
+            "ref you would have to know to look for)."
         )
 
     def _release_run_worktree_for_slug(self, layout: "RunLayout") -> None:
@@ -1985,13 +2173,21 @@ class RunManager:
         self, layout: "RunLayout", run_dir: Path, man: Manifest
     ) -> "RX.ProgressFingerprint":
         """The plan §4.5 fingerprint at the public-verb boundary."""
-        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        excludes = run_bookkeeping_excludes(
+            self.work_root, self._bookkeeping_root(run_dir),
+            self._artifact_root_in_work(layout),
+        )
         record = None
         for rec in man.steps:  # the last non-terminal step anchors the attempt
             if rec.status not in (M.DONE, M.SKIPPED):
                 record = rec
+        # The R5 fingerprint covers index and worktree planes, so it must watch
+        # the tree the verb actually mutates (same family as F-002/F-007).
+        # Against the operator's checkout it would report "nothing changed"
+        # after a dedicated resume that did real work, and raise NoProgressError
+        # on a run that had progressed.
         return RX.build_progress_fingerprint(
-            self.repo_root, manifest=man, record=record, excludes=excludes
+            self.work_root, manifest=man, record=record, excludes=excludes
         )
 
     def _capture_progress(self, slug: str) -> "RX.ProgressFingerprint | None":
@@ -3510,21 +3706,54 @@ class RunManager:
         """
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
+        # F-003 / PROBLEM A: `finish` checks out the base and merges IN THE
+        # OPERATOR'S CHECKOUT. That is the precise vector the retained
+        # worktree-global tree guard exists to close, and `finish` was the one
+        # verb that never took it — so a `dedicated` run's finish could swap the
+        # branch under a live `same_tree` run of another slug. Keeping the guard
+        # only closes the vector if every operator-tree mutation holds it.
+        #
+        # Acquired around the WHOLE verb (not just the merge): the checkout, the
+        # merge, the branch delete and the pointer clear are one transaction
+        # from the other run's point of view.
         # P6 (post-review F-003): finish merges and DELETES a branch off the
         # run's recorded status, so it must read the authoritative state, not
         # a projection left stale by a branch reset or a kill window —
         # otherwise it could refuse a journal-complete run, or merge and
         # delete on the word of an older projection that still says `done`.
+        #
+        # BOTH of the steps below consult DRIVER LIVENESS, and `finish` is
+        # about to hold the drive lock itself — which would make finish look
+        # like that live driver to its own sub-operations. So both run BEFORE
+        # the acquisition (this is also why `_resume_once` reconciles first):
+        #
+        # * `_reconcile_projection` treats an un-acquirable drive lock as "a
+        #   live driver owns the projection" and returns without reconciling,
+        #   so finish would act on the stale projection it exists to distrust;
+        # * `_reap_orphaned_judge` is driver-gone-only, so it would decline to
+        #   reap and leak the run's judge process.
+        #
+        # Both are safe here: the reconcile is journal-authoritative and the
+        # reap is identity-verified and driver-gone-only, neither depends on
+        # holding the guard.
         self._reconcile_projection(run_dir, slug)
+        # FR-6: a completed run's driver is gone, so reap its orphaned judge
+        # (identity-verified, driver-gone-only); never the shared console.
+        self._reap_orphaned_judge(run_dir, slug)
+        finish_handle = self._acquire_worktree_lock(slug, None, run_dir=None)
+        try:
+            return self._finish_locked(slug, layout, run_dir)
+        finally:
+            self._release_worktree_lock(finish_handle)
+
+    def _finish_locked(self, slug: str, layout: "RunLayout", run_dir: Path) -> str:
+        """:meth:`finish`'s body, with the worktree-global guard held."""
         man = Manifest.load(run_dir / "manifest.json")
         # OPERATOR tree by design: `finish` merges the run branch INTO the
         # operator's base and leaves the human on a sensible branch — the
         # one verb whose whole purpose is to touch their checkout (P7a).
         repo = self.operator_root
         branch, base = man.branch, man.base_branch
-        # FR-6: a completed run's driver is gone, so reap its orphaned judge
-        # here (identity-verified, driver-gone-only); never the shared console.
-        self._reap_orphaned_judge(run_dir, slug)
 
         if man.status != M.RUN_DONE:
             raise FinishError(
@@ -3532,14 +3761,54 @@ class RunManager:
                 "only a completed run — resume or approve its gates first"
             )
         excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        if self._effective_worktree_mode(man) == WT.MODE_DEDICATED:
+            # Under `dedicated` the governed artifacts legitimately sit
+            # UNCOMMITTED in the operator's checkout forever: that checkout is
+            # the authoring surface (§14.2 option A), and what reaches the run
+            # branch is the copy the sync publishes into the run worktree. So
+            # `runs/<slug>/prd.md` here is the human's source file, not dirt,
+            # and blocking finish on it would make finish impossible for every
+            # dedicated run.
+            excludes = excludes + governed_artifact_paths(
+                self.operator_root, layout.slug_dir
+            )
         if not gitops.is_clean(repo, exclude=excludes):
+            dirt = gitops.status_porcelain(repo, exclude=excludes, untracked_all=True)
+            listing = "\n  ".join(dirt.splitlines()[:8])
             raise FinishError(
-                "refusing finish: worktree is dirty; commit or discard first"
+                "refusing finish: worktree is dirty; commit or discard first.\n"
+                f"  Tree inspected: {repo}\n  {listing}\n"
+                f"  Inspect it with: git -C {repo} status"
             )
         if not gitops.branch_exists(repo, branch):
             raise FinishError(f"run branch {branch!r} does not exist")
         if not gitops.branch_exists(repo, base):
             raise FinishError(f"base branch {base!r} does not exist")
+        # F-011: the cleanliness guard above inspects the OPERATOR's checkout,
+        # which is correct for the merge but says nothing about the run's own
+        # tree — and the release below force-removes that tree. Without this,
+        # `finish` would silently convert a builder's uncommitted work into a
+        # recovery ref the operator never asked for and would not know to look
+        # for. Refuse instead, naming the tree and how to inspect it.
+        self._refuse_if_run_worktree_dirty(man, verb="finish")
+        # Ordered AFTER the dirt refusal on purpose: uncommitted work that a
+        # teardown would sweep into a recovery ref is a bigger deal than a merge
+        # that cannot start, so the operator hears about it first.
+        # Under `dedicated` the operator's checkout holds the governed artifacts
+        # UNTRACKED (they are the authoring surface; the run branch commits the
+        # synced copy). The merge below wants to write those same paths as
+        # TRACKED files, and git refuses outright when an untracked working-tree
+        # file would be overwritten — before starting the merge, so there is
+        # nothing to abort. Detect it here and say exactly what to do, rather
+        # than surfacing a bare `merge failed`.
+        #
+        # Deliberately a REFUSAL, not a fix-up: the engine could delete the
+        # operator's untracked copy when it is byte-identical to the committed
+        # one, but silently removing a human's file to make a verb succeed is
+        # the wrong default even when the content survives. The operator
+        # decides. (Smoothing this is a P7d usability item, noted in the commit
+        # body — it is the one place dedicated `finish` costs a manual step.)
+        self._refuse_on_untracked_merge_collision(layout, man, repo, base)
         # PROBLEM D / spike E2-D: release the run worktree BEFORE the branch is
         # merged and deleted. The merge itself is unaffected by a live worktree
         # (E2-F/G measured that, and it leaves the operator exactly where they
@@ -3559,11 +3828,24 @@ class RunManager:
         try:
             gitops.merge_branch(repo, branch, message=msg)
         except gitops.GitError as exc:
-            gitops.merge_abort(repo)
-            gitops.checkout_branch(repo, branch)  # leave the human where they were
+            # git can refuse a merge BEFORE starting one (an untracked file that
+            # would be overwritten, an unreadable ref). There is no MERGE_HEAD
+            # then, so `merge --abort` itself fails — and an exception from the
+            # CLEANUP path would replace the real cause with a confusing
+            # "no merge to abort". Cleanup is best-effort; the original error is
+            # what the operator needs.
+            try:
+                gitops.merge_abort(repo)
+            except gitops.GitError:
+                pass
+            try:
+                gitops.checkout_branch(repo, branch)  # leave the human where they were
+            except gitops.GitError:
+                pass
             raise FinishError(
-                f"merge of {branch!r} into {base!r} conflicts; resolve it "
-                f"manually (merge aborted, back on {branch!r}). Details: {exc}"
+                f"merge of {branch!r} into {base!r} conflicts (or was refused "
+                f"outright); resolve it manually — any half-merge was aborted "
+                f"and you are back on {branch!r}. Details: {exc}"
             )
         gitops.delete_branch(repo, branch)
         self._clear_active_pointer(layout)
@@ -3844,10 +4126,15 @@ class RunManager:
         # branches over uncommitted work could carry or clobber it). Only the
         # engine's own bookkeeping is excluded (review F-001), so an
         # uncommitted real artifact still blocks.
-        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        excludes = run_bookkeeping_excludes(
+            self.work_root, self._bookkeeping_root(run_dir),
+            self._artifact_root_in_work(layout),
+        )
         if not gitops.is_clean(self.work_root, exclude=excludes):
             raise RollbackGuardError(
-                "refusing rollback: worktree is dirty; commit or discard first"
+                "refusing rollback: worktree is dirty; commit or discard "
+                f"first.\n  Tree inspected: {self.work_root}\n"
+                f"  Inspect it with: git -C {self.work_root} status"
             )
         # Guard 2: branch tip must AGREE with the manifest's last recorded
         # commit before a rewind (FR-9.9). Three tiers (#62/#72), all read
@@ -3914,8 +4201,16 @@ class RunManager:
             run_branch=man.branch,
             recorded_sha=last_recorded,
             excludes=excludes,
-            bookkeeping_candidates=engine_bookkeeping_candidates(repo, run_dir),
-            approved_artifacts=governed_artifact_paths(repo, layout.slug_dir),
+            # F-002: carrier-derived, like resume. `repo` here is the WORK
+            # tree, so handing it the operator-checkout run dir / slug dir
+            # makes `_tree_rel` raise StateDirNotContained under `dedicated`
+            # and rollback dies before it reaches the executor.
+            bookkeeping_candidates=engine_bookkeeping_candidates(
+                repo, self._bookkeeping_root(run_dir)
+            ),
+            approved_artifacts=governed_artifact_paths(
+                repo, self._artifact_root_in_work(layout)
+            ),
         )
         state_obs = RX.observe_state(man, None, liveness=RX.DriverLiveness.NONE)
 
@@ -4203,6 +4498,15 @@ class RunManager:
                       response_action=None, interrupted_override=None) -> Orchestrator:
         kwargs = dict(
             repo_root=self.repo_root,
+            # F-001: the whole phase turns on this line. Without it the
+            # Orchestrator falls back to `work_root = repo_root`, so a
+            # `dedicated` run's agents, shell steps and engine commits all
+            # execute against the OPERATOR's checkout while the judge boundary
+            # is pinned to the run worktree — silently defeating A1 with the
+            # judge off, and denying every legitimate write as a path escape
+            # with it on. Reads `self.work_root`, which `_run_paths` has
+            # already resolved for this run (`repo_root` outside a drive).
+            work_root=self.work_root,
             run_dir=run_dir,
             artifact_root=layout.slug_dir,
             config=self.config,

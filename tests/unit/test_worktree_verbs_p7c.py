@@ -1,0 +1,294 @@
+"""Real verbs driven in `dedicated` mode (P7c-1.1, review F-009).
+
+The gap this closes, stated plainly: the P7c-1 suite created run worktrees by
+calling `worktree.ensure` directly, and every existing verb test ran under the
+shipped `same_tree` default. So nothing exercised `RunManager.start` / `resume`
+/ `approve` / `rollback` / `finish` with a dedicated tree — and two blocking
+defects landed underneath that gap:
+
+* the Orchestrator was never handed `work_root`, so the agent's cwd, the shell
+  steps and every engine commit ran in the OPERATOR's checkout (F-001);
+* `_rollback_locked` resolved bookkeeping paths against the operator checkout
+  while passing the work tree, so a dedicated rollback raised
+  `StateDirNotContained` before reaching the executor (F-002).
+
+Both are invisible to any test that does not drive a real verb end to end in
+dedicated mode. These do. The autouse `operator_checkout_invariance` fixture in
+conftest.py asserts A1 over every one of them for free.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gauntlet.engine import gitops
+from gauntlet.engine import manifest as M
+from gauntlet.engine import worktree as WT
+from gauntlet.engine.run import RunManager
+
+from conftest import FakeAdapter, git
+
+CONFIG_DEDICATED = """
+base_branch: main
+run_root: runs
+worktree:
+  mode: dedicated
+agents:
+  builder: {adapter: claude-code}
+"""
+
+LINEAR = """
+name: p
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+      - {id: tests, type: shell, run: "true"}
+      - {id: commit, type: commit, message: "P1: implement\\n\\nthe body."}
+"""
+
+GATED = """
+name: p
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: gate, type: human_gate, show: [prd.md]}
+      - {id: after, type: shell, run: "true"}
+"""
+
+
+def _prepare(repo) -> RunManager:
+    (repo / ".gauntlet").mkdir(exist_ok=True)
+    (repo / ".gauntlet" / "config.yaml").write_text(CONFIG_DEDICATED)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add config")
+    return RunManager(repo)
+
+
+def _pipeline(repo, text: str):
+    (repo / "pipelines").mkdir(exist_ok=True)
+    path = repo / "pipelines" / "p.yaml"
+    path.write_text(text)
+    git(repo, "add", "pipelines")
+    git(repo, "commit", "-qm", "add pipeline")
+    return path
+
+
+def _author_prd(mgr: RunManager, slug: str) -> None:
+    mgr.new(slug)
+    mgr.layout(slug).prd_path.write_text("# Real PRD\n\nA genuine PRD.\n")
+
+
+def _run_worktree(mgr: RunManager, branch: str):
+    return WT.observe(
+        mgr.operator_root, branch, common_dir=mgr._git_common_dir()
+    )
+
+
+# --- F-001: the drive actually happens in the run's tree ---------------------
+
+
+def test_start_drives_the_run_worktree_not_the_operator_checkout(fixture_repo):
+    """The F-001 regression, asserted on all three planes it broke.
+
+    Agent cwd, the engine's commit, and the operator's checkout — each was
+    wrong before, and each is checked here rather than inferring from one.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    adapter = FakeAdapter(writes={"feature.py": "code\n"})
+
+    before_branch = gitops.current_branch(fixture_repo)
+    before_head = gitops.head_sha(fixture_repo)
+    status = mgr.start("demo", path, use_judge=False,
+                       adapter_factory=lambda n: adapter)
+    assert status == M.RUN_DONE
+
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None, "a dedicated run must register its own worktree"
+
+    # 1. the agent wrote into the RUN tree, not the operator's
+    assert (entry.path / "feature.py").exists()
+    assert not (fixture_repo / "feature.py").exists()
+
+    # 2. the engine's phase commit landed on the run branch, reachable from the
+    #    run tree's HEAD — and the operator's HEAD never moved
+    assert gitops.commit_subject(fixture_repo, "refs/heads/gauntlet/demo") == (
+        "P1: implement"
+    )
+    assert gitops.current_branch(fixture_repo) == before_branch
+    assert gitops.head_sha(fixture_repo) == before_head
+
+    # 3. the run's own state stayed in the operator's checkout (spike §4.4)
+    man = mgr.status("demo")
+    assert man.status == M.RUN_DONE
+    assert (mgr.layout("demo").run_dir(man.run_id) / "manifest.json").exists()
+    assert man.worktree_mode == WT.MODE_DEDICATED
+
+
+def test_start_records_the_born_mode_and_locks_the_tree(fixture_repo):
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    mgr.start("demo", path, use_judge=False,
+              adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert WT.parse_lock_reason(entry.locked) is not None, (
+        "the anti-prune marker must be held for the life of the run (§8.3)"
+    )
+
+
+def test_a_dirty_operator_checkout_does_not_block_a_dedicated_start(fixture_repo):
+    """The #61 guard protects against `checkout -b` carrying dirt onto the run
+    branch. A dedicated start checks nothing out in the operator's tree, so the
+    guard has nothing to protect and must not block (spike §9.4)."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    (fixture_repo / "operator-scratch.txt").write_text("my own uncommitted work\n")
+    status = mgr.start("demo", path, use_judge=False,
+                       adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}))
+    assert status == M.RUN_DONE
+    assert (fixture_repo / "operator-scratch.txt").read_text() == (
+        "my own uncommitted work\n"
+    ), "the operator's uncommitted work is untouched"
+
+
+# --- gate / approve / resume in dedicated mode -------------------------------
+
+
+def test_gate_park_then_approve_drives_the_run_worktree(fixture_repo):
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None
+    assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
+    assert mgr.status("demo").record("after").status == M.DONE
+
+
+def test_resume_recreates_a_missing_worktree_and_verifies_head(fixture_repo):
+    """Acceptance A3 through the PRODUCTION path (review F-008).
+
+    Previously only the unit test called `WT.recreate`, so the head check never
+    ran in a real run. Here the tree is destroyed between verbs and `resume`
+    must rebuild it from the branch plus journal state.
+    """
+    import subprocess
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    recorded = gitops.head_sha(entry.path)
+
+    subprocess.run(["rm", "-rf", str(entry.path)], check=True)
+    state = WT.describe(fixture_repo, mode=WT.MODE_DEDICATED, branch="gauntlet/demo")
+    assert state.missing, "registered-and-absent is the §11 row-2 signal"
+
+    assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
+    again = _run_worktree(mgr, "gauntlet/demo")
+    assert again is not None and again.path.is_dir()
+    assert gitops.head_sha(again.path) == recorded
+
+
+# --- F-002: rollback reaches the executor in dedicated mode ------------------
+
+
+TWO_PHASE = """
+name: p
+version: 1
+stages:
+  - id: p1
+    steps:
+      - {id: a, type: agent_task, agent: builder, prompt_text: go}
+      - {id: c1, type: commit, message: "P1: phase one\\n\\nbody one."}
+  - id: p2
+    steps:
+      - {id: b, type: agent_task, agent: builder, prompt_text: go}
+      - {id: c2, type: commit, message: "P2: phase two\\n\\nbody two."}
+"""
+
+
+def test_rollback_completes_in_dedicated_mode(fixture_repo):
+    """F-002: this raised StateDirNotContained before reaching the executor."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, TWO_PHASE)
+    # A distinct file per call, so each phase's commit is non-empty (the same
+    # pattern test_run_lifecycle uses for its two-phase fixture).
+    calls = {"n": 0}
+
+    def factory(name):
+        calls["n"] += 1
+        return FakeAdapter(writes={f"f{calls['n']}.py": "x\n"})
+
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=factory) == M.RUN_DONE
+    man = mgr.status("demo")
+    assert [c.phase for c in man.commits] == ["P1", "P2"]
+
+    target = mgr.rollback("demo", 1)
+    assert target
+    after = mgr.status("demo")
+    assert [c.phase for c in after.commits] == ["P1"], (
+        "rollback must rewind the manifest to the phase-1 boundary"
+    )
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert gitops.commit_subject(entry.path, "HEAD") == "P1: phase one", (
+        "and the RUN tree must be the one that was rewound"
+    )
+
+
+# --- F-011: finish refuses on run-tree dirt, then tears down in order --------
+
+
+def test_finish_refuses_when_the_run_worktree_is_dirty(fixture_repo):
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    (entry.path / "uncommitted.txt").write_text("work the builder left\n")
+
+    with pytest.raises(FinishError) as exc:
+        mgr.finish("demo")
+    assert str(entry.path) in str(exc.value), "the refusal must name the tree"
+    assert "git -C" in str(exc.value), "and give an executable inspect command"
+    assert (entry.path / "uncommitted.txt").exists(), "nothing was destroyed"
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_releases_the_worktree_then_deletes_the_branch(fixture_repo):
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    assert _run_worktree(mgr, "gauntlet/demo") is not None
+    # A dedicated run commits the governed artifacts on ITS branch, so the
+    # operator's authoring copy is an untracked duplicate the merge would
+    # overwrite. `finish` refuses and names both resolutions; take the one a
+    # real operator would (keep their authored file as a commit on the base).
+    with pytest.raises(FinishError, match="would overwrite"):
+        mgr.finish("demo")
+    git(fixture_repo, "add", "runs/demo/prd.md")
+    git(fixture_repo, "commit", "-qm", "author prd")
+
+    mgr.finish("demo")
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo"), (
+        "PROBLEM D / E2-D: the branch delete only succeeds after the release"
+    )
+    assert _run_worktree(mgr, "gauntlet/demo") is None

@@ -245,24 +245,24 @@ def describe(repo_root: Path, *, mode: str, branch: str) -> WorktreeState:
     """Observe a run's tree without mutating anything (the `status` source).
 
     A `same_tree` run yields ``registered=False, path=None`` — the honest
-    answer, and what renders as ``worktree: null``. Deliberately tolerant of a
-    git failure here: `status` is the verb an operator reaches for when things
-    are already wrong, so an unreadable worktree list degrades to "not
-    registered" rather than making the whole status payload unavailable. Every
-    MUTATING path uses :func:`observe` instead, where the same failure
-    propagates.
+    answer for a run that drives the operator's checkout.
+
+    An unreadable worktree list raises :class:`gitops.GitError` (F-013). It
+    must NOT degrade to ``registered=False``: that is a positive claim ("this
+    run has no worktree") manufactured from a failed observation, and the
+    schema documents this object as observed facts. The caller
+    (:func:`operator.compute_worktree_block`) turns the raise into
+    ``worktree: null`` — "unknown" — which is the honest rendering and keeps
+    `status` from contradicting a mutating verb that CAN read the list (R4).
     """
     if mode != MODE_DEDICATED:
         return WorktreeState(
             mode=mode, path=None, registered=False, present=False,
             locked_reason=None, prunable=None, head=None,
         )
-    try:
-        entry = observe(
-            repo_root, branch, common_dir=gitops.git_common_dir(repo_root)
-        )
-    except gitops.GitError:
-        entry = None
+    entry = observe(
+        repo_root, branch, common_dir=gitops.git_common_dir(repo_root)
+    )
     if entry is None:
         return WorktreeState(
             mode=mode, path=None, registered=False, present=False,
@@ -384,6 +384,14 @@ def _ensure_locked(
             slug=slug,
         )
     if entry is not None and entry.prunable is None and target.is_dir():
+        # F-004: a healthy tree is not enough — it must also still carry OUR
+        # anti-prune lock. A crash between `worktree add` and `worktree lock`
+        # (the `after_add` boundary) leaves exactly this shape: registered,
+        # non-prunable, on disk, and UNLOCKED. Returning here without checking
+        # adopted it permanently unlocked, so any other run's repository-wide
+        # prune could delete it mid-drive — the one failure §8.3's lock exists
+        # to prevent. Re-establishing the marker is the self-healing action.
+        _require_lock(repo_root, target, slug=slug, run_id=run_id, entry=entry)
         return RunWorktree(path=target, branch=branch)
     if entry is not None:
         # Registered but gone (or registered with a stale admin entry): §11
@@ -407,10 +415,7 @@ def _ensure_locked(
     except gitops.GitError as exc:
         # A tree that cannot be marked is a tree another run's prune may delete
         # mid-drive (E8-C). Undo rather than proceed unmarked.
-        try:
-            gitops.remove_worktree(repo_root, target)
-        except gitops.GitError:
-            pass
+        _discard_worktree(repo_root, target, slug=slug, run_id=run_id)
         raise WorktreeUnavailable(
             f"could not lock the run worktree for {slug!r} at {target}: {exc}. "
             "An unmarked run worktree can be pruned out from under a live run "
@@ -438,14 +443,91 @@ def _clear_registration(
         except gitops.GitError:
             pass
     if entry.path.is_dir():
-        try:
-            gitops.remove_worktree(repo_root, entry.path)
-        except gitops.GitError:
-            pass
+        _discard_worktree(
+            repo_root, entry.path, slug="<stale>", run_id="stale-registration"
+        )
     try:
         gitops.prune_worktrees(repo_root, expire="now")
     except gitops.GitError:
         pass
+
+
+def _require_lock(
+    repo_root: Path,
+    target: Path,
+    *,
+    slug: str,
+    run_id: str,
+    entry: gitops.WorktreeEntry,
+) -> None:
+    """Ensure an adopted tree carries THIS run's lock; fail closed otherwise.
+
+    Three cases, and the middle one is the reason this exists (F-004):
+
+    * already ours — nothing to do;
+    * **unlocked** — a crash between ``add`` and ``lock``. Establish it. This is
+      the self-healing half: the invariant is "a live run's tree is locked", and
+      an interrupted lifecycle should converge back to it rather than run
+      forever in a state that is silently prune-vulnerable;
+    * **locked by someone else** — a different run/id, or a human's manual
+      ``worktree lock``. Never steal it: a foreign marker is evidence we cannot
+      explain, and overwriting it is the same class of mistake as ``add -f``.
+    """
+    expected = lock_reason(slug, run_id)
+    current = entry.locked
+    if current == expected:
+        return
+    if current is None:
+        try:
+            gitops.lock_worktree(repo_root, target, reason=expected)
+            return
+        except gitops.GitError as exc:
+            raise WorktreeUnavailable(
+                f"run worktree {target} for {slug!r} is unlocked (a crash "
+                f"between `worktree add` and `worktree lock`) and the marker "
+                f"could not be re-established: {exc}. Driving it unlocked would "
+                "leave it deletable by any other run's prune (spike E8-C).",
+                slug=slug,
+            ) from exc
+    raise WorktreeUnavailable(
+        f"run worktree {target} for {slug!r} is locked by someone else: "
+        f"{current!r} (expected {expected!r}). Refusing to steal a marker this "
+        "engine did not place — it is evidence of another holder or a manual "
+        "`git worktree lock`. Inspect it, then `git -C "
+        f"{repo_root} worktree unlock {target}` if it is genuinely stale.",
+        slug=slug,
+    )
+
+
+def _discard_worktree(
+    repo_root: Path, path: Path, *, slug: str, run_id: str
+) -> str | None:
+    """The ONE forced-removal path: prove clean or snapshot, then remove (F-005).
+
+    ``gitops.remove_worktree`` is unconditionally ``--force``. Two cleanup
+    callers reached it directly — the failed-lock unwind and the stale-entry
+    clear — so a tree with uncommitted work could be destroyed without the
+    durable record R2 requires. The odds differ (a seconds-old tree is usually
+    empty; a stale registered tree may hold real work) but R2 does not scale
+    with odds, and one guarded helper is simpler than two justified exceptions.
+
+    Returns the snapshot ref when one was taken. Never raises: both callers are
+    already on an error/cleanup path. A tree that could not be preserved is
+    LEFT IN PLACE rather than force-removed — leaking a worktree is recoverable
+    (``gauntlet clean``), destroying uncommitted work is not.
+    """
+    ref: str | None = None
+    try:
+        ref = _snapshot_if_dirty(path, slug=slug, run_id=run_id, excludes=None)
+    except WorktreeUnavailable:
+        return None  # could not preserve → do not destroy
+    except (gitops.GitError, OSError):
+        return None
+    try:
+        gitops.remove_worktree(repo_root, path)
+    except gitops.GitError:
+        pass
+    return ref
 
 
 def recreate(

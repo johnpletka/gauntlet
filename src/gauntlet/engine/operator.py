@@ -703,6 +703,7 @@ def compute_status_assessment(
     liveness: str,
     *,
     run_instance_dir: Path,
+    work_root: Path | None = None,
 ) -> "RXM.RecoveryAssessment | None":
     """Build the shared recovery assessment for the read-only status surface.
 
@@ -713,6 +714,16 @@ def compute_status_assessment(
     ``None`` and the caller renders the pure state table instead — status
     must never crash or mutate because advisory git evidence was
     unavailable.
+
+    ``work_root`` (F-007) is the tree this run actually drives — the run
+    worktree for a `dedicated` run, the operator's checkout otherwise. R4 says
+    the read-only view and the mutating path must not disagree, and they
+    observe INDEX and WORKTREE planes: assessing the operator's checkout for a
+    dedicated run would let the operator's own uncommitted edits change the
+    recommendation while the run tree's real dirt stayed invisible, so `status`
+    and `resume` would describe different trees and recommend accordingly.
+    Defaults to ``repo_root``, which is the same-tree answer and every
+    pre-P7c caller's behaviour.
     """
     from gauntlet.engine import gitops
     from gauntlet.engine.execution import (
@@ -721,20 +732,25 @@ def compute_status_assessment(
         run_bookkeeping_excludes,
     )
 
+    work = work_root or repo_root
     try:
         artifact_root = run_instance_dir.parent
+        # The bookkeeping/artifact paths are the same RELATIVE strings in both
+        # trees (the run worktree mirrors the operator layout), so they are
+        # computed once against the operator checkout — where the run-instance
+        # dir actually lives — and applied to whichever tree is observed.
         excludes = run_bookkeeping_excludes(
             repo_root, run_instance_dir, artifact_root
         )
         record = RX._attempt_record(man)
         fingerprint = RX.build_progress_fingerprint(
-            repo_root, manifest=man, record=record, excludes=excludes
+            work, manifest=man, record=record, excludes=excludes
         )
     except (gitops.GitError, RX.RecoveryExecError, OSError, ValueError):
         return None  # unobservable environment: render the pure state table
     try:
         git_obs = RX.observe_git(
-            repo_root,
+            work,
             run_branch=man.branch,
             recorded_sha=RX.reconciliation_boundary(man),
             excludes=excludes,

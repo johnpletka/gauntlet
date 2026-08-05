@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- park reasons (PRD FR-7.2 enum) ------------------------------------------
 # The canonical ``parked_reason`` enum a PARKED step carries (harness-efficiency
@@ -753,6 +753,28 @@ class Manifest(BaseModel):
     # which is exactly the auto-migration spike §10 forbids. `config` is read in
     # exactly one place — `start()`, choosing what a NEW run is born as.
     worktree_mode: str | None = None
+
+    @field_validator("worktree_mode")
+    @classmethod
+    def _worktree_mode(cls, v: str | None) -> str | None:
+        """Reject a mode this engine cannot act on (F-006, fail closed).
+
+        Validated at LOAD as well as at construction, because the dangerous
+        direction is reading a manifest someone else wrote — a corrupt file, or
+        one from a forward version that knows a third mode. `None` stays valid:
+        it is every pre-P7c run.
+        """
+        if v is None:
+            return None
+        from gauntlet.engine.worktree import MODES
+
+        if v not in MODES:
+            raise ValueError(
+                f"worktree_mode must be one of {sorted(MODES)} or absent; got "
+                f"{v!r} — refusing to load a manifest whose tree layout this "
+                "engine cannot determine"
+            )
+        return v
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

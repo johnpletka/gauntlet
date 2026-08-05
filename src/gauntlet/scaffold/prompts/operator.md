@@ -131,8 +131,12 @@ behind that output. Drive every decision off the reported state class:
   --same-tree`, which drives THIS resume in your own checkout. `--same-tree` is
   one-shot: it is never persisted and never applied automatically.
 - **`worktree missing`** (a dedicated run whose tree is gone) — `status --json`
-  shows `worktree.registered: true` with `present: false` and git's own
-  `prunable` reason. The tree was swept (a reboot, a `/tmp` clean, an `rm -rf`)
+  shows `worktree.registered: true` with `present: false`; plain `status`
+  prints `worktree: MISSING at <path>`. Note `prunable` is usually **null**
+  here, not a reason string: a live run's tree is held under `git worktree
+  lock` for its whole life, and git does not report a locked worktree as
+  prunable. Registered-and-absent is the signal, not `prunable`.
+  The tree was swept (a reboot, a `/tmp` clean, an `rm -rf`)
   while the branch ref and the journal — the authoritative state — survived.
   This is recoverable by construction: action is plain `gauntlet resume
   <slug>`, which recreates the worktree from the branch plus journal state and

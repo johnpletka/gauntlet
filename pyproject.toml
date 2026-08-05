@@ -74,6 +74,7 @@ dev-dependencies = [
 testpaths = ["tests"]
 markers = [
     "integration: requires live CLI/API credentials; excluded by default",
+    "operator_tree_verb: drives `finish`/`clean`, which mutate the operator's checkout by design (spike §9.4) — exempt from the A1 invariance fixture",
 ]
 # `uv run pytest` runs units only; `uv run pytest -m integration` overrides.
 addopts = "-m 'not integration'"

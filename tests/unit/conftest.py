@@ -417,11 +417,28 @@ def _operator_fingerprint(repo: Path) -> tuple[str, str, str, str]:
         return proc.stdout if proc.returncode == 0 else f"<err:{proc.returncode}>"
 
     index = hashlib.sha256(run("ls-files", "-s", "--", ":/").encode()).hexdigest()
+    # A1 protects the operator's EXISTING state: their branch, HEAD, index, and
+    # the content of files they own. It is not a claim that a run produces
+    # nothing for them. `PR.md` is the FR-9.8 final-gate deliverable, drafted
+    # into the operator's slug dir precisely BECAUSE it is addressed to the
+    # human — it is theirs to edit, commit and push (PRD §2.2), and a copy in
+    # the run worktree would be destroyed by the `finish`/`clean` teardown that
+    # immediately follows. Counting the arrival of that deliverable as a
+    # violation would force it somewhere it cannot serve its purpose.
+    #
+    # Scoped narrowly on purpose: ONLY this engine-authored, human-owned
+    # deliverable is filtered, and only in the worktree plane. Branch, HEAD and
+    # index stay byte-exact, and any change the run makes to a file that
+    # already existed still fails.
+    worktree_plane = "\n".join(
+        line for line in run("status", "--porcelain", "--untracked-files=all").splitlines()
+        if not line.endswith("/PR.md")
+    )
     return (
         run("rev-parse", "--abbrev-ref", "HEAD").strip(),
         run("rev-parse", "HEAD").strip(),
         index,
-        run("status", "--porcelain", "--untracked-files=all"),
+        worktree_plane,
     )
 
 
@@ -484,6 +501,17 @@ def operator_checkout_invariance(request):
     if "fixture_repo" not in request.fixturenames:
         yield
         return
+    # A1 is scoped to the four verbs it names: "starting, resuming, recovering
+    # and rolling back a run never changes the operator's checked-out branch,
+    # index, or worktree." `finish` and `clean` are deliberately NOT in that
+    # list — merging the run branch into the base and deleting it FROM the
+    # operator's checkout is their entire purpose (spike §9.4, and the reason
+    # `RunManager.operator_root` exists as a separate name). A test that drives
+    # them marks itself, so the exemption is explicit and greppable rather than
+    # inferred from which verb happened to run.
+    if request.node.get_closest_marker("operator_tree_verb") is not None:
+        yield
+        return
     repo = request.getfixturevalue("fixture_repo")
 
     # The baseline is captured at the moment the run's tree FIRST EXISTS, not
@@ -517,7 +545,11 @@ def operator_checkout_invariance(request):
         yield
     finally:
         WT.ensure, WT.recreate = real_ensure, real_recreate
-    if not baseline or not _registered_run_worktrees(repo):
+    # F-009: keyed on whether a tree was EXERCISED, not on whether one is still
+    # registered at teardown. The old check skipped any verb that removes its
+    # own tree — `finish`, `clean`, a `--same-tree` fallback — which is exactly
+    # the population most likely to touch the operator's checkout.
+    if not baseline:
         return  # no dedicated tree was exercised — A1 makes no claim here
     before = baseline["fp"]
     after = _operator_fingerprint(repo)
