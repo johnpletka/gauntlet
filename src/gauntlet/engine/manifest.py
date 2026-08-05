@@ -739,6 +739,20 @@ class Manifest(BaseModel):
     # the fork manual-push note. Absent (``None``) for branch mode / heavyweight
     # runs; additive, so older manifests load unchanged.
     pr: ReviewPrRecord | None = None
+    # Which tree layout this run was BORN into (P7c, spike §13). Set once by
+    # `start()` from `config.worktree.mode` and never rewritten by a later
+    # verb. Additive and optional, so every pre-P7c manifest loads unchanged
+    # with ``None`` — which resolves to `same_tree`, the legacy population's
+    # mode forever (§16).
+    #
+    # This field exists to make auto-migration STRUCTURALLY impossible. A run's
+    # effective mode is resolved from evidence and from THIS record, never from
+    # the live config (`RunManager._effective_worktree_mode`): otherwise an
+    # operator flipping `worktree.mode: dedicated` on a repo with existing runs
+    # would silently move every one of them into a worktree on its next resume,
+    # which is exactly the auto-migration spike §10 forbids. `config` is read in
+    # exactly one place — `start()`, choosing what a NEW run is born as.
+    worktree_mode: str | None = None
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:

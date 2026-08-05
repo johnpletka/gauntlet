@@ -172,6 +172,60 @@ class RunPaths:
         """True once ``work_root`` is a tree distinct from the operator's."""
         return self.work_root != self.repo_root
 
+    def _mirror(self, path: Path, *, field: str) -> Path:
+        """``path``'s counterpart inside ``work_root``, at the same relative spot.
+
+        The run worktree mirrors the operator checkout's layout exactly, so a
+        human reading the run branch finds `<run_root>/<slug>/<run-id>/` and
+        `<run_root>/<slug>/prd.md` where they expect them, and the committed
+        history of a `dedicated` run is byte-comparable with a `same_tree`
+        one's. Same-tree callers get the path back unchanged, which is what
+        makes every consumer below a no-op before P7c's flag is set.
+        """
+        if not self.dedicated_worktree:
+            return path
+        try:
+            rel = path.resolve().relative_to(self.repo_root.resolve())
+        except ValueError:
+            raise StateDirNotContained(
+                f"{field} {str(path)!r} does not resolve inside the operator "
+                f"checkout {str(self.repo_root)!r}, so it has no counterpart in "
+                f"the run worktree {str(self.work_root)!r}. A dedicated-worktree "
+                "run keeps its state in the operator's checkout by construction "
+                "(spike §4.4); an uncontained one cannot be mirrored, and "
+                "guessing would silently disable the bookkeeping allowlist."
+            ) from None
+        return self.work_root / rel
+
+    @property
+    def bookkeeping_root(self) -> Path:
+        """Where the engine's COMMITTABLE bookkeeping lives, in the work tree.
+
+        This is the answer to "relative to WHICH root?" for every bookkeeping
+        path builder below. Same-tree it is ``state_root`` itself — the
+        run-instance dir, unchanged since P6. Dedicated it is the two-file
+        EXPORT dir inside the run worktree (spike §4.4), because the FR-2.2
+        checkpoint commit must stage a path that exists in the branch's tree,
+        and ``state_root`` deliberately is not in that tree.
+
+        The authority question this raises is answered in
+        ``worktree.write_bookkeeping_export``: the journal under ``state_root``
+        is authoritative (R8), ``state_root/manifest.json`` is its live
+        projection, and the export is write-only — one writer, zero readers.
+        """
+        return self._mirror(self.state_root, field="state root")
+
+    @property
+    def artifact_root_in_work(self) -> Path:
+        """``artifact_root``'s counterpart in the work tree (spike §14.2).
+
+        The operator's checkout stays the governed-artifact AUTHORING surface
+        (ratified §14.2 option A) and is what the engine reads, validates and
+        hashes. This is the tree copy — what the run branch actually commits —
+        which the sync keeps in step on every mutating contact.
+        """
+        return self._mirror(self.artifact_root, field="artifact root")
+
     def git_common_dir(self) -> Path:
         """The shared git dir, identical from every worktree (spike E1/E8).
 
@@ -264,6 +318,42 @@ class StepContext:
 
     def steps_dir(self) -> Path:
         return self.run_dir / "steps"
+
+    @property
+    def bookkeeping_root(self) -> Path:
+        """This step's committable bookkeeping dir, in the tree it commits in.
+
+        ``run_dir`` same-tree; the run worktree's export dir under `dedicated`
+        (spike §4.4). Handlers that stage bookkeeping paths must ask THIS, never
+        ``run_dir`` — under `dedicated` the run dir is not in the work tree at
+        all, and the builders would fail closed rather than answer.
+        """
+        return self.paths.bookkeeping_root
+
+    @property
+    def artifact_root_in_work(self) -> Path:
+        """The governed artifacts' location in the work tree (spike §14.2)."""
+        return self.paths.artifact_root_in_work
+
+    def refresh_bookkeeping_export(self) -> None:
+        """Re-materialize the two-file export from the live projection (§4.4).
+
+        No-op same-tree. Must run before any handler stages bookkeeping paths
+        under `dedicated`, or the existence filter in
+        :func:`run_bookkeeping_paths` returns ``[]`` and the commit silently
+        no-ops — the FR-2.2 audit-trail loss spike §9.3 catalogued.
+        """
+        if not self.paths.dedicated_worktree:
+            return
+        from gauntlet.engine import worktree as WT
+
+        WT.write_bookkeeping_export(
+            self.work_root or self.repo_root,
+            self.run_dir,
+            self.config.run_root,
+            self.manifest.slug,
+            self.manifest.run_id,
+        )
 
 
 Handler = Callable[[Step, StepContext], StepResult]

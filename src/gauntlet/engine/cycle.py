@@ -153,6 +153,10 @@ def _persist_manifest(ctx: StepContext) -> None:
         ctx.persist()
     else:  # pragma: no cover - exercised only outside the orchestrator
         ctx.manifest.write_atomic(ctx.run_dir / "manifest.json")
+    # Every cycle site that stages bookkeeping paths flushes through here
+    # first, so this is the one place the run worktree's export dir has to be
+    # refreshed to keep those paths existing-and-current (P7c, spike §4.4).
+    ctx.refresh_bookkeeping_export()
 
 
 def _checkpoint(
@@ -403,11 +407,11 @@ def _apply_cycle_rewind(
         recorded_sha=recorded_sha,
         excludes=ctx.excludes,
         bookkeeping_candidates=engine_bookkeeping_candidates(
-            repo, ctx.run_dir,
+            repo, ctx.bookkeeping_root,
             state_outside_worktree=ctx.state_outside_worktree,
         ),
         approved_artifacts=governed_artifact_paths(
-            repo, ctx.artifact_root,
+            repo, ctx.artifact_root_in_work,
             artifacts_outside_worktree=ctx.artifacts_outside_worktree,
         ),
     )
@@ -457,11 +461,15 @@ def _apply_cycle_rewind(
         clean_excludes=tuple(ctx.excludes or ()),
     )
     executor = RX.RecoveryExecutor(
-        repo,
+        # repo_root is the OPERATOR's checkout (run-instance dir, drive lock,
+        # projection — all of which stay there, spike §4.4); work_root is the
+        # tree this rewind mutates. `repo` above is already the work tree.
+        ctx.repo_root,
         ctx.run_dir,
         run_id=ctx.manifest.run_id,
         run_root=ctx.config.run_root,
         excludes=ctx.excludes,
+        work_root=repo,
     )
     return executor.apply(
         assessment,
@@ -514,7 +522,7 @@ def _reset_dirty_to_handoff(
         f"round {rnd} (P5 re-enter at fix)"
     )
     paths = run_bookkeeping_paths(
-        ctx.work_root, ctx.run_dir,
+        ctx.work_root, ctx.bookkeeping_root,
         state_outside_worktree=ctx.state_outside_worktree,
     )
     preserving = (
@@ -527,7 +535,7 @@ def _reset_dirty_to_handoff(
         # Flush first so the preserved bookkeeping carries the latest state.
         _persist_manifest(ctx)
         paths = run_bookkeeping_paths(
-            ctx.work_root, ctx.run_dir,
+            ctx.work_root, ctx.bookkeeping_root,
             state_outside_worktree=ctx.state_outside_worktree,
         )
         entry = (
@@ -790,7 +798,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 f"gauntlet: flush run bookkeeping before "
                 f"{phase or ctx.record.id} round-{rnd} review handoff",
                 run_bookkeeping_paths(
-                    ctx.work_root, ctx.run_dir,
+                    ctx.work_root, ctx.bookkeeping_root,
                     state_outside_worktree=ctx.state_outside_worktree,
                 ),
                 identity=gitops.ENGINE_IDENTITY,

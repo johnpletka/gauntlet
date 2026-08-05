@@ -42,6 +42,7 @@ from gauntlet.engine.execution import (
     INTERRUPTED,
     PARKED,
     SKIPPED,
+    RunPaths,
     StepContext,
     StepResult,
     engine_bookkeeping_candidates,
@@ -201,12 +202,60 @@ class Orchestrator:
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
         # dirty checks / commits — real run artifacts stay visible (review F-001).
+        # The single roots policy object for this drive (P7c, problem B). Every
+        # bookkeeping path below asks IT "relative to which root?" rather than
+        # each site re-deriving the answer from `work_root`/`run_dir` — which is
+        # exactly the conflation P7a named and P7c makes observable, because
+        # under `dedicated` the run-instance dir is NOT in the tree we commit in.
+        self.paths = RunPaths(
+            repo_root=repo_root,
+            work_root=self.work_root,
+            state_root=run_dir,
+            artifact_root=artifact_root,
+            state_outside_worktree=state_outside_worktree,
+        )
         self.excludes = run_bookkeeping_excludes(
-            self.work_root, run_dir, artifact_root,
+            self.work_root, self.bookkeeping_root, self.artifact_root_in_work,
             state_outside_worktree=state_outside_worktree,
         )
         self._ignore_run_dir()
         self._seed_artifacts()
+
+    @property
+    def bookkeeping_root(self) -> Path:
+        """Where this drive's committable bookkeeping lives IN THE WORK TREE.
+
+        ``run_dir`` same-tree; the run worktree's two-file export dir under
+        `dedicated` (spike §4.4). See :attr:`RunPaths.bookkeeping_root`.
+        """
+        return self.paths.bookkeeping_root
+
+    @property
+    def artifact_root_in_work(self) -> Path:
+        """The governed artifacts' location in the work tree (spike §14.2)."""
+        return self.paths.artifact_root_in_work
+
+    def _refresh_bookkeeping_export(self) -> None:
+        """Re-materialize the export dir from the live projection (§4.4).
+
+        A no-op same-tree. Under `dedicated` this is the ONLY writer of the
+        exported ``manifest.json``/``RUN.md``, and it runs immediately before
+        every bookkeeping commit — so the committed audit trail is always the
+        state as of that commit, and the export is never read back to make a
+        decision. See ``worktree.write_bookkeeping_export`` for why that
+        asymmetry is the design.
+        """
+        if not self.paths.dedicated_worktree:
+            return
+        from gauntlet.engine import worktree as WT
+
+        WT.write_bookkeeping_export(
+            self.work_root,
+            self.run_dir,
+            self.config.run_root,
+            self.manifest.slug,
+            self.manifest.run_id,
+        )
 
     def _ignore_run_dir(self) -> None:
         """Keep the engine's own live run-instance dir out of the worktree state.
@@ -849,7 +898,7 @@ class Orchestrator:
         if not gitops.is_dirty_vs(
             self.work_root, rec.base_sha, exclude=self.excludes,
             bookkeeping=engine_bookkeeping_candidates(
-                self.work_root, self.run_dir,
+                self.work_root, self.bookkeeping_root,
                 state_outside_worktree=self.state_outside_worktree,
             ),
         ):
@@ -1003,11 +1052,11 @@ class Orchestrator:
             recorded_sha=rec.base_sha,
             excludes=self.excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(
-                repo, self.run_dir,
+                repo, self.bookkeeping_root,
                 state_outside_worktree=self.state_outside_worktree,
             ),
             approved_artifacts=governed_artifact_paths(
-                repo, self.artifact_root,
+                repo, self.artifact_root_in_work,
                 artifacts_outside_worktree=self.artifacts_outside_worktree,
             ),
         )
@@ -1054,12 +1103,16 @@ class Orchestrator:
             clean_excludes=tuple(clean_excludes),
         )
         executor = RX.RecoveryExecutor(
-            repo,
+            # repo_root is the OPERATOR's checkout — it resolves the run-instance
+            # dir, the drive lock and the projection, all of which stay there by
+            # design (spike §4.4). work_root is the tree the rewind mutates.
+            self.repo_root,
             self.run_dir,
             run_id=self.manifest.run_id,
             run_root=self.config.run_root,
             excludes=self.excludes,
             clock=self.clock,
+            work_root=self.work_root,
         )
         return executor.apply(
             assessment,
@@ -1443,7 +1496,7 @@ class Orchestrator:
             return gitops.is_dirty_vs(
                 self.work_root, rec.base_sha, exclude=self.excludes,
                 bookkeeping=engine_bookkeeping_candidates(
-                    self.work_root, self.run_dir,
+                    self.work_root, self.bookkeeping_root,
                     state_outside_worktree=self.state_outside_worktree,
                 ),
             )
@@ -2059,6 +2112,12 @@ class Orchestrator:
         # Keep RUN.md consistent with the manifest we are about to commit (the
         # manifest is authoritative; RUN.md is its derived index).
         write_run_index(self.run_dir, self.manifest, self.writer)
+        # Materialize the export dir BEFORE resolving the paths to stage: under
+        # `dedicated` those paths are inside the run worktree and would not
+        # exist yet, so `run_bookkeeping_paths`' existence filter would return
+        # [] and this commit would silently no-op — the exact FR-2.2 audit-trail
+        # loss spike §9.3 catalogued.
+        self._refresh_bookkeeping_export()
         paths = self._bookkeeping_paths()
         if not paths:
             return None
@@ -2074,7 +2133,7 @@ class Orchestrator:
         fix-rerun rewinds) force-stages.
         """
         return run_bookkeeping_paths(
-            self.work_root, self.run_dir,
+            self.work_root, self.bookkeeping_root,
             state_outside_worktree=self.state_outside_worktree,
         )
 

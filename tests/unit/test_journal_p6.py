@@ -88,6 +88,21 @@ def test_journal_lifecycle_literals_match_manifest_constants():
 
 
 def test_event_vocabulary_is_the_plan_4_6_set_plus_genesis():
+    """The plan §4.6 vocabulary, plus genesis, plus P7c's two audit kinds.
+
+    Rewritten in P7c because the phase legitimately extends the vocabulary and
+    this guard pins it exactly. The pin is still doing its job: the point is
+    that a NEW kind cannot appear without a deliberate edit here, not that the
+    set is frozen forever — spike §16 explicitly allows
+    ``WorktreeAdopted``/``WorktreeReleased`` as additive within the existing
+    extension pattern, with no journal schema-version bump.
+
+    Both new kinds are STATE-LESS audit events (`append_audit`). That is the
+    load-bearing part: the authoritative answer to "does this run have a
+    worktree?" is ``git worktree list --porcelain`` (spike §10 makes that the
+    detection rule precisely so it never depends on an event having landed), so
+    these record the transition without joining the state chain.
+    """
     assert set(J.EVENT_KINDS) == {
         "JournalGenesis",
         "AttemptStarted",
@@ -102,6 +117,8 @@ def test_event_vocabulary_is_the_plan_4_6_set_plus_genesis():
         "RecoveryActionApplied",
         "StepCompleted",
         "RunStatusChanged",
+        "WorktreeAdopted",
+        "WorktreeReleased",
     }
 
 

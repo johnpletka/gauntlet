@@ -477,6 +477,45 @@ class ReviewConfig(BaseModel):
     state_dir: str | None = None
 
 
+class WorktreeConfig(BaseModel):
+    """The optional `worktree:` block (P7c, spike §13).
+
+    ``mode`` chooses which tree a run's agents edit and the engine commits in:
+
+    * ``same_tree`` (**the default, and what P7c ships with**) — the pre-P7
+      layout: the run drives the operator's own checkout. Every run started
+      before P7c is this mode forever (spike §10/§16), and it stays the
+      documented fallback for any adopter layout that cannot host a worktree.
+    * ``dedicated`` — the run gets its own linked worktree at the derived path
+      ``<git-common-dir>/gauntlet/worktrees/<slug>/<run-id>`` (§6.2). There is
+      deliberately **no path knob**: a configurable root would need a
+      ``resolve()``-based containment validator, and spike E9-C proves the
+      string-based check this module already has is defeated by a symlink
+      (§6.4, deferral D2).
+
+    The default is `same_tree` because §13's phasing makes flipping it a
+    separate stage (P7d) gated on a dogfood run that exercises §11 rows 2, 5
+    and 10. So P7's acceptance criteria A1/A2/A3 hold for runs a human has
+    explicitly opted in — not for runs in general — until that gate passes.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    mode: str = "same_tree"
+
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v: str) -> str:
+        from gauntlet.engine.worktree import MODES
+
+        value = (v or "").strip()
+        if value not in MODES:
+            raise ValueError(
+                f"worktree.mode must be one of {sorted(MODES)}; got {v!r}"
+            )
+        return value
+
+
 class CollectorConfig(BaseModel):
     """Per-collector enumeration overrides (FR-3.2, PR #59 review F4).
 
@@ -518,6 +557,10 @@ class RunConfig(BaseModel):
     # repos with `asset_root: .gauntlet` so every gauntlet-owned file lives under
     # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
     asset_root: str = "."
+    # Which tree a run's agents edit (P7c, spike §13). Defaults to the pre-P7
+    # `same_tree` layout; `dedicated` is opt-in until P7d flips it. See
+    # WorktreeConfig — the worktree PATH is derived and has no knob (§6.4).
+    worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
     test_command: str = "uv run pytest"
     # Per-collector enumeration command overrides (FR-3.2, PR #59 review F4):
     # `collectors: {pytest: {command: "hatch run pytest"}}`. Absent, the pytest

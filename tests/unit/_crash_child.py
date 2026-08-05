@@ -27,6 +27,21 @@ that the parent SIGKILLs at a precise point in the kill-timing matrix:
   orchestrator persists: every projection write in the process), so its
   matrix covers every event-append/projection-write boundary in a real run.
 
+- ``wt:<point>:<sig>`` (P7c): a real process death at one of the five
+  worktree-lifecycle boundaries, each mapping to exactly one row of the spike
+  §11 recovery table so the fault matrix and that table cannot drift —
+
+  * ``before_add``    — §11 rows 1/8: creation crash / partial create. No admin
+    entry, but the BRANCH survives (E6-C), so a retry must not trip over it;
+  * ``after_add``     — §11 row 6: the admin entry exists with no anti-prune
+    lock yet, the window in which another run's prune could take it;
+  * ``after_lock``    — §11 row 5: locked but the export dir is not written, so
+    the first bookkeeping commit has no path to stage;
+  * ``before_remove`` — §11 row 3: teardown crash with the tree still present
+    and the branch still held, which is what blocks a later ``branch -D``;
+  * ``after_remove``  — §11 row 2: the tree is gone and ``WorktreeReleased`` was
+    never appended, so the journal and git disagree.
+
 - ``lock:<point>:<sig>`` (P7b): a real process death at one of the three
   boundaries the split drive lock introduces —
 
@@ -179,6 +194,29 @@ def _arm_lock_boundary_kill(spec: str) -> None:
     RunManager._release_worktree_lock = release
 
 
+def _arm_worktree_boundary_kill(spec: str) -> None:
+    """Self-signal at a worktree-lifecycle boundary (``wt:<point>:<sig>``, P7c).
+
+    Uses the module's own ``_boundary_hook`` seam rather than wrapping public
+    functions, so the kill lands INSIDE the critical section (between the git
+    calls) rather than merely around it — which is the only way to leave the
+    half-states §11 rows 1/2/5/6 describe.
+    """
+    from gauntlet.engine import worktree as WT
+
+    _, point, sig_name = spec.split(":")
+    sig = signal.SIGKILL if sig_name == "kill" else signal.SIGTERM
+    if point not in WT._BOUNDARIES:
+        raise SystemExit(f"unknown worktree boundary {point!r}; "
+                         f"known: {list(WT._BOUNDARIES)}")
+
+    def hook(reached: str) -> None:
+        if reached == point:
+            signal.raise_signal(sig)
+
+    WT._boundary_hook = hook
+
+
 def main() -> int:
     repo, slug = Path(sys.argv[1]), sys.argv[2]
     mode = sys.argv[3] if len(sys.argv) > 3 else "mid_step"
@@ -187,6 +225,9 @@ def main() -> int:
         adapter = CompletingAdapter()
     elif mode.startswith("lock:"):
         _arm_lock_boundary_kill(mode)
+        adapter = CompletingAdapter()
+    elif mode.startswith("wt:"):
+        _arm_worktree_boundary_kill(mode)
         adapter = CompletingAdapter()
     else:
         adapter = CompletingAdapter() if mode == "between_step" else SleepyAdapter()

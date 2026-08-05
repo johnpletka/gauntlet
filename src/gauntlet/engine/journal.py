@@ -77,6 +77,15 @@ EVENT_KINDS = (
     "RecoveryActionApplied",
     "StepCompleted",
     "RunStatusChanged",
+    # P7c worktree lifecycle (spike §10). Additive within the existing
+    # extension pattern — no schema-version bump (§16) — and deliberately
+    # STATE-LESS audit events (`append_audit`), never state-carrying ones:
+    # the authoritative answer to "does this run have a worktree?" is
+    # `git worktree list --porcelain`, which §10 makes the detection rule
+    # precisely so it never depends on an event having landed. These are the
+    # transition record — who adopted what, when, and at which SHA.
+    "WorktreeAdopted",
+    "WorktreeReleased",
 )
 
 # Lifecycle literals, pinned 1:1 to manifest.py's constants by

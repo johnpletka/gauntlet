@@ -1356,6 +1356,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "suspension",
     "gate",
     "projection",
+    "worktree",
     "steps",
     "next_actions"
   ],
@@ -1645,6 +1646,43 @@ _STATUS_SCHEMA_JSON = r'''{
               "reasoning": {"type": ["string", "null"]}
             }
           }
+        }
+      }
+    },
+    "worktree": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["mode", "path", "registered", "present", "locked_reason", "prunable", "head"],
+      "description": "Which tree this run's agents edit (recovery-redesign P7c, spike \u00a76.2/\u00a713). Always present. `mode` is resolved from EVIDENCE and from what the run recorded at birth, never from the live `worktree.mode` config \u2014 flipping that config never moves an existing run (spike \u00a710: a pre-P7 run is never auto-migrated, and never wedged). A `same_tree` run reports mode `same_tree` with every other field null/false: it drives the operator's own checkout, which is the pre-P7 layout and the mode of every run started before P7c. A `dedicated` run reports the derived worktree path under the git common dir. `registered` is whether git's worktree administration knows the tree; `present` is whether it is actually on disk \u2014 registered-but-absent is spike \u00a711 row 2 (the tree was swept or deleted while the branch ref and the journal survived) and is recreatable from refs plus journal state. `prunable` carries git's own reason string for that case. `locked_reason` is the `git worktree lock --reason` marker held for the life of a live run, which is the only thing that stops another run's prune from removing this run's admin entry. Observed facts only \u2014 never a recommendation; actions belong in next_actions.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["same_tree", "dedicated"],
+          "description": "The tree layout this run drives in."
+        },
+        "path": {
+          "type": ["string", "null"],
+          "description": "Absolute path of the run worktree; null for a `same_tree` run or a `dedicated` run with no registered tree."
+        },
+        "registered": {
+          "type": "boolean",
+          "description": "Whether `git worktree list` registers a worktree for this run's branch."
+        },
+        "present": {
+          "type": "boolean",
+          "description": "Whether the registered worktree is actually on disk."
+        },
+        "locked_reason": {
+          "type": ["string", "null"],
+          "description": "The `git worktree lock --reason` text, or null when unlocked."
+        },
+        "prunable": {
+          "type": ["string", "null"],
+          "description": "Git's own reason string when the admin entry is prunable (spike \u00a711 row 2), else null."
+        },
+        "head": {
+          "type": ["string", "null"],
+          "description": "The worktree's HEAD SHA as git reports it, or null."
         }
       }
     },
@@ -2114,6 +2152,44 @@ def _escalated_findings(run_instance_dir: Path, redact) -> list[dict]:
     return out
 
 
+def compute_worktree_block(
+    repo_root: Path, man: "M.Manifest", *, mode: str | None = None
+) -> dict | None:
+    """The §6.1 ``worktree`` object for one run (P7c). I/O-bearing.
+
+    Kept out of :func:`status_payload` so that serializer stays pure, exactly
+    like ``gate`` and ``current_step_freshness``.
+
+    ``mode`` is the run's EFFECTIVE mode, resolved by
+    ``RunManager._effective_worktree_mode`` — evidence plus what the run
+    recorded at birth, never the live config. Passing it in rather than
+    re-deriving it here is deliberate: one resolution rule, one place, so the
+    status surface and the mutating verbs can never disagree about which tree a
+    run drives (R4).
+
+    Returns ``None`` only when git cannot be observed at all, which renders as
+    ``worktree: null`` — "unknown", which is a different statement from
+    ``mode: "same_tree"`` ("this run drives your own checkout").
+    """
+    from gauntlet.engine import worktree as WT
+
+    if mode is None:
+        mode = man.worktree_mode or WT.MODE_SAME_TREE
+    try:
+        state = WT.describe(repo_root, mode=mode, branch=man.branch)
+    except Exception:  # pragma: no cover - status must never fail on observation
+        return None
+    return {
+        "mode": state.mode,
+        "path": str(state.path) if state.path is not None else None,
+        "registered": state.registered,
+        "present": state.present,
+        "locked_reason": state.locked_reason,
+        "prunable": state.prunable,
+        "head": state.head,
+    }
+
+
 def compute_gate_context(
     man: Manifest,
     run_instance_dir: Path,
@@ -2180,6 +2256,7 @@ def status_payload(
     now: datetime | None = None,
     current_step_timeout_s: float | None = None,
     projection: dict | None = None,
+    worktree: dict | None = None,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -2199,6 +2276,14 @@ def status_payload(
     ``current_step_freshness: null``; a number renders as the nested object
     ``{ "last_event_age_s": <number> }`` — the **object** is the nullable unit,
     never a top-level ``last_event_age_s`` (§6.1).
+
+    ``worktree`` is the P7c tree-layout block, assembled by the I/O-bearing
+    :func:`compute_worktree_block` in the caller and threaded in the same way.
+    It is ALWAYS rendered (never omitted): a `same_tree` run renders the
+    `same_tree` object rather than ``null``, because "this run drives your own
+    checkout" is a fact the operator needs, not an absence. ``None`` here means
+    the caller could not observe git at all, which renders as ``worktree:
+    null`` — the honest "unknown", distinct from "same_tree".
 
     ``gate`` is the FR-8.1 gate decision context, assembled by the I/O-bearing
     :func:`compute_gate_context` in the caller and threaded in the same way (so
@@ -2267,6 +2352,7 @@ def status_payload(
         # warn-don't-park default). Always present; an empty array when none.
         "warnings": list(man.warnings),
         "quota": quota,
+        "worktree": worktree,
         "driver": {
             "state": driver.state,
             "pid": driver.pid,

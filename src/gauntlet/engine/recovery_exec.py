@@ -2268,8 +2268,14 @@ class RecoveryExecutor:
         for attempt in range(20):
             snapshot_id = base_id if attempt == 0 else f"{base_id}-{attempt + 1}"
             try:
+                # The snapshot hashes a WORKING TREE (its index and its file
+                # contents), so it must be taken of the tree this executor is
+                # about to rewind — never the operator's checkout (P7c). The
+                # static ROOT_SCOPE audit cannot see this: `create_snapshot` is
+                # not a `gitops.*` call, which is precisely why the roots have
+                # to be carried rather than re-chosen per site.
                 return git_snapshot.create_snapshot(
-                    self.repo_root,
+                    self.work_root,
                     run_id=self.run_id,
                     snapshot_id=snapshot_id,
                     attempt_id=request.attempt_id,
@@ -2365,7 +2371,9 @@ class RecoveryExecutor:
     # -- replay (idempotent convergence of a surviving intent) -----------------
 
     def _replay(self, intent: RecoveryIntent) -> str:
-        return replay_intent(self.repo_root, self.run_dir, intent)
+        # `replay_intent` checks out, resets and cleans — every one of them a
+        # working-tree mutation, so it takes the WORK root (P7c).
+        return replay_intent(self.work_root, self.run_dir, intent)
 
 
 def _tree_entry(repo: Path, tree: str, rel: str) -> tuple[str, str] | None:
@@ -2811,17 +2819,22 @@ def _append_manifest_warning(run_dir: Path, note: str) -> None:
         man.write_atomic(path)
 
 
-def replay_pending_intent(repo: Path, run_dir: Path) -> str | None:
+def replay_pending_intent(work_root: Path, run_dir: Path) -> str | None:
     """Replay a surviving intent if one exists; ``None`` when there is none.
 
     The hook every mutating command calls after taking the lock: a killed
     transaction is converged (or fails closed with named evidence) before any
     new work runs against the repository.
+
+    Takes the WORK root (P7c): the replay checks out, resets and cleans, so it
+    converges the tree the run drives. ``run_dir`` stays the operator-checkout
+    run-instance dir — a surviving intent must outlive the tree its replay
+    repairs (spike §9.5), which is the whole reason §4.4 leaves it there.
     """
     intent = load_intent(run_dir)
     if intent is None:
         return None
-    return replay_intent(repo, run_dir, intent)
+    return replay_intent(work_root, run_dir, intent)
 
 
 __all__ = [

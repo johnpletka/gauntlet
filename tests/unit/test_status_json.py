@@ -227,6 +227,16 @@ def test_section_6_2_example_validates():
         # Additive P6 field (recovery-redesign plan §4.6): journal ↔ projection
         # agreement — always present, null when the projection is healthy.
         "projection": None,
+        # Additive P7c field (spike §6.2/§13): which tree this run drives.
+        # Always present. This example is a run in the pre-P7c layout, which is
+        # the default and the mode of every run started before P7c — so it
+        # renders the `same_tree` OBJECT, not null. Null is reserved for "git
+        # could not be observed", which is a different statement.
+        "worktree": {
+            "mode": "same_tree", "path": None, "registered": False,
+            "present": False, "locked_reason": None, "prunable": None,
+            "head": None,
+        },
         "steps": [
             {"id": "prd-cycle", "iteration": None, "status": "done",
              "duration_s": 620.0, "notes": None,

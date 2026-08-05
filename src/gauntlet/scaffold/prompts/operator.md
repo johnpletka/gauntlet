@@ -71,6 +71,12 @@ behind that output. Drive every decision off the reported state class:
   named artifact file directly, then plain `gauntlet resume <slug>` re-runs
   **only the validator** (no agent re-run). The edit is audited: content hashes
   at park and at resume are recorded in the manifest.
+  **Edit the copy in YOUR OWN checkout**, always — never one inside a run
+  worktree. Your checkout is the authoring surface for `prd.md`/`plan.md`: it
+  is what the engine reads, validates and hashes, and the resume publishes your
+  bytes into the run's tree for you. A dedicated run's tree also holds those
+  files, but editing them there edits a disposable copy the next sync
+  overwrites.
 - **`failed`** — a step failed. Action: read the evidence with `gauntlet logs
   <slug>` (and the failed step's `notes` + engine-stamped `halt_reason`), then
   recover by failure kind:
@@ -100,7 +106,12 @@ behind that output. Drive every decision off the reported state class:
   `prd.md`/`plan.md` edit is surfaced loudly through the artifact's own gate,
   never refused or discarded. It re-parks (fast, zero agent work) only when
   the killed attempt left *uncommitted* work vs the step's recorded base — the
-  park message shows the dirty verdict (uncommitted paths). Repeating a resume
+  park message shows the dirty verdict (uncommitted paths). **Check which tree
+  those paths are in.** For a dedicated run they are in the run worktree, not
+  your checkout — so `git status` where you are standing can read *clean* while
+  the verb refuses on dirtiness, and the two are not in conflict. `status
+  --json` prints `worktree.path`; inspect with `git -C <that path> status`.
+  Repeating a resume
   that changes nothing exits nonzero, naming the unchanged state and the
   executable safe actions — never a silent re-park loop. The
   sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it preserves
@@ -109,6 +120,25 @@ behind that output. Drive every decision off the reported state class:
   committed `P<N> wip:` checkpoint (committed milestones survive), and re-runs
   the step cleanly. One-shot — the configured `interrupted_step` policy is
   unchanged. Never reach for `git reset` on a run branch instead.
+- **`worktree_unavailable`** — the run is configured for a dedicated worktree
+  (`worktree.mode: dedicated`) and that tree could not be created, locked, or
+  verified: the path was taken, the branch is checked out somewhere else, the
+  disk filled, or the repo has uninitialized submodules. **Nothing was moved
+  or modified** — the run is exactly where it was, and the engine did *not*
+  quietly fall back to your checkout. `status` names the reason and the git
+  error verbatim. Action: fix what the message names and `gauntlet resume
+  <slug>`, or take the operator-chosen fallback `gauntlet resume <slug>
+  --same-tree`, which drives THIS resume in your own checkout. `--same-tree` is
+  one-shot: it is never persisted and never applied automatically.
+- **`worktree missing`** (a dedicated run whose tree is gone) — `status --json`
+  shows `worktree.registered: true` with `present: false` and git's own
+  `prunable` reason. The tree was swept (a reboot, a `/tmp` clean, an `rm -rf`)
+  while the branch ref and the journal — the authoritative state — survived.
+  This is recoverable by construction: action is plain `gauntlet resume
+  <slug>`, which recreates the worktree from the branch plus journal state and
+  verifies the recreated HEAD matches the journal head before driving. Do
+  **not** hand-run `git worktree add`; the engine also re-establishes the
+  anti-prune lock that stops another run's cleanup from removing it again.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
 - **`unknown`** — an unrecognized or internally contradictory manifest. Action:
@@ -155,6 +185,23 @@ Work top-down; stop at the first branch that matches.
 
 ## 3. Gates and responses (the routine pauses)
 
+**Reading the diff a gate is gating.** Do this from your own checkout, without
+checking anything out:
+
+```
+git log --oneline <base>..gauntlet/<slug>
+git diff <base>...gauntlet/<slug>
+git show gauntlet/<slug>
+```
+
+All three are read-only and disturb nothing — this is the better habit in every
+mode. For a **dedicated** run it is the only one that works: the run branch is
+checked out in the run's own worktree, and git refuses a second checkout of the
+same branch (`fatal: 'gauntlet/<slug>' is already used by worktree at ...`).
+Never `git checkout gauntlet/<slug>`. If you want a browsable copy, make your
+own worktree off the branch's tip — never adopt or edit the run's.
+
+
 - **Approve** a parked `human_gate` only after you have actually reviewed what it
   is gating: `gauntlet approve <slug>`. Approval is a human ratification, not a
   formality — see the guardrails.
@@ -197,7 +244,9 @@ the end-of-phase-N boundary together (FR-9.9) — they never disagree afterward.
 Before any rewind it writes a backup ref and a manifest snapshot, so every
 rollback is reversible. The guards, in order:
 
-- **Dirty worktree** → refuses; commit or discard first (only engine
+- **Dirty worktree** → refuses; commit or discard first. The refusal names the
+  tree it inspected — for a dedicated run that is the run worktree
+  (`status --json` → `worktree.path`), not your checkout (only engine
   bookkeeping and `PR.md` are exempt).
 - **Branch tip vs last recorded commit:** equal, or ahead by only engine
   bookkeeping commits → proceeds. Ahead by *real* unmanifested commits that
@@ -248,6 +297,16 @@ defeats the safety the pipeline is built on.
   explicitly invites you to hand-fix the named artifact — that path is designed
   for it, and the resume revalidates and records the edit (content-hash audit)
   rather than trusting it blindly. No other state licenses an edit.
+
+  With `worktree.mode: dedicated` this guardrail stops being something you hold
+  in your head and becomes **structural**: the builder's tree is a separate
+  directory under the git common dir that you have no reason to open, rather
+  than files sitting in your own editor. That is the clearest operator-facing
+  win of the dedicated layout. The trade, stated plainly: you also lose the
+  ability to watch the agent's work appear in your file tree. Use `gauntlet
+  logs <slug>` for the live transcript, `git diff <base>...gauntlet/<slug>`
+  for committed progress, and `status --json` → `worktree.path` when you
+  genuinely need to look at the tree itself.
 
 ## 7. Operating a `gauntlet review` run (the lightweight surface)
 

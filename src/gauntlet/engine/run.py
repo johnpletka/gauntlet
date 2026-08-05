@@ -21,6 +21,7 @@ import socket
 import sys
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,10 +33,12 @@ from gauntlet.engine import (
     manifest as M,
     prd_stub,
     recovery_exec as RX,
+    worktree as WT,
 )
 from gauntlet.engine.recovery import AbortAction, NoProgressError
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
+    RunPaths,
     engine_bookkeeping_candidates,
     governed_artifact_paths,
     human_owned_excludes,
@@ -182,6 +185,16 @@ def _reservation_matches(run_dir: Path, token: str | None) -> bool:
 
 class ActiveRunError(RuntimeError):
     """`start()` refused because a non-terminal run is already active."""
+
+
+class WorktreeUnavailableError(RuntimeError):
+    """A run's dedicated worktree could not be made ready (P7c, spike §13).
+
+    Distinct from :class:`WorktreeLockError`, which is about *who is driving*.
+    This is about *which tree they would drive in*, and it is always raised
+    without having mutated anything: the run is left exactly as it was, and the
+    message carries the operator-chosen fallback (`resume --same-tree`).
+    """
 
 
 class WorktreeLockError(RuntimeError):
@@ -621,6 +634,13 @@ class RunManager:
         # in memory so an atexit fallback can release it on an unclean exit that
         # bypasses the per-verb `finally`.
         self._held_lock: _LockHandle | None = None
+        # The ACTIVE run's roots (P7c, problem B). `None` outside a driving
+        # verb, which is the same-tree answer every read-only surface wants.
+        # Set by `_run_paths` for the duration of one drive and never longer:
+        # `work_root` is a property OF A RUN, not of a manager, and a manager
+        # that remembered one run's tree past its verb would hand it to the
+        # next — the exact class of defect the carrier exists to prevent.
+        self._paths: RunPaths | None = None
 
     @property
     def operator_root(self) -> Path:
@@ -642,10 +662,421 @@ class RunManager:
     def work_root(self) -> Path:
         """The tree a run's agents edit and the engine commits in.
 
-        Identical to the operator's checkout in the pre-P7 same-tree layout;
-        P7c resolves it per-run to that run's dedicated worktree.
+        Per-RUN, not per-manager (P7c): inside a driving verb that resolved a
+        `dedicated` run's paths this is that run's own worktree; everywhere
+        else — every `same_tree` run, and every read-only surface — it is the
+        operator's checkout, exactly as before.
         """
-        return self.repo_root
+        return self._paths.work_root if self._paths is not None else self.repo_root
+
+    @property
+    def paths(self) -> RunPaths | None:
+        """The active run's roots, or ``None`` outside a driving verb."""
+        return self._paths
+
+    @property
+    def configured_worktree_mode(self) -> str:
+        """`config.worktree.mode` — what a NEW run is born as (spike §13).
+
+        Read in exactly ONE place: :meth:`start`. Every other caller asks
+        :meth:`_effective_worktree_mode`, which resolves from evidence and from
+        what the run recorded at birth. That asymmetry is not stylistic — see
+        that method for why config must never decide an existing run's mode.
+        """
+        cfg = getattr(self.config, "worktree", None)
+        return getattr(cfg, "mode", None) or WT.MODE_SAME_TREE
+
+    def _effective_worktree_mode(self, man: Manifest) -> str:
+        """The mode THIS run actually drives in — evidence first, config never.
+
+        The safety boundary between P7c-1 and P7c-2 (`proposals/
+        P7c-split-seam.md` §3). Resolution order, and each rule's reason:
+
+        1. **a registered worktree for ``man.branch``** → `dedicated`. The tree
+           is observable ground truth, and ``worktree list --porcelain`` answers
+           with a dead driver, which is what makes it usable from a recovery
+           assessment (spike §10).
+        2. **an unreleased ``WorktreeAdopted`` in the journal** → `dedicated`.
+           The tree is *missing* but was adopted: spike §11 row 2. The answer
+           must be "dedicated, recreate it", never "same_tree" — resolving this
+           case to `same_tree` would silently drop the run back into the
+           operator's checkout at exactly the moment its own tree vanished.
+        3. **``man.worktree_mode``** → what the run was born as.
+        4. otherwise → `same_tree`: a pre-P7c run, the legacy population (§16).
+
+        **``config.worktree.mode`` is deliberately absent from this list.** If
+        it appeared here, an operator setting `dedicated` on a repository that
+        already has runs would move every one of them into a worktree on its
+        next `resume` — no operator action, no journal event, at a moment they
+        believe they only changed a default. That is the auto-migration spike
+        §10 forbids ("a pre-P7 run is never auto-migrated, and never wedged"),
+        and it would arrive in the commit that never mentions migration.
+
+        Rules 1 and 2 are §10's detection rule in both directions, so P7c-2's
+        migration eligibility predicate is the negation of this one and cannot
+        drift from it.
+        """
+        try:
+            # Scoped to the engine's OWN worktrees root: the operator's main
+            # checkout is itself a registered worktree, and in `same_tree` mode
+            # it is exactly where this branch is checked out. Unscoped, every
+            # same_tree run would resolve `dedicated`.
+            if WT.observe(
+                self.operator_root, man.branch,
+                common_dir=self._git_common_dir(),
+            ) is not None:
+                return WT.MODE_DEDICATED
+        except gitops.GitError:
+            # Fail closed toward the run's OWN record rather than guessing:
+            # an unreadable worktree list must not be read as "no worktree".
+            pass
+        if self._journal_says_adopted(man):
+            return WT.MODE_DEDICATED
+        return man.worktree_mode or WT.MODE_SAME_TREE
+
+    def _journal_says_adopted(self, man: Manifest) -> bool:
+        """True when the journal records an adoption with no later release.
+
+        Rule 2 of :meth:`_effective_worktree_mode`. Read-only and tolerant: the
+        journal is authoritative for run state, but the worktree's existence is
+        independently observable (rule 1), so an unreadable journal degrades to
+        "no adoption recorded" rather than failing the verb.
+        """
+        try:
+            run_dir = self.layout(man.slug).run_dir(man.run_id)
+            events = J.read_events(run_dir)
+        except (OSError, ValueError, J.JournalError):
+            return False
+        adopted = False
+        for evt in events:
+            kind = evt.get("kind")
+            if kind == "WorktreeAdopted":
+                adopted = True
+            elif kind == "WorktreeReleased":
+                adopted = False
+        return adopted
+
+    def _git_common_dir(self) -> Path:
+        """The shared git dir, resolved from the OPERATOR's checkout.
+
+        Deliberately not from the work root: the incident that most needs this
+        path is acceptance A3 — recreating a run worktree that is MISSING — and
+        running git inside the very tree that no longer exists would fail
+        exactly then. The operator's checkout is the surviving root by
+        construction, because the CLI was invoked from it (P7a/F-001).
+        """
+        return gitops.git_common_dir(self.operator_root)
+
+    @contextmanager
+    def _run_paths(
+        self,
+        layout: "RunLayout",
+        run_dir: Path,
+        man: Manifest | None = None,
+        *,
+        slug: str,
+        run_id: str,
+        branch: str,
+        mode: str,
+        same_tree: bool = False,
+    ):
+        """Resolve this run's roots for one verb, ensuring the tree exists.
+
+        The single place a run's `work_root` is decided, and the mechanism the
+        P7b reviewer's F-001 was deferred here for. Everything downstream —
+        the Orchestrator, every StepContext, the RecoveryExecutor, the
+        verifier's disposable-copy parent and the judge's path boundary — takes
+        its roots from the :class:`RunPaths` this yields, so the three roots can
+        never be independently (mis)chosen per call site again.
+
+        ``mode`` is the run's EFFECTIVE mode — from
+        :meth:`_effective_worktree_mode` for an existing run, or from
+        :attr:`configured_worktree_mode` for one being born in :meth:`start`.
+        It is a required argument rather than something resolved here on
+        purpose: the resolution rule is the anti-auto-migration boundary, and
+        making every caller name the mode it resolved keeps that decision
+        greppable instead of buried in a context manager.
+
+        ``same_tree=True`` is the operator-chosen `--same-tree` fallback (spike
+        §13). It is never automatic: if the worktree cannot be created, locked
+        or verified we raise :class:`WT.WorktreeUnavailable` and the caller
+        parks with that reason. Falling back silently would mutate the
+        operator's checkout precisely when the machine is already in an
+        unexpected state, which is the one thing P7 exists to prevent.
+
+        Restores the previous value on exit rather than clearing to ``None``,
+        so a nested verb (auto-resume inside a drive) cannot strand the outer
+        one on the wrong tree.
+        """
+        prior = self._paths
+        dedicated = mode == WT.MODE_DEDICATED and not same_tree
+        work_root = self.repo_root
+        if dedicated:
+            wt = WT.ensure(
+                self.operator_root,
+                self._git_common_dir(),
+                slug=slug,
+                run_id=run_id,
+                branch=branch,
+            )
+            work_root = wt.path
+            self._record_worktree_adopted(run_dir, wt, slug=slug, run_id=run_id)
+        paths = RunPaths(
+            repo_root=self.repo_root,
+            work_root=work_root,
+            state_root=run_dir,
+            artifact_root=layout.slug_dir,
+        )
+        self._paths = paths
+        try:
+            if dedicated:
+                self._sync_governed_artifacts(paths, layout)
+            yield paths
+        finally:
+            self._paths = prior
+
+    @contextmanager
+    def _worktree_paths_or_park(
+        self,
+        layout: "RunLayout",
+        run_dir: Path,
+        man: Manifest,
+        *,
+        mode: str,
+        same_tree: bool = False,
+    ):
+        """:meth:`_run_paths`, converting an unavailable tree into a park (§13).
+
+        The fail-closed fallback, and it is **operator-chosen, never
+        automatic**. When the tree cannot be created, locked or verified the run
+        does not proceed and does not quietly move to the operator's checkout —
+        it stays exactly where it was, records `worktree_unavailable` durably as
+        a manifest warning so ``status`` can name it, and raises with the one
+        safe executable action R1 requires: ``gauntlet resume <slug>
+        --same-tree``.
+
+        No manifest *status* is fabricated. A resume that cannot start leaves
+        the run in the state it was already in — inventing a `parked` status
+        with no parked step record would put a shape into the manifest that no
+        reader expects, which is the opposite of data-over-inference.
+        """
+        try:
+            with self._run_paths(
+                layout, run_dir, man,
+                slug=man.slug, run_id=man.run_id, branch=man.branch,
+                mode=mode, same_tree=same_tree,
+            ) as paths:
+                yield paths
+        except WT.WorktreeUnavailable as exc:
+            self._record_worktree_unavailable(run_dir, man, exc)
+            raise WorktreeUnavailableError(
+                f"{exc}\n\nThe run has NOT been moved or modified. Safe action: "
+                f"{exc.action}  (drive this run in the operator's checkout "
+                "instead — spike §13: the fallback is operator-chosen, never "
+                "automatic)."
+            ) from exc
+
+    @staticmethod
+    def _record_worktree_unavailable(
+        run_dir: Path, man: Manifest, exc: "WT.WorktreeUnavailable"
+    ) -> None:
+        """Persist the park reason so ``status`` names it, not just the shell.
+
+        Deduplicated: a repeated failure must not grow the warning list without
+        bound (an operator retrying five times should see one reason, not five).
+        """
+        note = f"{WT.PARK_REASON_WORKTREE_UNAVAILABLE}: {exc}  Safe action: {exc.action}"
+        try:
+            if note in man.warnings:
+                return
+            man.warnings.append(note)
+            man.write_atomic(run_dir / "manifest.json")
+        except (OSError, ValueError):
+            pass  # the raise below still names the reason and the action
+
+    def _sync_governed_artifacts(self, paths: RunPaths, layout: "RunLayout") -> None:
+        """Publish the operator's governed artifacts into the run worktree.
+
+        Spike §14.2 option A, ratified: **the operator's checkout stays the
+        authoring surface.** The human authors and hand-edits `prd.md`/`plan.md`
+        there, the engine reads, validates and hashes them from there
+        (``artifact_root`` never moves, §4.4), and this copies the current bytes
+        into the run's tree so the run branch commits what the human actually
+        wrote.
+
+        Copy, never link: §14.2 option C (symlinking the artifact dir in) was
+        rejected because the run worktree gets ``reset --hard``, and a symlinked
+        tracked path under a hard reset is how you lose the human's file.
+
+        This does NOT bypass R9. Whether an approved artifact may change at all
+        is decided by the governance path on the operator's copy, unchanged;
+        this only makes the run's tree agree with the copy that decision was
+        made about. On a `same_tree` run the two are the same file and this is
+        never called.
+        """
+        dest_dir = paths.artifact_root_in_work
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("prd.md", "plan.md"):
+            src = layout.slug_dir / name
+            if not src.exists():
+                continue
+            dest = dest_dir / name
+            text = src.read_text()
+            if dest.exists() and dest.read_text() == text:
+                continue
+            dest.write_text(text)
+
+    def _record_worktree_adopted(
+        self, run_dir: Path, wt: "WT.RunWorktree", *, slug: str, run_id: str
+    ) -> None:
+        """Journal a ``WorktreeAdopted`` event when a tree is created/recreated.
+
+        Only on a transition — adopting an already-healthy tree on every
+        subsequent verb is not an event, it is the steady state, and journaling
+        it would bury the two transitions that matter (first adoption, and the
+        §11-row-2 recreate) under one event per verb.
+        """
+        if not (wt.created or wt.recreated):
+            return
+        try:
+            head = gitops.head_sha(wt.path)
+        except gitops.GitError:
+            head = None
+        J.append_audit(
+            run_dir,
+            "WorktreeAdopted",
+            {
+                "slug": slug,
+                "run_id": run_id,
+                "branch": wt.branch,
+                "path": str(wt.path),
+                "recreated": wt.recreated,
+                "branch_sha": head,
+            },
+            run_id=run_id,
+            # Keyed on the transition, not the moment: re-adopting the SAME
+            # tree at the SAME head is not a new event, so a retried verb
+            # cannot pad the journal with duplicates.
+            idempotency_key=(
+                f"worktree-adopted:{run_id}:{wt.path}:{head}:"
+                f"{'recreate' if wt.recreated else 'create'}"
+            ),
+        )
+
+    def _record_worktree_released(
+        self, run_dir: Path, path: Path, *, slug: str, run_id: str,
+        snapshot_ref: str | None = None,
+    ) -> None:
+        """Journal a ``WorktreeReleased`` event after a teardown (spike §10)."""
+        J.append_audit(
+            run_dir,
+            "WorktreeReleased",
+            {
+                "slug": slug,
+                "run_id": run_id,
+                "path": str(path),
+                "snapshot_ref": snapshot_ref,
+            },
+            run_id=run_id,
+            idempotency_key=f"worktree-released:{run_id}:{path}",
+        )
+
+    def _release_run_worktree_for_slug(self, layout: "RunLayout") -> None:
+        """:meth:`_release_run_worktree` for ``clean``, which may have no run.
+
+        ``clean`` legitimately runs when the active-run pointer is already
+        stale and there is no loadable manifest — that is spike §11 row 3, "a
+        stale worktree whose run is gone", and it is exactly the case where the
+        tree most needs removing. So the branch name is derived from config
+        rather than read from a manifest, and a missing run dir is not an error.
+        """
+        branch = f"{self.config.branch_prefix}{layout.slug}"
+        try:
+            entry = WT.observe(
+                self.operator_root, branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            return
+        if entry is None:
+            return
+        try:
+            run_dir = layout.active_run_dir()
+            man = Manifest.load(run_dir / "manifest.json")
+        except (OSError, ValueError, FileNotFoundError, UnsafeRunSegment):
+            # Row 3: no run to journal against. Remove the tree anyway — it is
+            # the orphan this verb exists to clear — and skip the event, which
+            # would have nowhere authoritative to land.
+            WT.release(
+                self.operator_root, entry.path,
+                slug=layout.slug, run_id=entry.head or "unknown",
+            )
+            return
+        self._release_run_worktree(run_dir, man)
+
+    def _release_run_worktree(
+        self, run_dir: Path, man: Manifest, *, excludes: list[str] | None = None
+    ) -> None:
+        """Tear this run's worktree down, in the order git and R2 require.
+
+        Called by the verbs that END a run's relationship with its branch —
+        ``clean``, ``finish`` and ``abort``. Ordering is load-bearing (problem
+        D / spike E2-D): with a live worktree on the branch, ``branch -D``
+        hard-refuses, so the tree must be unlocked and removed FIRST. A dirty
+        tree is snapshotted before any ``--force`` (§11 row 10 / R2).
+
+        A no-op for a `same_tree` run and for a `dedicated` run whose tree is
+        already gone — both are the steady state, not a failure.
+        """
+        entry = None
+        try:
+            # Scoped (see `WT.observe`): unscoped this would return the
+            # OPERATOR's checkout for a `same_tree` run and then remove it.
+            entry = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            return
+        if entry is None:
+            return
+        ref = WT.release(
+            self.operator_root,
+            entry.path,
+            slug=man.slug,
+            run_id=man.run_id,
+            excludes=excludes,
+        )
+        self._record_worktree_released(
+            run_dir, entry.path, slug=man.slug, run_id=man.run_id, snapshot_ref=ref
+        )
+
+    def _bookkeeping_root(self, run_dir: Path) -> Path:
+        """The committable bookkeeping dir for ``run_dir``, IN THE WORK TREE.
+
+        ``run_dir`` itself same-tree; the run worktree's two-file export dir
+        under `dedicated` (spike §4.4). Every bookkeeping path builder in this
+        class asks THIS rather than passing ``run_dir`` straight through —
+        under `dedicated` the run dir is not in the tree we commit in, so the
+        builders would (correctly) fail closed instead of answering.
+        """
+        if self._paths is None:
+            return run_dir
+        return RunPaths(
+            repo_root=self._paths.repo_root,
+            work_root=self._paths.work_root,
+            state_root=run_dir,
+            artifact_root=self._paths.artifact_root,
+        ).bookkeeping_root
+
+    def _artifact_root_in_work(self, layout: "RunLayout") -> Path:
+        """The governed artifacts' location in the work tree (spike §14.2)."""
+        if self._paths is None:
+            return layout.slug_dir
+        return RunPaths(
+            repo_root=self._paths.repo_root,
+            work_root=self._paths.work_root,
+            state_root=self._paths.state_root,
+            artifact_root=layout.slug_dir,
+        ).artifact_root_in_work
 
     def layout(self, slug: str) -> RunLayout:
         return RunLayout(self.repo_root, self.config, slug)
@@ -737,8 +1168,16 @@ class RunManager:
             return cur
         return raw
 
-    def _prepare_run_branch(self, branch: str, base: str) -> None:
+    def _prepare_run_branch(
+        self, branch: str, base: str, *, dedicated: bool = False
+    ) -> None:
         """Put the worktree on a clean run branch ``branch`` based on ``base``.
+
+        ``dedicated`` (P7c) mints the branch WITHOUT checking it out: the run
+        worktree does not exist yet, and the tree that would otherwise receive
+        the checkout is the operator's — the one acceptance A1 says a start must
+        never touch. The run worktree is then created ON the branch by
+        ``worktree add`` (spike §6.2), which is also what supplies A2 for free.
 
         Fail-closed branch lifecycle (replaces a bare ``checkout``, which once
         silently rewound a worktree onto a stale branch):
@@ -752,10 +1191,22 @@ class RunManager:
         """
         repo = self.work_root
         if not gitops.branch_exists(repo, branch):
-            gitops.checkout_or_create_branch(repo, branch, base)
+            if dedicated:
+                gitops.create_branch(self.operator_root, branch, base)
+            else:
+                gitops.checkout_or_create_branch(repo, branch, base)
             return
         if gitops.is_ancestor(repo, branch, base):
-            gitops.recreate_branch(repo, branch, base)
+            if dedicated:
+                # `branch -f`, not `checkout -B`: there is no tree to check it
+                # out into yet, and checking it out in the OPERATOR's tree is
+                # exactly what acceptance A1 forbids. Git refuses `-f` outright
+                # if the branch is live in any worktree (spike E2-E), which is
+                # the correct fail-closed answer for a spent branch that is
+                # somehow still checked out.
+                gitops.create_branch(self.operator_root, branch, base, force=True)
+            else:
+                gitops.recreate_branch(repo, branch, base)
             return
         raise StaleRunBranchError(
             f"run branch {branch!r} already exists with commits not in base "
@@ -1251,23 +1702,36 @@ class RunManager:
             # single `dir/` entry the exclude pathspecs cannot suppress, and
             # the refusal message would be less actionable (see the
             # status_porcelain docstring).
-            dirt = gitops.status_porcelain(
-                self.work_root, exclude=preflight_excludes, untracked_all=True
-            )
-            if dirt:
-                listing = "\n  ".join(dirt.splitlines()[:8])
-                raise WorktreeDirtyError(
-                    f"refusing to start {slug!r}: the worktree has "
-                    "uncommitted changes beyond this run's prd.md:\n"
-                    f"  {listing}\n"
-                    "Commit, stash, or discard them first — starting now "
-                    f"would create {branch!r} carrying these changes and "
-                    "fail the first clean-handoff guard (FR-9.3), leaving a "
-                    "half-initialized run branch to clean up by hand (#61). "
-                    "(A pending PR.md from a finished run is exempt and "
-                    "never blocks a start.)"
+            # The #61 guard exists because `checkout -b` CARRIES uncommitted
+            # changes onto the fresh run branch. Under `dedicated` nothing is
+            # checked out in the operator's tree at all — the branch is minted
+            # from the base ref and a fresh worktree is checked out at the
+            # derived path — so the operator's dirt cannot ride onto the run
+            # branch and cannot fail the first clean-handoff guard. Refusing on
+            # it would be a guard against a mechanism that no longer exists,
+            # and it would block a start for a reason the operator could not
+            # act on (spike §9.4 flags this as the behaviour change to
+            # document). The prd.md the run needs reaches the run branch
+            # through the §14.2 sync instead, not through the checkout.
+            born_dedicated = self.configured_worktree_mode == WT.MODE_DEDICATED
+            if not born_dedicated:
+                dirt = gitops.status_porcelain(
+                    self.work_root, exclude=preflight_excludes, untracked_all=True
                 )
-            self._prepare_run_branch(branch, base_branch)
+                if dirt:
+                    listing = "\n  ".join(dirt.splitlines()[:8])
+                    raise WorktreeDirtyError(
+                        f"refusing to start {slug!r}: the worktree has "
+                        "uncommitted changes beyond this run's prd.md:\n"
+                        f"  {listing}\n"
+                        "Commit, stash, or discard them first — starting now "
+                        f"would create {branch!r} carrying these changes and "
+                        "fail the first clean-handoff guard (FR-9.3), leaving a "
+                        "half-initialized run branch to clean up by hand (#61). "
+                        "(A pending PR.md from a finished run is exempt and "
+                        "never blocks a start.)"
+                    )
+            self._prepare_run_branch(branch, base_branch, dedicated=born_dedicated)
 
             run_dir = layout.run_dir(run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -1299,12 +1763,21 @@ class RunManager:
                 base_branch=base_branch,
                 pipeline=PipelineRef(name=pipeline.name, version=pipeline.version, hash=phash),
                 prompt_hashes=self._prompt_hashes(pipeline),
+                # The ONE place `config.worktree.mode` is read (spike §13 /
+                # `proposals/P7c-split-seam.md` §3): it decides what a NEW run
+                # is born as, and is then recorded so no later verb has to
+                # consult live config — which is what makes flipping the config
+                # on a repo with existing runs incapable of moving them.
+                worktree_mode=self.configured_worktree_mode,
             )
-            status = self._drive(
-                layout, run_dir, pipeline, man,
-                use_judge=use_judge, adapter_factory=adapter_factory,
-                extra_context=extra_context, clock=clock,
-            )
+            with self._worktree_paths_or_park(
+                layout, run_dir, man, mode=man.worktree_mode
+            ):
+                status = self._drive(
+                    layout, run_dir, pipeline, man,
+                    use_judge=use_judge, adapter_factory=adapter_factory,
+                    extra_context=extra_context, clock=clock,
+                )
         finally:
             self._release_worktree_lock(handle)
         # Auto-resume runs OUTSIDE the lock (each attempt re-acquires it via
@@ -1320,7 +1793,8 @@ class RunManager:
     def resume(self, slug: str, *, response: str | None = None,
                use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None,
-               auto_sleep=None, reset_interrupted: bool = False) -> str:
+               auto_sleep=None, reset_interrupted: bool = False,
+               same_tree: bool = False) -> str:
         """One resume, then in-process auto-resume of a usage-limit park (FR-3.4).
 
         A manual resume always continues the session once immediately (the
@@ -1337,11 +1811,16 @@ class RunManager:
         status = self._resume_once(
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
-            reset_interrupted=reset_interrupted,
+            reset_interrupted=reset_interrupted, same_tree=same_tree,
         )
         # NOTE: reset_interrupted is deliberately NOT forwarded to the
         # auto-resume continuation — it is a one-shot operator decision for
-        # THIS resume, never a standing policy (#72).
+        # THIS resume, never a standing policy (#72). `same_tree` is withheld
+        # for the same reason and a stronger one: it is the fallback for a
+        # worktree that was unavailable at THIS moment, so carrying it into an
+        # unattended continuation would keep driving the operator's checkout
+        # long after the condition cleared — silently, which is the one thing
+        # spike §13 says the fallback must never be.
         status = self._auto_resume_if_scheduled(
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock, sleep=auto_sleep,
@@ -1352,7 +1831,8 @@ class RunManager:
     def _resume_once(self, slug: str, *, response: str | None = None,
                      use_judge: bool = True, adapter_factory=None,
                      extra_context: dict | None = None, clock=None,
-                     reset_interrupted: bool = False) -> str:
+                     reset_interrupted: bool = False,
+                     same_tree: bool = False) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
@@ -1373,75 +1853,105 @@ class RunManager:
         # id from the manifest so a concurrent verb's refusal names the holder.
         handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
-            # P3 (plan §4.3): a recovery transaction killed between its intent
-            # persist and its intent clear left a durable, replayable intent.
-            # Resume is a mutating command, so it converges that intent FIRST —
-            # idempotently, under the lock — before driving anything new; an
-            # unrecognized repository state fails closed with named evidence.
-            replayed = RX.replay_pending_intent(self.repo_root, run_dir)
-            if replayed is not None:
-                man = Manifest.load(run_dir / "manifest.json")  # finisher wrote
-            pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")
-            if phash != man.pipeline.hash:
-                raise RuntimeError(
-                    "pipeline content hash changed since the run started "
-                    f"({man.pipeline.hash} -> {phash}); resume refuses to run a "
-                    "different pipeline against an existing manifest (FR-5.6)"
+            # Resolve THIS run's tree before anything observes or mutates one.
+            # The mode comes from evidence + what the run was born as, never
+            # from live config — see `_effective_worktree_mode`. `--same-tree`
+            # is the operator's one-shot override for a run whose worktree is
+            # unavailable (spike §13); it drives this resume in the operator's
+            # checkout and is never persisted as a mode change.
+            mode = self._effective_worktree_mode(man)
+            with self._worktree_paths_or_park(
+                layout, run_dir, man, mode=mode, same_tree=same_tree
+            ) as paths:
+                return self._resume_locked(
+                    layout, run_dir, man, paths,
+                    response=response, use_judge=use_judge,
+                    adapter_factory=adapter_factory, extra_context=extra_context,
+                    clock=clock, reset_interrupted=reset_interrupted,
                 )
-            # F-1: resume continues the SAME branch the run committed to. Never
-            # recreate it from base (the old checkout_or_create_branch) — that
-            # would silently drop the manifest's recorded commits. P4 (plan
-            # §5.4/R6): the branch↔manifest relationship is now assessed by the
-            # SAME observation machinery status renders — an inventoried,
-            # proven relation — and reconciled by class: bookkeeping tolerated,
-            # checkpoint/implementation/operator ranges ADOPTED (loud manifest
-            # audit, no rewind), behind/forked/missing refused with the
-            # assessment's executable recovery actions named. Everything is
-            # validated against the branch REF *before* checkout, so a refusal
-            # never rewinds the worktree onto a stale/reset branch.
-            repo = self.work_root
-            git_obs = self._observe_resume_branch(layout, run_dir, man)
-            relation = RX.BranchRelation
-            if git_obs.branch_relation is relation.MISSING:
-                raise RunBranchStateError(
-                    f"resume: run branch {man.branch!r} is missing; recreating "
-                    "it from base would drop the manifest's recorded commits. "
-                    "Restore the branch (e.g. from refs/gauntlet/backup/) "
-                    "first." + self._relation_action_detail(git_obs, man)
-                )
-            if git_obs.branch_relation in (relation.BEHIND, relation.FORKED):
-                last = git_obs.recorded_sha or ""
-                raise RunBranchStateError(
-                    f"resume: branch {man.branch!r} is missing the "
-                    f"manifest's recorded commit {last[:10]} (reset or "
-                    "recreated); the branch and manifest disagree. "
-                    "Reconcile (restore the branch, or `gauntlet rollback`) "
-                    "before resuming."
-                    + self._relation_action_detail(git_obs, man)
-                )
-            gitops.checkout_branch(repo, man.branch)
-            # Linear branch-ahead reconciliation (P4, plan §5.4 / issue #72):
-            # adopt a proven checkpoint/implementation/operator range into the
-            # manifest — loud, manifest-only, never a Git mutation — so a
-            # builder killed after committing but before the manifest flush
-            # resumes without rollback or git surgery.
-            adoption_notes = RX.reconcile_branch_ahead(man, git_obs, verb="resume")
-            if adoption_notes:
-                man.write_atomic(run_dir / "manifest.json")
-            # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
-            # FR-7.1 idempotent recovery). All validation and operator-identity
-            # resolution happen HERE, before driving; the orchestrator only
-            # applies an already-validated, fail-closed decision.
-            action = self._plan_response_action(man, response, pipeline)
-            return self._drive(
-                layout, run_dir, pipeline, man,
-                use_judge=use_judge, adapter_factory=adapter_factory,
-                extra_context=extra_context, clock=clock,
-                response_action=action,
-                interrupted_override="reset_to_base" if reset_interrupted else None,
-            )
         finally:
             self._release_worktree_lock(handle)
+
+    def _resume_locked(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest, paths: RunPaths,
+        *, response: str | None, use_judge: bool, adapter_factory,
+        extra_context: dict | None, clock, reset_interrupted: bool,
+    ) -> str:
+        """The body of one resume, with the drive lock held and roots resolved."""
+        # P3 (plan §4.3): a recovery transaction killed between its intent
+        # persist and its intent clear left a durable, replayable intent.
+        # Resume is a mutating command, so it converges that intent FIRST —
+        # idempotently, under the lock — before driving anything new; an
+        # unrecognized repository state fails closed with named evidence.
+        replayed = RX.replay_pending_intent(self.work_root, run_dir)
+        if replayed is not None:
+            man = Manifest.load(run_dir / "manifest.json")  # finisher wrote
+        pipeline, phash = load_pipeline(run_dir / "pipeline.yaml")
+        if phash != man.pipeline.hash:
+            raise RuntimeError(
+                "pipeline content hash changed since the run started "
+                f"({man.pipeline.hash} -> {phash}); resume refuses to run a "
+                "different pipeline against an existing manifest (FR-5.6)"
+            )
+        # F-1: resume continues the SAME branch the run committed to. Never
+        # recreate it from base (the old checkout_or_create_branch) — that
+        # would silently drop the manifest's recorded commits. P4 (plan
+        # §5.4/R6): the branch↔manifest relationship is now assessed by the
+        # SAME observation machinery status renders — an inventoried,
+        # proven relation — and reconciled by class: bookkeeping tolerated,
+        # checkpoint/implementation/operator ranges ADOPTED (loud manifest
+        # audit, no rewind), behind/forked/missing refused with the
+        # assessment's executable recovery actions named. Everything is
+        # validated against the branch REF *before* checkout, so a refusal
+        # never rewinds the worktree onto a stale/reset branch.
+        repo = self.work_root
+        git_obs = self._observe_resume_branch(layout, run_dir, man)
+        relation = RX.BranchRelation
+        if git_obs.branch_relation is relation.MISSING:
+            raise RunBranchStateError(
+                f"resume: run branch {man.branch!r} is missing; recreating "
+                "it from base would drop the manifest's recorded commits. "
+                "Restore the branch (e.g. from refs/gauntlet/backup/) "
+                "first." + self._relation_action_detail(git_obs, man)
+            )
+        if git_obs.branch_relation in (relation.BEHIND, relation.FORKED):
+            last = git_obs.recorded_sha or ""
+            raise RunBranchStateError(
+                f"resume: branch {man.branch!r} is missing the "
+                f"manifest's recorded commit {last[:10]} (reset or "
+                "recreated); the branch and manifest disagree. "
+                "Reconcile (restore the branch, or `gauntlet rollback`) "
+                "before resuming."
+                + self._relation_action_detail(git_obs, man)
+            )
+        # Under `dedicated` the run worktree was created ON this branch and
+        # is the only worktree that may hold it (git's one-branch-one-
+        # worktree rule, spike E2-A), so "ensure the tree is on the branch"
+        # is already true and a checkout here would be a no-op at best. Under
+        # `same_tree` this is still the line that puts the operator's
+        # checkout on the run branch (spike §9.4).
+        if not paths.dedicated_worktree:
+            gitops.checkout_branch(repo, man.branch)
+        # Linear branch-ahead reconciliation (P4, plan §5.4 / issue #72):
+        # adopt a proven checkpoint/implementation/operator range into the
+        # manifest — loud, manifest-only, never a Git mutation — so a
+        # builder killed after committing but before the manifest flush
+        # resumes without rollback or git surgery.
+        adoption_notes = RX.reconcile_branch_ahead(man, git_obs, verb="resume")
+        if adoption_notes:
+            man.write_atomic(run_dir / "manifest.json")
+        # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
+        # FR-7.1 idempotent recovery). All validation and operator-identity
+        # resolution happen HERE, before driving; the orchestrator only
+        # applies an already-validated, fail-closed decision.
+        action = self._plan_response_action(man, response, pipeline)
+        return self._drive(
+            layout, run_dir, pipeline, man,
+            use_judge=use_judge, adapter_factory=adapter_factory,
+            extra_context=extra_context, clock=clock,
+            response_action=action,
+            interrupted_override="reset_to_base" if reset_interrupted else None,
+        )
 
     def _observe_resume_branch(
         self, layout: "RunLayout", run_dir: Path, man: Manifest
@@ -1454,17 +1964,19 @@ class RunManager:
         merge commit inside the range fails closed through
         :class:`RX.RecoveryObservationError` with named evidence.
         """
-        excludes = run_bookkeeping_excludes(self.repo_root, run_dir, layout.slug_dir)
+        excludes = run_bookkeeping_excludes(
+            self.work_root, self._bookkeeping_root(run_dir), layout.slug_dir
+        )
         return RX.observe_git(
-            self.repo_root,
+            self.work_root,
             run_branch=man.branch,
             recorded_sha=RX.reconciliation_boundary(man),
             excludes=excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(
-                self.repo_root, run_dir
+                self.work_root, self._bookkeeping_root(run_dir)
             ),
             approved_artifacts=governed_artifact_paths(
-                self.repo_root, layout.slug_dir
+                self.work_root, self._artifact_root_in_work(layout)
             ),
         )
 
@@ -1984,21 +2496,26 @@ class RunManager:
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the approval drives anything (post-P3 review F-002).
-            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
-                man = Manifest.load(run_dir / "manifest.json")
-            gate = explicit_gate or man.current_step
-            if gate is None:
-                raise ValueError("no gate to approve; run is not parked")
-            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-            # Approving a gate drives the rest of the run, so honor use_judge.
-            if use_judge:
-                return self._with_judge(man, run_dir, lambda env: self._approve_drive(
-                    layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
-            orch = self._orchestrator(layout, run_dir, pipeline, man,
-                                      judge_env={}, adapter_factory=adapter_factory)
-            status = orch.approve_gate(gate, notes)
-            self._maybe_draft_pr(layout, run_dir, man, status)
-            return status
+            # A driving verb runs in the run's own tree (P7c). Resolved from
+            # evidence + what the run was born as, never from live config.
+            with self._worktree_paths_or_park(
+                layout, run_dir, man, mode=self._effective_worktree_mode(man)
+            ):
+                if RX.replay_pending_intent(self.work_root, run_dir) is not None:
+                    man = Manifest.load(run_dir / "manifest.json")
+                gate = explicit_gate or man.current_step
+                if gate is None:
+                    raise ValueError("no gate to approve; run is not parked")
+                pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+                # Approving a gate drives the rest of the run, so honor use_judge.
+                if use_judge:
+                    return self._with_judge(man, run_dir, lambda env: self._approve_drive(
+                        layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
+                orch = self._orchestrator(layout, run_dir, pipeline, man,
+                                          judge_env={}, adapter_factory=adapter_factory)
+                status = orch.approve_gate(gate, notes)
+                self._maybe_draft_pr(layout, run_dir, man, status)
+                return status
         finally:
             self._release_worktree_lock(handle)
 
@@ -2018,21 +2535,26 @@ class RunManager:
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the rejection re-drives anything (post-P3 review F-002).
-            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
-                man = Manifest.load(run_dir / "manifest.json")
-            gate = explicit_gate or man.current_step
-            if gate is None:
-                raise ValueError("no gate to reject; run is not parked")
-            pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
-            if use_judge:
-                return self._with_judge(man, run_dir, lambda env: self._reject_drive(
-                    layout, run_dir, pipeline, man, gate, notes, user, env,
-                    adapter_factory))
-            orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
-                                      adapter_factory=adapter_factory)
-            status = orch.reject_gate(gate, notes, user)
-            self._maybe_draft_pr(layout, run_dir, man, status)
-            return status
+            # A driving verb runs in the run's own tree (P7c). Resolved from
+            # evidence + what the run was born as, never from live config.
+            with self._worktree_paths_or_park(
+                layout, run_dir, man, mode=self._effective_worktree_mode(man)
+            ):
+                if RX.replay_pending_intent(self.work_root, run_dir) is not None:
+                    man = Manifest.load(run_dir / "manifest.json")
+                gate = explicit_gate or man.current_step
+                if gate is None:
+                    raise ValueError("no gate to reject; run is not parked")
+                pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+                if use_judge:
+                    return self._with_judge(man, run_dir, lambda env: self._reject_drive(
+                        layout, run_dir, pipeline, man, gate, notes, user, env,
+                        adapter_factory))
+                orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
+                                          adapter_factory=adapter_factory)
+                status = orch.reject_gate(gate, notes, user)
+                self._maybe_draft_pr(layout, run_dir, man, status)
+                return status
         finally:
             self._release_worktree_lock(handle)
 
@@ -2150,6 +2672,13 @@ class RunManager:
             )
         man.status = M.RUN_ABORTED
         man.write_atomic(run_dir / "manifest.json")
+        # The run worktree is deliberately LEFT IN PLACE (spike §11: abort may
+        # remove it or keep it as evidence — this keeps it). Abort's R1
+        # contract is "abort while retaining all snapshots and evidence", and a
+        # run is most often aborted precisely because something went wrong in
+        # that tree; deleting the one artifact an operator would want to look
+        # at would contradict the verb's whole purpose. `gauntlet clean` is the
+        # verb that removes it, and it does so in the E2-D-safe order.
         # FR-6: an orphaned judge left by a dead/crashed driver is reaped here
         # (identity-verified, driver-gone-only); a live run's judge is untouched.
         self._reap_orphaned_judge(run_dir, slug)
@@ -2923,6 +3452,12 @@ class RunManager:
                 f"no branch {branch!r}"
                 + ("; cleared stale active-run pointer" if cleared else "; nothing to do")
             )
+        # PROBLEM D / spike E2-D: with a live worktree on this branch,
+        # `branch -D` hard-refuses ("cannot delete branch ... used by worktree
+        # at ..."). The tree must be unlocked and removed FIRST, and a dirty
+        # one is snapshotted before any `--force` (§11 row 10 / R2). A no-op
+        # for a `same_tree` run and for a tree that is already gone.
+        self._release_run_worktree_for_slug(layout)
         base = self._recorded_base(layout)
         if not force:
             if base is None:
@@ -3005,6 +3540,11 @@ class RunManager:
             raise FinishError(f"run branch {branch!r} does not exist")
         if not gitops.branch_exists(repo, base):
             raise FinishError(f"base branch {base!r} does not exist")
+        # PROBLEM D / spike E2-D: release the run worktree BEFORE the branch is
+        # merged and deleted. The merge itself is unaffected by a live worktree
+        # (E2-F/G measured that, and it leaves the operator exactly where they
+        # were), but the `branch -D` that follows is not. Ordering, not taste.
+        self._release_run_worktree(run_dir, man, excludes=excludes)
 
         # Already merged (e.g. landed via a PR): nothing to merge, just tidy.
         if gitops.is_ancestor(repo, branch, base):
@@ -3264,9 +3804,16 @@ class RunManager:
             # refuse ("behind") forever, so a retried rollback could never
             # reach the executor's own survivor replay. Reload the manifest
             # after a replay: the site finisher rewrote it.
-            if RX.replay_pending_intent(self.repo_root, run_dir) is not None:
-                man = Manifest.load(run_dir / "manifest.json")
-            target = self._rollback_locked(layout, run_dir, man, phase)
+            # Rollback rewinds a WORKING tree (checkout/reset/clean), so it
+            # must run in the run's own tree — spike E8-B measured the
+            # isolation this buys: a hard reset there leaves the operator's
+            # branch, HEAD, index and reflog untouched.
+            with self._worktree_paths_or_park(
+                layout, run_dir, man, mode=self._effective_worktree_mode(man)
+            ):
+                if RX.replay_pending_intent(self.work_root, run_dir) is not None:
+                    man = Manifest.load(run_dir / "manifest.json")
+                target = self._rollback_locked(layout, run_dir, man, phase)
         finally:
             self._release_worktree_lock(handle)
         # R5: a repeated rollback to the same boundary that changes nothing —
@@ -3443,11 +3990,15 @@ class RunManager:
             )
 
         executor = RX.RecoveryExecutor(
-            repo,
+            # repo_root is the OPERATOR's checkout — it resolves the run-instance
+            # dir, the drive lock and the projection, all of which stay there by
+            # design (spike §4.4). work_root is the tree the rewind mutates.
+            self.operator_root,
             run_dir,
             run_id=man.run_id,
             run_root=self.config.run_root,
             excludes=excludes,
+            work_root=repo,
         )
         executor.apply(
             assessment,
@@ -3574,7 +4125,12 @@ class RunManager:
             audit_path=run_dir / "judge-audit.jsonl",
             run_id=man.run_id,
             judge_model=judge_model,
-            repo_root=self.repo_root,  # the fixed path boundary (notes #29)
+            # The fixed path boundary the agent's hooks check writes against
+            # (notes #29). It must be the tree the agent actually edits (P7c,
+            # spike §9.6): under `dedicated`, pinning the operator's checkout
+            # would make every legitimate write into the run worktree read as a
+            # path escape and the judge would deny the whole run.
+            repo_root=self.work_root,
             run_dir=run_dir,  # where judge.json lands (§6.2) — gitignored
         )
         env = judge.start()

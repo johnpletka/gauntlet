@@ -197,10 +197,64 @@ def doctor() -> None:
     typer.echo("\nenvironment OK")
 
 
+def _refuse_inside_run_worktree(cwd: Path) -> None:
+    """Refuse any verb invoked from INSIDE a run worktree (spike §14.4).
+
+    Ratified as a deliberate new CLI refusal. The hazard is specific and quiet:
+    a run worktree contains a tracked ``<run_root>/<slug>/{prd.md, plan.md,
+    <run-id>/manifest.json}`` (the §4.4 export), so ``gauntlet status`` run from
+    in there would read the COMMITTED projection at the branch tip instead of
+    the authoritative journal in the operator's checkout — and report a
+    plausible, stale answer with no indication anything was wrong. Every
+    mutating verb has the same problem one layer down: it would resolve the run
+    dir, the drive lock and the active-run pointer inside a disposable tree.
+
+    Detection is the engine's own layout, not a guess: the run worktree root is
+    derived (§6.2), so "am I under ``<git-common-dir>/gauntlet/worktrees``?"
+    is answerable without reading any run state, works when the run is dead,
+    and cannot false-positive on an adopter's own linked worktree — theirs is
+    not under the engine's directory. Symlinks are resolved on both sides
+    (spike E9-B/E9-C).
+
+    Deliberately silent for every adopter layout in §7 that is NOT a run
+    worktree: a nested repo, a bare/mirror clone, a submodule, and a plain
+    worktree-of-worktree all resolve their own common dir and fail the
+    containment test, so they are unaffected.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine import worktree as WT
+
+    try:
+        common = gitops.git_common_dir(cwd)
+    except (gitops.GitError, OSError):
+        return  # not a git repo (or unreadable) — other errors own that case
+    if not WT.is_inside_worktrees_root(cwd, common):
+        return
+    try:
+        toplevel = Path(gitops.show_toplevel(cwd))
+    except (gitops.GitError, OSError):
+        toplevel = cwd
+    operator_checkout = common.parent if common.name == ".git" else common
+    typer.echo(
+        f"error: this is a Gauntlet run worktree ({toplevel}), not your "
+        "checkout.\n"
+        "  A run worktree is the disposable tree the run's agents edit. Run "
+        "gauntlet verbs from your own checkout instead:\n"
+        f"      cd {operator_checkout}\n"
+        "  Reading run state from in here would answer from the committed "
+        "copy at this branch's tip rather than the authoritative journal "
+        "(spike §14.4).",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
 def _manager() -> "object":
     from gauntlet.engine.run import RunManager
 
-    return RunManager(Path.cwd())
+    cwd = Path.cwd()
+    _refuse_inside_run_worktree(cwd)
+    return RunManager(cwd)
 
 
 def _resolve_run_instance_dir(mgr, slug: str) -> Path:
@@ -879,6 +933,14 @@ def status(
                 now=now,
                 current_step_timeout_s=current_step_timeout_s,
                 projection=view.payload_block(),
+                # P7c: which tree this run drives. The mode comes from the
+                # manager's single resolution rule (evidence + what the run was
+                # born as), so `status` and the mutating verbs can never
+                # disagree about it (R4).
+                worktree=operator.compute_worktree_block(
+                    mgr.operator_root, man,
+                    mode=mgr._effective_worktree_mode(man),
+                ),
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -1178,6 +1240,14 @@ def resume(
              "configured interrupted_step policy is unchanged. A no-op when "
              "nothing is interrupted-dirty.",
     ),
+    same_tree: bool = typer.Option(
+        False, "--same-tree",
+        help="Drive THIS resume in your own checkout instead of the run's "
+             "dedicated worktree. The operator-chosen fallback for a "
+             "`worktree_unavailable` park (spike §13) — one-shot, never "
+             "persisted, and never applied automatically. A no-op for a run "
+             "already in same_tree mode.",
+    ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
@@ -1199,7 +1269,7 @@ def resume(
     try:
         status = mgr.resume(
             slug, response=response, use_judge=not no_judge,
-            reset_interrupted=reset_interrupted,
+            reset_interrupted=reset_interrupted, same_tree=same_tree,
         )
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next

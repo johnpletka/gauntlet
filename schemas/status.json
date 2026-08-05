@@ -42,6 +42,7 @@
     "suspension",
     "gate",
     "projection",
+    "worktree",
     "steps",
     "next_actions"
   ],
@@ -331,6 +332,43 @@
               "reasoning": {"type": ["string", "null"]}
             }
           }
+        }
+      }
+    },
+    "worktree": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["mode", "path", "registered", "present", "locked_reason", "prunable", "head"],
+      "description": "Which tree this run's agents edit (recovery-redesign P7c, spike \u00a76.2/\u00a713). Always present. `mode` is resolved from EVIDENCE and from what the run recorded at birth, never from the live `worktree.mode` config \u2014 flipping that config never moves an existing run (spike \u00a710: a pre-P7 run is never auto-migrated, and never wedged). A `same_tree` run reports mode `same_tree` with every other field null/false: it drives the operator's own checkout, which is the pre-P7 layout and the mode of every run started before P7c. A `dedicated` run reports the derived worktree path under the git common dir. `registered` is whether git's worktree administration knows the tree; `present` is whether it is actually on disk \u2014 registered-but-absent is spike \u00a711 row 2 (the tree was swept or deleted while the branch ref and the journal survived) and is recreatable from refs plus journal state. `prunable` carries git's own reason string for that case. `locked_reason` is the `git worktree lock --reason` marker held for the life of a live run, which is the only thing that stops another run's prune from removing this run's admin entry. Observed facts only \u2014 never a recommendation; actions belong in next_actions.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["same_tree", "dedicated"],
+          "description": "The tree layout this run drives in."
+        },
+        "path": {
+          "type": ["string", "null"],
+          "description": "Absolute path of the run worktree; null for a `same_tree` run or a `dedicated` run with no registered tree."
+        },
+        "registered": {
+          "type": "boolean",
+          "description": "Whether `git worktree list` registers a worktree for this run's branch."
+        },
+        "present": {
+          "type": "boolean",
+          "description": "Whether the registered worktree is actually on disk."
+        },
+        "locked_reason": {
+          "type": ["string", "null"],
+          "description": "The `git worktree lock --reason` text, or null when unlocked."
+        },
+        "prunable": {
+          "type": ["string", "null"],
+          "description": "Git's own reason string when the admin entry is prunable (spike \u00a711 row 2), else null."
+        },
+        "head": {
+          "type": ["string", "null"],
+          "description": "The worktree's HEAD SHA as git reports it, or null."
         }
       }
     },

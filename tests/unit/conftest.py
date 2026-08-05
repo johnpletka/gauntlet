@@ -393,3 +393,141 @@ def fake_adapter_factory():
         return factory
 
     return make
+
+
+# --- acceptance A1 as a property, not a case (P7c, spike §12.1) ---------------
+
+
+def _operator_fingerprint(repo: Path) -> tuple[str, str, str, str]:
+    """The four Git planes the plan §3 keeps independently observable.
+
+    Branch and HEAD (per-worktree), the index, and the working tree. A1 is
+    "starting, resuming, recovering and rolling back a run never changes the
+    operator's checked-out branch, index, or worktree", so all four must be
+    byte-identical across a verb — a partial fix that repoints only the commit
+    path would still move the index or leave dirt, and this catches that.
+    """
+    import hashlib
+    import subprocess
+
+    def run(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True
+        )
+        return proc.stdout if proc.returncode == 0 else f"<err:{proc.returncode}>"
+
+    index = hashlib.sha256(run("ls-files", "-s", "--", ":/").encode()).hexdigest()
+    return (
+        run("rev-parse", "--abbrev-ref", "HEAD").strip(),
+        run("rev-parse", "HEAD").strip(),
+        index,
+        run("status", "--porcelain", "--untracked-files=all"),
+    )
+
+
+def _registered_run_worktrees(repo: Path) -> set[str]:
+    """Resolved paths of worktrees under the engine's own worktrees root.
+
+    The evidence that a test actually exercised the `dedicated` layout. Scoped
+    to the engine's derived root so an adopter's (or a test's) own linked
+    worktree is never mistaken for a run worktree.
+    """
+    import subprocess
+
+    from gauntlet.engine import worktree as WT
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return set()
+    common = Path(proc.stdout.strip())
+    if not common.is_absolute():
+        common = (repo / common).resolve()
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return set()
+    found = set()
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            candidate = Path(line[len("worktree "):])
+            if WT.is_inside_worktrees_root(candidate, common):
+                found.add(str(candidate.resolve()))
+    return found
+
+
+@pytest.fixture(autouse=True)
+def operator_checkout_invariance(request):
+    """Assert acceptance A1 on EVERY test that drives a dedicated run.
+
+    Spike §12.1 asks for A1 as a *property* over the existing verb suite rather
+    than a handful of cases, because a property fails the moment any one of the
+    25 root-conflation sites in §9 is missed, and a case only fails if someone
+    thought to write it.
+
+    **Why it is conditional, and why that is not a weakening.** A `same_tree`
+    run drives the operator's checkout *by definition* — that is the pre-P7
+    layout, it is the shipped default through P7c, and asserting invariance
+    there would assert that the engine does nothing. So the fixture keys on
+    EVIDENCE rather than on configuration: it asserts invariance exactly when
+    the test actually created a run worktree under the engine's derived root.
+
+    That makes the property self-extending. Every new `dedicated` test inherits
+    it with no opt-in, and when P7d flips the default the assertion begins
+    firing across the whole suite with no test change at all — which is the
+    signal P7d needs and the reason not to gate it on a marker instead.
+    """
+    if "fixture_repo" not in request.fixturenames:
+        yield
+        return
+    repo = request.getfixturevalue("fixture_repo")
+
+    # The baseline is captured at the moment the run's tree FIRST EXISTS, not
+    # at test start. A1 is a claim about what happens while a dedicated run
+    # drives — "starting, resuming, recovering and rolling back never change
+    # the operator's checkout" — not about a test's own setup, which may
+    # legitimately commit to the operator's checkout before any run begins
+    # (adding a submodule, seeding history). Bracketing from tree-creation
+    # makes the property precise instead of merely strict, and a strict-but-
+    # imprecise property gets suppressed the first time it cries wolf.
+    from gauntlet.engine import worktree as WT
+
+    baseline: dict = {}
+
+    def _capture_once():
+        if not baseline:
+            baseline["fp"] = _operator_fingerprint(repo)
+
+    real_ensure, real_recreate = WT.ensure, WT.recreate
+
+    def ensure(*a, **kw):
+        _capture_once()
+        return real_ensure(*a, **kw)
+
+    def recreate(*a, **kw):
+        _capture_once()
+        return real_recreate(*a, **kw)
+
+    WT.ensure, WT.recreate = ensure, recreate
+    try:
+        yield
+    finally:
+        WT.ensure, WT.recreate = real_ensure, real_recreate
+    if not baseline or not _registered_run_worktrees(repo):
+        return  # no dedicated tree was exercised — A1 makes no claim here
+    before = baseline["fp"]
+    after = _operator_fingerprint(repo)
+    planes = ("branch", "HEAD", "index", "worktree")
+    drifted = [p for p, b, a in zip(planes, before, after) if b != a]
+    assert not drifted, (
+        "P7 acceptance A1 violated: this test created a dedicated run worktree, "
+        f"but the OPERATOR's checkout changed on: {', '.join(drifted)}.\n"
+        f"  before: {before}\n  after:  {after}\n"
+        "A run with its own worktree must never touch the operator's branch, "
+        "HEAD, index or working tree (spike §9/§12.1). Route the offending "
+        "call through `work_root` rather than the operator's checkout."
+    )

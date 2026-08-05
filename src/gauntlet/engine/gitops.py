@@ -15,6 +15,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # Intra-phase checkpoint-commit subject convention (harness-efficiency FR-11.1 /
 # §6): ``P<N> wip: <milestone>``. Matched at fixed field position (the subject
@@ -141,6 +142,7 @@ ROOT_SCOPE: dict[str, str] = {
     "is_git_repo": ROOT_SCOPE_REPO,
     "rev_parse": ROOT_SCOPE_REPO,
     "branch_exists": ROOT_SCOPE_REPO,
+    "create_branch": ROOT_SCOPE_REPO,   # ref-store only; checks out nothing
     "delete_branch": ROOT_SCOPE_REPO,
     "tag_exists": ROOT_SCOPE_REPO,
     "ref_is_valid_commit": ROOT_SCOPE_REPO,
@@ -167,10 +169,30 @@ ROOT_SCOPE: dict[str, str] = {
     "remote_url": ROOT_SCOPE_REPO,
     "remote_default_branch": ROOT_SCOPE_REPO,
     # --- COMMON: the shared git dir / worktree administration ----------------
+    #
+    # Every entry below mutates or reads the ONE worktree administration dir the
+    # whole repository shares, so the root passed in selects the *repository*,
+    # never a tree — any worktree of the repo answers identically (spike E1/E8).
+    # That is also why each of these runs inside the repo-global lock
+    # (`repolock`): the admin dir has no per-worktree isolation to fall back on.
     "git_common_dir": ROOT_SCOPE_COMMON,
     "add_worktree": ROOT_SCOPE_COMMON,
+    "add_worktree_branch": ROOT_SCOPE_COMMON,
     "remove_worktree": ROOT_SCOPE_COMMON,
     "prune_worktrees": ROOT_SCOPE_COMMON,
+    "lock_worktree": ROOT_SCOPE_COMMON,
+    "unlock_worktree": ROOT_SCOPE_COMMON,
+    "repair_worktree": ROOT_SCOPE_COMMON,
+    "list_worktrees": ROOT_SCOPE_COMMON,
+    "worktree_for_branch": ROOT_SCOPE_COMMON,
+    # `submodule status` reads the SUPERPROJECT's index and the on-disk
+    # submodule dirs, so it is genuinely a property of one tree — but the tree
+    # it must be asked about is always the RUN worktree (that is the point of
+    # spike §7: the superproject's own checkout has its submodules populated
+    # while a fresh linked worktree does not), so it is work-scoped and the
+    # static audit holds callers to naming a work root.
+    "submodule_status": ROOT_SCOPE_WORK,
+    "uninitialized_submodules": ROOT_SCOPE_WORK,
 }
 
 
@@ -561,9 +583,201 @@ def remove_worktree(repo: Path, path: Path) -> None:
     _run(repo, "worktree", "remove", "--force", str(path))
 
 
-def prune_worktrees(repo: Path) -> None:
-    """Prune stale worktree administrative entries (best-effort cleanup)."""
-    _run(repo, "worktree", "prune")
+def prune_worktrees(repo: Path, *, expire: str = "now") -> None:
+    """Prune stale worktree administrative entries.
+
+    ``expire`` is passed EXPLICITLY on every call (spike §11 row 7). A bare
+    ``git worktree prune`` consults ``gc.worktreePruneExpire``, which is
+    adopter-configurable: a repo that sets it to ``3.days.ago`` would silently
+    leave a freshly-missing entry registered, and the recreate path (§11 row 2)
+    would then hit ``already registered worktree`` instead of succeeding. Pinning
+    the value is the same fail-closed reasoning as ``status_porcelain``'s pinned
+    ``--untracked-files``: never let an adopter's config change the engine's
+    observed answer.
+
+    Repository-wide by construction (spike E8-C): this removes the ``prunable``
+    entry of EVERY worktree of the repository, not just the caller's. That is
+    why a live run worktree is held under :func:`lock_worktree` for its whole
+    life, and why every call here runs inside the repo-global lock.
+    """
+    _run(repo, "worktree", "prune", f"--expire={expire}")
+
+
+def add_worktree_branch(repo: Path, path: Path, branch: str) -> None:
+    """Check ``branch`` out into a NEW linked worktree at ``path`` (P7c, §6.2).
+
+    Deliberately not :func:`add_worktree`: that one is the verifier's
+    ``--detach --force`` disposable copy. A run worktree is the opposite on both
+    counts — it is *attached* to the run branch (so git's own
+    one-branch-one-worktree rule supplies acceptance A2 for free, spike E2-A),
+    and it is never ``--force``d (spike §11 rows 1 and 6: ``add -f`` would
+    silently adopt a registered admin entry the recovery assessment has not
+    explained, and ``add`` refusing a non-empty path is information, not an
+    obstacle).
+
+    Raises :class:`GitError` on every refusal — branch already checked out
+    elsewhere, path exists and is non-empty, stale admin entry, or a
+    leading-directory failure — so the caller parks with git's own stderr
+    preserved rather than guessing.
+    """
+    _run(repo, "worktree", "add", str(path), branch)
+
+
+def lock_worktree(repo: Path, path: Path, *, reason: str) -> None:
+    """``git worktree lock --reason`` — the git-native anti-prune marker (§8.3).
+
+    The ONLY thing that stops another run's ``prune_worktrees`` from removing
+    this run's admin entry while its tree is momentarily missing (spike E8-C),
+    and it also blocks ``worktree remove --force`` (E6-B), so a teardown must
+    :func:`unlock_worktree` first. Held for the LIFE of the run worktree, not
+    for a critical section — it is a marker, not a mutex.
+    """
+    _run(repo, "worktree", "lock", "--reason", reason, str(path))
+
+
+def unlock_worktree(repo: Path, path: Path) -> None:
+    """``git worktree unlock``. Raises :class:`GitError` if it was not locked."""
+    _run(repo, "worktree", "unlock", str(path))
+
+
+def repair_worktree(repo: Path, path: Path) -> str:
+    """``git worktree repair`` for a worktree whose paths moved (§11 row 9).
+
+    Preferred over prune+recreate when the tree is intact but the pointer pair
+    is broken (spike E6-F), because it preserves uncommitted work.
+    """
+    return _run(repo, "worktree", "repair", str(path))
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    """One record from ``git worktree list --porcelain``.
+
+    ``prunable`` carries git's own machine-readable reason string (e.g.
+    ``gitdir file points to non-existent location``) — the discovery signal
+    spike §4.2 identifies for "the tree is gone but the branch survives", which
+    is what the recreate action (§11 row 2) keys on. ``locked`` carries the
+    ``--reason`` text, so the holder of a lock is self-describing.
+    """
+
+    path: Path
+    head: str | None
+    branch: str | None  # short name; None for a detached or bare entry
+    bare: bool
+    detached: bool
+    locked: str | None  # the lock reason ("" when locked with no reason)
+    prunable: str | None  # git's reason string
+
+
+def list_worktrees(repo: Path) -> list[WorktreeEntry]:
+    """Parse ``git worktree list --porcelain`` into records.
+
+    The porcelain format is one blank-line-separated stanza per worktree, whose
+    first line is always ``worktree <path>``. ``locked``/``prunable`` appear as
+    a bare keyword or ``<keyword> <reason>``; both forms are preserved (a bare
+    keyword becomes ``""``, which is falsy-but-not-None, so "locked with no
+    reason" stays distinguishable from "not locked").
+
+    Paths are recorded AS GIT REPORTS THEM — git does not resolve symlinks here
+    (spike E9-B) — so any containment or identity comparison against an entry
+    must ``resolve()`` both sides itself.
+    """
+    out = _run(repo, "worktree", "list", "--porcelain")
+    entries: list[WorktreeEntry] = []
+    cur: dict[str, Any] = {}
+
+    def flush() -> None:
+        if not cur.get("path"):
+            return
+        branch_ref = cur.get("branch")
+        entries.append(
+            WorktreeEntry(
+                path=Path(cur["path"]),
+                head=cur.get("HEAD"),
+                branch=(
+                    branch_ref[len("refs/heads/"):]
+                    if isinstance(branch_ref, str)
+                    and branch_ref.startswith("refs/heads/")
+                    else branch_ref
+                ),
+                bare=bool(cur.get("bare")),
+                detached=bool(cur.get("detached")),
+                locked=cur.get("locked"),
+                prunable=cur.get("prunable"),
+            )
+        )
+        cur.clear()
+
+    for raw in out.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip():
+            flush()
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            flush()
+            cur["path"] = value
+        elif key in ("HEAD", "branch", "locked", "prunable"):
+            cur[key] = value
+        elif key in ("bare", "detached"):
+            cur[key] = True
+    flush()
+    return entries
+
+
+def worktree_for_branch(repo: Path, branch: str) -> WorktreeEntry | None:
+    """The registered worktree holding ``branch``, or ``None``.
+
+    The evidence half of the spike §10 detection rule ("a run is `same_tree` iff
+    its journal carries no ``WorktreeAdopted`` event AND ``worktree list``
+    registers no worktree for ``man.branch``") and the discovery half of §11
+    rows 2 and 4. Read-only and available when the driver is dead, which is what
+    makes it usable from a recovery assessment.
+    """
+    for entry in list_worktrees(repo):
+        if entry.branch == branch:
+            return entry
+    return None
+
+
+def submodule_status(repo: Path) -> list[tuple[str, str]]:
+    """``git submodule status`` → ``[(state_prefix, path)]`` (spike §7).
+
+    A worktree of a superproject checks out the submodule *gitlink* but leaves
+    the directory EMPTY, and ``git status`` reports the tree CLEAN — so a
+    builder would see failing tests with no signal pointing at the cause. The
+    leading ``-`` in this command's output is the machine-readable
+    "uninitialized" marker and is the only reliable detection.
+
+    ``state_prefix`` is ``"-"`` (uninitialized), ``"+"`` (checked out at a
+    different SHA than the index), ``"U"`` (merge conflicts) or ``""`` (in
+    sync). A repository with no submodules yields an empty list.
+    """
+    out = _run(repo, "submodule", "status")
+    rows: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        prefix = line[0] if line[0] in "-+U" else ""
+        rest = line[1:] if prefix else line
+        parts = rest.split()
+        if len(parts) >= 2:
+            rows.append((prefix, parts[1]))
+    return rows
+
+
+def uninitialized_submodules(repo: Path) -> list[str]:
+    """Submodule paths reporting the ``-`` (uninitialized) marker (spike §7).
+
+    Empty when the repository has no submodules, and empty when a
+    ``submodule`` invocation is not meaningful here — a repository without the
+    command's preconditions must not be misreported as having uninitialized
+    submodules, which would park every run on a repo that has none.
+    """
+    try:
+        return [path for prefix, path in submodule_status(repo) if prefix == "-"]
+    except GitError:
+        return []
 
 
 def branch_exists(repo: Path, branch: str) -> bool:
@@ -597,6 +811,24 @@ def recreate_branch(repo: Path, branch: str, start_point: str) -> None:
     unmerged work would orphan those commits.
     """
     _run(repo, "checkout", "-B", branch, start_point)
+
+
+def create_branch(repo: Path, branch: str, start_point: str, *, force: bool = False) -> None:
+    """Create (or with ``force``, reset) ``branch`` at ``start_point``.
+
+    The no-checkout sibling of :func:`checkout_or_create_branch`, added for the
+    dedicated-worktree start path (P7c): the run worktree does not exist yet
+    when the branch is minted, so there is no tree to check it out into — and
+    checking it out in the OPERATOR's tree is precisely what acceptance A1
+    forbids. ``git branch`` touches only the ref store, so it is repo-scoped.
+
+    ``force`` is the ``-f`` form used to recycle a *spent* run branch (one
+    already merged into its base). Git refuses it outright if the branch is
+    checked out in any worktree (spike E2-E), which is the correct fail-closed
+    answer and is why the caller does not need a lock of its own.
+    """
+    args = ["branch"] + (["-f"] if force else []) + [branch, start_point]
+    _run(repo, *args)
 
 
 def delete_branch(repo: Path, branch: str) -> None:

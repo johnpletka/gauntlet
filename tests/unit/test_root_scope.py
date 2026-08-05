@@ -53,6 +53,7 @@ WORK_ROOT_NAMES = {
     "self.work_root",
     "ctx.work_root",
     "copy.path",          # verifier disposable copy — a throwaway work tree
+    "wt.path",            # a `worktree.RunWorktree`'s tree — the run's work tree
     "worktree",           # collector enumeration target
     "linked",             # test/lab worktrees
     # the operator's tree, named deliberately
