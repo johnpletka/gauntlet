@@ -812,21 +812,33 @@ def discard_disposable_copy(repo_root: Path, copy: DisposableCopy) -> None:
     missing. Serializing add/remove/prune repo-globally is what keeps two
     concurrent runs in two linked worktrees from pruning each other.
 
-    Best-effort acquisition (:func:`repolock.repo_lock_best_effort`): this
-    function is contractually non-raising, so an unobtainable repo lock degrades
-    to the pre-P7b behaviour rather than wedging a sub-step that already
-    finished. The safety gate is the drive lock; this is hygiene.
+    Best-effort ACQUISITION (:func:`repolock.repo_lock_best_effort`): this
+    function is contractually non-raising, so it must not turn an unobtainable
+    repo lock into a failed sub-step. But it must not run the shared-git
+    mutations unlocked either (review F-004) — doing so would reproduce E8-C at
+    exactly the moment the lock exists to prevent it, since a contended lock
+    means another run is inside its own add/remove/prune section right now.
+
+    So a failed acquisition SKIPS both git calls and removes only our own temp
+    root, which is not shared state. That leaves a `prunable` admin entry
+    behind, which is a benign, self-healing state: the next teardown that does
+    hold the lock prunes it. Leaking an admin entry is strictly safer than
+    pruning the repository concurrently.
     """
-    with repolock.repo_lock_best_effort(repo_root, reason="verify:discard-copy"):
-        try:
-            gitops.remove_worktree(repo_root, copy.path)
-        except gitops.GitError:
-            pass
+    with repolock.repo_lock_best_effort(
+        repo_root, reason="verify:discard-copy"
+    ) as acquired:
+        if acquired:
+            try:
+                gitops.remove_worktree(repo_root, copy.path)
+            except gitops.GitError:
+                pass
         shutil.rmtree(copy.root, ignore_errors=True)
-        try:
-            gitops.prune_worktrees(repo_root)
-        except gitops.GitError:
-            pass
+        if acquired:
+            try:
+                gitops.prune_worktrees(repo_root)
+            except gitops.GitError:
+                pass
 
 
 # The collector-enumeration path is an ENGINE SUBPROCESS in a disposable copy

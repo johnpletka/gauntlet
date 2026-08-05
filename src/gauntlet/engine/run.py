@@ -914,11 +914,16 @@ class RunManager:
 
         ``run_dir=None`` reads the tree guard alone (the acquisition-time view,
         and the pre-P7b behaviour of this method).
+
+        A per-run lock that EXISTS but is unreadable does **not** fall through
+        (review F-002): consulting a different file would answer confidently
+        about a run whose own evidence we could not read. It returns ``None``,
+        which every caller here treats as a fail-closed refusal.
         """
         if run_dir is not None:
-            rec = locking.read_record(self._run_lock_path(run_dir))
-            if rec is not None:
-                return rec
+            kind, rec = locking.read_lock_state(self._run_lock_path(run_dir))
+            if kind != locking.LOCK_ABSENT:
+                return rec  # present → the record; malformed → None, no fallback
         return locking.read_record(self._tree_lock_path())
 
     # The reclaim rule itself now lives in `engine.locking` so the tree guard,
@@ -940,29 +945,35 @@ class RunManager:
         return locking.new_record(slug, run_id)
 
     def _try_reclaim(
-        self, lock_path: Path, observed: _LockRecord | None, nonce: str, payload: str
+        self, lock_path: Path, observed: _LockRecord, nonce: str, payload: str
     ) -> bool:
-        """Best-effort reclaim of a stale/corrupt lock; True iff we now hold it.
+        """Reclaim a lock we PROVED stale; True iff we now hold it.
 
-        Re-reads **``lock_path`` itself** immediately before removing it (P7b:
-        the caller may be reclaiming either scope, so this must never re-read
-        some other lock) and unlinks only the record we observed as stale
+        ``observed`` is a parsed record the caller has already proven dead or
+        PID-reused. This re-reads **``lock_path`` itself** immediately before
+        removing it (P7b: the caller may be reclaiming either scope, so this
+        must never re-read some other lock) and unlinks only that record
         (matching nonce) — never a *new* owner's fresh lock (the F-004 inverse
-        of ownership-validated release). Then races to atomically link our
-        record into place; a lost race (someone else reclaimed first) returns
-        ``False`` so the caller re-evaluates the holder.
+        of ownership-validated release), and never a record it could not read
+        (review F-002: an unreadable lock may belong to a LIVE driver, so
+        "cannot read" must never mean "may delete"). Then races to atomically
+        link our record into place; a lost race (someone else reclaimed first)
+        returns ``False`` so the caller re-evaluates the holder.
         """
-        current = locking.read_record(lock_path)
-        if current is not None:
+        kind, current = locking.read_lock_state(lock_path)
+        if kind == locking.LOCK_MALFORMED:
+            return False  # unreadable now → cannot prove staleness; fail closed
+        if kind == locking.LOCK_PRESENT:
+            assert current is not None
             if self._lock_is_live(current):
                 return False  # became live (or a fresh owner) → caller fails closed
-            if observed is None or current.nonce != observed.nonce:
+            if current.nonce != observed.nonce:
                 return False  # changed under us → re-evaluate, don't blind-unlink
-        # current is None (corrupt/vanished) or matches our observed stale record:
-        try:
-            os.unlink(lock_path)
-        except FileNotFoundError:
-            pass
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+        # LOCK_ABSENT: it vanished under us — nothing to unlink, just race for it.
         return self._link_into_place(lock_path, nonce, payload)
 
     def _acquire_one(
@@ -971,19 +982,32 @@ class RunManager:
         """Take ONE lock file or fail closed (FR-10.5); no handle bookkeeping.
 
         Atomic create-if-absent via ``os.link`` so check-and-acquire has no
-        TOCTOU window and the lock is never observed empty. A lock held by a
-        **live** pid fails the verb closed regardless of slug; a
-        dead/reused/unverifiable lock is reclaimed as stale.
+        TOCTOU window and the lock is never observed empty. The three outcomes
+        of the shared tri-state read (review F-002) are handled distinctly:
+
+        * **present + live** → fail the verb closed, regardless of slug;
+        * **present + provably dead/reused** → reclaim as stale;
+        * **malformed** (exists but unreadable or unparseable) → fail closed
+          with a named remedy. This is the case that used to be collapsed into
+          "corrupt → unlink it": an unreadable lock can belong to a *live*
+          driver, and stealing it re-opens double-driving. It is also what
+          ``operator.driver_info`` already reports as ``indeterminate``, so the
+          read-only view and the mutating path now agree (R4);
+        * **absent** → it vanished under us; loop and race for the link.
         """
         for _ in range(locking.LOCK_ACQUIRE_RETRIES):
             if self._link_into_place(lock_path, record.nonce, payload):
                 return
-            existing = locking.read_record(lock_path)
-            if existing is not None and self._lock_is_live(existing):
-                raise WorktreeLockError(self._lock_busy_message(existing))
-            if self._try_reclaim(lock_path, existing, record.nonce, payload):
-                return
-            # transient race (a concurrent reclaim/empty window) → re-evaluate
+            kind, existing = locking.read_lock_state(lock_path)
+            if kind == locking.LOCK_MALFORMED:
+                raise WorktreeLockError(locking.malformed_lock_message(lock_path))
+            if kind == locking.LOCK_PRESENT:
+                assert existing is not None
+                if self._lock_is_live(existing):
+                    raise WorktreeLockError(self._lock_busy_message(existing))
+                if self._try_reclaim(lock_path, existing, record.nonce, payload):
+                    return
+            # transient race (a concurrent reclaim, or it vanished) → re-evaluate
         raise WorktreeLockError(
             "could not acquire the worktree lock after repeated reclaim races "
             f"({lock_path}); a driver may be churning — fail closed (FR-10.5)"

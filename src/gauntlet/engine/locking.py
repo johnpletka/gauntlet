@@ -149,13 +149,57 @@ def new_record(slug: str, run_id: str | None) -> LockRecord:
     )
 
 
-def read_record(path: Path) -> LockRecord | None:
-    """Parse the lock at ``path``; ``None`` when absent, unreadable or malformed."""
+# The three things a lockfile can be, kept distinct (review F-002). Collapsing
+# `malformed` into `absent` is what let a mutating verb DELETE a lock it could
+# not read — including a live holder's, when the file was merely unreadable —
+# while `status` was simultaneously calling that same file `indeterminate`. One
+# tri-state read, consumed by the operator view, the drive lock and the
+# repo-global lock, is what keeps those surfaces from disagreeing (R4).
+LOCK_ABSENT = "absent"
+LOCK_MALFORMED = "malformed"
+LOCK_PRESENT = "present"
+
+
+def read_lock_state(path: Path) -> tuple[str, LockRecord | None]:
+    """Read one lockfile → ``(kind, record)``; the single lock-read primitive.
+
+    * ``LOCK_ABSENT`` — the file is not there. The only kind that may be
+      treated as "free": there is no evidence to override.
+    * ``LOCK_MALFORMED`` — the file EXISTS but could not be read (``OSError``:
+      permissions, I/O error) or could not be parsed. Fail closed: we cannot
+      prove who holds it, so it is never reclaimed and never treated as absent.
+    * ``LOCK_PRESENT`` — a parsed record; :func:`record_is_live` decides.
+    """
     try:
         text = path.read_text()
-    except (OSError, FileNotFoundError):
-        return None
-    return LockRecord.from_json(text)
+    except FileNotFoundError:
+        return (LOCK_ABSENT, None)
+    except OSError:
+        return (LOCK_MALFORMED, None)  # exists but unreadable → never reclaimable
+    rec = LockRecord.from_json(text)
+    if rec is None:
+        return (LOCK_MALFORMED, None)
+    return (LOCK_PRESENT, rec)
+
+
+def read_record(path: Path) -> LockRecord | None:
+    """The parsed record at ``path``, or ``None`` when it is not readable.
+
+    Convenience for callers that only need the record and treat every
+    not-a-record outcome the same way. Anything that decides whether a lock may
+    be **reclaimed** must use :func:`read_lock_state` instead — see F-002.
+    """
+    return read_lock_state(path)[1]
+
+
+def malformed_lock_message(path: Path) -> str:
+    """The fail-closed refusal for a lockfile that exists but cannot be read."""
+    return (
+        f"the drive lock {path} exists but cannot be read or parsed; refusing to "
+        "reclaim a lock whose holder cannot be identified (FR-10.5, fail "
+        "closed). Confirm no gauntlet process is driving this worktree "
+        "(`gauntlet status`), then remove the file by hand."
+    )
 
 
 def record_is_live(rec: LockRecord) -> bool:
@@ -234,10 +278,15 @@ def unlink_if_nonce(lock_path: Path, nonce: str) -> bool:
 
 __all__ = [
     "DRIVING_LOCK_NAME",
+    "LOCK_ABSENT",
     "LOCK_ACQUIRE_RETRIES",
+    "LOCK_MALFORMED",
+    "LOCK_PRESENT",
     "LockRecord",
     "link_into_place",
+    "malformed_lock_message",
     "new_record",
+    "read_lock_state",
     "read_record",
     "record_is_live",
     "unlink_if_nonce",

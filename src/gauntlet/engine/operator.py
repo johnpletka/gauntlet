@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 from datetime import datetime, timezone
 
 from gauntlet.engine import heartbeat as HB
+from gauntlet.engine import locking
 from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import Manifest, StepRecord
 from gauntlet.engine.pipeline import Pipeline, upstream_cycle_id_for_gate
@@ -290,17 +291,13 @@ def _lock_file_state(path: Path) -> tuple[str, _LockRecord | None]:
 
     ``kind`` is ``absent`` (no file), ``malformed`` (unreadable or unparseable
     / missing required field — FR-2.4 row g, fail closed), or ``present``.
+
+    Delegates to :func:`locking.read_lock_state` (review F-002): this
+    tri-state distinction used to exist ONLY here, while the mutating acquire
+    path collapsed malformed into absent and deleted the file. One primitive,
+    so the read-only view and the mutating verbs cannot disagree (R4).
     """
-    try:
-        text = path.read_text()
-    except FileNotFoundError:
-        return ("absent", None)
-    except OSError:
-        return ("malformed", None)
-    rec = _LockRecord.from_json(text)
-    if rec is None:
-        return ("malformed", None)
-    return ("present", rec)
+    return locking.read_lock_state(path)
 
 
 def _lock_state(
@@ -330,11 +327,25 @@ def _lock_state(
     pre-P7b behaviour, and what callers that have no resolved instance (or that
     are deliberately asking "who owns this tree?") get.
     """
+    return _lock_state_scoped(run_root, run_instance_dir)[:2]
+
+
+# Which file answered, so the caller can tell "another slug owns the shared
+# TREE" (legitimate, FR-2.4 row b) from "another slug's record is sitting at
+# THIS RUN's authoritative path" (inconsistent evidence — review F-003).
+_SCOPE_RUN = "run"
+_SCOPE_TREE = "tree"
+
+
+def _lock_state_scoped(
+    run_root: Path, run_instance_dir: Path | None = None
+) -> tuple[str, _LockRecord | None, str]:
+    """:func:`_lock_state` plus which scope answered."""
     if run_instance_dir is not None:
         kind, rec = _lock_file_state(Path(run_instance_dir) / DRIVING_LOCK_NAME)
-        if kind != "absent":
-            return (kind, rec)
-    return _lock_file_state(Path(run_root) / DRIVING_LOCK_NAME)
+        if kind != locking.LOCK_ABSENT:
+            return (kind, rec, _SCOPE_RUN)
+    return (*_lock_file_state(Path(run_root) / DRIVING_LOCK_NAME), _SCOPE_TREE)
 
 
 def _liveness_for_record(rec: _LockRecord) -> str:
@@ -383,22 +394,34 @@ def driver_info(
     The table stays TOTAL and every row stays reachable:
 
     * rows a/c–h are reached from whichever lockfile ``_lock_state`` answered;
-    * row b (**foreign lock → none**) is reached from the worktree-global lock,
+    * row b (**foreign lock → none**) is reached from the WORKTREE-GLOBAL lock,
       which genuinely names another slug whenever that slug is driving this
       shared tree, and from a legacy lock left by another slug's run. It is
-      *not* legacy-only in P7b. It also stays reachable from a per-run lock —
-      defensively: a lock naming a different slug inside this run's dir is a
-      misplaced or hand-copied file, and "not this run's driver" is the only
-      answer that cannot mislead.
+      *not* legacy-only in P7b. "No driver for this slug" is the true answer
+      there: the other slug's hold is transient contention, not evidence about
+      this run.
+
+    A foreign record at the **per-run** path is a different thing entirely and
+    is NOT row b (review F-003). That path is this run's own authoritative
+    evidence; a record naming someone else there is inconsistent — the file was
+    misplaced, hand-copied, or corrupted. Reporting ``none`` would tell the
+    operator "no driver, go ahead and resume" while the mutating path refuses
+    the very same lock as a live foreign holder, which is precisely the R4
+    disagreement ("the read-only view cannot ... recommend a resume that the
+    mutating path will reject"). It is ``indeterminate``: fail closed, offer
+    read-only actions, and let the operator look.
     """
-    kind, rec = _lock_state(run_root, run_instance_dir)
-    if kind == "absent":
+    kind, rec, scope = _lock_state_scoped(run_root, run_instance_dir)
+    if kind == locking.LOCK_ABSENT:
         return DriverInfo(LIVENESS_NONE, None, None, None)  # row a
-    if kind == "malformed":
+    if kind == locking.LOCK_MALFORMED:
         return DriverInfo(LIVENESS_INDETERMINATE, None, None, None)  # row g
     assert rec is not None
     if rec.slug != slug:
-        return DriverInfo(LIVENESS_NONE, None, None, None)  # row b — foreign lock
+        if scope == _SCOPE_RUN:
+            # Inconsistent evidence at this run's own path → fail closed.
+            return DriverInfo(LIVENESS_INDETERMINATE, None, None, None)
+        return DriverInfo(LIVENESS_NONE, None, None, None)  # row b — foreign tree hold
     state = _liveness_for_record(rec)
     return DriverInfo(state, rec.pid, rec.host or None, rec.started_at or None)
 
@@ -1265,9 +1288,9 @@ def read_recovery_intent(
     if not isinstance(step_id, str) or not step_id or not isinstance(lock_nonce, str):
         return (None, anomaly)
     kind, rec = _lock_state(run_root, run_instance_dir)
-    if kind == "absent":
+    if kind == locking.LOCK_ABSENT:
         nonce_matches = True  # finalize branch — verified target already gone
-    elif kind == "present" and rec is not None:
+    elif kind == locking.LOCK_PRESENT and rec is not None:
         nonce_matches = rec.nonce == lock_nonce
     else:  # malformed/unreadable lock → fail closed
         nonce_matches = False

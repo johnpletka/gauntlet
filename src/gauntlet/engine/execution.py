@@ -173,10 +173,20 @@ class RunPaths:
         return self.work_root != self.repo_root
 
     def git_common_dir(self) -> Path:
-        """The shared git dir, identical from every worktree (spike E1/E8)."""
+        """The shared git dir, identical from every worktree (spike E1/E8).
+
+        Resolved from ``repo_root`` — *the git repository*, i.e. the operator's
+        own checkout — and deliberately NOT from ``work_root`` (review F-001).
+        The common dir is a property of the repository, not of any one tree
+        (``gitops.ROOT_SCOPE`` classifies it ``common``), and the one incident
+        that most needs it is P7 acceptance A3: recreating a run worktree that
+        is **missing**. Deriving it by running git inside the very tree that no
+        longer exists would fail exactly then. The operator's checkout is the
+        surviving root by construction — the CLI was invoked from it.
+        """
         from gauntlet.engine import gitops
 
-        return gitops.git_common_dir(self.work_root)
+        return gitops.git_common_dir(self.repo_root)
 
 
 @dataclass

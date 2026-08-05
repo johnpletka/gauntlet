@@ -133,6 +133,18 @@ def _write_lock(
     )
 
 
+def _running_manifest() -> Manifest:
+    """A minimal `running` manifest for the next-actions assertions."""
+    from gauntlet.engine.manifest import PipelineRef, StepRecord
+
+    return Manifest(
+        run_id="run-1", slug="alpha", branch="gauntlet/alpha", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_RUNNING,
+        steps=[StepRecord(id="s", type="agent_task", status=M.RUNNING)],
+    )
+
+
 class _MidStepAdapter:
     """A builder that runs ``hook()`` while the drive lock is genuinely held."""
 
@@ -414,7 +426,8 @@ def test_fr24_row_b_stays_reachable_for_a_foreign_tree_hold(fixture_repo):
 
     While the tree is shared, another slug driving it holds the worktree-global
     lock under ITS name, and this slug has no per-run lock — which is the row's
-    live, non-legacy trigger.
+    live, non-legacy trigger. "No driver for alpha" is the true answer: beta's
+    hold is transient contention on the tree, not evidence about alpha's run.
     """
     run_root = fixture_repo / "runs"
     run_dir = run_root / "alpha" / "run-1"
@@ -424,12 +437,37 @@ def test_fr24_row_b_stays_reachable_for_a_foreign_tree_hold(fixture_repo):
     info = op.driver_info(run_root, "alpha", run_instance_dir=run_dir)
     assert info.state == op.LIVENESS_NONE
     assert (info.pid, info.host, info.since) == (None, None, None)
-    # ...and it is still reachable defensively from a misplaced per-run lock.
+
+
+def test_foreign_record_at_the_per_run_path_is_indeterminate_not_none(fixture_repo):
+    """Review F-003: inconsistent evidence at a run's OWN path must fail closed.
+
+    An earlier revision classified this as row b (``none``) "defensively". That
+    was the wrong direction and this test previously pinned it: ``none`` means
+    "no driver — resume is safe", while the mutating acquisition refuses the
+    very same file as a live foreign holder. That is the R4 disagreement the
+    plan forbids ("the read-only view cannot ... recommend a resume that the
+    mutating path will reject"). The per-run path is this run's authoritative
+    evidence; a record naming someone else there is misplaced or corrupt, and
+    the only non-misleading answer is ``indeterminate``.
+    """
+    mgr = _prepare(fixture_repo)
+    run_root = fixture_repo / "runs"
+    run_dir = run_root / "alpha" / "run-1"
+    run_dir.mkdir(parents=True)
     _write_lock(run_dir / DRIVING_LOCK_NAME, pid=os.getpid(),
                 identity=_live_identity(), slug="beta", run_id="run-b")
-    assert op.driver_liveness(
-        run_root, "alpha", run_instance_dir=run_dir
-    ) == op.LIVENESS_NONE
+
+    state = op.driver_liveness(run_root, "alpha", run_instance_dir=run_dir)
+    assert state == op.LIVENESS_INDETERMINATE
+    # Indeterminate offers read-only actions only — so status no longer proposes
+    # an action the mutating path rejects.
+    man = _running_manifest()
+    actions = op.next_actions(man, state)
+    assert {a.kind for a in actions} == {"observe"}, actions
+    # ...and the mutating path does refuse, which is what it must agree with.
+    with pytest.raises(WorktreeLockError):
+        mgr._acquire_worktree_lock("alpha", "run-1", run_dir=run_dir)
 
 
 def test_driver_info_without_an_instance_reads_the_worktree_global_lock(
@@ -477,6 +515,122 @@ def test_unverifiable_live_per_run_lock_is_not_reclaimed(fixture_repo):
         mgr.approve("alpha", notes="ok", use_judge=False)
     # ...and the tree guard was not left behind by the refused acquisition.
     assert not _tree_lock(fixture_repo).exists()
+
+
+# --- review F-002: a lock we cannot read is never a lock we may delete -------
+
+
+@pytest.mark.parametrize("scope", ["tree", "run"])
+@pytest.mark.parametrize("how", ["unparseable", "unreadable"])
+def test_malformed_lock_is_never_reclaimed_at_either_scope(fixture_repo, scope, how):
+    """A lockfile that EXISTS but cannot be read must fail the verb closed.
+
+    The reclaim path used to collapse absent/unreadable/unparseable into one
+    ``None`` and then unlink "the corrupt lock". That is a fail-closed
+    violation with teeth: an ``OSError`` on read (permissions, I/O) is exactly
+    what a LIVE driver's lock looks like when the file is momentarily
+    unreadable, and stealing it re-opens double-driving. It was also a direct
+    R4 disagreement — ``driver_info`` reports these as ``indeterminate`` while
+    the mutating path deleted the evidence and proceeded.
+    """
+    mgr = _prepare(fixture_repo)
+    run_dir = fixture_repo / "runs" / "alpha" / "run-1"
+    run_dir.mkdir(parents=True)
+    path = _tree_lock(fixture_repo) if scope == "tree" else run_dir / DRIVING_LOCK_NAME
+
+    if how == "unparseable":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not valid json ")
+        expected = "{ not valid json "
+    else:
+        # A LIVE, identity-verifiable holder whose file we cannot read.
+        rec = locking.new_record("beta", "run-b")
+        _write_lock(path, pid=os.getpid(), identity=_live_identity(),
+                    slug="beta", nonce=rec.nonce)
+        expected = path.read_text()
+        os.chmod(path, 0o000)
+
+    try:
+        # The read-only view already fails closed here (FR-2.4 row g)...
+        assert op.driver_liveness(
+            fixture_repo / "runs", "alpha", run_instance_dir=run_dir
+        ) == op.LIVENESS_INDETERMINATE
+        # ...and now so does the mutating path, instead of unlinking it.
+        with pytest.raises(WorktreeLockError, match="cannot be read or parsed"):
+            mgr._acquire_worktree_lock("alpha", "run-1", run_dir=run_dir)
+    finally:
+        if how == "unreadable":
+            os.chmod(path, 0o600)
+    assert path.exists(), "the unreadable lock was deleted"
+    assert path.read_text() == expected, "the unreadable lock was overwritten"
+    # No partial hold survived the refusal.
+    assert mgr._held_lock is None
+    if scope == "run":
+        assert not _tree_lock(fixture_repo).exists()
+
+
+def test_malformed_per_run_lock_does_not_fall_through_in_the_engine_read(
+    fixture_repo,
+):
+    """`RunManager._read_lock` must not answer from a different file (F-002).
+
+    `recover` keys its FR-5.1 gate on this read. Falling through from an
+    unreadable per-run lock to the tree guard would let it verify (and signal)
+    against a driver whose own evidence it could not read.
+    """
+    mgr = _prepare(fixture_repo)
+    run_dir = fixture_repo / "runs" / "alpha" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / DRIVING_LOCK_NAME).write_text("{ not valid json ")
+    _write_lock(_tree_lock(fixture_repo), pid=os.getpid(),
+                identity=_live_identity(), slug="alpha", nonce="tree-nonce")
+    assert mgr._read_lock(run_dir) is None  # not the tree guard's record
+    # An ABSENT per-run lock still falls back (the legacy-run read path).
+    (run_dir / DRIVING_LOCK_NAME).unlink()
+    rec = mgr._read_lock(run_dir)
+    assert rec is not None and rec.nonce == "tree-nonce"
+
+
+def test_vanished_lock_is_still_acquirable(fixture_repo):
+    """Fail-closed on unreadable must not break the genuine `absent` race.
+
+    `absent` is the one kind that may be treated as free; the tri-state split
+    exists precisely so tightening `malformed` does not wedge this path.
+    """
+    mgr = _prepare(fixture_repo)
+    run_dir = fixture_repo / "runs" / "alpha" / "run-1"
+    run_dir.mkdir(parents=True)
+    handle = mgr._acquire_worktree_lock("alpha", "run-1", run_dir=run_dir)
+    mgr._release_worktree_lock(handle)
+    again = mgr._acquire_worktree_lock("alpha", "run-1", run_dir=run_dir)
+    assert again.run_path == run_dir / DRIVING_LOCK_NAME
+    mgr._release_worktree_lock(again)
+
+
+def test_repo_lock_never_reclaims_an_unreadable_holder(fixture_repo):
+    """The same rule at the third scope — one policy, not three (F-002)."""
+    path = repolock.repo_lock_path(fixture_repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not valid json ")
+    with pytest.raises(repolock.RepoLockError, match="unreadable"):
+        with repolock.repo_lock(fixture_repo, reason="thief", timeout_s=0.2,
+                                sleep=lambda _s: None):
+            pass
+    assert path.read_text() == "{ not valid json "
+
+
+def test_one_tri_state_lock_read_is_shared_by_every_scope():
+    """The reclaim decision has exactly one reader (F-002).
+
+    Two readers with different notions of "unreadable" is how the operator view
+    and the mutating verbs disagreed in the first place.
+    """
+    import inspect
+
+    assert "locking.read_lock_state" in inspect.getsource(op._lock_file_state)
+    assert "read_lock_state" in inspect.getsource(repolock._acquire)
+    assert "read_lock_state" in inspect.getsource(RunManager._acquire_one)
+    assert "read_lock_state" in inspect.getsource(RunManager._try_reclaim)
 
 
 def test_a_failed_per_run_acquisition_releases_the_tree_guard(fixture_repo):
@@ -796,6 +950,30 @@ def test_lock_guard_without_a_run_dir_keeps_the_pre_p7b_path(fixture_repo):
 # =============================================================================
 
 
+def test_run_paths_common_dir_survives_a_missing_work_tree(fixture_repo, tmp_path):
+    """Review F-001: the common dir must resolve when work_root is GONE.
+
+    That is the P7 A3 incident — recreate a missing run worktree — and it is
+    the one moment a lookup routed through ``work_root`` cannot answer. Routing
+    it through ``repo_root`` (the operator's surviving checkout) makes the
+    answer available exactly when it is needed.
+    """
+    from gauntlet.engine.execution import RunPaths
+
+    missing = tmp_path / "run-worktree-that-was-swept-away"
+    paths = RunPaths(
+        repo_root=fixture_repo,
+        work_root=missing,
+        state_root=fixture_repo / "runs" / "alpha" / "run-1",
+        artifact_root=fixture_repo / "runs" / "alpha",
+    )
+    assert not missing.exists()
+    assert paths.dedicated_worktree
+    assert paths.git_common_dir() == gitops.git_common_dir(fixture_repo)
+    # ...and the repo-global lock path, which is derived from it, is reachable.
+    assert repolock.repo_lock_path(fixture_repo).parent.parent == paths.git_common_dir()
+
+
 def test_repo_lock_path_is_under_the_git_common_dir(fixture_repo):
     path = repolock.repo_lock_path(fixture_repo)
     assert path == gitops.git_common_dir(fixture_repo) / "gauntlet" / ".repo.lock"
@@ -957,10 +1135,58 @@ def test_repo_lock_best_effort_degrades_instead_of_raising(fixture_repo):
         with repolock.repo_lock_best_effort(
             fixture_repo, reason="teardown", timeout_s=0.0
         ) as acquired:
-            assert acquired is False  # the teardown proceeds unserialized
+            assert acquired is False  # the caller decides what is safe to skip
     finally:
         other.kill()
         other.wait(timeout=10)
+
+
+def test_teardown_skips_shared_git_mutations_when_the_repo_lock_is_unavailable(
+    fixture_repo,
+):
+    """Review F-004: a failed acquire must not run the mutations anyway.
+
+    An earlier revision degraded to "prune anyway", which reproduces spike
+    E8-C at exactly the moment the lock exists to prevent it — a contended lock
+    means another run is inside its own add/remove/prune section right now, and
+    a repository-wide prune there can drop that run's admin entry. The drive
+    lock cannot substitute: two linked worktrees have two different drive-lock
+    paths. Skipping leaves a `prunable` entry, which the next LOCKED teardown
+    cleans up.
+    """
+    from gauntlet.engine import verify
+
+    copy = verify.make_disposable_copy(fixture_repo)
+    called: list[str] = []
+    real_remove, real_prune = gitops.remove_worktree, gitops.prune_worktrees
+    gitops.remove_worktree = lambda *a, **k: called.append("remove")
+    gitops.prune_worktrees = lambda *a, **k: called.append("prune")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    real_best = repolock.repo_lock_best_effort
+    repolock.repo_lock_best_effort = lambda w, *, reason, **kw: real_best(
+        w, reason=reason, timeout_s=0.0
+    )
+    try:
+        _write_lock(repolock.repo_lock_path(fixture_repo), pid=other.pid,
+                    identity=None, slug="another-run")
+        verify.discard_disposable_copy(fixture_repo, copy)  # must not raise
+    finally:
+        repolock.repo_lock_best_effort = real_best
+        gitops.remove_worktree, gitops.prune_worktrees = real_remove, real_prune
+        other.kill()
+        other.wait(timeout=10)
+        repolock.repo_lock_path(fixture_repo).unlink(missing_ok=True)
+
+    assert called == [], f"ran shared-git mutations unlocked: {called}"
+    # Our own temp root is not shared state, so it is still cleaned up...
+    assert not copy.root.exists()
+    # ...and the leftover entry is `prunable`, i.e. self-healing, not corrupt.
+    listing = gitops._run(fixture_repo, "worktree", "list", "--porcelain")
+    assert "prunable" in listing
+    gitops.prune_worktrees(fixture_repo)  # a later LOCKED teardown clears it
+    assert "prunable" not in gitops._run(
+        fixture_repo, "worktree", "list", "--porcelain"
+    )
 
 
 def test_repo_lock_best_effort_propagates_body_errors(fixture_repo):

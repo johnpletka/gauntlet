@@ -22,6 +22,25 @@ So this lock serializes the disposable-copy lifecycle across every worktree of
 the repository. P7c adds the run worktree's own add/remove/prune to the same
 section; nothing about the lock changes then.
 
+**What is deliberately NOT under it** (review F-004b, a deviation from the
+§8.3 critical-section list, stated rather than left silent). §8.3 also names
+branch create/delete and snapshot ref writes. Both are already serialized by
+git itself, and putting them here would buy nothing while costing the exact
+thing §8.3 forbids — "never for a whole drive, or concurrent runs serialize":
+
+* snapshot ref writes go through `gitops.create_ref_exclusive`, which uses
+  `git update-ref --stdin` with the `create` verb, so git's own ref store
+  enforces create-only semantics transactionally (P2 review F-003 closed that
+  race properly, and `git_snapshot` already handles the lost-race case).
+  Snapshot *creation* also hashes and writes trees, so a repo-global lock
+  around it would serialize concurrent runs for a genuinely long section.
+* branch create / delete / force-update across worktrees hard-refuse under
+  git's own one-branch-one-worktree rule (spike E2-B / E2-D / E2-E), which is
+  a stronger guarantee than an advisory lockfile, not a weaker one.
+
+If a future phase finds a read-modify-write over branch state that git does
+not cover, it belongs here — but it must stay short-held.
+
 **Bounded wait, then fail closed.** Sections are sub-second, so a contended
 acquirer waits rather than erroring — a fail-immediately repo lock would turn
 routine concurrency into spurious failures, which is the "serialize whole
@@ -88,23 +107,35 @@ def _acquire(path: Path, reason: str, timeout_s: float, sleep) -> str:
     record = locking.new_record(slug=reason, run_id=None)
     payload = record.to_json()
     deadline = time.monotonic() + timeout_s
+    kind = locking.LOCK_ABSENT
     observed: locking.LockRecord | None = None
     while True:
         if locking.link_into_place(path, record.nonce, payload):
             return record.nonce
-        observed = locking.read_record(path)
+        # The SAME tri-state read the drive lock and `driver_info` use (F-002),
+        # so "unreadable" means the same thing at every lock scope.
+        kind, observed = locking.read_lock_state(path)
         if time.monotonic() >= deadline:
             break
-        if observed is not None and not locking.record_is_live(observed):
+        if kind == locking.LOCK_ABSENT:
+            continue  # vanished under us — race for the link again
+        if kind == locking.LOCK_PRESENT and not locking.record_is_live(observed):
             # Proven-dead holder: reclaim under the same guard the drive lock
             # uses — unlink ONLY the record we observed as stale, never a fresh
             # owner's (F-004). A lost race just re-loops.
             if locking.unlink_if_nonce(path, observed.nonce):
                 continue
-        # A present-but-unparseable lock (torn or hand-edited) is NOT treated as
-        # reclaimable: a transient read failure against a live holder must never
+        # A present-but-unreadable lock (torn, hand-edited, or permission-denied)
+        # is NOT reclaimable: a read failure against a live holder must never
         # steal it. It waits out the bound and then reports, below.
         sleep(_POLL_INTERVAL_S)
+    if kind == locking.LOCK_ABSENT:
+        raise RepoLockError(
+            f"could not acquire the repo-global git lock {path} within "
+            f"{timeout_s:.0f}s: it is being taken and released faster than this "
+            "process can claim it (a churning holder) — fail closed "
+            "(spike §8.3 layer 2)"
+        )
     if observed is None:
         raise RepoLockError(
             f"repo-global git lock {path} is present but unreadable and did not "
