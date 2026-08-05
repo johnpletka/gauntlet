@@ -697,6 +697,42 @@ def projection_rebuild_action(slug: str, act: "RXM.RebuildProjectionAction") -> 
     )
 
 
+def migrate_worktree_action(slug: str) -> Action:
+    """The §6.1 action row offering an eligible run its own worktree (P7c-2).
+
+    Spike §10's second table row: a run that predates the dedicated layout
+    "keeps driving in `same_tree` mode; `status` surfaces an *optional* action
+    `gauntlet migrate-worktree <slug>`". Optional is the operative word — the
+    operator chooses, and the run is fully drivable either way, so this is an
+    ADDITIONAL action appended after the ones that move the run forward, never
+    a replacement for them.
+
+    The eligibility decision is deliberately NOT made here. It is
+    ``RunManager.migration_blocker``, the negation of the single mode-resolution
+    rule, so the read-only surface can never offer a migration the verb would
+    refuse (R4). This function only renders it.
+
+    P7c-1 shipped the `worktree` status object able to express this case
+    already (mode `same_tree`, nothing registered), which is why P7c-2 adds an
+    action row and no schema field — the object reports observed facts, never a
+    recommendation (`proposals/P7c-split-seam.md` §5).
+    """
+    return Action(
+        "move this run into its own worktree",
+        "control",
+        ["gauntlet", "migrate-worktree", slug],
+        [],
+        True,
+        f"gauntlet migrate-worktree {slug}",
+        consequence=(
+            "Optional. Creates a dedicated worktree for this run and drives "
+            "there from now on, so the run stops editing your checkout. The "
+            "branch, the journal and the run dir do not move; undo with "
+            f"`gauntlet migrate-worktree {slug} --rollback`."
+        ),
+    )
+
+
 def compute_status_assessment(
     repo_root: Path,
     man: Manifest,

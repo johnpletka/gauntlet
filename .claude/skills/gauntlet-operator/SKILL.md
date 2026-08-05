@@ -37,6 +37,11 @@ The reflex it teaches, worth internalizing up front:
   `git checkout` it (git refuses while the run holds it) and never run a
   gauntlet verb from inside the run worktree (the CLI refuses, and tells you
   where to stand).
+- **Nothing moves a run's tree for you.** A run that predates the dedicated
+  layout keeps driving your checkout; `gauntlet migrate-worktree <slug>` is the
+  only thing that moves it, it is optional, and `status` offers it when the run
+  is eligible. `--rollback` undoes it. A run that cannot migrate is never
+  wedged by that — it stays fully drivable in `same_tree`.
 
 Stay inside your lane: this skill is for operating a run, not building or
 reviewing one. A human ratifies every gate, the safety judge is never bypassed,

@@ -143,6 +143,28 @@ behind that output. Drive every decision off the reported state class:
   verifies the recreated HEAD matches the journal head before driving. Do
   **not** hand-run `git worktree add`; the engine also re-establishes the
   anti-prune lock that stops another run's cleanup from removing it again.
+- **a `same_tree` run offered migration** — not a park and not a problem: a run
+  that started before (or beside) the dedicated layout drives your checkout, and
+  `status` offers the **optional** action `gauntlet migrate-worktree <slug>` to
+  give it a tree of its own. Nothing moves a run for you — setting
+  `worktree.mode: dedicated` in config only decides what *new* runs are born as,
+  so an existing run keeps driving `same_tree` until you run this by name.
+  Copy, never move: the branch, its commits, the journal, the manifest and the
+  run dir all stay exactly where they are; only the tree the agents edit
+  changes. Undo with `gauntlet migrate-worktree <slug> --rollback`, which
+  removes the tree and returns the run to `same_tree` with everything else
+  intact.
+  Two things to expect. **You must step off the run branch first**: a
+  `same_tree` run leaves `gauntlet/<slug>` checked out in your tree, and git
+  refuses a second worktree for a checked-out branch — so `git checkout <base>`,
+  then migrate. The engine will not check out or move a branch in your checkout
+  to make this succeed, by design. And **`gauntlet finish` may then ask you to
+  resolve your local untracked `prd.md`**: a dedicated run commits the synced
+  copy on its own branch, and the engine refuses rather than deleting your file
+  for you — it names both resolutions when it happens.
+  Migration is refused, with the blocker named, while a driver is `alive` or
+  `indeterminate`, and for a terminal run. **A refusal never wedges anything**:
+  the run is left exactly as it was and stays fully drivable in `same_tree`.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
 - **`unknown`** — an unrecognized or internally contradictory manifest. Action:

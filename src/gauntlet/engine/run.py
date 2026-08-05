@@ -43,6 +43,7 @@ from gauntlet.engine.execution import (
     governed_artifact_paths,
     human_owned_excludes,
     run_bookkeeping_excludes,
+    run_bookkeeping_paths,
 )
 from gauntlet.engine.identity import resolve_operator_identity
 from gauntlet.engine.judgeproc import (
@@ -249,6 +250,19 @@ class BaseBranchError(RuntimeError):
 
 class FinishError(RuntimeError):
     """`finish()` refused (run not done, dirty tree, or a merge conflict)."""
+
+
+class MigrateWorktreeRefused(RuntimeError):
+    """`migrate-worktree` refused, having mutated nothing (spike §10).
+
+    Every row of the §10 refusal matrix raises this, and every one of them
+    leaves the run **fully resumable in `same_tree` mode** with the blocker
+    named. That clause is the R1 obligation and the whole point of the design:
+    migration is an *added capability*, so a run must never be wedged by the
+    migration being impossible. Any message raised from here that does not tell
+    the operator what they can still do is a bug in this class's contract, not
+    a stylistic omission.
+    """
 
 
 # `base_branch: current` (case-insensitive) means "branch from whatever branch
@@ -755,6 +769,140 @@ class RunManager:
             )
         return recorded
 
+    # The run statuses that end a run. Spike §10's first table row: "completed /
+    # aborted / failed → rendered as `worktree: null, mode: same_tree`; never
+    # migrated", because a terminal run has no live tree to isolate. Refusing
+    # them costs nothing — a terminal run is not driving, so it has nothing to
+    # gain from its own tree, and a `failed` run stays as resumable in
+    # `same_tree` after the refusal as it was before it.
+    TERMINAL_RUN_STATUSES = (M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED)
+
+    @staticmethod
+    def _migratable_liveness() -> tuple[str, ...]:
+        """The driver states under which a run's tree may be moved or removed.
+
+        §10: "the P7 engine refuses to migrate a run whose lock is `alive` or
+        `indeterminate`", per ``_lock_is_live``'s deliberate asymmetry.
+        ``orphaned`` is *proven* dead and ``none`` is *no driver at all*;
+        everything else fails closed. The values come from
+        :mod:`gauntlet.engine.operator` rather than being re-literal'd, so this
+        gate and the FR-2.4 table it reads from cannot drift apart — the same
+        reason ``_reap_orphaned_judge`` imports them (§6.4: liveness has one
+        sanctioned primitive).
+        """
+        from gauntlet.engine import operator
+
+        return (operator.LIVENESS_ORPHANED, operator.LIVENESS_NONE)
+
+    def migration_blocker(self, man: Manifest, *, liveness: str) -> str | None:
+        """Why this run may NOT be migrated to a dedicated worktree, or ``None``.
+
+        **The eligibility rule is the NEGATION of
+        :meth:`_effective_worktree_mode`, not a second rule.** A run is
+        migratable iff that method resolves ``same_tree`` — which is exactly
+        §10's detection rule ("a run is `same_tree` iff its journal carries no
+        `WorktreeAdopted` event *and* `git worktree list --porcelain` registers
+        no worktree for `man.branch`") read in the other direction — **and** it
+        is non-terminal **and** its driver is provably dead or absent.
+
+        Deriving the tree half independently is how the two rules drift, and
+        drift here is not cosmetic: an eligibility rule that says `same_tree`
+        where the resolver says `dedicated` would move a run that already has a
+        tree, and the converse would refuse a run that should move. So this
+        method calls the resolver and reads no worktree evidence of its own —
+        `tests/unit/test_worktree_migrate_p7c.py` asserts both the agreement
+        (behaviourally, over every evidence shape) and the derivation
+        (statically, so a future edit cannot re-introduce a second reader).
+
+        Returns a complete operator-facing sentence, not a code: every caller
+        renders it verbatim, and each one ends with what the run can still do.
+        Raises :class:`WorktreeUnavailableError` for a manifest whose recorded
+        mode this engine cannot recognize — "I do not know which tree this run
+        drives" must stop the verb rather than pick one (F-006).
+        """
+        mode = self._effective_worktree_mode(man)
+        if mode != WT.MODE_SAME_TREE:
+            return (
+                f"run {man.run_id!r} already drives a dedicated worktree "
+                f"(effective mode {mode!r}); there is nothing to migrate. "
+                f"`gauntlet status {man.slug}` shows the tree."
+            )
+        if man.status in self.TERMINAL_RUN_STATUSES:
+            return (
+                f"run {man.run_id!r} is {man.status!r} — a terminal run is "
+                "never migrated (spike §10): it is not driving, so it has no "
+                "work to isolate in a tree of its own. Its evidence stays "
+                "exactly where it is."
+            )
+        if liveness not in self._migratable_liveness():
+            from gauntlet.engine import operator
+
+            why = {
+                operator.LIVENESS_ALIVE: (
+                    "a driver is LIVE and is driving this run in your checkout "
+                    "right now; moving the tree under it would pull the ground "
+                    "out from a running agent"
+                ),
+                operator.LIVENESS_INDETERMINATE: (
+                    "the driver's liveness cannot be PROVEN either way "
+                    "(indeterminate) — an unverifiable process is treated as "
+                    "live, never as gone (fail closed)"
+                ),
+            }.get(liveness, f"driver liveness is {liveness!r}")
+            return (
+                f"refusing to migrate {man.slug!r}: {why}. Wait for the driver "
+                f"to finish or park, or inspect with `gauntlet status "
+                f"{man.slug}` / `gauntlet logs {man.slug}`."
+            )
+        return None
+
+    def _migration_rollback_blocker(
+        self, man: Manifest, *, liveness: str
+    ) -> str | None:
+        """Why a migration may NOT be rolled back, or ``None``. Same derivation.
+
+        The mirror of :meth:`migration_blocker`, and it asks the same resolver:
+        a migration exists to be rolled back iff the run resolves ``dedicated``
+        **from evidence** while its manifest does *not* record it as born
+        dedicated. That second clause is what makes rollback exact rather than
+        approximate — migration deliberately writes no ``worktree_mode`` (see
+        :meth:`migrate_worktree`), so removing the tree and journalling the
+        release returns the run to ``same_tree`` by the resolver's own rules 3
+        and 4. A run BORN dedicated has no migration to undo: rule 3 would keep
+        resolving ``dedicated`` and the next drive would simply rebuild the
+        tree, so telling the operator "rolled back" would be a lie.
+        """
+        mode = self._effective_worktree_mode(man)
+        if mode != WT.MODE_DEDICATED:
+            return (
+                f"run {man.run_id!r} drives in {mode!r} mode; there is no "
+                "worktree migration to roll back."
+            )
+        if man.worktree_mode == WT.MODE_DEDICATED:
+            return (
+                f"run {man.run_id!r} was BORN dedicated (its manifest records "
+                "`worktree_mode: dedicated`), so it was never migrated and "
+                "there is nothing to roll back: removing the tree would only "
+                "make the next drive rebuild it. End the run instead "
+                f"(`gauntlet abort {man.slug}`, then `gauntlet clean "
+                f"{man.slug}`)."
+            )
+        if man.status in self.TERMINAL_RUN_STATUSES:
+            return (
+                f"run {man.run_id!r} is {man.status!r}; a terminal run's tree "
+                f"is removed by `gauntlet clean {man.slug}` (or `gauntlet "
+                f"finish {man.slug}`), which also tidies the branch and the "
+                "active-run pointer. Rollback is for a run that is still going."
+            )
+        if liveness not in self._migratable_liveness():
+            return (
+                f"refusing to roll back {man.slug!r}: driver liveness is "
+                f"{liveness!r}, not provably gone — removing the run worktree "
+                "under a driver that may be inside it is exactly what fails "
+                f"closed here. Inspect with `gauntlet status {man.slug}`."
+            )
+        return None
+
     def _journal_says_adopted(self, man: Manifest) -> bool:
         """True when the journal records an adoption with no later release.
 
@@ -1033,7 +1181,8 @@ class RunManager:
             dest.write_text(text)
 
     def _record_worktree_adopted(
-        self, run_dir: Path, wt: "WT.RunWorktree", *, slug: str, run_id: str
+        self, run_dir: Path, wt: "WT.RunWorktree", *, slug: str, run_id: str,
+        migrated: bool = False,
     ) -> None:
         """Journal a ``WorktreeAdopted`` event when a tree is created/recreated.
 
@@ -1041,6 +1190,18 @@ class RunManager:
         subsequent verb is not an event, it is the steady state, and journaling
         it would bury the two transitions that matter (first adoption, and the
         §11-row-2 recreate) under one event per verb.
+
+        ``migrated=True`` is P7c-2's explicit `migrate-worktree`, which appends
+        the SAME kind (the seam doc §4/§5 requires it: the resolver's rule 2
+        keys on the kind, and a second kind would have to be taught to every
+        reader). The payload records WHICH transition it was, because "was this
+        run born dedicated or moved there by a human?" is a question a future
+        debugger will have and cannot otherwise answer — data over inference.
+        ``prior_lock_path`` is spike §10 step 5's third payload field; it is
+        recorded as observed and is deliberately UNCHANGED by migration (§8.3
+        keeps the per-run drive lock in the operator's checkout precisely so
+        ``driver_info`` can answer with the run worktree missing), so it
+        documents where the lock was rather than where it moved.
         """
         if not (wt.created or wt.recreated):
             return
@@ -1048,24 +1209,29 @@ class RunManager:
             head = gitops.head_sha(wt.path)
         except gitops.GitError:
             head = None
+        payload = {
+            "slug": slug,
+            "run_id": run_id,
+            "branch": wt.branch,
+            "path": str(wt.path),
+            "recreated": wt.recreated,
+            "branch_sha": head,
+        }
+        if migrated:
+            payload["migrated"] = True
+            payload["prior_lock_path"] = str(self._run_lock_path(run_dir))
         J.append_audit(
             run_dir,
             "WorktreeAdopted",
-            {
-                "slug": slug,
-                "run_id": run_id,
-                "branch": wt.branch,
-                "path": str(wt.path),
-                "recreated": wt.recreated,
-                "branch_sha": head,
-            },
+            payload,
             run_id=run_id,
             # Keyed on the transition, not the moment: re-adopting the SAME
             # tree at the SAME head is not a new event, so a retried verb
             # cannot pad the journal with duplicates.
             idempotency_key=(
                 f"worktree-adopted:{run_id}:{wt.path}:{head}:"
-                f"{'recreate' if wt.recreated else 'create'}"
+                + ("migrate" if migrated
+                   else ("recreate" if wt.recreated else "create"))
             ),
         )
 
@@ -1133,7 +1299,10 @@ class RunManager:
             "files to make a verb succeed.)"
         )
 
-    def _refuse_if_run_worktree_dirty(self, man: Manifest, *, verb: str) -> None:
+    def _refuse_if_run_worktree_dirty(
+        self, man: Manifest, *, verb: str, exc_type: type = FinishError,
+        excludes: list[str] | None = None,
+    ) -> None:
         """Refuse when the RUN's own tree has uncommitted work (F-011/F-012).
 
         A no-op for a `same_tree` run (the caller's own operator-tree guard
@@ -1142,6 +1311,24 @@ class RunManager:
         because under `dedicated` the operator's `git status` reads CLEAN while
         the verb refuses on dirtiness — a contradiction they cannot resolve from
         where they are standing (spike §18.2 addition 2/3).
+
+        ``exc_type`` lets a verb raise its OWN refusal class from the shared
+        check (P7c-2: `migrate-worktree --rollback` raises
+        :class:`MigrateWorktreeRefused`). The alternative — reusing
+        :class:`FinishError` from a verb that is not `finish` — would put a
+        class the CLI error boundary maps to a different verb's contract in
+        front of the operator. One implementation, one message, the caller's
+        own type.
+
+        ``excludes`` are repo-relative paths this check must not read as dirt.
+        The refusal exists to protect a BUILDER's uncommitted work (F-011's
+        words) — the engine's own two-file bookkeeping export is not that: it
+        is write-only with zero readers and is regenerated on the next drive,
+        so a rollback taken between migration and the first checkpoint commit
+        must not be blocked by the export the migration itself just wrote.
+        Every other engine surface already excludes exactly this set via
+        ``run_bookkeeping_excludes``; passing it here keeps this check
+        consistent with them rather than uniquely stricter.
         """
         try:
             entry = WT.observe(
@@ -1153,13 +1340,15 @@ class RunManager:
             return
         work_root = entry.path  # the RUN's tree — a work root by construction
         try:
-            dirt = gitops.status_porcelain(work_root, untracked_all=True)
+            dirt = gitops.status_porcelain(
+                work_root, exclude=excludes or [], untracked_all=True
+            )
         except gitops.GitError:
             return
         if not dirt:
             return
         listing = "\n  ".join(dirt.splitlines()[:8])
-        raise FinishError(
+        raise exc_type(
             f"refusing {verb}: the RUN WORKTREE has uncommitted changes.\n"
             f"  Tree inspected: {entry.path}\n  {listing}\n"
             f"  Inspect it with: git -C {entry.path} status\n"
@@ -3866,6 +4055,413 @@ class RunManager:
             layout.active_pointer.unlink()
             return True
         return False
+
+    # ---- migrate-worktree (spike §10) ---------------------------------------
+    @staticmethod
+    def _refuse_migration_in_pipeline_context(verb: str) -> None:
+        """Operator-only, on the same boundary and for the same reason as `recover`.
+
+        ``GAUNTLET_STEP_ID`` is the per-step marker the orchestrator exports to
+        every in-run agent. A pipeline agent shelling out to this verb would be
+        refused for its OWN run anyway (its driver is alive), but nothing stops
+        it reaching another slug's — and relocating the tree another run is
+        driving in is not a thing any builder or reviewer has business doing.
+        Refused before any read, reconcile or mutation, so the refusal cannot
+        be half-applied.
+        """
+        if os.environ.get("GAUNTLET_STEP_ID"):
+            raise MigrateWorktreeRefused(
+                f"refusing `{verb}` inside a pipeline-agent context "
+                "(GAUNTLET_STEP_ID is set): moving a run's worktree is an "
+                "operator-only action, never an in-pipeline step. Nothing was "
+                "read or modified. Run it from an operator session instead."
+            )
+
+    def _migration_liveness(self, slug: str, run_dir: Path) -> str:
+        """This run's driver liveness, read through the one sanctioned primitive.
+
+        Called BEFORE the drive lock is acquired, always. P7c-1.1's F-003 fix
+        recorded why: a verb that holds the drive lock looks like a LIVE DRIVER
+        to anything that consults liveness, so a migration that acquired first
+        and asked second would refuse ITSELF — and `finish` / `_resume_once`
+        already order it this way for exactly that reason.
+        """
+        from gauntlet.engine import operator
+
+        return operator.driver_liveness(
+            self._run_root_dir(), slug, run_instance_dir=run_dir
+        )
+
+    def migrate_worktree(self, slug: str) -> str:
+        """Move a `same_tree` run into its own worktree — explicitly (spike §10).
+
+        The migration ACTION, the second half of the seam
+        (`proposals/P7c-split-seam.md` §2). P7c-1 shipped the DECISION — a
+        pre-P7c run keeps driving `same_tree` and nothing may move it
+        implicitly — and this is the only thing in the engine that may move it,
+        only when a human asks by name.
+
+        **Copy, never move, and journalled.** Spike §10's six steps in order:
+
+        1. take the per-run drive lock — after resolving liveness (above);
+        2. ``worktree add`` at the derived path. Git refuses if the branch is
+           checked out anywhere (E2-A), which in `same_tree` mode is the NORMAL
+           state — the run's own branch is in the operator's checkout. That
+           refusal is the correct answer, not a bug to route around: this verb
+           never checks out, resets or moves a branch in the operator's tree
+           (that is the whole of what P7 is protecting), so it hands the
+           operator git's own message plus the one action that clears it;
+        3. ``git worktree lock --reason`` — done by :func:`WT.ensure`, which is
+           also where the fail-closed unwind lives;
+        4. write the two-file export dir and VERIFY the bookkeeping paths
+           resolve in the new tree; a failure here removes the worktree again;
+        5. append ``WorktreeAdopted``;
+        6. leave the operator's checkout untouched — read only.
+
+        **A failure at any step leaves the run exactly as it was**, still
+        driving `same_tree`, still resumable. Nothing here writes
+        ``Manifest.worktree_mode``: a migrated run is `dedicated` because the
+        EVIDENCE says so (resolver rules 1 and 2), which is what lets
+        :meth:`rollback_worktree_migration` put it back exactly. Recording the
+        mode would make the rollback a lie — rule 3 would keep answering
+        `dedicated` with no tree in sight.
+
+        Governed artifacts are deliberately NOT synced here. `_run_paths` syncs
+        them on the first drive after migration, as it does for every dedicated
+        run, and doing it now would leave the freshly-created tree DIRTY with no
+        commit behind it — breaking the clean-tree invariant on a tree no agent
+        has touched yet. See the commit body for the `finish` collision this run
+        inherits as a result (P7c-1.1's second surfaced defect); migration
+        neither creates nor smooths it, and reports it in the success message.
+        """
+        safe_run_segment(slug, kind="slug")
+        self._refuse_migration_in_pipeline_context("gauntlet migrate-worktree")
+        layout = self.layout(slug)
+        run_dir = layout.active_run_dir()
+        # BOTH of the steps below consult driver liveness, and this verb is
+        # about to hold the drive lock itself — see `_migration_liveness` and
+        # `finish`'s identical ordering note. The reconcile is
+        # journal-authoritative (R8) and matters here because the terminal
+        # check reads `man.status`: migrating on the word of a projection left
+        # stale by a kill window is exactly the class of decision P6 moved off
+        # the projection.
+        self._reconcile_projection(run_dir, slug)
+        man = Manifest.load(run_dir / "manifest.json")
+        liveness = self._migration_liveness(slug, run_dir)
+        blocker = self.migration_blocker(man, liveness=liveness)
+        if blocker is not None:
+            raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        try:
+            # Re-read under the lock. Between the check above and the
+            # acquisition another engine could have migrated this run; the
+            # liveness leg is deliberately NOT re-checked, because we now hold
+            # the lock that makes it read `alive` — us.
+            man = Manifest.load(run_dir / "manifest.json")
+            blocker = self.migration_blocker(man, liveness=liveness)
+            if blocker is not None:
+                raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+            return self._migrate_locked(layout, run_dir, man)
+        finally:
+            self._release_worktree_lock(handle)
+
+    @staticmethod
+    def _still_resumable(blocker: str, man: Manifest) -> str:
+        """Append the R1 clause every §10 refusal owes the operator.
+
+        Spike §10's last table row is not advice, it is the obligation: "stays
+        fully resumable in `same_tree` mode; the refusal names the blocker …
+        the run is never wedged by the migration being impossible." A refusal
+        that stops at the blocker satisfies half of that row, so the clause is
+        appended here rather than repeated (and eventually forgotten) at each
+        raise site.
+        """
+        return (
+            f"{blocker}\n"
+            "Nothing was moved or modified. The run is untouched and remains "
+            f"fully drivable in `same_tree` mode: `gauntlet resume {man.slug}` "
+            "works exactly as it did before you ran this."
+        )
+
+    def _migrate_locked(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> str:
+        """:meth:`migrate_worktree`'s body, with the drive lock held."""
+        slug, run_id, branch = man.slug, man.run_id, man.branch
+        common = self._git_common_dir()
+        try:
+            wt = WT.ensure(
+                self.operator_root, common,
+                slug=slug, run_id=run_id, branch=branch,
+            )
+        except WT.WorktreeUnavailable as exc:
+            raise MigrateWorktreeRefused(
+                self._still_resumable(
+                    f"could not create the run worktree for {slug!r}: {exc}\n"
+                    f"  If git says the branch is already used by a worktree at "
+                    f"{self.operator_root}, that is your OWN checkout — the "
+                    "normal state for a same_tree run, and git's one-branch-"
+                    "one-worktree rule (spike E2-A) is what refuses. This verb "
+                    "will not check out or move a branch in your tree, so YOU "
+                    f"choose: `git -C {self.operator_root} checkout "
+                    f"{man.base_branch}` (or any branch that is not "
+                    f"{branch!r}), then `gauntlet migrate-worktree {slug}` "
+                    "again.",
+                    man,
+                )
+            ) from exc
+        # Step 4 — write the export and prove the bookkeeping paths RESOLVE in
+        # the new tree before anything is journalled. This is the step that can
+        # still fail after a healthy `worktree add`: `StateDirNotContained` is
+        # raised by the path builders when the run's state dir has no
+        # counterpart under the work root, and finding that out AFTER appending
+        # `WorktreeAdopted` would leave a run resolving `dedicated` into a tree
+        # its own bookkeeping cannot be committed in.
+        try:
+            self._verify_export(wt, run_dir, layout, man)
+        except BaseException as exc:
+            self._undo_failed_migration(wt, layout, man)
+            # An already-shaped refusal keeps its own message; a
+            # KeyboardInterrupt/SystemExit keeps its own TYPE. Laundering an
+            # operator's Ctrl-C into "migration refused" would report a
+            # decision the engine never made — the tree is still removed
+            # either way, which is the part that matters.
+            if isinstance(exc, MigrateWorktreeRefused) or not isinstance(
+                exc, Exception
+            ):
+                raise
+            raise MigrateWorktreeRefused(
+                self._still_resumable(
+                    f"the run worktree for {slug!r} was created but its "
+                    f"bookkeeping export could not be written or verified "
+                    f"({exc}); the worktree has been removed again.",
+                    man,
+                )
+            ) from exc
+        # Step 5, and deliberately OUTSIDE the undo above. If the journal append
+        # fails, the tree is registered, locked and healthy, so the resolver's
+        # rule 1 answers `dedicated` and the run is coherent and drivable — it
+        # is only missing an audit event, which the operator can see and roll
+        # back. Undoing here instead could strand a partially-appended adoption
+        # with no tree, which resolves `dedicated` via rule 2 and quietly
+        # rebuilds the tree on the next resume. A missing event is legible; a
+        # half-reversed one is not.
+        self._record_worktree_adopted(
+            run_dir, wt, slug=slug, run_id=run_id, migrated=True
+        )
+        return (
+            f"migrated {slug!r} to a dedicated worktree at {wt.path}\n"
+            f"  The run is unchanged: same branch ({branch}), same journal, "
+            "same run dir in your checkout. Only the tree its agents edit "
+            "moved.\n"
+            f"  Your checkout was not touched. Inspect the run's tree with "
+            f"`git -C {wt.path} status`; `gauntlet status {slug}` names it too.\n"
+            f"  Undo with `gauntlet migrate-worktree {slug} --rollback`.\n"
+            "  Note: `gauntlet finish` may now ask you to resolve your local "
+            f"untracked {layout.slug_dir.name}/prd.md — a dedicated run commits "
+            "the synced copy on its branch, and the engine will not delete your "
+            "file to make a verb succeed. It names both resolutions when it "
+            "happens."
+        )
+
+    def _verify_export(
+        self, wt: "WT.RunWorktree", run_dir: Path, layout: "RunLayout",
+        man: Manifest,
+    ) -> None:
+        """Write the §4.4 export and prove the §9.3 path builders answer.
+
+        Two independent checks, because they fail for different reasons: the
+        derived export dir must AGREE with the mirror `RunPaths` computes (a
+        layout skew between :func:`WT.export_dir` and
+        :attr:`RunPaths.bookkeeping_root` would put the committed bookkeeping
+        somewhere no reader mirrors to), and the builders must then return a
+        non-empty answer for files that actually exist on disk — the empty
+        answer is the silent-degrade :class:`StateDirNotContained` exists to
+        make loud.
+        """
+        paths = RunPaths(
+            repo_root=self.repo_root,
+            work_root=wt.path,
+            state_root=run_dir,
+            artifact_root=layout.slug_dir,
+        )
+        mirrored = paths.bookkeeping_root
+        derived = WT.export_dir(
+            wt.path, self.config.run_root, man.slug, man.run_id
+        )
+        if mirrored.resolve() != derived.resolve():
+            raise MigrateWorktreeRefused(
+                self._still_resumable(
+                    f"the export dir this engine derives ({derived}) is not "
+                    f"where the run's paths mirror to ({mirrored}); the run "
+                    "worktree has been removed again. This is a layout skew, "
+                    "not an operator error — report it.",
+                    man,
+                )
+            )
+        WT.write_bookkeeping_export(
+            wt.path, run_dir, self.config.run_root, man.slug, man.run_id
+        )
+        # Existence-independent allowlist first (it raises on an uncontained
+        # state dir), then the existence-filtered set the checkpoint commit
+        # actually stages.
+        engine_bookkeeping_candidates(wt.path, mirrored)
+        staged = run_bookkeeping_paths(wt.path, mirrored)
+        if not staged:
+            raise MigrateWorktreeRefused(
+                self._still_resumable(
+                    f"no bookkeeping file resolved inside the new run worktree "
+                    f"at {wt.path} (expected the export at {mirrored}); the "
+                    "worktree has been removed again. Without it the FR-2.2 "
+                    "checkpoint commit would have nothing in-tree to stage.",
+                    man,
+                )
+            )
+
+    def _undo_failed_migration(
+        self, wt: "WT.RunWorktree", layout: "RunLayout", man: Manifest
+    ) -> None:
+        """Remove a worktree whose migration failed after it was created (§10.4).
+
+        Best-effort and deliberately silent: the caller is already raising the
+        real cause, and a cleanup failure must not replace it (the same lesson
+        as P7c-1.1's `merge --abort` fix). No ``WorktreeReleased`` is appended
+        because no ``WorktreeAdopted`` was — the journal records transitions
+        that happened, and a migration that never completed is not one.
+
+        The export the failed step may have written is excluded from the
+        dirtiness check, so this removal does not stop to snapshot the engine's
+        own bookkeeping; genuinely uncommitted work in the tree still is
+        (R2 — :func:`WT.release` snapshots before any ``--force``).
+        """
+        try:
+            excludes = run_bookkeeping_excludes(
+                wt.path,
+                WT.export_dir(wt.path, self.config.run_root, man.slug, man.run_id),
+                layout.slug_dir,
+            )
+        except Exception:
+            excludes = None
+        try:
+            WT.release(
+                self.operator_root, wt.path,
+                slug=man.slug, run_id=man.run_id, excludes=excludes,
+            )
+        except Exception:
+            pass  # the caller's raise carries the real cause
+
+    def rollback_worktree_migration(self, slug: str) -> str:
+        """Return a migrated run to `same_tree`, journal intact (spike §10).
+
+        ``worktree unlock`` + ``worktree remove`` + ``WorktreeReleased``, which
+        is all it takes because §4.4 never moved the journal: the authoritative
+        state, the manifest projection, the transcripts, the heartbeat and the
+        recovery intent were in the operator's checkout the whole time and are
+        untouched here. What is destroyed is the tree — so a tree with
+        uncommitted work REFUSES rather than sweeping it into a recovery ref
+        the operator did not ask for and would not know to look for (F-011).
+
+        After it returns, the resolver answers `same_tree` again by its own
+        rules: no registered worktree (rule 1 fails), a `WorktreeReleased` after
+        the `WorktreeAdopted` (rule 2 fails), and no recorded birth mode (rule 3
+        is why a run BORN dedicated is refused above, not rolled back).
+        """
+        safe_run_segment(slug, kind="slug")
+        self._refuse_migration_in_pipeline_context(
+            "gauntlet migrate-worktree --rollback"
+        )
+        layout = self.layout(slug)
+        run_dir = layout.active_run_dir()
+        self._reconcile_projection(run_dir, slug)
+        man = Manifest.load(run_dir / "manifest.json")
+        liveness = self._migration_liveness(slug, run_dir)
+        blocker = self._migration_rollback_blocker(man, liveness=liveness)
+        if blocker is not None:
+            raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            blocker = self._migration_rollback_blocker(man, liveness=liveness)
+            if blocker is not None:
+                raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+            return self._rollback_migration_locked(layout, run_dir, man)
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _rollback_migration_locked(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> str:
+        """:meth:`rollback_worktree_migration`'s body, with the drive lock held."""
+        try:
+            entry = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError as exc:
+            raise MigrateWorktreeRefused(
+                self._still_resumable(
+                    f"could not read git's worktree list ({exc}), so this "
+                    "cannot prove which tree it would remove.",
+                    man,
+                )
+            ) from exc
+        if entry is None:
+            # The §11-row-2 shape reached through rollback: the tree is gone
+            # but the journal still records the adoption, so the resolver
+            # answers `dedicated` and the next resume would REBUILD it. Closing
+            # the adoption is the whole of the rollback here — and it is why
+            # this branch exists rather than reporting "nothing to do".
+            self._record_worktree_released(
+                run_dir, WT.run_worktree_path(
+                    self._git_common_dir(), man.slug, man.run_id
+                ),
+                slug=man.slug, run_id=man.run_id,
+            )
+            return (
+                f"rolled back {man.slug!r} to `same_tree`: its worktree was "
+                "already gone, and the journal's open adoption is now closed "
+                "so the next resume drives your checkout instead of rebuilding "
+                "a tree.\n"
+                f"  Branch {man.branch} and every commit on it are untouched."
+            )
+        # What may sit legitimately uncommitted in a run worktree, and is
+        # therefore not "a builder's work" for the purposes of the refusal
+        # below or the teardown snapshot:
+        #
+        # * the engine's own two-file EXPORT — write-only, zero readers,
+        #   regenerated on the next drive, and written by the migration itself,
+        #   so a rollback taken before the first checkpoint commit would
+        #   otherwise always be blocked by it;
+        # * the SYNCED governed artifacts. Under `dedicated` the operator's
+        #   checkout is the authoring surface (§14.2 option A) and
+        #   `_sync_governed_artifacts` publishes a copy into the run tree on
+        #   every mutating contact. Until a commit step stages it that copy is
+        #   untracked — and it is a COPY: the authoritative bytes never left
+        #   the operator's checkout, so removing the tree cannot lose them.
+        #   `finish` already excludes exactly this set from its own dirt check
+        #   for exactly this reason.
+        paths = RunPaths(
+            repo_root=self.repo_root,
+            work_root=entry.path,
+            state_root=run_dir,
+            artifact_root=layout.slug_dir,
+        )
+        excludes = run_bookkeeping_excludes(
+            entry.path, paths.bookkeeping_root, layout.slug_dir
+        ) + governed_artifact_paths(entry.path, paths.artifact_root_in_work)
+        self._refuse_if_run_worktree_dirty(
+            man, verb="migrate-worktree --rollback",
+            exc_type=MigrateWorktreeRefused, excludes=excludes,
+        )
+        self._release_run_worktree(run_dir, man, excludes=excludes)
+        return (
+            f"rolled back {man.slug!r} to `same_tree`: removed the run "
+            f"worktree at {entry.path}.\n"
+            f"  Branch {man.branch}, its commits, the journal and the run dir "
+            "are all untouched — §4.4 never moved them. The next "
+            f"`gauntlet resume {man.slug}` drives your own checkout again.\n"
+            f"  Re-migrate at any time with `gauntlet migrate-worktree "
+            f"{man.slug}`."
+        )
 
     # ---- status -------------------------------------------------------------
     def status(self, slug: str) -> Manifest:

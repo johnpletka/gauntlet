@@ -45,6 +45,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
     from gauntlet.engine.run import (
         AbortGuardError,
         EntryContractError,
+        MigrateWorktreeRefused,
         RecoverError,
         RollbackGuardError,
         UnsafeRunSegment,
@@ -63,6 +64,11 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         RunResolutionError,
         StatusContractError,
         PlanPhasesError,
+        # P7c-2 (spike §10): every migration refusal is an operational
+        # condition with a named blocker AND a named safe action — the run
+        # stays fully resumable in `same_tree` — so it prints one line, never
+        # a traceback.
+        MigrateWorktreeRefused,
         # R5 (plan §4.5): a mutating verb that returned to an identical
         # progress fingerprint without a legitimate live wait — exits nonzero
         # naming what is unchanged and the executable safe actions.
@@ -254,6 +260,27 @@ def _status_work_root(mgr, man) -> Path:
     if entry is None or not entry.path.is_dir():
         return mgr.operator_root
     return entry.path
+
+
+def _append_migration_action(mgr, man, liveness: str, rstate, slug: str) -> None:
+    """Offer `gauntlet migrate-worktree <slug>` when the run is eligible (P7c-2).
+
+    Read-only and fail-soft, for the same reason as :func:`_status_work_root`:
+    `status` is what an operator reaches for when things are already wrong, so
+    an unreadable worktree list or an unrecognized recorded mode declines to
+    OFFER the optional action rather than failing the whole command. The
+    `worktree` block still reports the observation honestly, so nothing is
+    hidden — only the recommendation is withheld, which is the correct
+    direction when the tool cannot prove the verb would succeed.
+    """
+    from gauntlet.engine import operator
+
+    try:
+        if mgr.migration_blocker(man, liveness=liveness) is not None:
+            return
+    except Exception:
+        return
+    rstate.next_actions.append(operator.migrate_worktree_action(slug))
 
 
 def _refuse_inside_run_worktree(cwd: Path) -> None:
@@ -911,6 +938,15 @@ def status(
                 rstate.next_actions.insert(
                     0, operator.projection_catchup_action(slug, view.detail)
                 )
+        # P7c-2 / spike §10 row 2: offer migration to a run that is eligible
+        # for it. APPENDED, never inserted: migration is optional and the run
+        # is fully drivable without it, so it must not displace the action that
+        # moves the run forward. Eligibility is the engine's own
+        # `migration_blocker` — the negation of the single mode-resolution rule
+        # — so `status` can never advertise a migration the verb would refuse
+        # (R4), which is the same discipline the projection-rebuild action
+        # follows above.
+        _append_migration_action(mgr, man, driver.state, rstate, slug)
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
         # Advisory freshness (live-run-observability FR-5): the single I/O point
@@ -1443,6 +1479,38 @@ def finish(slug: str) -> None:
     aborted and surfaced for a manual merge.
     """
     typer.echo(_manager().finish(slug))
+
+
+@app.command(name="migrate-worktree")
+@_friendly_errors
+def migrate_worktree(
+    slug: str,
+    rollback: bool = typer.Option(
+        False, "--rollback",
+        help="Undo a migration: unlock and remove the run's worktree and "
+             "return the run to same_tree mode. The branch, its commits, the "
+             "journal and the run dir are untouched. Refuses if the run "
+             "worktree has uncommitted work.",
+    ),
+) -> None:
+    """Move an existing run into its own dedicated worktree (spike §10).
+
+    Explicit and opt-in: a run that predates the dedicated layout keeps driving
+    your checkout until you run this, and nothing in the engine ever moves it
+    for you — not even setting `worktree.mode: dedicated` in config, which only
+    decides what NEW runs are born as.
+
+    Copy, never move: the branch, the journal, the manifest, the transcripts
+    and the run dir all stay exactly where they are. Only the tree the run's
+    agents edit changes. Refused under a live or unprovable driver, and for a
+    terminal run; a run that cannot migrate for any reason stays fully
+    resumable in same_tree mode with the blocker named.
+    """
+    mgr = _manager()
+    if rollback:
+        typer.echo(mgr.rollback_worktree_migration(slug))
+        return
+    typer.echo(mgr.migrate_worktree(slug))
 
 
 @app.command()
