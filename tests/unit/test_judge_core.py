@@ -560,3 +560,26 @@ def test_content_mentioning_protected_path_is_not_matched(tmp_path):
         repo_root=REPO_ROOT, step_id="implement",
     )
     assert d.matched_rule != "governed-learning-assets-in-pipeline"
+
+
+def test_ladder_exception_fails_closed_and_is_audited(tmp_path):
+    """An unhandled error anywhere in the ladder must become a deny, not a 500.
+
+    Without this the /decide endpoint raises and the caller sees a transport
+    error rather than an allow/deny — a single malformed path (or an
+    environment quirk in the judge process) would take the endpoint down for
+    every tool call. §2: fail closed, and record why (data over inference).
+    """
+    audit = tmp_path / "judge-audit.jsonl"
+    core = JudgeCore(engine(), audit_path=audit)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("Could not determine home directory.")
+
+    core.policy_engine.evaluate = _boom  # type: ignore[method-assign]
+    d = core.decide("Read", {"file_path": "~/notes.txt"}, repo_root=REPO_ROOT)
+    assert d.decision == "deny"
+    assert d.source == "fail-closed"
+    assert "Could not determine home directory" in d.rationale
+    line = json.loads(audit.read_text().splitlines()[0])
+    assert line["decision"] == "deny"

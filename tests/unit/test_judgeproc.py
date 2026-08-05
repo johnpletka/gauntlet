@@ -412,3 +412,38 @@ def test_judge_record_round_trips_and_rejects_malformed(tmp_path):
     assert JudgeRecord.from_json('{"pid": 1}') is None
     assert JudgeRecord.from_json("not json") is None
     assert read_judge_record(tmp_path) is None  # no file → None (degraded path)
+
+
+def test_child_env_always_carries_home(monkeypatch, clean_managed_env):
+    """The judge subprocess gets a HOME even when the driver was launched without.
+
+    The policy engine expands `~` in candidate paths (credential + boundary
+    checks); a judge with no home degrades those checks to literal-text
+    matching, so the engine supplies one from the passwd entry rather than
+    inheriting the gap.
+    """
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+    def _popen(argv, env=None, **kwargs):
+        captured["env"] = env
+        return _Proc()
+
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    monkeypatch.setattr(ManagedJudge, "_await_healthy", lambda self: None)
+    monkeypatch.setattr(judgeproc.subprocess, "Popen", _popen)
+    monkeypatch.delenv("HOME", raising=False)
+
+    mj = ManagedJudge(policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r")
+    try:
+        mj.start()
+        assert captured["env"]["HOME"] == str(Path.home())
+    finally:
+        mj._proc = None  # don't let teardown touch the fake proc
+        for v in _MANAGED_ENV_VARS:
+            os.environ.pop(v, None)

@@ -510,3 +510,80 @@ def test_credential_inside_repo_not_denied_by_outside_rule(engine, tmp_path):
 def test_bad_regex_rejected_at_load():
     with pytest.raises(Exception):
         Policy(version=1, deny=[PolicyRule(name="bad", command_patterns=["("])])
+
+
+# --- unresolvable `~` in a candidate path (never raise; fail closed) -------
+# `Path.expanduser()` raises RuntimeError — not OSError — whenever a leading
+# `~` cannot be resolved to a home directory: `~unknownuser/...` (no such
+# account), or a bare `~` in a process with no HOME and no passwd entry for its
+# uid (how the judge SERVICE is spawned in some environments). Both reach the
+# policy engine from untrusted input, because every Bash command is scanned for
+# `~`-prefixed path tokens, so an unhandled raise crashes /decide instead of
+# returning allow/deny. The engine must answer conservatively instead.
+
+@pytest.fixture
+def no_home(monkeypatch):
+    """A process with no discoverable home: HOME unset AND no passwd entry."""
+    import pwd
+
+    monkeypatch.delenv("HOME", raising=False)
+
+    def _no_passwd(uid):
+        raise KeyError(uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", _no_passwd)
+    # the premise of these tests: expansion really is impossible here
+    with pytest.raises(RuntimeError):
+        Path("~/.ssh/id_rsa").expanduser()
+
+
+def test_credential_read_denied_with_no_home(engine, no_home):
+    decision = engine.evaluate(
+        "Read", {"file_path": "~/.ssh/id_rsa"}, repo_root=REPO_ROOT
+    )
+    assert decision is not None and decision.decision == "deny"
+    assert "credential" in decision.matched_rule
+
+
+def test_bash_home_credential_token_denied_with_no_home(engine, no_home):
+    decision = engine.evaluate(
+        "Bash", {"command": "cat ~/.aws/credentials"}, repo_root=REPO_ROOT
+    )
+    assert decision is not None and decision.decision == "deny"
+
+
+def test_write_to_home_path_denied_with_no_home(engine, no_home):
+    # An un-expandable `~` cannot be placed relative to the repo, so the escape
+    # check treats it as outside — the same answer as with HOME set.
+    decision = engine.evaluate(
+        "Write", {"file_path": "~/notes.txt", "content": "x"}, repo_root=REPO_ROOT
+    )
+    assert decision is not None and decision.decision == "deny"
+
+
+def test_in_repo_call_unaffected_by_no_home(engine, no_home):
+    # Fail-closed on `~` must not degrade into denying ordinary in-repo work.
+    decision = engine.evaluate("Bash", {"command": "git status"}, repo_root=REPO_ROOT)
+    assert decision is not None and decision.decision == "allow"
+
+
+def test_unknown_user_home_path_denied_not_crashed(engine):
+    # HOME is set here: `~nosuchuser` still raises, because getpwnam fails.
+    decision = engine.evaluate(
+        "Bash",
+        {"command": "cat ~gauntletnosuchuser4242/.ssh/id_rsa"},
+        repo_root=REPO_ROOT,
+    )
+    assert decision is not None and decision.decision == "deny"
+
+
+def test_confinement_denies_unexpandable_home_path(engine, tmp_path):
+    # Inside a verifier boundary the same path must deny, not raise (PRD §7).
+    boundary = tmp_path / "copy"
+    boundary.mkdir()
+    decision = engine.confinement_deny(
+        "Read", {"file_path": "~gauntletnosuchuser4242/secrets.txt"},
+        boundary=boundary,
+    )
+    assert decision is not None and decision.decision == "deny"
+    assert decision.matched_rule == "verifier-boundary-path"
