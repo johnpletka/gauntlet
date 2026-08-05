@@ -156,9 +156,25 @@ class JudgeCore:
                 cached=True, cached_from=original_id,
             )
             return cached_decision
-        decision = self._ladder(
-            tool_name, tool_input, effective_root, step_id, boundary=boundary
-        )
+        try:
+            decision = self._ladder(
+                tool_name, tool_input, effective_root, step_id, boundary=boundary
+            )
+        except Exception as exc:  # defence in depth (§2 fail closed)
+            # The ladder must always yield a decision. An unhandled exception
+            # here would 500 the /decide endpoint, so a single malformed path or
+            # an environment quirk in the judge process could turn every tool
+            # call into a transport error instead of an allow/deny. Deny, and
+            # record the reason in the audit trail (data over inference).
+            decision = JudgeDecision(
+                decision="deny",
+                source="fail-closed",
+                rationale=(
+                    "judge could not evaluate this call "
+                    f"({type(exc).__name__}: {str(exc)[:200]}); failing closed"
+                ),
+                risk_category="judge-error",
+            )
         latency_ms = round((time.monotonic() - start) * 1000, 2)
         # Cache ONLY allow decisions (FR-12.1); deny/ask always re-evaluate.
         if decision.decision == "allow":

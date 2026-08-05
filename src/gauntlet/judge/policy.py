@@ -56,6 +56,28 @@ CREDENTIAL_PATH_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 # Extract candidate absolute or home-relative paths from a shell command.
 _PATH_TOKEN_RE = re.compile(r"(?<![\w/])(~|/)[^\s'\";|&]*")
 
+
+def _expand_user(path: Path) -> tuple[Path, bool]:
+    """``path.expanduser()`` that never raises. Returns ``(path, expanded_ok)``.
+
+    ``Path.expanduser`` raises ``RuntimeError`` — not an ``OSError`` — whenever a
+    leading ``~`` cannot be resolved to a home directory: ``~unknownuser/...``
+    (no such account), or a bare ``~`` in a process whose ``HOME`` is unset and
+    whose uid has no passwd entry. Both are reachable from untrusted input: any
+    agent Bash command is scanned for ``~``-prefixed path tokens, so an
+    unhandled raise here crashes ``/decide`` instead of returning allow/deny.
+
+    On failure the ORIGINAL, un-expanded path is returned with ``False`` so
+    callers stay conservative: regex matchers still see the literal
+    ``~/.ssh/id_rsa`` text, and boundary checks treat the path as outside the
+    repo (§2 fail closed).
+    """
+    try:
+        return path.expanduser(), True
+    except RuntimeError:
+        return path, False
+
+
 # --- verifier-boundary confinement (PR #59 review B1 / PRD §7 items 1, 2, 4) ---
 # These apply ONLY to a step with an engine-registered boundary (the verifier's
 # disposable copy) — never to builder/operator sessions. They live in code, not
@@ -295,7 +317,7 @@ class PolicyEngine:
             # resolve against the run's repo_root) — never content strings
             compiled_paths = rule.compiled_paths()
             checks.append(any(
-                pat.search(str(self._resolve(p, repo_root)))
+                pat.search(str(self._resolve(p, repo_root)[0]))
                 for p in paths for pat in compiled_paths
             ))
         if rule.path_escape:
@@ -354,8 +376,15 @@ class PolicyEngine:
         # symlinked escape is caught (review F-005). Both sides go through
         # realpath so a symlinked repo_root (e.g. macOS /tmp -> /private/tmp)
         # compares consistently.
-        resolved = PolicyEngine._resolve(path, repo_root)
-        root = Path(os.path.realpath(str(repo_root.expanduser())))
+        resolved, path_ok = PolicyEngine._resolve(path, repo_root)
+        root_expanded, root_ok = _expand_user(repo_root)
+        if not (path_ok and root_ok):
+            # A `~` we cannot expand (unknown user, or no home for this process)
+            # names a home directory we cannot place relative to the repo. Fail
+            # closed (§2): treat it as outside the boundary rather than letting
+            # an unresolvable path pass the escape check.
+            return True
+        root = Path(os.path.realpath(str(root_expanded)))
         try:
             resolved.relative_to(root)
             return False
@@ -363,16 +392,29 @@ class PolicyEngine:
             return True
 
     @staticmethod
-    def _resolve(path: Path, base: Path) -> Path:
-        expanded = path.expanduser()
+    def _resolve(path: Path, base: Path) -> tuple[Path, bool]:
+        """Resolve ``path`` against ``base``. Returns ``(resolved, expanded_ok)``.
+
+        ``expanded_ok`` is False when a leading ``~`` could not be expanded; the
+        returned path then carries the literal, un-expanded text so regex
+        matchers still see ``~/.aws/credentials`` rather than nothing at all.
+        Callers that need a boundary decision must fail closed on False.
+        """
+        expanded, ok = _expand_user(path)
         if not expanded.is_absolute():
-            expanded = base.expanduser() / expanded
+            base_expanded, base_ok = _expand_user(base)
+            ok = ok and base_ok
+            expanded = base_expanded / expanded
         # realpath follows symlinks for the existing prefix and lexically
         # normalizes the rest (no existence requirement), so both `..` escapes
         # and symlink escapes resolve to their real target.
-        return Path(os.path.realpath(str(expanded)))
+        return Path(os.path.realpath(str(expanded))), ok
 
     @staticmethod
     def _is_credential(path: Path) -> bool:
-        text = str(path.expanduser())
+        # An un-expandable `~` falls back to the literal text, which still
+        # carries the credential fragment (`~/.ssh/id_rsa`), so the match stays
+        # conservative instead of crashing the decide endpoint (§2 fail closed).
+        expanded, _ = _expand_user(path)
+        text = str(expanded)
         return any(p.search(text) for p in CREDENTIAL_PATH_PATTERNS)
