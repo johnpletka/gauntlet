@@ -27,6 +27,20 @@ that the parent SIGKILLs at a precise point in the kill-timing matrix:
   orchestrator persists: every projection write in the process), so its
   matrix covers every event-append/projection-write boundary in a real run.
 
+- ``lock:<point>:<sig>`` (P7b): a real process death at one of the three
+  boundaries the split drive lock introduces —
+
+  * ``after_tree``   — after the worktree-global tree guard is taken, before
+    the run dir exists at all (the ``start`` window §8.3's per-run lock cannot
+    cover);
+  * ``after_run``    — after the per-run lock is published, so BOTH files are
+    on disk and stale;
+  * ``before_release`` — with both held, at the point the verb would have
+    released them.
+
+  Each leaves a stale lock a later verb must reclaim rather than be wedged by
+  (R1). The child self-signals synchronously, so the boundary is exact.
+
 The parent then resumes and asserts the engine recovers without lost/duplicated
 effects.
 """
@@ -129,11 +143,50 @@ def _arm_persist_boundary_kill(repo: Path, spec: str) -> None:
     atexit.register(done_marker)
 
 
+def _arm_lock_boundary_kill(spec: str) -> None:
+    """Self-signal at a drive-lock boundary (``lock:<point>:<sig>``, P7b).
+
+    Wraps the three RunManager entry points that publish or drop a lock file,
+    so the process dies with a precisely-known set of stale locks on disk.
+    """
+    from gauntlet.engine.run import RunManager
+
+    _, point, sig_name = spec.split(":")
+    sig = signal.SIGKILL if sig_name == "kill" else signal.SIGTERM
+
+    real_acquire = RunManager._acquire_worktree_lock
+    real_attach = RunManager._attach_run_lock
+    real_release = RunManager._release_worktree_lock
+
+    def acquire(self, slug, run_id, *, run_dir=None):
+        handle = real_acquire(self, slug, run_id, run_dir=run_dir)
+        if point == "after_tree":
+            signal.raise_signal(sig)
+        return handle
+
+    def attach(self, handle, run_dir, *, record=None):
+        real_attach(self, handle, run_dir, record=record)
+        if point == "after_run":
+            signal.raise_signal(sig)
+
+    def release(self, handle):
+        if point == "before_release" and handle is not None:
+            signal.raise_signal(sig)
+        real_release(self, handle)
+
+    RunManager._acquire_worktree_lock = acquire
+    RunManager._attach_run_lock = attach
+    RunManager._release_worktree_lock = release
+
+
 def main() -> int:
     repo, slug = Path(sys.argv[1]), sys.argv[2]
     mode = sys.argv[3] if len(sys.argv) > 3 else "mid_step"
     if mode.startswith("boundary:"):
         _arm_persist_boundary_kill(repo, mode)
+        adapter = CompletingAdapter()
+    elif mode.startswith("lock:"):
+        _arm_lock_boundary_kill(mode)
         adapter = CompletingAdapter()
     else:
         adapter = CompletingAdapter() if mode == "between_step" else SleepyAdapter()

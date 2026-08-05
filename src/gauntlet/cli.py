@@ -725,7 +725,11 @@ def status(
     man = view.manifest
 
     run_root = mgr.repo_root / mgr.config.run_root
-    driver = operator.driver_info(run_root, slug)
+    # P7b: the drive lock is per-run now, so the liveness read is scoped to the
+    # instance `_resolve_run_instance_dir` already proved contained (never a raw
+    # path join off active-run.txt's bytes). Legacy runs, whose lock is still at
+    # the worktree-global path, are answered by driver_info's own fallback.
+    driver = operator.driver_info(run_root, slug, run_instance_dir=run_instance_dir)
     # A persisted-state contract violation (a non-canonical iteration, an unsafe
     # step id, or a payload that fails schema validation) is an actual error
     # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty

@@ -28,6 +28,7 @@ from pathlib import Path
 from gauntlet.engine import (
     gitops,
     journal as J,
+    locking,
     manifest as M,
     prd_stub,
     recovery_exec as RX,
@@ -57,9 +58,12 @@ from gauntlet.procident import (
     read_process_identity,
 )
 
-# The worktree-scoped active-run lockfile name (FR-10.5). One per repo/worktree,
-# at the resolved run root, gitignored.
-DRIVING_LOCK_NAME = ".driving.lock"
+# The drive-lockfile name (FR-10.5), identical at BOTH scopes P7b now writes:
+# the worktree-global *tree guard* at `<run_root>/.driving.lock` (retained, and
+# gitignored) and the per-run *driving lock* at
+# `<run_root>/<slug>/<run-id>/.driving.lock`. See the design note above
+# `_tree_lock_path` for why both exist while the tree is still shared.
+DRIVING_LOCK_NAME = locking.DRIVING_LOCK_NAME
 
 # The transient pre-signal recovery intent (operator-aids P4, FR-5.6 / §6.4).
 # Lives in the run-instance dir; written durably *before* `recover` signals and
@@ -83,8 +87,9 @@ SERVE_DIRNAME = ".serve"
 RESERVATION_FILENAME = "reservation"
 
 # Bounded retries for the acquire loop when racing a stale-lock reclaim, so a
-# pathological churn raises rather than spins (fail closed).
-_LOCK_ACQUIRE_RETRIES = 50
+# pathological churn raises rather than spins (fail closed). Shared with the
+# repo-global lock via `engine.locking` (P7b).
+_LOCK_ACQUIRE_RETRIES = locking.LOCK_ACQUIRE_RETRIES
 
 # Marker written into a scaffolded PRD; the entry contract refuses to run while
 # it is still present (FR-10.1 / review OQ-1: existence + non-stub-ness). The
@@ -291,86 +296,34 @@ def next_auto_resume_action(
     return (AUTO_RESUME_WAIT, remaining)
 
 
-@dataclass
-class _LockRecord:
-    """The on-disk content of ``<run_root>/.driving.lock`` (FR-10.5).
-
-    ``nonce`` is a fresh per-acquisition random token; the holder keeps it in
-    memory and releases the lock **only** if the file still carries that nonce
-    (review F-004), so a holder that was already reclaimed-as-stale can never
-    unlink a *new* owner's lock. ``proc_identity`` is the FR-7.2 OS
-    process-creation identity (or ``None`` if unobtainable → unverifiable).
-    """
-
-    nonce: str
-    slug: str
-    run_id: str | None
-    pid: int
-    pgid: int
-    started_at: str
-    host: str
-    proc_identity: dict | None
-
-    def to_json(self) -> str:
-        return json.dumps(
-            {
-                "nonce": self.nonce,
-                "slug": self.slug,
-                "run_id": self.run_id,
-                "pid": self.pid,
-                "pgid": self.pgid,
-                "started_at": self.started_at,
-                "host": self.host,
-                "proc_identity": self.proc_identity,
-            },
-            indent=2,
-        )
-
-    @classmethod
-    def from_json(cls, text: str) -> "_LockRecord | None":
-        try:
-            data = json.loads(text)
-            if not isinstance(data, dict):
-                return None
-            nonce = data["nonce"]
-            slug = data["slug"]
-            run_id = data.get("run_id")
-            started_at = data.get("started_at", "")
-            host = data.get("host", "")
-            proc_identity = data.get("proc_identity")
-            # Type-check the string-typed fields so a malformed lock (a non-string
-            # started_at/host/nonce/slug, or a non-dict proc_identity) is treated
-            # as malformed → indeterminate driver, never propagated into the
-            # status payload as a contract-violating since/host (operator F-003).
-            # `bool` is an int subclass but is not a str, so it is rejected here.
-            if not all(
-                isinstance(v, str) for v in (nonce, slug, started_at, host)
-            ):
-                return None
-            if run_id is not None and not isinstance(run_id, str):
-                return None
-            if proc_identity is not None and not isinstance(proc_identity, dict):
-                return None
-            return cls(
-                nonce=nonce,
-                slug=slug,
-                run_id=run_id,
-                pid=int(data["pid"]),
-                pgid=int(data.get("pgid", data["pid"])),
-                started_at=started_at,
-                host=host,
-                proc_identity=proc_identity,
-            )
-        except (ValueError, KeyError, TypeError):
-            return None
+# The lock record moved to `engine.locking` in P7b so the three lock layers
+# (tree guard, per-run driving lock, repo-global git lock) share ONE reclaim
+# rule rather than three copies that can drift. The historical name is kept
+# because `engine.operator` — and the tests — import it from here.
+_LockRecord = locking.LockRecord
 
 
 @dataclass
 class _LockHandle:
-    """An acquired worktree lock; carries the nonce that authorises release."""
+    """One acquisition of the drive lock; the nonce authorises the release.
+
+    P7b publishes a single record — one nonce — at up to two paths:
+
+    * ``path`` — the worktree-global **tree guard** at
+      ``<run_root>/.driving.lock``. Always present.
+    * ``run_path`` — the per-run **driving lock** at
+      ``<run_root>/<slug>/<run-id>/.driving.lock``. ``None`` until the run dir
+      exists (``start`` attaches it once the dir is minted; every other verb
+      takes both up front).
+
+    Both files carry the same nonce, so a nonce-keyed release — the F-004 guard,
+    and `recover`'s step-8 release of a *wedged driver's* lock via the intent's
+    ``lock_nonce`` — identifies the pair unambiguously.
+    """
 
     path: Path
     nonce: str
+    run_path: Path | None = None
 
 
 @dataclass
@@ -849,12 +802,62 @@ class RunManager:
     # complementary, *worktree-global* guard FR-10.5 adds: exactly one lockfile
     # per repo/worktree, so holding it for one slug blocks every driving verb
     # for every slug by construction. The two coexist (D7).
+    #
+    # ---- P7b: two scopes, one record (spike §8.3) ---------------------------
+    #
+    # P7b introduces the per-run driving lock at
+    # `<run_root>/<slug>/<run-id>/.driving.lock` and RETAINS the worktree-global
+    # guard above, at its existing path, until P7c retires it. Both are written
+    # from ONE `_LockRecord` (one nonce) per acquisition.
+    #
+    # Why retain rather than replace. The spike's §8.3 lock model is written for
+    # the END state, where every run has its own tree and git's own
+    # one-branch-one-worktree rule (E2-A/E2-B) supplies cross-run exclusion for
+    # free. That rule does not exist yet: through P7b every run still drives the
+    # operator's checkout. Demoting the lock to a per-run path alone would let
+    # slug A and slug B drive one tree concurrently — and two concurrent
+    # `gauntlet run <same-slug>` invocations mint DIFFERENT run ids, so they
+    # would take different per-run paths and both proceed, with only the racy
+    # `active-run.txt` check between them. That is a direct regression of the
+    # FR-10.5 mutual-exclusion guarantee, so the tree guard stays.
+    #
+    # Why it stays at the SAME path. Mutual exclusion is only worth what the
+    # contending set is worth: every process that can drive this tree must
+    # contend on the same object. A machine with two Gauntlet versions installed
+    # (spike §8.3's "reversal cost", §10's half-migrated machine) has a pre-P7b
+    # engine that knows exactly one lock path. Moving the tree guard to a new
+    # name would make that engine's driving verbs blind to a live P7b driver.
+    # Keeping it where it is means the old engine and the new engine exclude
+    # each other in BOTH directions — which is what §10's "a half-migrated
+    # machine cannot double-drive" is actually asking for.
+    #
+    # What P7c retires. Once `worktree.mode: dedicated` gives each run its own
+    # tree, cross-slug exclusion on one tree stops being the thing to protect
+    # and the tree guard becomes the legacy read-only path §10 describes: read
+    # (so a legacy `same_tree` run still blocks), never written.
 
     def _run_root_dir(self) -> Path:
         return self.repo_root / self.config.run_root
 
-    def _lock_path(self) -> Path:
+    def _tree_lock_path(self) -> Path:
+        """The retained worktree-global guard: `<run_root>/.driving.lock`.
+
+        One per repo/worktree. Holding it for any slug blocks every driving verb
+        for every slug — the property that keeps two runs off one shared tree,
+        and the path a pre-P7b engine also contends on.
+        """
         return self._run_root_dir() / DRIVING_LOCK_NAME
+
+    @staticmethod
+    def _run_lock_path(run_dir: Path) -> Path:
+        """The per-run driving lock: `<run_root>/<slug>/<run-id>/.driving.lock`.
+
+        Lives in the run-instance dir — in the OPERATOR's checkout, not in the
+        run's tree — because `driver_info` must be able to answer "is a driver
+        alive?" when the run worktree is missing, which is precisely the
+        recovery case P7 exists to make survivable (spike §8.3).
+        """
+        return run_dir / DRIVING_LOCK_NAME
 
     @staticmethod
     def _ensure_run_root_gitignore(run_root: Path) -> None:
@@ -881,47 +884,49 @@ class RunManager:
             lines = list(dict.fromkeys(existing + wanted))  # dedup, stable order
             gi.write_text("\n".join(lines) + "\n")
 
-    def _read_lock(self) -> _LockRecord | None:
-        try:
-            text = self._lock_path().read_text()
-        except (OSError, FileNotFoundError):
-            return None
-        return _LockRecord.from_json(text)
-
     @staticmethod
-    def _lock_is_live(rec: _LockRecord) -> bool:
-        """True unless the lock's holder is *proven* gone (FR-10.5).
+    def _ensure_run_dir_gitignore(run_dir: Path) -> None:
+        """Make a run-instance dir invisible to git BEFORE anything is written in it.
 
-        A worktree lock must fail **closed**: reclaim only when we can prove the
-        holder is dead (`os.kill` → ``ProcessLookupError``) or has been replaced
-        by a different process (the recorded *and* a freshly-read identity are
-        both present and differ → PID reuse). An ``os.kill``-live pid whose
-        identity is *unverifiable* — recorded ``null`` at capture, or unreadable
-        now (a transient ``ps`` failure, or an unsupported platform) — is treated
-        as LIVE, so a possibly-running driver never has its lock stolen and two
-        orchestrators can never drive one worktree (review F-001).
+        The per-run lock is the first file to land in a run dir, and it lands
+        *before* the Orchestrator's ``_ignore_run_dir`` runs (that is the
+        Orchestrator's job, and the Orchestrator does not exist yet at
+        acquisition time). Without this, the lock would be briefly visible to
+        ``git status`` and would dirty the tree ahead of the first clean-handoff
+        guard (FR-9.3) — the invariant in CLAUDE.md §1.
 
-        This is the deliberate opposite of ``procident.process_is_alive``, which
-        fails closed the *other* way for re-attach (FR-7.2: unverifiable → treat
-        as orphaned → recover). For mutual exclusion, unverifiable must block.
+        Writes the same self-ignoring ``*`` marker ``_ignore_run_dir`` writes, so
+        the two are idempotent with respect to each other and whichever runs
+        first wins.
         """
-        try:
-            os.kill(rec.pid, 0)
-        except ProcessLookupError:
-            return False  # proven dead → reclaimable as stale
-        except PermissionError:
-            pass  # exists (owned by another user) — the reuse check decides
-        except OSError:
-            return True  # cannot signal → do not assume gone; keep the lock
-        recorded = ProcessIdentity.from_dict(rec.proc_identity)
-        if recorded is None:
-            return True  # alive, identity unverifiable → cannot prove reuse
-        fresh = read_process_identity(rec.pid)
-        if fresh is None:
-            return True  # alive, fresh read failed → cannot prove reuse
-        # Both identities present: equal → same live process (block); differ →
-        # the pid was reused by a new process → the original is gone (reclaim).
-        return recorded.same_process(fresh)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        gitignore = run_dir / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n")
+
+    def _read_lock(self, run_dir: Path | None = None) -> _LockRecord | None:
+        """The drive-lock record for a run: per-run path first, tree guard second.
+
+        P7b writes both files from one record, so for a run driven by a P7b
+        engine either answers. The fallback is what makes a **legacy** run —
+        started by a pre-P7b engine, which only ever wrote the tree guard —
+        readable by this engine without migrating anything (spike §10).
+
+        ``run_dir=None`` reads the tree guard alone (the acquisition-time view,
+        and the pre-P7b behaviour of this method).
+        """
+        if run_dir is not None:
+            rec = locking.read_record(self._run_lock_path(run_dir))
+            if rec is not None:
+                return rec
+        return locking.read_record(self._tree_lock_path())
+
+    # The reclaim rule itself now lives in `engine.locking` so the tree guard,
+    # the per-run lock and the repo-global git lock cannot drift apart. These
+    # stay as methods because the semantics are part of this class's contract
+    # (and its tests reach for them by name).
+    _lock_is_live = staticmethod(locking.record_is_live)
+    _link_into_place = staticmethod(locking.link_into_place)
 
     @staticmethod
     def _lock_busy_message(rec: _LockRecord) -> str:
@@ -932,58 +937,22 @@ class RunManager:
         )
 
     def _new_lock_record(self, slug: str, run_id: str | None) -> _LockRecord:
-        pid = os.getpid()
-        try:
-            pgid = os.getpgid(pid)
-        except OSError:  # pragma: no cover - platform without process groups
-            pgid = pid
-        identity = read_process_identity(pid)
-        return _LockRecord(
-            nonce=secrets.token_hex(16),
-            slug=slug,
-            run_id=run_id,
-            pid=pid,
-            pgid=pgid,
-            started_at=_utc_stamp(),
-            host=socket.gethostname(),
-            proc_identity=identity.to_dict() if identity is not None else None,
-        )
-
-    @staticmethod
-    def _link_into_place(lock_path: Path, nonce: str, payload: str) -> bool:
-        """Atomically publish ``payload`` at ``lock_path`` iff it does not exist.
-
-        Write the full content to a unique temp first, then ``os.link`` it into
-        place — ``link`` fails if the target exists, so it is an atomic
-        create-if-absent **and** the lock is *never* observed empty (unlike
-        ``O_CREAT|O_EXCL`` then write, which leaves a zero-byte window a racing
-        acquirer could misread as corrupt and reclaim). Returns ``True`` on win.
-        """
-        tmp = lock_path.with_name(f"{lock_path.name}.{nonce}.tmp")
-        tmp.write_text(payload)
-        try:
-            os.link(tmp, lock_path)
-            return True
-        except FileExistsError:
-            return False
-        finally:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+        return locking.new_record(slug, run_id)
 
     def _try_reclaim(
         self, lock_path: Path, observed: _LockRecord | None, nonce: str, payload: str
     ) -> bool:
         """Best-effort reclaim of a stale/corrupt lock; True iff we now hold it.
 
-        Re-reads the lock immediately before removing it and unlinks **only** the
-        record we observed as stale (matching nonce) — never a *new* owner's
-        fresh lock (the F-004 inverse of ownership-validated release). Then races
-        to atomically link our record into place; a lost race (someone else
-        reclaimed first) returns ``False`` so the caller re-evaluates the holder.
+        Re-reads **``lock_path`` itself** immediately before removing it (P7b:
+        the caller may be reclaiming either scope, so this must never re-read
+        some other lock) and unlinks only the record we observed as stale
+        (matching nonce) — never a *new* owner's fresh lock (the F-004 inverse
+        of ownership-validated release). Then races to atomically link our
+        record into place; a lost race (someone else reclaimed first) returns
+        ``False`` so the caller re-evaluates the holder.
         """
-        current = self._read_lock()
+        current = locking.read_record(lock_path)
         if current is not None:
             if self._lock_is_live(current):
                 return False  # became live (or a fresh owner) → caller fails closed
@@ -996,37 +965,96 @@ class RunManager:
             pass
         return self._link_into_place(lock_path, nonce, payload)
 
-    def _acquire_worktree_lock(
-        self, slug: str, run_id: str | None
-    ) -> _LockHandle:
-        """Acquire the worktree lock or fail closed (FR-10.5).
+    def _acquire_one(
+        self, lock_path: Path, record: _LockRecord, payload: str
+    ) -> None:
+        """Take ONE lock file or fail closed (FR-10.5); no handle bookkeeping.
 
         Atomic create-if-absent via ``os.link`` so check-and-acquire has no
         TOCTOU window and the lock is never observed empty. A lock held by a
         **live** pid fails the verb closed regardless of slug; a
-        dead/reused/unverifiable lock is reclaimed as stale. Acquired **first**
-        by `start`/`resume`/`approve`, before any run dir / `active-run.txt` /
-        git mutation.
+        dead/reused/unverifiable lock is reclaimed as stale.
         """
-        run_root = self._run_root_dir()
-        run_root.mkdir(parents=True, exist_ok=True)
-        self._ensure_run_root_gitignore(run_root)
-        lock_path = self._lock_path()
-        record = self._new_lock_record(slug, run_id)
-        payload = record.to_json()
-        for _ in range(_LOCK_ACQUIRE_RETRIES):
+        for _ in range(locking.LOCK_ACQUIRE_RETRIES):
             if self._link_into_place(lock_path, record.nonce, payload):
-                return self._take_handle(lock_path, record.nonce)
-            existing = self._read_lock()
+                return
+            existing = locking.read_record(lock_path)
             if existing is not None and self._lock_is_live(existing):
                 raise WorktreeLockError(self._lock_busy_message(existing))
             if self._try_reclaim(lock_path, existing, record.nonce, payload):
-                return self._take_handle(lock_path, record.nonce)
+                return
             # transient race (a concurrent reclaim/empty window) → re-evaluate
         raise WorktreeLockError(
             "could not acquire the worktree lock after repeated reclaim races "
             f"({lock_path}); a driver may be churning — fail closed (FR-10.5)"
         )
+
+    def _acquire_worktree_lock(
+        self, slug: str, run_id: str | None, *, run_dir: Path | None = None
+    ) -> _LockHandle:
+        """Acquire the drive lock for a run and fail closed (FR-10.5).
+
+        Takes the worktree-global **tree guard** first — the coarse, still
+        load-bearing exclusion while every run shares the operator's checkout —
+        then, when ``run_dir`` is given, the **per-run** lock inside that run's
+        instance dir. One record, one nonce, published at both paths. The order
+        is fixed (tree then run) at every call site, and the tree guard is
+        released if the per-run acquisition fails, so no partial hold survives.
+
+        ``run_dir=None`` is the `start()` case: the run dir does not exist yet
+        at acquisition time, so `start` attaches the per-run lock with
+        :meth:`_attach_run_lock` the moment it mints the dir — still under the
+        tree guard, and still before any agent runs. Deliberately NOT solved by
+        creating the run dir here: `start` can legitimately refuse after
+        acquiring (a still-active run, a dirty worktree), and an empty
+        `run-<ts>/` left behind by a refusal would become the
+        lexicographically-greatest instance that `resolve_run_instance` picks
+        when there is no `active-run.txt`.
+
+        Acquired **first** by `start`/`resume`/`approve`, before any run dir /
+        `active-run.txt` / git mutation.
+        """
+        run_root = self._run_root_dir()
+        run_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_run_root_gitignore(run_root)
+        record = self._new_lock_record(slug, run_id)
+        payload = record.to_json()
+        tree_path = self._tree_lock_path()
+        self._acquire_one(tree_path, record, payload)
+        handle = self._take_handle(tree_path, record.nonce)
+        if run_dir is not None:
+            try:
+                self._attach_run_lock(handle, run_dir, record=record)
+            except BaseException:
+                self._release_worktree_lock(handle)
+                raise
+        return handle
+
+    def _attach_run_lock(
+        self, handle: _LockHandle, run_dir: Path, *, record: _LockRecord | None = None
+    ) -> None:
+        """Publish this acquisition's record at the per-run path too (P7b).
+
+        Idempotent for a handle that already carries a ``run_path``. The run dir
+        is created and self-ignored FIRST, so the lock never dirties the tree
+        (see :meth:`_ensure_run_dir_gitignore`).
+        """
+        if handle.run_path is not None:
+            return
+        self._ensure_run_dir_gitignore(run_dir)
+        if record is None:
+            # Re-derive the published record so the two files stay byte-identical
+            # (same pid/pgid/identity/started_at), not merely same-nonce.
+            record = locking.read_record(handle.path)
+        if record is None or record.nonce != handle.nonce:
+            raise WorktreeLockError(
+                f"the tree guard at {handle.path} no longer carries this "
+                "acquisition's nonce; refusing to publish a per-run lock under "
+                "an ownership we cannot prove (FR-10.5)"
+            )
+        run_path = self._run_lock_path(run_dir)
+        self._acquire_one(run_path, record, record.to_json())
+        handle.run_path = run_path
 
     def _take_handle(self, lock_path: Path, nonce: str) -> _LockHandle:
         handle = _LockHandle(path=lock_path, nonce=nonce)
@@ -1037,19 +1065,20 @@ class RunManager:
     def _release_worktree_lock(self, handle: _LockHandle | None) -> None:
         """Release the lock, but only if it still carries our nonce (F-004).
 
-        If the file now holds a different nonce, we were already reclaimed as
+        If a file now holds a different nonce, we were already reclaimed as
         stale and a *new* owner is driving — unlinking would re-open
-        double-driving, so the release is a **no-op**. Idempotent: safe to call
+        double-driving, so that release is a **no-op**. Idempotent: safe to call
         from the per-verb ``finally`` and again from the atexit fallback.
+
+        Releases the per-run lock BEFORE the tree guard — the reverse of
+        acquisition — so no window exists in which another process can take the
+        tree guard while this run's per-run lock still looks held.
         """
         if handle is None:
             return
-        current = self._read_lock()
-        if current is not None and current.nonce == handle.nonce:
-            try:
-                os.unlink(handle.path)
-            except FileNotFoundError:
-                pass
+        if handle.run_path is not None:
+            locking.unlink_if_nonce(handle.run_path, handle.nonce)
+        locking.unlink_if_nonce(handle.path, handle.nonce)
         if self._held_lock is handle:
             self._held_lock = None
         # No-op if already gone; clears the atexit fallback for this manager
@@ -1126,8 +1155,11 @@ class RunManager:
                 run_id = f"run-{_utc_stamp()}-{suffix}"
                 suffix += 1
 
-        # Acquire the worktree lock FIRST — before any run dir / active-run.txt
-        # / git mutation (FR-10.5). Released in `finally` on park/done/error.
+        # Acquire the worktree-global tree guard FIRST — before any run dir /
+        # active-run.txt / git mutation (FR-10.5). Released in `finally` on
+        # park/done/error. The per-run lock (P7b) is attached below, the moment
+        # the run dir exists; until then this guard alone excludes every other
+        # driving verb on this tree, including a second `start` of this slug.
         handle = self._acquire_worktree_lock(slug, run_id)
         try:
             self._refuse_if_active_run(layout)
@@ -1204,6 +1236,14 @@ class RunManager:
 
             run_dir = layout.run_dir(run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
+            # P7b: publish this acquisition's record at the per-run path now that
+            # the dir exists, so `driver_info`, `recover` and the recovery
+            # executor's lock guard can all find THIS run's driver at the
+            # per-run location for the whole drive. Still under the tree guard,
+            # still before any agent runs. `_attach_run_lock` writes the run
+            # dir's self-ignoring `.gitignore` first, so the lock never dirties
+            # the tree ahead of the first clean-handoff guard.
+            self._attach_run_lock(handle, run_dir)
             # The active-run pointer is live bookkeeping, never commit payload
             # (BOOTSTRAP-NOTES #33). An engine-written slug-level .gitignore
             # keeps it ignored in EVERY repo — including throwaway fixture repos
@@ -1296,7 +1336,7 @@ class RunManager:
         # Resume is a driving verb (FR-10.5): take the worktree lock FIRST,
         # before the branch checkout / drive. The lock record carries this run's
         # id from the manifest so a concurrent verb's refusal names the holder.
-        handle = self._acquire_worktree_lock(slug, man.run_id)
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             # P3 (plan §4.3): a recovery transaction killed between its intent
             # persist and its intent clear left a durable, replayable intent.
@@ -1586,7 +1626,7 @@ class RunManager:
         write is not clobbered; return ``False`` (re-loop and re-decide) if the
         parked usage-limit schedule is gone or already at the ceiling.
         """
-        handle = self._acquire_worktree_lock(slug, run_id)
+        handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
             step = self._parked_usage_limit_step(man)
@@ -1606,7 +1646,7 @@ class RunManager:
         Same lock discipline as :meth:`_arm_next_attempt`: reload + revalidate so
         the exhaustion note never overwrites a concurrent manual resume's state.
         """
-        handle = self._acquire_worktree_lock(slug, run_id)
+        handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
             step = self._parked_usage_limit_step(man)
@@ -1905,7 +1945,7 @@ class RunManager:
         # Approve drives the rest of the run, so it is a driving verb (FR-10.5):
         # take the worktree lock first, released in `finally` on the next park /
         # done / error.
-        handle = self._acquire_worktree_lock(slug, man.run_id)
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the approval drives anything (post-P3 review F-002).
@@ -1939,7 +1979,7 @@ class RunManager:
         # `approve` it is a driving verb: take the worktree lock first and honor
         # the judge. The rejection is attributed to the resolved operator identity.
         user = resolve_operator_identity(self.repo_root)
-        handle = self._acquire_worktree_lock(slug, man.run_id)
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the rejection re-drives anything (post-P3 review F-002).
@@ -2022,7 +2062,9 @@ class RunManager:
             return None  # non-positive or mismatched group → fail closed
 
         # (c) the owning driver must be provably gone (orphaned/none) — §6.4.
-        liveness = operator.driver_liveness(self._run_root_dir(), slug)
+        liveness = operator.driver_liveness(
+            self._run_root_dir(), slug, run_instance_dir=run_dir
+        )
         if liveness not in (operator.LIVENESS_ORPHANED, operator.LIVENESS_NONE):
             return None  # alive (running) or indeterminate → fail closed
 
@@ -2128,8 +2170,8 @@ class RunManager:
         before_fp = self._capture_progress(slug)  # R5 guard input
 
         # FR-5.6 step 1: capture the lock once and run the full FR-5.1 gate.
-        captured = self._read_lock()
-        verified = self._verify_recover_target(captured, slug)
+        captured = self._read_lock(run_dir)
+        verified = self._verify_recover_target(captured, slug, run_dir=run_dir)
 
         # FR-5.6 step 2: state guard — the in-flight step must still be `running`.
         target = self._recover_target_step(man)
@@ -2138,7 +2180,7 @@ class RunManager:
         # A changed/absent nonce means the driver finished or relaunched between
         # step 1 and now → abort WITHOUT signalling (the race against a normally
         # completing driver, closed).
-        current = self._read_lock()
+        current = self._read_lock(run_dir)
         if current is None or current.nonce != verified.nonce:
             raise RecoverConcurrent(
                 f"run {man.run_id!r} completed or relaunched concurrently "
@@ -2177,7 +2219,7 @@ class RunManager:
         # write: if the nonce vanished/changed or the target is no longer
         # `running`, the driver finished or relaunched → discard the just-written
         # intent and abort WITHOUT signalling or mutating the manifest.
-        recheck = self._read_lock()
+        recheck = self._read_lock(run_dir)
         fresh_man = Manifest.load(manifest_path)
         fresh_target = self._find_step_by_rendered_id(fresh_man, intent.step_id)
         if (
@@ -2231,7 +2273,7 @@ class RunManager:
             return "unknown", "os_user"
 
     def _verify_recover_target(
-        self, rec: "_LockRecord | None", slug: str
+        self, rec: "_LockRecord | None", slug: str, *, run_dir: Path | None = None
     ) -> "_LockRecord":
         """The full FR-5.1 identity gate (all ANDed); return the verified record.
 
@@ -2264,7 +2306,9 @@ class RunManager:
                 f"({socket.gethostname()!r}); refusing to signal a foreign-host "
                 f"PID in a shared run root. {safe}"
             )
-        liveness = operator.driver_liveness(self._run_root_dir(), slug)
+        liveness = operator.driver_liveness(
+            self._run_root_dir(), slug, run_instance_dir=run_dir
+        )
         if liveness != operator.LIVENESS_ALIVE:
             why = {
                 operator.LIVENESS_ORPHANED: (
@@ -2347,17 +2391,31 @@ class RunManager:
             return M.SIGNAL_ALREADY_DEAD
         return _signal_process_group(intent.pgid)
 
-    def _release_lock_if_nonce(self, nonce: str) -> None:
+    def _release_lock_if_nonce(self, nonce: str, run_dir: Path | None = None) -> None:
         """Release the drive lock only if it still carries ``nonce`` (FR-5.6 step 8).
 
         Mirrors :meth:`_release_worktree_lock`'s nonce guard, but keyed on the
         recovered nonce rather than a held handle — `recover` never *acquired* the
         lock, it is releasing the wedged driver's. Never unlinks a new owner's
         fresh lock.
+
+        P7b: the recovered driver published ONE record at BOTH scopes, so both
+        are released under the same nonce. Releasing only the per-run lock would
+        leave the wedged driver's tree guard behind and wedge every driving verb
+        on this worktree — the exact "recoverable, never stuck" line R1 draws.
+        Each file is checked independently, so a partially-released pair (a
+        crash between the two unlinks) still converges.
         """
-        current = self._read_lock()
-        if current is not None and current.nonce == nonce:
-            _unlink_durable(self._lock_path())
+        for path in self._lock_paths_for(run_dir):
+            current = locking.read_record(path)
+            if current is not None and current.nonce == nonce:
+                _unlink_durable(path)
+
+    def _lock_paths_for(self, run_dir: Path | None) -> list[Path]:
+        """Every path this engine's drive lock can occupy, per-run first (P7b)."""
+        paths = [] if run_dir is None else [self._run_lock_path(run_dir)]
+        paths.append(self._tree_lock_path())
+        return paths
 
     @staticmethod
     def _guard_run_file(run_dir: Path, name: str) -> Path:
@@ -2486,7 +2544,7 @@ class RunManager:
         # "manifest not yet finalized".
         _unlink_durable(run_dir / RECOVERY_INTENT_NAME)
         # Step 8: release the lock under the recorded-nonce guard.
-        self._release_lock_if_nonce(intent.lock_nonce)
+        self._release_lock_if_nonce(intent.lock_nonce, run_dir)
         return True
 
     def _record_recovery_reconciliation(
@@ -2619,7 +2677,7 @@ class RunManager:
         ):
             return
         try:
-            handle = self._acquire_worktree_lock(slug, pre.run_id)
+            handle = self._acquire_worktree_lock(slug, pre.run_id, run_dir=run_dir)
         except WorktreeLockError:
             # A live driver owns the projection; its own write lands next.
             return
@@ -2728,7 +2786,7 @@ class RunManager:
         if intent is None:
             return "malformed recovery intent present; left in place for inspection"
 
-        current = self._read_lock()
+        current = self._read_lock(run_dir)
         if current is not None and current.nonce != intent.lock_nonce:
             # Stale: a relaunched driver holds a fresh lock → discard, no signal,
             # no manifest mutation.
@@ -3140,7 +3198,7 @@ class RunManager:
         # Rollback is a worktree-mutating verb: take the drive lock so a live
         # driver can never race the rewind (PR #77 review), exactly like
         # resume/abort.
-        handle = self._acquire_worktree_lock(slug, man.run_id)
+        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             # Converge any surviving recovery intent BEFORE the guards run
             # (post-P3 review F-002): a rollback killed between its Git apply

@@ -414,7 +414,8 @@ def test_recover_aborts_when_nonce_changes_before_signal(tmp_path, procs, monkey
         proc_identity=verified.proc_identity,
     )
     reads = iter([verified, changed])  # step 1 capture, then step 3 re-read
-    monkeypatch.setattr(mgr, "_read_lock", lambda: next(reads))
+    # P7b: `_read_lock` takes the run dir (per-run path first, tree guard second).
+    monkeypatch.setattr(mgr, "_read_lock", lambda run_dir=None: next(reads))
 
     with pytest.raises(RecoverConcurrent, match="completed or relaunched"):
         mgr.recover("demo")

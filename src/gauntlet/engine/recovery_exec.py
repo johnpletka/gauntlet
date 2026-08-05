@@ -1848,7 +1848,7 @@ def _clear_intent(run_dir: Path, intent_id: str) -> None:
 
 
 class WorktreeLockGuard:
-    """Transaction step 1: hold, or prove we already hold, the worktree lock.
+    """Transaction step 1: hold, or prove we already hold, the drive lock.
 
     Every production caller runs inside a verb that already holds the
     ``.driving.lock`` (resume/rollback acquire it in RunManager before any
@@ -1857,14 +1857,33 @@ class WorktreeLockGuard:
     no lock exists (direct engine embedding, tests), an ephemeral lock is
     taken for the transaction and released after — atomically created, never
     reclaimed from a live pid.
+
+    P7b: the drive lock moved to the run-instance dir, so the guard follows it
+    there (``lock_path``) — that is the file a P7b verb holds for this run. The
+    worktree-global path is still consulted as a **second** gate
+    (``tree_lock_path``): a live holder there is either another slug driving
+    this shared tree or a pre-P7b engine's driver, and either must block a
+    rewind of this tree. Both checks must pass, so this is strictly stronger
+    than the single check it replaces — never weaker.
+
+    Reclaim policy (identity verification) still belongs to RunManager: a
+    stale foreign lock at either path is a fail-closed refusal here, never a
+    steal.
     """
 
-    def __init__(self, repo_root: Path, run_root: str) -> None:
-        self.lock_path = repo_root / run_root / DRIVING_LOCK_NAME
+    def __init__(
+        self, repo_root: Path, run_root: str, *, run_dir: Path | None = None
+    ) -> None:
+        self.tree_lock_path = repo_root / run_root / DRIVING_LOCK_NAME
+        # No run dir (a caller embedding the executor directly) → the pre-P7b
+        # behaviour: the worktree-global path IS the lock.
+        self.lock_path = (
+            (run_dir / DRIVING_LOCK_NAME) if run_dir is not None else self.tree_lock_path
+        )
 
-    def _read(self) -> dict[str, Any] | None:
+    def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
-            data = json.loads(self.lock_path.read_text())
+            data = json.loads((path or self.lock_path).read_text())
         except (OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
@@ -1879,32 +1898,34 @@ class WorktreeLockGuard:
             return True  # cannot prove dead → fail closed (treat as live)
         return True
 
-    @contextmanager
-    def hold(self) -> Iterator[None]:
-        record = self._read()
-        if record is not None:
-            try:
-                pid = int(record.get("pid"))
-            except (TypeError, ValueError):
-                pid = -1
-            if pid == os.getpid():
-                yield  # already held by this process (the normal verb path)
-                return
-            if pid > 0 and self._pid_alive(pid):
-                raise RecoveryLockError(
-                    f"worktree lock {self.lock_path} is held by live pid "
-                    f"{pid}; refusing a concurrent recovery mutation (FR-10.5)"
-                )
-            # A stale/corrupt foreign lock: do NOT reclaim here — reclaim
-            # policy (identity verification) belongs to RunManager. Fail
-            # closed with the remedy.
+    def _check(self, path: Path) -> str:
+        """``ours`` / ``absent`` / raise. One lockfile, the unchanged rule."""
+        record = self._read(path)
+        if record is None:
+            return "absent"
+        try:
+            pid = int(record.get("pid"))
+        except (TypeError, ValueError):
+            pid = -1
+        if pid == os.getpid():
+            return "ours"
+        if pid > 0 and self._pid_alive(pid):
             raise RecoveryLockError(
-                f"worktree lock {self.lock_path} exists but its holder is not "
-                "verifiably this process; run the recovery through a locked "
-                "verb (resume/rollback) or remove the stale lock first"
+                f"worktree lock {path} is held by live pid "
+                f"{pid}; refusing a concurrent recovery mutation (FR-10.5)"
             )
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        nonce = secrets.token_hex(16)
+        # A stale/corrupt foreign lock: do NOT reclaim here — reclaim
+        # policy (identity verification) belongs to RunManager. Fail
+        # closed with the remedy.
+        raise RecoveryLockError(
+            f"worktree lock {path} exists but its holder is not "
+            "verifiably this process; run the recovery through a locked "
+            "verb (resume/rollback) or remove the stale lock first"
+        )
+
+    def _ephemeral(self, path: Path, nonce: str) -> None:
+        """Atomically create a transaction-scoped lock at ``path`` (never reclaim)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
             {
                 "nonce": nonce,
@@ -1918,14 +1939,14 @@ class WorktreeLockGuard:
             },
             indent=2,
         )
-        tmp = self.lock_path.with_name(f"{self.lock_path.name}.{nonce}.tmp")
+        tmp = path.with_name(f"{path.name}.{nonce}.tmp")
         tmp.write_text(payload)
         try:
             try:
-                os.link(tmp, self.lock_path)
+                os.link(tmp, path)
             except FileExistsError:
                 raise RecoveryLockError(
-                    f"worktree lock {self.lock_path} appeared during "
+                    f"worktree lock {path} appeared during "
                     "acquisition; refusing a concurrent recovery mutation"
                 ) from None
         finally:
@@ -1933,15 +1954,49 @@ class WorktreeLockGuard:
                 os.unlink(tmp)
             except FileNotFoundError:
                 pass
+
+    def _drop_ephemeral(self, path: Path, nonce: str) -> None:
+        current = self._read(path)
+        if current is not None and current.get("nonce") == nonce:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        # The worktree-global guard first: a live foreign holder there owns this
+        # tree, whichever run it belongs to, and no rewind may proceed under it.
+        # Absent is fine — an embedded caller has no RunManager verb around it.
+        split = self.tree_lock_path != self.lock_path
+        tree_state = self._check(self.tree_lock_path) if split else "ours"
+        if self._check(self.lock_path) == "ours":
+            yield  # already held by this process (the normal verb path)
+            return
+        # Ephemeral acquisition. When the two scopes are split, take BOTH — the
+        # tree guard is what stops a concurrent RunManager verb from driving a
+        # DIFFERENT run against this same tree while the rewind is in flight, so
+        # holding only the per-run lock would be weaker than the pre-P7b guard.
+        nonce = secrets.token_hex(16)
+        held_tree = False
+        if split and tree_state == "absent":
+            self._ephemeral(self.tree_lock_path, nonce)
+            held_tree = True
+        try:
+            self._ephemeral(self.lock_path, nonce)
+        except BaseException:
+            if held_tree:
+                self._drop_ephemeral(self.tree_lock_path, nonce)
+            raise
         try:
             yield
         finally:
-            current = self._read()
-            if current is not None and current.get("nonce") == nonce:
-                try:
-                    os.unlink(self.lock_path)
-                except FileNotFoundError:
-                    pass
+            # Reverse of acquisition: the per-run lock first, then the tree
+            # guard, so no window exists where the tree looks free while this
+            # rewind's own lock is still held.
+            self._drop_ephemeral(self.lock_path, nonce)
+            if held_tree:
+                self._drop_ephemeral(self.tree_lock_path, nonce)
 
 
 @dataclass
@@ -1983,7 +2038,11 @@ class RecoveryExecutor:
         self.clock = clock or (
             lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
-        self.lock_guard = lock_guard or WorktreeLockGuard(repo_root, run_root)
+        # P7b: `run_dir` IS the run-instance dir, which is where the drive lock
+        # lives now — so the guard follows the lock without a new parameter.
+        self.lock_guard = lock_guard or WorktreeLockGuard(
+            repo_root, run_root, run_dir=run_dir
+        )
 
     # -- transaction steps, in order ------------------------------------------
 

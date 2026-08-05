@@ -285,13 +285,12 @@ def _this_host() -> str:
 
 
 # --- the drive lock (the single read path) -----------------------------------
-def _lock_state(run_root: Path) -> tuple[str, _LockRecord | None]:
-    """Read ``<run_root>/.driving.lock`` once → ``(kind, record)``.
+def _lock_file_state(path: Path) -> tuple[str, _LockRecord | None]:
+    """Read one lockfile → ``(kind, record)``.
 
     ``kind`` is ``absent`` (no file), ``malformed`` (unreadable or unparseable
     / missing required field — FR-2.4 row g, fail closed), or ``present``.
     """
-    path = Path(run_root) / DRIVING_LOCK_NAME
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -302,6 +301,40 @@ def _lock_state(run_root: Path) -> tuple[str, _LockRecord | None]:
     if rec is None:
         return ("malformed", None)
     return ("present", rec)
+
+
+def _lock_state(
+    run_root: Path, run_instance_dir: Path | None = None
+) -> tuple[str, _LockRecord | None]:
+    """The drive lock for a run: per-run path first, worktree-global second (P7b).
+
+    P7b splits one lockfile into two scopes and publishes ONE record at both,
+    so for a run driven by a P7b engine either file answers. Reading the
+    per-run path first, and the worktree-global path only when the per-run one
+    is ``absent``, is what makes three populations readable by one function:
+
+    * a **P7b run** — answered by its own per-run lock;
+    * a **legacy run** started by a pre-P7b engine, which only ever wrote
+      ``<run_root>/.driving.lock`` — answered by the fallback (spike §10:
+      legacy locks are read so a half-migrated machine cannot double-drive);
+    * **another slug driving this shared tree** — no per-run lock for the slug
+      being asked about, and a worktree-global lock naming someone else, which
+      is FR-2.4 row b.
+
+    A per-run lock that is present but ``malformed`` does NOT fall through: an
+    unreadable lock for exactly this run is row g (indeterminate, fail closed),
+    and silently consulting a different file would downgrade that to a
+    confident answer.
+
+    ``run_instance_dir=None`` reads the worktree-global path alone — the
+    pre-P7b behaviour, and what callers that have no resolved instance (or that
+    are deliberately asking "who owns this tree?") get.
+    """
+    if run_instance_dir is not None:
+        kind, rec = _lock_file_state(Path(run_instance_dir) / DRIVING_LOCK_NAME)
+        if kind != "absent":
+            return (kind, rec)
+    return _lock_file_state(Path(run_root) / DRIVING_LOCK_NAME)
 
 
 def _liveness_for_record(rec: _LockRecord) -> str:
@@ -330,14 +363,35 @@ def _liveness_for_record(rec: _LockRecord) -> str:
     return LIVENESS_INDETERMINATE  # row h — foreign-host (or unrecorded) host
 
 
-def driver_info(run_root: Path, slug: str) -> DriverInfo:
+def driver_info(
+    run_root: Path, slug: str, *, run_instance_dir: Path | None = None
+) -> DriverInfo:
     """The full driver-liveness view for ``slug`` (FR-2.4 total table).
 
     ``pid``/``host``/``since`` are populated from the lock only when a parsed
     record for this slug yields a non-``none`` liveness; they are ``None``
     (the §6.1 nullable contract) for the no-lock, foreign, and malformed cases.
+
+    ``run_instance_dir`` (P7b) is the run whose driver is being asked about. It
+    must be a resolved, containment-checked instance — ``resolve_run_instance``
+    plus the two-link chain in ``cli._resolve_run_instance_dir``, never a raw
+    ``run_root/slug/<name>`` join — because these bytes ultimately come from
+    ``active-run.txt``. Omitting it reads the worktree-global lock alone, which
+    stays correct (it is where a legacy run's lock lives, and where a foreign
+    slug's tree hold shows up) but cannot distinguish two P7b runs of one slug.
+
+    The table stays TOTAL and every row stays reachable:
+
+    * rows a/c–h are reached from whichever lockfile ``_lock_state`` answered;
+    * row b (**foreign lock → none**) is reached from the worktree-global lock,
+      which genuinely names another slug whenever that slug is driving this
+      shared tree, and from a legacy lock left by another slug's run. It is
+      *not* legacy-only in P7b. It also stays reachable from a per-run lock —
+      defensively: a lock naming a different slug inside this run's dir is a
+      misplaced or hand-copied file, and "not this run's driver" is the only
+      answer that cannot mislead.
     """
-    kind, rec = _lock_state(run_root)
+    kind, rec = _lock_state(run_root, run_instance_dir)
     if kind == "absent":
         return DriverInfo(LIVENESS_NONE, None, None, None)  # row a
     if kind == "malformed":
@@ -349,9 +403,11 @@ def driver_info(run_root: Path, slug: str) -> DriverInfo:
     return DriverInfo(state, rec.pid, rec.host or None, rec.started_at or None)
 
 
-def driver_liveness(run_root: Path, slug: str) -> str:
+def driver_liveness(
+    run_root: Path, slug: str, *, run_instance_dir: Path | None = None
+) -> str:
     """Just the FR-2.4 liveness value (``alive``/``orphaned``/``indeterminate``/``none``)."""
-    return driver_info(run_root, slug).state
+    return driver_info(run_root, slug, run_instance_dir=run_instance_dir).state
 
 
 # --- structured next actions (FR-4.2 object shape) ---------------------------
@@ -1208,7 +1264,7 @@ def read_recovery_intent(
     lock_nonce = data.get("lock_nonce")
     if not isinstance(step_id, str) or not step_id or not isinstance(lock_nonce, str):
         return (None, anomaly)
-    kind, rec = _lock_state(run_root)
+    kind, rec = _lock_state(run_root, run_instance_dir)
     if kind == "absent":
         nonce_matches = True  # finalize branch — verified target already gone
     elif kind == "present" and rec is not None:
