@@ -920,11 +920,22 @@ class RunManager:
         about a run whose own evidence we could not read. It returns ``None``,
         which every caller here treats as a fail-closed refusal.
         """
+        return self._read_lock_state(run_dir)[1]
+
+    def _read_lock_state(
+        self, run_dir: Path | None = None
+    ) -> tuple[str, _LockRecord | None]:
+        """:meth:`_read_lock`, keeping the tri-state kind (review F-002).
+
+        Callers that must distinguish "no lock" from "a lock I could not read"
+        take this. :meth:`_read_lock` discards the kind, which is safe only
+        where every not-a-record outcome is already handled identically.
+        """
         if run_dir is not None:
             kind, rec = locking.read_lock_state(self._run_lock_path(run_dir))
             if kind != locking.LOCK_ABSENT:
-                return rec  # present → the record; malformed → None, no fallback
-        return locking.read_record(self._tree_lock_path())
+                return (kind, rec)  # present → record; malformed → no fallback
+        return locking.read_lock_state(self._tree_lock_path())
 
     # The reclaim rule itself now lives in `engine.locking` so the tree guard,
     # the per-run lock and the repo-global git lock cannot drift apart. These
@@ -2769,6 +2780,9 @@ class RunManager:
         Keyed on the intent, **not** a fresh liveness gate (a now-dead target is
         the *expected* post-signal outcome, not a failure):
 
+        * **Malformed** — lock present but unreadable/unparseable: mutate
+          nothing, keep the intent, surface the file (review F-002). "Cannot
+          read the lock" is never "the lock is absent".
         * **Stale** — lock **present** with a **different** nonce (a relaunched
           driver holds a fresh lock): discard the intent, no signal, no manifest
           mutation.
@@ -2810,7 +2824,26 @@ class RunManager:
         if intent is None:
             return "malformed recovery intent present; left in place for inspection"
 
-        current = self._read_lock(run_dir)
+        kind, current = self._read_lock_state(run_dir)
+        if kind == locking.LOCK_MALFORMED:
+            # The lock EXISTS but could not be read or parsed (review F-002,
+            # confirm pass). This is not the "absent" case the live branch below
+            # is written for: absent means "the verified target was killed and
+            # nothing relaunched", which is a fact. Unreadable is the absence of
+            # a fact, and finalizing on it would signal a process and rewrite the
+            # manifest on evidence we never saw. `operator.read_recovery_intent`
+            # already fails closed here (`nonce_matches = False`), so treating it
+            # as absent was also a direct R4 disagreement between the read-only
+            # view and this mutating path. Mutate nothing; leave the intent for
+            # the operator, who is told exactly which file to look at.
+            return (
+                "recovery intent present, but the drive lock "
+                f"({self._run_lock_path(run_dir) if run_dir else self._tree_lock_path()}) "
+                "exists and cannot be read or parsed; refusing to finalize a "
+                "recovery against a lock whose holder cannot be identified "
+                "(fail closed). Left in place — inspect the lock, and remove it "
+                "by hand once you have confirmed no driver is running."
+            )
         if current is not None and current.nonce != intent.lock_nonce:
             # Stale: a relaunched driver holds a fresh lock → discard, no signal,
             # no manifest mutation.

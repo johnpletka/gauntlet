@@ -591,6 +591,69 @@ def test_malformed_per_run_lock_does_not_fall_through_in_the_engine_read(
     assert rec is not None and rec.nonce == "tree-nonce"
 
 
+def _seed_intent_run(repo: Path, *, lock_body: str | None) -> tuple[RunManager, Path]:
+    """A run with a surviving recovery intent whose target step is `running`."""
+    from gauntlet.engine.manifest import PipelineRef, StepRecord
+    from gauntlet.engine.run import RECOVERY_INTENT_NAME
+
+    mgr = _prepare(repo)
+    run_dir = repo / "runs" / "alpha" / "run-1"
+    run_dir.mkdir(parents=True)
+    Manifest(
+        run_id="run-1", slug="alpha", branch="gauntlet/alpha", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"), status=M.RUN_RUNNING,
+        steps=[StepRecord(id="s", type="agent_task", status=M.RUNNING)],
+    ).write_atomic(run_dir / "manifest.json")
+    (run_dir / RECOVERY_INTENT_NAME).write_text(json.dumps({
+        "ts": "t", "actor": "a", "actor_source": "os_user", "reason": None,
+        "lock_nonce": "N", "pid": 2_000_000_000, "pgid": 2_000_000_000,
+        "proc_identity": None, "host": os.uname().nodename, "step_id": "s",
+        "prior_step_status": "running", "prior_run_status": "running",
+    }))
+    if lock_body is not None:
+        (run_dir / DRIVING_LOCK_NAME).write_text(lock_body)
+    return mgr, run_dir
+
+
+def test_malformed_lock_blocks_recovery_intent_finalization(fixture_repo):
+    """F-002 confirm pass: 'cannot read the lock' is not 'the lock is absent'.
+
+    `_reconcile_recovery_intent` runs on BOTH `resume` and `recover`, before any
+    lock is acquired, and its live branch signals a process and rewrites the
+    manifest. It keyed on `_read_lock`, which collapsed malformed into `None` —
+    so an unreadable lock authorized finalization as though the driver were
+    provably gone. `operator.read_recovery_intent` (the read-only detector)
+    already failed closed here, making this the same R4 disagreement as the
+    original finding.
+    """
+    from gauntlet.engine.run import RECOVERY_INTENT_NAME
+
+    mgr, run_dir = _seed_intent_run(fixture_repo, lock_body="{ not valid json ")
+    note = mgr._reconcile_recovery_intent(run_dir)
+
+    assert note is not None and "cannot be read or parsed" in note
+    assert (run_dir / RECOVERY_INTENT_NAME).exists(), "the intent was consumed"
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.steps[0].status == M.RUNNING, "the manifest was mutated"
+    assert man.recoveries == []
+    # The refusal names the file the operator has to look at.
+    assert str(run_dir / DRIVING_LOCK_NAME) in note
+
+
+def test_absent_lock_still_finalizes_a_recovery_intent(fixture_repo):
+    """The counterfactual that proves the branch above genuinely diverged.
+
+    An ABSENT lock is a fact — the verified target was killed and nothing
+    relaunched — and must still finalize. Without this, the fix could be a
+    blanket refusal that quietly disables FR-5.6 reconciliation.
+    """
+    mgr, run_dir = _seed_intent_run(fixture_repo, lock_body=None)
+    mgr._reconcile_recovery_intent(run_dir)
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.steps[0].status != M.RUNNING
+    assert len(man.recoveries) == 1
+
+
 def test_vanished_lock_is_still_acquirable(fixture_repo):
     """Fail-closed on unreadable must not break the genuine `absent` race.
 
@@ -1093,6 +1156,63 @@ def test_repo_lock_is_reentrant_within_one_process(fixture_repo):
             assert again.nonce == first.nonce  # not re-acquired
         assert path.exists()  # the inner exit must not release the outer hold
     assert not path.exists()
+
+
+def test_snapshot_ref_publication_is_race_safe_without_the_repo_lock(fixture_repo):
+    """Why §8.3's snapshot-ref section is NOT under the repo-global lock (F-004b).
+
+    The confirm pass asked for it to be locked narrowly around
+    `create_ref_exclusive`. That would wrap an operation git already makes
+    atomic: `git update-ref --stdin` with the `create` verb is a ref-store
+    transaction that fails when the ref exists (P2 review F-003 chose it for
+    exactly this reason). An advisory lock around it adds contention and buys
+    nothing — so the decline is recorded as evidence here rather than as prose
+    in a docstring.
+    """
+    import concurrent.futures as cf
+
+    sha = gitops.head_sha(fixture_repo)
+    ref = "refs/gauntlet/recovery/race"
+
+    def create(_i: int) -> str:
+        try:
+            gitops.create_ref_exclusive(fixture_repo, ref, sha)
+            return "won"
+        except gitops.GitError:
+            return "lost"
+
+    with cf.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(create, range(16)))
+
+    assert results.count("won") == 1, results
+    assert results.count("lost") == 15, results
+    assert gitops.rev_parse(fixture_repo, ref) == sha  # the winner's ref stands
+
+
+def test_run_branch_is_protected_across_worktrees_by_git_itself(fixture_repo, tmp_path):
+    """The other half of the F-004b decline: branch mutation (spike E2-B/D/E).
+
+    Branch create/delete/force-update against a branch checked out in another
+    worktree hard-refuse in git. That is a stronger guarantee than an advisory
+    lockfile, and it is what P7c relies on once each run has its own tree.
+    """
+    linked = tmp_path / "linked"
+    git(fixture_repo, "worktree", "add", "-q", "-b", "gauntlet/held", str(linked))
+    try:
+        for args in (
+            ("checkout", "gauntlet/held"),      # E2-B
+            ("branch", "-D", "gauntlet/held"),  # E2-D
+            ("branch", "-f", "gauntlet/held", "HEAD"),  # E2-E
+        ):
+            proc = subprocess.run(
+                ["git", "-C", str(fixture_repo), *args],
+                capture_output=True, text=True,
+            )
+            assert proc.returncode != 0, f"git allowed {args!r}"
+            assert "used by worktree" in (proc.stderr or "")
+    finally:
+        git(fixture_repo, "worktree", "remove", "--force", str(linked))
+        git(fixture_repo, "branch", "-D", "gauntlet/held")
 
 
 def test_repo_lock_reentrancy_does_not_leak_across_threads(fixture_repo):
