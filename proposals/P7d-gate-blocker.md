@@ -122,12 +122,58 @@ is the fail-closed "the fixer made no changes", which reads as a model failure.
 That is a data-over-inference violation of the kind CLAUDE.md §2 exists to
 prevent: the durable record says "allowed" about an action that was denied.
 
-### 2.5 Severity
+### 2.5 What the guard actually keys on (measured after the halt)
+
+Two probes, run at the maintainer's request before the ratification decision,
+because the option space in §5 depends on the answer. Both use the `Write` tool
+specifically — §2.3 shows the Bash forms are unreliable evidence.
+
+**Probe 1 — segment, or git-directory identity?** Three paths in one turn:
+
+| # | path shape | result |
+|---|---|---|
+| 1 | a plain directory literally named `.git`, **not a git dir** | **refused** — "which is a sensitive file" |
+| 2 | a linked worktree under a real git common dir **not named `.git`** (`git init --separate-git-dir`) | **permitted**, the file landed |
+| 3 | a linked worktree under `.git/` — the control | **refused** |
+
+A directory that merely *looks* like `.git` is blocked; a directory that
+genuinely **is** the git common dir but is not named `.git` is not. **The guard
+is textual matching on the path segment, not containment in the resolved git
+directory.** Three consequences:
+
+* **Submodules are broken under §6.2 as well.** A submodule's common dir is
+  `<superproject>/.git/modules/<name>`, which carries the segment. §7 treats
+  submodule superprojects as a supported adopter layout.
+* **Bare repositories would have worked.** Their common dir is `<repo>.git` —
+  the segment is `repo.git`, not `.git`. The shape that fails is the ordinary
+  one, which is part of why nothing caught this earlier.
+* **Any location without a `.git` segment is writable**, which confirms Option A
+  in §5 by direct measurement rather than by inference from §2.2's control.
+
+**Probe 2 — is `codex` subject to the same guard? No.** `codex exec --sandbox
+workspace-write`, with its cwd inside the `.git`-nested run worktree, created its
+file successfully. The blocker is specific to the `claude` CLI.
+
+That is not the reassurance it first looks like. It means the failure is
+**per-adapter**, so any detector must probe each adapter separately: a
+codex-only check would report the tree healthy while every `claude` builder and
+verifier step failed silently. It also explains the dogfood exactly — the
+reviewer (codex) worked throughout; only the builder and fixer (claude) were
+blocked.
+
+*Incidental, recorded because it costs someone an hour otherwise:* `codex exec
+--model gpt-5-mini` is rejected outright on a ChatGPT account ("not supported
+when using Codex with a ChatGPT account"), so the e2e fixture's
+`reviewer: {adapter: codex, model: gpt-5.5}` is load-bearing and cannot be
+cheapened that way.
+
+### 2.6 Severity
 
 Under `worktree.mode: dedicated`, every step run by the `claude` adapter —
 `builder`, `verifier`, and the behavioural verifier's disposable copy, which is
 created *inside* the run worktree — is subject to this. Flipping the default
-makes it the condition of every new run on every adopter machine.
+makes it the condition of every new run on every adopter machine, in every
+ordinary repository and every submodule superproject.
 
 ---
 
@@ -229,22 +275,62 @@ commit body ends with. P7d was to be where that stopped being true. It is not.
 None of these is taken here. Each amends something ratified, so each needs the
 maintainer.
 
+Seven properties any location must satisfy. The first is new — it is what broke
+§6.2 — and the rest are what §6.1/§6.3 rejected the alternatives for:
+
+| | property | why it matters |
+|---|---|---|
+| 1 | **agent-writable** (no `.git` path segment, §2.5) | the blocker |
+| 2 | invisible to `git status --ignored` | clean-handoff invariant, CLAUDE.md §1 |
+| 3 | survives `git clean -xdff` | an ordinary operator keystroke |
+| 4 | same filesystem | makes `EXDEV` structurally unreachable |
+| 5 | inside the repository | plan §7 acceptance property |
+| 6 | no outer-repo contamination | E5-A |
+| 7 | no repo-identity map / machine-global GC | operational surface |
+
+| | location | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| **1A** | `<repo>/.gauntlet/worktrees/…` (§6.1's Option A) | yes | mitigable | mitigable | yes | yes | yes | yes |
+| **1B** | sibling of the repo (§6.3's Option C) | yes | yes | yes | yes | **no** | **no** | needs one |
+| **1C** | `~/.local/state/…` (§6.3's Option D) | yes | yes | yes | **no** | **no** | yes | **needs one** |
+| — | `<git-common-dir>/gauntlet/…` (§6.2, current) | **no** | yes | yes | yes | yes | yes | yes |
+
 ### Option 1 — move the derived root out of `.git/` (amends §6.2)
 
-`<git-common-dir>/../.gauntlet-worktrees/<slug>/<run-id>`, or a sibling
-directory beside the repo.
+**Recommended sub-option: 1A, `<repo>/.gauntlet/worktrees/<slug>/<run-id>` —
+the location §6.1 rejected.** That rejection was correct when it was written and
+one half of it is no longer true.
 
-* **Fixes it completely** — §2.2's control proves a linked worktree outside
-  `.git/` is fully writable, on the same branch, same repo, same flags.
-* **Costs:** every property §6.2 measured has to be re-measured at the new
-  location. The ones that actually depended on being under `.git/` are:
-  invisibility to `git status --ignored` and immunity to `git clean -xdff`
-  (§6.1 rejected an in-repo root for exactly these), and same-filesystem
-  guarantee (which made `EXDEV` structurally unreachable, §6.3). A sibling
-  directory outside the repo re-opens §7's "no outside-repository path is
-  written" question, which is why §15's D2 says a configurable root needs that
-  rewrite. **This is the option the evidence points at, and it is the one that
-  needs the most re-ratification.**
+§6.1 disqualified an in-repo root on two measured results:
+
+* **"`git clean -xdff` deletes the entire run worktree."** This was disqualifying
+  in a world where a destroyed tree meant a lost run. **It is not that world any
+  more.** A deleted run worktree is precisely §11 row 2 — registered-and-absent —
+  P7c built `recreate_worktree` for it, and §3 above records the P7d dogfood
+  proving it end to end: the tree was `rm -rf`'d, a real `gauntlet resume`
+  rebuilt it from the branch plus journal, and the recreated HEAD was verified
+  against the journal's own `branch_sha`. `clean -xdff` becomes a recoverable
+  event the engine already handles and has demonstrated handling. Residual cost:
+  uncommitted work in the tree at that instant is lost — bounded by the
+  clean-handoff invariant, which says the tree is normally clean.
+* **"`clean -xdf` deletes the engine-owned `.gitignore`,"** leaving the tree as
+  visible dirt from the next command onward. Real, but self-healing by a pattern
+  the engine already uses: `_ensure_run_root_gitignore` rewrites exactly this
+  kind of marker idempotently on every drive. Re-establishing it per verb turns a
+  permanent breakage into a transient one.
+
+* **What 1A buys that 1B and 1C cannot: plan §7 stays intact.** Both of the
+  outside-the-repo options write outside the repository, so both amend a global
+  acceptance property of a **governed** artifact — which is its own review loop
+  and gate. 1A needs no such amendment. 1B additionally fails E5-A outright when
+  the parent directory is itself a repository, and 1C is the only option where
+  the worktree can land on a different device, which §6.3 flags as *unmeasured*
+  (that host had no second writable volume).
+* **Costs of 1A, stated plainly:** properties 2 and 3 become *mitigated* rather
+  than *structural*, which is a real reduction in guarantee. The containment
+  check also becomes load-bearing in a way it was not under §6.2 — though §2.5
+  makes it simpler than §6.4 anticipated, since what must be verified is the
+  absence of a `.git` **segment**, not containment in the git directory.
 
 ### Option 2 — ship D2 (a configurable `worktree_root`) and default it outside `.git/`
 
@@ -274,8 +360,16 @@ a stochastic failure proves nothing in either direction.
 
 So the check must exercise **each write mechanism the adapter actually uses, by
 name and without model choice** — the `Write` tool, the `Edit` tool, and a shell
-redirection — and treat *any* of them being refused as the failure. Two parts,
-because the refusal does not surface where the engine currently looks (§2.4):
+redirection — and treat *any* of them being refused as the failure.
+
+It must also run **per adapter, and never generalize between them** (§2.5, probe
+2). `codex` is not subject to this guard and `claude` is, so a check that probes
+whichever adapter is convenient would report the tree healthy while every
+`claude` builder and verifier step failed silently — which is exactly the shape
+of the dogfood failure, where the codex reviewer worked throughout.
+
+Two parts, because the refusal does not surface where the engine currently
+looks (§2.4):
 
 * a **`doctor` check** that runs each mechanism against a scratch path under the
   derived worktree root and reports which are refused;
@@ -289,8 +383,11 @@ Stated plainly: this is a detector, not a fix. It converts a silent, model-
 dependent failure into `worktree_unavailable`-class evidence. Only Option 1
 makes `dedicated` work.
 
-**Recommendation:** Option 1 for the layout, plus Option 4 regardless. Option 1 is
-the only one that makes `dedicated` actually work — moving the root out of
+**Recommendation:** Option 1 — sub-option **1A**, `<repo>/.gauntlet/worktrees/` —
+for the layout, plus Option 4 regardless. 1A is the only candidate that fixes the
+blocker without amending a governed artifact, and §2.5's probes plus §3's proven
+recreate path are what changed its standing since §6.1 rejected it. Option 1 is
+the only family that makes `dedicated` actually work — moving the root out of
 `.git/` is the correction, not the detector. Option 4 is worth doing anyway
 because it is the only thing that would have made this dogfood's failure legible
 without a human reading a transcript, but it must be built as a deterministic
