@@ -83,7 +83,7 @@ def _author_prd(mgr: RunManager, slug: str) -> None:
 
 def _run_worktree(mgr: RunManager, branch: str):
     return WT.observe(
-        mgr.operator_root, branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, branch, main_root=mgr._main_worktree_root()
     )
 
 

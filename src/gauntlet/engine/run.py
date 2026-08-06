@@ -748,7 +748,7 @@ class RunManager:
             # same_tree run would resolve `dedicated`.
             if WT.observe(
                 self.operator_root, man.branch,
-                common_dir=self._git_common_dir(),
+                main_root=self._main_worktree_root(),
             ) is not None:
                 return WT.MODE_DEDICATED
         except gitops.GitError:
@@ -905,15 +905,23 @@ class RunManager:
                 "prove the run branch is free to be checked out in a new "
                 "worktree."
             )
-        common = None
-        try:
-            common = self._git_common_dir()
-        except (gitops.GitError, OSError):
-            pass
-        if entry is not None and not (
-            common is not None
-            and WT.is_inside_worktrees_root(entry.path, common)
-        ):
+        # An ENGINE-owned tree does not block: for the new root because the run
+        # already has its tree, and for the pre-P7e root (P7e) because
+        # relocating exactly that tree is what `migrate-worktree` now also does.
+        # Refusing it here would make the relocation unreachable and leave the
+        # legacy run with no action at all — spike §10's "never wedged".
+        engine_owned = False
+        if entry is not None:
+            try:
+                engine_owned = WT.is_inside_worktrees_root(
+                    entry.path, self._main_worktree_root()
+                ) or WT.legacy_observe(
+                    self.operator_root, man.branch,
+                    common_dir=self._git_common_dir(),
+                ) is not None
+            except (gitops.GitError, OSError):
+                engine_owned = False
+        if entry is not None and not engine_owned:
             return (
                 f"branch {man.branch!r} is currently checked out at "
                 f"{entry.path}, and git refuses a second worktree for a "
@@ -1035,6 +1043,26 @@ class RunManager:
         """
         return gitops.git_common_dir(self.operator_root)
 
+    def _main_worktree_root(self) -> Path:
+        """The repository's MAIN worktree — what run-worktree paths derive from.
+
+        P7e's anchor, replacing :meth:`_git_common_dir` everywhere the question
+        is "where does the engine put run worktrees?" (the common dir is still
+        the answer to "where is shared git state?", which is why both exist).
+
+        Resolved from the OPERATOR's checkout for the same reason
+        :meth:`_git_common_dir` is: the incident that most needs this path is
+        acceptance A3 — recreating a MISSING run worktree — and running git
+        inside the tree that no longer exists would fail exactly then.
+
+        Not ``self.operator_root`` itself: an operator may legitimately drive
+        from their own linked worktree (spike §18.2 addition 5 even suggests
+        making one), and the derived root must be the same from every vantage
+        point or two checkouts of one repo would grow two sets of run
+        worktrees, invisible to each other's containment checks.
+        """
+        return gitops.main_worktree_root(self.operator_root)
+
     @contextmanager
     def _run_paths(
         self,
@@ -1094,6 +1122,10 @@ class RunManager:
             # fallback, not an override.
             self._release_for_same_tree_fallback(run_dir, man, slug=slug, branch=branch)
         if dedicated:
+            main_root = self._main_worktree_root()
+            # P7e: passed only so `ensure` can recognise a tree still at the
+            # pre-P7e root and refuse with the relocation command rather than
+            # with `--same-tree`, which would drive in the operator's checkout.
             common = self._git_common_dir()
             # F-008: when the tree is registered-but-absent (spike §11 row 2)
             # this is a RECREATE, not a fresh create, and acceptance A3 says the
@@ -1111,10 +1143,11 @@ class RunManager:
             kwargs = {"expect_head": expect} if state.missing else {}
             wt = factory(
                 self.operator_root,
-                common,
+                main_root,
                 slug=slug,
                 run_id=run_id,
                 branch=branch,
+                common_dir=common,
                 **kwargs,
             )
             work_root = wt.path
@@ -1241,7 +1274,7 @@ class RunManager:
         """
         try:
             entry = WT.observe(
-                self.operator_root, branch, common_dir=self._git_common_dir()
+                self.operator_root, branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             return
@@ -1743,7 +1776,7 @@ class RunManager:
         """
         try:
             entry = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             return
@@ -1781,7 +1814,7 @@ class RunManager:
         branch = f"{self.config.branch_prefix}{layout.slug}"
         try:
             entry = WT.observe(
-                self.operator_root, branch, common_dir=self._git_common_dir()
+                self.operator_root, branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             return
@@ -1820,7 +1853,7 @@ class RunManager:
             # Scoped (see `WT.observe`): unscoped this would return the
             # OPERATOR's checkout for a `same_tree` run and then remove it.
             entry = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             return
@@ -4794,15 +4827,77 @@ class RunManager:
             "works exactly as it did before you ran this."
         )
 
+    def _relocate_legacy_worktree(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest, common: Path
+    ) -> Path | None:
+        """Free a pre-P7e tree so the run can be re-created at the new root (P7e).
+
+        The second thing `migrate-worktree` now does. A run that opted into
+        `dedicated` under a P7c/P7d engine has its tree at
+        ``<git-common-dir>/gauntlet/worktrees/…``, where the `claude` CLI cannot
+        write; this is the operator-chosen, journalled transaction that moves it
+        to the writable root. Returns the old path, or ``None`` when the run is
+        not a legacy one and this is an ordinary `same_tree` migration.
+
+        **Why this is a release-and-recreate rather than a directory move.** The
+        run's authoritative state — journal, manifest projection, transcripts —
+        never lived in the tree (spike §4.4), and the branch ref is shared, so
+        recreating at the new path from the branch reconstructs everything that
+        matters. Moving the directory would additionally require ``git worktree
+        repair`` to fix the admin entry's gitdir pointer, which is a second
+        failure mode for no gain.
+
+        **Why a dirty legacy tree is refused rather than snapshotted.**
+        :func:`WT.release` would capture it into ``refs/gauntlet/recovery/…``
+        and proceed, which satisfies R2 but converts the operator's visible
+        work-in-progress into a recovery ref they have to know to look for. The
+        clean-handoff invariant says the tree is normally clean, so a dirty one
+        here means something is genuinely in flight and the operator should
+        decide. Refusing costs them one command; the snapshot path costs them
+        the discoverability of their own work.
+        """
+        entry = WT.legacy_observe(self.operator_root, man.branch, common_dir=common)
+        if entry is None:
+            return None
+        excludes = self._run_tree_excludes(layout, man, run_dir)
+        if entry.path.is_dir():
+            work_root = entry.path  # the legacy RUN tree — a work root by construction
+            try:
+                dirt = gitops.status_porcelain(
+                    work_root, exclude=excludes, untracked_all=True
+                )
+            except gitops.GitError:
+                dirt = ""
+            if dirt:
+                listing = "\n  ".join(dirt.splitlines()[:8])
+                raise MigrateWorktreeRefused(
+                    f"refusing to relocate {man.slug!r}: its worktree at the "
+                    f"pre-P7e location has uncommitted changes.\n"
+                    f"  Tree inspected: {entry.path}\n  {listing}\n"
+                    f"  Inspect it with: git -C {entry.path} status\n"
+                    "Relocating recreates the tree at the new root from the "
+                    "branch, so anything uncommitted there would survive only "
+                    "as a recovery ref. Commit or discard it in that tree "
+                    "first, then run `gauntlet migrate-worktree "
+                    f"{man.slug}` again. Nothing has been moved or modified."
+                )
+        WT.release(
+            self.operator_root, entry.path,
+            slug=man.slug, run_id=man.run_id, excludes=excludes,
+        )
+        return entry.path
+
     def _migrate_locked(
         self, layout: "RunLayout", run_dir: Path, man: Manifest
     ) -> str:
         """:meth:`migrate_worktree`'s body, with the drive lock held."""
         slug, run_id, branch = man.slug, man.run_id, man.branch
+        main_root = self._main_worktree_root()
         common = self._git_common_dir()
+        relocated_from = self._relocate_legacy_worktree(layout, run_dir, man, common)
         try:
             wt = WT.ensure(
-                self.operator_root, common,
+                self.operator_root, main_root,
                 slug=slug, run_id=run_id, branch=branch,
             )
         except WT.WorktreeUnavailable as exc:
@@ -4883,9 +4978,17 @@ class RunManager:
                     "retry.",
                 )
             )
+        headline = (
+            f"relocated {slug!r} from {relocated_from} to {wt.path}\n"
+            "  That old location is under the git directory, where the `claude` "
+            "CLI refuses to write (proposals/P7d-gate-blocker.md §2), so a "
+            "builder or verifier step in it could fail silently.\n"
+            if relocated_from is not None
+            else f"migrated {slug!r} to a dedicated worktree at {wt.path}\n"
+        )
         return (
-            f"migrated {slug!r} to a dedicated worktree at {wt.path}\n"
-            f"  The run is unchanged: same branch ({branch}), same journal, "
+            headline
+            + f"  The run is unchanged: same branch ({branch}), same journal, "
             "same run dir in your checkout. Only the tree its agents edit "
             "moved.\n"
             f"  Your checkout was not touched. Inspect the run's tree with "
@@ -4925,7 +5028,7 @@ class RunManager:
         """
         try:
             entry = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             return []
@@ -5147,7 +5250,7 @@ class RunManager:
         """
         try:
             entry = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError:
             entry = None
@@ -5155,7 +5258,7 @@ class RunManager:
             self._discard_migrated_tree(entry.path, layout, man)
         try:
             survivor = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError as exc:
             return (
@@ -5225,7 +5328,7 @@ class RunManager:
         """:meth:`rollback_worktree_migration`'s body, with the drive lock held."""
         try:
             entry = WT.observe(
-                self.operator_root, man.branch, common_dir=self._git_common_dir()
+                self.operator_root, man.branch, main_root=self._main_worktree_root()
             )
         except gitops.GitError as exc:
             raise MigrateWorktreeRefused(
@@ -5243,7 +5346,7 @@ class RunManager:
             # this branch exists rather than reporting "nothing to do".
             if not self._record_worktree_released(
                 run_dir, WT.run_worktree_path(
-                    self._git_common_dir(), man.slug, man.run_id
+                    self._main_worktree_root(), man.slug, man.run_id
                 ),
                 slug=man.slug, run_id=man.run_id,
             ):

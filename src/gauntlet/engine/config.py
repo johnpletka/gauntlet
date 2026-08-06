@@ -487,11 +487,13 @@ class WorktreeConfig(BaseModel):
       before P7c is this mode forever (spike §10/§16), and it stays the
       documented fallback for any adopter layout that cannot host a worktree.
     * ``dedicated`` — the run gets its own linked worktree at the derived path
-      ``<git-common-dir>/gauntlet/worktrees/<slug>/<run-id>`` (§6.2). There is
-      deliberately **no path knob**: a configurable root would need a
-      ``resolve()``-based containment validator, and spike E9-C proves the
-      string-based check this module already has is defeated by a symlink
-      (§6.4, deferral D2).
+      ``<main-worktree>/.gauntlet/worktrees/<slug>/<run-id>`` (§6.2 as corrected
+      by P7e; the ratified §6.2 location under the git dir is unusable because
+      the `claude` CLI refuses to write any path carrying a ``.git`` segment —
+      see `proposals/P7d-gate-blocker.md`). There is deliberately **no path
+      knob**: a configurable root would need a ``resolve()``-based containment
+      validator, and spike E9-C proves the string-based check this module
+      already has is defeated by a symlink (§6.4, deferral D2).
 
     The default is `same_tree` because §13's phasing makes flipping it a
     separate stage (P7d) gated on a dogfood run that exercises §11 rows 2, 5

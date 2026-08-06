@@ -170,10 +170,10 @@ def _still_fully_resumable(mgr: RunManager, slug: str, repo: Path) -> None:
     man = Manifest.load(run_dir / "manifest.json")
     assert mgr._effective_worktree_mode(man) == WT.MODE_SAME_TREE
     assert WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     ) is None
-    assert not WT.worktrees_root(mgr._git_common_dir()).exists() or not list(
-        WT.worktrees_root(mgr._git_common_dir()).glob(f"{slug}/*")
+    assert not WT.worktrees_root(mgr._main_worktree_root()).exists() or not list(
+        WT.worktrees_root(mgr._main_worktree_root()).glob(f"{slug}/*")
     )
     assert man.status == M.RUN_PARKED
     # And the branch is still where the run left it, in the operator's repo.
@@ -527,11 +527,11 @@ def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
     #    run's prune can delete it mid-drive).
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     assert entry is not None
     assert entry.path == WT.run_worktree_path(
-        mgr._git_common_dir(), "demo", man.run_id
+        mgr._main_worktree_root(), "demo", man.run_id
     )
     assert WT.parse_lock_reason(entry.locked) == ("demo", man.run_id)
 
@@ -569,7 +569,7 @@ def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
     assert "rolled back 'demo'" in out
     man = Manifest.load(run_dir / "manifest.json")
     assert WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     ) is None
     assert mgr._effective_worktree_mode(man) == WT.MODE_SAME_TREE
     kinds = [
@@ -624,7 +624,7 @@ def test_rollback_closes_an_open_adoption_when_the_tree_is_already_gone(
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     # The tree vanishes (reboot / tmp sweep / rm -rf) but stays REGISTERED, so
     # `observe` still finds it — clear the registration too, which is the shape
@@ -654,7 +654,7 @@ def test_the_engines_own_export_never_blocks_a_rollback(fixture_repo):
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     assert gitops.status_porcelain(entry.path, untracked_all=True), (
         "precondition: the export leaves the fresh tree untracked-dirty"
@@ -680,7 +680,7 @@ def test_rollback_refuses_rather_than_sweeping_away_uncommitted_work(
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
 
     (entry.path / "builder-wip.py").write_text("half a feature\n")
@@ -691,7 +691,7 @@ def test_rollback_refuses_rather_than_sweeping_away_uncommitted_work(
     assert str(entry.path) in str(exc.value)
     # Still migrated, still drivable — the refusal changed nothing.
     assert WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     ) is not None
 
 
@@ -724,7 +724,7 @@ def test_a_failed_export_removes_the_worktree_and_leaves_the_run_same_tree(
 
     man = Manifest.load(run_dir / "manifest.json")
     assert WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     ) is None
     assert mgr._effective_worktree_mode(man) == WT.MODE_SAME_TREE
     assert not [
@@ -803,7 +803,7 @@ def test_rollback_fails_closed_before_removing_anything(fixture_repo, monkeypatc
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     assert entry is not None, "the tree must survive a rollback that failed closed"
     assert mgr._effective_worktree_mode(man) == WT.MODE_DEDICATED
@@ -869,7 +869,7 @@ def test_rollback_refuses_a_governed_artifact_edited_in_the_run_tree(
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     tree_prd = entry.path / "runs" / "demo" / "prd.md"
     tree_prd.parent.mkdir(parents=True, exist_ok=True)
@@ -897,7 +897,7 @@ def test_an_identical_synced_artifact_still_does_not_block_a_rollback(
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
     entry = WT.observe(
-        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+        mgr.operator_root, man.branch, main_root=mgr._main_worktree_root()
     )
     tree_prd = entry.path / "runs" / "demo" / "prd.md"
     tree_prd.parent.mkdir(parents=True, exist_ok=True)

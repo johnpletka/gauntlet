@@ -253,7 +253,7 @@ def _status_work_root(mgr, man) -> Path:
             return mgr.operator_root
         entry = WT.observe(
             mgr.operator_root, man.branch,
-            common_dir=mgr._git_common_dir(),
+            main_root=mgr._main_worktree_root(),
         )
     except Exception:
         return mgr.operator_root
@@ -296,11 +296,20 @@ def _refuse_inside_run_worktree(cwd: Path) -> None:
     dir, the drive lock and the active-run pointer inside a disposable tree.
 
     Detection is the engine's own layout, not a guess: the run worktree root is
-    derived (§6.2), so "am I under ``<git-common-dir>/gauntlet/worktrees``?"
-    is answerable without reading any run state, works when the run is dead,
-    and cannot false-positive on an adopter's own linked worktree — theirs is
-    not under the engine's directory. Symlinks are resolved on both sides
-    (spike E9-B/E9-C).
+    derived (§6.2 as corrected by P7e), so "am I under
+    ``<main-worktree>/.gauntlet/worktrees``?" is answerable without reading any
+    run state, works when the run is dead, and cannot false-positive on an
+    adopter's own linked worktree — theirs is not under the engine's directory.
+    Symlinks are resolved on both sides (spike E9-B/E9-C).
+
+    **The anchor must be the MAIN worktree, not this one (P7e).** Under §6.2
+    the root hung off the git common dir, which every worktree of a repository
+    reports identically — so the containment test worked from inside a run
+    worktree, which is the only place it ever fires. ``rev-parse
+    --show-toplevel`` does not have that property: from inside a run worktree it
+    answers *that tree*, so the root would derive to
+    ``<run-worktree>/.gauntlet/worktrees``, the test would never match, and this
+    refusal would become unreachable exactly where it is needed.
 
     Deliberately silent for every adopter layout in §7 that is NOT a run
     worktree: a nested repo, a bare/mirror clone, a submodule, and a plain
@@ -311,16 +320,20 @@ def _refuse_inside_run_worktree(cwd: Path) -> None:
     from gauntlet.engine import worktree as WT
 
     try:
-        common = gitops.git_common_dir(cwd)
+        main_root = gitops.main_worktree_root(cwd)
     except (gitops.GitError, OSError):
         return  # not a git repo (or unreadable) — other errors own that case
-    if not WT.is_inside_worktrees_root(cwd, common):
+    if not WT.is_inside_worktrees_root(cwd, main_root):
         return
     try:
         toplevel = Path(gitops.show_toplevel(cwd))
     except (gitops.GitError, OSError):
         toplevel = cwd
-    operator_checkout = common.parent if common.name == ".git" else common
+    # The main worktree IS the operator's checkout, observed rather than
+    # reconstructed. P7e retires the previous `common.parent if common.name ==
+    # ".git"` heuristic, which guessed wrong for `--separate-git-dir` layouts
+    # and had no answer at all for a bare repository.
+    operator_checkout = main_root
     typer.echo(
         f"error: this is a Gauntlet run worktree ({toplevel}), not your "
         "checkout.\n"

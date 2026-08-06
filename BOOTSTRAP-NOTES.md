@@ -1123,3 +1123,59 @@ the maintainer's options: `proposals/P7d-gate-blocker.md`.
   outcome; a probe that lets a model choose how to write inherits the same
   nondeterminism and can pass via `tee` while the real task fails on `Write`.
   A detector, not a fix — moving the worktree out of `.git/` is the fix.
+
+## 2026-08-06 — P7e: the maintainer ratified 1A, and the root moved out of `.git/`
+
+The decision the P7d halt was waiting on. Recorded here because
+`proposals/P7d-gate-blocker.md` is a *proposal* — it lists options and
+recommends one; it does not and cannot ratify itself, and every P7d commit body
+ends "the halt stands until a human rules."
+
+- **The ratification.** The maintainer chose sub-option **1A**,
+  `<repo>/.gauntlet/worktrees/<slug>/<run-id>`, on 2026-08-06, in the session
+  that opened the P7-completion tranche, answering a direct question that named
+  all four options with their costs. This note plus the P7e commit body are
+  where that authority lives; `proposals/P7-worktree-spike.md` §6.2 is **not**
+  amended and still reads as ratified, exactly as P7d left it.
+- **The precondition was checked, not assumed.** Before starting, the tranche
+  searched every `*.md` in the repo, the P7d/P7d.1/P7d.2 commit bodies, this
+  file, all 18 GitHub issues, and any `decisions/`/`adr/` directory. No
+  ratification existed. The phase prompt's own instruction — "if it has not
+  happened, say so and stop" — was followed, and the run stopped and asked. That
+  is the process working: agents propose, humans ratify.
+- **§6.2's properties were RE-MEASURED at the new root (E11), not inherited.**
+  Kept: same filesystem (so `EXDEV` stays structurally unreachable), inside the
+  repository (so `RECOVERY-REDESIGN-PLAN.md` §7 survives unamended — the thing
+  1A buys over the two outside-the-repo options), no outer-repo contamination,
+  no repo-identity map, `fsck`/`gc` tolerance, and a valid parent for the
+  verifier's disposable copy. **Fixed:** agent-writability — `Write`, `Edit` and
+  a shell redirection all land at the new root (E12), the same three that were
+  refused under `.git/`. **Traded, and named as trades:** invisibility to `git
+  status` is now *maintained* by an engine-owned marker rather than structural;
+  `git status --ignored` now lists the tree; and `git clean -xdff` now deletes
+  it.
+- **`clean -xdff` was demonstrated recoverable rather than argued to be.** E11
+  produced the §11-row-2 shape — registered-and-`prunable`, branch ref intact —
+  and a real `prune` + `add` rebuilt the tree on its branch with its commits.
+  A test now asserts the recovery instead of the old immunity.
+- **Two things that surprised the implementation and are worth knowing.**
+  (a) `git worktree lock` does **not** protect against `git clean` — clean is
+  not worktree-aware — so the lock is not a mitigation here, only against
+  `prune`/`remove`. (b) The root had to be anchored at the **main worktree**
+  (`git worktree list --porcelain`'s first entry, which every vantage point
+  reports identically) rather than at the invoking checkout. `rev-parse
+  --show-toplevel` answers *the tree you are standing in*, so anchoring there
+  would have made the §14.4 "you are inside a run worktree" refusal unreachable
+  from the only place it ever fires, and would have grown two disjoint sets of
+  run worktrees for an operator who drives from their own linked worktree.
+  §6.2 got that vantage-independence for free from the shared git dir; it had to
+  be re-established deliberately.
+- **The legacy population is handled explicitly, not by a backstop.** An
+  adopter who opted into `dedicated` before this commit has a tree at the old
+  root, which the new containment check cannot see. Resolver rule 2 (an
+  unreleased `WorktreeAdopted`) would keep such a run `dedicated` — but resting
+  the safety property on a backstop is not the same as deciding it, so the
+  engine detects the old root by name, refuses to drive with a message naming
+  `gauntlet migrate-worktree <slug>`, and that verb now relocates it. The
+  refusal deliberately does **not** offer `--same-tree`: that action is correct
+  for its own case and would, here, drive the run in the operator's checkout.

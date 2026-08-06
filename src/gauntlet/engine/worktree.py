@@ -1,12 +1,45 @@
-"""The dedicated run worktree: derivation, lifecycle and discovery (P7c).
+"""The dedicated run worktree: derivation, lifecycle and discovery (P7c/P7e).
 
-Spike §6.2 fixes the root at
-``<git-common-dir>/gauntlet/worktrees/<slug>/<run-id>`` — derived, with **no
-config knob** (§6.4). Every property P7 needs was measured there: invisible to
-``git status`` even with ``--ignored``, untouched by ``git clean -xdff``,
-tolerated by ``fsck``/``gc``, on the same filesystem as the repo by
-construction (so ``EXDEV`` is structurally unreachable for every atomic write),
-and still a valid parent for the verifier's disposable copy.
+**CORRECTION TO THE RATIFIED SPIKE (P7e).** Spike §6.2 fixed the root at
+``<git-common-dir>/gauntlet/worktrees/<slug>/<run-id>``. That location is not
+usable: the `claude` CLI — which drives every `builder` and `verifier` step —
+refuses to write any file whose path carries a literal ``.git`` **segment**,
+and it does so non-uniformly across write mechanisms, so a run there fails only
+*iff the model does not improvise a form the guard misses*. The full
+measurement is `proposals/P7d-gate-blocker.md`; the maintainer ratified
+sub-option **1A** on 2026-08-06 (see `proposals/P7-final-split.md` §1).
+
+The root is therefore ``<main-worktree>/.gauntlet/worktrees/<slug>/<run-id>`` —
+still derived, still with **no config knob** (§6.4, deferral D2).
+
+Which of §6.2's measured properties survive, re-measured at the new location
+rather than assumed (P7e, experiment E11):
+
+* **agent-writable** — FIXED, and the reason the move happened. `Write`, `Edit`
+  and a shell redirection all land here; all three were refused under ``.git/``.
+* **invisible to ``git status``** — KEPT, but *mitigated rather than
+  structural*: it depends on the self-ignoring marker this module re-establishes
+  on every drive (:func:`ensure_root_marker`). Under ``.git/`` git ignored the
+  tree with no help from us.
+* **invisible to ``git status --ignored``** — **TRADED.** The tree now shows as
+  ``!! .gauntlet/worktrees/``. Nothing in the engine reads `--ignored`
+  (``gitops.is_clean`` does not pass it), so the FR-9.3 clean-handoff guard is
+  unaffected; the loss is visible to a human who asks for ignored files.
+* **untouched by ``git clean -xdff``** — **TRADED.** ``-xdf`` deletes the
+  marker but skips the tree; ``-xdff`` deletes the tree. The second is a
+  recoverable §11 row 2 event, *demonstrated* rather than argued: E11 produced
+  the registered-and-``prunable`` shape with the branch ref intact, and a
+  ``prune`` + ``add`` rebuilt the tree on its branch. Note that ``git worktree
+  lock`` does NOT protect against ``clean`` — git's clean is not
+  worktree-aware — so the lock is not a mitigation here.
+* **same filesystem / inside the repository / no outer-repo contamination / no
+  repo-identity map** — KEPT, all four measured at the new root. Same-device
+  means ``EXDEV`` stays structurally unreachable for every atomic write; inside
+  the repository means `RECOVERY-REDESIGN-PLAN.md` §7's global acceptance
+  property survives **unamended**, which is what 1A buys over the two
+  outside-the-repo options.
+* **tolerated by ``fsck``/``gc``, and a valid parent for the verifier's
+  disposable copy** — KEPT (§12.4 holds: only the parent changes).
 
 **What lives here and what deliberately does not.** This module owns the
 *tree*: creating it, marking it, discovering it, recreating it, tearing it
@@ -56,12 +89,25 @@ MODE_SAME_TREE = "same_tree"
 MODE_DEDICATED = "dedicated"
 MODES = (MODE_SAME_TREE, MODE_DEDICATED)
 
-# The fixed path segments under the git common dir (§6.2). Not configurable:
-# a knob would need a `resolve()`-based containment validator, and spike E9-C
-# proves the existing string-based `_validate_repo_relative` is defeated by a
-# symlink. Not shipping the knob avoids the whole class (§6.4, deferral D2).
-WORKTREE_DIRNAME = "gauntlet"
+# The fixed path segments under the MAIN worktree root (P7e; §6.2 as corrected).
+# Not configurable: a knob would need a `resolve()`-based containment validator,
+# and spike E9-C proves the existing string-based `_validate_repo_relative` is
+# defeated by a symlink. Not shipping the knob avoids the whole class (§6.4,
+# deferral D2).
+#
+# `.gauntlet/` is shared with the adopter's TRACKED `config.yaml`, which is why
+# the self-ignoring marker goes one level down at `worktrees/.gitignore` and
+# never at `.gauntlet/.gitignore` — the latter would blanket-ignore the very
+# file `RunConfig.load` reads.
+GAUNTLET_DIRNAME = ".gauntlet"
 WORKTREE_SUBDIR = "worktrees"
+
+# The pre-P7e root, retained for DETECTION ONLY (P7e). An adopter who opted
+# into `dedicated` before this commit has a tree here; the engine must
+# recognise it well enough to refuse actionably and to relocate it on request,
+# and must never let it resolve as `same_tree` — that would drop the run back
+# onto the operator's own checkout. Never written to.
+LEGACY_WORKTREE_DIRNAME = "gauntlet"
 
 # The park reason a caller raises when the tree cannot be made ready. Mirrored
 # in manifest.py's park-reason vocabulary and in schemas/status.json.
@@ -121,12 +167,68 @@ class RunWorktree:
     recreated: bool = False
 
 
-def worktrees_root(common_dir: Path) -> Path:
-    """``<git-common-dir>/gauntlet/worktrees`` — the parent of every run tree."""
-    return common_dir / WORKTREE_DIRNAME / WORKTREE_SUBDIR
+def worktrees_root(main_root: Path) -> Path:
+    """``<main-worktree>/.gauntlet/worktrees`` — the parent of every run tree.
+
+    ``main_root`` is the MAIN worktree (``gitops.main_worktree_root``), never
+    the invoking checkout. See that function for why: an operator driving from
+    their own linked worktree must derive the same root as one driving from the
+    main checkout, or `observe`'s scoping, the §14.4 refusal and
+    ``_run_tree_excludes`` stop agreeing about which trees are the engine's.
+    """
+    return main_root / GAUNTLET_DIRNAME / WORKTREE_SUBDIR
 
 
-def run_worktree_path(common_dir: Path, slug: str, run_id: str) -> Path:
+def legacy_worktrees_root(common_dir: Path) -> Path:
+    """``<git-common-dir>/gauntlet/worktrees`` — the pre-P7e root (detection only).
+
+    Runs created by a P7c/P7d engine live under here. Nothing writes to it; it
+    exists so :func:`legacy_observe` can tell "this run has a tree at the OLD
+    derived path" apart from "this run has no tree", which are the same answer
+    to every containment check built on :func:`worktrees_root` and would
+    otherwise resolve the run to `same_tree`.
+    """
+    return common_dir / LEGACY_WORKTREE_DIRNAME / WORKTREE_SUBDIR
+
+
+def ensure_root_marker(main_root: Path) -> Path | None:
+    """Re-establish the self-ignoring marker at the worktrees root (P7e).
+
+    The engine-owned ``<main>/.gauntlet/worktrees/.gitignore`` containing ``*``
+    (which therefore ignores itself) is what keeps run worktrees out of the
+    operator's ``git status`` — the clean-handoff invariant in CLAUDE.md §1 and
+    the FR-9.3 guard. Under spike §6.2 no marker was needed, because ``.git/``
+    is invisible to git by construction; that invisibility is the guarantee 1A
+    downgrades from *structural* to *maintained*, and this is what maintains it.
+
+    Called on **every** driving verb, not once at creation, because ``git clean
+    -xdf`` deletes the marker while deliberately skipping the worktree itself
+    (``Skipping repository …`` / ``Removing .gauntlet/worktrees/.gitignore``,
+    measured at E11). Without re-establishment that single ordinary keystroke
+    would leave the tree as permanent untracked dirt from the next command
+    onward; with it, the breakage is transient. Idempotent, and mirrors
+    :meth:`run.RunManager._ensure_run_root_gitignore`.
+
+    Never writes ``.gauntlet/.gitignore``: ``.gauntlet/config.yaml`` is a
+    tracked adopter file and a ``*`` one level up would blanket-ignore it.
+
+    Returns the marker path, or ``None`` if it could not be written — a
+    best-effort guarantee, because failing a drive over a cosmetic ignore rule
+    would be a worse trade than a dirty ``git status``. The caller that cares
+    (the FR-9.3 clean guard) reports the dirt on its own.
+    """
+    root = worktrees_root(main_root)
+    marker = root / ".gitignore"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if not marker.exists() or marker.read_text() != "*\n":
+            marker.write_text("*\n")
+    except OSError:
+        return None
+    return marker
+
+
+def run_worktree_path(main_root: Path, slug: str, run_id: str) -> Path:
     """The derived, non-configurable path for one run's tree (§6.2/§6.4).
 
     ``slug`` and ``run_id`` are already containment-checked by
@@ -136,19 +238,46 @@ def run_worktree_path(common_dir: Path, slug: str, run_id: str) -> Path:
     the one incident that most needs this path — recreating a MISSING tree
     (acceptance A3) — must work from the branch ref and the journal alone.
     """
-    return worktrees_root(common_dir) / slug / run_id
+    return worktrees_root(main_root) / slug / run_id
 
 
-def is_inside_worktrees_root(path: Path, common_dir: Path) -> bool:
+def is_inside_worktrees_root(path: Path, main_root: Path) -> bool:
     """True when ``path`` resolves inside the engine-owned worktrees root.
 
     Both sides are ``resolve()``d before comparison: git records worktree paths
     exactly as given and does not resolve symlinks (spike E9-B), so a string
     comparison would be defeated by the same symlink that defeats
     ``_validate_repo_relative`` (E9-C).
+
+    **Why this is still sound after P7e** (design problem A). Under §6.2 the
+    root was inside the git dir, so containment was a fact about a directory git
+    itself owned. It is now an ordinary in-repo path that could in principle
+    collide with an adopter's own files, which makes this a *validator* rather
+    than a *derivation*. Three callers depend on it and each stays correct for a
+    different reason:
+
+    * **``observe``'s scoping** — asks "is this tree one the engine created for a
+      run?". A false negative degrades to git's own one-branch-one-worktree
+      refusal, which names the holder; a false positive would let teardown call
+      ``worktree remove`` on a tree the engine does not own. The
+      ``resolve()``-on-both-sides discipline is what prevents the false
+      positive, and it is unchanged.
+    * **the §14.4 "you are inside a run worktree" refusal** — now anchored at
+      the MAIN worktree (``gitops.main_worktree_root``) rather than the invoking
+      checkout, so it answers the same way from inside a run worktree as from
+      the operator's. Anchoring at ``--show-toplevel`` would have made the
+      refusal unreachable from precisely the place it exists to fire.
+    * **``_run_tree_excludes``** — excludes the engine's own root from
+      dirtiness checks. It is scoped to a path *under the repo* now, which is
+      strictly narrower than the git dir it replaced.
+
+    An adopter who keeps their own files at ``.gauntlet/worktrees/`` would
+    collide; that path is engine-owned by the same convention that already owns
+    ``.gauntlet/config.yaml``, and the marker written there makes the ownership
+    visible on disk.
     """
     try:
-        path.resolve().relative_to(worktrees_root(common_dir).resolve())
+        path.resolve().relative_to(worktrees_root(main_root).resolve())
         return True
     except (ValueError, OSError, RuntimeError):
         return False
@@ -178,8 +307,40 @@ def parse_lock_reason(reason: str | None) -> tuple[str, str] | None:
 # --- discovery ----------------------------------------------------------------
 
 
+def legacy_observe(
+    repo_root: Path, branch: str, *, common_dir: Path
+) -> gitops.WorktreeEntry | None:
+    """This run's worktree at the PRE-P7e root, or ``None``. Read-only (P7e).
+
+    The evidence half of the legacy-root case. A run created by a P7c/P7d engine
+    has its tree under ``<git-common-dir>/gauntlet/worktrees/``, which every
+    containment check built on :func:`worktrees_root` now rejects — so without
+    this the engine cannot tell "the tree is at the old path" from "there is no
+    tree", and those two must not share an answer:
+
+    * ``ensure`` would try to ``worktree add`` at the new path and hit git's
+      one-branch-one-worktree refusal, which is fail-closed but offers
+      ``--same-tree`` — the one action that WOULD drop the run onto the
+      operator's checkout;
+    * a run whose journal lost its ``WorktreeAdopted`` backstop would resolve
+      `same_tree` outright, which is the silent form of the same thing.
+
+    Spike §10's rule is absolute — a pre-existing run is never auto-migrated and
+    never wedged — so this feeds an actionable refusal and the explicit
+    relocation, never an implicit move.
+    """
+    entry = gitops.worktree_for_branch(repo_root, branch)
+    if entry is None:
+        return None
+    try:
+        entry.path.resolve().relative_to(legacy_worktrees_root(common_dir).resolve())
+    except (ValueError, OSError, RuntimeError):
+        return None
+    return entry
+
+
 def observe(
-    repo_root: Path, branch: str, *, common_dir: Path | None = None
+    repo_root: Path, branch: str, *, main_root: Path | None = None
 ) -> gitops.WorktreeEntry | None:
     """This run's OWN worktree for ``branch``, or ``None``. Read-only.
 
@@ -189,7 +350,7 @@ def observe(
     :class:`gitops.GitError` because "cannot read the worktree list" must not
     be indistinguishable from "there is no worktree" (fail closed).
 
-    ``common_dir`` scopes the answer to trees under the engine's own derived
+    ``main_root`` scopes the answer to trees under the engine's own derived
     root, and every caller that is asking "does this run have a dedicated
     worktree?" MUST pass it. Without it the answer is any worktree holding the
     branch — **including the operator's own main checkout**, which is exactly
@@ -211,7 +372,7 @@ def observe(
     entry = gitops.worktree_for_branch(repo_root, branch)
     if entry is None:
         return None
-    if common_dir is not None and not is_inside_worktrees_root(entry.path, common_dir):
+    if main_root is not None and not is_inside_worktrees_root(entry.path, main_root):
         return None
     return entry
 
@@ -261,7 +422,7 @@ def describe(repo_root: Path, *, mode: str, branch: str) -> WorktreeState:
             locked_reason=None, prunable=None, head=None,
         )
     entry = observe(
-        repo_root, branch, common_dir=gitops.git_common_dir(repo_root)
+        repo_root, branch, main_root=gitops.main_worktree_root(repo_root)
     )
     if entry is None:
         return WorktreeState(
@@ -308,11 +469,12 @@ def _verify_submodules(work_root: Path, slug: str) -> None:
 
 def ensure(
     repo_root: Path,
-    common_dir: Path,
+    main_root: Path,
     *,
     slug: str,
     run_id: str,
     branch: str,
+    common_dir: Path | None = None,
 ) -> RunWorktree:
     """Make this run's dedicated tree exist, be marked, and be usable.
 
@@ -336,12 +498,22 @@ def ensure(
     Everything that touches the shared worktree administration dir runs inside
     the repo-global lock, because that dir has no per-worktree isolation to fall
     back on (spike E9-D: a lost ``worktree add`` race leaves debris behind).
+
+    ``common_dir`` is optional and used for ONE thing (P7e): recognising a tree
+    still at the pre-P7e root, so that case gets a refusal naming the relocation
+    instead of git's generic one offering ``--same-tree``. Omitting it is safe —
+    the add still fails closed — just less actionable.
     """
-    target = run_worktree_path(common_dir, slug, run_id)
+    target = run_worktree_path(main_root, slug, run_id)
+    if common_dir is not None:
+        _refuse_legacy_root(repo_root, common_dir, slug=slug, branch=branch, target=target)
+    # Re-established before the tree exists, so it is never briefly visible to
+    # `git status` (the same ordering reason as `_ensure_run_dir_gitignore`).
+    ensure_root_marker(main_root)
     try:
         with repolock.repo_lock(repo_root, reason=f"worktree:ensure:{slug}"):
             wt = _ensure_locked(
-                repo_root, target, common_dir,
+                repo_root, target, main_root,
                 slug=slug, run_id=run_id, branch=branch,
             )
     except repolock.RepoLockError as exc:
@@ -352,19 +524,53 @@ def ensure(
     return wt
 
 
+def _refuse_legacy_root(
+    repo_root: Path, common_dir: Path, *, slug: str, branch: str, target: Path
+) -> None:
+    """Fail closed, actionably, on a run whose tree is at the pre-P7e root (P7e).
+
+    Spike §10's rule is that a pre-existing run is never auto-migrated and never
+    wedged. Relocating this tree implicitly would be the auto-migration half;
+    letting ``ensure`` fall through to ``worktree add`` would be the wedged half
+    in disguise, because git's refusal — correct as it is — carries the
+    ``--same-tree`` action, and taking it would drive this run in the operator's
+    own checkout. That is the one outcome the legacy case must never reach by
+    default.
+
+    So: name the old tree, name the new root, and name the verb that moves it.
+    """
+    entry = legacy_observe(repo_root, branch, common_dir=common_dir)
+    if entry is None:
+        return
+    raise WorktreeUnavailable(
+        f"run {slug!r} has its worktree at {entry.path}, which is the pre-P7e "
+        f"location under the git directory. Gauntlet no longer drives runs "
+        f"there: the `claude` CLI refuses to write any path containing a "
+        f"`.git` segment, so a builder or verifier step in that tree fails — "
+        f"sometimes silently, depending on which write form the model picks "
+        f"(proposals/P7d-gate-blocker.md §2). This run's tree has NOT been "
+        f"moved and nothing has been changed.\n"
+        f"  Relocate it to {target} with:\n"
+        f"      gauntlet migrate-worktree {slug}\n"
+        f"  That is an explicit, journalled, copy-never-move transaction and it "
+        f"refuses while a driver is live. Until then the run is not driven.",
+        slug=slug,
+    )
+
+
 def _ensure_locked(
-    repo_root: Path, target: Path, common_dir: Path,
+    repo_root: Path, target: Path, main_root: Path,
     *, slug: str, run_id: str, branch: str,
 ) -> RunWorktree:
     """:func:`ensure`'s body, with the repo-global lock already held.
 
-    ``common_dir`` is threaded in rather than re-derived from ``target``:
+    ``main_root`` is threaded in rather than re-derived from ``target``:
     counting path components back up to the git dir is the kind of arithmetic
     that is silently wrong by one, and the failure mode is invisible — a
     mis-scoped ``observe`` returns ``None``, the stale-entry cleanup never
     runs, and ``add`` fails on an entry this function was supposed to clear.
     """
-    entry = observe(repo_root, branch, common_dir=common_dir)
+    entry = observe(repo_root, branch, main_root=main_root)
     recreated = False
     created = False
     if entry is not None and entry.path.resolve() != target.resolve():
@@ -532,12 +738,13 @@ def _discard_worktree(
 
 def recreate(
     repo_root: Path,
-    common_dir: Path,
+    main_root: Path,
     *,
     slug: str,
     run_id: str,
     branch: str,
     expect_head: str | None = None,
+    common_dir: Path | None = None,
 ) -> RunWorktree:
     """The §11-row-2 recovery action, as an explicit verb (acceptance A3).
 
@@ -550,7 +757,8 @@ def recreate(
     that keeps it proven at runtime rather than assumed.
     """
     wt = ensure(
-        repo_root, common_dir, slug=slug, run_id=run_id, branch=branch
+        repo_root, main_root, slug=slug, run_id=run_id, branch=branch,
+        common_dir=common_dir,
     )
     if expect_head:
         actual = gitops.head_sha(wt.path)
@@ -741,6 +949,8 @@ def write_bookkeeping_export(
 
 __all__ = [
     "EXPORT_BANNER",
+    "GAUNTLET_DIRNAME",
+    "LEGACY_WORKTREE_DIRNAME",
     "MODES",
     "MODE_DEDICATED",
     "MODE_SAME_TREE",
@@ -750,8 +960,11 @@ __all__ = [
     "WorktreeUnavailable",
     "describe",
     "ensure",
+    "ensure_root_marker",
     "export_dir",
     "is_inside_worktrees_root",
+    "legacy_observe",
+    "legacy_worktrees_root",
     "lock_reason",
     "observe",
     "parse_lock_reason",

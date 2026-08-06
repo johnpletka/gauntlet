@@ -130,6 +130,16 @@ behind that output. Drive every decision off the reported state class:
   <slug>`, or take the operator-chosen fallback `gauntlet resume <slug>
   --same-tree`, which drives THIS resume in your own checkout. `--same-tree` is
   one-shot: it is never persisted and never applied automatically.
+- **a dedicated run whose tree is at the OLD location** — only on repositories
+  that opted into `dedicated` before the run worktree moved out of the git
+  directory. The refusal names the tree it found, the new path, and the verb:
+  `gauntlet migrate-worktree <slug>` relocates it. Take that action rather than
+  `--same-tree` here — the tree is fine, it is simply somewhere the `claude` CLI
+  refuses to write, which is why the run could not be driven. Relocating rebuilds
+  the tree at the new root from the branch, so **commit or discard uncommitted
+  work in the old tree first**; the verb refuses while any exists rather than
+  sweeping it into a recovery ref you would have to know to look for. Nothing is
+  moved until you run it, and a live driver blocks it.
 - **`worktree missing`** (a dedicated run whose tree is gone) — `status --json`
   shows `worktree.registered: true` with `present: false`; plain `status`
   prints `worktree: MISSING at <path>`. Note `prunable` is usually **null**
@@ -338,13 +348,24 @@ defeats the safety the pipeline is built on.
 
   With `worktree.mode: dedicated` this guardrail stops being something you hold
   in your head and becomes **structural**: the builder's tree is a separate
-  directory under the git common dir that you have no reason to open, rather
-  than files sitting in your own editor. That is the clearest operator-facing
-  win of the dedicated layout. The trade, stated plainly: you also lose the
-  ability to watch the agent's work appear in your file tree. Use `gauntlet
-  logs <slug>` for the live transcript, `git diff <base>...gauntlet/<slug>`
-  for committed progress, and `status --json` → `worktree.path` when you
-  genuinely need to look at the tree itself.
+  directory — `.gauntlet/worktrees/<slug>/<run-id>` inside your repo, gitignored
+  by an engine-owned marker — that you have no reason to open, rather than files
+  sitting in your own editor. That is the clearest operator-facing win of the
+  dedicated layout. The trade, stated plainly: the agent's work no longer
+  appears in the files you are already editing. It is still browsable when you
+  want it (`status --json` → `worktree.path` names the exact directory), but
+  reach for `gauntlet logs <slug>` for the live transcript and `git diff
+  <base>...gauntlet/<slug>` for committed progress first — both answer the
+  question without disturbing anything.
+
+  Two things about that directory are worth knowing before they surprise you.
+  It is **gitignored, not hidden**: `git status` stays clean, but `git status
+  --ignored` lists it. And `git clean -xdff` **will** delete it — double-force
+  ignores the "skip repositories" rule that `-xdf` respects. That is recoverable
+  rather than fatal: the branch and the journal both survive, so `gauntlet
+  resume <slug>` rebuilds the tree and verifies its HEAD against the state the
+  run recorded. Uncommitted work in the tree at that instant is the one thing
+  that does not survive.
 
 ## 7. Operating a `gauntlet review` run (the lightweight surface)
 

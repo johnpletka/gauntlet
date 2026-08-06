@@ -26,8 +26,15 @@ from gauntlet.engine.run import RunManager
 from conftest import git
 
 
-def _common(repo: Path) -> Path:
-    return gitops.git_common_dir(repo)
+def _main(repo: Path) -> Path:
+    """The anchor run-worktree paths derive from (P7e: the MAIN worktree).
+
+    Was ``gitops.git_common_dir`` while the root lived under ``.git/``. Every
+    call site that used it is asking "where does the engine put run worktrees?",
+    which is now anchored at the main worktree — so the rename is the whole
+    change at those sites, and their assertions are untouched.
+    """
+    return gitops.main_worktree_root(repo)
 
 
 def _manifest(slug="demo", run_id="run-1", branch=None, mode=None) -> Manifest:
@@ -44,15 +51,54 @@ def _manifest(slug="demo", run_id="run-1", branch=None, mode=None) -> Manifest:
 # --- the derived root (§6.2/§6.4) --------------------------------------------
 
 
-def test_worktree_path_is_derived_under_the_git_common_dir(fixture_repo):
-    """§6.2: invisible to status/clean, on the same filesystem, no knob."""
-    common = _common(fixture_repo)
-    path = WT.run_worktree_path(common, "demo", "run-1")
-    assert path == common / "gauntlet" / "worktrees" / "demo" / "run-1"
-    assert WT.is_inside_worktrees_root(path, common)
+def test_worktree_path_is_derived_under_the_main_worktree(fixture_repo):
+    """P7e: the derived root is `<main-worktree>/.gauntlet/worktrees`, no knob.
+
+    REWRITTEN at P7e, and the rename is the point. This asserted the ratified
+    §6.2 root under the git common dir. That location is unusable: the `claude`
+    CLI refuses to write any path carrying a literal `.git` segment, so every
+    builder and verifier step in such a tree fails — non-uniformly across write
+    mechanisms, so it fails *iff the model does not improvise a form the guard
+    misses* (`proposals/P7d-gate-blocker.md` §2). The maintainer ratified
+    sub-option 1A on 2026-08-06.
+
+    The `.gauntlet/` prefix is load-bearing in a way the old `gauntlet/` was
+    not: it is the same directory that holds the adopter's TRACKED
+    `config.yaml`, which is why the self-ignoring marker goes one level down.
+    """
+    main_root = _main(fixture_repo)
+    path = WT.run_worktree_path(main_root, "demo", "run-1")
+    assert path == main_root / ".gauntlet" / "worktrees" / "demo" / "run-1"
+    assert WT.is_inside_worktrees_root(path, main_root)
+    assert ".git" not in path.parts, (
+        "the path must carry no literal `.git` segment — that is the blocker "
+        "P7e exists to fix, and it is a property of the PATH, not of the engine"
+    )
     # There is no config knob for it — §6.4, deferral D2.
     assert not hasattr(RunConfig().worktree, "root")
     assert not hasattr(RunConfig().worktree, "path")
+
+
+def test_the_derived_root_is_the_same_from_every_vantage_point(fixture_repo):
+    """P7e: anchored at the MAIN worktree, not at the invoking checkout.
+
+    The property §6.2 got for free from the shared git common dir, which had to
+    be re-established deliberately once the root moved into the working tree.
+    Without it, an operator driving from their own linked worktree would derive
+    a second, disjoint set of run worktrees, and the §14.4 refusal — which only
+    ever fires from *inside* a run worktree — could never match.
+    """
+    main_root = _main(fixture_repo)
+    git(fixture_repo, "branch", "gauntlet/demo")
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
+                   branch="gauntlet/demo")
+    operator_wt = fixture_repo.parent / "operator-own"
+    git(fixture_repo, "branch", "side")
+    gitops.add_worktree_branch(fixture_repo, operator_wt, "side")
+
+    for vantage in (fixture_repo, operator_wt, wt.path):
+        assert gitops.main_worktree_root(vantage) == main_root, vantage
+        assert WT.is_inside_worktrees_root(wt.path, gitops.main_worktree_root(vantage))
 
 
 def test_config_defaults_to_same_tree_and_refuses_an_unknown_mode():
@@ -63,19 +109,77 @@ def test_config_defaults_to_same_tree_and_refuses_an_unknown_mode():
         RunConfig(worktree={"mode": "somewhere-else"})
 
 
-def test_a_run_worktree_is_invisible_to_status_and_survives_clean_xdff(fixture_repo):
-    """The two properties §6.1 disqualified the in-repo option for."""
-    common = _common(fixture_repo)
-    target = WT.run_worktree_path(common, "demo", "run-1")
+def test_a_run_worktree_is_invisible_to_status_via_the_engine_owned_marker(
+    fixture_repo,
+):
+    """P7e: invisibility is now MAINTAINED, not structural — so assert the mechanism.
+
+    Under §6.2 the tree was inside `.git/` and git ignored it with no help from
+    us. At the 1A root it is ordinary working-tree content, and what keeps it
+    out of `git status` is the engine-owned self-ignoring marker. That marker is
+    therefore part of the clean-handoff invariant (CLAUDE.md §1) rather than a
+    tidiness detail, and it must never sit at `.gauntlet/.gitignore`, which
+    would blanket-ignore the tracked `config.yaml` beside it.
+    """
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
     wt = WT.ensure(
-        fixture_repo, common, slug="demo", run_id="run-1", branch="gauntlet/demo"
+        fixture_repo, main_root, slug="demo", run_id="run-1", branch="gauntlet/demo"
     )
     assert wt.path.is_dir()
     assert gitops.status_porcelain(fixture_repo, untracked_all=True) == ""
+
+    marker = main_root / ".gauntlet" / "worktrees" / ".gitignore"
+    assert marker.read_text() == "*\n"
+    assert not (main_root / ".gauntlet" / ".gitignore").exists(), (
+        "a `*` one level up would ignore the adopter's tracked config.yaml"
+    )
+
+    # Deleting the marker (what `git clean -xdf` does) makes the tree dirt; the
+    # next drive must re-establish it rather than leave the repo permanently
+    # unclean from one ordinary operator keystroke.
+    marker.unlink()
+    assert gitops.status_porcelain(fixture_repo, untracked_all=True) != ""
+    WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
+              branch="gauntlet/demo")
+    assert gitops.status_porcelain(fixture_repo, untracked_all=True) == ""
+
+
+def test_clean_xdff_destroys_the_tree_but_leaves_it_recoverable(fixture_repo):
+    """P7e: the §6.1 disqualifier, re-measured and downgraded to recoverable.
+
+    REWRITTEN at P7e. This asserted `clean -xdff` could not reach the run
+    worktree, which was true under `.git/` and is FALSE at the 1A root — so the
+    old assertion cannot simply be re-anchored, it has to change sides.
+
+    §6.1 treated this as disqualifying because a destroyed tree meant a lost
+    run. It no longer does. What `-xdff` produces is exactly spike §11 row 2 —
+    registered-and-absent, with the branch ref and the journal (which never
+    lived in the tree, §4.4) intact — and P7c built `recreate` for precisely
+    that. So the test now asserts the RECOVERY rather than the immunity, which
+    is the honest form of the trade the maintainer ratified.
+    """
+    main_root = _main(fixture_repo)
+    git(fixture_repo, "branch", "gauntlet/demo")
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
+                   branch="gauntlet/demo")
+    (wt.path / "feature.py").write_text("work\n")
+    git(wt.path, "add", "-A")
+    git(wt.path, "commit", "-qm", "P1: work")
+    recorded = gitops.head_sha(wt.path)
+
     subprocess.run(["git", "-C", str(fixture_repo), "clean", "-xdff"], check=True,
                    capture_output=True)
-    assert target.is_dir(), "clean -xdff must not reach under the git common dir"
+    assert not wt.path.is_dir(), "measured at P7e (E11): -xdff DOES reach it now"
+    # The two things recovery needs both survived, which is why this is a
+    # recoverable event and not a lost run.
+    assert gitops.rev_parse(fixture_repo, "gauntlet/demo") == recorded
+
+    again = WT.recreate(fixture_repo, main_root, slug="demo", run_id="run-1",
+                        branch="gauntlet/demo", expect_head=recorded)
+    assert again.path.is_dir()
+    assert gitops.head_sha(again.path) == recorded
+    assert (again.path / "feature.py").read_text() == "work\n"
 
 
 # --- acceptance A2: concurrent operations cannot target one worktree ---------
@@ -83,9 +187,9 @@ def test_a_run_worktree_is_invisible_to_status_and_survives_clean_xdff(fixture_r
 
 def test_a2_git_refuses_a_second_worktree_for_the_run_branch(fixture_repo):
     """A2 is supplied by git itself (spike E2-A), not by an advisory lock."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
               branch="gauntlet/demo")
     with pytest.raises(gitops.GitError) as exc:
         gitops.add_worktree_branch(
@@ -96,12 +200,12 @@ def test_a2_git_refuses_a_second_worktree_for_the_run_branch(fixture_repo):
 
 def test_a2_ensure_refuses_to_adopt_a_worktree_at_a_foreign_path(fixture_repo):
     """§11 row 6: never `add -f`, never adopt an entry nothing explained."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
     foreign = fixture_repo.parent / "hand-made"
     gitops.add_worktree_branch(fixture_repo, foreign, "gauntlet/demo")
     with pytest.raises(WT.WorktreeUnavailable) as exc:
-        WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+        WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                   branch="gauntlet/demo")
     assert str(foreign) in str(exc.value)
     assert "--same-tree" in exc.value.action
@@ -153,9 +257,9 @@ def test_a3_missing_worktree_is_recreated_and_head_matches_the_journal(fixture_r
     recreated HEAD must equal the journal head's `branch_sha` — "the tree came
     back" and "the tree came back CORRECT" are different assertions.
     """
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     (wt.path / "feature.py").write_text("work\n")
     git(wt.path, "add", "-A")
@@ -184,7 +288,7 @@ def test_a3_missing_worktree_is_recreated_and_head_matches_the_journal(fixture_r
     state = WT.describe(fixture_repo, mode=WT.MODE_DEDICATED, branch="gauntlet/demo")
     assert state.missing, "registered-and-absent is the real row-2 signal"
 
-    again = WT.recreate(fixture_repo, common, slug="demo", run_id="run-1",
+    again = WT.recreate(fixture_repo, main_root, slug="demo", run_id="run-1",
                         branch="gauntlet/demo", expect_head=recorded)
     assert again.recreated
     assert gitops.head_sha(again.path) == recorded
@@ -192,13 +296,13 @@ def test_a3_missing_worktree_is_recreated_and_head_matches_the_journal(fixture_r
 
 def test_a3_recreate_refuses_when_the_branch_disagrees_with_the_journal(fixture_repo):
     """A recreate that lands on a different SHA is a reconcile, not a repair."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     subprocess.run(["rm", "-rf", str(wt.path)], check=True)
     with pytest.raises(WT.WorktreeUnavailable) as exc:
-        WT.recreate(fixture_repo, common, slug="demo", run_id="run-1",
+        WT.recreate(fixture_repo, main_root, slug="demo", run_id="run-1",
                     branch="gauntlet/demo", expect_head="0" * 40)
     assert "journal head records" in str(exc.value)
 
@@ -208,9 +312,9 @@ def test_a3_recreate_refuses_when_the_branch_disagrees_with_the_journal(fixture_
 
 def test_row5_the_git_lock_is_what_stops_another_runs_prune(fixture_repo):
     """§11 row 5 / E8-C: prune is repository-wide; only the lock stops it."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     entry = WT.observe(fixture_repo, "gauntlet/demo")
     assert entry is not None and entry.locked is not None
@@ -242,9 +346,9 @@ def test_row7_prune_always_passes_an_explicit_expiry(fixture_repo, monkeypatch):
 
 def test_row10_a_dirty_worktree_is_snapshotted_before_any_force_removal(fixture_repo):
     """§11 row 10 / R2: never `--force` without a durable record."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     (wt.path / "uncommitted.txt").write_text("work nobody committed\n")
 
@@ -256,9 +360,9 @@ def test_row10_a_dirty_worktree_is_snapshotted_before_any_force_removal(fixture_
 
 def test_row3_release_then_delete_is_the_order_git_requires(fixture_repo):
     """PROBLEM D / E2-D: `branch -D` refuses while a worktree holds the branch."""
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     with pytest.raises(gitops.GitError) as exc:
         gitops.delete_branch(fixture_repo, "gauntlet/demo")
@@ -289,7 +393,7 @@ def test_submodule_superproject_parks_rather_than_handing_over_an_empty_tree(
     git(fixture_repo, "commit", "-qm", "add submodule")
     git(fixture_repo, "branch", "gauntlet/demo")
     with pytest.raises(WT.WorktreeUnavailable) as exc:
-        WT.ensure(fixture_repo, _common(fixture_repo), slug="demo",
+        WT.ensure(fixture_repo, _main(fixture_repo), slug="demo",
                   run_id="run-1", branch="gauntlet/demo")
     assert "uninitialized submodules" in str(exc.value)
     assert "submodule update --init" in str(exc.value)
@@ -325,7 +429,7 @@ def test_mode_resolves_from_evidence_when_a_worktree_is_registered(fixture_repo)
     mgr = RunManager(fixture_repo, RunConfig())
     git(fixture_repo, "branch", "gauntlet/demo")
     man = _manifest(mode=WT.MODE_SAME_TREE)  # the record says same_tree...
-    WT.ensure(fixture_repo, _common(fixture_repo), slug="demo", run_id="run-1",
+    WT.ensure(fixture_repo, _main(fixture_repo), slug="demo", run_id="run-1",
               branch="gauntlet/demo")
     # ...but a worktree exists, so the evidence wins.
     assert mgr._effective_worktree_mode(man) == WT.MODE_DEDICATED
@@ -458,9 +562,9 @@ def test_verbs_refuse_when_invoked_from_inside_a_run_worktree(fixture_repo,
 
     from gauntlet import cli
 
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     with pytest.raises(typer.Exit):
         cli._refuse_inside_run_worktree(wt.path)
@@ -493,12 +597,12 @@ def test_lifecycle_reaches_every_named_crash_boundary_in_order(fixture_repo,
     turns each into a real SIGKILL; this keeps the two from drifting, because a
     boundary that stopped firing would leave that kill mode silently inert.
     """
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "branch", "gauntlet/demo")
     reached: list[str] = []
     monkeypatch.setattr(WT, "_boundary_hook", reached.append)
 
-    wt = WT.ensure(fixture_repo, common, slug="demo", run_id="run-1",
+    wt = WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
                    branch="gauntlet/demo")
     assert reached == ["before_add", "after_add", "after_lock"]
 
@@ -529,14 +633,14 @@ def test_the_operators_own_checkout_is_never_mistaken_for_a_run_worktree(
     asking.
     """
     mgr = RunManager(fixture_repo, RunConfig())
-    common = _common(fixture_repo)
+    main_root = _main(fixture_repo)
     git(fixture_repo, "checkout", "-qb", "gauntlet/demo")  # the same_tree layout
     man = _manifest(mode=WT.MODE_SAME_TREE)
 
     assert gitops.worktree_for_branch(fixture_repo, "gauntlet/demo") is not None, (
         "precondition: git DOES register the operator's checkout for this branch"
     )
-    assert WT.observe(fixture_repo, "gauntlet/demo", common_dir=common) is None, (
+    assert WT.observe(fixture_repo, "gauntlet/demo", main_root=main_root) is None, (
         "scoped, the operator's checkout is not a run worktree"
     )
     assert mgr._effective_worktree_mode(man) == WT.MODE_SAME_TREE

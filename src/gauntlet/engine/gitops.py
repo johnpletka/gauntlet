@@ -187,6 +187,11 @@ ROOT_SCOPE: dict[str, str] = {
     "repair_worktree": ROOT_SCOPE_COMMON,
     "list_worktrees": ROOT_SCOPE_COMMON,
     "worktree_for_branch": ROOT_SCOPE_COMMON,
+    # Reads `worktree list --porcelain`, which every worktree of a repository
+    # answers identically — that vantage-independence is the whole reason P7e
+    # anchors the derived run-worktree root here rather than on `show_toplevel`,
+    # which is WORK-scoped precisely because it does NOT have it.
+    "main_worktree_root": ROOT_SCOPE_COMMON,
     # `submodule status` reads the SUPERPROJECT's index and the on-disk
     # submodule dirs, so it is genuinely a property of one tree — but the tree
     # it must be asked about is always the RUN worktree (that is the point of
@@ -304,6 +309,38 @@ def git_common_dir(repo: Path) -> Path:
     out = _run(repo, "rev-parse", "--git-common-dir").strip()
     path = Path(out)
     return (path if path.is_absolute() else (repo / path)).resolve()
+
+
+def main_worktree_root(repo: Path) -> Path:
+    """Absolute path of the repository's MAIN worktree, from any vantage point.
+
+    The anchor the run-worktree root is derived from (P7e). It is deliberately
+    not ``rev-parse --show-toplevel``: that answers *the checkout you are
+    standing in*, so an operator driving from their own linked worktree — or
+    anything running inside a run worktree — would derive a different root and
+    the containment rules built on it (``worktree.is_inside_worktrees_root``,
+    the §14.4 refusal, ``_run_tree_excludes``) would stop agreeing with each
+    other. Spike §6.2 got that vantage-independence for free from the shared
+    git common dir; anchoring at the main worktree is how it survives the move
+    out of ``.git/``.
+
+    ``git worktree list --porcelain`` reports the main worktree FIRST — before
+    the linked worktrees, and independently of creation order or of which
+    worktree the command runs from (measured at P7e from the main checkout, an
+    adopter's linked worktree, and a run worktree). For a bare repository the
+    first entry is the bare directory itself, which keeps spike §7's "P7 must
+    not accidentally forbid a bare repo" true.
+
+    Raises :class:`GitError` when the list is unreadable or empty rather than
+    guessing: a wrong answer here relocates every run worktree.
+    """
+    entries = list_worktrees(repo)
+    if not entries:
+        raise GitError(
+            f"`git worktree list` reported no worktrees for {repo}; cannot "
+            "derive the main worktree root"
+        )
+    return entries[0].path.resolve()
 
 
 def git_index_path(repo: Path) -> Path:

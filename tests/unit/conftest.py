@@ -454,27 +454,29 @@ def _registered_run_worktrees(repo: Path) -> set[str]:
     from gauntlet.engine import worktree as WT
 
     proc = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return set()
-    common = Path(proc.stdout.strip())
-    if not common.is_absolute():
-        common = (repo / common).resolve()
-    proc = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
         return set()
-    found = set()
-    for line in proc.stdout.splitlines():
-        if line.startswith("worktree "):
-            candidate = Path(line[len("worktree "):])
-            if WT.is_inside_worktrees_root(candidate, common):
-                found.add(str(candidate.resolve()))
-    return found
+    paths = [
+        Path(line[len("worktree "):])
+        for line in proc.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    if not paths:
+        return set()
+    # P7e: the derived root hangs off the MAIN worktree, which git reports
+    # first, rather than off the git common dir. Deliberately re-derived from
+    # git here rather than imported from the engine — this fixture is the check
+    # ON the engine, so sharing the engine's own derivation would let one bug
+    # satisfy both sides.
+    main_root = paths[0].resolve()
+    return {
+        str(p.resolve())
+        for p in paths
+        if WT.is_inside_worktrees_root(p, main_root)
+    }
 
 
 @pytest.fixture(autouse=True)
