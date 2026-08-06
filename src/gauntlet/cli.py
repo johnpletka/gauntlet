@@ -186,12 +186,26 @@ def init(
 
 @app.command()
 @_friendly_errors
-def doctor() -> None:
+def doctor(
+    writability: bool = typer.Option(
+        False,
+        "--writability",
+        help=(
+            "Also probe whether each configured agent CLI can actually WRITE "
+            "under the run-worktree root. Spends a real agent turn per write "
+            "mechanism per adapter, which is why it is opt-in."
+        ),
+    ),
+) -> None:
     """Validate the environment: CLIs, auth, hooks, judge, keys (FR-1.3, FR-1.5)."""
-    from gauntlet.engine.doctor import FAIL, OK, WARN, has_failure, run_doctor
+    from gauntlet.engine.doctor import (
+        FAIL, OK, WARN, check_writability, has_failure, run_doctor,
+    )
 
     glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
     results = run_doctor(Path.cwd())
+    if writability:
+        results += check_writability(Path.cwd())
     for r in results:
         line = f"  {glyph.get(r.status, '?')} {r.name}: {r.detail}"
         typer.echo(line)

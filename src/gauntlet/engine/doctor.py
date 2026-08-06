@@ -1177,3 +1177,88 @@ def run_doctor(
 
 def has_failure(results: list[CheckResult]) -> bool:
     return any(r.status == FAIL for r in results)
+
+
+def check_writability(repo_root: Path) -> list[CheckResult]:
+    """Probe each adapter's ability to write under the run-worktree root (P7f).
+
+    **Opt-in, and deliberately not part of `run_doctor`.** Every other check
+    here is offline and near-instant; this one spends a real agent turn per
+    write mechanism per adapter, because reading the *post-tool* outcome is the
+    only way to see a refusal at all (`proposals/P7d-gate-blocker.md` §2.4 — the
+    judge is a PreToolUse hook, so the audit records `allow` for writes that
+    never happened). Wiring that into the default `gauntlet doctor` would turn a
+    diagnostic an operator runs reflexively into one that costs tokens and
+    minutes, so it lives behind `gauntlet doctor --writability`.
+
+    Probes directly under the derived worktrees root rather than creating a run
+    worktree: the guard measured at P7d keys on the PATH (a literal `.git`
+    segment), so the root's prefix is what determines the answer, and probing it
+    needs no run, no branch and no lock.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine import worktree as WT
+    from gauntlet.engine import writability as W
+    from gauntlet.engine.config import RunConfig
+
+    try:
+        config = RunConfig.load(repo_root / ".gauntlet" / "config.yaml")
+    except Exception as exc:
+        return [CheckResult("writability", FAIL, f"config not loadable: {exc}",
+                            remedy="run `gauntlet init` to scaffold a config")]
+    try:
+        root = WT.worktrees_root(gitops.main_worktree_root(repo_root))
+    except Exception as exc:
+        return [CheckResult("writability", FAIL, f"cannot derive the run-worktree "
+                            f"root: {exc}")]
+
+    probe_root = root / ".doctor-probe"
+    results: list[CheckResult] = []
+    seen: set[str] = set()
+    try:
+        probe_root.mkdir(parents=True, exist_ok=True)
+        WT.ensure_root_marker(gitops.main_worktree_root(repo_root))
+        for name, profile in (config.agents or {}).items():
+            kind = getattr(profile, "adapter", None)
+            if not kind or kind in seen:
+                continue
+            seen.add(kind)
+            try:
+                adapter = profile.build_adapter()
+            except Exception as exc:
+                results.append(CheckResult(
+                    f"writability[{kind}]", WARN,
+                    f"adapter {kind!r} could not be built: {exc}",
+                ))
+                continue
+            if not W.should_probe(adapter):
+                continue
+            report = W.probe(adapter, probe_root, adapter_name=kind)
+            if report.ok:
+                results.append(CheckResult(
+                    f"writability[{kind}]", OK, report.summary()))
+            elif report.refused:
+                results.append(CheckResult(
+                    f"writability[{kind}]", FAIL,
+                    f"{report.summary()} under {root}",
+                    remedy=(
+                        "the run worktree root is not writable by this agent "
+                        "CLI; a `.git` segment in the path is the known cause "
+                        "(proposals/P7d-gate-blocker.md §2)"
+                    ),
+                ))
+            else:
+                results.append(CheckResult(
+                    f"writability[{kind}]", WARN, report.summary(),
+                    remedy="the adapter could not run; check its CLI and auth",
+                ))
+    finally:
+        import shutil
+
+        shutil.rmtree(probe_root, ignore_errors=True)
+    if not results:
+        results.append(CheckResult(
+            "writability", WARN,
+            "no configured adapter declares a real CLI permission layer to probe",
+        ))
+    return results

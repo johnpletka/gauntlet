@@ -1184,6 +1184,78 @@ class RunManager:
         finally:
             self._paths = prior
 
+    def _writability_preflight(
+        self, paths: "RunPaths", adapter_factory
+    ) -> None:
+        """Park BEFORE the first agent step if the run tree is not writable (P7f).
+
+        `proposals/P7d-gate-blocker.md` §5 Option 4's second surface. The failure
+        it detects is not hypothetical: an entire dogfood run was lost to it,
+        and every durable record said the writes were allowed, because the judge
+        is a PreToolUse hook and adjudicates before the CLI's own permission
+        layer (§2.4). This turns that into a named park with evidence.
+
+        **Only at `start`, never on resume.** The probe costs one real agent turn
+        per mechanism per adapter, and the question it answers — "will this CLI
+        write at this path?" — is a property of the path and the adapter, not of
+        the run's progress. Paying it once, before a run commits to a tree, is
+        the right trade; paying it on every resume would tax the recovery path
+        this whole redesign exists to make cheap.
+
+        **Only for `dedicated` runs.** A `same_tree` run drives the operator's
+        own checkout, which they are demonstrably able to edit; there is nothing
+        to discover.
+
+        Raises :class:`WT.WorktreeUnavailable` so it lands in the same
+        fail-closed park as the §7 submodule case — the shape Option 4 asks for
+        — with the run not moved and not modified.
+        """
+        from gauntlet.engine import writability as W
+
+        if paths.work_root == self.operator_root:
+            return  # same_tree: the operator edits this tree themselves
+        reports = []
+        for profile in self._preflight_profiles():
+            try:
+                adapter = adapter_factory(profile)
+            except Exception:
+                continue  # adapter construction is the drive's problem to report
+            if not W.should_probe(adapter):
+                continue
+            reports.append(
+                W.probe(adapter, paths.work_root, adapter_name=profile)
+            )
+        reason = W.park_reason(reports)
+        if reason is not None:
+            raise WT.WorktreeUnavailable(reason, slug=self._slug_of(paths))
+
+    def _preflight_profiles(self) -> list[str]:
+        """One configured profile per distinct ADAPTER KIND.
+
+        Per-adapter, never generalized between adapters (§2.5 probe 2) — but
+        also not per-*profile*: the permission behaviour being measured belongs
+        to the CLI, so four profiles on `claude-code` would pay four times for
+        one answer. Deduping by `profile.adapter` is what makes the preflight
+        affordable enough to run at every start.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for name, profile in (getattr(self.config, "agents", {}) or {}).items():
+            kind = getattr(profile, "adapter", None)
+            if not kind or kind in seen:
+                continue
+            seen.add(kind)
+            out.append(name)
+        return out
+
+    @staticmethod
+    def _slug_of(paths: "RunPaths") -> str | None:
+        """Best-effort slug for a park message; the artifact root is named for it."""
+        try:
+            return paths.artifact_root.name
+        except Exception:
+            return None
+
     @contextmanager
     def _worktree_paths_or_park(
         self,
@@ -2593,7 +2665,8 @@ class RunManager:
             )
             with self._worktree_paths_or_park(
                 layout, run_dir, man, mode=man.worktree_mode
-            ):
+            ) as paths:
+                self._writability_preflight(paths, adapter_factory)
                 status = self._drive(
                     layout, run_dir, pipeline, man,
                     use_judge=use_judge, adapter_factory=adapter_factory,
