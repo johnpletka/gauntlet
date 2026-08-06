@@ -1522,10 +1522,12 @@ def migrate_worktree(
 ) -> None:
     """Move an existing run into its own dedicated worktree (spike §10).
 
-    Explicit and opt-in: a run that predates the dedicated layout keeps driving
-    your checkout until you run this, and nothing in the engine ever moves it
-    for you — not even setting `worktree.mode: dedicated` in config, which only
-    decides what NEW runs are born as.
+    Explicit and opt-in: a run that started before `dedicated` became the
+    default (P7g), or one deliberately pinned to `worktree.mode: same_tree`,
+    keeps driving your checkout until you run this, and nothing in the engine
+    ever moves it for you — not even changing `worktree.mode` in config, which
+    only decides what NEW runs are born as. That asymmetry is what kept the
+    default flip from relocating any run already under way.
 
     Copy, never move: the branch, the journal, the manifest, the transcripts
     and the run dir all stay exactly where they are. Only the tree the run's

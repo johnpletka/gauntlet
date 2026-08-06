@@ -468,7 +468,13 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
     # enumeration runs. It never "parks closed after running an unsupported
     # collector" (FR-3.2 / P2-A5).
     map_name = step.get("map", _ACCEPTANCE_MAP_DEFAULT)
-    map_path = ctx.artifact_root / map_name
+    # In the WORK tree, not the operator's checkout (P7g). Unlike prd.md/plan.md
+    # this artifact has no authoring surface: the block comment above
+    # `_ACCEPTANCE_MAP_DEFAULT` records that "the builder writes it with its file
+    # tools", and a builder's cwd IS the work tree — the whole point of P7. Read
+    # from `artifact_root` this gate halted every `dedicated` run with "no
+    # acceptance map", pointing at a path the builder was never asked to write.
+    map_path = ctx.artifact_root_in_work / map_name
     if not map_path.exists():
         return _acceptance_gate_halt(
             f"acceptance gate: phase {phase_id} has no acceptance map at "
@@ -1152,6 +1158,13 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                 park.usage_by_agent = usage_by_agent
                 return park
         artifact_writes[output] = out_path
+        # P7g: publish the validated bytes into the tree the run branch commits
+        # in. Same-tree this is a no-op; under `dedicated` it is the only thing
+        # that puts a mid-drive artifact where `commit_output` (and the
+        # downstream cycle's baseline commit and reviewer) can see it. Runs
+        # AFTER validation, so an invalid artifact is never published — it
+        # stays in the operator's checkout for the sanctioned hand-edit.
+        ctx.publish_artifact(output)
         # Prevent-at-source (report #3): a producer that opts in commits its own
         # declared deliverable as it finalizes, so HEAD advances at production
         # time. The deliverable then survives a crash before the next step AND
@@ -1353,6 +1366,11 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
     # committed only on validity; the resume path must too, to keep the
     # clean-handoff invariant for the downstream cycle).
     commit_sha = commit_phase = None
+    # P7g: the hand-edit landed in the operator's checkout (the playbook's one
+    # sanctioned edit, and it says to make it there). Publish it into the work
+    # tree whether or not this step commits, so the downstream reviewer is
+    # handed the bytes the human actually wrote.
+    ctx.publish_artifact(output)
     if step.get("commit_output"):
         outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
         if isinstance(outcome, StepResult):  # fail-closed format/commit error
@@ -1383,6 +1401,12 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
     Stages exactly the one path (never ``git add -A``), so an unrelated dirty
     file is neither swept into this commit nor able to defeat it — it stays
     uncommitted for the downstream clean-handoff guard to name.
+
+    ``out_path`` is the AUTHORITY (the operator's checkout, §4.4); what gets
+    committed is its work-tree counterpart, which
+    :meth:`StepContext.publish_artifact` has already materialised. Relativising
+    the authority against ``work_root`` is what produced "resolves outside the
+    repo" for every `dedicated` producer step (P7g).
     """
     phase = step.get("phase")
     if not phase:
@@ -1392,12 +1416,17 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
             "the producer commit needs a phase prefix (e.g. PLAN) for the "
             "enforced header format",
         )
+    in_work = ctx.publish_artifact(output)
     try:
-        rel = out_path.resolve().relative_to(ctx.work_root.resolve()).as_posix()
+        rel = in_work.resolve().relative_to(ctx.work_root.resolve()).as_posix()
     except ValueError:
         return StepResult(
             status=FAILED,
-            notes=f"commit_output: artifact {output!r} resolves outside the repo",
+            notes=(
+                f"commit_output: artifact {output!r} resolves to {in_work}, "
+                f"which is outside the tree this run commits in "
+                f"({ctx.work_root})"
+            ),
         )
     dirty = {
         ln[3:].strip()

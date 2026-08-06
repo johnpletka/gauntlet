@@ -26,7 +26,8 @@ from gauntlet.engine.orchestrator import ENGINE_IDENTITY
 from gauntlet.engine.pipeline import load_pipeline
 from gauntlet.engine.run import RunManager
 
-from conftest import git
+from conftest import git, run_work_tree
+from gauntlet.engine import worktree as WT
 
 CONFIG = """
 base_branch: main
@@ -215,8 +216,15 @@ def _run_dir(mgr: RunManager) -> Path:
 
 
 def _checkpoint_log(repo: Path) -> list[str]:
-    """`author|subject` for every engine response-checkpoint commit, oldest→newest."""
-    out = gitops._run(repo, "log", "--reverse", "--format=%an|%s")
+    """`author|subject` for every engine response-checkpoint commit, oldest→newest.
+
+    P7g: walks the RUN BRANCH, not whatever the operator has checked out. The
+    checkpoints are committed in the tree the run drives, and under the
+    dedicated default that is not the operator's — but refs are shared across
+    every worktree of a repository (spike E1), so naming the branch reads the
+    same history from either vantage point and keeps this helper mode-agnostic.
+    """
+    out = gitops._run(repo, "log", "--reverse", "--format=%an|%s", "gauntlet/demo")
     return [ln for ln in out.splitlines() if ln.split("|", 1)[-1].startswith("gauntlet: response")]
 
 
@@ -245,7 +253,7 @@ def test_response_proceeds_records_pending_then_consumed(tmp_path):
     # proceed resolved the conflict in place: discriminator cleared (FR-2.1).
     assert rec.parked_reason is None
     # A real phase commit landed (no re-park).
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
 
 
 def test_response_checkpoints_reach_git_history_in_order(tmp_path):
@@ -724,7 +732,7 @@ def test_interrupted_step_resumes_past_engine_checkpoint_commits(tmp_path):
     rec.status = M.INTERRUPTED
     rec.parked_reason = None
     rec.halt_reason = M.HALT_REASON_SIGNAL_KILL
-    assert rec.base_sha == gitops.head_sha(repo)  # stamped pre-checkpoint
+    assert rec.base_sha == gitops.rev_parse(repo, "gauntlet/demo")  # stamped pre-checkpoint
     man.write_atomic(run_dir / "manifest.json")
 
     adapter = ScriptedAdapter("proceed")
@@ -759,7 +767,7 @@ def test_resume_reset_interrupted_discards_and_reruns(tmp_path):
     rec.parked_reason = None
     rec.halt_reason = M.HALT_REASON_SIGNAL_KILL
     man.write_atomic(run_dir / "manifest.json")
-    (repo / "partial.py").write_text("half written by the killed attempt\n")
+    (run_work_tree(repo) / "partial.py").write_text("half written by the killed attempt\n")
 
     # Plain resume: parks (dirty), zero agent work, and the notes name the verb.
     adapter = ScriptedAdapter("proceed")
@@ -779,7 +787,7 @@ def test_resume_reset_interrupted_discards_and_reruns(tmp_path):
     )
     assert status == M.RUN_DONE
     assert len(adapter.prompts) == 1
-    assert not (repo / "partial.py").exists()  # discarded...
+    assert not (run_work_tree(repo) / "partial.py").exists()  # discarded...
     refs = gitops._run(repo, "for-each-ref", "refs/gauntlet/recovery/")
     assert "refs/gauntlet/recovery/" in refs  # ...but snapshotted first (P3)
     rec = mgr.status("demo").record("implement")
@@ -847,14 +855,14 @@ def _seed_dirty_running_pending(repo: Path, mgr: RunManager) -> None:
     man = Manifest.load(run_dir / "manifest.json")
     rec = man.record("implement")
     rec.status = M.RUNNING
-    rec.base_sha = gitops.head_sha(repo)
+    rec.base_sha = gitops.rev_parse(repo, "gauntlet/demo")
     rec.human_responses.append(HumanResponse(
         response_id="implement-resp-1", response_text="Ratify option 1.",
         timestamp="2026-06-24T00:00:00+00:00", user="fixture@gauntlet.local",
         response_attempt=1, state=M.RESPONSE_PENDING,
     ))
     man.write_atomic(run_dir / "manifest.json")
-    (repo / "partial.py").write_text("half-written before the kill")  # dirty base
+    (run_work_tree(repo) / "partial.py").write_text("half-written before the kill")  # dirty base
 
 
 def test_recovery_dirty_base_reset_relaunches_pending(tmp_path):
@@ -877,7 +885,7 @@ def test_recovery_dirty_base_reset_relaunches_pending(tmp_path):
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
     assert rec.attempts == 0
-    assert not (repo / "partial.py").exists()  # partial work discarded
+    assert not (run_work_tree(repo) / "partial.py").exists()  # partial work discarded
     assert len(adapter.prompts) == 1  # one logical re-execution
 
 
@@ -900,7 +908,7 @@ def test_recovery_dirty_base_reset_preserves_response_checkpoints(tmp_path):
     run_dir = _run_dir(mgr)
     man = Manifest.load(run_dir / "manifest.json")
     rec = man.record("implement")
-    rec.base_sha = gitops.head_sha(repo)  # implementation baseline, pre-checkpoint
+    rec.base_sha = gitops.rev_parse(repo, "gauntlet/demo")  # implementation baseline, pre-checkpoint
     rec.status = M.RUNNING
     rec.human_responses.append(HumanResponse(
         response_id="implement-resp-1", response_text="Ratify option 1.",
@@ -910,14 +918,23 @@ def test_recovery_dirty_base_reset_preserves_response_checkpoints(tmp_path):
     man.write_atomic(run_dir / "manifest.json")
     # A real pending checkpoint commit on top of base_sha (the state a crash
     # AFTER the pending flush but mid-edit would have on disk).
-    run_rel = run_dir.resolve().relative_to(repo.resolve()).as_posix()
+    # P7g: a checkpoint commits the run's EXPORT of the projection, in the tree
+    # the run drives — the authoritative journal and manifest stay in the
+    # operator's checkout and are never committed (spike §4.4), so the export is
+    # the only in-tree path a bookkeeping commit can name. Materialised with the
+    # engine's own writer, exactly as a real checkpoint does before staging.
+    work = run_work_tree(repo)
+    WT.write_bookkeeping_export(
+        work, run_dir, mgr.config.run_root, "demo", run_dir.name
+    )
+    run_rel = (Path(mgr.config.run_root) / "demo" / run_dir.name).as_posix()
     gitops.commit_run_bookkeeping(
-        repo, "gauntlet: response implement-resp-1 pending",
+        work, "gauntlet: response implement-resp-1 pending",
         [f"{run_rel}/manifest.json"], identity=ENGINE_IDENTITY,
     )
-    pending_sha = gitops.head_sha(repo)
+    pending_sha = gitops.rev_parse(repo, "gauntlet/demo")
     assert pending_sha != rec.base_sha  # the checkpoint really advanced HEAD
-    (repo / "partial.py").write_text("half-written before the kill")  # dirty base
+    (run_work_tree(repo) / "partial.py").write_text("half-written before the kill")  # dirty base
 
     adapter = ScriptedAdapter("proceed")
     status = mgr.resume(
@@ -928,11 +945,18 @@ def test_recovery_dirty_base_reset_preserves_response_checkpoints(tmp_path):
     assert len(rec.human_responses) == 1
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
     assert rec.attempts == 0
-    assert not (repo / "partial.py").exists()  # partial work discarded
+    assert not (run_work_tree(repo) / "partial.py").exists()  # partial work discarded
     assert len(adapter.prompts) == 1  # one logical re-execution
 
-    # Both checkpoints are reachable from HEAD, in order — the reset did not drop
-    # the pending checkpoint that base_sha sits behind (F-001).
+    # Both checkpoints are reachable from the run branch, in order — the reset
+    # did not drop the pending checkpoint that base_sha sits behind (F-001).
+    # Asserted as the EXACT log, deliberately: the bookkeeping-preserving rewind
+    # stands in for the pending checkpoint with a single equivalently-labelled
+    # commit, so a THIRD entry here would mean the rewind had degraded to a
+    # plain reset and re-committed the checkpoint afterwards — which is exactly
+    # what P7g's flip exposed (the export did not exist in the run tree yet, so
+    # the existence-filtered bookkeeping path list came back empty and turned
+    # `preserving` off). A count is the only thing that catches that.
     assert _checkpoint_log(repo) == [
         "Gauntlet Engine|gauntlet: response implement-resp-1 pending",
         "Gauntlet Engine|gauntlet: response implement-resp-1 consumed",
@@ -947,7 +971,7 @@ def _seed_dirty_running_with_committed_pending(repo: Path, mgr: RunManager) -> s
     run_dir = _run_dir(mgr)
     man = Manifest.load(run_dir / "manifest.json")
     rec = man.record("implement")
-    rec.base_sha = gitops.head_sha(repo)  # implementation baseline, pre-checkpoint
+    rec.base_sha = gitops.rev_parse(repo, "gauntlet/demo")  # implementation baseline, pre-checkpoint
     rec.status = M.RUNNING
     rec.human_responses.append(HumanResponse(
         response_id="implement-resp-1", response_text="Ratify option 1.",
@@ -955,14 +979,23 @@ def _seed_dirty_running_with_committed_pending(repo: Path, mgr: RunManager) -> s
         response_attempt=1, state=M.RESPONSE_PENDING,
     ))
     man.write_atomic(run_dir / "manifest.json")
-    run_rel = run_dir.resolve().relative_to(repo.resolve()).as_posix()
+    # P7g: a checkpoint commits the run's EXPORT of the projection, in the tree
+    # the run drives — the authoritative journal and manifest stay in the
+    # operator's checkout and are never committed (spike §4.4), so the export is
+    # the only in-tree path a bookkeeping commit can name. Materialised with the
+    # engine's own writer, exactly as a real checkpoint does before staging.
+    work = run_work_tree(repo)
+    WT.write_bookkeeping_export(
+        work, run_dir, mgr.config.run_root, "demo", run_dir.name
+    )
+    run_rel = (Path(mgr.config.run_root) / "demo" / run_dir.name).as_posix()
     gitops.commit_run_bookkeeping(
-        repo, "gauntlet: response implement-resp-1 pending",
+        work, "gauntlet: response implement-resp-1 pending",
         [f"{run_rel}/manifest.json"], identity=ENGINE_IDENTITY,
     )
-    pending_sha = gitops.head_sha(repo)
+    pending_sha = gitops.rev_parse(repo, "gauntlet/demo")
     assert pending_sha != rec.base_sha  # the checkpoint really advanced HEAD
-    (repo / "partial.py").write_text("half-written before the kill")  # dirty base
+    (run_work_tree(repo) / "partial.py").write_text("half-written before the kill")  # dirty base
     return pending_sha
 
 
@@ -1010,7 +1043,7 @@ def test_recovery_dirty_base_reset_survives_crash_in_rewind_window(tmp_path, mon
     assert len(rec.human_responses) == 1  # NOT re-appended
     assert rec.human_responses[0].state == M.RESPONSE_CONSUMED
     assert rec.attempts == 0
-    assert not (repo / "partial.py").exists()  # partial work discarded
+    assert not (run_work_tree(repo) / "partial.py").exists()  # partial work discarded
     assert len(adapter.prompts) == 1  # one logical re-execution
     assert _checkpoint_log(repo) == [
         "Gauntlet Engine|gauntlet: response implement-resp-1 pending",

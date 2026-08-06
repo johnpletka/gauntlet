@@ -101,10 +101,18 @@ def test_the_derived_root_is_the_same_from_every_vantage_point(fixture_repo):
         assert WT.is_inside_worktrees_root(wt.path, gitops.main_worktree_root(vantage))
 
 
-def test_config_defaults_to_same_tree_and_refuses_an_unknown_mode():
-    """P7c ships `same_tree`; flipping the default is P7d's own gate (§13)."""
-    assert RunConfig().worktree.mode == WT.MODE_SAME_TREE
-    assert RunConfig(worktree={"mode": "dedicated"}).worktree.mode == "dedicated"
+def test_config_defaults_to_dedicated_and_refuses_an_unknown_mode():
+    """P7g: `dedicated` is the default; `same_tree` stays selectable forever.
+
+    This one line is the whole of P7g's production change, so it is asserted
+    directly rather than inferred from a run's behaviour. It gates two claims at
+    once: that acceptance A1/A2/A3 now hold for runs in general (a new run gets
+    its own tree without anyone opting in), and that spike §16's "`same_tree` is
+    not removed" survived the flip — it remains the mode of every legacy run and
+    the documented fallback for an adopter layout that cannot host a worktree.
+    """
+    assert RunConfig().worktree.mode == WT.MODE_DEDICATED
+    assert RunConfig(worktree={"mode": "same_tree"}).worktree.mode == "same_tree"
     with pytest.raises(Exception):
         RunConfig(worktree={"mode": "somewhere-else"})
 

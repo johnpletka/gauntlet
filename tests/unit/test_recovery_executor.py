@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from conftest import FakeAdapter, git
+from conftest import FakeAdapter, git, run_work_tree
 
 from gauntlet.engine import cycle as cycle_mod
 from gauntlet.engine import git_snapshot, gitops, manifest as M
@@ -746,7 +746,8 @@ def _rollback_manager(repo) -> RunManager:
 def _drive_rollback(repo) -> None:
     mgr = _rollback_manager(repo)
     target = mgr.rollback("demo", phase=1)
-    assert gitops.head_sha(repo) == target
+    # P7g: rollback rewinds the RUN's tree; the operator's HEAD never moves.
+    assert gitops.head_sha(run_work_tree(repo)) == target
 
 
 def _cycle_ctx(repo):
@@ -862,8 +863,10 @@ def test_killed_rollback_replays_via_resume_and_converges(fixture_repo, monkeypa
 
     run_dir = mgr.layout("demo").active_run_dir()
     # The Git apply completed; the manifest transition did not; the intent is
-    # durable and replayable.
-    assert gitops.head_sha(fixture_repo) == p1_target
+    # durable and replayable. P7g: the apply landed in the RUN's tree — the
+    # operator's HEAD is untouched, which is acceptance A1 and is asserted for
+    # this test by the autouse property.
+    assert gitops.head_sha(run_work_tree(fixture_repo)) == p1_target
     assert RX.load_intent(run_dir) is not None
     stale = mgr.status("demo")
     assert [c.phase for c in stale.commits] == ["P1", "P2"]  # not yet rewound
@@ -881,7 +884,7 @@ def test_killed_rollback_replays_via_resume_and_converges(fixture_repo, monkeypa
     assert RX.load_intent(run_dir) is None
     assert any("replayed after a process death" in w for w in man.warnings)
     assert [c.phase for c in man.commits] == ["P1", "P2"]
-    assert gitops.commit_subject(fixture_repo, "HEAD") == "P2: phase two"
+    assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P2: phase two"
     # A second resume finds nothing to replay and nothing to do.
     assert RX.replay_pending_intent(fixture_repo, run_dir) is None
 
@@ -1100,7 +1103,7 @@ def test_killed_rollback_converges_when_retried_via_rollback(
         mgr.rollback("demo", phase=1)
     monkeypatch.undo()
     run_dir = mgr.layout("demo").active_run_dir()
-    assert gitops.head_sha(fixture_repo) == p1_target  # branch already reset
+    assert gitops.head_sha(run_work_tree(fixture_repo)) == p1_target  # branch already reset
     assert RX.load_intent(run_dir) is not None
     stale = mgr.status("demo")
     assert [c.phase for c in stale.commits] == ["P1", "P2"]  # not yet rewound
@@ -1314,13 +1317,38 @@ def test_internal_rewind_surfaces_governed_operator_discard_loudly(fixture_repo)
     assert gitops.is_ancestor(fixture_repo, ahead, snapshot.snapshot_commit)
 
 
+def _commit_governed_edit_on_the_run_branch(
+    repo: Path, mgr, text: str, *,
+    subject: str = "tweak the plan wording by hand",
+) -> None:
+    """A human's governed-artifact edit, committed where the rollback will see it.
+
+    R9's governance path watches the COMMIT RANGE a rewind discards, so the
+    edit has to be a commit on the run branch. P7g splits where the two happen:
+    the human authors in their own checkout (§14.2 option A — the authoring
+    surface, and what the engine reads and hashes), and the bytes reach the run
+    branch through the engine's publish-into-the-work-tree step. Doing both
+    here, in that order, is what a `same_tree` run does in one move — and what
+    a `dedicated` run does across two trees.
+    """
+    from conftest import run_work_tree as _work
+
+    authority = mgr.layout("demo").slug_dir / "plan.md"
+    authority.write_text(text)
+    work = _work(repo)
+    published = work / "runs" / "demo" / "plan.md"
+    published.parent.mkdir(parents=True, exist_ok=True)
+    published.write_text(text)
+    git(work, "add", "--", "runs/demo/plan.md")
+    git(work, "-c", "user.name=Human", "-c", "user.email=h@h.local",
+        "commit", "-qm", subject)
+
+
 def test_rollback_surfaces_governed_operator_discard_loudly(fixture_repo):
     mgr = _rollback_manager(fixture_repo)
-    plan = fixture_repo / "runs" / "demo" / "plan.md"
-    plan.write_text("manually amended plan\n")
-    git(fixture_repo, "add", "-A")
-    git(fixture_repo, "-c", "user.name=Human", "-c", "user.email=h@h.local",
-        "commit", "-qm", "tweak the plan wording by hand")
+    _commit_governed_edit_on_the_run_branch(
+        fixture_repo, mgr, "manually amended plan\n"
+    )
 
     mgr.rollback("demo", phase=1)
     man = mgr.status("demo")
@@ -1354,14 +1382,11 @@ def test_governed_discard_evidence_survives_kill_before_manifest_persist(
     Git apply cannot turn a governed discard into a silent one. Replay persists
     the warning before clearing the intent."""
     mgr = _rollback_manager(fixture_repo)
-    plan = fixture_repo / "runs" / "demo" / "plan.md"
-    plan.write_text("manual conventional-subject amendment\n")
-    git(fixture_repo, "add", "-A")
-    git(
-        fixture_repo,
-        "-c", "user.name=Human",
-        "-c", "user.email=h@h.local",
-        "commit", "-qm", "PLAN.1: revise the plan before approval",
+    # The subject deliberately LOOKS engine-shaped (`PLAN.1: …`), so the
+    # classifier must reject it on identity rather than on the message.
+    _commit_governed_edit_on_the_run_branch(
+        fixture_repo, mgr, "manual conventional-subject amendment\n",
+        subject="PLAN.1: revise the plan before approval",
     )
     monkeypatch.setattr(
         run_mod,

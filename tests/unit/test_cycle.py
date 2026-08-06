@@ -44,7 +44,7 @@ from gauntlet.engine.manifest import Manifest, PipelineRef
 from gauntlet.engine.orchestrator import Orchestrator
 from gauntlet.engine.pipeline import Pipeline
 
-from conftest import FakeAdapter
+from conftest import FakeAdapter, git
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -397,9 +397,11 @@ def test_only_artifact_dirty_sees_nested_untracked_artifact(fixture_repo):
     assert ".gauntlet/runs/estimation-improvements/prd.md" not in collapsed
     # `work_root` is the tree the guard inspects (P7a); it equals repo_root in
     # the same-tree layout, which is what a real StepContext resolves here.
+    # `artifact_root_in_work` is the artifact's location IN that tree (P7g) —
+    # the same path same-tree, a different one under `dedicated`.
     ctx = SimpleNamespace(
         repo_root=fixture_repo, work_root=fixture_repo,
-        artifact_root=slug_dir, excludes=[],
+        artifact_root=slug_dir, artifact_root_in_work=slug_dir, excludes=[],
     )
     assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is True
 
@@ -413,10 +415,61 @@ def test_only_artifact_dirty_false_when_a_second_path_is_dirty(fixture_repo):
     (fixture_repo / "stray.txt").write_text("unexpected uncommitted work\n")
     # `work_root` is the tree the guard inspects (P7a); it equals repo_root in
     # the same-tree layout, which is what a real StepContext resolves here.
+    # `artifact_root_in_work` is the artifact's location IN that tree (P7g) —
+    # the same path same-tree, a different one under `dedicated`.
     ctx = SimpleNamespace(
         repo_root=fixture_repo, work_root=fixture_repo,
-        artifact_root=slug_dir, excludes=[],
+        artifact_root=slug_dir, artifact_root_in_work=slug_dir, excludes=[],
     )
+    assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is False
+
+
+def test_only_artifact_dirty_locates_the_artifact_in_a_dedicated_run_tree(
+    fixture_repo, tmp_path
+):
+    """P7g: the guard reads the WORK tree's copy, not the operator's authority.
+
+    Under `dedicated` the two are different files (spike §14.2 option A keeps
+    the operator's checkout as the authoring surface, and
+    `_sync_governed_artifacts` publishes the bytes into the run's tree). The
+    guard resolved the artifact against `artifact_root` — a path that is not
+    under `work_root` at all — so `relative_to` raised and the `except ValueError`
+    degraded to "more than the artifact is dirty". The baseline commit then never
+    fired and EVERY artifact-mode cycle failed the round-1 clean-handoff guard,
+    naming the very file the engine had just published there.
+
+    Asserted against a work tree that is a real, separate git repo with the
+    artifact genuinely untracked in it, so the test enters the path it names
+    rather than simulating the outcome.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    git(work, "init", "-q")
+    git(work, "config", "user.name", "Fixture")
+    git(work, "config", "user.email", "fixture@gauntlet.local")
+    git(work, "config", "commit.gpgsign", "false")
+    (work / "README.md").write_text("work tree\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "init")
+
+    # The AUTHORITY: the human's copy, in the operator's checkout, which is not
+    # under `work_root` — this is what made `relative_to` raise.
+    authority = fixture_repo / "runs" / "slug"
+    authority.mkdir(parents=True)
+    (authority / "prd.md").write_text("PRD body\n")
+    # The PUBLISHED copy, in the tree the run branch commits in.
+    in_work = work / "runs" / "slug"
+    in_work.mkdir(parents=True)
+    (in_work / "prd.md").write_text("PRD body\n")
+
+    ctx = SimpleNamespace(
+        repo_root=fixture_repo, work_root=work,
+        artifact_root=authority, artifact_root_in_work=in_work, excludes=[],
+    )
+    assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is True
+    # And a second dirty path in the RUN tree still fails the guard, so the fix
+    # did not trade the ValueError for a blanket pass.
+    (work / "stray.txt").write_text("unexpected uncommitted work\n")
     assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is False
 
 

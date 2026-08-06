@@ -2097,7 +2097,32 @@ class RunManager:
                 # if the branch is live in any worktree (spike E2-E), which is
                 # the correct fail-closed answer for a spent branch that is
                 # somehow still checked out.
-                gitops.create_branch(self.operator_root, branch, base, force=True)
+                try:
+                    gitops.create_branch(self.operator_root, branch, base, force=True)
+                except gitops.GitError as exc:
+                    # P7g: this became a COMMON path the moment `dedicated`
+                    # became the default. `abort` deliberately keeps the run
+                    # worktree as evidence (spike §11 — "abort while retaining
+                    # all snapshots and evidence"), so the ordinary
+                    # abort-then-re-run sequence now meets a live worktree on a
+                    # spent branch. Failing closed is right; failing closed with
+                    # git's bare `cannot force update the branch ... used by
+                    # worktree at ...` is not — it names no verb the operator
+                    # can run. Auto-releasing the tree here was rejected: it
+                    # would destroy the evidence `abort` was asked to keep,
+                    # silently, inside a verb the operator ran for another
+                    # reason.
+                    raise StaleRunBranchError(
+                        f"run branch {branch!r} is merged into {base!r} (spent) "
+                        f"but a run worktree still holds it, so it cannot be "
+                        f"recreated: {exc}\n"
+                        f"  A previous run of this slug was aborted or left "
+                        f"behind; `abort` keeps its tree deliberately, as "
+                        f"evidence. Remove it with `gauntlet clean "
+                        f"{branch.split('/')[-1]}` (which snapshots any "
+                        f"uncommitted work into refs/gauntlet/recovery/ first), "
+                        f"then start again. Nothing has been changed."
+                    ) from exc
             else:
                 gitops.recreate_branch(repo, branch, base)
             return
@@ -2175,10 +2200,27 @@ class RunManager:
     # each other in BOTH directions — which is what §10's "a half-migrated
     # machine cannot double-drive" is actually asking for.
     #
-    # What P7c retires. Once `worktree.mode: dedicated` gives each run its own
-    # tree, cross-slug exclusion on one tree stops being the thing to protect
-    # and the tree guard becomes the legacy read-only path §10 describes: read
-    # (so a legacy `same_tree` run still blocks), never written.
+    # ---- P7h: what the retirement actually retired -------------------------
+    #
+    # P7g made `dedicated` the default, which is the precondition P7c-1's
+    # CORRECTION 1 named. Cross-slug exclusion on ONE tree stopped being what a
+    # *drive* must protect, so a dedicated drive now takes only its per-run lock
+    # and merely READS this file (§10 step 6: read, never written, for one
+    # release, so a half-migrated machine cannot double-drive).
+    #
+    # It is NOT retired everywhere, and the reason is the other half of
+    # CORRECTION 1 — the half the flip does not make false. `finish` merges the
+    # run branch into the base and `clean` steps the human off it, both IN THE
+    # OPERATOR'S CHECKOUT by design (spike §9.4). Those verbs, `migrate-worktree`
+    # and its rollback, every `same_tree` drive, and `start`'s minting
+    # transaction still write it. See `_acquire_worktree_lock`'s `tree_guard`
+    # argument for the full table and `_demote_to_run_lock` for why `start`'s
+    # boundary is where it is.
+    #
+    # The direction that is genuinely lost, stated rather than discovered: a
+    # pre-P7b engine knows only this path, so it can no longer see a live
+    # dedicated driver. Its own `worktree add` still fails closed on the branch
+    # (E2-A), which is why the loss is acceptable for the one-release window.
 
     def _run_root_dir(self) -> Path:
         return self.repo_root / self.config.run_root
@@ -2369,16 +2411,17 @@ class RunManager:
         )
 
     def _acquire_worktree_lock(
-        self, slug: str, run_id: str | None, *, run_dir: Path | None = None
+        self, slug: str, run_id: str | None, *, run_dir: Path | None = None,
+        tree_guard: bool = True,
     ) -> _LockHandle:
         """Acquire the drive lock for a run and fail closed (FR-10.5).
 
-        Takes the worktree-global **tree guard** first — the coarse, still
-        load-bearing exclusion while every run shares the operator's checkout —
-        then, when ``run_dir`` is given, the **per-run** lock inside that run's
-        instance dir. One record, one nonce, published at both paths. The order
-        is fixed (tree then run) at every call site, and the tree guard is
-        released if the per-run acquisition fails, so no partial hold survives.
+        Takes the worktree-global **tree guard** first — the coarse exclusion
+        that protects the OPERATOR's shared checkout — then, when ``run_dir`` is
+        given, the **per-run** lock inside that run's instance dir. One record,
+        one nonce, published at both paths. The order is fixed (tree then run)
+        at every call site, and the tree guard is released if the per-run
+        acquisition fails, so no partial hold survives.
 
         ``run_dir=None`` is the `start()` case: the run dir does not exist yet
         at acquisition time, so `start` attaches the per-run lock with
@@ -2390,8 +2433,36 @@ class RunManager:
         lexicographically-greatest instance that `resolve_run_instance` picks
         when there is no `active-run.txt`.
 
-        Acquired **first** by `start`/`resume`/`approve`, before any run dir /
-        `active-run.txt` / git mutation.
+        ---- P7h: ``tree_guard=False`` — the retirement (spike §10 step 6) ----
+
+        The guard is the exclusion for **one shared tree**. P7g made `dedicated`
+        the default, so a run's agents no longer edit the operator's checkout
+        and cross-slug exclusion on it stops being the thing a *drive* must
+        protect — git's own one-branch-one-worktree rule (E2-A) supplies A2 for
+        free, per run, because the run branch is per-slug. A dedicated
+        `resume`/`approve`/`reject`/`rollback` therefore passes
+        ``tree_guard=False``: it takes only its per-run lock, and the long agent
+        drive no longer holds a repository-wide exclusion.
+
+        It still **READS** the guard first and fails closed on a live holder.
+        That is §10 step 6's "read, never written, for one release", and it is
+        what stops a half-migrated machine double-driving: a legacy `same_tree`
+        run — or an engine old enough to know only this path — genuinely IS
+        driving the operator's checkout while it holds this file. The reverse
+        direction is lost by construction and is the honest cost of the
+        retirement: a pre-P7b engine knows only the tree guard, so it cannot see
+        a live P7h dedicated driver. Its own `worktree add` still fails closed
+        on the branch.
+
+        Which callers keep writing it, and why each does:
+
+        * every `same_tree` drive — it is that run's real exclusion, unchanged;
+        * `finish` and `clean` — spike §9.4 keeps them as OPERATOR-tree verbs by
+          design (`finish` merges into the base and `clean` steps off the run
+          branch, both in the human's checkout), which is exactly the half of
+          P7c-1's CORRECTION 1 that the flip does NOT make false;
+        * `migrate-worktree` and its rollback — the run is `same_tree` at entry;
+        * `start`, for the minting window only. See :meth:`_demote_to_run_lock`.
         """
         run_root = self._run_root_dir()
         run_root.mkdir(parents=True, exist_ok=True)
@@ -2399,6 +2470,17 @@ class RunManager:
         record = self._new_lock_record(slug, run_id)
         payload = record.to_json()
         tree_path = self._tree_lock_path()
+        if not tree_guard:
+            self._refuse_if_tree_guard_live()
+            if run_dir is None:  # every no-guard call site drives a known run
+                raise WorktreeLockError(
+                    "internal: a drive that does not write the tree guard must "
+                    "name its run dir, or it would hold no lock at all"
+                )
+            run_path = self._run_lock_path(run_dir)
+            self._ensure_run_dir_gitignore(run_dir)
+            self._acquire_one(run_path, record, payload)
+            return self._take_handle(run_path, record.nonce)
         self._acquire_one(tree_path, record, payload)
         handle = self._take_handle(tree_path, record.nonce)
         if run_dir is not None:
@@ -2408,6 +2490,50 @@ class RunManager:
                 self._release_worktree_lock(handle)
                 raise
         return handle
+
+    def _refuse_if_tree_guard_live(self) -> None:
+        """Fail closed on a live holder of the retired tree guard (P7h).
+
+        The READ half of §10 step 6. A holder here is a driver that believes it
+        owns the operator's shared checkout — a legacy `same_tree` run, a
+        `finish`/`clean` in flight, or an engine predating the per-run lock —
+        and every one of those is a reason not to start a second drive.
+
+        A MALFORMED guard fails closed too, for the same reason
+        :meth:`_acquire_one` does: an unreadable lock can belong to a live
+        driver, and treating "I could not read it" as "nobody is there" is how
+        double-driving comes back.
+        """
+        kind, rec = locking.read_lock_state(self._tree_lock_path())
+        if kind == locking.LOCK_MALFORMED:
+            raise WorktreeLockError(
+                locking.malformed_lock_message(self._tree_lock_path())
+            )
+        if kind == locking.LOCK_PRESENT and rec is not None and self._lock_is_live(rec):
+            raise WorktreeLockError(self._lock_busy_message(rec))
+
+    def _demote_to_run_lock(self, handle: _LockHandle) -> None:
+        """Drop the tree guard, keep the per-run lock, for the rest of the drive.
+
+        `start` is the one verb that cannot simply skip the guard: its run dir —
+        and therefore its per-run lock path — does not exist at acquisition
+        time, and the window in between is where the genuine same-slug race
+        lives. Two concurrent `gauntlet run <slug>` invocations mint DIFFERENT
+        run ids, so a purely per-run lock puts them at two different paths and
+        both proceed; the tree guard is what makes the mint a transaction.
+
+        So a dedicated `start` holds the guard for exactly that transaction —
+        run-id mint, branch preparation, run dir, per-run lock, active-run
+        pointer — and demotes here, before the drive. The long agent work then
+        holds only the per-run lock, which is P7h's whole point.
+
+        Idempotent and nonce-guarded like every other release: the guard is
+        unlinked only if it still carries THIS acquisition's nonce (F-004).
+        """
+        if handle.run_path is None:
+            return  # nothing to demote to; keep the guard rather than hold none
+        locking.unlink_if_nonce(handle.path, handle.nonce)
+        handle.path, handle.run_path = handle.run_path, None
 
     def _attach_run_lock(
         self, handle: _LockHandle, run_dir: Path, *, record: _LockRecord | None = None
@@ -2646,6 +2772,16 @@ class RunManager:
             # reloads precisely what started the run (FR-5.6 reproducibility).
             (run_dir / "pipeline.yaml").write_text(pipeline_path.read_text())
             layout.active_pointer.write_text(run_id)
+            if born_dedicated:
+                # P7h: the tree guard covered the MINTING transaction — run id,
+                # branch preparation, run dir, per-run lock, active-run pointer
+                # — because that is where the same-slug race lives (two
+                # concurrent starts mint DIFFERENT run ids and would otherwise
+                # take different per-run paths and both proceed). The drive that
+                # follows edits the run's OWN tree, so from here it holds only
+                # the per-run lock: another slug's resume no longer waits behind
+                # this run's agents, which is what P7h buys.
+                self._demote_to_run_lock(handle)
 
             man = Manifest(
                 run_id=run_id,
@@ -2745,7 +2881,15 @@ class RunManager:
         # Resume is a driving verb (FR-10.5): take the worktree lock FIRST,
         # before the branch checkout / drive. The lock record carries this run's
         # id from the manifest so a concurrent verb's refusal names the holder.
-        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        # P7h: a dedicated drive takes only its per-run lock (it READS the tree
+        # guard and fails closed on a live holder). The mode is resolved before
+        # the acquisition for that reason — it decides which exclusion this verb
+        # needs, and it is evidence-based, so it answers with the driver dead.
+        mode = self._effective_worktree_mode(man)
+        handle = self._acquire_worktree_lock(
+            slug, man.run_id, run_dir=run_dir,
+            tree_guard=(mode != WT.MODE_DEDICATED or same_tree),
+        )
         try:
             # Resolve THIS run's tree before anything observes or mutates one.
             # The mode comes from evidence + what the run was born as, never
@@ -2753,7 +2897,20 @@ class RunManager:
             # is the operator's one-shot override for a run whose worktree is
             # unavailable (spike §13); it drives this resume in the operator's
             # checkout and is never persisted as a mode change.
-            mode = self._effective_worktree_mode(man)
+            # F-1's guard, hoisted ABOVE the tree resolution for a DEDICATED
+            # run (P7g). The authoritative check still lives in `_resume_locked`
+            # against the full branch relation and is what a `same_tree` resume
+            # reaches unchanged; this is additive, and scoped to the one mode
+            # where a MISSING branch is fatal to `worktree add` first: a dedicated
+            # resume died with git's generic `invalid reference: gauntlet/<slug>`
+            # wrapped in a `worktree_unavailable` park that offered
+            # `--same-tree` — an action that only relocates the same failure.
+            # The precise diagnosis ("recreating it from base would drop the
+            # manifest's recorded commits") must reach the operator, and the
+            # refusal must observe rather than mutate, which is the same
+            # ordering `_rollback_locked` states explicitly for its own guards.
+            if mode == WT.MODE_DEDICATED and not same_tree:
+                self._refuse_missing_run_branch(layout, run_dir, man)
             with self._worktree_paths_or_park(
                 layout, run_dir, man, mode=mode, same_tree=same_tree
             ) as paths:
@@ -2765,6 +2922,46 @@ class RunManager:
                 )
         finally:
             self._release_worktree_lock(handle)
+
+    def _refuse_missing_run_branch(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> None:
+        """Fail closed, with the F-1 diagnosis, when the run branch is gone.
+
+        Read from the OPERATOR's checkout because refs are shared across every
+        worktree of a repository (spike E1), so this answers correctly with the
+        run's tree missing — which is precisely the state it has to answer in.
+        Observational only: nothing is created, checked out or moved.
+
+        The refusal carries :meth:`_relation_action_detail` for the R4 reason:
+        the message the mutating path emits must name the SAME executable
+        actions the read-only status surface renders for this relation, and
+        `test_agreement_diverged_rows_status_renders_what_resume_refuses_with`
+        asserts exactly that. Emitting a shorter message here would have made
+        the two surfaces disagree the moment the guard moved.
+        """
+        try:
+            if gitops.branch_exists(self.operator_root, man.branch):
+                return
+        except gitops.GitError:
+            # "Cannot read refs" is not "the branch is missing". This guard is
+            # an EARLY, additive diagnosis — the authoritative one still runs in
+            # `_resume_locked` against the full branch relation — so an
+            # unreadable repository falls through to it rather than being
+            # reported as a deleted branch.
+            return
+        try:
+            detail = self._relation_action_detail(
+                self._observe_resume_branch(layout, run_dir, man), man
+            )
+        except Exception:  # advisory detail must never mask the refusal
+            detail = ""
+        raise RunBranchStateError(
+            f"resume: run branch {man.branch!r} is missing; recreating "
+            "it from base would drop the manifest's recorded commits. "
+            "Restore the branch (e.g. from refs/gauntlet/backup/) "
+            "first." + detail
+        )
 
     def _resume_locked(
         self, layout: "RunLayout", run_dir: Path, man: Manifest, paths: RunPaths,
@@ -3394,7 +3591,12 @@ class RunManager:
         # Approve drives the rest of the run, so it is a driving verb (FR-10.5):
         # take the worktree lock first, released in `finally` on the next park /
         # done / error.
-        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        handle = self._acquire_worktree_lock(
+            slug, man.run_id, run_dir=run_dir,
+            # P7h: a dedicated run's drive holds only its per-run lock; the tree
+            # guard is READ (a live holder still refuses) but not written.
+            tree_guard=self._effective_worktree_mode(man) != WT.MODE_DEDICATED,
+        )
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the approval drives anything (post-P3 review F-002).
@@ -3433,7 +3635,12 @@ class RunManager:
         # `approve` it is a driving verb: take the worktree lock first and honor
         # the judge. The rejection is attributed to the resolved operator identity.
         user = resolve_operator_identity(self.repo_root)
-        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        handle = self._acquire_worktree_lock(
+            slug, man.run_id, run_dir=run_dir,
+            # P7h: a dedicated run's drive holds only its per-run lock; the tree
+            # guard is READ (a live holder still refuses) but not written.
+            tree_guard=self._effective_worktree_mode(man) != WT.MODE_DEDICATED,
+        )
         try:
             # A surviving recovery intent from a killed transaction converges
             # before the rejection re-drives anything (post-P3 review F-002).
@@ -4526,7 +4733,14 @@ class RunManager:
         # FR-6: a completed run's driver is gone, so reap its orphaned judge
         # (identity-verified, driver-gone-only); never the shared console.
         self._reap_orphaned_judge(run_dir, slug)
-        finish_handle = self._acquire_worktree_lock(slug, None, run_dir=None)
+        # P7h / design problem F: `run_dir=None` meant "the tree guard is the
+        # only exclusion", which was true only while that guard was universal.
+        # It is not any more, so finish must name its own run dir or it would
+        # stop excluding a live driver OF ITS OWN RUN — and finish merges and
+        # deletes that run's branch. It keeps writing the tree guard as well:
+        # spike §9.4 makes it an OPERATOR-tree verb by design, which is the half
+        # of P7c-1's CORRECTION 1 the default flip does not make false.
+        finish_handle = self._acquire_worktree_lock(slug, None, run_dir=run_dir)
         try:
             return self._finish_locked(slug, layout, run_dir)
         finally:
@@ -4540,6 +4754,20 @@ class RunManager:
         # one verb whose whole purpose is to touch their checkout (P7a).
         repo = self.operator_root
         branch, base = man.branch, man.base_branch
+        # Where the human actually was when they ran `finish`. The conflict path
+        # below restores it, and until P7g it hard-coded ``branch`` instead —
+        # true only while `same_tree` guaranteed the operator was standing on the
+        # run branch. Under the P7g default they are on their own integration
+        # branch, and a refused merge would have moved them onto a run branch
+        # they had never checked out: not a rewind but a *relocation*, and the
+        # opposite of the "leave the human where they were" the code intends.
+        # ``None`` on a detached HEAD, which is left alone rather than guessed at.
+        try:
+            was_on = gitops.current_branch(repo)
+        except gitops.GitError:
+            was_on = None
+        if was_on == "HEAD":
+            was_on = None
 
         if man.status != M.RUN_DONE:
             raise FinishError(
@@ -4696,7 +4924,8 @@ class RunManager:
             except gitops.GitError:
                 pass
             try:
-                gitops.checkout_branch(repo, branch)  # leave the human where they were
+                if was_on:  # leave the human where they were (P7g: measured, not assumed)
+                    gitops.checkout_branch(repo, was_on)
             except gitops.GitError:
                 pass
             kept = self._settle_quarantined(moved)
@@ -4716,7 +4945,9 @@ class RunManager:
             raise FinishError(
                 f"merge of {branch!r} into {base!r} conflicts (or was refused "
                 f"outright); resolve it manually — any half-merge was aborted "
-                f"and you are back on {branch!r}. Details: {exc}{restored}"
+                + (f"and you are back on {was_on!r}. " if was_on
+                   else "and your checkout was left as it was. ")
+                + f"Details: {exc}{restored}"
             )
         # The merge landed, so git has rewritten every quarantined path as a
         # tracked file. Only now is the set-aside copy redundant.
@@ -4842,7 +5073,12 @@ class RunManager:
         blocker = self.migration_blocker(man, liveness=liveness)
         if blocker is not None:
             raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
-        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        handle = self._acquire_worktree_lock(
+            slug, man.run_id, run_dir=run_dir,
+            # P7h: a dedicated run's drive holds only its per-run lock; the tree
+            # guard is READ (a live holder still refuses) but not written.
+            tree_guard=self._effective_worktree_mode(man) != WT.MODE_DEDICATED,
+        )
         try:
             # Re-read under the lock. Between the check above and the
             # acquisition another engine could have migrated this run; the
@@ -5385,6 +5621,11 @@ class RunManager:
         blocker = self._migration_rollback_blocker(man, liveness=liveness)
         if blocker is not None:
             raise MigrateWorktreeRefused(self._rollback_refusal(blocker, man))
+        # P7h: this verb ENDS a run's dedicated life and hands its branch back
+        # to the operator's checkout, so it keeps the tree guard even though the
+        # run resolves `dedicated` at entry — it is an operator-tree transition,
+        # not a drive, and it must exclude a concurrent `same_tree` driver of
+        # another slug for the same reason `finish` and `clean` do.
         handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
@@ -5704,7 +5945,12 @@ class RunManager:
         # Rollback is a worktree-mutating verb: take the drive lock so a live
         # driver can never race the rewind (PR #77 review), exactly like
         # resume/abort.
-        handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
+        handle = self._acquire_worktree_lock(
+            slug, man.run_id, run_dir=run_dir,
+            # P7h: a dedicated run's drive holds only its per-run lock; the tree
+            # guard is READ (a live holder still refuses) but not written.
+            tree_guard=self._effective_worktree_mode(man) != WT.MODE_DEDICATED,
+        )
         try:
             # Converge any surviving recovery intent BEFORE the guards run
             # (post-P3 review F-002): a rollback killed between its Git apply
@@ -5717,6 +5963,17 @@ class RunManager:
             # must run in the run's own tree — spike E8-B measured the
             # isolation this buys: a hard reset there leaves the operator's
             # branch, HEAD, index and reflog untouched.
+            #
+            # P7g: for a DEDICATED run the missing-branch guard is hoisted
+            # ABOVE the tree resolution, because `worktree add` is what meets a
+            # deleted branch first and it answers with git's generic `invalid reference`
+            # wrapped in a `worktree_unavailable` park offering `--same-tree` —
+            # an action that cannot help when the branch itself is gone. This
+            # verb's own contract ("EVERY guard and resolution BEFORE the
+            # checkout … prevalidation is observational") requires the specific
+            # refusal, and it must reach the operator before anything is built.
+            if self._effective_worktree_mode(man) == WT.MODE_DEDICATED:
+                self._refuse_missing_rollback_branch(man)
             with self._worktree_paths_or_park(
                 layout, run_dir, man, mode=self._effective_worktree_mode(man)
             ):
@@ -5732,6 +5989,24 @@ class RunManager:
             slug, before_fp, verb="rollback", exempt_human_waits=False
         )
         return target
+
+    def _refuse_missing_rollback_branch(self, man: Manifest) -> None:
+        """The `_rollback_locked` branch guard, reachable before the tree exists.
+
+        Read from the OPERATOR's checkout: refs are shared across every worktree
+        of a repository (spike E1), so this answers correctly with the run's tree
+        missing — which is the state it exists to answer in. Observational only.
+        """
+        try:
+            if gitops.branch_exists(self.operator_root, man.branch):
+                return
+        except gitops.GitError:
+            return  # unreadable refs ≠ missing branch; `_rollback_locked` decides
+        raise RollbackGuardError(
+            f"refusing rollback: run branch {man.branch!r} is missing; "
+            "restore it (e.g. from refs/gauntlet/backup/ or "
+            "refs/gauntlet/recovery/) first"
+        )
 
     def _rollback_locked(self, layout, run_dir, man: Manifest, phase: int) -> str:
         # Rollback rewinds the RUN BRANCH (FR-9.9) — never whatever branch
@@ -5757,6 +6032,23 @@ class RunManager:
             self.work_root, self._bookkeeping_root(run_dir),
             self._artifact_root_in_work(layout),
         )
+        if self._paths is not None and self._paths.dedicated_worktree:
+            # P7g. The engine PUBLISHES the operator's governed artifacts into
+            # this tree on every mutating contact (§14.2 option A), so under
+            # `dedicated` the copy is engine-written content sitting uncommitted
+            # in the very tree this guard inspects — and rollback refused on the
+            # file the drive it belongs to had just placed there. `finish` and
+            # `migrate-worktree --rollback` already share the one derivation of
+            # "what may legitimately sit uncommitted in a run's own worktree";
+            # the phase rollback was simply missing from that set.
+            #
+            # It is `_verified_synced_artifacts`, not a category exemption: each
+            # artifact earns its place by proven byte-identity with the
+            # operator's authoritative copy (review F-003), so a governed file
+            # EDITED inside the run tree still blocks and is still named.
+            excludes = excludes + self._verified_synced_artifacts(
+                self.work_root, self._artifact_root_in_work(layout), layout
+            )
         if not gitops.is_clean(self.work_root, exclude=excludes):
             raise RollbackGuardError(
                 "refusing rollback: worktree is dirty; commit or discard "

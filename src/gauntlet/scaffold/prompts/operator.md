@@ -120,9 +120,9 @@ behind that output. Drive every decision off the reported state class:
   committed `P<N> wip:` checkpoint (committed milestones survive), and re-runs
   the step cleanly. One-shot — the configured `interrupted_step` policy is
   unchanged. Never reach for `git reset` on a run branch instead.
-- **`worktree_unavailable`** — the run is configured for a dedicated worktree
-  (`worktree.mode: dedicated`) and that tree could not be created, locked, or
-  verified: the path was taken, the branch is checked out somewhere else, the
+- **`worktree_unavailable`** — the run drives a dedicated worktree (the
+  default since P7g; `worktree.mode: same_tree` opts back out) and that tree
+  could not be created, locked, or verified: the path was taken, the branch is checked out somewhere else, the
   disk filled, or the repo has uninitialized submodules. **Nothing was moved
   or modified** — the run is exactly where it was, and the engine did *not*
   quietly fall back to your checkout. `status` names the reason and the git
@@ -153,12 +153,15 @@ behind that output. Drive every decision off the reported state class:
   verifies the recreated HEAD matches the journal head before driving. Do
   **not** hand-run `git worktree add`; the engine also re-establishes the
   anti-prune lock that stops another run's cleanup from removing it again.
-- **a `same_tree` run offered migration** — not a park and not a problem: a run
-  that started before (or beside) the dedicated layout drives your checkout, and
-  `status` offers the **optional** action `gauntlet migrate-worktree <slug>` to
-  give it a tree of its own. Nothing moves a run for you — setting
-  `worktree.mode: dedicated` in config only decides what *new* runs are born as,
-  so an existing run keeps driving `same_tree` until you run this by name.
+- **a `same_tree` run offered migration** — not a park and not a problem, and
+  since P7g it is the *exception* rather than the norm: a run that started
+  before the dedicated layout became the default, or one an adopter deliberately
+  pinned to `worktree.mode: same_tree`, drives your checkout, and `status`
+  offers the **optional** action `gauntlet migrate-worktree <slug>` to give it a
+  tree of its own. Nothing moves a run for you — the config `mode` only decides
+  what *new* runs are born as, so an existing run keeps driving `same_tree`
+  until you run this by name. That asymmetry is deliberate: a default flip must
+  never relocate a run that is already under way.
   Copy, never move: the branch, its commits, the journal, the manifest and the
   run dir all stay exactly where they are; only the tree the agents edit
   changes. Undo with `gauntlet migrate-worktree <slug> --rollback`, which
@@ -346,12 +349,12 @@ defeats the safety the pipeline is built on.
   for it, and the resume revalidates and records the edit (content-hash audit)
   rather than trusting it blindly. No other state licenses an edit.
 
-  With `worktree.mode: dedicated` this guardrail stops being something you hold
-  in your head and becomes **structural**: the builder's tree is a separate
-  directory — `.gauntlet/worktrees/<slug>/<run-id>` inside your repo, gitignored
-  by an engine-owned marker — that you have no reason to open, rather than files
+  Since P7g this guardrail is **structural rather than behavioural for every
+  new run**, with no configuration: the builder's tree is a separate directory —
+  `.gauntlet/worktrees/<slug>/<run-id>` inside your repo, gitignored by an
+  engine-owned marker — that you have no reason to open, rather than files
   sitting in your own editor. That is the clearest operator-facing win of the
-  dedicated layout. The trade, stated plainly: the agent's work no longer
+  dedicated layout, and it now applies by default. The trade, stated plainly: the agent's work no longer
   appears in the files you are already editing. It is still browsable when you
   want it (`status --json` → `worktree.path` names the exact directory), but
   reach for `gauntlet logs <slug>` for the live transcript and `git diff

@@ -82,9 +82,11 @@ from typing import Callable
 
 from gauntlet.engine import git_snapshot, gitops, repolock
 
-# `worktree.mode` values (spike §13). `same_tree` is the DEFAULT and stays the
-# mode of every legacy run forever (§16); `dedicated` is opt-in until a dogfood
-# run justifies P7d flipping it.
+# `worktree.mode` values (spike §13). `dedicated` is the DEFAULT since P7g, so
+# acceptance A1/A2/A3 hold for runs in general. `same_tree` is not removed
+# (§16): it stays the mode of every legacy run forever, and the documented,
+# explicitly-selectable fallback for an adopter layout that cannot host a
+# worktree.
 MODE_SAME_TREE = "same_tree"
 MODE_DEDICATED = "dedicated"
 MODES = (MODE_SAME_TREE, MODE_DEDICATED)

@@ -37,13 +37,14 @@ from gauntlet.engine import gitops, locking, manifest as M, operator as op, repo
 from gauntlet.engine.manifest import Manifest
 from gauntlet.engine.recovery_exec import RecoveryLockError, WorktreeLockGuard
 from gauntlet.engine.run import (
+    ActiveRunError,
     DRIVING_LOCK_NAME,
     RunManager,
     WorktreeLockError,
 )
 from gauntlet.procident import read_process_identity
 
-from conftest import git
+from conftest import FakeAdapter, git, run_work_tree
 
 CHILD = Path(__file__).parent / "_crash_child.py"
 
@@ -75,6 +76,11 @@ stages:
       - {id: after, type: shell, run: "true"}
 """
 
+# P7h: the mode the tree guard is still FOR — a run that edits the operator's
+# own checkout, where cross-slug exclusion on that one tree remains the thing to
+# protect. Pinned explicitly since P7g made `dedicated` the default.
+CONFIG_SAME_TREE = CONFIG_YAML + "worktree:\n  mode: same_tree\n"
+
 CRASH_PIPELINE = """
 name: crash
 version: 1
@@ -88,9 +94,9 @@ stages:
 
 
 # --- fixtures / helpers ------------------------------------------------------
-def _prepare(repo: Path) -> RunManager:
+def _prepare(repo: Path, config: str = CONFIG_YAML) -> RunManager:
     (repo / ".gauntlet").mkdir()
-    (repo / ".gauntlet" / "config.yaml").write_text(CONFIG_YAML)
+    (repo / ".gauntlet" / "config.yaml").write_text(config)
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "add config")
     return RunManager(repo)
@@ -177,13 +183,27 @@ def _isolate_repo_lock():
 # =============================================================================
 
 
-def test_two_concurrent_drives_of_different_slugs_cannot_both_proceed(fixture_repo):
-    """Decision A, the cross-slug half: one shared tree, one driver.
+def test_two_concurrent_drives_of_different_slugs_both_proceed_on_their_own_trees(
+    fixture_repo,
+):
+    """Decision A's cross-slug half, RETIRED at P7h — as its own text foretold.
 
-    The per-run lock cannot supply this — ``alpha`` and ``beta`` take different
-    per-run paths by construction. Only the retained worktree-global guard
-    stops the second verb, and it must keep doing so until P7c gives each run
-    its own tree (spike §8.1's one-branch-one-worktree rule is what replaces it).
+    Through P7f this asserted the opposite, and said why: the guard "must keep
+    doing so **until P7c gives each run its own tree** (spike §8.1's
+    one-branch-one-worktree rule is what replaces it)". P7g made `dedicated` the
+    default, so that condition is now met and the exclusion it named is no
+    longer the thing to protect: `alpha` and `beta` edit different directories
+    and commit to different branches, and git's own rule (E2-A) supplies
+    acceptance A2 per run, for free, because the run branch is per-slug.
+
+    So the assertion inverts, and it is deliberately more than "no exception
+    was raised": both runs must actually have their own registered tree, and
+    each must hold its own branch. A pair that both "succeeded" into ONE tree
+    would pass a bare no-raise check and be the exact defect this file exists
+    to catch.
+
+    What is NOT retired is asserted by the two tests below: the same-slug mint
+    is still serialised, and a live holder of the tree guard still refuses.
     """
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "alpha")
@@ -207,11 +227,15 @@ def test_two_concurrent_drives_of_different_slugs_cannot_both_proceed(fixture_re
         adapter_factory=lambda n: _MidStepAdapter(drive_beta),
     ) == M.RUN_DONE
 
-    assert len(seen) == 1
-    assert isinstance(seen[0], WorktreeLockError), seen
-    assert "being driven by alpha" in str(seen[0])
-    # ...and beta genuinely never started: no run instance, no per-run lock.
-    assert not (fixture_repo / "runs" / "beta" / "active-run.txt").exists()
+    assert seen == ["PROCEEDED"], seen
+    # ...and beta genuinely ran: its own instance, its own tree, its own branch.
+    assert (fixture_repo / "runs" / "beta" / "active-run.txt").exists()
+    alpha_tree = run_work_tree(fixture_repo, "alpha")
+    beta_tree = run_work_tree(fixture_repo, "beta")
+    assert alpha_tree != fixture_repo and beta_tree != fixture_repo
+    assert alpha_tree != beta_tree
+    assert gitops.current_branch(alpha_tree) == "gauntlet/alpha"
+    assert gitops.current_branch(beta_tree) == "gauntlet/beta"
 
 
 def test_two_concurrent_starts_of_the_same_slug_cannot_both_proceed(fixture_repo):
@@ -220,9 +244,17 @@ def test_two_concurrent_starts_of_the_same_slug_cannot_both_proceed(fixture_repo
     Two concurrent ``gauntlet run <slug>`` invocations mint DIFFERENT run ids
     (``run-<utc>``), so a purely per-run lock puts them at two different paths
     and both proceed, with only the racy ``active-run.txt`` check between them.
-    The refusal must be the LOCK's (``WorktreeLockError``), not the per-slug
-    orphan guard's (``ActiveRunError``) — the orphan guard runs after the
-    acquisition and is moot at a gate, so it cannot carry this guarantee.
+    P7h does NOT retire this. The tree guard still covers `start`'s MINTING
+    transaction — run id, branch preparation, run dir, per-run lock, active-run
+    pointer — and only demotes to the per-run lock afterwards
+    (`RunManager._demote_to_run_lock`). That boundary is chosen precisely here:
+    before it, two starts would race with nothing between them; after it, the
+    pointer is durable and the per-slug orphan guard is authoritative.
+
+    So the refusal is asserted as an OUTCOME rather than as one exception type:
+    whichever side of the demote the second start lands on, it must be refused
+    and exactly one run instance must exist. Pinning the type would assert the
+    mechanism's internals, and the mechanism is what moved.
     """
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "alpha")
@@ -244,7 +276,7 @@ def test_two_concurrent_starts_of_the_same_slug_cannot_both_proceed(fixture_repo
         adapter_factory=lambda n: _MidStepAdapter(second_start),
     ) == M.RUN_DONE
 
-    assert isinstance(seen[0], WorktreeLockError), seen
+    assert isinstance(seen[0], (WorktreeLockError, ActiveRunError)), seen
     # Exactly one run instance exists — the second start minted nothing.
     instances = sorted(
         p.name for p in (fixture_repo / "runs" / "alpha").iterdir()
@@ -253,8 +285,20 @@ def test_two_concurrent_starts_of_the_same_slug_cannot_both_proceed(fixture_repo
     assert len(instances) == 1, instances
 
 
-def test_both_scopes_are_held_during_a_drive_and_both_released_after(fixture_repo):
-    """One acquisition, one nonce, two files — and a clean release of both."""
+def test_a_dedicated_drive_holds_only_the_per_run_lock(fixture_repo):
+    """P7h: the tree guard covers the MINT, the per-run lock covers the DRIVE.
+
+    Through P7f both files were held for the whole drive — one acquisition, one
+    nonce, two files. P7g gave every run its own tree, so holding a
+    repository-wide exclusion for the length of the agent work stopped being
+    the thing to protect, and `start` demotes to the per-run lock the moment its
+    minting transaction is durable.
+
+    Asserted from INSIDE a live drive, because that is the only place the
+    difference is observable, and asserted as the per-run lock genuinely being
+    held (right slug, right run id, this pid) rather than merely as the tree
+    guard being absent — "no lock at all" would also satisfy the weaker form.
+    """
     mgr = _prepare(fixture_repo)
     _author_prd(mgr, "alpha")
     git(fixture_repo, "add", "-A")
@@ -276,13 +320,79 @@ def test_both_scopes_are_held_during_a_drive_and_both_released_after(fixture_rep
     ) == M.RUN_DONE
 
     tree, run = observed["tree"], observed["run"]
-    assert tree is not None and run is not None, observed
-    assert tree.nonce == run.nonce  # one acquisition
-    assert tree.pid == run.pid == os.getpid()
+    assert run is not None, observed          # the drive's own exclusion IS held
+    assert run.pid == os.getpid()
     assert run.slug == "alpha" and run.run_id is not None
-    # Released in reverse order, both gone.
+    assert tree is None, (                    # ...and the repo-wide one is not
+        "a dedicated drive still holds the worktree-global tree guard; P7h "
+        "demotes to the per-run lock once the mint is durable"
+    )
+    # Released, and nothing left behind at either scope.
     assert not _tree_lock(fixture_repo).exists()
     assert not (observed["run_dir"] / DRIVING_LOCK_NAME).exists()
+
+
+def test_a_same_tree_drive_still_holds_both_scopes(fixture_repo):
+    """The half P7h does NOT retire: one shared tree still needs one driver.
+
+    A `same_tree` run edits the operator's checkout, so cross-slug exclusion on
+    that tree is still exactly what the guard is for. This is the control for
+    the test above — without it, "the tree guard is absent" would be satisfied
+    by an engine that simply stopped writing it everywhere.
+    """
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
+    _author_prd(mgr, "alpha")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "author PRD")
+    linear = _pipeline(fixture_repo, LINEAR)
+    observed: dict[str, object] = {}
+
+    def inspect() -> None:
+        run_dir = mgr.layout("alpha").active_run_dir()
+        observed["tree"] = locking.read_record(_tree_lock(fixture_repo))
+        observed["run"] = locking.read_record(run_dir / DRIVING_LOCK_NAME)
+        observed["run_dir"] = run_dir
+
+    assert mgr.start(
+        "alpha", linear, use_judge=False,
+        adapter_factory=lambda n: _MidStepAdapter(inspect),
+    ) == M.RUN_DONE
+
+    tree, run = observed["tree"], observed["run"]
+    assert tree is not None and run is not None, observed
+    assert tree.nonce == run.nonce  # still one acquisition, two files
+    assert tree.pid == run.pid == os.getpid()
+    assert not _tree_lock(fixture_repo).exists()
+    assert not (observed["run_dir"] / DRIVING_LOCK_NAME).exists()
+
+
+def test_a_live_tree_guard_still_refuses_a_dedicated_drive(fixture_repo):
+    """§10 step 6's READ half: retired to read-only, not to ignored.
+
+    A holder of the tree guard is a driver that believes it owns the operator's
+    shared checkout — a legacy `same_tree` run, a `finish`/`clean` in flight, or
+    an engine predating the per-run lock. A dedicated drive no longer WRITES
+    this file, but it must still refuse while one is live, or a half-migrated
+    machine double-drives (spike §10 step 6).
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "alpha")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "author PRD")
+    gated = _pipeline(fixture_repo, GATED)
+    assert mgr.start("alpha", gated, use_judge=False) == M.RUN_PARKED
+    run_dir = mgr.layout("alpha").active_run_dir()
+
+    # A live legacy holder, named for another slug — the half-migrated shape.
+    _write_lock(_tree_lock(fixture_repo), pid=os.getpid(),
+                identity=_live_identity(), slug="legacy-other",
+                nonce="nonce-legacy")
+    with pytest.raises(WorktreeLockError, match="being driven by legacy-other"):
+        mgr.resume("alpha", use_judge=False)
+    # Refused without writing anything: the guard still carries the legacy nonce
+    # and this run took no per-run lock.
+    assert locking.read_record(_tree_lock(fixture_repo)).nonce == "nonce-legacy"
+    assert not (run_dir / DRIVING_LOCK_NAME).exists()
 
 
 def test_per_run_lock_never_dirties_the_worktree(fixture_repo):
@@ -330,8 +440,6 @@ def test_a_refused_start_leaves_no_empty_run_instance(fixture_repo):
     gated = _pipeline(fixture_repo, GATED)
     assert mgr.start("alpha", gated, use_judge=False) == M.RUN_PARKED
     before = sorted(p.name for p in (fixture_repo / "runs" / "alpha").iterdir())
-    from gauntlet.engine.run import ActiveRunError
-
     with pytest.raises(ActiveRunError):  # the parked run blocks a second start
         mgr.start("alpha", gated, use_judge=False)
     assert sorted(p.name for p in (fixture_repo / "runs" / "alpha").iterdir()) == before
@@ -810,10 +918,15 @@ def test_lock_deleted_mid_drive_leaves_a_resumable_run(fixture_repo):
             self.calls = 0
 
         def __call__(self) -> None:
+            # P7h: a dedicated drive holds only the per-run lock, so the tree
+            # guard is legitimately absent here. Delete whatever IS held — the
+            # claim under test is "a vanished lock does not crash the drive nor
+            # wedge the run", and that has to hold for the scopes actually in
+            # play rather than for a fixed pair.
             held["tree_before"] = _tree_lock(fixture_repo).exists()
             held["run_before"] = (run_dir / DRIVING_LOCK_NAME).exists()
-            _tree_lock(fixture_repo).unlink()
-            (run_dir / DRIVING_LOCK_NAME).unlink()
+            _tree_lock(fixture_repo).unlink(missing_ok=True)
+            (run_dir / DRIVING_LOCK_NAME).unlink(missing_ok=True)
 
     # `approve` re-drives; the `after` shell step runs under the held lock, so
     # remove the files from a manifest-write hook instead of an agent step.
@@ -833,7 +946,11 @@ def test_lock_deleted_mid_drive_leaves_a_resumable_run(fixture_repo):
     finally:
         Manifest.write_atomic = real_write
 
-    assert held == {"tree_before": True, "run_before": True}
+    # P7h: `approve` on a dedicated run holds only the per-run lock. The
+    # per-run half is the one this test is about (it is the drive's exclusion);
+    # the tree guard's presence is mode-dependent and is asserted directly by
+    # the retirement tests below.
+    assert held["run_before"] is True, held
     assert status == M.RUN_DONE  # the drive survived its lock vanishing
     # And the run is not wedged: a further verb acquires cleanly.
     handle = mgr._acquire_worktree_lock("alpha", "run-x", run_dir=run_dir)
@@ -1407,3 +1524,44 @@ def test_lock_record_json_shape_is_unchanged():
     assert time.strptime(data["started_at"], "%Y-%m-%dT%H-%M-%S")
     assert locking.LockRecord.from_json(rec.to_json()) == rec
 
+
+
+def test_finish_takes_the_per_run_lock_of_its_own_run(fixture_repo):
+    """P7h / design problem F: `finish` passed ``run_dir=None``.
+
+    That was safe only while the tree guard was universal — it WAS the
+    exclusion, so naming a run dir added nothing. Once a dedicated drive stops
+    writing the guard, `run_dir=None` means finish stops excluding a live driver
+    OF ITS OWN RUN, and finish merges and then deletes that run's branch. The
+    per-run lock is the only thing that can answer "is this run being driven?",
+    so finish must take it.
+
+    Asserted through the real verb against a genuinely held per-run lock, not by
+    inspecting the call: the claim is that finish REFUSES, not that it passes an
+    argument.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "alpha")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "author PRD")
+    linear = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start(
+        "alpha", linear, use_judge=False,
+        adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}),
+    ) == M.RUN_DONE
+    run_dir = mgr.layout("alpha").active_run_dir()
+
+    # A live driver of THIS run, at the per-run path — the only place a
+    # dedicated drive publishes.
+    _write_lock(run_dir / DRIVING_LOCK_NAME, pid=os.getpid(),
+                identity=_live_identity(), slug="alpha", run_id=run_dir.name,
+                nonce="nonce-live-driver")
+
+    with pytest.raises(WorktreeLockError, match="being driven by alpha"):
+        mgr.finish("alpha")
+    # Refused having changed nothing: the branch is intact and the run's
+    # driver still holds its lock.
+    assert gitops.branch_exists(fixture_repo, "gauntlet/alpha")
+    assert locking.read_record(
+        run_dir / DRIVING_LOCK_NAME
+    ).nonce == "nonce-live-driver"

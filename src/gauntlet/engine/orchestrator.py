@@ -940,6 +940,16 @@ class Orchestrator:
             # the manifest, labelled with the canonical response-checkpoint
             # subject so it stands in as the pending checkpoint itself (the
             # post-rewind reconcile below is then a no-op, not a duplicate).
+            # P7g: materialize the export BEFORE resolving the paths, for the
+            # same reason `commit_run_bookkeeping` does (see its comment). Under
+            # `dedicated` the bookkeeping paths live inside the run worktree and
+            # `run_bookkeeping_paths` filters by EXISTENCE, so without this the
+            # list comes back empty, `preserving` goes False, and the rewind
+            # silently degrades to a plain `reset --hard` — which orphans the
+            # pending-response checkpoint this whole block exists to preserve.
+            # F-001 was not re-broken by the flip; it was re-broken by the
+            # export not being on disk yet, and the flip made that the default.
+            self._refresh_bookkeeping_export()
             paths = self._bookkeeping_paths()
             preserving = bool(paths) and gitops.head_sha(self.work_root) != target
             message = (

@@ -335,6 +335,39 @@ class StepContext:
         """The governed artifacts' location in the work tree (spike §14.2)."""
         return self.paths.artifact_root_in_work
 
+    def publish_artifact(self, name: str) -> Path:
+        """Copy a freshly authored artifact into the work tree; return its path.
+
+        Spike §14.2 option A splits authoring from committing: a producer step
+        writes its ``output:`` into ``artifact_root`` — the operator's checkout,
+        which is what the engine reads, validates and hashes — while the run
+        branch is committed in ``work_root``. Same-tree those are one file and
+        this is a no-op returning the same path.
+
+        Under `dedicated` they are two files, and nothing bridged them
+        MID-DRIVE: :meth:`RunManager._sync_governed_artifacts` runs once when
+        the run's roots are resolved, so an artifact authored after that point
+        (``plan.md``, produced by the plan-author step of the shipped `standard`
+        pipeline) never reached the tree it had to be committed in. The producer
+        commit then failed closed with "artifact 'plan.md' resolves outside the
+        repo", and a producer WITHOUT ``commit_output`` fared worse: its
+        reviewer would have been handed a tree the artifact was simply not in.
+        P7g's flip is what made that the default path rather than an opt-in one.
+
+        Copy, never link, for §14.2 option C's reason: the run worktree gets
+        ``reset --hard``, and a symlinked tracked path under a hard reset is how
+        the human's file is lost.
+        """
+        src = self.artifact_root / name
+        dest = self.artifact_root_in_work / name
+        if dest == src or not src.exists():
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        data = src.read_bytes()
+        if not dest.exists() or dest.read_bytes() != data:
+            dest.write_bytes(data)
+        return dest
+
     def refresh_bookkeeping_export(self) -> None:
         """Re-materialize the two-file export from the live projection (§4.4).
 

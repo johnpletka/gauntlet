@@ -482,11 +482,13 @@ class WorktreeConfig(BaseModel):
 
     ``mode`` chooses which tree a run's agents edit and the engine commits in:
 
-    * ``same_tree`` (**the default, and what P7c ships with**) — the pre-P7
-      layout: the run drives the operator's own checkout. Every run started
-      before P7c is this mode forever (spike §10/§16), and it stays the
-      documented fallback for any adopter layout that cannot host a worktree.
-    * ``dedicated`` — the run gets its own linked worktree at the derived path
+    * ``same_tree`` — the pre-P7 layout: the run drives the operator's own
+      checkout. Every run started before P7c is this mode forever (spike
+      §10/§16), and it stays the documented fallback for any adopter layout
+      that cannot host a worktree. **Not removed by the flip** — selecting it
+      explicitly is supported, and is the one way an adopter opts back out.
+    * ``dedicated`` (**the default since P7g**) — the run gets its own linked
+      worktree at the derived path
       ``<main-worktree>/.gauntlet/worktrees/<slug>/<run-id>`` (§6.2 as corrected
       by P7e; the ratified §6.2 location under the git dir is unusable because
       the `claude` CLI refuses to write any path carrying a ``.git`` segment —
@@ -495,15 +497,22 @@ class WorktreeConfig(BaseModel):
       validator, and spike E9-C proves the string-based check this module
       already has is defeated by a symlink (§6.4, deferral D2).
 
-    The default is `same_tree` because §13's phasing makes flipping it a
-    separate stage (P7d) gated on a dogfood run that exercises §11 rows 2, 5
-    and 10. So P7's acceptance criteria A1/A2/A3 hold for runs a human has
-    explicitly opted in — not for runs in general — until that gate passes.
+    **P7g flipped the default**, which is the whole of that phase's production
+    change. §13 made the flip a separate stage gated on a dogfood run; P7d ran
+    it, found spike §6.2's root unwritable by the `claude` CLI, and halted. P7e
+    relocated the root, P7f added the per-adapter writability preflight, and
+    this line is what P7g changes. From here P7's acceptance criteria A1/A2/A3
+    hold for runs **in general** rather than only for runs a human opted in.
+
+    Setting a mode never moves an EXISTING run: `RunManager` reads this in
+    exactly one place (`start`), records it on the manifest, and resolves every
+    later verb from that record plus observed evidence. Flipping a default that
+    silently relocated live runs would be the auto-migration spike §10 forbids.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    mode: str = "same_tree"
+    mode: str = "dedicated"
 
     @field_validator("mode")
     @classmethod
@@ -559,8 +568,8 @@ class RunConfig(BaseModel):
     # repos with `asset_root: .gauntlet` so every gauntlet-owned file lives under
     # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
     asset_root: str = "."
-    # Which tree a run's agents edit (P7c, spike §13). Defaults to the pre-P7
-    # `same_tree` layout; `dedicated` is opt-in until P7d flips it. See
+    # Which tree a run's agents edit (P7c, spike §13). Defaults to `dedicated`
+    # since P7g; `same_tree` stays selectable as the legacy/fallback mode. See
     # WorktreeConfig — the worktree PATH is derived and has no knob (§6.4).
     worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
     test_command: str = "uv run pytest"

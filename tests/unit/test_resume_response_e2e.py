@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import run_work_tree
 from gauntlet.engine import gitops, manifest as M
 
 from test_resume_response import (
@@ -106,13 +107,14 @@ def test_e2e_conflict_resume_proceeds_unsticks_run(tmp_path):
         "Gauntlet Engine|gauntlet: response implement-resp-1 consumed",
     ]
     # The phase commit itself landed (the proceed path committed real work).
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
-    assert (repo / "feature.py").exists()
+    # P7g: the phase commit lands on the run BRANCH, in the run's tree.
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert (run_work_tree(repo) / "feature.py").exists()
     # PRD §8 / appendix: the implementation phase commit BODY references the
     # consumed response_id, linking the committed code to the human decision that
     # ratified it — the audit linkage the bookkeeping checkpoint alone cannot
     # stand in for (F-001).
-    phase_body = gitops.commit_message(repo, "HEAD")
+    phase_body = gitops.commit_message(repo, "gauntlet/demo")
     assert "Gauntlet-Response: implement-resp-1" in phase_body
 
 
@@ -193,9 +195,10 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
         "Gauntlet Engine|gauntlet: response implement-resp-2 pending",
         "Gauntlet Engine|gauntlet: response implement-resp-2 consumed",
     ]
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    # P7g: the phase commit lands on the run BRANCH, in the run's tree.
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
     # PRD §8 / appendix: the phase commit body references BOTH consumed responses
     # — the full audit linkage from the committed code to every human decision in
     # the cycle that produced it (F-001).
-    phase_body = gitops.commit_message(repo, "HEAD")
+    phase_body = gitops.commit_message(repo, "gauntlet/demo")
     assert "Gauntlet-Response: implement-resp-1, implement-resp-2" in phase_body

@@ -27,7 +27,7 @@ from gauntlet.engine.run import (
     WorktreeDirtyError,
 )
 
-from conftest import FakeAdapter, git
+from conftest import FakeAdapter, git, run_work_tree
 
 CONFIG_YAML = """
 base_branch: main
@@ -38,6 +38,17 @@ agents:
 """
 
 CONFIG_BASE_CURRENT = CONFIG_YAML.replace("base_branch: main", "base_branch: current")
+
+# The #61 dirty-worktree preflight is a `same_tree` guard, and P7g makes that
+# explicit rather than inherited. The bug it defends is mechanical: `checkout -b`
+# CARRIES the operator's uncommitted changes onto the fresh run branch, which
+# then fails the first clean-handoff guard and strands a half-born branch. A
+# `dedicated` run mints the branch from the base ref and checks out a fresh
+# worktree, so the operator's dirt has no route onto it — the engine already
+# skips the guard for a born-dedicated run (run.py, `born_dedicated`), and spike
+# §9.4 records that as the behaviour change to document. Pinned, not deleted:
+# the guard still fires for every legacy run and every adopter on the fallback.
+CONFIG_SAME_TREE = CONFIG_YAML + "worktree:\n  mode: same_tree\n"
 
 LINEAR = """
 name: p
@@ -119,7 +130,7 @@ def test_start_refuses_dirty_worktree_before_creating_branch(fixture_repo):
     # The reported bug (#61): start() created gauntlet/<slug>, THEN failed on
     # the dirty tree — stranding the operator on a half-born branch they had
     # to hand-delete. Now: refuse first, while still on the operator's branch.
-    mgr = _prepare(fixture_repo)
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo)
     (fixture_repo / "wip.py").write_text("uncommitted scratch\n")  # untracked
@@ -130,7 +141,7 @@ def test_start_refuses_dirty_worktree_before_creating_branch(fixture_repo):
 
 
 def test_start_refuses_modified_tracked_file(fixture_repo):
-    mgr = _prepare(fixture_repo)
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo)
     (fixture_repo / "README.md").write_text("edited but not committed\n")
@@ -169,7 +180,7 @@ def test_start_refuses_extra_file_beside_uncommitted_prd(fixture_repo):
     # fail the clean-handoff guard AFTER the branch existed — #61 again. The
     # preflight exempts exactly prd.md, so the extra file is refused up
     # front, before the branch is created.
-    mgr = _prepare(fixture_repo)
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo)
     (mgr.layout("demo").slug_dir / "notes.md").write_text("scratch notes\n")
@@ -183,7 +194,7 @@ def test_start_refuses_stale_uncommitted_plan_md(fixture_repo):
     # A plan.md at start() is stale state from a prior aborted attempt (the
     # run itself authors plan.md after the branch exists) — refuse rather
     # than let it fail the plan-cycle handoff post-branch.
-    mgr = _prepare(fixture_repo)
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo)
     (mgr.layout("demo").slug_dir / "plan.md").write_text("# stale plan\n")
@@ -199,7 +210,7 @@ def test_start_refuses_sibling_slug_artifact_dirt(fixture_repo):
     # branch existed — the exact stranded-branch bug #61 reported. The
     # preflight applies the same exclusion policy as the drive, so it refuses
     # up front, before the branch is created.
-    mgr = _prepare(fixture_repo)
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     _author_prd(mgr, "other")  # authored-but-unstarted sibling PRD
     _author_prd(mgr, "demo")
     path = _write_pipeline(fixture_repo)
@@ -207,6 +218,39 @@ def test_start_refuses_sibling_slug_artifact_dirt(fixture_repo):
         mgr.start("demo", path, use_judge=False)
     assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
     assert gitops.current_branch(fixture_repo) == "main"
+
+
+def test_a_dedicated_start_is_not_blocked_by_operator_dirt(fixture_repo):
+    """P7g, the behaviour change spike §9.4 asks to be documented.
+
+    The #61 preflight above guards a `checkout -b` that CARRIES the operator's
+    uncommitted changes onto the fresh run branch. Under the P7g default there
+    is no such checkout: the branch is minted from the base ref and a fresh
+    worktree is checked out at the derived path, so operator dirt has no route
+    onto the run branch and cannot fail the first clean-handoff guard. Refusing
+    on it would guard a mechanism that no longer exists — and would block a
+    start for a reason the operator could not act on.
+
+    The claim is proven, not assumed: the dirt is still sitting in the
+    operator's checkout afterwards (untouched — A1), and it did NOT reach the
+    run branch.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _write_pipeline(fixture_repo)
+    (fixture_repo / "wip.py").write_text("uncommitted scratch\n")
+
+    assert mgr.start(
+        "demo", path, use_judge=False,
+        adapter_factory=lambda n: FakeAdapter(writes={"f.py": "x\n"}),
+    ) == M.RUN_DONE
+
+    # the operator's scratch file is exactly where they left it...
+    assert (fixture_repo / "wip.py").read_text() == "uncommitted scratch\n"
+    assert "wip.py" not in git(fixture_repo, "ls-files")
+    # ...and it never reached the run branch, which is the property #61 protects
+    assert "wip.py" not in git(fixture_repo, "ls-tree", "-r", "--name-only",
+                               "gauntlet/demo")
 
 
 # --- stale-branch guard ------------------------------------------------------
@@ -243,8 +287,14 @@ def test_start_discards_spent_merged_branch_and_recreates(fixture_repo):
     # gauntlet/demo points at base (trivially merged: equal == ancestor)
     git(fixture_repo, "branch", "gauntlet/demo", base)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
-    assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
-    assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: implement"
+    # P7g: the discard-and-recreate is observed on the RUN's tree and on the run
+    # BRANCH, not on the operator's HEAD. A `dedicated` run leaves the operator
+    # on `main` by construction (acceptance A1), so asserting their checkout had
+    # moved onto `gauntlet/demo` would be asserting the thing P7 exists to stop.
+    # The claim itself — the spent branch was discarded and recreated with this
+    # run's work on it — is unchanged and is what these two lines now say.
+    assert gitops.current_branch(run_work_tree(fixture_repo)) == "gauntlet/demo"
+    assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P1: implement"
 
 
 # --- clean -------------------------------------------------------------------
@@ -270,8 +320,18 @@ def test_clean_force_deletes_unmerged_branch(fixture_repo):
 def test_clean_deletes_merged_branch_and_keeps_run_dir(fixture_repo):
     mgr = _prepare(fixture_repo)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
-    # merge the run into main, then clean is safe
+    # merge the run into main, then clean is safe.
+    # P7g: under `dedicated` the operator's authored `runs/demo/prd.md` stays
+    # UNTRACKED in their checkout (their copy is the authoring surface, §14.2
+    # option A) while the run branch carries the tracked copy the run committed.
+    # A raw `git merge` refuses to overwrite an untracked file — which is exactly
+    # the state `gauntlet finish` resolves for the operator when the two are
+    # byte-identical. This test's subject is `clean`, so it does by hand what
+    # `finish` would have done, rather than pretending the state is not there.
     git(fixture_repo, "checkout", "-q", "main")
+    local_prd = mgr.layout("demo").prd_path
+    if local_prd.exists() and "prd.md" not in git(fixture_repo, "ls-files", "runs"):
+        local_prd.unlink()
     git(fixture_repo, "merge", "--no-ff", "-m", "land", "gauntlet/demo")
     layout = mgr.layout("demo")
     assert layout.prd_path.exists()  # committed audit trail present
@@ -323,6 +383,20 @@ def test_resume_refuses_when_run_branch_missing(fixture_repo):
     path = _write_pipeline(fixture_repo, GATED)
     assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED  # parked, resumable
     git(fixture_repo, "checkout", "-q", "main")
+    # P7g: the run branch is held by the run's own worktree, and git hard-refuses
+    # `branch -D` for a checked-out branch (spike E2-D). Releasing the tree first
+    # is what an operator deleting a run branch actually has to do, and it leaves
+    # the §11 row-3 shape this test needs: the branch genuinely gone while the
+    # run's state (manifest, journal, pointer) survives in the operator's
+    # checkout. A `same_tree` run reaches the same shape with the `-D` alone.
+    work = run_work_tree(fixture_repo)
+    if work != fixture_repo:
+        # The engine holds a `git worktree lock` for the life of the run, and
+        # that blocks `remove --force` too (spike E6-B) — so an operator taking
+        # a run branch away has to unlock first. Exactly the sequence §11 row 3
+        # describes, done by hand here because the point is the branch's absence.
+        git(fixture_repo, "worktree", "unlock", str(work))
+        git(fixture_repo, "worktree", "remove", "--force", str(work))
     git(fixture_repo, "branch", "-D", "gauntlet/demo")
     with pytest.raises(RunBranchStateError, match="missing"):
         mgr.resume("demo", use_judge=False)
@@ -332,7 +406,14 @@ def test_resume_refuses_reset_branch_without_rewinding_worktree(fixture_repo):
     # F-1 follow-up: validate the branch REF before checkout, so a refused resume
     # never rewinds the worktree onto the stale/reset branch. Stand on main with
     # gauntlet/demo reset behind its recorded commit.
-    mgr = _prepare(fixture_repo)
+    #
+    # PINNED to `same_tree` (P7g): the hazard this defends — a refused resume
+    # switching the OPERATOR's checkout onto a bad branch — exists only where
+    # resume checks the branch out in their tree. Under `dedicated` there is no
+    # such checkout at all, and the autouse A1 property asserts that globally
+    # rather than here. The ref validation itself still applies to a dedicated
+    # run; that half is asserted by the companion test below.
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
     git(fixture_repo, "checkout", "-q", "main")
     git(fixture_repo, "branch", "-f", "gauntlet/demo", "gauntlet/demo~1")  # drop P1
@@ -342,10 +423,34 @@ def test_resume_refuses_reset_branch_without_rewinding_worktree(fixture_repo):
     assert gitops.current_branch(fixture_repo) == "main"
 
 
+def test_dedicated_resume_refuses_a_reset_run_branch(fixture_repo):
+    """P7g: the ref guard still fires when the branch lives in the run's tree.
+
+    The `same_tree` sibling above proves the operator's checkout is not rewound
+    by a refused resume. This proves the guard it depends on — "the run branch is
+    missing the manifest's recorded commit" — is reached at all under the P7g
+    default, where the reset has to happen inside the run worktree because git
+    hard-refuses `branch -f` on a branch checked out elsewhere (spike E2-E).
+    """
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    work = run_work_tree(fixture_repo)
+    assert work != fixture_repo, "the P7g default must give this run its own tree"
+    git(work, "reset", "--hard", "-q", "HEAD~1")  # drop the recorded P1 commit
+    with pytest.raises(RunBranchStateError, match="missing the manifest"):
+        mgr.resume("demo", use_judge=False)
+
+
 def test_clean_refuses_dirty_worktree_on_branch(fixture_repo):
     # F-2: clean must not carry uncommitted changes onto the base when it steps
     # off the run branch. Dirty tree fails closed — even under --force.
-    mgr = _prepare(fixture_repo)
+    #
+    # PINNED to `same_tree` (P7g): "steps off the run branch" is the precondition,
+    # and it only happens when the operator's checkout is ON that branch. A
+    # `dedicated` run leaves them on `main`, so `clean` never steps off and this
+    # guard never fires. Pinned rather than deleted — it is still the guard for
+    # every legacy run and every adopter on the documented fallback.
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
     assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
     (fixture_repo / "uncommitted.py").write_text("work in progress\n")
@@ -361,7 +466,10 @@ def test_clean_dirty_guard_does_not_hide_run_artifacts(fixture_repo):
     # whole run root — so an uncommitted run artifact (prd.md under runs/<slug>/)
     # still blocks clean instead of being silently carried onto base. (With the
     # prior whole-run_root exclude, prd.md was hidden and this would not raise.)
-    mgr = _prepare(fixture_repo)
+    # PINNED to `same_tree` for the same reason as the sibling above: "carried
+    # onto base" needs `clean` to step the operator's checkout off the run
+    # branch, which a `dedicated` run never puts it on.
+    mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
     # prd.md is committed by the run; an uncommitted *edit* to it is real
     # artifact dirt that must block clean (it was hidden under the old exclude).
@@ -398,10 +506,15 @@ def test_finish_aborts_on_conflict_and_returns_to_branch(fixture_repo):
     git(fixture_repo, "add", "-A")
     git(fixture_repo, "-c", "user.name=H", "-c", "user.email=h@h",
         "commit", "-qm", "base edits clash.py")
-    git(fixture_repo, "checkout", "-q", "gauntlet/demo")
+    # P7g: the human stays on their own branch — `git checkout gauntlet/demo`
+    # hard-refuses while the run's worktree holds it (spike E2-B), and standing
+    # on the run branch is precisely what the dedicated layout removes. The
+    # claim under test is unchanged: the conflicting merge is ABORTED, the run
+    # branch survives, and the human is left where they were with a clean tree.
+    was_on = gitops.current_branch(fixture_repo)
     with pytest.raises(FinishError, match="conflicts"):
         mgr.finish("demo")
-    # merge aborted, branch intact, human back on the run branch
-    assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+    # merge aborted, branch intact, human left exactly where they started
+    assert gitops.current_branch(fixture_repo) == was_on
     assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
-    assert gitops.is_clean(fixture_repo, exclude=[".gauntlet/runs"])
+    assert gitops.is_clean(fixture_repo, exclude=[".gauntlet/runs", "runs"])

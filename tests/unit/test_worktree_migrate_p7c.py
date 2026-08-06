@@ -44,12 +44,21 @@ from conftest import FakeAdapter, git
 DEAD_PID = 2_000_000_000  # never live: the kill -9'd / power-loss driver
 THIS_HOST = socket.gethostname()
 
-# Deliberately the SHIPPED default. Migration's whole population is runs that
-# were born before `dedicated` existed (or beside it), so every test here
-# starts one the way a real pre-P7c run started.
+# Deliberately PINNED, not inherited (P7g). Through P7f this relied on
+# `same_tree` being the shipped default; P7g flips that, and a default-dedicated
+# fixture has nothing to migrate — every test in this file would pass vacuously
+# by asserting on a run that was already in the destination state.
+#
+# The mode is pinned rather than the file deleted because migration's population
+# did not go away: it is every run born before `dedicated` existed, plus every
+# adopter whose layout cannot host a worktree and who sets `same_tree`
+# deliberately (spike §16 keeps it as the documented fallback). The path still
+# exists and still needs this coverage; it just stops being the default.
 CONFIG_SAME_TREE = """
 base_branch: main
 run_root: runs
+worktree:
+  mode: same_tree
 agents:
   builder: {adapter: claude-code}
 """

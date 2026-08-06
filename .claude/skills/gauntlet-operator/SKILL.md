@@ -30,18 +30,20 @@ The reflex it teaches, worth internalizing up front:
   evidence; reach for it before resuming anything.
 - **Recover is narrow and guarded.** `gauntlet recover <slug>` is only for a
   proven-alive, wedged driver, and it never auto-resumes.
-- **Run every verb from the operator's checkout.** A run configured with
-  `worktree.mode: dedicated` edits its own worktree under the git common dir,
-  not your tree — `status --json` prints its path under `worktree`. Read the
-  run branch with `git log`/`git diff`/`git show` from where you are; never
-  `git checkout` it (git refuses while the run holds it) and never run a
-  gauntlet verb from inside the run worktree (the CLI refuses, and tells you
-  where to stand).
-- **Nothing moves a run's tree for you.** A run that predates the dedicated
-  layout keeps driving your checkout; `gauntlet migrate-worktree <slug>` is the
-  only thing that moves it, it is optional, and `status` offers it when the run
-  is eligible. `--rollback` undoes it. A run that cannot migrate is never
-  wedged by that — it stays fully drivable in `same_tree`.
+- **Run every verb from the operator's checkout.** A run edits its OWN worktree
+  at `.gauntlet/worktrees/<slug>/<run-id>` inside your repo — that is the
+  default, not an opt-in — so the agent's edits do not appear in your tree.
+  `status --json` prints the exact path under `worktree`. Read the run branch
+  with `git log`/`git diff`/`git show` from where you are; never `git checkout`
+  it (git refuses while the run holds it) and never run a gauntlet verb from
+  inside the run worktree (the CLI refuses, and tells you where to stand).
+- **Nothing moves a run's tree for you.** A run started before the dedicated
+  layout became the default — or one deliberately pinned to
+  `worktree.mode: same_tree` — keeps driving your checkout;
+  `gauntlet migrate-worktree <slug>` is the only thing that moves it, it is
+  optional, and `status` offers it when the run is eligible. `--rollback`
+  undoes it. A run that cannot migrate is never wedged by that — it stays fully
+  drivable in `same_tree`.
 
 Stay inside your lane: this skill is for operating a run, not building or
 reviewing one. A human ratifies every gate, the safety judge is never bypassed,

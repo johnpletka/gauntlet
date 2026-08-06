@@ -2365,7 +2365,19 @@ def _review_prompt(
         # tree is clean at every handoff, FR-9.3), so the diff is deterministic
         # and lossless-by-path: unchanged context is one `git show` away.
         if rnd > 1 and prev_review_sha is not None:
-            rel = Path(path).resolve().relative_to(ctx.work_root.resolve()).as_posix()
+            # P7g: the DIFF is taken in the work tree and the path is handed to
+            # a reviewer whose cwd is that tree, so it must be work-relative.
+            # `path` above resolves the AUTHORITY (the operator's copy — what
+            # the engine reads and hashes, §4.4) and under `dedicated` that is
+            # outside `work_root`, so relativising it raised `ValueError`
+            # outright. `artifact_root_in_work` is the same file's location in
+            # the tree the reviewer is standing in.
+            rel = (
+                (ctx.artifact_root_in_work / name)
+                .resolve()
+                .relative_to(ctx.work_root.resolve())
+                .as_posix()
+            )
             diff = gitops.range_diff_path(ctx.work_root, prev_review_sha, handoff, rel)
             parts.append(
                 f"\n--- artifact under review: {name} (diff since round {rnd - 1}; "
@@ -3143,12 +3155,28 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
     round-1 clean-handoff check with a misleading "worktree dirty" error
     instead of committing the baseline. (This is the adopter-layout failure
     mode; gauntlet's own root layout happened to dodge it.)
+
+    **The artifact is located in the WORK tree, not in the operator's checkout**
+    (P7g). ``ctx.artifact_root`` never moves (spike §4.4): under `dedicated` it
+    names the human's authoring copy, which does not live under ``work_root`` at
+    all. Resolving there raised ``ValueError`` and the ``except`` degraded to
+    "more than the artifact is dirty", so the baseline commit never fired and
+    EVERY artifact-mode cycle failed the round-1 clean-handoff guard — naming
+    the very file :meth:`RunManager._sync_governed_artifacts` had just published
+    into that tree. That is spike §9.3's silent-degrade family in a fourth
+    module, and it is what the P7g flip exposed. ``artifact_root_in_work`` is
+    the mirror the sync writes to, so the two now agree by construction.
+
+    The ``except`` is kept and still returns ``False``, which is fail-closed
+    here: the caller's only alternative to a baseline commit is the FR-9.3
+    refusal, so an unresolvable artifact stops the handoff rather than passing
+    an uncommitted tree to a reviewer.
     """
     name = step.get("artifact")
     if not name:
         return False
     try:
-        rel = (ctx.artifact_root / name).resolve().relative_to(
+        rel = (ctx.artifact_root_in_work / name).resolve().relative_to(
             ctx.work_root.resolve()
         ).as_posix()
     except ValueError:

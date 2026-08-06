@@ -25,6 +25,7 @@ from gauntlet.adapters.base import AdapterCapabilities, AgentResult
 from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.run import RunManager
 
+from conftest import run_work_tree
 from test_resume_response import (
     CONFLICT_TEXT,
     PIPELINE,
@@ -247,7 +248,7 @@ def test_proceed_in_place_completes_and_commits(tmp_path):
     assert rec.status == M.DONE
     assert rec.parked_reason is None  # proceed clears the discriminator
     assert rec.attempts == 0  # not a failure
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
 
 
 def test_proceed_with_deviation_completes(tmp_path):
@@ -280,7 +281,7 @@ def test_amendment_required_reparks_no_implementation(tmp_path):
     assert rec.status == M.PARKED
     assert rec.parked_reason == M.PARKED_REASON_RESPONSE
     assert rec.attempts == 0  # a re-park is not a failure (FR-6)
-    assert not (repo / "feature.py").exists()  # nothing implemented
+    assert not (run_work_tree(repo) / "feature.py").exists()  # nothing implemented
     # the response is consumed (terminal outcome), audit trail intact
     assert rec.human_responses[-1].state == M.RESPONSE_CONSUMED
 
@@ -440,7 +441,7 @@ def test_proceed_with_conflict_object_fails_closed(tmp_path):
     rec = mgr.status("demo").record("implement")
     assert rec.status == M.FAILED
     assert rec.attempts == 1
-    assert not (repo / "feature.py").exists()  # nothing landed
+    assert not (run_work_tree(repo) / "feature.py").exists()  # nothing landed
 
 
 def test_repark_with_null_conflict_fails_closed(tmp_path):
@@ -662,8 +663,8 @@ def test_routed_proceed_classifies_on_mechanic_then_implements_on_builder(tmp_pa
     assert mgr.status("demo").record("implement").status == M.DONE
     # mechanic classified first, THEN the builder was re-driven to implement
     assert factory.built == ["mechanic", "builder"]
-    assert (repo / "feature.py").read_text() == "implemented\n"  # builder's work
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
+    assert (run_work_tree(repo) / "feature.py").read_text() == "implemented\n"  # builder's work
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
 
 
 TIMEOUT_CONFIG = """
@@ -769,7 +770,7 @@ def test_repark_with_dirty_worktree_restores_clean_tree(tmp_path):
     # The builder's uncommitted edit was discarded; no implementation change
     # survives to the handoff (the only residual dirt is engine bookkeeping,
     # which the clean-handoff invariant deliberately excludes).
-    assert not (repo / "feature.py").exists()
+    assert not (run_work_tree(repo) / "feature.py").exists()
     assert "feature.py" not in gitops.status_porcelain(repo)
     # ...and preserved losslessly in a complete-format recovery snapshot (P2
     # pilot: this rewind path migrated off refs/gauntlet/backup/ overlays).
@@ -827,7 +828,7 @@ def test_pilot_rewind_creates_durable_snapshot_before_mutation(tmp_path, monkeyp
             adapter_factory=lambda n: adapter, clock=_clock(),
         )
     # The builder's edit was never discarded (mutation failed closed)...
-    assert (repo / "feature.py").exists()
+    assert (run_work_tree(repo) / "feature.py").exists()
     # ...and the snapshot ref was already durable, loadable, and complete.
     refs = gitops._run(
         repo, "for-each-ref", "--format=%(refname)", "refs/gauntlet/recovery"
@@ -865,7 +866,7 @@ def test_pilot_rewind_snapshot_failure_precedes_any_mutation(tmp_path, monkeypat
             adapter_factory=lambda n: adapter, clock=_clock(),
         )
     assert reset_calls == []  # no destructive verb ran after the failure
-    assert (repo / "feature.py").exists()  # the dirty work is untouched
+    assert (run_work_tree(repo) / "feature.py").exists()  # the dirty work is untouched
 
 
 def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):
@@ -881,7 +882,7 @@ def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):
         "demo", response="ambiguous", use_judge=False,
         adapter_factory=lambda n: reparked, clock=_clock(),
     ) == M.RUN_PARKED
-    assert not (repo / "feature.py").exists()
+    assert not (run_work_tree(repo) / "feature.py").exists()
     # Second resume: a clean proceed lands the phase commit normally.
     proceed = DispositionAdapter(
         _disposition(
@@ -894,8 +895,8 @@ def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):
         "demo", response="now resolved", use_judge=False,
         adapter_factory=lambda n: proceed, clock=_clock(),
     ) == M.RUN_DONE
-    assert gitops.commit_subject(repo, "HEAD") == "P1: implement phase"
-    assert (repo / "feature.py").read_text() == "implemented\n"
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert (run_work_tree(repo) / "feature.py").read_text() == "implemented\n"
 
 
 def test_responses_considered_lists_consumed_id(tmp_path):

@@ -22,7 +22,7 @@ from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.manifest import Manifest
 from gauntlet.engine.run import RunManager
 
-from conftest import git
+from conftest import await_sentinel, git, run_work_tree
 
 CHILD = Path(__file__).parent / "_crash_child.py"
 
@@ -87,13 +87,10 @@ def _spawn_and_kill(repo: Path, kill_delay: float) -> None:
     proc = subprocess.Popen([sys.executable, str(CHILD), str(repo), "demo"])
     # Wait until the agent is mid-step (sentinel dropped), then a small extra
     # delay so the kill can also land during/after the manifest write.
-    deadline = time.monotonic() + 30
-    while not ready.exists() and time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"child exited early ({proc.returncode})")
-        time.sleep(0.01)
-    assert ready.exists(), "child never reached the mid-step sentinel"
-    time.sleep(kill_delay)
+    # P7g: the child's adapter drops the sentinel in its `cwd`, which under the
+    # dedicated default is the RUN's tree — so the wait looks in whichever tree
+    # the run drives rather than only in the operator's checkout.
+    await_sentinel(repo, ".crash_ready", proc)
     os.kill(proc.pid, signal.SIGKILL)
     proc.wait(timeout=10)
 
@@ -115,11 +112,15 @@ def test_kill9_resume_recovers_in_a_loop(tmp_path, iteration):
     # Exactly one commit, containing the recovered file; clean tree; no dupes.
     final = mgr.status("demo")
     assert [c.phase for c in final.commits] == ["P1"]
-    assert gitops.commit_subject(repo, "HEAD") == "P1: crash phase"
-    assert (repo / "feature.py").read_text() == "RECOVERED — final content\n"
+    # P7g: the recovered effects are on the run BRANCH and in the RUN's tree —
+    # the recovery property is unchanged, only the vantage point is. Naming the
+    # branch reads the same from either tree (refs are shared, spike E1).
+    work = run_work_tree(repo)
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
     # work tree is clean; only the engine's own run bookkeeping is untracked
-    assert gitops.is_clean(repo, exclude=["runs"])
-    log = gitops._run(repo, "log", "--format=%s")
+    assert gitops.is_clean(work, exclude=["runs"])
+    log = gitops._run(repo, "log", "--format=%s", "gauntlet/demo")
     assert log.count("P1: crash phase") == 1  # not double-committed
 
 
@@ -132,5 +133,6 @@ def test_kill9_resume_parks_under_park_policy(tmp_path):
     # dirty mid-edit tree (review F-003).
     assert status == M.RUN_PARKED
     assert mgr.status("demo").record("implement").status == M.INTERRUPTED
-    # the partial work is still present (parked, not discarded) for inspection
-    assert (repo / "feature.py").read_text().startswith("PARTIAL")
+    # the partial work is still present (parked, not discarded) for inspection —
+    # in the tree the killed builder was editing (P7g)
+    assert (run_work_tree(repo) / "feature.py").read_text().startswith("PARTIAL")

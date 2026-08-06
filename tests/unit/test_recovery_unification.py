@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeAdapter, git
+from conftest import FakeAdapter, git, run_work_tree
 
 from gauntlet.adapters.base import AgentFailedError, AgentResult
 from gauntlet.engine import gitops, manifest as M
@@ -187,15 +187,34 @@ def test_kill_at_every_persist_boundary_classifies_and_converges(
         manifest_path = run_dir / "manifest.json"
         from gauntlet.engine import journal as J
 
-        if not manifest_path.exists() and not J.read_events(run_dir):
-            # Killed before the first durable persist: the run never began
-            # durably — there is no state to recover (or corrupt).
+        # P7g. "The run never began durably" is a claim about journalled STATE,
+        # and R8 makes state events the authority — so it is read from the same
+        # place the assertions below read from, not from "the journal directory
+        # has some file in it". Under the dedicated default the FIRST event a
+        # run appends is `WorktreeAdopted`, which is worktree-lifecycle AUDIT
+        # and carries no `state_json`: `projection_status` correctly answers
+        # `no_journal`, and the old `J.read_events(run_dir)` test — true the
+        # moment ANY event exists — sent that shape into an assertion about a
+        # manifest that provably cannot exist yet.
+        #
+        # Deliberately NOT loosened to "skip when the view is empty": the
+        # projection must also be absent. A loadable manifest with no state
+        # event is `unjournaled`/`corrupt`, which is a real finding and still
+        # falls through to the assertions.
+        view = op.load_projection_view(repo, run_dir, slug="demo")
+        if view.manifest is None and not manifest_path.exists():
+            # Killed before the first durable STATE persist: the run never began
+            # durably — there is no state to recover (or corrupt). What a
+            # dedicated run CAN have left behind at this boundary is a
+            # registered, locked worktree with no run state pointing at it;
+            # `test_a_pre_state_kill_leaves_a_releasable_worktree` below proves
+            # that shape has a safe executable action (R1) rather than assuming
+            # it does.
             continue
         # P6 (R4/R8): classification reads the AUTHORITATIVE state — the
         # projection when it matches the journal head, else the journal head
         # itself (a mid-boundary kill leaves the projection one state
         # behind; a first-persist mid kill leaves no projection at all).
-        view = op.load_projection_view(repo, run_dir, slug="demo")
         assert view.manifest is not None, (
             f"boundary {when}-persist-{n} ({sig}) left no classifiable "
             "authoritative state (journal + projection both unusable)"
@@ -232,9 +251,44 @@ def test_kill_at_every_persist_boundary_classifies_and_converges(
         assert status == M.RUN_DONE
         final = mgr.status("demo")
         assert [c.phase for c in final.commits] == ["P1"]
-        assert (repo / "feature.py").read_text().endswith("final content\n")
+        # P7g: the recovered file is in the tree the run drives.
+        assert (
+            run_work_tree(repo) / "feature.py"
+        ).read_text().endswith("final content\n")
         covered += 1
     assert covered >= 4, f"only {covered} real persist boundaries exercised"
+
+
+def test_a_pre_state_kill_leaves_a_releasable_worktree(tmp_path):
+    """P7g: the one durable shape the flip adds ahead of the first state event.
+
+    Under the dedicated default a run adopts (creates, registers and locks) its
+    worktree BEFORE the orchestrator's first durable persist, and journals that
+    adoption as an audit event. A kill in that window therefore leaves something
+    on disk — a registered, `git worktree lock`ed tree on the run branch — for a
+    run that has no journalled state and no projection at all.
+
+    The boundary matrix skips that window as "the run never began durably", so
+    this is what stops the skip from hiding a leak: the state must still have a
+    safe executable action (R1). `gauntlet clean` is it, and it is asserted to
+    actually remove the tree rather than merely to not raise.
+    """
+    repo, mgr, exhausted = _kill_at_boundary(tmp_path, 1, "before", "kill")
+    assert not exhausted, "persist-1 must be reachable for this shape to exist"
+    run_dir = mgr.layout("demo").active_run_dir()
+    view = op.load_projection_view(repo, run_dir, slug="demo")
+    if view.manifest is not None or (run_dir / "manifest.json").exists():
+        pytest.skip("this engine persists run state before adopting the tree")
+
+    work = run_work_tree(repo)
+    assert work != repo, "the P7g default must have adopted a tree by persist-1"
+    assert work.is_dir()
+
+    mgr.clean("demo", force=True)
+
+    assert not work.exists(), "clean left the pre-state worktree behind"
+    assert run_work_tree(repo) == repo  # no registered worktree holds the branch
+    assert not gitops.branch_exists(repo, "gauntlet/demo")
 
 
 # =============================================================================

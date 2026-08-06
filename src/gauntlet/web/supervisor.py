@@ -643,14 +643,66 @@ class JobSupervisor:
 
     # ---- worktree lock surface (FR-10.5) -------------------------------------
     def driving_lock(self) -> LockInfo | None:
-        """The current worktree-lock holder, if any (read-only surface).
+        """Is anything driving this repository right now? (read-only surface)
 
-        Returns ``None`` when no lockfile exists or it is unparseable. ``live``
-        is the PID-reuse-safe liveness of the holder; the console disables
-        repo-wide controls only while a holder is **live** (a stale lock is the
-        engine's to reclaim, not the UI's).
+        Returns ``None`` when nothing is, or when the only evidence is
+        unparseable. ``live`` is the PID-reuse-safe liveness of the holder; the
+        console disables repo-wide controls only while a holder is **live** (a
+        stale lock is the engine's to reclaim, not the UI's).
+
+        **P7h.** This used to be one file — the worktree-global tree guard at
+        ``<run_root>/.driving.lock``. A dedicated run no longer writes it (it
+        holds only the per-run lock inside its run-instance dir), so reading
+        that path alone would answer "no driver" for every live run under the
+        P7g default. That is strictly worse than refusing: the console would
+        offer Launch/Resume/Approve against a running drive, and every one of
+        those would then fail closed in the engine — the R4 disagreement where
+        the read-only view recommends what the mutating path rejects.
+
+        So the question is answered from BOTH scopes: the tree guard first (a
+        legacy `same_tree` run, a `finish`/`clean` in flight, or a pre-P7b
+        engine genuinely owns the operator's shared checkout while it holds
+        that), then any per-run lock. The first LIVE holder wins.
+
+        The cost, named rather than discovered: two `dedicated` runs of
+        different slugs can now legitimately drive at once, and this surface
+        still reports "locked" for both, so the console over-refuses where the
+        engine would allow. That is the deliberate direction for the
+        one-release window — a surface that refuses is recoverable, one that
+        silently answers "no driver" for a live run is not.
         """
-        path = self.run_root / DRIVING_LOCK_NAME
+        stale: LockInfo | None = None
+        for path in self._drive_lock_paths():
+            info = self._lock_info(path)
+            if info is None:
+                continue
+            if info.live:
+                return info
+            if stale is None:
+                # Remember the first readable-but-dead holder and KEEP LOOKING:
+                # a stale tree guard must never stop the scan before a live
+                # per-run lock is seen, or the retirement re-opens the very
+                # "no driver for a live run" answer it exists to prevent.
+                stale = info
+        return stale
+
+    def _drive_lock_paths(self) -> list[Path]:
+        """The tree guard, then every per-run lock, in that order (P7h).
+
+        Tree guard first because a holder there is the broader claim — it means
+        someone believes they own the operator's shared checkout. The per-run
+        glob is bounded by the run-instance dirs that exist; an unreadable run
+        root simply yields the guard alone.
+        """
+        paths = [self.run_root / DRIVING_LOCK_NAME]
+        try:
+            paths.extend(sorted(self.run_root.glob(f"*/*/{DRIVING_LOCK_NAME}")))
+        except OSError:
+            pass
+        return paths
+
+    @staticmethod
+    def _lock_info(path: Path) -> LockInfo | None:
         try:
             data = json.loads(path.read_text())
         except (OSError, FileNotFoundError, ValueError):

@@ -70,6 +70,81 @@ def fixture_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def run_work_tree(repo: Path, slug: str = "demo", *, prefix: str = "gauntlet/") -> Path:
+    """The tree a run's agents edit and the engine commits in (P7g).
+
+    P7g makes `dedicated` the default, so an assertion about a file an agent
+    wrote, or about the branch a run has checked out, must name THIS tree — for
+    a `dedicated` run it is not the operator's checkout, and asserting there is
+    asserting the thing P7 exists to stop being true.
+
+    Resolved from git's own ``worktree list`` rather than from
+    ``gauntlet.engine.worktree``'s derivation, for the same reason
+    :func:`_registered_run_worktrees` re-derives its root: these helpers are the
+    check ON the engine, and sharing the engine's derivation would let one bug
+    satisfy both sides. Falls back to ``repo`` when no worktree holds the run
+    branch, which is exactly the `same_tree` answer.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return repo
+    current: Path | None = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):])
+        elif line == f"branch refs/heads/{prefix}{slug}" and current is not None:
+            return current
+    return repo
+
+
+def await_sentinel(repo: Path, rel: str, proc=None, *, timeout: float = 30.0) -> Path:
+    """Block until a crash-child sentinel appears — in whichever tree it drives.
+
+    The crash-injection harness signals "the agent step is now mid-flight" by
+    dropping a file from inside the step: the agent adapter writes it into its
+    ``cwd``, and a blocking shell step writes it into the tree it runs in. Both
+    are the WORK tree, so under the P7g default the sentinel lands in the run
+    worktree and never appears in the operator's checkout. Polling ``repo`` alone
+    therefore timed out on every crash test — "child never reached the mid-step
+    sentinel" — which is the harness encoding a `same_tree` truth, not the child
+    failing to get there.
+
+    Deliberately polls BOTH trees rather than being told which: the sentinel is
+    plumbing, and a harness that had to know the layout would be one more thing
+    to migrate the next time the layout moves. The partial edit the recovery
+    property is actually about (``feature.py``) is untouched — it stays wherever
+    the agent wrote it, which is the point of P7.
+
+    Returns the sentinel's path. Raises if the child exits first or the deadline
+    passes, with the same diagnosis the assertions used to carry.
+    """
+    import time
+
+    candidates = [repo / rel] + sorted(
+        (repo / ".gauntlet" / "worktrees").glob(f"*/*/{rel}")
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for path in candidates:
+            if path.exists():
+                return path
+        # a tree created after we listed: re-glob each pass, it is cheap
+        candidates = [repo / rel] + sorted(
+            (repo / ".gauntlet" / "worktrees").glob(f"*/*/{rel}")
+        )
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"child exited early ({proc.returncode})")
+        time.sleep(0.01)
+    raise AssertionError(
+        f"child never reached the sentinel {rel!r} in {timeout}s "
+        f"(looked in the operator's checkout and every run worktree under "
+        f"{repo / '.gauntlet' / 'worktrees'})"
+    )
+
+
 def _git_bytes(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -479,6 +554,23 @@ def _registered_run_worktrees(repo: Path) -> set[str]:
     }
 
 
+def _a1_drift(repo: Path, before: tuple[str, str, str, str]) -> str | None:
+    """The A1 violation message for one bracket, or ``None`` when it held."""
+    after = _operator_fingerprint(repo)
+    planes = ("branch", "HEAD", "index", "worktree")
+    drifted = [p for p, b, a in zip(planes, before, after) if b != a]
+    if not drifted:
+        return None
+    return (
+        "P7 acceptance A1 violated: this test created a dedicated run worktree, "
+        f"but the OPERATOR's checkout changed on: {', '.join(drifted)}.\n"
+        f"  before: {before}\n  after:  {after}\n"
+        "A run with its own worktree must never touch the operator's branch, "
+        "HEAD, index or working tree (spike §9/§12.1). Route the offending "
+        "call through `work_root` rather than the operator's checkout."
+    )
+
+
 @pytest.fixture(autouse=True)
 def operator_checkout_invariance(request):
     """Assert acceptance A1 on EVERY test that drives a dedicated run.
@@ -486,19 +578,41 @@ def operator_checkout_invariance(request):
     Spike §12.1 asks for A1 as a *property* over the existing verb suite rather
     than a handful of cases, because a property fails the moment any one of the
     25 root-conflation sites in §9 is missed, and a case only fails if someone
-    thought to write it.
+    thought to write it. P7g makes `dedicated` the default, so this now fires
+    across the whole suite rather than over the handful of tests that opted in.
 
     **Why it is conditional, and why that is not a weakening.** A `same_tree`
     run drives the operator's checkout *by definition* — that is the pre-P7
-    layout, it is the shipped default through P7c, and asserting invariance
-    there would assert that the engine does nothing. So the fixture keys on
-    EVIDENCE rather than on configuration: it asserts invariance exactly when
-    the test actually created a run worktree under the engine's derived root.
+    layout, it remains the mode of every legacy run and the documented fallback
+    (§16), and asserting invariance there would assert that the engine does
+    nothing. So the fixture keys on EVIDENCE rather than on configuration: it
+    asserts invariance exactly when the test actually created a run worktree
+    under the engine's derived root. That also stops a `--same-tree` fallback
+    test from claiming coverage it does not have.
 
-    That makes the property self-extending. Every new `dedicated` test inherits
-    it with no opt-in, and when P7d flips the default the assertion begins
-    firing across the whole suite with no test change at all — which is the
-    signal P7d needs and the reason not to gate it on a marker instead.
+    **Why the bracket is per-DRIVE (P7g, design problem D).** Through P7f the
+    baseline was captured once, at the first tree creation, and compared once at
+    teardown. That single bracket spans everything a test does after its first
+    run — including a legitimate commit in the operator's checkout BETWEEN two
+    runs, which is a shape the flip makes common
+    (`test_lock_released_on_done_and_park` is exactly it, and P7d spot-checked
+    it as a false positive). A strict-but-imprecise property gets suppressed the
+    first time it cries wolf, which is the failure this docstring's own earlier
+    warning named.
+
+    So the bracket is now :meth:`RunManager._run_paths` — the region in which a
+    run drives with resolved roots, entered by exactly the verbs A1 names
+    (`start`, `resume`, `approve`/`reject`, `rollback`) and nesting correctly
+    for an auto-resume inside a drive. Each drive is fingerprinted and checked
+    on its own, so N drives are N independent assertions instead of one
+    aggregate, and what a test does between drives is its own business. This is
+    strictly MORE checking, not less: the only interval dropped is the one
+    BETWEEN verbs, which A1 makes no claim about.
+
+    `migrate-worktree` creates a tree outside any `_run_paths` bracket (it is
+    the one other `WT.ensure` caller in the engine), so it keeps the pre-P7g
+    capture-once/compare-at-teardown treatment rather than silently losing its
+    coverage.
     """
     if "fixture_repo" not in request.fixturenames:
         yield
@@ -516,52 +630,75 @@ def operator_checkout_invariance(request):
         return
     repo = request.getfixturevalue("fixture_repo")
 
-    # The baseline is captured at the moment the run's tree FIRST EXISTS, not
-    # at test start. A1 is a claim about what happens while a dedicated run
-    # drives — "starting, resuming, recovering and rolling back never change
-    # the operator's checkout" — not about a test's own setup, which may
-    # legitimately commit to the operator's checkout before any run begins
-    # (adding a submodule, seeding history). Bracketing from tree-creation
-    # makes the property precise instead of merely strict, and a strict-but-
-    # imprecise property gets suppressed the first time it cries wolf.
+    import contextlib
+
     from gauntlet.engine import worktree as WT
+    from gauntlet.engine.run import RunManager
 
-    baseline: dict = {}
-
-    def _capture_once():
-        if not baseline:
-            baseline["fp"] = _operator_fingerprint(repo)
+    # Violations are COLLECTED and asserted at teardown rather than raised
+    # inside the drive: several engine drive paths carry broad `except`
+    # handlers, and an assertion raised into one of them would be swallowed and
+    # re-reported as a park reason instead of as a test failure.
+    violations: list[str] = []
+    depth = 0            # `_run_paths` nesting; only the outermost is bracketed
+    exercised = False    # was a dedicated tree created inside this bracket?
+    outside: dict = {}   # the `migrate-worktree` fallback bracket
 
     real_ensure, real_recreate = WT.ensure, WT.recreate
+    real_run_paths = RunManager._run_paths
+
+    def _mark():
+        nonlocal exercised
+        if depth:
+            exercised = True
+        elif not outside:
+            # A tree created outside any drive — `migrate-worktree`, the one
+            # other `WT.ensure` caller. Keep the pre-P7g bracket: baseline
+            # here, compared once at teardown.
+            outside["fp"] = _operator_fingerprint(repo)
 
     def ensure(*a, **kw):
-        _capture_once()
+        _mark()
         return real_ensure(*a, **kw)
 
     def recreate(*a, **kw):
-        _capture_once()
+        _mark()
         return real_recreate(*a, **kw)
 
+    @contextlib.contextmanager
+    def _bracket(cm):
+        nonlocal depth, exercised
+        outermost = depth == 0
+        before = _operator_fingerprint(repo) if outermost else None
+        if outermost:
+            exercised = False
+        depth += 1
+        try:
+            with cm as value:
+                yield value
+        finally:
+            depth -= 1
+            # F-009's rule, unchanged: keyed on whether a tree was EXERCISED,
+            # not on whether one is still registered afterwards. A drive that
+            # removes its own tree (a `--same-tree` fallback) is exactly the
+            # population most likely to touch the operator's checkout.
+            if outermost and exercised:
+                drift = _a1_drift(repo, before)
+                if drift is not None:
+                    violations.append(drift)
+
+    def run_paths(self, *a, **kw):
+        return _bracket(real_run_paths(self, *a, **kw))
+
     WT.ensure, WT.recreate = ensure, recreate
+    RunManager._run_paths = run_paths
     try:
         yield
     finally:
         WT.ensure, WT.recreate = real_ensure, real_recreate
-    # F-009: keyed on whether a tree was EXERCISED, not on whether one is still
-    # registered at teardown. The old check skipped any verb that removes its
-    # own tree — `finish`, `clean`, a `--same-tree` fallback — which is exactly
-    # the population most likely to touch the operator's checkout.
-    if not baseline:
-        return  # no dedicated tree was exercised — A1 makes no claim here
-    before = baseline["fp"]
-    after = _operator_fingerprint(repo)
-    planes = ("branch", "HEAD", "index", "worktree")
-    drifted = [p for p, b, a in zip(planes, before, after) if b != a]
-    assert not drifted, (
-        "P7 acceptance A1 violated: this test created a dedicated run worktree, "
-        f"but the OPERATOR's checkout changed on: {', '.join(drifted)}.\n"
-        f"  before: {before}\n  after:  {after}\n"
-        "A run with its own worktree must never touch the operator's branch, "
-        "HEAD, index or working tree (spike §9/§12.1). Route the offending "
-        "call through `work_root` rather than the operator's checkout."
-    )
+        RunManager._run_paths = real_run_paths
+    if outside:
+        drift = _a1_drift(repo, outside["fp"])
+        if drift is not None:
+            violations.append(drift)
+    assert not violations, "\n\n".join(violations)
