@@ -2076,13 +2076,27 @@ def _spec_reference_block(step: Step, ctx: StepContext, rnd: int) -> str:
     Fails closed if `review_against` is set but unreadable — a spec that was
     approved at its gate and has since vanished is a defect, never a silent
     degrade to a spec-less review (CLAUDE.md §2).
+
+    Fails closed too if it resolves outside the repo root. `validate_pipeline`
+    rejects an absolute/escaping value at load (review F-001), and this is the
+    second lock on the same door: whatever the resolved path came from — the
+    artifact map or `artifact_root / name` — this block inlines a whole file into
+    a reviewer prompt and the transcripts, so containment is re-proved at the
+    point of the read rather than trusted from a check made elsewhere.
     """
     name = step.get("review_against")
     if not name or rnd > 1:
         return ""
-    path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+    path = Path(ctx.artifacts.get(name) or (ctx.artifact_root / name))
+    root = ctx.repo_root.resolve()
+    resolved = path.resolve()
+    if root != resolved and root not in resolved.parents:
+        raise ValueError(
+            f"review_against artifact {name!r} resolves outside the repo root "
+            f"({resolved}); refusing to inline it into the review prompt"
+        )
     try:
-        text = Path(path).read_text()
+        text = resolved.read_text()
     except OSError as exc:
         raise ValueError(
             f"review_against artifact {name!r} is unreadable at {path}: {exc}"

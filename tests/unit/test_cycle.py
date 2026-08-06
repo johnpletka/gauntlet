@@ -697,6 +697,26 @@ def test_review_against_fails_closed_when_the_spec_is_unreadable(cycle_repo):
     assert not reviewer.calls  # never reviewed without the spec
 
 
+def test_review_against_outside_the_repo_root_fails_closed(cycle_repo, tmp_path):
+    # Review F-001: the block inlines a whole file into the reviewer prompt and
+    # the transcripts. `validate_pipeline` rejects an escaping value at load; the
+    # runtime re-proves containment at the read rather than trusting that check,
+    # so a value that reaches here by any other route (a hand-edited pipeline, a
+    # validation call made without roots) still never leaks the file.
+    outside = tmp_path / "secret.md"
+    outside.write_text("CREDENTIALS-SENTINEL\n")
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters,
+        step_extra={"review_against": f"../{outside.name}"},
+    )
+    assert status != M.RUN_DONE
+    assert "outside the repo root" in man.record("cycle").notes
+    assert not reviewer.calls  # nothing was reviewed, nothing was inlined
+
+
 def test_review_against_is_round_one_only(cycle_repo):
     # Rounds 2+ run cycle-rereview.md and are regression-scoped to the fix diff
     # (FR-1.2); re-inlining the whole spec would only re-pay for it.

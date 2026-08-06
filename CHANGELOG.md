@@ -23,7 +23,12 @@ artifact under review, so a plan reviewer never had the PRD in context at all �
 the codex reviewer was never told the path and the `api`-adapter panel member
 cannot read the repo — so the new `review_against:` step key (set to `prd.md`
 on `plan-cycle` in `pipelines/standard.yaml`) inlines the approved spec beside
-the plan for round 1, failing closed if it is unreadable. Rounds 2+ are
+the plan for round 1, failing closed if it is unreadable. Because the key names
+a file whose whole body lands in a reviewer prompt and the transcripts, it is
+validated like any other path-bearing artifact reference: pipeline load rejects
+a dangling name, an absolute or `../` value, a path that resolves outside the
+repo root, and a seed that is not on disk — and the cycle re-proves containment
+at the read. Rounds 2+ are
 unaffected (regression-scoped, FR-1.2), as is the PRD cycle, which has no
 upstream spec. **Upgrade note:** the prompt half ships with the scaffold, but
 the sweep is keyed on the spec block's presence and stays inert without it — if
