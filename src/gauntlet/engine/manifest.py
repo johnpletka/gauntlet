@@ -474,6 +474,11 @@ class StepRecord(BaseModel):
     # tallies here so trend math reads the manifest, never the log dirs (the
     # plan's P7 test strategy is "trend-metric math from fixture manifests").
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Current invocation's PreToolUse authorization counts (issue #83). Kept as
+    # explicit data so status can expose a bricked/all-denied agent without an
+    # operator mining its transcript. Older manifests load with zeroes.
+    judge_tool_calls_allowed: int = 0
+    judge_tool_calls_denied: int = 0
     # Write-ahead adversarial-cycle sub-step checkpoints (harness-efficiency
     # FR-4.1). Appended (and the manifest flushed) as each round sub-step
     # completes, so a mid-round interruption — a usage-limit park (P1) or a kill —

@@ -1651,6 +1651,11 @@ def _judge_model(config: RunConfig) -> str | None:
     return profile.model if profile is not None else None
 
 
+def _judge_effort(config: RunConfig) -> str | None:
+    profile = config.agents.get("judge_llm")
+    return profile.effort if profile is not None else None
+
+
 def _with_review_judge(config, repo_root: Path, state_dir: Path, man: Manifest, fn):
     """Run ``fn(judge_env)`` under a run-scoped judge (FR-7.1).
 
@@ -1666,6 +1671,7 @@ def _with_review_judge(config, repo_root: Path, state_dir: Path, man: Manifest, 
         audit_path=state_dir / "judge-audit.jsonl",
         run_id=man.run_id,
         judge_model=_judge_model(config),
+        judge_effort=_judge_effort(config),
         repo_root=repo_root,
         run_dir=state_dir,
     )

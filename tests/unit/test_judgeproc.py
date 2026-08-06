@@ -210,6 +210,25 @@ def test_spawn_mints_token_when_port_free_but_no_global_token(monkeypatch, clean
             os.environ.pop(v, None)
 
 
+def test_spawn_threads_configured_judge_effort(monkeypatch, clean_managed_env):
+    captured: dict = {}
+    monkeypatch.setattr(ManagedJudge, "_port_is_free", staticmethod(lambda h, p: True))
+    _patch_spawn(monkeypatch, captured)
+    mj = ManagedJudge(
+        policy_path=Path("p.yaml"), audit_path=Path("a.jsonl"), run_id="r",
+        judge_model="gpt-5.6-luna", judge_effort="low",
+    )
+    try:
+        mj.start()
+        argv = captured["argv"]
+        assert argv[argv.index("--judge-model") + 1] == "gpt-5.6-luna"
+        assert argv[argv.index("--judge-effort") + 1] == "low"
+    finally:
+        mj._proc = None
+        for v in _MANAGED_ENV_VARS:
+            os.environ.pop(v, None)
+
+
 # --- judge.json lifecycle (FR-5, §6.2) -------------------------------------------
 class _LiveProc:
     """A stand-in subprocess whose pid is THIS test process — so getpgid and

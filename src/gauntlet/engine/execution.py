@@ -105,6 +105,11 @@ class StepResult:
     # (FR-6.6): rounds, finding/verdict/confirm tallies an adversarial_cycle
     # emits so trend metrics come from the manifest (P7 test strategy).
     metrics: dict[str, Any] = field(default_factory=dict)
+    # Pre-execution judge decisions observed during this agent_task invocation
+    # (issue #83). These are authorization counts, not inferred post-execution
+    # success: every adapter routes through the same judge audit.
+    judge_tool_calls_allowed: int = 0
+    judge_tool_calls_denied: int = 0
 
 
 # An adapter factory lets unit tests inject fakes by agent-profile name without

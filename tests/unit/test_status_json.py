@@ -241,11 +241,13 @@ def test_section_6_2_example_validates():
             {"id": "prd-cycle", "iteration": None, "status": "done",
              "duration_s": 620.0, "notes": None,
              "halt_reason": None, "parked_reason": None,
-             "recovery_cause": None, "recovery_disposition": None},
+             "recovery_cause": None, "recovery_disposition": None,
+             "judge_tool_calls": {"allowed": 0, "denied": 0}},
             {"id": "impl-cycle", "iteration": 0, "status": "parked",
              "duration_s": None, "notes": "awaiting human decision",
              "halt_reason": None, "parked_reason": "gate",
-             "recovery_cause": "none", "recovery_disposition": "human_decision"},
+             "recovery_cause": "none", "recovery_disposition": "human_decision",
+             "judge_tool_calls": {"allowed": 0, "denied": 0}},
         ],
         "next_actions": [
             {"label": "approve", "kind": "decide",
@@ -508,7 +510,8 @@ def test_new_fields_present_and_valid():
     for key in ("current_step_elapsed_s", "current_step_timeout_remaining_s",
                 "run_elapsed_s", "totals", "agent_usage", "quota"):
         assert key in payload, key
-    for key in ("duration_s", "notes", "halt_reason", "parked_reason"):
+    for key in ("duration_s", "notes", "halt_reason", "parked_reason",
+                "judge_tool_calls"):
         assert key in payload["steps"][0], key
     assert set(payload["totals"]) == {
         "input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"

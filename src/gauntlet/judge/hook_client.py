@@ -214,6 +214,10 @@ def decide_from_payload(payload, env: dict | None = None) -> tuple[str, str, int
         return "deny", "judge response was not a JSON object; failing closed", 2
     decision = result.get("decision", "deny")
     reason = result.get("rationale") or f"judge decision: {decision}"
+    if decision == "deny" and result.get("source") == "fail-closed":
+        # Distinguish a broken/unavailable classifier from a policy denial at
+        # the call site while preserving the fail-closed deny decision (#83).
+        reason = f"JUDGE CANNOT EVALUATE — {reason}"
     if decision not in ("allow", "deny", "ask"):
         decision, reason = "deny", f"judge returned invalid decision {decision!r}; failing closed"
     exit_code = 2 if decision == "deny" else 0

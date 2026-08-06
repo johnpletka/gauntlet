@@ -234,6 +234,15 @@ def test_classifier_adapter_bounded_under_hook_timeout():
     assert worst_case < HOOK_TIMEOUT_S
 
 
+def test_classifier_uses_configured_profile_effort():
+    from gauntlet.judge.runner import build_core
+
+    core = build_core(
+        policy_path=POLICY, judge_model="test/model", judge_effort="low"
+    )
+    assert core.classifier._adapter.reasoning_effort == "low"
+
+
 def test_audit_redacts_secret_in_command(tmp_path, monkeypatch):
     from gauntlet.logging.redact import RedactingWriter, Redactor
 

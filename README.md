@@ -505,6 +505,13 @@ agents:
   reviewer:  { adapter: codex,       model: gpt-5.5, effort: high }
 ```
 
+The `judge_llm` profile uses this same validated `effort` value. Its
+backward-compatible default is `minimal`; models that reject that tier can set
+`effort: low` (or another supported canonical tier). `gauntlet doctor` executes
+one live probe through the judge's actual classifier schema, timeout, and effort
+path, so an incompatible model/effort pair fails preflight instead of denying
+every agent tool call at runtime.
+
 Mechanical emissions — commit-message drafting and resume-disposition output —
 run on a designated cheap `mechanic:` profile in the shipped config, so the
 builder's constrained provider window is spent on building.
