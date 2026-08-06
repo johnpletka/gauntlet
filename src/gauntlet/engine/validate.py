@@ -2,9 +2,10 @@
 
 Run once when a pipeline is loaded for a run. Three classes of check:
 
-* **Dangling artifact dataflow** (FR-5.3): every ``inputs:``/``artifact:``
-  reference must be a seed artifact (``prd.md``/``plan.md``) or produced by an
-  earlier step's ``output:``.
+* **Dangling artifact dataflow** (FR-5.3): every ``inputs:``/``artifact:``/
+  ``review_against:`` reference must be a seed artifact (``prd.md``/``plan.md``)
+  or produced by an earlier step's ``output:`` — and the path-bearing ones are
+  containment-checked under the repo root (FR-1.3).
 * **Adapter capabilities** (FR-2.3): a step that writes the repo cannot bind an
   adapter that can't (e.g. ``api``); a step that needs a schema *warns* if its
   adapter only does best-effort JSON, and *errors* if it does none.
@@ -23,6 +24,7 @@ from gauntlet.engine.execution import get_spec
 from gauntlet.engine.pipeline import (
     INPUT_MODE_INLINE,
     INPUT_MODE_PHASE,
+    INPUT_MODE_REFERENCE,
     InputRef,
     Pipeline,
     Step,
@@ -253,6 +255,18 @@ def _validate_step(
             "point (dangling reference, FR-5.3)"
         )
 
+    # 2a'. `review_against:` (issue #80) is a path-bearing artifact reference like
+    # any other — the cycle resolves it under the artifact root and inlines the
+    # WHOLE FILE into the reviewer prompt and the transcripts. So it gets the same
+    # FR-5.3 dataflow check and the same FR-1.3 containment/existence checks: an
+    # absolute or `../` value would otherwise read a file from outside the run's
+    # artifacts into an API-backed reviewer's context (review F-001).
+    if step.get("review_against") is not None:
+        _validate_review_against(
+            step, available, produced, report,
+            repo_root=repo_root, artifact_root=artifact_root,
+        )
+
     # 2b. adversarial_cycle role bindings (FR-5.2): the three core roles are
     # required, and capability checks are role-aware — the FIXER writes the
     # repo (FR-2.3); the REVIEWER is intended read-only (FR-9.6), so a
@@ -469,6 +483,63 @@ def _validate_scoped_input(
         err = _scoped_path_error(ref, produced, repo_root, artifact_root)
         if err is not None:
             report.errors.append(f"step {step.id!r} input {ref.name!r}: {err} (FR-1.3)")
+
+
+def _validate_review_against(
+    step: Step,
+    available: set[str],
+    produced: set[str],
+    report: ValidationReport,
+    *,
+    repo_root: Path | None,
+    artifact_root: Path | None,
+) -> None:
+    """Fail-closed checks for a step's ``review_against:`` spec (issue #80).
+
+    The cycle inlines the named artifact's full body into the round-1 reviewer
+    prompt (``_spec_reference_block``), so an unvalidated value is a read
+    primitive: it is resolved as ``artifact_root / name`` and would happily
+    escape to ``../../secrets`` or an absolute path, leaking a local file into an
+    API-backed reviewer's context and the run transcripts (review F-001). Three
+    checks, mirroring what a reference input already gets:
+
+      * dataflow — the name must be a seed or produced by an earlier step
+        (FR-5.3), so a typo is a load error, not a mid-run park;
+      * shape — never absolute, never containing a ``..`` segment. Enforced even
+        when the roots are unknown (the unit-test callers), so no caller can
+        validate a pipeline that the runtime would then read out of tree;
+      * path — with roots known, containment under the repo root plus
+        existence-as-a-file for a seed (FR-1.3, via the shared checker).
+    """
+    name = step.get("review_against")
+    if not isinstance(name, str) or not name.strip():
+        report.errors.append(
+            f"step {step.id!r} `review_against:` must be a non-empty artifact "
+            f"name, got {name!r} (issue #80)"
+        )
+        return
+    if name not in available:
+        report.errors.append(
+            f"step {step.id!r} review_against {name!r} is not a seed artifact and "
+            "is produced by no earlier step (dangling reference, FR-5.3)"
+        )
+        return
+    parts = Path(name).parts
+    if Path(name).is_absolute() or ".." in parts:
+        report.errors.append(
+            f"step {step.id!r} review_against {name!r} must be a run-artifact "
+            "name, not an absolute or parent-escaping path: its body is inlined "
+            "into the reviewer prompt (FR-1.3 / review F-001)"
+        )
+        return
+    if repo_root is not None and artifact_root is not None:
+        err = _scoped_path_error(
+            InputRef(name, INPUT_MODE_REFERENCE), produced, repo_root, artifact_root
+        )
+        if err is not None:
+            report.errors.append(
+                f"step {step.id!r} review_against {name!r}: {err} (FR-1.3)"
+            )
 
 
 def _scoped_path_error(

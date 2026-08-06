@@ -61,11 +61,19 @@ stages:
       # to land before max-rounds escalation parks. The bump is scoped to
       # plan-cycle/impl-cycle per FR-6.1; the prd-cycle above stays at 2. The
       # fail-closed terminus (escalate to human at max-rounds) is unchanged.
+      # `review_against: prd.md` (issue #80) inlines the approved PRD alongside
+      # the plan for round 1, which is what makes review-document.md's mandatory
+      # FR-by-FR coverage sweep executable: artifact mode otherwise inlines only
+      # the artifact under review, so the codex reviewer was never told where the
+      # PRD lives and the `api`-adapter panel member could not read it at all.
+      # The prd-cycle above deliberately does NOT set it — a PRD has no upstream
+      # spec to owe coverage to, and the sweep is inert without the block.
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
          phase: PLAN, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: gemini, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 3,
+         review_against: prd.md,
          review_prompt: prompts/review-document.md}
       # Deterministic structural gate (FR-5.1): the prose reviewer above never
       # parses the gauntlet-phases block, so a malformed block (e.g. an unquoted
