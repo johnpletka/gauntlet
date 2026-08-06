@@ -1462,32 +1462,65 @@ class RunManager:
         )
         return self._journal_has_key(run_dir, key)
 
+    def _matches_committed_object(
+        self, operator_root: Path, local: Path, ref: str, rel: str
+    ) -> bool:
+        """True iff ``local`` is the SAME GIT OBJECT as ``ref:rel``.
+
+        Bytes are only one plane (review F-002). A `100755` local file and a
+        `100644` blob compare byte-equal and are different objects, and the
+        plan's §7 matrix lists the executable bit and the regular-file/symlink
+        distinction as independently recoverable state. So the mode is compared
+        too, and a symlink on either side is never a match — restoring it as a
+        regular file would silently convert one kind of entry into another.
+        """
+        try:
+            committed = gitops.file_bytes_at_commit(operator_root, ref, rel)
+            mode = gitops.file_mode_at_commit(operator_root, ref, rel)
+        except gitops.GitError:
+            return False
+        if committed is None or mode is None:
+            return False
+        try:
+            if not local.is_file() or local.is_symlink():
+                return False
+            if local.read_bytes() != committed:
+                return False
+        except OSError:
+            return False
+        executable = bool(local.stat().st_mode & 0o111)
+        return mode == ("100755" if executable else "100644")
+
     def _untracked_merge_collisions(
-        self, layout: "RunLayout", man: Manifest, operator_root: Path
+        self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
     ) -> tuple[list[str], list[str]]:
-        """``(identical, divergent)`` untracked files the merge would overwrite.
+        """``(identical, divergent)`` untracked files the landing would overwrite.
 
         Only non-empty under `dedicated`, and only for the governed artifacts —
         the exact set the operator authors in their checkout (§14.2 option A)
         and the run branch commits from the copy the sync published into the run
-        worktree. Git refuses a merge outright when an untracked working-tree
-        file would be overwritten, and it refuses **even when the bytes are
-        identical** (measured), so this is the normal end state of a dedicated
-        run, not an edge case.
+        worktree. Git refuses outright when an untracked working-tree file would
+        be overwritten, and it refuses **even when the bytes are identical**
+        (measured), so this is the normal end state of a dedicated run, not an
+        edge case.
 
-        The split is what P7d resolves (a P7c-2 deferral). A collision is
-        ``identical`` only when the operator's file is a regular file (never a
-        symlink — a symlink is a different object, not a copy) whose bytes equal
-        the version on the run branch. Everything else is ``divergent``: the
-        operator edited their copy after the last sync, or it is unreadable, or
-        it is a symlink. Divergence is a real disagreement about a governed
-        artifact and only a human can settle it (R9), so it refuses.
+        **Two refusers, not one** (review F-003). `finish` both `checkout`s the
+        recorded base and then merges the run branch, and EITHER can refuse. A
+        path untracked on the branch the operator happens to be standing on but
+        tracked at the base is refused by the *checkout* — which runs after the
+        run worktree has already been released, so the failure is unrecoverable
+        by retrying and needs manual git. So a collision is anything untracked
+        here and tracked at the run branch **or** at the base, and it is
+        classified before anything is destroyed.
 
-        This is the same "earn the exclusion by comparison" discipline review
-        F-003 imposed on the rollback path, applied in the opposite direction:
-        there proof let the engine *skip* protecting a file, here it lets the
-        engine *replace* one — and here the bytes demonstrably survive, because
-        the merge restores them as a tracked file in the same commit.
+        A collision is ``identical`` only when the local file is the same git
+        object (bytes AND mode, :meth:`_matches_committed_object`) as EVERY ref
+        that would write it. Requiring agreement from both refs is what keeps
+        the resolution honest: quarantining a file that matches the branch but
+        not the base would let the checkout replace the operator's copy with a
+        third version they never saw. Everything else is ``divergent`` — a real
+        disagreement about an approved artifact, which only a human settles
+        (R9), so it refuses early.
         """
         if self._effective_worktree_mode(man) != WT.MODE_DEDICATED:
             return ([], [])
@@ -1498,26 +1531,21 @@ class RunManager:
             if not local.exists():
                 continue
             try:
-                if not gitops.any_tracked_at(
-                    operator_root, f"refs/heads/{man.branch}", [rel]
-                ):
-                    continue
                 if gitops.is_tracked(operator_root, rel):
                     continue  # already tracked here — an ordinary merge
-                committed = gitops.file_bytes_at_commit(
-                    operator_root, f"refs/heads/{man.branch}", rel
-                )
+                writers = [
+                    ref
+                    for ref in (f"refs/heads/{man.branch}", f"refs/heads/{base}")
+                    if gitops.any_tracked_at(operator_root, ref, [rel])
+                ]
             except gitops.GitError:
                 continue
-            try:
-                same = (
-                    committed is not None
-                    and local.is_file()
-                    and not local.is_symlink()
-                    and local.read_bytes() == committed
-                )
-            except OSError:
-                same = False  # cannot prove identical → never auto-resolve
+            if not writers:
+                continue
+            same = all(
+                self._matches_committed_object(operator_root, local, ref, rel)
+                for ref in writers
+            )
             (identical if same else divergent).append(rel)
         return (identical, divergent)
 
@@ -1528,17 +1556,19 @@ class RunManager:
 
         Detection only, and deliberately early — before the worktree release, so
         a finish that cannot complete has destroyed nothing. The identical half
-        is resolved late, by :meth:`_resolve_identical_merge_collisions`,
-        immediately before the merge that restores it.
+        is quarantined by :meth:`_quarantine_identical_merge_collisions` just
+        before the checkout+merge that restores it.
         """
-        _, divergent = self._untracked_merge_collisions(layout, man, operator_root)
+        _, divergent = self._untracked_merge_collisions(
+            layout, man, operator_root, base
+        )
         if not divergent:
             return
         listing = "\n  ".join(divergent)
         raise FinishError(
-            "refusing finish: your checkout has untracked file(s) that the "
-            f"merge of {man.branch!r} into {base!r} would overwrite, and their "
-            "bytes DIFFER from the copy on the run branch:\n"
+            "refusing finish: your checkout has untracked file(s) that landing "
+            f"{man.branch!r} on {base!r} would overwrite, and they are NOT the "
+            "same object as the committed copy (bytes or file mode differ):\n"
             f"  {listing}\n"
             "These are the governed artifacts you authored. A dedicated run "
             "commits them on its own branch (from the copy synced into the run "
@@ -1557,40 +1587,128 @@ class RunManager:
             "then `gauntlet finish` again."
         )
 
-    def _resolve_identical_merge_collisions(
-        self, layout: "RunLayout", man: Manifest, operator_root: Path
-    ) -> list[str]:
-        """Clear untracked duplicates PROVEN identical to what the merge brings in.
+    # Suffix for the set-aside copy of a governed artifact during a landing.
+    # Deliberately visible and greppable: if a crash ever strands one, an
+    # operator who lists the directory sees a named file rather than a mystery.
+    QUARANTINE_SUFFIX = ".gauntlet-finish-backup"
 
-        Called immediately before :func:`gitops.merge_branch` and nowhere else.
-        Re-derives the collision set rather than trusting the early detection,
-        because the worktree release runs in between and a re-check costs one
-        `git show` per governed artifact.
+    def _quarantine_identical_merge_collisions(
+        self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
+    ) -> list[tuple[str, Path]]:
+        """Set aside untracked duplicates PROVEN identical to what git will write.
 
-        **Why this is not "the engine deletes a human's file."** The bytes are
-        proven equal to a blob on the run branch, and the very next operation
-        restores them at the same path as a *tracked* file. The operator's disk
-        ends the verb byte-identical to how it started; what changes is that the
-        path stops being an untracked duplicate. P7c-1.1 declined to do this and
-        was right to, in the terms it used: *"silently removing a human's file
-        to make a verb succeed is the wrong default."* The objection is to
-        **silently**, and to acting without proof — so this proves identity
-        first and the caller names every path it cleared in the verb's result.
+        Called immediately before the checkout+merge and nowhere else, and
+        resolved by :meth:`_settle_quarantined` on every exit path.
 
-        Late by design: on the already-merged path there is no merge to restore
-        them, and detection cannot produce a collision there anyway (a branch
-        that is an ancestor of the base has its files tracked in the base). Doing
-        it here rather than at detection time makes that reasoning unnecessary.
+        **Move, never delete** (review F-002, and R2's "preserve before
+        mutation"). An unlink is unrecoverable if anything downstream fails, and
+        it races: between proving the bytes match and removing the file, an
+        operator's editor can save a new version that the unlink then destroys.
+        A rename is atomic and keeps whatever bytes existed at that instant, so
+        the identity is re-proven on the QUARANTINED copy — the object we
+        actually hold — and a file that changed under us is put straight back
+        and refused.
+
+        **Why this is not "the engine deletes a human's file."** The set-aside
+        object is proven identical (bytes and mode) to a blob every ref that
+        would write the path already carries, git restores it at that same path
+        as a *tracked* file, and the copy is only removed once that succeeded.
+        The operator's disk ends the verb byte-identical to how it started.
+        P7c-1.1 declined this and was right in the terms it used: *"silently
+        removing a human's file to make a verb succeed is the wrong default."*
+        The objection is to **silently**, and to acting without proof — so this
+        proves identity twice and the caller names every path in the result.
+
+        Re-derives the collision set rather than trusting the early detection:
+        the worktree release runs in between, and a re-check costs one `ls-tree`
+        and one `show` per governed artifact.
         """
-        identical, _ = self._untracked_merge_collisions(layout, man, operator_root)
-        cleared: list[str] = []
+        identical, _ = self._untracked_merge_collisions(
+            layout, man, operator_root, base
+        )
+        moved: list[tuple[str, Path]] = []
+        refs = [f"refs/heads/{man.branch}", f"refs/heads/{base}"]
         for rel in identical:
+            live = self.operator_root / rel
+            held = live.with_name(live.name + self.QUARANTINE_SUFFIX)
             try:
-                (self.operator_root / rel).unlink()
+                if held.exists():
+                    raise FinishError(
+                        f"refusing finish: {held} already exists. A previous "
+                        "finish set your artifact aside and did not put it "
+                        "back. Inspect it, restore or remove it by hand, then "
+                        "retry — the engine will not overwrite a file it "
+                        "cannot explain."
+                    )
+                live.rename(held)
             except OSError:
-                continue  # the merge will refuse and say so; never mask that
-            cleared.append(rel)
-        return cleared
+                continue  # could not move it → leave it; git refuses and says so
+            moved.append((rel, held))
+            # Re-prove on the object we now hold, not the one we measured.
+            still_same = any(
+                self._matches_committed_object(operator_root, held, ref, rel)
+                for ref in refs
+                if gitops.any_tracked_at(operator_root, ref, [rel])
+            )
+            if not still_same:
+                self._settle_quarantined(moved)
+                raise FinishError(
+                    f"refusing finish: {rel} changed while finish was setting "
+                    "it aside, so it is no longer the redundant duplicate this "
+                    "verb proved it was. Your file has been put back exactly as "
+                    "found. Commit it, or discard it, then retry."
+                )
+        return moved
+
+    @staticmethod
+    def _settle_quarantined(moved: list[tuple[str, Path]]) -> list[str]:
+        """Resolve every set-aside artifact; return paths whose copy was KEPT.
+
+        The ONE exit path for a quarantine, called on success and on every
+        failure alike. Making it universal is the point: a separate
+        "discard on success" helper has to assume git restored the file, and
+        that assumption is false on the already-merged path where no checkout
+        runs — which would delete the operator's artifact outright. This asks
+        the filesystem instead of assuming.
+
+        Best-effort and never raises: the failure paths that call this are
+        already carrying the real cause, and an exception here would replace it
+        (P7c-1.1's `merge --abort` lesson).
+
+        Three cases, and the middle one is why this is not a plain rename back:
+
+        * the live path is free — move it back, the ordinary undo;
+        * git has since recreated the live path (the error path checks the run
+          branch back out, and that branch tracks these artifacts) with the SAME
+          object we hold — the file is already restored, so the held copy is
+          redundant and is dropped;
+        * git recreated it with a DIFFERENT object — never overwrite. The copy
+          stays beside it under its visible suffix and the caller names it, so
+          the operator gets two files to compare instead of a silent choice made
+          for them.
+        """
+        kept: list[str] = []
+        for rel, held in moved:
+            live = held.with_name(held.name[: -len(RunManager.QUARANTINE_SUFFIX)])
+            try:
+                if not held.exists():
+                    continue
+                if not live.exists():
+                    held.rename(live)
+                    continue
+                same = (
+                    live.is_file()
+                    and not live.is_symlink()
+                    and held.read_bytes() == live.read_bytes()
+                    and (live.stat().st_mode & 0o111) == (held.stat().st_mode & 0o111)
+                )
+                if same:
+                    held.unlink()
+                else:
+                    kept.append(str(held))
+            except OSError:
+                kept.append(str(held))
+        return kept
 
     def _refuse_if_run_worktree_dirty(
         self, man: Manifest, *, verb: str, exc_type: type = FinishError,
@@ -4123,6 +4241,21 @@ class RunManager:
         # journal first. Safe-wrapped: `clean` legitimately runs when the
         # pointer is already stale and there is no run dir to reconcile.
         self._reconcile_projection_safe(layout)
+        # Review F-005: `clean` destroys a run's tree AND its branch, and until
+        # now it acquired no drive lock at all — so it could pull the working
+        # directory out from under a live driver and delete the branch that
+        # driver is committing to. The worktree-global tree guard never covered
+        # this (clean never took it either), so it is a gap P7c opened when it
+        # gave `clean` a worktree to release, not one the guard used to close.
+        #
+        # Liveness is read BEFORE the lock is taken, for the reason P7c-1.1's
+        # F-003 recorded: a verb holding the drive lock looks like a live driver
+        # to anything that consults liveness, so acquiring first would make
+        # `clean` refuse itself. `indeterminate` fails closed with `alive` — the
+        # same asymmetry `recover`, `_reap_orphaned_judge` and the migration
+        # gate take, and the safe direction when the alternative is destroying a
+        # tree we cannot prove is idle.
+        self._refuse_clean_under_a_live_driver(slug, layout)
         branch = f"{self.config.branch_prefix}{slug}"
         if not gitops.branch_exists(repo, branch):
             cleared = self._clear_active_pointer(layout)
@@ -4130,6 +4263,71 @@ class RunManager:
                 f"no branch {branch!r}"
                 + ("; cleared stale active-run pointer" if cleared else "; nothing to do")
             )
+        handle = self._acquire_worktree_lock(slug, None, run_dir=self._clean_run_dir(layout))
+        try:
+            return self._clean_locked(slug, layout, repo, branch, force=force)
+        finally:
+            self._release_worktree_lock(handle)
+
+    @staticmethod
+    def _clean_run_dir(layout: "RunLayout") -> Path | None:
+        """The run-instance dir for `clean` to lock, when one resolves.
+
+        ``clean`` legitimately runs with a stale pointer and no run dir — spike
+        §11 row 3, "a stale worktree whose run is gone", the case where the tree
+        most needs removing. There is no per-run lock to take then, and the tree
+        guard alone is the right (and only) exclusion.
+        """
+        try:
+            return layout.active_run_dir()
+        except (OSError, ValueError):  # FileNotFoundError is an OSError
+            return None
+
+    def _refuse_clean_under_a_live_driver(self, slug: str, layout: "RunLayout") -> None:
+        """Fail closed rather than tear a tree away from a driver (review F-005)."""
+        run_dir = self._clean_run_dir(layout)
+        if run_dir is None:
+            return  # no run instance → nothing is driving it
+        try:
+            liveness = self._migration_liveness(slug, run_dir)
+        except (OSError, ValueError):
+            return  # cannot read a driver record at all → treat as no driver
+        if liveness in self._migratable_liveness():
+            return
+        from gauntlet.engine import operator
+
+        detail = (
+            "a driver is LIVE and is driving this run right now"
+            if liveness == operator.LIVENESS_ALIVE
+            else "this run's driver state is INDETERMINATE — its lock could not "
+            "be read, so it may still be running"
+        )
+        raise WorktreeLockError(
+            f"refusing clean for {slug!r}: {detail}. `clean` removes the run's "
+            "worktree and deletes its branch, and doing that under a driver "
+            "takes the working directory out from under it mid-step.\n"
+            f"  Stop it first (`gauntlet abort {slug}`), or wait for it to "
+            f"finish; `gauntlet status {slug}` shows the driver. If you are "
+            "sure the driver is dead, `gauntlet recover` proves it and clears "
+            "the lock."
+        )
+
+    def _clean_locked(
+        self,
+        slug: str,
+        layout: "RunLayout",
+        operator_root: Path,
+        branch: str,
+        *,
+        force: bool,
+    ) -> str:
+        """:meth:`clean`'s body, with the drive lock held.
+
+        The tree parameter is named ``operator_root``, not ``repo``: `clean`
+        steps off the run branch and deletes it FROM THE HUMAN'S CHECKOUT by
+        design (spike §9.4), and `test_root_scope` bans the ambiguous name from
+        every work-scoped call precisely so that set stays greppable.
+        """
         # PROBLEM D / spike E2-D: with a live worktree on this branch,
         # `branch -D` hard-refuses ("cannot delete branch ... used by worktree
         # at ..."). The tree must be unlocked and removed FIRST, and a dirty
@@ -4143,13 +4341,13 @@ class RunManager:
                     f"cannot determine the base for {branch!r} (no run manifest); "
                     "merge it and retry, or pass --force to delete anyway"
                 )
-            if not gitops.is_ancestor(repo, branch, base):
+            if not gitops.is_ancestor(operator_root, branch, base):
                 raise RunBranchNotMergedError(
                     f"refusing to delete {branch!r}: not fully merged into base "
                     f"{base!r}. Merge it first (e.g. `gauntlet finish {slug}`), "
                     "or pass --force to discard it."
                 )
-        if gitops.current_branch(repo) == branch:
+        if gitops.current_branch(operator_root) == branch:
             target = base
             if target is None or target == branch:
                 raise RunBranchNotMergedError(
@@ -4162,16 +4360,16 @@ class RunManager:
             # PR.md) — NOT the whole run root, which would hide tracked artifacts
             # like prd.md/plan.md and let their uncommitted edits ride onto base.
             excludes = run_bookkeeping_excludes(
-                repo, layout.active_run_dir(), layout.slug_dir
+                operator_root, layout.active_run_dir(), layout.slug_dir
             )
-            if not gitops.is_clean(repo, exclude=excludes):
+            if not gitops.is_clean(operator_root, exclude=excludes):
                 raise WorktreeDirtyError(
                     f"refusing clean: worktree is dirty and clean must step off "
                     f"{branch!r} onto {target!r}, which would carry the changes "
                     "onto the base. Commit or discard them first."
                 )
-            gitops.checkout_branch(repo, target)
-        gitops.delete_branch(repo, branch)
+            gitops.checkout_branch(operator_root, target)
+        gitops.delete_branch(operator_root, branch)
         self._clear_active_pointer(layout)
         return f"deleted {branch!r}" + (" (forced)" if force else "")
 
@@ -4300,9 +4498,13 @@ class RunManager:
         #
         # P7d splits what P7c-1.1 refused wholesale. A DIVERGENT duplicate still
         # refuses here, early, having destroyed nothing. An IDENTICAL one is
-        # resolved immediately before the merge that restores it — see
-        # `_resolve_identical_merge_collisions` for why proof-then-replace is
-        # not the "silently removing a human's file" P7c-1.1 declined.
+        # SET ASIDE (moved, never deleted) just before the checkout+merge that
+        # restores it — see `_quarantine_identical_merge_collisions`.
+        #
+        # Review F-003: the collision set covers the base ref as well as the run
+        # branch, because `checkout_branch(repo, base)` below refuses on the
+        # same untracked-overwrite rule the merge does — and it runs AFTER the
+        # run worktree has been released, so a refusal there is not retryable.
         self._refuse_on_untracked_merge_collision(layout, man, repo, base)
         # PROBLEM D / spike E2-D: release the run worktree BEFORE the branch is
         # merged and deleted. The merge itself is unaffected by a live worktree
@@ -4319,19 +4521,60 @@ class RunManager:
         # directory to inspect, so the list is never consulted.
         self._release_run_worktree(run_dir, man, excludes=run_excludes)
 
+        # Set aside BEFORE any checkout, not just before the merge: BOTH write
+        # these paths and both refuse on an untracked file (review F-003), and
+        # both run AFTER the release above — so a refusal there is not fixable
+        # by retrying. Hoisted above the already-merged branch so the two
+        # landing paths cannot diverge on this; reasoning that one of them
+        # "cannot reach a collision" is exactly the kind of argument that stops
+        # being true when the surrounding code moves.
+        moved = self._quarantine_identical_merge_collisions(layout, man, repo, base)
+        cleared = [rel for rel, _held in moved]
+
         # Already merged (e.g. landed via a PR): nothing to merge, just tidy.
         if gitops.is_ancestor(repo, branch, base):
-            if gitops.current_branch(repo) == branch:
-                gitops.checkout_branch(repo, base)
+            try:
+                if gitops.current_branch(repo) == branch:
+                    gitops.checkout_branch(repo, base)
+            except gitops.GitError as exc:
+                self._settle_quarantined(moved)
+                raise FinishError(
+                    f"{branch!r} is already merged into {base!r} but the base "
+                    f"could not be checked out: {exc}\n"
+                    "  The branch was NOT deleted. Nothing else was changed."
+                )
+            # Settle FIRST, then report what settling actually did. On this path
+            # a checkout may not have run at all (the operator was already off
+            # the run branch), in which case nothing restored the artifact and
+            # `_settle_quarantined` simply put it back — so claiming a
+            # replacement here would describe an operation that did not happen.
+            # `restored` is the paths whose set-aside copy is still on disk.
+            restored = self._settle_quarantined(moved)
             gitops.delete_branch(repo, branch)
             self._clear_active_pointer(layout)
-            return f"already merged into {base!r}; deleted {branch!r}"
+            note = ""
+            if cleared:
+                note = (
+                    f"; your untracked {', '.join(cleared)} was set aside for "
+                    "the landing and is back in place"
+                )
+            if restored:
+                note += (
+                    f"; a differing version was already present, so your copy "
+                    f"was left beside it as {', '.join(restored)}"
+                )
+            return f"already merged into {base!r}; deleted {branch!r}{note}"
 
-        gitops.checkout_branch(repo, base)
-        # Immediately before the merge, and only for duplicates re-proven
-        # byte-identical to the blob the merge is about to write at that same
-        # path. Anything divergent already refused above.
-        cleared = self._resolve_identical_merge_collisions(layout, man, repo)
+        try:
+            gitops.checkout_branch(repo, base)
+        except gitops.GitError as exc:
+            self._settle_quarantined(moved)
+            raise FinishError(
+                f"could not check out base {base!r} to land {branch!r}: {exc}\n"
+                "  Nothing was merged. The run worktree has already been "
+                "released, so re-running `gauntlet finish` is safe once the "
+                "base is checkable-out."
+            )
         msg = f"Merge {branch} into {base} (gauntlet finish {slug}, run {man.run_id})"
         try:
             gitops.merge_branch(repo, branch, message=msg)
@@ -4350,25 +4593,33 @@ class RunManager:
                 gitops.checkout_branch(repo, branch)  # leave the human where they were
             except gitops.GitError:
                 pass
-            restore = (
-                "\nYour untracked duplicate(s) of "
-                f"{', '.join(cleared)} were cleared for the merge and are "
-                f"unchanged on {branch!r}; restore them with "
-                f"`git -C {self.operator_root} checkout {branch} -- "
-                f"{' '.join(cleared)}`."
-                if cleared
-                else ""
-            )
+            kept = self._settle_quarantined(moved)
+            restored = ""
+            if cleared:
+                restored = (
+                    f"\nYour untracked {', '.join(cleared)} was set aside for "
+                    "the landing and has been put back."
+                )
+            if kept:
+                restored += (
+                    f"\n  NOTE: git had already restored a DIFFERENT version at "
+                    f"that path, so your copy was left beside it as "
+                    f"{', '.join(kept)} rather than overwriting either. Compare "
+                    "them and keep the one you want."
+                )
             raise FinishError(
                 f"merge of {branch!r} into {base!r} conflicts (or was refused "
                 f"outright); resolve it manually — any half-merge was aborted "
-                f"and you are back on {branch!r}. Details: {exc}{restore}"
+                f"and you are back on {branch!r}. Details: {exc}{restored}"
             )
+        # The merge landed, so git has rewritten every quarantined path as a
+        # tracked file. Only now is the set-aside copy redundant.
+        self._settle_quarantined(moved)
         gitops.delete_branch(repo, branch)
         self._clear_active_pointer(layout)
         note = (
             f"; replaced your untracked duplicate(s) of {', '.join(cleared)} "
-            "with the merged tracked copy (byte-identical)"
+            "with the merged tracked copy (same bytes and file mode)"
             if cleared
             else ""
         )
@@ -4640,11 +4891,13 @@ class RunManager:
             f"  Your checkout was not touched. Inspect the run's tree with "
             f"`git -C {wt.path} status`; `gauntlet status {slug}` names it too.\n"
             f"  Undo with `gauntlet migrate-worktree {slug} --rollback`.\n"
-            "  Note: `gauntlet finish` may now ask you to resolve your local "
-            f"untracked {layout.slug_dir.name}/prd.md — a dedicated run commits "
-            "the synced copy on its branch, and the engine will not delete your "
-            "file to make a verb succeed. It names both resolutions when it "
-            "happens."
+            "  Note: a dedicated run commits the synced copy of "
+            f"{layout.slug_dir.name}/prd.md on its own branch, so your local "
+            "copy becomes an untracked duplicate. `gauntlet finish` sets that "
+            "aside for you and lets the merge restore it as a tracked file when "
+            "it is the same object (same bytes and file mode), naming what it "
+            "replaced. If yours has DIVERGED it refuses instead and names both "
+            "resolutions — that disagreement is yours to settle."
         )
 
     def _run_tree_excludes(
@@ -4754,23 +5007,72 @@ class RunManager:
         copy, and is never excluded) with identical bytes. Anything else —
         divergent, missing on either side, unreadable — is treated as
         uncommitted work, which makes the rollback refuse and name it.
+
+        **The worktree plane is not the only plane** (review F-001). Byte
+        equality is a claim about the FILE; excluding the path drops it from the
+        dirtiness check *and* from :func:`WT.release`'s snapshot decision, and a
+        linked worktree has its own private index that dies with it. A path
+        staged at version B while the working tree holds an
+        authority-identical C would be judged redundant, skip the snapshot, and
+        take B to the grave — the staged/unstaged-differ row the plan's §7
+        matrix names explicitly, and the one state a working-tree comparison
+        structurally cannot see.
+
+        So the index plane must be proven empty too. The accepted shapes are
+        exactly: no status entry at all (tracked and clean), ``??``
+        (untracked — no index state exists to lose), and ``' M'`` (index equals
+        HEAD, worktree modified — both versions survive, one in the branch and
+        one as the authority). Everything else — anything staged, unmerged, a
+        type change, a rename — keeps its protection.
         """
         verified: list[str] = []
         for rel in governed_artifact_paths(work_root, artifact_root_in_work):
             in_tree = work_root / rel
             authority = layout.slug_dir / Path(rel).name
             try:
-                if (
+                if not (
                     in_tree.is_file()
                     and not in_tree.is_symlink()
                     and authority.is_file()
                     and not authority.is_symlink()
                     and in_tree.read_bytes() == authority.read_bytes()
+                    # Mode is its own plane (review F-002, plan §7): a copy that
+                    # differs only in the executable bit is a different object,
+                    # and dropping its protection would silently lose that bit.
+                    and (in_tree.stat().st_mode & 0o111)
+                    == (authority.stat().st_mode & 0o111)
                 ):
-                    verified.append(rel)
+                    continue
             except OSError:
                 continue  # cannot prove identical → do not exclude
+            if self._path_has_index_state(work_root, rel):
+                continue  # F-001: staged/unmerged state the file cannot show
+            verified.append(rel)
         return verified
+
+    # Porcelain XY codes for a path carrying NOTHING unique in the index: no
+    # entry at all, untracked, or index-equals-HEAD with a modified worktree.
+    _NO_INDEX_STATE_CODES = ("??", " M")
+
+    @staticmethod
+    def _path_has_index_state(work_root: Path, rel: str) -> bool:
+        """True when ``rel`` holds index-plane state a teardown would destroy.
+
+        Fail-closed in both error directions: an unreadable status is treated as
+        "there IS state", because the caller uses this to decide whether it may
+        stop protecting the path, and "I could not look" must never read as
+        "there is nothing there".
+        """
+        try:
+            out = gitops.status_porcelain(work_root, paths=[rel], untracked_all=True)
+        except gitops.GitError:
+            return True
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            if line[:2] not in RunManager._NO_INDEX_STATE_CODES:
+                return True
+        return False
 
     def _rollback_refusal(self, blocker: str, man: Manifest) -> str:
         """A rollback refusal, closing with the mode it actually leaves (F-007).

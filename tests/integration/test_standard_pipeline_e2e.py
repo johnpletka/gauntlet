@@ -249,17 +249,47 @@ def _assert_governed_live_stop(mgr: RunManager) -> None:
         assert current, man.model_dump()
         step = current[-1]
         if step.status == M.HALTED:
-            # A generated one-phase plan can still contain an implementation
-            # commit that claims deferrals to phases the plan does not define.
-            # The acceptance gate must fail closed (FR-3.3); this is a governed
-            # live-system outcome, not an end-to-end completion substitute.
+            # A live one-phase run can produce artifacts the acceptance gate
+            # must reject, and the gate failing closed on them is a governed
+            # outcome — not an end-to-end completion substitute.
+            #
+            # BROADENED (P7d review F-007). This branch used to pin ONE gate id
+            # and ONE precondition, and both pins were narrower than the
+            # contract they stand for, so a correct fail-closed halt failed the
+            # test:
+            #
+            # * `standard.yaml` carries TWO acceptance gates — `acceptance-gate`
+            #   pre-cycle and `acceptance-recheck` post-cycle (PR #59 review
+            #   F1). Either can be the one that fires; the id is not the
+            #   contract, the TYPE and the fail-closed shape are.
+            # * the gate has more than one precondition. The observed halt was
+            #   FR-3.2 (an acceptance map carrying clause ids absent from the
+            #   plan phase), while the pin named only FR-3.3 (deferrals to
+            #   nonexistent phases).
+            #
+            # Enumerating the messages was the mistake, not the choice of which
+            # one: the gate has more than a dozen distinct preconditions, so any
+            # list of them is a list that goes stale. This asserts the CONTRACT
+            # those messages share — an acceptance-gate step, halted on a
+            # precondition, carrying the gate's own engine-authored fail-closed
+            # explanation, with the tree left clean.
+            #
+            # Still a real assertion, and it is the one that matters: an
+            # incidental crash, an adapter error, or a halt from some other step
+            # type all fail here. What it stops doing is failing when a live run
+            # trips a governed precondition this file had not thought of.
             assert step.type == "acceptance_gate"
-            assert step.id == "acceptance-gate"
+            assert step.id in ("acceptance-gate", "acceptance-recheck"), step.id
             assert step.halt_reason == M.HALT_REASON_PRECONDITION
             notes = step.notes or ""
-            assert "defers work to nonexistent phase(s)" in notes
-            assert "a deferral must target a real plan phase" in notes
-            assert "fail closed, FR-3.3" in notes
+            assert notes.startswith("acceptance gate:"), notes
+            assert "fail closed" in notes or "FR-3." in notes, (
+                "the halt must carry the gate's own governed explanation, not a "
+                f"bare error: {notes!r}"
+            )
+            assert len(notes) > len("acceptance gate:") + 20, (
+                f"and it must actually say what failed: {notes!r}"
+            )
             assert gitops.is_clean(
                 mgr.repo_root, exclude=["runs"]
             ), gitops.status_porcelain(mgr.repo_root, exclude=["runs"])

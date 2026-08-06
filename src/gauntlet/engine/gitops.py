@@ -166,6 +166,7 @@ ROOT_SCOPE: dict[str, str] = {
     "any_tracked_at": ROOT_SCOPE_REPO,
     "file_at_commit": ROOT_SCOPE_REPO,
     "file_bytes_at_commit": ROOT_SCOPE_REPO,
+    "file_mode_at_commit": ROOT_SCOPE_REPO,
     "advance_is_engine_bookkeeping": ROOT_SCOPE_REPO,
     "remote_url": ROOT_SCOPE_REPO,
     "remote_default_branch": ROOT_SCOPE_REPO,
@@ -409,7 +410,11 @@ def _exclude_pathspec(exclude: list[str] | None) -> list[str]:
 
 
 def status_porcelain(
-    repo: Path, *, exclude: list[str] | None = None, untracked_all: bool = False
+    repo: Path,
+    *,
+    exclude: list[str] | None = None,
+    untracked_all: bool = False,
+    paths: list[str] | None = None,
 ) -> str:
     """Porcelain status; empty string means a clean worktree.
 
@@ -430,11 +435,17 @@ def status_porcelain(
     ``.gauntlet/runs/`` before anything under it is tracked, so a path-equality
     check never sees the file. Callers that match on individual paths must pass
     ``untracked_all=True``.
+
+    ``paths`` narrows the report to a repo-relative pathspec. It lets a caller
+    ask about ONE path without string-matching git's own output, which is quoted
+    and rename-aware and therefore parses wrong exactly where it matters least
+    and breaks worst. Combines with ``exclude``; git applies both pathspecs.
     """
     mode = "all" if untracked_all else "normal"
+    scope = ["--", *paths] if paths else []
     return _run(
         repo, "status", "--porcelain", f"--untracked-files={mode}",
-        *_exclude_pathspec(exclude),
+        *_exclude_pathspec(exclude), *scope,
     ).strip()
 
 
@@ -1121,6 +1132,21 @@ def file_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
         return _run(repo, "show", f"{sha}:{relpath}")
     except GitError:
         return None
+
+
+def file_mode_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
+    """The git mode of ``relpath`` at ``sha`` (e.g. ``100644``), or ``None``.
+
+    The executable bit and the regular-file/symlink distinction are their own
+    state plane (plan §7), so a caller proving "this file is a redundant copy of
+    what is committed" has not proved it from the bytes alone: a `100755` local
+    file and a `100644` blob compare byte-equal and are different objects.
+    """
+    try:
+        out = _run(repo, "ls-tree", sha, "--", relpath).strip()
+    except GitError:
+        return None
+    return out.split()[0] if out else None
 
 
 def file_bytes_at_commit(repo: Path, sha: str, relpath: str) -> bytes | None:

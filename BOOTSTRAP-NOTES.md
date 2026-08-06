@@ -1116,8 +1116,10 @@ the maintainer's options: `proposals/P7d-gate-blocker.md`.
   the first tree's creation. A phase that does the flip should re-base the A1
   baseline per run, or that shape will be miscounted as a violation.
 - **Suggested durable mitigation, independent of where the worktree ends up:**
-  a start-time preflight (and a `doctor` check) that writes a probe file into
-  the run worktree *through the adapter* and parks with a named reason if it is
-  refused — the same fail-closed shape as the §7 submodule park. That is the
-  only one of the options that would have made this failure legible without a
-  human reading a transcript.
+  a start-time preflight (and a `doctor` check) that parks with a named reason
+  when the run worktree is not writable — the fail-closed shape of the §7
+  submodule park. It must exercise **each** adapter write mechanism by name
+  (`Write`, `Edit`, a shell redirection) and read the *post-tool* permission
+  outcome; a probe that lets a model choose how to write inherits the same
+  nondeterminism and can pass via `tee` while the real task fails on `Write`.
+  A detector, not a fix — moving the worktree out of `.git/` is the fix.

@@ -337,7 +337,7 @@ def test_finish_refuses_a_divergent_untracked_duplicate(fixture_repo):
     prd.write_text(prd.read_text() + "\nan edit made after the run's last sync\n")
     edited = prd.read_bytes()
 
-    with pytest.raises(FinishError, match="bytes DIFFER"):
+    with pytest.raises(FinishError, match="NOT the same object"):
         mgr.finish("demo")
 
     assert prd.read_bytes() == edited, "the divergent file is never touched"
@@ -421,4 +421,237 @@ def test_finish_still_refuses_an_artifact_edited_inside_the_run_tree(fixture_rep
 
     assert synced.read_bytes() == b"# Plan\n\nEDITED IN THE RUN TREE\n", (
         "the edit is preserved, not snapshotted-and-removed"
+    )
+
+
+# --- P7d review fixes --------------------------------------------------------
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_snapshots_a_governed_artifact_staged_in_the_run_tree(fixture_repo):
+    """Review F-001: byte equality is a claim about the FILE, not the index.
+
+    A linked worktree has its own private index that dies with it. If the run
+    tree stages version B while its working copy holds an authority-identical C,
+    the worktree-only comparison called the path redundant, excluded it from
+    BOTH the dirtiness refusal and `WT.release`'s snapshot decision, and the
+    teardown took B with it — the staged/unstaged-differ row the plan's §7
+    matrix names, and the one state the file's own bytes cannot reveal.
+    """
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None
+
+    authority = b"# Plan\n\nauthority bytes\n"
+    (fixture_repo / "runs" / "demo" / "plan.md").write_bytes(authority)
+    synced = entry.path / "runs" / "demo" / "plan.md"
+    synced.parent.mkdir(parents=True, exist_ok=True)
+    # Stage version B...
+    synced.write_bytes(b"# Plan\n\nSTAGED VERSION B - ONLY IN THE INDEX\n")
+    git(entry.path, "add", "runs/demo/plan.md")
+    # ...then leave an authority-identical C in the working tree.
+    synced.write_bytes(authority)
+
+    with pytest.raises(FinishError, match="RUN WORKTREE has uncommitted"):
+        mgr.finish("demo")
+
+    assert synced.exists(), "the tree was not torn down"
+    staged = git(entry.path, "show", ":runs/demo/plan.md")
+    assert "STAGED VERSION B" in staged, "the index version is still recoverable"
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_refuses_a_duplicate_whose_file_mode_differs(fixture_repo):
+    """Review F-002: the executable bit is its own state plane (plan §7).
+
+    A `100755` local file and a `100644` blob compare byte-equal and are
+    different git objects. Replacing one with the other would silently drop the
+    mode, so mode inequality makes the collision divergent.
+    """
+    import os
+
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    prd = fixture_repo / "runs" / "demo" / "prd.md"
+    assert prd.read_bytes() == git(
+        fixture_repo, "show", "gauntlet/demo:runs/demo/prd.md"
+    ).encode(), "precondition: the bytes match, so only the mode can differ"
+    os.chmod(prd, 0o755)
+
+    with pytest.raises(FinishError, match="NOT the same object"):
+        mgr.finish("demo")
+
+    assert prd.stat().st_mode & 0o111, "the operator's executable bit survives"
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_restores_the_set_aside_artifact_when_the_landing_fails(fixture_repo):
+    """Review F-002: move-then-restore, never unlink — R2 in the landing path.
+
+    An unlink is unrecoverable the moment anything downstream fails. The file is
+    moved aside, and every failure path must put it back exactly as found.
+    Driven through a real failure (a conflicting commit on the base) rather than
+    a patched helper, so the restore is proven where it actually has to happen.
+    """
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    prd = fixture_repo / "runs" / "demo" / "prd.md"
+    authored = prd.read_bytes()
+    # A conflicting commit on the base at the same path the merge will write.
+    git(fixture_repo, "checkout", "-q", "main")
+    (fixture_repo / "feature.py").write_text("a conflicting base version\n")
+    git(fixture_repo, "add", "feature.py")
+    git(fixture_repo, "commit", "-qm", "base touches the same path")
+
+    with pytest.raises(FinishError, match="conflicts"):
+        mgr.finish("demo")
+
+    assert prd.read_bytes() == authored, "put back exactly as found"
+    assert not list(fixture_repo.glob("runs/demo/*.gauntlet-finish-backup")), (
+        "and no set-aside copy is stranded"
+    )
+
+
+def test_clean_refuses_while_a_driver_is_live(fixture_repo, monkeypatch):
+    """Review F-005: `clean` destroys a tree AND a branch, under no lock at all.
+
+    P7c gave `clean` a worktree to release without giving it the drive lock, so
+    a concurrent driver could lose its working directory and its branch
+    mid-step. The worktree-global tree guard never covered this either — `clean`
+    never acquired it — so this is a gap, not a regression from the guard.
+    """
+    from gauntlet.engine import operator as op
+    from gauntlet.engine.run import WorktreeLockError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None
+
+    monkeypatch.setattr(
+        RunManager, "_migration_liveness", lambda self, s, d: op.LIVENESS_ALIVE
+    )
+    with pytest.raises(WorktreeLockError, match="refusing clean"):
+        mgr.clean("demo", force=True)
+
+    assert entry.path.is_dir(), "the live run's tree is untouched"
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
+
+
+def test_clean_refuses_under_an_indeterminate_driver(fixture_repo, monkeypatch):
+    """The half that is easy to get wrong: `indeterminate` fails closed too.
+
+    "I could not read the lock" must be treated as `alive`, never as gone —
+    the same asymmetry `recover`, `_reap_orphaned_judge` and the migration gate
+    take. Paired with the live case so a predicate that always refuses cannot
+    satisfy both.
+    """
+    from gauntlet.engine import operator as op
+    from gauntlet.engine.run import WorktreeLockError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+
+    monkeypatch.setattr(
+        RunManager,
+        "_migration_liveness",
+        lambda self, s, d: op.LIVENESS_INDETERMINATE,
+    )
+    with pytest.raises(WorktreeLockError, match="INDETERMINATE"):
+        mgr.clean("demo", force=True)
+
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo")
+
+
+@pytest.mark.operator_tree_verb  # `clean` deletes the run branch from the operator's checkout (§9.4)
+def test_clean_still_works_when_the_driver_is_gone(fixture_repo):
+    """The other direction: the refusal must not become a wedge.
+
+    A parked run with no live driver is the normal `clean` case and must stay
+    executable, or F-005's fix trades a data-loss bug for an unusable verb.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    entry = _run_worktree(mgr, "gauntlet/demo")
+
+    mgr.clean("demo", force=True)
+
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+    assert not entry.path.is_dir()
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_already_merged_never_strands_the_set_aside_artifact(fixture_repo):
+    """The quarantine's exit path must ask the filesystem, not assume.
+
+    On the already-merged path `finish` deletes the branch WITHOUT merging, and
+    it checks the base out only when the operator is standing on the run branch.
+    So a "discard the set-aside copy, git restored it" step is wrong here: when
+    no checkout runs, nothing restores it, and discarding would delete the
+    operator's artifact outright.
+
+    The state is built deliberately rather than incidentally: the operator ends
+    up on a THIRD branch, forked before the artifact existed, so
+    `runs/<slug>/prd.md` is untracked in their index while the base tracks it.
+    That is the only shape that both produces a quarantine and skips the
+    checkout — and a test that never reaches the quarantine proves nothing,
+    which is why the assertion on "set aside" is here rather than implied.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    fork_point = gitops.head_sha(fixture_repo)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    prd = fixture_repo / "runs" / "demo" / "prd.md"
+    authored = prd.read_bytes()
+
+    # Land it by hand, so `finish` takes the already-merged path. The untracked
+    # duplicate has to go first — git refuses the merge over it, which is the
+    # very collision this suite exists for.
+    prd.unlink()
+    git(fixture_repo, "merge", "-q", "--no-ff", "-m", "landed", "gauntlet/demo")
+    assert gitops.is_tracked(fixture_repo, "runs/demo/prd.md"), "the base now has it"
+    # ...then stand somewhere the artifact is untracked.
+    git(fixture_repo, "checkout", "-q", "-b", "side", fork_point)
+    assert not gitops.is_tracked(fixture_repo, "runs/demo/prd.md"), (
+        "precondition: untracked here, tracked on the base — a real collision"
+    )
+    prd.write_bytes(authored)
+
+    out = mgr.finish("demo")
+
+    assert "already merged" in out, out
+    assert "set aside" in out, (
+        "the quarantine must actually have fired, or this proves nothing: " + out
+    )
+    assert prd.read_bytes() == authored, "the operator's artifact was NOT stranded"
+    assert not list(fixture_repo.glob("runs/demo/*.gauntlet-finish-backup")), (
+        "and no set-aside copy is left behind"
     )

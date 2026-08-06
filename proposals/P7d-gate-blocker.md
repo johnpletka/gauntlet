@@ -264,16 +264,38 @@ directory beside the repo.
 ### Option 4 — make the failure visible, whatever else is decided
 
 Independent of the root question and worth doing on its own: the engine cannot
-currently tell "the agent chose not to write" from "the agent was refused". The
-smallest honest fix is a `doctor` check and a start-time preflight that writes a
-probe file into the run worktree **through the adapter** and parks with a named
-reason if it is refused — the same fail-closed shape as the §7 submodule park.
-That turns §2.4's silent failure into `worktree_unavailable`-class evidence.
+currently tell "the agent chose not to write" from "the agent was refused".
+
+The probe must be **deterministic**, and that is the whole difficulty. A probe
+that asks a model to "write a file here" inherits precisely the nondeterminism
+in §2.3: it can pass by choosing `tee` while the real task later fails on
+`Write`, or fail merely because it chose a blocked form. A stochastic probe for
+a stochastic failure proves nothing in either direction.
+
+So the check must exercise **each write mechanism the adapter actually uses, by
+name and without model choice** — the `Write` tool, the `Edit` tool, and a shell
+redirection — and treat *any* of them being refused as the failure. Two parts,
+because the refusal does not surface where the engine currently looks (§2.4):
+
+* a **`doctor` check** that runs each mechanism against a scratch path under the
+  derived worktree root and reports which are refused;
+* a **start-time preflight** on the same set, parking with a named reason before
+  any agent step — the fail-closed shape of the §7 submodule park.
+
+Both require reading the adapter's *post-tool* permission outcome rather than
+the PreToolUse hook's verdict, which is the specific blindness §2.4 describes.
+
+Stated plainly: this is a detector, not a fix. It converts a silent, model-
+dependent failure into `worktree_unavailable`-class evidence. Only Option 1
+makes `dedicated` work.
 
 **Recommendation:** Option 1 for the layout, plus Option 4 regardless. Option 1 is
-the only one that makes `dedicated` actually work, and Option 4 is the only one
-that would have made this dogfood's failure legible without a human reading a
-transcript.
+the only one that makes `dedicated` actually work — moving the root out of
+`.git/` is the correction, not the detector. Option 4 is worth doing anyway
+because it is the only thing that would have made this dogfood's failure legible
+without a human reading a transcript, but it must be built as a deterministic
+per-mechanism check (see above) or it will reproduce the very nondeterminism it
+is meant to catch.
 
 ---
 
