@@ -39,6 +39,7 @@ from gauntlet.engine.recovery import AbortAction, NoProgressError
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     RunPaths,
+    StateDirNotContained,
     engine_bookkeeping_candidates,
     governed_artifact_paths,
     human_owned_excludes,
@@ -250,6 +251,16 @@ class BaseBranchError(RuntimeError):
 
 class FinishError(RuntimeError):
     """`finish()` refused (run not done, dirty tree, or a merge conflict)."""
+
+
+class _MigrationStepFailed(RuntimeError):
+    """Internal: a migration step failed after the worktree was created.
+
+    Never escapes :meth:`RunManager._migrate_locked`. It carries only the CAUSE;
+    the operator-facing message is composed after the unwind has run and been
+    verified, so no refusal can claim a post-state that was not observed
+    (review F-004).
+    """
 
 
 class MigrateWorktreeRefused(RuntimeError):
@@ -854,7 +865,95 @@ class RunManager:
                 f"to finish or park, or inspect with `gauntlet status "
                 f"{man.slug}` / `gauntlet logs {man.slug}`."
             )
-        return None
+        return self._migration_precondition_blocker(man)
+
+    def _migration_precondition_blocker(self, man: Manifest) -> str | None:
+        """The git preconditions §10 requires, or ``None``. Not a mode rule.
+
+        Spike §10's last table row names four cannot-migrate cases, and two of
+        them are properties of the operator's checkout rather than of the run's
+        state: **"dirty operator tree"** and **"branch checked out elsewhere"**.
+        Deliberately separate from :meth:`migration_blocker`'s state legs, which
+        answer "what mode is this run in?" from one authority — this answers
+        "would the git operation succeed right now?", a different question with a
+        different source. The static test keeps both honest: neither may
+        re-derive the MODE.
+
+        Both preconditions are consulted by the verb AND by the `status` offer,
+        which is what makes the R4 claim true rather than aspirational (review
+        F-006): before this, the normal parked `same_tree` state — run branch
+        checked out in the operator's tree — produced an `executable: true`
+        offer that git was certain to refuse.
+
+        * **branch held elsewhere** (F-006): git refuses a second worktree for a
+          checked-out branch (E2-A). This verb will not check out or move a
+          branch in the operator's tree, so the operator must step off first.
+        * **dirty operator tree** (F-005): a same_tree run's uncommitted work
+          lives in the operator's checkout. Migration builds a clean tree from
+          the committed branch tip, so that work would be STRANDED — silently,
+          and on whatever branch the operator has since moved to (git carries
+          compatible edits across a checkout). Engine bookkeeping and the
+          governed artifacts are excluded: the first is invisible everywhere
+          else, and the second is republished into the run tree by the sync, so
+          neither is stranded.
+        """
+        try:
+            entry = gitops.worktree_for_branch(self.operator_root, man.branch)
+        except gitops.GitError as exc:
+            return (
+                f"could not read git's worktree list ({exc}), so this cannot "
+                "prove the run branch is free to be checked out in a new "
+                "worktree."
+            )
+        common = None
+        try:
+            common = self._git_common_dir()
+        except (gitops.GitError, OSError):
+            pass
+        if entry is not None and not (
+            common is not None
+            and WT.is_inside_worktrees_root(entry.path, common)
+        ):
+            return (
+                f"branch {man.branch!r} is currently checked out at "
+                f"{entry.path}, and git refuses a second worktree for a "
+                "checked-out branch (spike E2-A). This verb will not check out "
+                "or move a branch in your tree — that is the invariant P7 "
+                f"exists to protect — so step off it first: `git -C "
+                f"{entry.path} checkout {man.base_branch}` (or any branch that "
+                f"is not {man.branch!r}), then migrate."
+            )
+        return self._dirty_operator_tree_blocker(man)
+
+    def _dirty_operator_tree_blocker(self, man: Manifest) -> str | None:
+        """Spike §10's "dirty operator tree" cannot-migrate case (review F-005)."""
+        layout = self.layout(man.slug)
+        try:
+            run_dir = layout.run_dir(man.run_id)
+        except (UnsafeRunSegment, OSError):
+            return None
+        try:
+            excludes = run_bookkeeping_excludes(
+                self.operator_root, run_dir, layout.slug_dir
+            ) + governed_artifact_paths(self.operator_root, layout.slug_dir)
+            dirt = gitops.status_porcelain(
+                self.operator_root, exclude=excludes, untracked_all=True
+            )
+        except (gitops.GitError, StateDirNotContained, OSError):
+            return None  # cannot observe → the git operation itself fails closed
+        if not dirt:
+            return None
+        listing = "\n  ".join(dirt.splitlines()[:8])
+        return (
+            f"your checkout has uncommitted work that this run may own:\n"
+            f"  Tree inspected: {self.operator_root}\n  {listing}\n"
+            "A `same_tree` run's work-in-progress lives in YOUR checkout. "
+            "Migration builds the run's new tree from the committed branch tip, "
+            "so anything uncommitted would be left behind here — on whatever "
+            "branch you are standing on — while the agents carried on somewhere "
+            "else (spike §10, 'dirty operator tree'). Commit it to the run "
+            "branch or stash it, then migrate."
+        )
 
     def _migration_rollback_blocker(
         self, man: Manifest, *, liveness: str
@@ -1019,7 +1118,25 @@ class RunManager:
                 **kwargs,
             )
             work_root = wt.path
-            self._record_worktree_adopted(run_dir, wt, slug=slug, run_id=run_id)
+            if not self._record_worktree_adopted(
+                run_dir, wt, slug=slug, run_id=run_id
+            ):
+                # The tree is real and registered, so resolver rule 1 keeps
+                # answering `dedicated` and this drive is correct. What is lost
+                # is rule 2's BACKSTOP: if the tree later vanishes together
+                # with its registration, nothing records that it was ever
+                # adopted and the run would fall back to the operator's
+                # checkout (review F-001). Not worth parking a live drive over
+                # — but never silent either, so it lands as a durable warning
+                # `status` surfaces.
+                self._warn(
+                    run_dir,
+                    "worktree adoption could not be journalled for run "
+                    f"{run_id!r}; the tree at {wt.path} is in use and correct, "
+                    "but if it is later deleted AND unregistered this run will "
+                    "resolve `same_tree` instead of recreating it. Check the "
+                    "journal directory is writable.",
+                )
         paths = RunPaths(
             repo_root=self.repo_root,
             work_root=work_root,
@@ -1092,6 +1209,24 @@ class RunManager:
             man.write_atomic(run_dir / "manifest.json")
         except (OSError, ValueError):
             pass  # the raise below still names the reason and the action
+
+    @staticmethod
+    def _warn(run_dir: Path, note: str) -> None:
+        """Add a durable manifest warning that ``status`` surfaces. Deduplicated.
+
+        For conditions that must not stay silent but must not halt a live drive
+        either — the FR-10.3 warnings array is exactly this channel. Best-effort
+        on its own write: a warning that cannot be persisted must never be the
+        thing that fails the verb it was describing.
+        """
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            if note in man.warnings:
+                return
+            man.warnings.append(note)
+            man.write_atomic(run_dir / "manifest.json")
+        except (OSError, ValueError):
+            pass
 
     def _release_for_same_tree_fallback(
         self, run_dir: Path, man: Manifest | None, *, slug: str, branch: str
@@ -1180,11 +1315,73 @@ class RunManager:
                 continue
             dest.write_text(text)
 
+    # The two journal kinds that record a run's tree lifecycle. Counted
+    # together to form the GENERATION below, because they alternate: the Nth
+    # transition of either kind is a distinct event from the (N-2)th.
+    _WORKTREE_LIFECYCLE_KINDS = ("WorktreeAdopted", "WorktreeReleased")
+
+    def _lifecycle_generation(self, run_dir: Path) -> int:
+        """How many worktree lifecycle transitions this run has already recorded.
+
+        The disambiguator in both idempotency keys (review F-002). Without it a
+        key is a function of (run, path, head, transition-kind) — all of which
+        REPEAT once migration and rollback made the lifecycle a cycle rather
+        than a one-way trip:
+
+        * migrate → rollback → migrate at an unchanged head produced the same
+          adoption key twice, so the second adoption was silently deduplicated
+          and the journal's last word was ``WorktreeReleased`` — a run whose
+          tree later vanished with its registration would then resolve
+          `same_tree` and drive the operator's checkout;
+        * the release key never carried the head at all, so the SECOND rollback
+          was always deduplicated, leaving an open adoption and a resume that
+          rebuilt the tree the operator had just removed.
+
+        Derived from the journal rather than counted in memory, so it survives
+        a crash and is identical for every process that reads the same run. A
+        genuine retry (the append failed and the verb is re-run) recomputes the
+        SAME generation and therefore the same key, which is what keeps
+        exactly-once intact; only a transition that actually landed advances it.
+        """
+        try:
+            return sum(
+                1 for evt in J.read_events(run_dir)
+                if evt.get("kind") in self._WORKTREE_LIFECYCLE_KINDS
+            )
+        except (OSError, ValueError, J.JournalError):
+            # Unreadable journal: fall back to a key that cannot collide with a
+            # recorded generation. `_journal_has_key` below then reports the
+            # event as unrecorded and the caller fails closed, which is the
+            # right direction — we cannot prove what this run's history is.
+            return -1
+
+    def _journal_has_key(self, run_dir: Path, key: str) -> bool:
+        """Whether the journal durably carries an event with ``key``.
+
+        :func:`J.append_audit` is best-effort BY CONTRACT — it swallows I/O
+        errors and returns ``False`` for both "already recorded" and "could not
+        record", which are opposite outcomes. Every caller that needs the
+        transition to be durable therefore re-reads rather than trusting the
+        return value, and an unreadable journal answers ``False`` (fail closed).
+        """
+        try:
+            return any(
+                evt.get("idempotency_key") == key for evt in J.read_events(run_dir)
+            )
+        except (OSError, ValueError, J.JournalError):
+            return False
+
     def _record_worktree_adopted(
         self, run_dir: Path, wt: "WT.RunWorktree", *, slug: str, run_id: str,
         migrated: bool = False,
-    ) -> None:
+    ) -> bool:
         """Journal a ``WorktreeAdopted`` event when a tree is created/recreated.
+
+        Returns whether the transition is DURABLY recorded — ``True`` when
+        nothing was due. Callers for whom the answer is the whole point (the
+        explicit `migrate-worktree` transaction) fail closed on ``False``;
+        see :meth:`_journal_has_key` for why the return of ``append_audit``
+        cannot be used directly.
 
         Only on a transition — adopting an already-healthy tree on every
         subsequent verb is not an event, it is the steady state, and journaling
@@ -1204,7 +1401,7 @@ class RunManager:
         documents where the lock was rather than where it moved.
         """
         if not (wt.created or wt.recreated):
-            return
+            return True
         try:
             head = gitops.head_sha(wt.path)
         except gitops.GitError:
@@ -1220,26 +1417,37 @@ class RunManager:
         if migrated:
             payload["migrated"] = True
             payload["prior_lock_path"] = str(self._run_lock_path(run_dir))
-        J.append_audit(
-            run_dir,
-            "WorktreeAdopted",
-            payload,
-            run_id=run_id,
-            # Keyed on the transition, not the moment: re-adopting the SAME
-            # tree at the SAME head is not a new event, so a retried verb
-            # cannot pad the journal with duplicates.
-            idempotency_key=(
-                f"worktree-adopted:{run_id}:{wt.path}:{head}:"
-                + ("migrate" if migrated
-                   else ("recreate" if wt.recreated else "create"))
-            ),
+        # Keyed on the transition AND the generation: re-adopting the same tree
+        # within one generation is not a new event (so a retried verb cannot pad
+        # the journal), but the second migration of a run that was rolled back
+        # IS one, and used to collide with the first (F-002).
+        key = (
+            f"worktree-adopted:{run_id}:{self._lifecycle_generation(run_dir)}:"
+            f"{wt.path}:{head}:"
+            + ("migrate" if migrated
+               else ("recreate" if wt.recreated else "create"))
         )
+        J.append_audit(
+            run_dir, "WorktreeAdopted", payload,
+            run_id=run_id, idempotency_key=key,
+        )
+        return self._journal_has_key(run_dir, key)
 
     def _record_worktree_released(
         self, run_dir: Path, path: Path, *, slug: str, run_id: str,
         snapshot_ref: str | None = None,
-    ) -> None:
-        """Journal a ``WorktreeReleased`` event after a teardown (spike §10)."""
+    ) -> bool:
+        """Journal a ``WorktreeReleased`` event after a teardown (spike §10).
+
+        Returns whether the transition is durably recorded. The generation is
+        load-bearing here in the same way as for adoption, and more so: this key
+        never carried a head, so before F-002 EVERY release after the first was
+        deduplicated into the first one.
+        """
+        key = (
+            f"worktree-released:{run_id}:"
+            f"{self._lifecycle_generation(run_dir)}:{path}"
+        )
         J.append_audit(
             run_dir,
             "WorktreeReleased",
@@ -1250,8 +1458,9 @@ class RunManager:
                 "snapshot_ref": snapshot_ref,
             },
             run_id=run_id,
-            idempotency_key=f"worktree-released:{run_id}:{path}",
+            idempotency_key=key,
         )
+        return self._journal_has_key(run_dir, key)
 
     def _refuse_on_untracked_merge_collision(
         self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
@@ -4165,8 +4374,9 @@ class RunManager:
         finally:
             self._release_worktree_lock(handle)
 
-    @staticmethod
-    def _still_resumable(blocker: str, man: Manifest) -> str:
+    def _still_resumable(
+        self, blocker: str, man: Manifest, *, mode: str | None = None
+    ) -> str:
         """Append the R1 clause every §10 refusal owes the operator.
 
         Spike §10's last table row is not advice, it is the obligation: "stays
@@ -4175,7 +4385,32 @@ class RunManager:
         that stops at the blocker satisfies half of that row, so the clause is
         appended here rather than repeated (and eventually forgotten) at each
         raise site.
+
+        **The clause is mode-aware** (review F-007). A rollback refusal is
+        evaluated only after the resolver has already answered `dedicated`, so
+        telling that operator their run "remains fully drivable in `same_tree`
+        mode" is not a harmless simplification — it is a false statement about
+        which tree their agents will edit next, handed to them at the moment
+        they are trying to work out what state they are in. ``mode`` names the
+        mode this refusal LEAVES the run in; it is observed by the caller, never
+        assumed here.
         """
+        if mode == WT.MODE_DEDICATED:
+            where = "keeps driving its own dedicated worktree"
+            try:
+                state = WT.describe(
+                    self.operator_root, mode=mode, branch=man.branch
+                )
+                if state.path is not None:
+                    where = f"keeps driving its own worktree at {state.path}"
+            except Exception:
+                pass
+            return (
+                f"{blocker}\n"
+                f"Nothing was moved or modified. The run is untouched and "
+                f"{where}: `gauntlet resume {man.slug}` works exactly as it did "
+                "before you ran this."
+            )
         return (
             f"{blocker}\n"
             "Nothing was moved or modified. The run is untouched and remains "
@@ -4195,8 +4430,17 @@ class RunManager:
                 slug=slug, run_id=run_id, branch=branch,
             )
         except WT.WorktreeUnavailable as exc:
+            # `WT.ensure` is NOT all-or-nothing: it verifies submodules (spike
+            # §7) AFTER the tree has been created and locked, so a superproject
+            # with uninitialized submodules raises having left a registered
+            # worktree behind — and the resolver's rule 1 then answers
+            # `dedicated`. Emitting the same_tree refusal there stated something
+            # false about the run's mode (review F-004). So unwind whatever was
+            # created, verify the unwind, and let the observed state write the
+            # message.
             raise MigrateWorktreeRefused(
-                self._still_resumable(
+                self._unwound_refusal(
+                    layout, run_dir, man,
                     f"could not create the run worktree for {slug!r}: {exc}\n"
                     f"  If git says the branch is already used by a worktree at "
                     f"{self.operator_root}, that is your OWN checkout — the "
@@ -4207,7 +4451,6 @@ class RunManager:
                     f"{man.base_branch}` (or any branch that is not "
                     f"{branch!r}), then `gauntlet migrate-worktree {slug}` "
                     "again.",
-                    man,
                 )
             ) from exc
         # Step 4 — write the export and prove the bookkeeping paths RESOLVE in
@@ -4220,35 +4463,50 @@ class RunManager:
         try:
             self._verify_export(wt, run_dir, layout, man)
         except BaseException as exc:
-            self._undo_failed_migration(wt, layout, man)
-            # An already-shaped refusal keeps its own message; a
-            # KeyboardInterrupt/SystemExit keeps its own TYPE. Laundering an
-            # operator's Ctrl-C into "migration refused" would report a
-            # decision the engine never made — the tree is still removed
-            # either way, which is the part that matters.
-            if isinstance(exc, MigrateWorktreeRefused) or not isinstance(
-                exc, Exception
-            ):
+            # A KeyboardInterrupt/SystemExit keeps its own TYPE — laundering an
+            # operator's Ctrl-C into "migration refused" would report a decision
+            # the engine never made. The unwind runs either way, which is the
+            # part that matters.
+            if not isinstance(exc, Exception):
+                self._discard_migrated_tree(wt.path, layout, man)
                 raise
             raise MigrateWorktreeRefused(
-                self._still_resumable(
+                self._unwound_refusal(
+                    layout, run_dir, man,
                     f"the run worktree for {slug!r} was created but its "
                     f"bookkeeping export could not be written or verified "
-                    f"({exc}); the worktree has been removed again.",
-                    man,
+                    f"({exc}).",
                 )
             ) from exc
-        # Step 5, and deliberately OUTSIDE the undo above. If the journal append
-        # fails, the tree is registered, locked and healthy, so the resolver's
-        # rule 1 answers `dedicated` and the run is coherent and drivable — it
-        # is only missing an audit event, which the operator can see and roll
-        # back. Undoing here instead could strand a partially-appended adoption
-        # with no tree, which resolves `dedicated` via rule 2 and quietly
-        # rebuilds the tree on the next resume. A missing event is legible; a
-        # half-reversed one is not.
-        self._record_worktree_adopted(
+        # Step 5. Recorded AFTER the tree exists — the mirror of rollback, which
+        # records BEFORE it destroys; both orderings fail toward "the tree's
+        # existence and the journal agree", which is what the resolver reads.
+        #
+        # Fail closed on an unrecorded adoption (review F-001). An earlier draft
+        # kept the tree and warned, reasoning that rule 1 still answers
+        # `dedicated` so the run is coherent. It is — until the tree is lost
+        # together with its registration, at which point rule 2 is the ONLY
+        # backstop and it is missing, and the run silently drops to driving the
+        # operator's checkout. Migration is an explicit transaction whose entire
+        # product is a durable mode change; if that cannot be recorded, the
+        # honest outcome is that it did not happen. Checking the journal's
+        # actual contents rather than `append_audit`'s ambiguous return is what
+        # makes the unwind safe here: a partially-landed event reports as
+        # recorded and is not unwound.
+        if not self._record_worktree_adopted(
             run_dir, wt, slug=slug, run_id=run_id, migrated=True
-        )
+        ):
+            raise MigrateWorktreeRefused(
+                self._unwound_refusal(
+                    layout, run_dir, man,
+                    f"the worktree for {slug!r} was created, but the adoption "
+                    "could not be written to the journal — so nothing would "
+                    "record that this run was migrated, and a later loss of the "
+                    "tree would drop it back to driving your checkout without "
+                    "saying so. Check the journal directory is writable, then "
+                    "retry.",
+                )
+            )
         return (
             f"migrated {slug!r} to a dedicated worktree at {wt.path}\n"
             f"  The run is unchanged: same branch ({branch}), same journal, "
@@ -4290,14 +4548,10 @@ class RunManager:
             wt.path, self.config.run_root, man.slug, man.run_id
         )
         if mirrored.resolve() != derived.resolve():
-            raise MigrateWorktreeRefused(
-                self._still_resumable(
-                    f"the export dir this engine derives ({derived}) is not "
-                    f"where the run's paths mirror to ({mirrored}); the run "
-                    "worktree has been removed again. This is a layout skew, "
-                    "not an operator error — report it.",
-                    man,
-                )
+            raise _MigrationStepFailed(
+                f"the export dir this engine derives ({derived}) is not where "
+                f"the run's paths mirror to ({mirrored}). This is a layout "
+                "skew, not an operator error — report it."
             )
         WT.write_bookkeeping_export(
             wt.path, run_dir, self.config.run_root, man.slug, man.run_id
@@ -4308,26 +4562,76 @@ class RunManager:
         engine_bookkeeping_candidates(wt.path, mirrored)
         staged = run_bookkeeping_paths(wt.path, mirrored)
         if not staged:
-            raise MigrateWorktreeRefused(
-                self._still_resumable(
-                    f"no bookkeeping file resolved inside the new run worktree "
-                    f"at {wt.path} (expected the export at {mirrored}); the "
-                    "worktree has been removed again. Without it the FR-2.2 "
-                    "checkpoint commit would have nothing in-tree to stage.",
-                    man,
-                )
+            raise _MigrationStepFailed(
+                f"no bookkeeping file resolved inside the new run worktree at "
+                f"{wt.path} (expected the export at {mirrored}). Without it the "
+                "FR-2.2 checkpoint commit would have nothing in-tree to stage."
             )
 
-    def _undo_failed_migration(
-        self, wt: "WT.RunWorktree", layout: "RunLayout", man: Manifest
+    def _verified_synced_artifacts(
+        self, work_root: Path, artifact_root_in_work: Path, layout: "RunLayout"
+    ) -> list[str]:
+        """Governed artifacts in the run tree PROVEN identical to the authority.
+
+        Review F-003. The rollback excludes governed artifacts from both the
+        dirtiness refusal and :func:`WT.release`'s snapshot decision, on the
+        grounds that they are redundant copies of the operator's authoritative
+        file. That is true right after a sync and false the moment anything
+        edits the tree copy — and "the playbook says not to edit it there" is
+        not proof that nobody did. An unproven exclusion here does not merely
+        skip a warning: it deletes the bytes.
+
+        So each artifact earns its exclusion by comparison. Both sides must be
+        regular files (a symlink on either side is a different object, not a
+        copy, and is never excluded) with identical bytes. Anything else —
+        divergent, missing on either side, unreadable — is treated as
+        uncommitted work, which makes the rollback refuse and name it.
+        """
+        verified: list[str] = []
+        for rel in governed_artifact_paths(work_root, artifact_root_in_work):
+            in_tree = work_root / rel
+            authority = layout.slug_dir / Path(rel).name
+            try:
+                if (
+                    in_tree.is_file()
+                    and not in_tree.is_symlink()
+                    and authority.is_file()
+                    and not authority.is_symlink()
+                    and in_tree.read_bytes() == authority.read_bytes()
+                ):
+                    verified.append(rel)
+            except OSError:
+                continue  # cannot prove identical → do not exclude
+        return verified
+
+    def _rollback_refusal(self, blocker: str, man: Manifest) -> str:
+        """A rollback refusal, closing with the mode it actually leaves (F-007).
+
+        Every path here has already been through the resolver, so the mode is
+        observed rather than assumed: `dedicated` for the refusals reached after
+        eligibility resolved that way (live driver, terminal, born-dedicated),
+        and `same_tree` for the one that fires precisely BECAUSE the run is not
+        dedicated — where the old fixed text was right by accident.
+        """
+        try:
+            mode = self._effective_worktree_mode(man)
+        except Exception:
+            mode = None
+        return self._still_resumable(blocker, man, mode=mode)
+
+    def _discard_migrated_tree(
+        self, path: Path, layout: "RunLayout", man: Manifest
     ) -> None:
         """Remove a worktree whose migration failed after it was created (§10.4).
 
-        Best-effort and deliberately silent: the caller is already raising the
-        real cause, and a cleanup failure must not replace it (the same lesson
-        as P7c-1.1's `merge --abort` fix). No ``WorktreeReleased`` is appended
-        because no ``WorktreeAdopted`` was — the journal records transitions
-        that happened, and a migration that never completed is not one.
+        Best-effort: the caller is already raising the real cause, and a cleanup
+        failure must not replace it (the same lesson as P7c-1.1's
+        `merge --abort` fix). Whether it SUCCEEDED is not assumed — the caller
+        re-observes and lets the observed state write the message (F-004).
+
+        No ``WorktreeReleased`` is appended because no ``WorktreeAdopted`` was:
+        the journal records transitions that happened, and a migration that
+        never completed is not one.
 
         The export the failed step may have written is excluded from the
         dirtiness check, so this removal does not stop to snapshot the engine's
@@ -4336,19 +4640,76 @@ class RunManager:
         """
         try:
             excludes = run_bookkeeping_excludes(
-                wt.path,
-                WT.export_dir(wt.path, self.config.run_root, man.slug, man.run_id),
+                path,
+                WT.export_dir(path, self.config.run_root, man.slug, man.run_id),
                 layout.slug_dir,
             )
         except Exception:
             excludes = None
         try:
             WT.release(
-                self.operator_root, wt.path,
+                self.operator_root, path,
                 slug=man.slug, run_id=man.run_id, excludes=excludes,
             )
         except Exception:
             pass  # the caller's raise carries the real cause
+
+    def _unwound_refusal(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest, blocker: str
+    ) -> str:
+        """Unwind a partial migration, VERIFY it, and say what is actually true.
+
+        Review F-004. Every pre-adoption failure used to emit the fixed
+        "nothing was moved … remains fully drivable in `same_tree`" clause, but
+        two paths reach it with a registered worktree still on disk:
+        :func:`WT.ensure` verifies submodules (spike §7) only AFTER creating and
+        locking the tree, and the export unwind swallowed every
+        :func:`WT.release` failure. In both, the resolver's rule 1 then answers
+        `dedicated` — so the refusal was making a false statement about which
+        tree the run's agents would edit next, at the moment the operator was
+        trying to establish exactly that.
+
+        So: discard whatever exists at this run's derived path, re-observe, and
+        branch on the observation. Restored → the same_tree clause, now earned.
+        Not restored → name the surviving tree, the mode it actually leaves, and
+        the executable action that finishes the job. Never a claim we did not
+        verify, in either direction.
+        """
+        try:
+            entry = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            entry = None
+        if entry is not None:
+            self._discard_migrated_tree(entry.path, layout, man)
+        try:
+            survivor = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError as exc:
+            return (
+                f"{blocker}\n"
+                f"The migration was unwound, but git's worktree list could not "
+                f"be read afterwards ({exc}), so this cannot prove which tree "
+                f"the run now drives. Check `gauntlet status {man.slug}` before "
+                "resuming."
+            )
+        if survivor is None:
+            return self._still_resumable(blocker, man, mode=WT.MODE_SAME_TREE)
+        return (
+            f"{blocker}\n"
+            f"The migration was unwound, but the run worktree at "
+            f"{survivor.path} could NOT be removed, so this run is now in "
+            "`dedicated` mode — not `same_tree`. It is not wedged and no state "
+            "was lost: the branch, the journal and the run dir are untouched, "
+            "and the run drives that tree.\n"
+            f"  To finish returning it: `gauntlet migrate-worktree {man.slug} "
+            "--rollback`.\n"
+            f"  To drive this run in your own checkout right now: `gauntlet "
+            f"resume {man.slug} --same-tree`.\n"
+            f"  To inspect the tree: `git -C {survivor.path} status`."
+        )
 
     def rollback_worktree_migration(self, slug: str) -> str:
         """Return a migrated run to `same_tree`, journal intact (spike §10).
@@ -4377,13 +4738,13 @@ class RunManager:
         liveness = self._migration_liveness(slug, run_dir)
         blocker = self._migration_rollback_blocker(man, liveness=liveness)
         if blocker is not None:
-            raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+            raise MigrateWorktreeRefused(self._rollback_refusal(blocker, man))
         handle = self._acquire_worktree_lock(slug, man.run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
             blocker = self._migration_rollback_blocker(man, liveness=liveness)
             if blocker is not None:
-                raise MigrateWorktreeRefused(self._still_resumable(blocker, man))
+                raise MigrateWorktreeRefused(self._rollback_refusal(blocker, man))
             return self._rollback_migration_locked(layout, run_dir, man)
         finally:
             self._release_worktree_lock(handle)
@@ -4398,7 +4759,7 @@ class RunManager:
             )
         except gitops.GitError as exc:
             raise MigrateWorktreeRefused(
-                self._still_resumable(
+                self._rollback_refusal(
                     f"could not read git's worktree list ({exc}), so this "
                     "cannot prove which tree it would remove.",
                     man,
@@ -4410,12 +4771,22 @@ class RunManager:
             # answers `dedicated` and the next resume would REBUILD it. Closing
             # the adoption is the whole of the rollback here — and it is why
             # this branch exists rather than reporting "nothing to do".
-            self._record_worktree_released(
+            if not self._record_worktree_released(
                 run_dir, WT.run_worktree_path(
                     self._git_common_dir(), man.slug, man.run_id
                 ),
                 slug=man.slug, run_id=man.run_id,
-            )
+            ):
+                raise MigrateWorktreeRefused(
+                    self._rollback_refusal(
+                        f"the release of {man.slug!r} could not be written to "
+                        "the journal, and closing the open adoption is the ONLY "
+                        "thing this rollback does when the tree is already gone "
+                        "— so reporting success would be reporting nothing. "
+                        "Check the journal directory is writable, then retry.",
+                        man,
+                    )
+                )
             return (
                 f"rolled back {man.slug!r} to `same_tree`: its worktree was "
                 "already gone, and the journal's open adoption is now closed "
@@ -4431,14 +4802,16 @@ class RunManager:
         #   regenerated on the next drive, and written by the migration itself,
         #   so a rollback taken before the first checkpoint commit would
         #   otherwise always be blocked by it;
-        # * the SYNCED governed artifacts. Under `dedicated` the operator's
+        # * a governed artifact in the run tree whose bytes are PROVEN identical
+        #   to the operator's authoritative copy. Under `dedicated` the
         #   checkout is the authoring surface (§14.2 option A) and
-        #   `_sync_governed_artifacts` publishes a copy into the run tree on
-        #   every mutating contact. Until a commit step stages it that copy is
-        #   untracked — and it is a COPY: the authoritative bytes never left
-        #   the operator's checkout, so removing the tree cannot lose them.
-        #   `finish` already excludes exactly this set from its own dirt check
-        #   for exactly this reason.
+        #   `_sync_governed_artifacts` publishes a copy on every mutating
+        #   contact, so the common case is untracked-but-redundant and must not
+        #   block. Review F-003: "it is only a copy" was an ASSUMPTION, and
+        #   this list feeds `WT.release`'s snapshot decision as well as the
+        #   refusal — so an edit made directly in the run tree (by an agent, or
+        #   by an operator who ignored the playbook) was excluded from both
+        #   protections and destroyed. Proof replaces the assumption below.
         paths = RunPaths(
             repo_root=self.repo_root,
             work_root=entry.path,
@@ -4447,12 +4820,47 @@ class RunManager:
         )
         excludes = run_bookkeeping_excludes(
             entry.path, paths.bookkeeping_root, layout.slug_dir
-        ) + governed_artifact_paths(entry.path, paths.artifact_root_in_work)
+        ) + self._verified_synced_artifacts(
+            entry.path, paths.artifact_root_in_work, layout
+        )
         self._refuse_if_run_worktree_dirty(
             man, verb="migrate-worktree --rollback",
             exc_type=MigrateWorktreeRefused, excludes=excludes,
         )
-        self._release_run_worktree(run_dir, man, excludes=excludes)
+        if not self._record_worktree_released(
+            run_dir, entry.path, slug=man.slug, run_id=man.run_id,
+        ):
+            # Recorded BEFORE the tree is removed, and fail closed if it did not
+            # land (review F-001). The other ordering loses either way: a
+            # removal followed by a failed append leaves no tree and an OPEN
+            # adoption, so the resolver answers `dedicated`, the next resume
+            # rebuilds the tree the operator just removed, and the verb has
+            # already said it succeeded. This way the failure leaves the tree
+            # intact and the run coherent, and a retry is safe.
+            raise MigrateWorktreeRefused(
+                self._rollback_refusal(
+                    f"the release of {man.slug!r} could not be written to the "
+                    "journal, so the rollback was not performed — the worktree "
+                    f"at {entry.path} is untouched. Removing it while the "
+                    "journal still recorded an open adoption would make the "
+                    "next resume rebuild it. Check the journal directory is "
+                    "writable, then retry.",
+                    man,
+                )
+            )
+        ref = WT.release(
+            self.operator_root, entry.path,
+            slug=man.slug, run_id=man.run_id, excludes=excludes,
+        )
+        if ref:
+            # Not expected — the refusal above covers real dirt — but a
+            # snapshot the operator does not know about is exactly the thing
+            # F-011 objected to, so it is never silent.
+            self._warn(
+                run_dir,
+                f"rollback snapshotted uncommitted work from the run worktree "
+                f"before removing it; recover it from {ref}",
+            )
         return (
             f"rolled back {man.slug!r} to `same_tree`: removed the run "
             f"worktree at {entry.path}.\n"

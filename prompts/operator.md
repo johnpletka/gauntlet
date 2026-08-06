@@ -154,17 +154,27 @@ behind that output. Drive every decision off the reported state class:
   changes. Undo with `gauntlet migrate-worktree <slug> --rollback`, which
   removes the tree and returns the run to `same_tree` with everything else
   intact.
-  Two things to expect. **You must step off the run branch first**: a
-  `same_tree` run leaves `gauntlet/<slug>` checked out in your tree, and git
-  refuses a second worktree for a checked-out branch — so `git checkout <base>`,
-  then migrate. The engine will not check out or move a branch in your checkout
-  to make this succeed, by design. And **`gauntlet finish` may then ask you to
-  resolve your local untracked `prd.md`**: a dedicated run commits the synced
-  copy on its own branch, and the engine refuses rather than deleting your file
-  for you — it names both resolutions when it happens.
+  Two preconditions, both checked before anything is touched — so `status` only
+  offers the action once it would actually run. **Step off the run branch
+  first**: a `same_tree` run leaves `gauntlet/<slug>` checked out in your tree,
+  and git refuses a second worktree for a checked-out branch, so
+  `git checkout <base>` and then migrate. The engine will not check out or move
+  a branch in your checkout to make this succeed, by design. **Commit or stash
+  uncommitted work first**: a `same_tree` run's work-in-progress lives in your
+  checkout, and migration builds the run's new tree from the committed branch
+  tip — so anything uncommitted would be stranded with you while the agents
+  carried on elsewhere. Your `prd.md`/`plan.md` are not affected; they are
+  republished into the run tree.
+  Also expect that **`gauntlet finish` may then ask you to resolve your local
+  untracked `prd.md`**: a dedicated run commits the synced copy on its own
+  branch, and the engine refuses rather than deleting your file for you — it
+  names both resolutions when it happens.
   Migration is refused, with the blocker named, while a driver is `alive` or
   `indeterminate`, and for a terminal run. **A refusal never wedges anything**:
-  the run is left exactly as it was and stays fully drivable in `same_tree`.
+  the run is left exactly as it was and stays fully drivable in `same_tree`. If
+  a failure ever leaves the tree behind, the refusal says so explicitly and
+  names the mode the run is actually in — it never claims `same_tree` without
+  having verified it.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
 - **`unknown`** — an unrecognized or internally contradictory manifest. Action:

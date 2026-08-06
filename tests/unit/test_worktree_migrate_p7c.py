@@ -282,11 +282,84 @@ def test_a_branch_checked_out_in_the_operator_tree_refuses_actionably(
     with pytest.raises(MigrateWorktreeRefused) as exc:
         mgr.migrate_worktree("demo")
     msg = str(exc.value)
-    assert "checkout" in msg and "gauntlet migrate-worktree demo" in msg
+    assert "is currently checked out" in msg
     assert f"git -C {fixture_repo} checkout main" in msg
     _still_fully_resumable(mgr, "demo", fixture_repo)
     # A1 in its rawest form: the refusal did not move the human off the branch.
     assert gitops.current_branch(fixture_repo) == "gauntlet/demo"
+
+
+def test_the_branch_holder_is_a_precondition_checked_before_any_mutation(
+    fixture_repo,
+):
+    """Rewritten at P7c-2.1 (review F-006): the refusal moved EARLIER, on purpose.
+
+    P7c-2 let this case reach `worktree add` and turned git's E2-A error into
+    the message. That worked, but it meant `status` — which cannot see a git
+    error that has not happened yet — advertised the migration as executable in
+    precisely the state where it was certain to fail. Making the branch holder a
+    PRECONDITION lets both surfaces consult the same answer, so the offer and
+    the refusal agree (R4), and the refusal now happens before the engine
+    touches git at all.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+
+    blocker = mgr.migration_blocker(man, liveness=op.LIVENESS_NONE)
+    assert blocker is not None and "is currently checked out" in blocker
+
+    _step_off_the_run_branch(fixture_repo)
+    assert mgr.migration_blocker(man, liveness=op.LIVENESS_NONE) is None
+
+
+def test_a_dirty_operator_tree_blocks_migration(fixture_repo):
+    """Spike §10's "dirty operator tree" cannot-migrate case (review F-005).
+
+    A `same_tree` run's work-in-progress lives in the operator's checkout.
+    Migration builds the new tree from the committed branch tip, so uncommitted
+    work would be stranded here — silently, and on whatever branch the operator
+    stepped onto, since git carries compatible edits across a checkout. The
+    spike lists this as a refusal; P7c-2 checked only mode, terminality and
+    liveness and would have proceeded.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    (fixture_repo / "wip.py").write_text("half a feature\n")
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+
+    blocker = mgr.migration_blocker(man, liveness=op.LIVENESS_NONE)
+    assert blocker is not None and "wip.py" in blocker
+
+    with pytest.raises(MigrateWorktreeRefused):
+        mgr.migrate_worktree("demo")
+    _still_fully_resumable(mgr, "demo", fixture_repo)
+
+    # Committed → no longer stranded, so no longer a blocker.
+    git(fixture_repo, "add", "wip.py")
+    git(fixture_repo, "commit", "-qm", "wip")
+    assert mgr.migration_blocker(man, liveness=op.LIVENESS_NONE) is None
+
+
+def test_the_governed_artifact_does_not_read_as_operator_dirt(fixture_repo):
+    """The other half of F-005: the dirt check must not block every migration.
+
+    The operator's `prd.md` is the authoring surface and the sync republishes it
+    into the run tree, so it is never stranded by a migration. Counting it as
+    dirt would refuse every run whose artifact is not yet committed — which is
+    the normal state before the first commit step — and trade a data-loss bug
+    for a wedge.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    prd = mgr.layout("demo").prd_path
+    assert prd.exists() and "?? runs/demo/prd.md" in gitops.status_porcelain(
+        fixture_repo, untracked_all=True
+    )
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+    assert mgr.migration_blocker(man, liveness=op.LIVENESS_NONE) is None
 
 
 def test_a_blocked_migration_leaves_the_run_drivable(fixture_repo):
@@ -388,15 +461,19 @@ def test_the_eligibility_predicate_reads_no_worktree_evidence_of_its_own():
     src = Path(RunManager.__module__.replace(".", "/") + ".py")
     src = Path(__file__).resolve().parents[2] / "src" / src
     tree = ast.parse(src.read_text())
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "migration_blocker"
-    )
-    names = {
-        (n.attr if isinstance(n, ast.Attribute) else n.id)
-        for n in ast.walk(fn)
-        if isinstance(n, (ast.Attribute, ast.Name))
-    }
+
+    def names_in(fn_name: str) -> set[str]:
+        fn = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == fn_name
+        )
+        return {
+            (n.attr if isinstance(n, ast.Attribute) else n.id)
+            for n in ast.walk(fn)
+            if isinstance(n, (ast.Attribute, ast.Name))
+        }
+
+    names = names_in("migration_blocker")
     assert "_effective_worktree_mode" in names, (
         "migration eligibility must be derived from the single mode-resolution "
         "rule, not computed independently"
@@ -407,6 +484,22 @@ def test_the_eligibility_predicate_reads_no_worktree_evidence_of_its_own():
         "that is a SECOND resolution rule, and it will drift from "
         "`_effective_worktree_mode`. Ask the resolver instead."
     )
+    # Extended at P7c-2.1. The eligibility path grew git PRECONDITION legs
+    # (branch holder, dirty operator tree) which legitimately observe git —
+    # they answer "would the operation succeed?", not "what mode is this run
+    # in?" So `observe`-family calls are allowed there, but the MODE-deriving
+    # names stay banned across the whole path: one authority for the mode, no
+    # matter how many helpers the path grows.
+    mode_only = {"_journal_says_adopted", "worktree_mode"}
+    for helper in (
+        "_migration_precondition_blocker", "_dirty_operator_tree_blocker"
+    ):
+        leaked = names_in(helper) & mode_only
+        assert not leaked, (
+            f"`{helper}` re-derives the worktree MODE ({leaked}). Preconditions "
+            "may observe git; they may not answer the mode question a second "
+            "time."
+        )
 
 
 # --- the round trip: migrate → drive → roll back ------------------------------
@@ -623,7 +716,11 @@ def test_a_failed_export_removes_the_worktree_and_leaves_the_run_same_tree(
     monkeypatch.setattr(WT, "write_bookkeeping_export", boom)
     with pytest.raises(MigrateWorktreeRefused) as exc:
         mgr.migrate_worktree("demo")
-    assert "removed again" in str(exc.value)
+    assert "disk full" in str(exc.value)
+    # The same_tree clause is EARNED here — the unwind ran and was verified
+    # before the message was composed (F-004) — so asserting it is asserting
+    # the observation, not the wording.
+    assert "fully drivable in `same_tree` mode" in str(exc.value)
 
     man = Manifest.load(run_dir / "manifest.json")
     assert WT.observe(
@@ -655,6 +752,179 @@ def test_an_interrupt_mid_migration_stays_an_interrupt(fixture_repo, monkeypatch
         mgr.migrate_worktree("demo")
     # …and the tree it had created is gone all the same.
     _still_fully_resumable(mgr, "demo", fixture_repo)
+
+
+# --- review P7c-2.1: the lifecycle is durable, repeatable and honest ---------
+
+
+def test_migration_fails_closed_when_the_adoption_cannot_be_journalled(
+    fixture_repo, monkeypatch
+):
+    """F-001: `append_audit` is best-effort BY CONTRACT, so success must be proven.
+
+    It swallows I/O errors and returns False for both "already recorded" and
+    "could not record" — opposite outcomes. A migration that ignored that could
+    report success while leaving no record of the adoption, and if the tree
+    later vanished together with its registration the run would silently fall
+    back to driving the operator's checkout: resolver rule 2 is the backstop,
+    and it would be missing.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    monkeypatch.setattr(
+        "gauntlet.engine.journal.append_audit", lambda *a, **k: False
+    )
+    with pytest.raises(MigrateWorktreeRefused) as exc:
+        mgr.migrate_worktree("demo")
+    assert "journal" in str(exc.value)
+    _still_fully_resumable(mgr, "demo", fixture_repo)
+
+
+def test_rollback_fails_closed_before_removing_anything(fixture_repo, monkeypatch):
+    """F-001, the direction that matters more: record BEFORE you destroy.
+
+    Removing the tree and then failing to journal the release leaves no tree and
+    an OPEN adoption, so the resolver answers `dedicated`, the next resume
+    rebuilds the tree the operator just removed — and the verb has already said
+    it succeeded. Recording first means the failure leaves the tree intact and
+    the run coherent, and a retry is safe.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    mgr.migrate_worktree("demo")
+    monkeypatch.setattr(
+        "gauntlet.engine.journal.append_audit", lambda *a, **k: False
+    )
+    with pytest.raises(MigrateWorktreeRefused) as exc:
+        mgr.rollback_worktree_migration("demo")
+    assert "journal" in str(exc.value)
+
+    monkeypatch.undo()
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+    entry = WT.observe(
+        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+    )
+    assert entry is not None, "the tree must survive a rollback that failed closed"
+    assert mgr._effective_worktree_mode(man) == WT.MODE_DEDICATED
+    # …and the retry works.
+    assert "rolled back" in mgr.rollback_worktree_migration("demo")
+
+
+def test_a_second_migrate_rollback_cycle_is_recorded_distinctly(fixture_repo):
+    """F-002: the lifecycle is a CYCLE, so its keys must carry a generation.
+
+    Before the fix an adoption key was a function of (run, path, head,
+    transition) and a release key of (run, path) alone — all of which repeat.
+    So the second migration at an unchanged head was deduplicated away, and the
+    second rollback ALWAYS was. Either one leaves the journal's last word
+    disagreeing with reality, which is exactly what resolver rule 2 reads.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    run_dir = mgr.layout("demo").active_run_dir()
+
+    mgr.migrate_worktree("demo")
+    mgr.rollback_worktree_migration("demo")
+    mgr.migrate_worktree("demo")          # same HEAD as the first migration
+    man = Manifest.load(run_dir / "manifest.json")
+    kinds = [
+        e["kind"] for e in _events(run_dir)
+        if e.get("kind", "").startswith("Worktree")
+    ]
+    assert kinds == ["WorktreeAdopted", "WorktreeReleased", "WorktreeAdopted"], (
+        "the second adoption was deduplicated against the first"
+    )
+    # The journal's last word is an OPEN adoption, so a tree that vanishes with
+    # its registration still resolves `dedicated` and is recreated (rule 2).
+    assert mgr._journal_says_adopted(man)
+
+    mgr.rollback_worktree_migration("demo")
+    kinds = [
+        e["kind"] for e in _events(run_dir)
+        if e.get("kind", "").startswith("Worktree")
+    ]
+    assert kinds[-1] == "WorktreeReleased", (
+        "the second release was deduplicated against the first, leaving an open "
+        "adoption that would rebuild the tree the operator just removed"
+    )
+    assert not mgr._journal_says_adopted(man)
+    assert mgr._effective_worktree_mode(man) == WT.MODE_SAME_TREE
+
+
+def test_rollback_refuses_a_governed_artifact_edited_in_the_run_tree(
+    fixture_repo,
+):
+    """F-003: "it is only a synced copy" was an assumption, and it deleted bytes.
+
+    The exclusion feeds `WT.release`'s snapshot decision as well as the
+    refusal, so an artifact edited inside the run worktree was invisible to
+    BOTH protections and destroyed. The playbook saying not to edit it there is
+    not proof that nobody did. Now each artifact earns its exclusion by
+    byte-comparison against the authoritative copy.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    mgr.migrate_worktree("demo")
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+    entry = WT.observe(
+        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+    )
+    tree_prd = entry.path / "runs" / "demo" / "prd.md"
+    tree_prd.parent.mkdir(parents=True, exist_ok=True)
+    tree_prd.write_text("# Real PRD\n\nEDITED IN THE RUN TREE.\n")
+
+    with pytest.raises(MigrateWorktreeRefused) as exc:
+        mgr.rollback_worktree_migration("demo")
+    assert "prd.md" in str(exc.value)
+    # Still there — refused, not swept into a recovery ref.
+    assert "EDITED IN THE RUN TREE" in tree_prd.read_text()
+
+
+def test_an_identical_synced_artifact_still_does_not_block_a_rollback(
+    fixture_repo,
+):
+    """The other half of F-003: proof, not paranoia.
+
+    The common case — a synced copy byte-identical to the operator's file — must
+    still be excluded, or every dedicated run becomes un-rollbackable and the
+    fix has traded one wedge for another.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    mgr.migrate_worktree("demo")
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
+    entry = WT.observe(
+        mgr.operator_root, man.branch, common_dir=mgr._git_common_dir()
+    )
+    tree_prd = entry.path / "runs" / "demo" / "prd.md"
+    tree_prd.parent.mkdir(parents=True, exist_ok=True)
+    tree_prd.write_text(mgr.layout("demo").prd_path.read_text())  # exact copy
+
+    assert "rolled back" in mgr.rollback_worktree_migration("demo")
+
+
+def test_a_rollback_refusal_never_claims_the_run_is_same_tree(fixture_repo):
+    """F-007: a rollback refusal is reached only after the run resolved dedicated.
+
+    Telling that operator the run "remains fully drivable in `same_tree` mode"
+    is not a harmless simplification — it is a false statement about which tree
+    their agents edit next, handed to them at the moment they are trying to
+    establish exactly that.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    mgr.migrate_worktree("demo")
+    run_dir = mgr.layout("demo").active_run_dir()
+    _write_run_lock(mgr, "demo", pid=os.getpid(), identity=_ident(os.getpid()))
+
+    with pytest.raises(MigrateWorktreeRefused) as exc:
+        mgr.rollback_worktree_migration("demo")
+    msg = str(exc.value)
+    assert "same_tree" not in msg, msg
+    assert "own worktree at" in msg
 
 
 # --- A2 in the mixed population is not weakened by migration ------------------
@@ -712,6 +982,22 @@ def test_status_offers_migration_only_to_an_eligible_run(fixture_repo):
     mgr = _parked_same_tree_run(fixture_repo)
     run_dir = mgr.layout("demo").active_run_dir()
     man = Manifest.load(run_dir / "manifest.json")
+
+    # Rewritten at P7c-2.1 (review F-006). P7c-2 asserted the offer appears in
+    # the state this fixture builds — but that state has the run branch checked
+    # out in the operator's tree, where git is CERTAIN to refuse the migration.
+    # Advertising `executable: true` there is the R4 disagreement this file
+    # otherwise exists to prevent, so the offer is now withheld until the
+    # migration would actually succeed.
+    rstate0 = op.compute_run_state(man, op.LIVENESS_NONE)
+    n0 = len(rstate0.next_actions)
+    _append_migration_action(mgr, man, op.LIVENESS_NONE, rstate0, "demo")
+    assert len(rstate0.next_actions) == n0, (
+        "migration was offered while the run branch was checked out in the "
+        "operator's tree, where the verb refuses"
+    )
+
+    _step_off_the_run_branch(fixture_repo)
     rstate = op.compute_run_state(man, op.LIVENESS_NONE)
     before = len(rstate.next_actions)
 
@@ -755,6 +1041,9 @@ def test_status_json_carries_the_migration_action_and_stays_schema_valid(
         .read_text()
     )
     _parked_same_tree_run(fixture_repo)
+    # The offer is real only once it would actually run (review F-006), so the
+    # operator steps off the run branch exactly as the playbook says.
+    _step_off_the_run_branch(fixture_repo)
     monkeypatch.chdir(fixture_repo)
     result = CliRunner().invoke(app, ["status", "demo", "--json"])
     assert result.exit_code == 0, result.output
@@ -768,6 +1057,10 @@ def test_status_json_carries_the_migration_action_and_stays_schema_valid(
     ]
     assert len(migrate) == 1
     assert migrate[0]["consequence"] and "Optional" in migrate[0]["consequence"]
+    # `executable: true` is now a claim the engine can stand behind: the same
+    # predicate that produced this offer is what the verb consults.
+    assert migrate[0]["executable"] is True
+    assert migrate[0]["required_inputs"] == []
     validate_schema(payload, schema)
 
 
