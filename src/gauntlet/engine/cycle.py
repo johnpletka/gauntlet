@@ -2053,6 +2053,48 @@ def _intent_review_block(step: Step) -> str:
     )
 
 
+def _spec_reference_block(step: Step, ctx: StepContext, rnd: int) -> str:
+    """The approved upstream spec a document-mode artifact must fully cover
+    (issue #80), inlined for the reviewer.
+
+    Artifact mode inlines ONLY the artifact under review, so a plan-cycle
+    reviewer never had the PRD in context: the codex reviewer was never told the
+    path, and the `api`-adapter panel member (`reads_repo=False`) could not read
+    it at all. A coverage sweep the reviewer cannot execute is worse than none —
+    it gets answered from the plan's own traceability claims. `review_against:`
+    on the step names the spec; ``prompts/review-document.md`` makes the
+    FR-by-FR sweep mandatory whenever this block is present, and inert when it
+    is not (a PRD cycle, or an adopter still on a pipeline without the key).
+
+    Round 1 only: rounds 2+ run ``cycle-rereview.md`` and are regression-scoped
+    to the fix diff (FR-1.2), so re-inlining the whole spec buys nothing.
+
+    Unlike the `intent` block this is NOT wrapped as untrusted data: the spec is
+    a governed first-party artifact of this run (approved at its own gate), and
+    it is presented exactly as the artifact under review is.
+
+    Fails closed if `review_against` is set but unreadable — a spec that was
+    approved at its gate and has since vanished is a defect, never a silent
+    degrade to a spec-less review (CLAUDE.md §2).
+    """
+    name = step.get("review_against")
+    if not name or rnd > 1:
+        return ""
+    path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        raise ValueError(
+            f"review_against artifact {name!r} is unreadable at {path}: {exc}"
+        ) from exc
+    return (
+        f"\n\n--- approved spec the artifact above must fully cover: {name} ---\n"
+        "Run the mandatory coverage sweep against THIS document, clause by "
+        "clause, before raising anything else.\n"
+        f"{text}"
+    )
+
+
 # Headroom under the adapter's declared input cap for everything appended
 # around the diff (lens fragments, carried findings, the human-decision block)
 # plus CLI envelope overhead. 64 KiB is deliberately generous: the cost of
@@ -2166,6 +2208,11 @@ def _review_prompt(
             )
         else:
             parts.append(f"\n--- artifact under review: {name} ---\n{Path(path).read_text()}")
+        # The upstream spec the artifact owes coverage to (issue #80). Empty for
+        # a PRD cycle (nothing upstream), for rounds 2+, and for any step that
+        # does not set `review_against:` — so every existing cycle's prompt is
+        # byte-for-byte unchanged.
+        parts.append(_spec_reference_block(step, ctx, rnd))
     if carried:
         parts.append(
             f"\n--- findings still open from round {rnd - 1} (re-review ONLY "

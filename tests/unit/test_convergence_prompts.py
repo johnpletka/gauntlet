@@ -89,6 +89,22 @@ def test_review_prompts_have_untestable_oracle_rule():
         assert "fixture matrix" in text.lower(), name
 
 
+# --- issue #80: mandatory PRD-coverage sweep in document-mode review ---------
+def test_review_document_has_mandatory_coverage_sweep():
+    # A plan review reliably finds contradictions in text it reads and reliably
+    # misses requirements with no counterpart to collide with. The sweep must be
+    # a PROCEDURE (enumerate the spec, map each clause to a delivering phase),
+    # not the pre-existing dispositional "cover the spec with no gaps" line.
+    text = _read("review-document.md")
+    assert "Coverage sweep (mandatory" in text
+    lowered = text.lower()
+    assert "requirement by requirement" in lowered
+    assert "traceability" in lowered           # a traceability row is a claim to check
+    assert "spec-gap" in text                  # the findings.json category
+    assert "severity at least `major`" in text
+    assert "summary" in lowered                # the map is persisted, not implicit
+
+
 def test_triage_has_untestable_oracle_rule():
     text = _read("triage.md")
     assert "FR-6.3" in text

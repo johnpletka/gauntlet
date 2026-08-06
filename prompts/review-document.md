@@ -13,6 +13,24 @@ Review against, in priority order:
 3. The guiding principles in CLAUDE.md §2 (determinism, fail-closed, separation
    of concerns, data over inference, process fidelity).
 
+**Coverage sweep (mandatory, before anything else) — whenever an approved spec
+is provided below the artifact:** walk that spec requirement by requirement —
+every FR, every FR acceptance criterion, every ratified decision. For each, name
+the phase and acceptance clause of the artifact under review that delivers it.
+Any clause you cannot map to a delivering phase is a finding, category
+`spec-gap`, severity at least `major` — including a requirement the artifact
+defers wholesale when the spec says it starts earlier. If the artifact carries
+its own FR→phase traceability table, verify it claim-by-claim against the phase
+text: a traceability row is an assertion to check, not evidence, and a phase
+that merely *mentions* an FR has not necessarily delivered it. Put the resulting
+clause→phase map in `summary` so the sweep is auditable.
+
+This is a procedure, not a disposition. An absent requirement generates no
+contradiction for you to notice — you will find the ambiguities and the forward
+dependencies in the text you read whether or not you enumerate, and you will
+miss exactly the requirements that have no counterpart in the artifact at all.
+Enumerate.
+
 Hunt specifically for: ambiguity a builder could implement two ways, untestable
 or unmeasurable requirements, missing edge cases or failure modes, phases that
 depend on later work, and assumptions stated as facts. For a plan, check that
