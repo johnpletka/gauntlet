@@ -165,10 +165,12 @@ behind that output. Drive every decision off the reported state class:
   tip — so anything uncommitted would be stranded with you while the agents
   carried on elsewhere. Your `prd.md`/`plan.md` are not affected; they are
   republished into the run tree.
-  Also expect that **`gauntlet finish` may then ask you to resolve your local
-  untracked `prd.md`**: a dedicated run commits the synced copy on its own
-  branch, and the engine refuses rather than deleting your file for you — it
-  names both resolutions when it happens.
+  `gauntlet finish` then handles your local untracked `prd.md` for you when it
+  is byte-identical to what the run branch committed: it clears the duplicate,
+  the merge restores the same bytes as a tracked file, and the result line says
+  which paths it replaced. If your copy has **diverged** from the branch's, it
+  refuses instead and names both resolutions — a disagreement about an approved
+  artifact is yours to settle, not the engine's.
   Migration is refused, with the blocker named, while a driver is `alive` or
   `indeterminate`, and for a terminal run. **A refusal never wedges anything**:
   the run is left exactly as it was and stays fully drivable in `same_tree`. If

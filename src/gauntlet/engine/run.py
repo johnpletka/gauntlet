@@ -1462,18 +1462,37 @@ class RunManager:
         )
         return self._journal_has_key(run_dir, key)
 
-    def _refuse_on_untracked_merge_collision(
-        self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
-    ) -> None:
-        """Refuse a finish whose merge git would reject on an untracked file.
+    def _untracked_merge_collisions(
+        self, layout: "RunLayout", man: Manifest, operator_root: Path
+    ) -> tuple[list[str], list[str]]:
+        """``(identical, divergent)`` untracked files the merge would overwrite.
 
-        Only reachable under `dedicated`, and only for the governed artifacts —
-        the exact set the operator authors in their checkout and the run branch
-        commits from the synced copy.
+        Only non-empty under `dedicated`, and only for the governed artifacts —
+        the exact set the operator authors in their checkout (§14.2 option A)
+        and the run branch commits from the copy the sync published into the run
+        worktree. Git refuses a merge outright when an untracked working-tree
+        file would be overwritten, and it refuses **even when the bytes are
+        identical** (measured), so this is the normal end state of a dedicated
+        run, not an edge case.
+
+        The split is what P7d resolves (a P7c-2 deferral). A collision is
+        ``identical`` only when the operator's file is a regular file (never a
+        symlink — a symlink is a different object, not a copy) whose bytes equal
+        the version on the run branch. Everything else is ``divergent``: the
+        operator edited their copy after the last sync, or it is unreadable, or
+        it is a symlink. Divergence is a real disagreement about a governed
+        artifact and only a human can settle it (R9), so it refuses.
+
+        This is the same "earn the exclusion by comparison" discipline review
+        F-003 imposed on the rollback path, applied in the opposite direction:
+        there proof let the engine *skip* protecting a file, here it lets the
+        engine *replace* one — and here the bytes demonstrably survive, because
+        the merge restores them as a tracked file in the same commit.
         """
         if self._effective_worktree_mode(man) != WT.MODE_DEDICATED:
-            return
-        collisions: list[str] = []
+            return ([], [])
+        identical: list[str] = []
+        divergent: list[str] = []
         for rel in governed_artifact_paths(self.operator_root, layout.slug_dir):
             local = self.operator_root / rel
             if not local.exists():
@@ -1485,28 +1504,93 @@ class RunManager:
                     continue
                 if gitops.is_tracked(operator_root, rel):
                     continue  # already tracked here — an ordinary merge
+                committed = gitops.file_bytes_at_commit(
+                    operator_root, f"refs/heads/{man.branch}", rel
+                )
             except gitops.GitError:
                 continue
-            collisions.append(rel)
-        if not collisions:
+            try:
+                same = (
+                    committed is not None
+                    and local.is_file()
+                    and not local.is_symlink()
+                    and local.read_bytes() == committed
+                )
+            except OSError:
+                same = False  # cannot prove identical → never auto-resolve
+            (identical if same else divergent).append(rel)
+        return (identical, divergent)
+
+    def _refuse_on_untracked_merge_collision(
+        self, layout: "RunLayout", man: Manifest, operator_root: Path, base: str
+    ) -> None:
+        """Refuse a finish whose merge git would reject on a DIVERGENT untracked file.
+
+        Detection only, and deliberately early — before the worktree release, so
+        a finish that cannot complete has destroyed nothing. The identical half
+        is resolved late, by :meth:`_resolve_identical_merge_collisions`,
+        immediately before the merge that restores it.
+        """
+        _, divergent = self._untracked_merge_collisions(layout, man, operator_root)
+        if not divergent:
             return
-        listing = "\n  ".join(collisions)
+        listing = "\n  ".join(divergent)
         raise FinishError(
             "refusing finish: your checkout has untracked file(s) that the "
-            f"merge of {man.branch!r} into {base!r} would overwrite:\n"
+            f"merge of {man.branch!r} into {base!r} would overwrite, and their "
+            "bytes DIFFER from the copy on the run branch:\n"
             f"  {listing}\n"
             "These are the governed artifacts you authored. A dedicated run "
             "commits them on its own branch (from the copy synced into the run "
-            "worktree), so your local copies are now redundant duplicates of "
-            "what is about to be merged in.\n"
+            "worktree). An identical duplicate would be replaced for you; a "
+            "divergent one is a real disagreement about an approved artifact, "
+            "and only you can say which version wins (R9).\n"
+            "Compare with:\n"
+            f"  git -C {self.operator_root} diff --no-index -- "
+            f"<(git -C {self.operator_root} show {man.branch}:{divergent[0]}) "
+            f"{divergent[0]}\n"
             "Resolve by either:\n"
-            f"  git -C {self.operator_root} add {' '.join(collisions)} && "
+            f"  git -C {self.operator_root} add {' '.join(divergent)} && "
             "git commit -m 'author prd'   # keep yours as a commit on the base\n"
-            f"  rm {' '.join(str(self.operator_root / c) for c in collisions)}"
+            f"  rm {' '.join(str(self.operator_root / c) for c in divergent)}"
             "   # take the run branch's copy\n"
-            "then `gauntlet finish` again. (The engine does not delete your "
-            "files to make a verb succeed.)"
+            "then `gauntlet finish` again."
         )
+
+    def _resolve_identical_merge_collisions(
+        self, layout: "RunLayout", man: Manifest, operator_root: Path
+    ) -> list[str]:
+        """Clear untracked duplicates PROVEN identical to what the merge brings in.
+
+        Called immediately before :func:`gitops.merge_branch` and nowhere else.
+        Re-derives the collision set rather than trusting the early detection,
+        because the worktree release runs in between and a re-check costs one
+        `git show` per governed artifact.
+
+        **Why this is not "the engine deletes a human's file."** The bytes are
+        proven equal to a blob on the run branch, and the very next operation
+        restores them at the same path as a *tracked* file. The operator's disk
+        ends the verb byte-identical to how it started; what changes is that the
+        path stops being an untracked duplicate. P7c-1.1 declined to do this and
+        was right to, in the terms it used: *"silently removing a human's file
+        to make a verb succeed is the wrong default."* The objection is to
+        **silently**, and to acting without proof — so this proves identity
+        first and the caller names every path it cleared in the verb's result.
+
+        Late by design: on the already-merged path there is no merge to restore
+        them, and detection cannot produce a collision there anyway (a branch
+        that is an ancestor of the base has its files tracked in the base). Doing
+        it here rather than at detection time makes that reasoning unnecessary.
+        """
+        identical, _ = self._untracked_merge_collisions(layout, man, operator_root)
+        cleared: list[str] = []
+        for rel in identical:
+            try:
+                (self.operator_root / rel).unlink()
+            except OSError:
+                continue  # the merge will refuse and say so; never mask that
+            cleared.append(rel)
+        return cleared
 
     def _refuse_if_run_worktree_dirty(
         self, man: Manifest, *, verb: str, exc_type: type = FinishError,
@@ -4188,7 +4272,22 @@ class RunManager:
         # `finish` would silently convert a builder's uncommitted work into a
         # recovery ref the operator never asked for and would not know to look
         # for. Refuse instead, naming the tree and how to inspect it.
-        self._refuse_if_run_worktree_dirty(man, verb="finish")
+        # P7d (a P7c-2 deferral, weighed and taken): the RUN tree's check gets
+        # the same exclusion set every other run-tree surface uses, instead of
+        # none at all. Unexcluded, it counted the engine's own write-only export
+        # and the synced governed artifacts as "a builder's uncommitted work" —
+        # so a dedicated run that reached `done` with an untracked synced
+        # `prd.md` in its tree was refused by the guard that exists to protect
+        # something else entirely. It was strictly *stricter* than finish's own
+        # operator-tree check three lines up, which has excluded exactly this
+        # set since P7c-1.1, and the asymmetry was an oversight rather than a
+        # decision. Governed artifacts still earn their exclusion by BYTE
+        # COMPARISON (review F-003) — an artifact edited inside the run tree is
+        # divergent, is not excluded, and still blocks.
+        run_excludes = self._run_tree_excludes(layout, man, run_dir)
+        self._refuse_if_run_worktree_dirty(
+            man, verb="finish", excludes=run_excludes
+        )
         # Ordered AFTER the dirt refusal on purpose: uncommitted work that a
         # teardown would sweep into a recovery ref is a bigger deal than a merge
         # that cannot start, so the operator hears about it first.
@@ -4197,21 +4296,28 @@ class RunManager:
         # synced copy). The merge below wants to write those same paths as
         # TRACKED files, and git refuses outright when an untracked working-tree
         # file would be overwritten — before starting the merge, so there is
-        # nothing to abort. Detect it here and say exactly what to do, rather
-        # than surfacing a bare `merge failed`.
+        # nothing to abort.
         #
-        # Deliberately a REFUSAL, not a fix-up: the engine could delete the
-        # operator's untracked copy when it is byte-identical to the committed
-        # one, but silently removing a human's file to make a verb succeed is
-        # the wrong default even when the content survives. The operator
-        # decides. (Smoothing this is a P7d usability item, noted in the commit
-        # body — it is the one place dedicated `finish` costs a manual step.)
+        # P7d splits what P7c-1.1 refused wholesale. A DIVERGENT duplicate still
+        # refuses here, early, having destroyed nothing. An IDENTICAL one is
+        # resolved immediately before the merge that restores it — see
+        # `_resolve_identical_merge_collisions` for why proof-then-replace is
+        # not the "silently removing a human's file" P7c-1.1 declined.
         self._refuse_on_untracked_merge_collision(layout, man, repo, base)
         # PROBLEM D / spike E2-D: release the run worktree BEFORE the branch is
         # merged and deleted. The merge itself is unaffected by a live worktree
         # (E2-F/G measured that, and it leaves the operator exactly where they
         # were), but the `branch -D` that follows is not. Ordering, not taste.
-        self._release_run_worktree(run_dir, man, excludes=excludes)
+        #
+        # The release takes the RUN tree's excludes for the same reason the
+        # refusal above does: this list also feeds `WT.release`'s snapshot
+        # decision, and the operator-derived set answered that question about
+        # the wrong tree. Empty is safe rather than a fallback case — the two
+        # go empty under exactly the same conditions (no tree, an unreadable
+        # worktree list, or a registered-but-absent tree), and in every one of
+        # them `_release_run_worktree` returns early or `WT.release` finds no
+        # directory to inspect, so the list is never consulted.
+        self._release_run_worktree(run_dir, man, excludes=run_excludes)
 
         # Already merged (e.g. landed via a PR): nothing to merge, just tidy.
         if gitops.is_ancestor(repo, branch, base):
@@ -4222,6 +4328,10 @@ class RunManager:
             return f"already merged into {base!r}; deleted {branch!r}"
 
         gitops.checkout_branch(repo, base)
+        # Immediately before the merge, and only for duplicates re-proven
+        # byte-identical to the blob the merge is about to write at that same
+        # path. Anything divergent already refused above.
+        cleared = self._resolve_identical_merge_collisions(layout, man, repo)
         msg = f"Merge {branch} into {base} (gauntlet finish {slug}, run {man.run_id})"
         try:
             gitops.merge_branch(repo, branch, message=msg)
@@ -4240,14 +4350,29 @@ class RunManager:
                 gitops.checkout_branch(repo, branch)  # leave the human where they were
             except gitops.GitError:
                 pass
+            restore = (
+                "\nYour untracked duplicate(s) of "
+                f"{', '.join(cleared)} were cleared for the merge and are "
+                f"unchanged on {branch!r}; restore them with "
+                f"`git -C {self.operator_root} checkout {branch} -- "
+                f"{' '.join(cleared)}`."
+                if cleared
+                else ""
+            )
             raise FinishError(
                 f"merge of {branch!r} into {base!r} conflicts (or was refused "
                 f"outright); resolve it manually — any half-merge was aborted "
-                f"and you are back on {branch!r}. Details: {exc}"
+                f"and you are back on {branch!r}. Details: {exc}{restore}"
             )
         gitops.delete_branch(repo, branch)
         self._clear_active_pointer(layout)
-        return f"merged {branch!r} into {base!r} and deleted the branch"
+        note = (
+            f"; replaced your untracked duplicate(s) of {', '.join(cleared)} "
+            "with the merged tracked copy (byte-identical)"
+            if cleared
+            else ""
+        )
+        return f"merged {branch!r} into {base!r} and deleted the branch{note}"
 
     def _recorded_base(self, layout: "RunLayout") -> str | None:
         """The resolved base branch recorded by the run, or None if unreadable."""
@@ -4522,6 +4647,49 @@ class RunManager:
             "happens."
         )
 
+    def _run_tree_excludes(
+        self, layout: "RunLayout", man: Manifest, run_dir: Path
+    ) -> list[str]:
+        """What may legitimately sit uncommitted in a run's own worktree.
+
+        The one derivation of that set, shared by every verb that inspects or
+        tears down a run tree (`finish`, `migrate-worktree --rollback`). Two
+        members, each earning its place differently:
+
+        * the engine's **two-file export** — write-only with zero readers,
+          regenerated on the next drive, and written by the engine itself, so
+          counting it as a builder's work would block a teardown on the
+          engine's own bookkeeping;
+        * a **governed artifact PROVEN byte-identical** to the operator's
+          authoritative copy. Proof, never category (review F-003): this list
+          feeds ``WT.release``'s snapshot decision as well as the dirtiness
+          refusal, so an artifact edited inside the run tree must fall out of it
+          and be protected as the uncommitted work it is.
+
+        Empty (and harmless) for a `same_tree` run or one with no tree: the
+        callers' own guards cover those, and an empty exclusion list is the
+        strict direction.
+        """
+        try:
+            entry = WT.observe(
+                self.operator_root, man.branch, common_dir=self._git_common_dir()
+            )
+        except gitops.GitError:
+            return []
+        if entry is None or not entry.path.is_dir():
+            return []
+        paths = RunPaths(
+            repo_root=self.repo_root,
+            work_root=entry.path,
+            state_root=run_dir,
+            artifact_root=layout.slug_dir,
+        )
+        return run_bookkeeping_excludes(
+            entry.path, paths.bookkeeping_root, layout.slug_dir
+        ) + self._verified_synced_artifacts(
+            entry.path, paths.artifact_root_in_work, layout
+        )
+
     def _verify_export(
         self, wt: "WT.RunWorktree", run_dir: Path, layout: "RunLayout",
         man: Manifest,
@@ -4794,35 +4962,12 @@ class RunManager:
                 "a tree.\n"
                 f"  Branch {man.branch} and every commit on it are untouched."
             )
-        # What may sit legitimately uncommitted in a run worktree, and is
-        # therefore not "a builder's work" for the purposes of the refusal
-        # below or the teardown snapshot:
-        #
-        # * the engine's own two-file EXPORT — write-only, zero readers,
-        #   regenerated on the next drive, and written by the migration itself,
-        #   so a rollback taken before the first checkpoint commit would
-        #   otherwise always be blocked by it;
-        # * a governed artifact in the run tree whose bytes are PROVEN identical
-        #   to the operator's authoritative copy. Under `dedicated` the
-        #   checkout is the authoring surface (§14.2 option A) and
-        #   `_sync_governed_artifacts` publishes a copy on every mutating
-        #   contact, so the common case is untracked-but-redundant and must not
-        #   block. Review F-003: "it is only a copy" was an ASSUMPTION, and
-        #   this list feeds `WT.release`'s snapshot decision as well as the
-        #   refusal — so an edit made directly in the run tree (by an agent, or
-        #   by an operator who ignored the playbook) was excluded from both
-        #   protections and destroyed. Proof replaces the assumption below.
-        paths = RunPaths(
-            repo_root=self.repo_root,
-            work_root=entry.path,
-            state_root=run_dir,
-            artifact_root=layout.slug_dir,
-        )
-        excludes = run_bookkeeping_excludes(
-            entry.path, paths.bookkeeping_root, layout.slug_dir
-        ) + self._verified_synced_artifacts(
-            entry.path, paths.artifact_root_in_work, layout
-        )
+        # What may sit legitimately uncommitted in a run worktree — the engine's
+        # write-only export, and a governed artifact PROVEN byte-identical to
+        # the operator's authoritative copy (review F-003). Derived by
+        # `_run_tree_excludes`, which `finish` now shares (P7d): two callers
+        # asking the same question of the same tree must not answer it twice.
+        excludes = self._run_tree_excludes(layout, man, run_dir)
         self._refuse_if_run_worktree_dirty(
             man, verb="migrate-worktree --rollback",
             exc_type=MigrateWorktreeRefused, excludes=excludes,

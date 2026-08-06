@@ -1057,3 +1057,67 @@ branch the run *launched from*, and that branch later diverged. The guard is
 right to fail closed, but the operator's proof (`git merge-base --is-ancestor
 <run-branch> main`) suggests the check could also accept containment in the
 repo's default branch before demanding `--force`.
+
+## 2026-08-06 — P7d gating dogfood: `dedicated` runs cannot be written to under `.git/`
+
+The P7d gate (`proposals/P7c-split-seam.md` §6) makes flipping
+`worktree.mode` to `dedicated` conditional on a dogfood run exercising spike
+§11 rows 2, 5 and 10. The dogfood was run — a real `gauntlet run` in
+`dedicated` mode on the toy PRD with live agents and the judge on, driven from
+the CLI. **All three rows passed. The flip did not happen anyway**, because the
+run itself failed for a reason none of the three rows covers. Full write-up and
+the maintainer's options: `proposals/P7d-gate-blocker.md`.
+
+- **What blocks it:** the `claude` CLI refuses to write any file whose path
+  contains a `.git/` component — *"which is a sensitive file"* — and spike §6.2
+  puts every run worktree at `<git-common-dir>/gauntlet/worktrees/…`, i.e.
+  inside `.git/`. Reproduced with no Gauntlet, no judge and no hook in the path;
+  the control (same branch, same repo, same flags, linked worktree at a sibling
+  path *outside* `.git/`) writes fine.
+- **Why it was not caught before P7d:** every experiment in the spike's Appendix
+  A measures *git* — visibility to `status`, survival of `clean -xdff`, prune
+  cross-talk, `EXDEV`. This is a property of the **agent CLI that drives every
+  builder and verifier step**, and nothing in the spike or the unit suite
+  exercises an agent writing inside a run worktree. The P7c suites drive real
+  verbs in dedicated mode with *fake* adapters, which is exactly the seam.
+- **Why it is worse than a hard refusal:** the guard is not uniform. `Write`,
+  `Edit` and `printf > file` are refused; `cat > file <<EOF` and `tee file` are
+  not. So a dedicated run fails **iff the model does not improvise a write form
+  the guard misses**. Both happened in the same dogfood, same pipeline, same
+  tree: the opus round was refused and failed closed with "fixer made no changes
+  in round 1 despite 7 accepted finding(s)"; a haiku round found `tee` and
+  completed normally, committing a real fix to the run branch.
+- **Manual intervention it forced, which is the point of this file:** none was
+  possible from inside the run. The operator-visible symptom is a generic
+  fail-closed message that reads as a model failure. Recovery was to abandon the
+  round, not to fix anything.
+- **The evidence lies, and that is its own defect.** Gauntlet's judge is a
+  **PreToolUse** hook, so it adjudicates *before* the CLI applies its own
+  permission rules. `judge-audit.jsonl` therefore records `Write … allow` for
+  writes that never happened. Nothing in the manifest, journal, audit or
+  transcript names the refusal. Same family as the stale-driver entry above: the
+  durable record is confidently wrong about what occurred.
+- **What the three rows did prove** (details and commands in the proposal):
+  row 5 — `git worktree lock` is exactly what stops another run's
+  `prune --expire now`, with the unlocked control pruned immediately, and a
+  locked worktree is never reported `prunable` (confirming P7c-1's CORRECTION 2
+  in the wild); row 2 — a deleted tree was recreated by a real `gauntlet resume`
+  with `WorktreeAdopted{recreated: true}` and the HEAD verified against the
+  journal's own `branch_sha`, after which the run made real progress; row 10 —
+  a dirty run worktree was captured into `refs/gauntlet/recovery/…` with
+  `reason: worktree-teardown` before the forced removal, and the builder's
+  uncommitted bytes were recovered from the snapshot.
+- **Measured, separately, what the flip would have cost the suite** (on a
+  throwaway worktree, discarded): `101 failed, 2874 passed, 3 skipped … 13
+  errors`. The 13 errors are the autouse A1 property firing at teardown — the
+  signal P7d exists to produce. Spot-checked, they are not all engine defects:
+  `test_lock_released_on_done_and_park` trips it by committing in the operator's
+  checkout *between two runs*, and the fixture captures its baseline once, at
+  the first tree's creation. A phase that does the flip should re-base the A1
+  baseline per run, or that shape will be miscounted as a violation.
+- **Suggested durable mitigation, independent of where the worktree ends up:**
+  a start-time preflight (and a `doctor` check) that writes a probe file into
+  the run worktree *through the adapter* and parks with a named reason if it is
+  refused — the same fail-closed shape as the §7 submodule park. That is the
+  only one of the options that would have made this failure legible without a
+  human reading a transcript.

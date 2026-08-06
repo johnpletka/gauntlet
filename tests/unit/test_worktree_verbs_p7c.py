@@ -269,6 +269,62 @@ def test_finish_refuses_when_the_run_worktree_is_dirty(fixture_repo):
 
 @pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
 def test_finish_releases_the_worktree_then_deletes_the_branch(fixture_repo):
+    """REWRITTEN at P7d: an IDENTICAL untracked duplicate no longer refuses.
+
+    This test used to assert that `finish` refuses outright on the governed-
+    artifact merge collision, and it was right about P7c-1.1's behaviour. P7d
+    proves that behaviour wrong as a default: under `dedicated` the operator's
+    checkout is the authoring surface, so an untracked `runs/<slug>/prd.md`
+    byte-identical to the copy the run branch committed is the NORMAL end state
+    of every dedicated run — and refusing there made a manual step mandatory on
+    the happy path.
+
+    The assertion is not weakened, it is moved to the property that actually
+    matters: the operator's bytes survive. After the finish the path is TRACKED
+    on the base with the same content it had before, which is the whole
+    justification for clearing it (the merge restores it in the same breath).
+    `test_finish_refuses_a_divergent_untracked_duplicate` keeps the refusal
+    pinned for the case where the bytes disagree.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    assert _run_worktree(mgr, "gauntlet/demo") is not None
+    prd = fixture_repo / "runs" / "demo" / "prd.md"
+    authored = prd.read_bytes()
+    assert not gitops.is_tracked(fixture_repo, "runs/demo/prd.md"), (
+        "precondition: the authoring copy is untracked in the operator checkout"
+    )
+
+    out = mgr.finish("demo")
+
+    assert "replaced your untracked duplicate" in out, (
+        "the operator must be TOLD which files were cleared — the P7c-1.1 "
+        "objection was to doing it SILENTLY, not to doing it"
+    )
+    assert prd.read_bytes() == authored, "the operator's bytes are unchanged"
+    assert gitops.is_tracked(fixture_repo, "runs/demo/prd.md"), (
+        "and the path is now the merged TRACKED copy, not an untracked duplicate"
+    )
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo"), (
+        "PROBLEM D / E2-D: the branch delete only succeeds after the release"
+    )
+    assert _run_worktree(mgr, "gauntlet/demo") is None
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_refuses_a_divergent_untracked_duplicate(fixture_repo):
+    """The other half of P7d's split: proof earns the replacement, nothing else.
+
+    An operator who edits their authoring copy after the run's last sync has a
+    real disagreement with what the run branch committed about an APPROVED
+    artifact. R9 says the engine never silently adopts either side, so this
+    still refuses — and the refusal must be legible as being about divergence,
+    not about the mere existence of the file.
+    """
     from gauntlet.engine.run import FinishError
 
     mgr = _prepare(fixture_repo)
@@ -277,18 +333,92 @@ def test_finish_releases_the_worktree_then_deletes_the_branch(fixture_repo):
     assert mgr.start("demo", path, use_judge=False,
                      adapter_factory=lambda n: FakeAdapter(
                          writes={"feature.py": "code\n"})) == M.RUN_DONE
-    assert _run_worktree(mgr, "gauntlet/demo") is not None
-    # A dedicated run commits the governed artifacts on ITS branch, so the
-    # operator's authoring copy is an untracked duplicate the merge would
-    # overwrite. `finish` refuses and names both resolutions; take the one a
-    # real operator would (keep their authored file as a commit on the base).
-    with pytest.raises(FinishError, match="would overwrite"):
-        mgr.finish("demo")
-    git(fixture_repo, "add", "runs/demo/prd.md")
-    git(fixture_repo, "commit", "-qm", "author prd")
+    prd = fixture_repo / "runs" / "demo" / "prd.md"
+    prd.write_text(prd.read_text() + "\nan edit made after the run's last sync\n")
+    edited = prd.read_bytes()
 
-    mgr.finish("demo")
-    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo"), (
-        "PROBLEM D / E2-D: the branch delete only succeeds after the release"
+    with pytest.raises(FinishError, match="bytes DIFFER"):
+        mgr.finish("demo")
+
+    assert prd.read_bytes() == edited, "the divergent file is never touched"
+    assert gitops.branch_exists(fixture_repo, "gauntlet/demo"), (
+        "and the refusal is early — before the release destroys anything"
     )
-    assert _run_worktree(mgr, "gauntlet/demo") is None
+    assert _run_worktree(mgr, "gauntlet/demo") is not None
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_is_not_blocked_by_the_run_trees_own_synced_artifact(fixture_repo):
+    """The second P7c-2 deferral: `finish`'s run-tree check gets its excludes.
+
+    A dedicated run reaching `done` has the synced governed artifact sitting
+    untracked in its OWN tree (that is what `_sync_governed_artifacts` puts
+    there) plus the engine's write-only export. With no exclusion set, the
+    run-tree dirtiness guard — whose stated purpose is protecting a BUILDER's
+    uncommitted work — counted both as exactly that and refused.
+
+    Asserted through the verb rather than by inspecting the exclusion list, so
+    a future refactor that keeps the list and stops passing it still fails.
+
+    The artifact used is `plan.md` rather than `prd.md` because the state the
+    deferral names needs a synced artifact the run branch has NOT committed —
+    P7c-2 said as much ("in practice a real pipeline's commit step stages the
+    artifact first, which is why P7c-1.1's dedicated-finish test passes"). A
+    pipeline that produces a plan after the last commit leaves exactly this.
+    """
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None
+    # The authoritative copy in the operator's checkout, and the sync's copy in
+    # the run tree — untracked on the branch, byte-identical, which is what
+    # `_sync_governed_artifacts` leaves behind on every mutating contact.
+    plan_bytes = b"# Plan\n\nA governed artifact synced after the last commit.\n"
+    (fixture_repo / "runs" / "demo" / "plan.md").write_bytes(plan_bytes)
+    synced = entry.path / "runs" / "demo" / "plan.md"
+    synced.parent.mkdir(parents=True, exist_ok=True)
+    synced.write_bytes(plan_bytes)
+    assert gitops.status_porcelain(entry.path, untracked_all=True), (
+        "precondition: the run tree is dirty by the unexcluded reading"
+    )
+
+    mgr.finish("demo")  # must not raise
+
+    assert not gitops.branch_exists(fixture_repo, "gauntlet/demo")
+
+
+@pytest.mark.operator_tree_verb  # `finish` merges into the operator's base by design (§9.4)
+def test_finish_still_refuses_an_artifact_edited_inside_the_run_tree(fixture_repo):
+    """The exclusion is earned by bytes at `finish` too, not by category.
+
+    `finish` is a NEW caller of the shared `_run_tree_excludes` derivation, so
+    review F-003's lesson has to hold at this call site independently: a
+    governed artifact whose run-tree copy DIVERGED from the authority is a real
+    edit, is not excluded, and must still stop the verb — because the release
+    that follows would otherwise sweep it into a recovery ref nobody asked for.
+    """
+    from gauntlet.engine.run import FinishError
+
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    path = _pipeline(fixture_repo, LINEAR)
+    assert mgr.start("demo", path, use_judge=False,
+                     adapter_factory=lambda n: FakeAdapter(
+                         writes={"feature.py": "code\n"})) == M.RUN_DONE
+    entry = _run_worktree(mgr, "gauntlet/demo")
+    assert entry is not None
+    (fixture_repo / "runs" / "demo" / "plan.md").write_bytes(b"# Plan\n\nauthority\n")
+    synced = entry.path / "runs" / "demo" / "plan.md"
+    synced.parent.mkdir(parents=True, exist_ok=True)
+    synced.write_bytes(b"# Plan\n\nEDITED IN THE RUN TREE\n")
+
+    with pytest.raises(FinishError, match="RUN WORKTREE has uncommitted"):
+        mgr.finish("demo")
+
+    assert synced.read_bytes() == b"# Plan\n\nEDITED IN THE RUN TREE\n", (
+        "the edit is preserved, not snapshotted-and-removed"
+    )

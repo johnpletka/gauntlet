@@ -165,6 +165,7 @@ ROOT_SCOPE: dict[str, str] = {
     "diff_range_empty": ROOT_SCOPE_REPO,
     "any_tracked_at": ROOT_SCOPE_REPO,
     "file_at_commit": ROOT_SCOPE_REPO,
+    "file_bytes_at_commit": ROOT_SCOPE_REPO,
     "advance_is_engine_bookkeeping": ROOT_SCOPE_REPO,
     "remote_url": ROOT_SCOPE_REPO,
     "remote_default_branch": ROOT_SCOPE_REPO,
@@ -1118,6 +1119,21 @@ def file_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
     """
     try:
         return _run(repo, "show", f"{sha}:{relpath}")
+    except GitError:
+        return None
+
+
+def file_bytes_at_commit(repo: Path, sha: str, relpath: str) -> bytes | None:
+    """:func:`file_at_commit`, but the RAW BYTES, or ``None`` if absent there.
+
+    The text variant decodes, which is fine for reading an artifact but not for
+    *proving two files are the same object*. `finish` uses this to establish
+    that an operator's untracked file is byte-identical to the copy the merge is
+    about to bring in before it will touch that file at all (P7d) — and a proof
+    that survives a decode round-trip is not a proof of the bytes.
+    """
+    try:
+        return _run_bytes(repo, "show", f"{sha}:{relpath}")
     except GitError:
         return None
 
