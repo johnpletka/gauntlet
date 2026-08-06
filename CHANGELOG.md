@@ -28,9 +28,8 @@ a file whose whole body lands in a reviewer prompt and the transcripts, it is
 validated like any other path-bearing artifact reference: pipeline load rejects
 a dangling name, an absolute or `../` value, a path that resolves outside the
 repo root, and a seed that is not on disk — and the cycle re-proves containment
-at the read. Rounds 2+ are
-unaffected (regression-scoped, FR-1.2), as is the PRD cycle, which has no
-upstream spec. **Upgrade note:** the prompt half ships with the scaffold, but
+at the read. Rounds 2+ are unaffected (regression-scoped, FR-1.2), as is the
+PRD cycle, which has no upstream spec. **Upgrade note:** the prompt half ships with the scaffold, but
 the sweep is keyed on the spec block's presence and stays inert without it — if
 your `pipelines/standard.yaml` is customized, `gauntlet upgrade` will not add
 the key for you; add `review_against: prd.md` to your `plan-cycle` step.
