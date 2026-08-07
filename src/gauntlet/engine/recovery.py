@@ -718,12 +718,43 @@ class ContinueOnRecoveryBranchAction(_ActionBase):
     # so a behind run branch the operator is standing on restores via a pure
     # fast-forward merge instead. Additive with a back-compatible default.
     via: Literal["branch_force", "ff_merge"] = "branch_force"
-    requires_snapshot: Literal[True] = True
+    # The ref value this action was ASSESSED against, and the compare-and-swap
+    # guard the rendered command carries (post-review F-003). ``None`` means
+    # "the ref did not exist" — the missing-branch and fork-preservation forms,
+    # which must create rather than overwrite.
+    #
+    # Why it is required rather than advisory: an assessment is a *photograph*.
+    # The operator reads it, and runs the command it advertises some time
+    # later; a resume, another operator or a driver may advance the ref in
+    # between. Without the guard the advertised `git branch -f` applies a stale
+    # decision to a moved ref — rewinding a tip that had advanced, or replacing
+    # a ref recreated in the gap — and orphans those commits silently, which is
+    # the one outcome plan §5.4's "every action is non-destructive" forbids.
+    # Carrying the expected value makes git's own ref transaction refuse the
+    # stale update atomically, so the failure mode becomes a loud refusal.
+    expected_sha: str | None = None
+    # With the guard in place this action cannot discard history: it either
+    # creates a ref that did not exist, or fast-forwards one that is provably
+    # still where it was observed. There is nothing for a pre-mutation snapshot
+    # to preserve, and declaring one that no renderer takes was the contradiction
+    # post-review F-003 named. Preservation here is *structural*, not archival.
+    requires_snapshot: Literal[False] = False
     requires_human_decision: Literal[False] = False
 
     @model_validator(mode="after")
     def _valid_start(self) -> "ContinueOnRecoveryBranchAction":
         _validate_sha(self.start_sha, field="start_sha")
+        if self.expected_sha is not None:
+            _validate_sha(self.expected_sha, field="expected_sha")
+            if self.expected_sha == self.start_sha:
+                raise ValueError(
+                    "a recovery ref restoration whose expected value already "
+                    "equals its start commit would be a no-op"
+                )
+        if self.via == "ff_merge" and self.expected_sha is None:
+            raise ValueError(
+                "a fast-forward merge restoration requires the ref to exist"
+            )
         return self
 
 

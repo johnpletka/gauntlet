@@ -46,6 +46,7 @@ Moving the root out of `.git/` (P7e) is the correction.
 from __future__ import annotations
 
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,9 +59,20 @@ EDIT_TOOL = "edit_tool"
 SHELL_REDIRECT = "shell_redirect"
 MECHANISMS = (WRITE_TOOL, EDIT_TOOL, SHELL_REDIRECT)
 
-# The scratch directory the probe writes in, inside the run worktree. Removed on
-# every exit path: the central invariant (CLAUDE.md §1) is that the tree is
-# clean at every handoff, and the preflight runs before the first agent step.
+# The scratch directory the probe writes in, inside the run worktree. A PREFIX,
+# not a fixed name (post-review F-002): the directory is created exclusively,
+# with a random suffix, and an existing entry is never reused. A fixed name
+# cannot be trusted here — `mkdir(exist_ok=True)` accepts an existing symlink to
+# a directory, and this probe's very first act is an ENGINE-side write
+# (`probe_edit.txt`'s seed), so a planted `.gauntlet-writability-probe ->
+# /somewhere/else` would put engine bytes outside the repository before any
+# agent runs, and the `rmtree(ignore_errors=True)` cleanup would leave both the
+# link and the escaped file behind. The same reuse would delete a pre-existing
+# real directory of that name.
+#
+# Removed on every exit path regardless: the central invariant (CLAUDE.md §1) is
+# that the tree is clean at every handoff, and the preflight runs before the
+# first agent step.
 PROBE_DIRNAME = ".gauntlet-writability-probe"
 
 _SEED = "SEED\n"
@@ -166,12 +178,24 @@ def probe(adapter: Any, work_root: Path, *, adapter_name: str) -> AdapterWritabi
     Never raises for a refusal — a refusal is a RESULT, and the caller decides
     whether it parks (start-time preflight) or is reported (`doctor`). An
     adapter that blows up is captured per-mechanism as an ``error`` for the same
-    reason.
+    reason, and so does a scratch directory that cannot be created safely: that
+    is "could not run", not "refused", and it reaches the operator through the
+    same fail-closed park rather than through an exception from a function
+    whose whole contract is that it reports instead of raising.
     """
-    probe_dir = work_root / PROBE_DIRNAME
     outcomes: list[MechanismOutcome] = []
     try:
-        probe_dir.mkdir(parents=True, exist_ok=True)
+        probe_dir = _scratch_dir(work_root)
+    except OSError as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        return AdapterWritability(
+            adapter=adapter_name,
+            work_root=work_root,
+            outcomes=tuple(
+                MechanismOutcome(m, landed=False, error=detail) for m in MECHANISMS
+            ),
+        )
+    try:
         for mechanism in MECHANISMS:
             outcomes.append(_one(adapter, probe_dir, mechanism))
     finally:
@@ -179,6 +203,32 @@ def probe(adapter: Any, work_root: Path, *, adapter_name: str) -> AdapterWritabi
     return AdapterWritability(
         adapter=adapter_name, work_root=work_root, outcomes=tuple(outcomes)
     )
+
+
+def _scratch_dir(work_root: Path) -> Path:
+    """Create the probe's scratch directory exclusively, inside ``work_root``.
+
+    ``mkdtemp`` is the exclusivity: it creates with ``O_EXCL`` semantics under a
+    name nothing else holds, so there is no pre-existing entry to reuse, no
+    symlink to follow, and no foreign directory for the cleanup ``rmtree`` to
+    delete. The containment assertion after it is the belt to that braces — the
+    resolved directory must still be under the resolved ``work_root``, which is
+    what makes "the engine writes only inside the run's tree" a checked property
+    here rather than an assumption about the name.
+
+    Raises :class:`OSError` (including a :class:`ValueError` for an escaped
+    path, normalized) so :func:`probe` can report it as a per-mechanism error.
+    """
+    path = Path(tempfile.mkdtemp(prefix=f"{PROBE_DIRNAME}-", dir=work_root))
+    try:
+        path.resolve().relative_to(work_root.resolve())
+    except (ValueError, OSError, RuntimeError) as exc:
+        shutil.rmtree(path, ignore_errors=True)
+        raise OSError(
+            f"the writability probe's scratch directory {path} resolves outside "
+            f"the run worktree {work_root}; refusing to write there"
+        ) from exc
+    return path
 
 
 def _one(adapter: Any, probe_dir: Path, mechanism: str) -> MechanismOutcome:

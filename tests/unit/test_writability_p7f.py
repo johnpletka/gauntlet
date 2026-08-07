@@ -106,6 +106,61 @@ def test_the_probe_directory_is_removed_so_the_tree_stays_clean(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_planted_probe_symlink_is_never_written_through(tmp_path):
+    """Post-review F-002: the scratch directory is created, never adopted.
+
+    `mkdir(exist_ok=True)` on a fixed name accepts an existing symlink to a
+    directory, and this probe's first act is an ENGINE-side write (the Edit
+    mechanism's seed). A planted link therefore put engine bytes outside the
+    repository before any agent ran, while `rmtree(ignore_errors=True)` left
+    both the link and the escaped file in place.
+    """
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (work_root / W.PROBE_DIRNAME).symlink_to(outside, target_is_directory=True)
+
+    report = W.probe(_Adapter(), work_root, adapter_name="claude-code")
+
+    assert report.ok, report.summary()
+    assert list(outside.iterdir()) == [], "the probe wrote outside the tree"
+    assert (work_root / W.PROBE_DIRNAME).is_symlink(), "a foreign entry was consumed"
+    assert [p.name for p in work_root.iterdir()] == [W.PROBE_DIRNAME]
+
+
+def test_a_pre_existing_real_directory_of_that_name_is_not_deleted(tmp_path):
+    """Post-review F-002: the cleanup only ever removes what the probe made."""
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    squatter = work_root / W.PROBE_DIRNAME
+    squatter.mkdir()
+    (squatter / "someone-elses.txt").write_text("keep me\n")
+
+    report = W.probe(_Adapter(), work_root, adapter_name="claude-code")
+
+    assert report.ok, report.summary()
+    assert (squatter / "someone-elses.txt").read_text() == "keep me\n"
+
+
+def test_a_scratch_directory_that_cannot_be_made_reports_rather_than_raises(
+    tmp_path, monkeypatch
+):
+    """Post-review F-002: an unmakeable scratch dir is "could not run", not a
+    refusal, and it reaches the operator through the same fail-closed park —
+    never as an exception out of a function whose contract is to report."""
+    monkeypatch.setattr(
+        W.tempfile, "mkdtemp",
+        lambda **_kw: (_ for _ in ()).throw(OSError("read-only file system")),
+    )
+    report = W.probe(_Adapter(), tmp_path, adapter_name="claude-code")
+
+    assert not report.ok
+    assert set(report.errored) == set(W.MECHANISMS)
+    assert report.refused == ()
+    assert "could not run" in W.park_reason([report])
+
+
 # --- property 2: each mechanism by name, no model choice ---------------------
 
 

@@ -190,6 +190,54 @@ def test_clean_xdff_destroys_the_tree_but_leaves_it_recoverable(fixture_repo):
     assert (again.path / "feature.py").read_text() == "work\n"
 
 
+# --- the derived root must also be a REAL directory (post-review F-001) ------
+
+
+@pytest.mark.parametrize("segment", [".gauntlet", ".gauntlet/worktrees",
+                                     ".gauntlet/worktrees/demo"])
+def test_a_symlinked_root_segment_refuses_before_anything_is_written(
+    fixture_repo, tmp_path, segment
+):
+    """Post-review F-001: the derivation is a join; the disk is not.
+
+    `mkdir(exist_ok=True)` accepts an existing symlink to a directory at any
+    engine-derived segment, and everything that follows — the `.gitignore`
+    marker, `git worktree add`, then the agents' own files — lands through it,
+    outside the repository. `is_inside_worktrees_root` cannot catch it after
+    the fact: it `resolve()`s the root, so a root pointing outside makes the
+    OUTSIDE target the trusted boundary and containment answers True for paths
+    that are not in the repository at all.
+
+    That inverts the plan §7 property this whole location was chosen to keep,
+    so it is checked with `lstat` before any mutation, and the answer is the
+    same fail-closed park every other worktree-readiness failure raises.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = fixture_repo / segment
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    main_root = _main(fixture_repo)
+    git(fixture_repo, "branch", "gauntlet/demo")
+
+    with pytest.raises(WT.WorktreeUnavailable) as exc:
+        WT.ensure(fixture_repo, main_root, slug="demo", run_id="run-1",
+                  branch="gauntlet/demo")
+    assert "symlink" in str(exc.value)
+
+    # Nothing was created or written through the link, and the containment
+    # helper no longer vouches for what is on the other side of it.
+    assert list(outside.iterdir()) == [], "the engine wrote outside the repository"
+    assert not WT.is_inside_worktrees_root(
+        WT.run_worktree_path(main_root, "demo", "run-1"), main_root
+    )
+    if segment != ".gauntlet/worktrees/demo":
+        # A link AT the root is also the one that would carry the marker
+        # write outside; a link at the per-run segment is below it, so the
+        # marker itself stays a legitimate in-repository write.
+        assert WT.ensure_root_marker(main_root) is None
+
+
 # --- acceptance A2: concurrent operations cannot target one worktree ---------
 
 

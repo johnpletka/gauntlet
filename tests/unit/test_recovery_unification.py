@@ -822,8 +822,8 @@ def test_live_driver_gets_no_branch_reconciliation_actions(fixture_repo):
 def test_behind_action_executes_and_resume_converges(fixture_repo, checked_out):
     """F-003: the advertised behind-branch restore is genuinely executable
     from BOTH checkout positions — `git merge --ff-only` when standing on the
-    run branch (a forced branch move is invalid there), `git branch -f`
-    otherwise — and a subsequent plain resume converges."""
+    run branch (a forced branch move is invalid there), a compare-and-swap
+    `git update-ref` otherwise — and a subsequent plain resume converges."""
     mgr, man, base, run_dir = _seed(fixture_repo)
     tip = _commit(fixture_repo, "P1: land the phase", {"phase.py": "done\n"},
                   author=("Builder", "b@g.local"))
@@ -840,7 +840,13 @@ def test_behind_action_executes_and_resume_converges(fixture_repo, checked_out):
     if checked_out == "run_branch":
         assert restore.argv[:3] == ["git", "merge", "--ff-only"]
     else:
-        assert restore.argv[:3] == ["git", "branch", "-f"]
+        # Post-review F-003: guarded against the ref moving between the
+        # assessment and the operator running it — the observed tip is the
+        # compare-and-swap old value.
+        assert restore.argv[:3] == [
+            "git", "update-ref", "refs/heads/gauntlet/demo",
+        ]
+        assert restore.argv[4] == base
 
     # Execute exactly the advertised argv, then resume to convergence.
     subprocess.run(
@@ -859,7 +865,9 @@ def test_missing_branch_action_executes_and_resume_converges(fixture_repo):
     git(fixture_repo, "branch", "-qD", "gauntlet/demo")
     rstate, _ = _status_actions(fixture_repo, run_dir)
     restore = next(a for a in rstate.next_actions if a.kind == "recover")
-    assert restore.argv[:3] == ["git", "branch", "-f"]
+    # Create-only: the empty old value is git's own "must not exist" guard.
+    assert restore.argv[:3] == ["git", "update-ref", "refs/heads/gauntlet/demo"]
+    assert restore.argv[4] == ""
     subprocess.run(
         ["git", "-C", str(fixture_repo), *restore.argv[1:]],
         check=True, capture_output=True,
@@ -889,6 +897,83 @@ def test_fork_action_description_matches_its_payload(fixture_repo):
         check=True, capture_output=True,
     )
     assert gitops.rev_parse(fixture_repo, f"refs/heads/{act.branch_name}") == fork_tip
+
+
+def test_stale_behind_restore_refuses_after_the_branch_advances(fixture_repo):
+    """Post-review F-003: the advertised restore is a compare-and-swap.
+
+    An assessment is a photograph. If the run branch advances between `status`
+    computing the action and the operator running the command it printed, the
+    unguarded `git branch -f` would rewind that new tip and orphan its commits
+    with nothing in the run's evidence explaining it. The guarded form refuses
+    and changes nothing.
+    """
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    tip = _commit(fixture_repo, "P1: land the phase", {"phase.py": "done\n"},
+                  author=("Builder", "b@g.local"))
+    man.commits.append(M.CommitRecord(step_id="implement", phase="P1", sha=tip))
+    man.steps[0].base_sha = tip
+    man.write_atomic(run_dir / "manifest.json")
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qf", "gauntlet/demo", base)  # now BEHIND
+
+    rstate, _ = _status_actions(fixture_repo, run_dir)
+    restore = next(a for a in rstate.next_actions if a.kind == "recover")
+
+    # THE GAP: something advances the run branch after the action was rendered.
+    git(fixture_repo, "checkout", "-q", "gauntlet/demo")
+    advanced = _commit(fixture_repo, "unrelated later work", {"later.py": "x\n"})
+    git(fixture_repo, "checkout", "-q", "main")
+
+    proc = subprocess.run(
+        ["git", "-C", str(fixture_repo), *restore.argv[1:]], capture_output=True
+    )
+    assert proc.returncode != 0, "a stale ref restore must not apply"
+    assert b"but expected" in proc.stderr, proc.stderr
+    assert gitops.rev_parse(fixture_repo, "refs/heads/gauntlet/demo") == advanced
+    # `advanced` is reachable — nothing was orphaned.
+    assert gitops.rev_parse(fixture_repo, advanced) == advanced
+
+
+def test_stale_missing_restore_refuses_when_the_ref_reappears(fixture_repo):
+    """Post-review F-003: the create-only forms cannot overwrite either.
+
+    A run branch recreated in the gap (a resume, a second operator) is not this
+    action's subject; replacing it would discard whatever it points at.
+    """
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qD", "gauntlet/demo")
+    rstate, _ = _status_actions(fixture_repo, run_dir)
+    restore = next(a for a in rstate.next_actions if a.kind == "recover")
+
+    other = _commit(fixture_repo, "someone else's recreation", {"other.py": "x\n"})
+    git(fixture_repo, "branch", "-qf", "gauntlet/demo", other)
+
+    proc = subprocess.run(
+        ["git", "-C", str(fixture_repo), *restore.argv[1:]], capture_output=True
+    )
+    assert proc.returncode != 0, "a create-only restore must not overwrite"
+    assert b"already exists" in proc.stderr, proc.stderr
+    assert gitops.rev_parse(fixture_repo, "refs/heads/gauntlet/demo") == other
+
+
+def test_restore_command_string_matches_its_argv(fixture_repo):
+    """Post-review F-003: the operator copies the STRING, so it must carry the
+    guard the argv does — an omitted empty old value is an unconditional
+    update wearing a compare-and-swap's clothes."""
+    mgr, man, base, run_dir = _seed(fixture_repo)
+    git(fixture_repo, "checkout", "-q", "main")
+    git(fixture_repo, "branch", "-qD", "gauntlet/demo")
+    rstate, _ = _status_actions(fixture_repo, run_dir)
+    restore = next(a for a in rstate.next_actions if a.kind == "recover")
+    assert restore.command.endswith("''")
+    assert "create-only" in (restore.consequence or "")
+    proc = subprocess.run(
+        restore.command, shell=True, cwd=fixture_repo, capture_output=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert gitops.rev_parse(fixture_repo, "refs/heads/gauntlet/demo")
 
 
 def test_unobservable_range_renders_fail_closed_like_resume(fixture_repo):

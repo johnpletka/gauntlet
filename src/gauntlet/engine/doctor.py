@@ -1272,6 +1272,18 @@ def check_writability(repo_root: Path) -> list[CheckResult]:
                             f"root: {exc}")]
 
     probe_root = root / ".doctor-probe"
+    # The third site of post-review F-001's class, and the same answer: the
+    # derived root is only contained if every segment of it is a real
+    # directory. `mkdir(exist_ok=True)` would otherwise create this probe —
+    # and the seed bytes the writability probe puts in it — through a symlink,
+    # outside the repository, on a read-only diagnostic command.
+    try:
+        WT.require_contained(gitops.main_worktree_root(repo_root), probe_root)
+    except WT.WorktreeUnavailable as exc:
+        return [CheckResult(
+            "writability", FAIL, str(exc),
+            remedy="replace the symlinked segment with a real directory",
+        )]
     results: list[CheckResult] = []
     seen: set[str] = set()
     try:

@@ -616,29 +616,7 @@ def render_assessment_actions(
             resume.consequence = act.description
             actions.append(resume)
         elif kind is RXM.RecoveryActionKind.CONTINUE_ON_RECOVERY_BRANCH:
-            # Non-destructive ref restoration (plan §5.4), checkout-aware
-            # (post-review F-003): `git branch -f` onto history the assessment
-            # proved exists — invalid for the checked-out branch, where the
-            # action instead carries `via="ff_merge"` and renders a pure
-            # fast-forward merge (git refuses a non-ff, so nothing can be
-            # discarded). Never a reset/checkout/clean.
-            if act.via == "ff_merge":
-                argv = ["git", "merge", "--ff-only", act.start_sha]
-                command = f"git merge --ff-only {act.start_sha[:10]}"
-            else:
-                argv = ["git", "branch", "-f", act.branch_name, act.start_sha]
-                command = f"git branch -f {act.branch_name} {act.start_sha[:10]}"
-            actions.append(
-                Action(
-                    "restore run branch",
-                    "recover",
-                    argv,
-                    [],
-                    True,
-                    command,
-                    consequence=act.description,
-                )
-            )
+            actions.append(_restore_ref_action(act))
         elif kind is RXM.RecoveryActionKind.ABORT:
             actions.append(
                 Action(
@@ -656,6 +634,84 @@ def render_assessment_actions(
         # restore_snapshot) have no rendering yet; adding one later is
         # additive.
     return actions
+
+
+def _restore_ref_action(act: "RXM.ContinueOnRecoveryBranchAction") -> Action:
+    """The §6.1 row for a non-destructive ref restoration (plan §5.4).
+
+    Two shapes, and both are guarded rather than trusted (post-review F-003).
+
+    * ``via="ff_merge"`` — the operator is standing ON the run branch, where a
+      forced ref move is invalid. A pure fast-forward merge is git's own guard:
+      it refuses anything that is not a fast-forward, so nothing can be
+      discarded whatever the ref does between the assessment and the command.
+    * ``via="branch_force"`` — every other case, rendered as a **compare-and-swap**
+      ``git update-ref <ref> <new> <expected>`` rather than ``git branch -f``.
+
+    Why the change of verb. An assessment is a photograph, and the command it
+    advertises runs whenever the operator gets to it. ``git branch -f`` applies
+    unconditionally, so a resume (or a second operator) that advanced the ref in
+    that gap gets rewound by a decision taken before it happened, and the
+    commits it made are orphaned with nothing in the run's evidence explaining
+    it. ``update-ref``'s third argument is the guard git's own ref transaction
+    enforces atomically: the empty string means "must not exist" — the
+    missing-branch and fork-preservation forms, which create and never overwrite
+    — and a SHA means "must still be exactly this". A ref that moved therefore
+    fails loudly and leaves everything intact, which is the fail-closed
+    direction and what lets plan §5.4's "every action is non-destructive" hold
+    as a property of the command rather than of the moment it was computed.
+
+    This is the guard, not a lock: it makes the mutation refuse-or-apply against
+    the observed value, which is exactly what an operator running a git command
+    by hand can be given. It does not make the restoration a driven Gauntlet
+    transaction with an intent and a journal record — that is a new verb and a
+    third executor plane, deferred and tracked in `FUTURE.md` (PR #87 review).
+
+    One property ``branch -f`` had that ``update-ref`` does not is git's refusal
+    to move the CHECKED-OUT branch. It is not lost where it matters: the only
+    form that moves an *existing* ref is the behind-relation one, and a behind
+    run branch the operator is standing on renders ``ff_merge`` instead. The
+    residue is an operator who checks the run branch out in the gap — there the
+    guarded move still applies, because the ref is where it was observed, and
+    it is a fast-forward: every commit stays reachable and the reflog records
+    the pre-state, so the visible cost is a stale index one ``git reset --hard``
+    corrects. That is a different failure class from orphaning commits.
+
+    The displayed command and ``argv`` must stay interchangeable — an operator
+    copies the string. The create-only form therefore renders the empty
+    old-value as a quoted ``''``: dropping it would silently turn a
+    compare-and-swap back into the unconditional update this exists to remove.
+    """
+    ref = f"refs/heads/{act.branch_name}"
+    if act.via == "ff_merge":
+        argv = ["git", "merge", "--ff-only", act.start_sha]
+        command = f"git merge --ff-only {act.start_sha[:10]}"
+        guard = (
+            f"; refuses unless {act.branch_name} is still an ancestor of it "
+            "(fast-forward only, so nothing can be discarded)"
+        )
+    elif act.expected_sha is not None:
+        argv = ["git", "update-ref", ref, act.start_sha, act.expected_sha]
+        command = (
+            f"git update-ref {ref} {act.start_sha[:10]} {act.expected_sha[:10]}"
+        )
+        guard = (
+            f"; refuses unless {act.branch_name} is still at "
+            f"{act.expected_sha[:10]} (compare-and-swap)"
+        )
+    else:
+        argv = ["git", "update-ref", ref, act.start_sha, ""]
+        command = f"git update-ref {ref} {act.start_sha[:10]} ''"
+        guard = f"; refuses if {act.branch_name} exists by then (create-only)"
+    return Action(
+        "restore run branch",
+        "recover",
+        argv,
+        [],
+        True,
+        command,
+        consequence=act.description + guard,
+    )
 
 
 def projection_catchup_action(slug: str, detail: str | None) -> Action:

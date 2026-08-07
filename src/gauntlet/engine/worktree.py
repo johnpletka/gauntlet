@@ -193,6 +193,75 @@ def legacy_worktrees_root(common_dir: Path) -> Path:
     return common_dir / LEGACY_WORKTREE_DIRNAME / WORKTREE_SUBDIR
 
 
+def _symlinked_segment(main_root: Path, path: Path) -> Path | None:
+    """The first engine-derived segment of ``path`` that is a symlink, else None.
+
+    The derivation :func:`worktrees_root` performs is a *join*, and a join says
+    nothing about what is on disk at each segment. ``mkdir(exist_ok=True)``
+    accepts an existing **symlink to a directory** at any of them, and every
+    write that follows — the ``.gitignore`` marker, ``git worktree add``, the
+    agents' own files — then lands through that link, outside the repository.
+    :func:`is_inside_worktrees_root` cannot catch it afterwards: it
+    ``resolve()``s the root itself, so a root that points outside makes the
+    *outside* target the trusted boundary and containment returns True for
+    paths that are not in the repository at all. That inverts the plan §7
+    property "no path outside the repository is written", which is precisely
+    what P7e's move out of ``.git/`` was chosen to keep.
+
+    So every segment the engine derives — ``.gauntlet``, ``worktrees`` and the
+    per-run ``<slug>/<run-id>`` below them — is checked with ``lstat`` (never
+    followed) before anything is created, and the anchor is the RESOLVED main
+    worktree so the walk starts from a real directory. A segment that does not
+    exist yet is not a finding: ``mkdir`` will create it as a real directory,
+    and it is the *existing* link that is the escape.
+
+    This is a check-then-write, so it is not a defence against an adversary
+    racing the engine on the same machine; it is a defence against a symlink
+    that is simply *there* — checked into the repository, or left by an earlier
+    tool — which is the form actually observed.
+    """
+    anchor = main_root.resolve()
+    try:
+        segments = path.relative_to(main_root).parts
+    except ValueError:
+        return path  # not derived from this root at all — fail closed
+    current = anchor
+    for part in segments:
+        current = current / part
+        if current.is_symlink():
+            return current
+    try:
+        current.resolve().relative_to(anchor)
+    except (ValueError, OSError, RuntimeError):
+        return current
+    return None
+
+
+def require_contained(main_root: Path, path: Path, *, slug: str | None = None) -> None:
+    """Fail closed when ``path``'s derived segments escape the repository.
+
+    The mutating counterpart of :func:`_symlinked_segment`: raises
+    :class:`WorktreeUnavailable` — the park every other worktree-readiness
+    failure raises — rather than returning a verdict, because the callers are
+    the ones about to write.
+    """
+    escape = _symlinked_segment(main_root, path)
+    if escape is None:
+        return
+    raise WorktreeUnavailable(
+        f"refusing to use the run-worktree path {path}: {escape} is a symlink, "
+        f"so creating or writing there would land outside the repository "
+        f"({escape.resolve(strict=False)}). Gauntlet derives this path and "
+        f"requires every segment of it to be a real directory under "
+        f"{main_root} — the containment check that scopes teardown, the "
+        f"`git status` marker and the run's own writes all assume it. Nothing "
+        f"has been created or modified. Remove or replace that symlink with a "
+        f"real directory (or move the run to a repository that does not carry "
+        f"one) and retry.",
+        slug=slug,
+    )
+
+
 def ensure_root_marker(main_root: Path) -> Path | None:
     """Re-establish the self-ignoring marker at the worktrees root (P7e).
 
@@ -218,9 +287,18 @@ def ensure_root_marker(main_root: Path) -> Path | None:
     best-effort guarantee, because failing a drive over a cosmetic ignore rule
     would be a worse trade than a dirty ``git status``. The caller that cares
     (the FR-9.3 clean guard) reports the dirt on its own.
+
+    Best-effort does NOT extend to writing through a symlinked root: a marker
+    that lands outside the repository is not a cosmetic failure, so a root
+    whose segments do not pass :func:`_symlinked_segment` is left untouched and
+    reported as ``None``. The mutating callers refuse separately and loudly via
+    :func:`require_contained`; this one is also reached from read-only
+    surfaces (``doctor``), which must not raise here.
     """
     root = worktrees_root(main_root)
     marker = root / ".gitignore"
+    if _symlinked_segment(main_root, root) is not None:
+        return None
     try:
         root.mkdir(parents=True, exist_ok=True)
         if not marker.exists() or marker.read_text() != "*\n":
@@ -277,7 +355,17 @@ def is_inside_worktrees_root(path: Path, main_root: Path) -> bool:
     collide; that path is engine-owned by the same convention that already owns
     ``.gauntlet/config.yaml``, and the marker written there makes the ownership
     visible on disk.
+
+    **The root itself must be real** (post-review F-001). ``resolve()``-ing both
+    sides is what defeats a symlink *inside* the tree, but it is defeated by a
+    symlink AT the root: resolving a root that points outside the repository
+    makes the outside target the trusted boundary, and every path beneath it
+    then answers True. A symlinked segment therefore answers False outright —
+    the fail-closed direction for all three callers, because a tree reached
+    through such a link is by definition not one this engine derived.
     """
+    if _symlinked_segment(main_root, worktrees_root(main_root)) is not None:
+        return False
     try:
         path.resolve().relative_to(worktrees_root(main_root).resolve())
         return True
@@ -507,6 +595,11 @@ def ensure(
     the add still fails closed — just less actionable.
     """
     target = run_worktree_path(main_root, slug, run_id)
+    # Before ANY mutation — marker, `worktree add`, or the per-run directories
+    # in between (post-review F-001). The derived path is only as contained as
+    # the segments it is joined from, and a symlink at any of them turns every
+    # write below into a write outside the repository.
+    require_contained(main_root, target, slug=slug)
     if common_dir is not None:
         _refuse_legacy_root(repo_root, common_dir, slug=slug, branch=branch, target=target)
     # Re-established before the tree exists, so it is never briefly visible to
@@ -972,6 +1065,7 @@ __all__ = [
     "parse_lock_reason",
     "recreate",
     "release",
+    "require_contained",
     "run_worktree_path",
     "worktrees_root",
     "write_bookkeeping_export",

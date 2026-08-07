@@ -1436,6 +1436,13 @@ def relation_recovery_actions(
     workflow, "not only reconcile manually". Every action is non-destructive:
     it creates or fast-forwards a ref onto history that provably exists, or
     aborts retaining all evidence.
+
+    "Non-destructive" is a claim about the ref *as observed here*, and this
+    function runs at assessment time while the command it produces runs
+    whenever the operator gets to it (post-review F-003). Each action therefore
+    carries ``expected_sha`` — the observed value, or ``None`` for a ref that
+    did not exist — so the rendered command is a compare-and-swap and a ref
+    that moved in that gap refuses the stale update instead of applying it.
     """
     relation = git_obs.branch_relation
     actions: list[RecoveryAction] = []
@@ -1452,6 +1459,11 @@ def relation_recovery_actions(
                 branch_name=git_obs.run_branch,
                 start_sha=recorded,
                 via="branch_force",
+                # MISSING: the ref must still be absent when the command runs.
+                # A ref recreated in the gap (a resume, another operator) is
+                # NOT this action's subject, and overwriting it would discard
+                # whatever it points at.
+                expected_sha=None,
             )
         )
     elif relation is BranchRelation.BEHIND and recorded is not None:
@@ -1469,6 +1481,13 @@ def relation_recovery_actions(
                 branch_name=git_obs.run_branch,
                 start_sha=recorded,
                 via="ff_merge" if on_run_branch else "branch_force",
+                # BEHIND: the branch is at `run_branch_sha` and `recorded` is
+                # ahead of it. If a driver advances the branch in the gap, the
+                # forced move back to `recorded` would REWIND the new tip and
+                # orphan those commits; the guard makes git refuse it instead.
+                # (The `ff_merge` form is already refused by git in that case,
+                # but it carries the value too so both forms audit alike.)
+                expected_sha=git_obs.run_branch_sha,
             )
         )
     elif relation is BranchRelation.FORKED and git_obs.run_branch_sha is not None:
@@ -1491,6 +1510,10 @@ def relation_recovery_actions(
                 branch_name=f"{git_obs.run_branch}-fork-{tip[:10]}",
                 start_sha=tip,
                 via="branch_force",
+                # The fork-preservation ref is a NEW name derived from the tip
+                # it preserves. It must not already exist: one that does was
+                # created by something else, and this action has no claim on it.
+                expected_sha=None,
             )
         )
     actions.append(

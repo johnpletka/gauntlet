@@ -984,3 +984,26 @@ def test_read_probe_fails_when_profile_config_cannot_read(monkeypatch, tmp_path)
     result = _real_profile_read_probe("builder", profile, tmp_path)
     assert result.status == FAIL
     assert "could not read a repo file" in result.detail
+
+
+def test_writability_check_refuses_a_symlinked_worktrees_root(fixture_repo, tmp_path):
+    """Post-review F-001, third site: `doctor --writability` creates its own
+    probe directory under the derived root, so a symlinked segment would put
+    the probe — and the writability seed bytes inside it — outside the
+    repository on a *diagnostic* command. It refuses before creating anything.
+    """
+    from gauntlet.engine import worktree as WT
+    from gauntlet.engine.doctor import check_writability
+
+    repo = _healthy_repo(fixture_repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = WT.worktrees_root(repo)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.symlink_to(outside, target_is_directory=True)
+
+    results = check_writability(repo)
+
+    assert [r.status for r in results] == [FAIL]
+    assert "symlink" in results[0].detail
+    assert list(outside.iterdir()) == []
