@@ -57,7 +57,19 @@ max_frs_per_phase: 10
 # independent of an ambient activated venv and of which dev-dependency table a
 # live builder happens to author. The collector preserves this project-owned
 # launcher argument while normalizing only its own output flags.
-test_command: "uv run --no-project --with pytest pytest -q"
+#
+# `--python 3.12` pins the INTERPRETER to this fixture's own declared floor
+# (`requires-python = '>=3.12'`, written by `_scaffold` below and cited by the
+# toy PRD). `--no-project` is what makes the pin necessary: it deliberately
+# decouples the runner from the project, and therefore from its
+# `requires-python` too, so the step floated to whatever ambient interpreter
+# the machine happened to default to — 3.10 on the gate machine. A live builder
+# that encodes the documented floor as a test (a correct thing to do) then
+# failed its own suite on a version mismatch the fixture created, failing the
+# phase for a reason the phase had no control over. Found by the P7 gate's full
+# integration run; not a P7 regression, a latent fixture inconsistency that
+# only a builder making that particular choice surfaces.
+test_command: "uv run --no-project --python 3.12 --with pytest pytest -q"
 agents:
   builder:
     adapter: claude-code
