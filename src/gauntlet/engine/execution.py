@@ -368,6 +368,46 @@ class StepContext:
             dest.write_bytes(data)
         return dest
 
+    def adopt_artifact(self, name: str) -> Path:
+        """Copy an artifact the CYCLE authored in the work tree back; return its path.
+
+        The inverse of :meth:`publish_artifact`, and the correction to spike
+        §14.2 option A's premise that "the operator's checkout stays the
+        authoring surface". That premise holds for *producer* steps, which write
+        their ``output:`` into ``artifact_root``. It is false for an
+        artifact-mode adversarial cycle: the fixer agent's cwd is ``work_root``,
+        so every fix round authors the governed artifact THERE by construction,
+        and the cycle commits it there on the run branch.
+
+        Nothing carried those bytes back, so under `dedicated` ``artifact_root``
+        kept the pre-review artifact, with two consequences — one silent, one
+        loud:
+
+        * every downstream step reads the artifact from ``artifact_root``
+          (:func:`~gauntlet.engine.steptypes` reference resolution), so
+          `standard.yaml`'s plan-author authored plan.md from the UN-REVIEWED
+          prd.md, and the human ratifying at `prd-approve` was looking at a
+          checkout that never showed the version they were ratifying;
+        * :meth:`RunManager._sync_governed_artifacts` re-publishes
+          ``artifact_root`` into the work tree at every root resolution — which
+          is once per DRIVE, not once per run — so the next `approve`/`resume`
+          reverted the committed review fixes and the round-1 clean-handoff
+          guard (FR-9.3) failed the run naming the artifact it had just
+          clobbered.
+
+        Same-tree the two are one file and this is a no-op. Copy, never link,
+        for :meth:`publish_artifact`'s reason.
+        """
+        src = self.artifact_root_in_work / name
+        dest = self.artifact_root / name
+        if dest == src or not src.exists():
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        data = src.read_bytes()
+        if not dest.exists() or dest.read_bytes() != data:
+            dest.write_bytes(data)
+        return dest
+
     def refresh_bookkeeping_export(self) -> None:
         """Re-materialize the two-file export from the live projection (§4.4).
 

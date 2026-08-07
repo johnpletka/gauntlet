@@ -451,3 +451,67 @@ def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
         identity=Identity("Builder", "b@g.local"), exclude=_BK_EXCLUDES,
     )
     assert gitops.is_dirty_vs(fixture_repo, base, exclude=_BK_EXCLUDES, bookkeeping=_BK_PATHS)
+
+
+def test_dirty_paths_does_not_eat_the_first_paths_leading_character(fixture_repo):
+    """A worktree-only first entry must report its WHOLE path (P7.1).
+
+    The defect this pins is a one-character corruption that only ever hit the
+    FIRST reported entry, which is why it survived the whole unit suite and
+    surfaced only in a live run. ``status_porcelain`` ``.strip()``s its report,
+    so a leading ``" M"`` (modified, unstaged — the commonest status of all)
+    loses its leading space; the old ``line[3:]`` slicing then ate the path's
+    first character too, turning ``runs/toy/prd.md`` into ``uns/toy/prd.md``.
+
+    Asserted on a TRACKED, MODIFIED, UNSTAGED file so the status really is
+    ``" M"`` — the precondition the bug needs. A staged or untracked file
+    reports ``"M "``/``"??"`` with no leading space and would pass vacuously.
+    """
+    tracked = fixture_repo / "tracked.txt"
+    tracked.write_text("seed\n")
+    gitops._run(fixture_repo, "add", "tracked.txt")
+    gitops.commit_all(
+        fixture_repo, "seed: add tracked file\n\nBody.\n",
+        identity=Identity("T", "t@example.com"),
+    )
+    tracked.write_text("modified, unstaged\n")
+
+    # the precondition, asserted rather than assumed
+    raw = gitops._run(
+        fixture_repo, "status", "--porcelain", "--untracked-files=all"
+    )
+    assert raw.startswith(" M tracked.txt"), repr(raw)
+
+    assert gitops.dirty_paths(fixture_repo) == ["tracked.txt"]
+
+
+def test_dirty_paths_reports_every_entry_and_survives_renames(fixture_repo):
+    """The parse must be structural, not positional.
+
+    Guards the two things ``-z`` buys over line-splitting: a rename entry
+    carries a SECOND NUL field (its source) that must be skipped rather than
+    reported as a path, and a path with a space must not be truncated at it.
+    """
+    src = fixture_repo / "old name.txt"
+    src.write_text("body\n")
+    gitops._run(fixture_repo, "add", "old name.txt")
+    gitops.commit_all(
+        fixture_repo, "seed: add renameable file\n\nBody.\n",
+        identity=Identity("T", "t@example.com"),
+    )
+    gitops._run(fixture_repo, "mv", "old name.txt", "new name.txt")
+    (fixture_repo / "untracked.txt").write_text("x\n")
+
+    found = gitops.dirty_paths(fixture_repo)
+    assert "new name.txt" in found, found       # space preserved, not truncated
+    assert "old name.txt" not in found, found   # rename SOURCE field skipped
+    assert "untracked.txt" in found, found
+
+
+def test_dirty_paths_honours_exclude(fixture_repo):
+    """``exclude`` still reaches git as a pathspec, as ``status_porcelain``'s does."""
+    (fixture_repo / "runs").mkdir()
+    (fixture_repo / "runs" / "bookkeeping.json").write_text("{}\n")
+    (fixture_repo / "code.py").write_text("x = 1\n")
+
+    assert gitops.dirty_paths(fixture_repo, exclude=["runs"]) == ["code.py"]

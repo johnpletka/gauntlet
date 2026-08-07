@@ -692,6 +692,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             return _finish(baseline, usage, commits, artifact_writes, metrics)
         commits.append((phase, baseline))
         handoff = baseline
+        # The baseline commit froze the work tree's copy; bring the authority
+        # copy the engine reads and hashes level with it (§14.2 correction).
+        _adopt_artifact(ctx, step)
 
     # --- FR-4.1/FR-4.2 resume: reuse completed sub-step checkpoints -----------
     # A cycle that parked (usage-limit, P1) or was killed mid-round left write-
@@ -1158,6 +1161,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 if not (c.step_id == ctx.record.id and c.phase == phase_tag)
             ]
             commits.append((phase_tag, fix_sha))
+            # Artifact mode only: the fixer authored the governed artifact in
+            # the work tree, so the authority copy must follow it (§14.2
+            # correction). Code mode has no governed artifact to carry back.
+            _adopt_artifact(ctx, step)
             _checkpoint(ctx, "fix", rnd, handoff, result_sha=fix_sha)
 
         # ---- 4. diff-scoped confirm (FR-9.5) ----------------------------------
@@ -3108,10 +3115,7 @@ def _clean_handoff_failure(ctx: StepContext, rnd: int) -> StepResult:
     internal cycle residue (a fixer/reviewer mutation that escaped a commit), a
     genuine defect, so it stays terminal — re-running the guard would not fix it.
     """
-    status = gitops.status_porcelain(
-        ctx.work_root, exclude=ctx.excludes, untracked_all=True
-    )
-    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
+    paths = gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes)
     listed = ", ".join(paths) if paths else "(no paths reported)"
     if rnd == 1:
         # Upstream precondition: something before the cycle left the tree dirty
@@ -3181,11 +3185,26 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
         ).as_posix()
     except ValueError:
         return False
-    status = gitops.status_porcelain(
-        ctx.work_root, exclude=ctx.excludes, untracked_all=True
-    )
-    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
-    return paths == [rel]
+    return gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes) == [rel]
+
+
+def _adopt_artifact(ctx: StepContext, step: Step) -> None:
+    """Carry an artifact-mode cycle's committed edits back to the authority copy.
+
+    Fires only in artifact mode and only for the artifact under review; a
+    code-mode cycle has no governed artifact and this is a no-op, as it is
+    same-tree (where the two paths are one file). See
+    :meth:`StepContext.adopt_artifact` for why the copy is needed at all.
+
+    Called AFTER the commit, never before: the commit is what makes the work
+    tree's bytes the reviewed, durable version. Copying earlier would publish
+    a tree state that no commit vouches for.
+    """
+    if step.get("mode", "artifact") != "artifact":
+        return
+    name = step.get("artifact")
+    if name:
+        ctx.adopt_artifact(name)
 
 
 def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):

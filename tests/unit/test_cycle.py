@@ -2647,3 +2647,99 @@ def test_carried_remainder_verdict_is_fix_now_legitimate():
     assert v["verdict"] == "legitimate" and v["action"] == "fix_now"
     assert set(v) == {"finding_id", "verdict", "reasoning", "action", "confidence",
                       "target_artifact"}  # conforms to schemas/triage.json
+
+
+def test_only_artifact_dirty_sees_a_tracked_modified_artifact(fixture_repo):
+    """The guard must fire for a TRACKED artifact with unstaged edits (P7.1).
+
+    The state this pins is the one a re-reviewed governed artifact is always in:
+    already committed, then edited. Its porcelain status is ``" M"`` — a leading
+    SPACE — and ``status_porcelain`` strips the report, so the old ``line[3:]``
+    slicing ate the path's first character whenever it was the FIRST entry.
+    ``runs/slug/prd.md`` became ``uns/slug/prd.md``, never equalled the
+    artifact's own path, and the guard silently declined: no baseline commit,
+    then a round-1 clean-handoff failure naming a corrupted path.
+
+    Every pre-existing guard test used an UNTRACKED artifact (``"??"``, no
+    leading space), which is why a live run found this and the suite did not.
+    The ``" M"`` precondition is asserted, not assumed.
+    """
+    slug_dir = fixture_repo / "runs" / "slug"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "prd.md").write_text("PRD body\n")
+    gitops._run(fixture_repo, "add", "-A")
+    gitops.commit_all(
+        fixture_repo, "seed: commit the human's prd.md\n\nBody.\n",
+        identity=gitops.Identity("Fixture", "fixture@gauntlet.local"),
+    )
+    (slug_dir / "prd.md").write_text("PRD body, revised by the fixer\n")
+
+    raw = gitops._run(fixture_repo, "status", "--porcelain", "--untracked-files=all")
+    assert raw.startswith(" M runs/slug/prd.md"), repr(raw)
+
+    ctx = SimpleNamespace(
+        repo_root=fixture_repo, work_root=fixture_repo,
+        artifact_root=slug_dir, artifact_root_in_work=slug_dir, excludes=[],
+    )
+    assert _only_artifact_dirty(ctx, {"artifact": "prd.md"}) is True
+
+
+def test_adopt_artifact_carries_cycle_fixes_back_to_the_authority(tmp_path):
+    """A cycle's committed artifact edits must reach ``artifact_root`` (P7.1).
+
+    Spike §14.2 option A assumed "the operator's checkout stays the authoring
+    surface". True for producer steps; FALSE for an artifact-mode cycle, whose
+    fixer runs with cwd = ``work_root`` and therefore authors the governed
+    artifact there. Nothing carried those bytes back, so the authority copy kept
+    the PRE-REVIEW artifact — which every downstream step reads — and the next
+    drive's `_sync_governed_artifacts` published it back over the committed
+    fixes.
+
+    Uses a real :class:`StepContext` against two genuinely distinct roots, so it
+    exercises the copy rather than a stand-in.
+    """
+    from gauntlet.engine.execution import StepContext
+
+    operator = tmp_path / "operator"
+    work = tmp_path / "work"
+    (operator / "runs" / "slug").mkdir(parents=True)
+    (work / "runs" / "slug").mkdir(parents=True)
+    authority = operator / "runs" / "slug" / "prd.md"
+    in_work = work / "runs" / "slug" / "prd.md"
+    authority.write_text("PRE-REVIEW\n")
+    in_work.write_text("REVIEWED AND COMMITTED\n")
+
+    # `paths` is derived, so the roots are set as the FIELDS a real run sets and
+    # the genuine RunPaths policy object still resolves `artifact_root_in_work`.
+    ctx = StepContext.__new__(StepContext)
+    ctx.repo_root = operator
+    ctx.work_root = work
+    ctx.run_dir = operator / "runs" / "slug" / "run-1"
+    ctx.artifact_root = operator / "runs" / "slug"
+    ctx.state_outside_worktree = False
+    assert ctx.paths.dedicated_worktree  # the precondition; same-tree is a no-op
+    assert ctx.artifact_root_in_work == work / "runs" / "slug"
+
+    returned = ctx.adopt_artifact("prd.md")
+
+    assert returned == authority
+    assert authority.read_text() == "REVIEWED AND COMMITTED\n"
+    # and the work tree's copy is untouched — this carries back, never round-trips
+    assert in_work.read_text() == "REVIEWED AND COMMITTED\n"
+
+
+def test_adopt_artifact_fires_only_in_artifact_mode(tmp_path):
+    """A code-mode cycle has no governed artifact to carry back."""
+    from gauntlet.engine.cycle import _adopt_artifact
+
+    called: list[str] = []
+    ctx = SimpleNamespace(adopt_artifact=called.append)
+
+    _adopt_artifact(ctx, {"mode": "code_review", "artifact": "prd.md"})
+    assert called == []
+
+    _adopt_artifact(ctx, {"mode": "artifact"})  # artifact mode, nothing named
+    assert called == []
+
+    _adopt_artifact(ctx, {"artifact": "prd.md"})  # artifact mode is the default
+    assert called == ["prd.md"]

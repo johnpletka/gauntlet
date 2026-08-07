@@ -1428,13 +1428,7 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
                 f"({ctx.work_root})"
             ),
         )
-    dirty = {
-        ln[3:].strip()
-        for ln in gitops.status_porcelain(
-            ctx.work_root, exclude=ctx.excludes, untracked_all=True
-        ).splitlines()
-        if ln.strip()
-    }
+    dirty = set(gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes))
     if rel not in dirty:
         return None, None  # identical to HEAD — nothing to commit, no empty commit
     message = (

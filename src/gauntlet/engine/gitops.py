@@ -111,6 +111,7 @@ ROOT_SCOPE: dict[str, str] = {
     "is_clean": ROOT_SCOPE_WORK,
     "is_dirty_vs": ROOT_SCOPE_WORK,
     "dirty_paths_matching": ROOT_SCOPE_WORK,
+    "dirty_paths": ROOT_SCOPE_WORK,
     "worktree_tree_hash": ROOT_SCOPE_WORK,
     "diff_head": ROOT_SCOPE_WORK,
     "diff_worktree_vs": ROOT_SCOPE_WORK,
@@ -488,6 +489,54 @@ def status_porcelain(
 
 def is_clean(repo: Path, *, exclude: list[str] | None = None) -> bool:
     return status_porcelain(repo, exclude=exclude) == ""
+
+
+def dirty_paths(
+    repo: Path,
+    *,
+    exclude: list[str] | None = None,
+    untracked_all: bool = True,
+) -> list[str]:
+    """Repo-relative paths with any uncommitted state, parsed STRUCTURALLY.
+
+    The safe way to answer "which paths are dirty?". Callers used to slice
+    :func:`status_porcelain`'s text as ``line[3:]``, which is wrong in a way
+    that hides: that function ``.strip()``s the whole report, so when the FIRST
+    entry's status is worktree-only — ``" M"``, ``" D"``, ``" A"``, a leading
+    SPACE, and much the most common kind — the leading space is eaten and
+    ``[3:]`` then eats the first character of the path too. ``runs/toy/prd.md``
+    arrives as ``uns/toy/prd.md``.
+
+    That was not merely cosmetic. :func:`~gauntlet.engine.cycle._only_artifact_dirty`
+    compares the parsed list against the artifact's own path, so a tracked
+    artifact with unstaged edits — the exact state an artifact-mode cycle
+    reviews — never matched, the FR-9.3 baseline commit silently declined, and
+    the round-1 clean-handoff guard failed the run while naming a corrupted
+    path. Only the first entry is affected, so it survived every test whose
+    fixture happened to dirty something else first.
+
+    Uses ``-z`` like :func:`dirty_paths_matching`: NUL-delimited, never quoted,
+    no leading-status ambiguity, and rename/copy entries report the live
+    (destination) path with their source field skipped.
+    """
+    mode = "all" if untracked_all else "normal"
+    out = _run(
+        repo, "status", "--porcelain", "-z", f"--untracked-files={mode}",
+        *_exclude_pathspec(exclude),
+    )
+    fields = out.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if not entry:
+            continue
+        status, rel = entry[:2], entry[3:]
+        paths.append(rel)
+        if "R" in status or "C" in status:
+            i += 1  # skip the rename/copy source field
+    return paths
 
 
 def is_dirty_vs(
