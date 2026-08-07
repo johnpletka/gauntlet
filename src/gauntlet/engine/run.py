@@ -5906,6 +5906,28 @@ class RunManager:
                 results.append({"proposal": proposal.name, "action": "rejected"})
                 continue
             excludes = run_bookkeeping_excludes(self.repo_root, run_dir, run_dir.parent)
+            # P7.5: the SAME exemption `finish` already makes, at the second
+            # site that needed it. Under `dedicated` the governed artifacts sit
+            # UNCOMMITTED in the operator's checkout forever — that checkout is
+            # the authoring surface (§14.2 option A) and what reaches the run
+            # branch is the copy in the run worktree — so `runs/<slug>/prd.md`
+            # here is the human's source file, not dirt. Without this the guard
+            # could never pass after a dedicated run and FR-6.4/6.5 governed
+            # apply was unreachable in the DEFAULT mode, exactly as blocking
+            # finish on it would have made finish impossible.
+            #
+            # `run_bookkeeping_excludes` is deliberately NOT widened instead:
+            # its docstring pins prd.md/plan.md as "real work ... committable",
+            # and hiding them from the dirty-BASE check is the F-001 defect it
+            # exists to prevent. Narrowed to `dedicated` for the same reason
+            # finish narrows it — under `same_tree` the run commits these files
+            # in this tree, so uncommitted ones there ARE dirt.
+            if self._effective_worktree_mode(
+                Manifest.load(run_dir / "manifest.json")
+            ) == WT.MODE_DEDICATED:
+                excludes = excludes + governed_artifact_paths(
+                    self.operator_root, run_dir.parent
+                )
             if not gitops.is_clean(self.operator_root, exclude=excludes):
                 raise P.ProposalError(
                     "refusing to apply a proposal: worktree is dirty; commit or "

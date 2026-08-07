@@ -222,3 +222,67 @@ def test_trend_reads_cross_run_metrics(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0].pct_legitimate == pytest.approx(100.0)
     assert rows[0].findings_per_round == pytest.approx(2.0)
+
+
+def test_review_tolerates_a_dedicated_runs_governed_artifacts(tmp_path: Path):
+    """A `dedicated` run's uncommitted prd.md/plan.md must not block apply (P7.5).
+
+    Under `dedicated` the governed artifacts sit uncommitted in the operator's
+    checkout FOREVER: that checkout is the authoring surface (spike §14.2) and
+    what reaches the run branch is the copy in the run worktree. The guard
+    therefore saw permanent, engine-authored residue as operator dirt and could
+    never pass again after a dedicated run — FR-6.4/6.5 governed apply was
+    unreachable in the DEFAULT mode. `finish` already carries this exemption;
+    this is the second site that needed it.
+
+    Non-vacuous by construction: the artifacts are asserted to be genuinely
+    reported by `git status` first, so the test really enters the guard with a
+    dirty tree rather than passing because nothing was dirty.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine import worktree as WT
+
+    repo = _repo(tmp_path)
+    run_dir = _seed_proposal(repo)
+    slug_dir = run_dir.parent
+    # born `dedicated` (resolver rule 3: what the run recorded at birth)
+    man = json.loads((run_dir / "manifest.json").read_text())
+    man["worktree_mode"] = "dedicated"
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (slug_dir / "prd.md").write_text("# PRD\n\nthe human's authoring copy\n")
+    (slug_dir / "plan.md").write_text("# Plan\n\nauthored in the run tree\n")
+
+    mgr = RunManager(repo)
+    # preconditions, asserted rather than assumed
+    from gauntlet.engine.manifest import Manifest
+    assert mgr._effective_worktree_mode(
+        Manifest.load(run_dir / "manifest.json")
+    ) == WT.MODE_DEDICATED
+    dirt = gitops.status_porcelain(repo, untracked_all=True)
+    assert "runs/demo/prd.md" in dirt and "runs/demo/plan.md" in dirt, dirt
+
+    results = mgr.review_proposals(
+        "demo", decide=lambda p: ("approve", ""), timestamp="2026-06-13"
+    )
+    assert [r["action"] for r in results] == ["applied"], results
+    assert "IMPROVED" in (repo / "prompts/triage.md").read_text()
+    # the exemption did not sweep the artifacts into the governed commit
+    files = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert set(files) == {"prompts/triage.md", "prompts/CHANGELOG.md"}
+
+
+def test_review_still_fails_closed_on_real_dirt_under_dedicated(tmp_path: Path):
+    """The P7.5 exemption is scoped to the governed artifacts, nothing else."""
+    repo = _repo(tmp_path)
+    run_dir = _seed_proposal(repo)
+    man = json.loads((run_dir / "manifest.json").read_text())
+    man["worktree_mode"] = "dedicated"
+    (run_dir / "manifest.json").write_text(json.dumps(man))
+    (run_dir.parent / "prd.md").write_text("# PRD\n\nauthoring copy\n")
+    (repo / "README.md").write_text("a real uncommitted change\n")
+
+    mgr = RunManager(repo)
+    with pytest.raises(P.ProposalError):
+        mgr.review_proposals(
+            "demo", decide=lambda p: ("approve", ""), timestamp="2026-06-13"
+        )

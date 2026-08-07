@@ -32,8 +32,8 @@
 
 ## Disagreements
 
-- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Allowing third-party adapters/steps to be loaded with no trust model, allowlist, or version pinning creates an unbounded remote code-execution surface; in a fail-closed safety harness this is a material security risk. The plan must specify explicit plugin trust/allowlisting and audit/installation controls before exposing dynamic entry points.
-- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence high) — Committing raw events.jsonl by default is a real operational/security risk—streams can be large and contain sensitive or unwanted content and would bloat or leak into git. The plan should change the default or document an explicit opt-in and sanitization policy to avoid accidental commits.
+- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading is an unaudited code-execution surface; in a fail-closed safety harness this is a material security risk that can enable arbitrary code execution or supply-chain attacks. The plan must specify trust, allowlisting, and versioning policies before exposing dynamic extensions.
+- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence high) — Committing raw events.jsonl by default can expose large or sensitive raw streams to git and conflicts with a fail-closed safety posture; this is a material spec/process issue rather than a stylistic preference. The plan should make the safe default explicit (ignore raw streams unless opted in) in this implementation phase.
 
 ## Corpus caveat (recorded honestly)
 
