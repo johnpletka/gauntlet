@@ -1707,6 +1707,11 @@ class Orchestrator:
             rec.agent_usage.setdefault(agent_name, M.UsageTotals()).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
+        # Current-invocation authorization accounting (#83). Assignment (not
+        # accumulation) keeps a resumed step's status tied to the attempt whose
+        # status/notes are currently displayed.
+        rec.judge_tool_calls_allowed = result.judge_tool_calls_allowed
+        rec.judge_tool_calls_denied = result.judge_tool_calls_denied
         if result.metrics:
             rec.metrics = dict(result.metrics)  # trend outcome counts (FR-6.6)
         if result.commit_sha:

@@ -235,6 +235,7 @@ class ManagedJudge:
         audit_path: Path,
         run_id: str,
         judge_model: str | None = None,
+        judge_effort: str | None = None,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         mode: str = "unattended",
@@ -246,6 +247,7 @@ class ManagedJudge:
         self.audit_path = audit_path
         self.run_id = run_id
         self.judge_model = judge_model
+        self.judge_effort = judge_effort
         self.host = host
         self.port = port
         self.mode = mode
@@ -335,6 +337,8 @@ class ManagedJudge:
         ]
         if self.judge_model:
             argv += ["--judge-model", self.judge_model]
+        if self.judge_effort:
+            argv += ["--judge-effort", self.judge_effort]
         if self.repo_root is not None:
             # Authoritative path boundary in the SERVICE itself (#31): the
             # judge never depends on GAUNTLET_REPO_ROOT reaching the agent's

@@ -38,6 +38,7 @@ from gauntlet.engine.execution import (
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
+    HALT_REASON_JUDGE_DENY,
     HALT_REASON_PRECONDITION,
     HALT_REASON_TIMEOUT,
     PARKED_REASON_ARTIFACT_INVALID,
@@ -879,6 +880,13 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                 "would be silently skipped — failing closed (FR-2.1 / review F-003)"
             ),
         )
+    # Snapshot the append-only judge audit before this invocation. The delta is
+    # the adapter-independent record of its PreToolUse allow/deny decisions
+    # (Claude/Codex expose different and sometimes incomplete event shapes).
+    from gauntlet.engine.judgeaudit import audit_offset
+
+    judge_audit = ctx.run_dir / "judge-audit.jsonl"
+    judge_offset = audit_offset(judge_audit) if ctx.judge_env else 0
     # FR-2.2: a plain `gauntlet resume` of an artifact_invalid park re-runs ONLY
     # the validator against the (possibly hand-edited) on-disk artifact — no
     # adapter invocation. Done here, before the adapter is even built, so a
@@ -1093,6 +1101,40 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         result = result.model_copy(update={"usage": spend.result()})
         usage_by_agent = spend.by_agent()
 
+    from gauntlet.engine.judgeaudit import JudgeToolCounts, counts_since
+
+    judge_counts = (
+        counts_since(judge_audit, offset=judge_offset, step_id=ctx.record.id)
+        if ctx.judge_env
+        else JudgeToolCounts()
+    )
+    # An exit-0 agent whose every requested tool was denied did not complete an
+    # implementation turn. Marking it DONE launders a judge/config failure into
+    # a vacuous green and defers the real cause to phase-commit (issue #83).
+    if judge_counts.all_denied:
+        if judge_counts.fail_closed_denied == judge_counts.denied:
+            headline = "judge cannot evaluate tool calls"
+        else:
+            headline = "judge denied every tool call"
+        reason = (
+            f" Last denial: {judge_counts.denial_reasons[-1]}"
+            if judge_counts.denial_reasons else ""
+        )
+        return StepResult(
+            status=FAILED,
+            session_id=result.session_id,
+            usage=result.usage,
+            usage_by_agent=usage_by_agent,
+            halt_reason=HALT_REASON_JUDGE_DENY,
+            judge_tool_calls_allowed=judge_counts.allowed,
+            judge_tool_calls_denied=judge_counts.denied,
+            notes=(
+                f"{headline}: 0 allowed, {judge_counts.denied} denied during "
+                f"agent {agent_name!r}; refusing to record a successful step."
+                f"{reason}"
+            ),
+        )
+
     # FR-3/FR-5/FR-10: on a `--response` resume the STRUCTURED disposition is
     # authoritative for the outcome, not the textual `halt_on` marker (which only
     # signals the FIRST conflict, before any response). Map it to the step status
@@ -1107,6 +1149,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         # and the `output:` artifact write (review F-004 — a re-park must not
         # produce the step's declared artifact).
         if outcome.status != DONE:
+            outcome.judge_tool_calls_allowed = judge_counts.allowed
+            outcome.judge_tool_calls_denied = judge_counts.denied
             return outcome
         # proceed_*: the structured disposition resolved the conflict and is
         # authoritative, so the obsolete textual UPSTREAM CONFLICT marker is
@@ -1132,6 +1176,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             status=status, session_id=result.session_id, usage=result.usage,
             usage_by_agent=usage_by_agent, notes=note,
             parked_reason=parked_reason, halt_reason=halt_reason,
+            judge_tool_calls_allowed=judge_counts.allowed,
+            judge_tool_calls_denied=judge_counts.denied,
         )
 
     artifact_writes: dict[str, Path] = {}
@@ -1150,12 +1196,20 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             park, result, summed = _validate_output(
                 step, ctx, _invoke, logger, validate_name, output, out_path, result,
             )
+            # Repair attempts are part of the same step invocation; refresh the
+            # append-only delta so the persisted counts include them too.
+            if ctx.judge_env:
+                judge_counts = counts_since(
+                    judge_audit, offset=judge_offset, step_id=ctx.record.id
+                )
             final_usage = summed
             usage_by_agent = {agent_name: summed} if summed else {}
             if park is not None:
                 park.session_id = result.session_id
                 park.usage = summed
                 park.usage_by_agent = usage_by_agent
+                park.judge_tool_calls_allowed = judge_counts.allowed
+                park.judge_tool_calls_denied = judge_counts.denied
                 return park
         artifact_writes[output] = out_path
         # P7g: publish the validated bytes into the tree the run branch commits
@@ -1176,6 +1230,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         if step.get("commit_output"):
             outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
             if isinstance(outcome, StepResult):  # fail-closed format/commit error
+                outcome.judge_tool_calls_allowed = judge_counts.allowed
+                outcome.judge_tool_calls_denied = judge_counts.denied
                 return outcome
             commit_sha, commit_phase = outcome
     return StepResult(
@@ -1190,6 +1246,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             f"agent {agent_name!r} completed\n{fallback_note}"
             if fallback_note else f"agent {agent_name!r} completed"
         ),
+        judge_tool_calls_allowed=judge_counts.allowed,
+        judge_tool_calls_denied=judge_counts.denied,
     )
 
 

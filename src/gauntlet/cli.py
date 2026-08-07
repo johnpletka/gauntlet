@@ -1789,6 +1789,10 @@ def judge_serve(
     judge_model: str = typer.Option(
         None, help="LiteLLM model for the LLM classifier rung (omit to fail-closed)."
     ),
+    judge_effort: str = typer.Option(
+        None, help="Canonical reasoning effort for the classifier rung; defaults "
+        "to minimal for backward compatibility."
+    ),
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8787, help="Bind port."),
     repo_root: Path = typer.Option(
@@ -1809,6 +1813,7 @@ def judge_serve(
         policy_path=policy,
         audit_path=audit,
         judge_model=judge_model,
+        judge_effort=judge_effort,
         host=host,
         port=port,
         repo_root=repo_root,

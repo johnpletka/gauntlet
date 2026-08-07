@@ -6354,13 +6354,17 @@ class RunManager:
 
     def _with_judge(self, man, run_dir, fn):
         judge_model = None
+        judge_effort = None
         if "judge_llm" in self.config.agents:
-            judge_model = self.config.agents["judge_llm"].model
+            profile = self.config.agents["judge_llm"]
+            judge_model = profile.model
+            judge_effort = profile.effort
         judge = ManagedJudge(
             policy_path=self.repo_root / self.config.asset_root / "policy.yaml",
             audit_path=run_dir / "judge-audit.jsonl",
             run_id=man.run_id,
             judge_model=judge_model,
+            judge_effort=judge_effort,
             # The fixed path boundary the agent's hooks check writes against
             # (notes #29). It must be the tree the agent actually edits (P7c,
             # spike §9.6): under `dedicated`, pinning the operator's checkout

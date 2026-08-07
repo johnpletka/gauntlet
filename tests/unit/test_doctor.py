@@ -95,7 +95,9 @@ def _probes(
     )
 
 
-def _set_judge_llm(repo: Path, model: str | None, *, adapter: str = "api") -> None:
+def _set_judge_llm(
+    repo: Path, model: str | None, *, adapter: str = "api", effort: str | None = None
+) -> None:
     """Set (or, with model=None, remove) the scaffold's `judge_llm` profile."""
     cfg_path = repo / ".gauntlet/config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text())
@@ -104,6 +106,8 @@ def _set_judge_llm(repo: Path, model: str | None, *, adapter: str = "api") -> No
         agents.pop("judge_llm", None)
     else:
         agents["judge_llm"] = {"adapter": adapter, "model": model}
+        if effort is not None:
+            agents["judge_llm"]["effort"] = effort
     cfg_path.write_text(yaml.safe_dump(cfg))
 
 
@@ -143,6 +147,40 @@ def test_judge_classifier_ok_when_model_resolvable(tmp_path):
     assert jc.status == OK
     assert "gpt-5-mini" in jc.detail
     assert not has_failure(results)
+
+
+def test_judge_classifier_live_probe_failure_is_a_doctor_failure(tmp_path):
+    # Issue #83: provider resolution alone is insufficient. The specialized
+    # classifier row must surface a runtime reasoning_effort rejection and must
+    # not also pay for a duplicate generic profile probe.
+    repo = _healthy_repo(tmp_path)
+    _set_judge_llm(repo, "gpt-5.6-luna", effort="minimal")
+    seen: list[str] = []
+
+    def probe(name, profile):
+        seen.append(name)
+        if name == "judge_llm":
+            return ProbeResult(
+                FAIL,
+                "judge classifier cannot evaluate: reasoning_effort=minimal unsupported",
+                remedy="set judge_llm.effort: low",
+            )
+        return ProbeResult(OK, f"{name} ok")
+
+    results = run_doctor(
+        repo,
+        probes=_probes(
+            _GOOD_VERSIONS, _GOOD_ENV, profile_model_probe=probe
+        ),
+    )
+    names = _by_name(results)
+    jc = names["judge-classifier"]
+    assert jc.status == FAIL
+    assert "cannot evaluate" in jc.detail
+    assert jc.remedy and "effort" in jc.remedy
+    assert seen.count("judge_llm") == 1
+    assert "profile:judge_llm" not in names
+    assert has_failure(results)
 
 
 def test_judge_classifier_fails_when_adapter_not_api(tmp_path):
@@ -842,6 +880,46 @@ def test_api_model_probe_fails_when_effort_rejected(monkeypatch, tmp_path):
     result = _real_profile_model_probe("triage", profile)
     assert result.status == FAIL
     assert "rejected by the provider" in result.detail
+
+
+def test_real_judge_probe_uses_classifier_schema_timeout_and_profile_effort(monkeypatch):
+    # The doctor probe is the runtime classifier construction, not a generic
+    # tool-less ping. A valid structured verdict proves the schema path worked.
+    from types import SimpleNamespace
+
+    from gauntlet.adapters.api import ApiAdapter
+    from gauntlet.engine.config import AgentProfile
+    from gauntlet.engine.doctor import OK, _real_profile_model_probe
+    from gauntlet.judge.runner import JUDGE_LLM_TIMEOUT_S
+
+    monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
+    captured: dict = {}
+
+    def fake_complete(self, messages):
+        captured.update(
+            model=self.model,
+            effort=self.reasoning_effort,
+            timeout=self.timeout_s,
+            retries=self.max_schema_retries,
+            prompt=messages[0]["content"],
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"decision":"allow","risk_category":"none",'
+                '"rationale":"harmless read"}'
+            )))],
+            usage=None,
+        )
+
+    monkeypatch.setattr(ApiAdapter, "_complete", fake_complete)
+    profile = AgentProfile(adapter="api", model="gpt-5.6-luna", effort="low")
+    result = _real_profile_model_probe("judge_llm", profile)
+    assert result.status == OK
+    assert captured["model"] == "gpt-5.6-luna"
+    assert captured["effort"] == "low"
+    assert captured["timeout"] == JUDGE_LLM_TIMEOUT_S
+    assert captured["retries"] == 0
+    assert "risk_category" in captured["prompt"]  # classifier schema appended
 
 
 # --- review F-003: the REAL read probe uses the profile's OWN config -----------

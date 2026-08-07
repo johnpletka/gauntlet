@@ -113,6 +113,11 @@ def _real_profile_model_probe(name: str, profile) -> ProbeResult:
                 remedy="use a valid LiteLLM model id; an unresolvable model fails "
                 "every call closed (FR-6.4)",
             )
+        # The judge gets a specialized probe through its exact classifier
+        # construction + schema path. A generic "ping" would miss a runtime-only
+        # classifier parameter mismatch (issue #83).
+        if name == "judge_llm":
+            return _judge_classifier_round_trip(profile)
         # A model can RESOLVE offline yet REJECT the configured reasoning_effort at
         # call time (not every provider/model accepts the param). FR-6.4 requires a
         # live round trip per profile that verifies effort acceptance, so probe it
@@ -121,6 +126,48 @@ def _real_profile_model_probe(name: str, profile) -> ProbeResult:
     if adapter in _CLI_BY_ADAPTER:
         return _cli_profile_round_trip(name, profile)
     return ProbeResult(WARN, f"no model probe for adapter {adapter!r}")
+
+
+def _judge_classifier_round_trip(profile) -> ProbeResult:
+    """Exercise the real judge classifier path with its effective effort (#83).
+
+    A valid ALLOW *or* DENY answer proves the classifier evaluated the request;
+    ``source=fail-closed`` means the judge could not evaluate it (provider,
+    parameter, timeout, or schema failure) and must fail doctor loudly.
+    """
+    from gauntlet.judge.runner import (
+        JUDGE_LLM_REASONING_EFFORT,
+        build_classifier,
+    )
+
+    model = profile.model
+    effort = getattr(profile, "effort", None) or JUDGE_LLM_REASONING_EFFORT
+    try:
+        decision = build_classifier(
+            judge_model=model, judge_effort=getattr(profile, "effort", None)
+        ).classify("Read", {"file_path": ".gauntlet/config.yaml"})
+    except Exception as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return ProbeResult(
+            FAIL,
+            f"judge classifier could not be constructed for model {model!r}, "
+            f"effort {effort!r}: {first[:200]}",
+            remedy="set judge_llm.effort to a canonical tier the model accepts",
+        )
+    if decision.source == "fail-closed":
+        return ProbeResult(
+            FAIL,
+            f"judge classifier cannot evaluate with model {model!r}, effort "
+            f"{effort!r}: {decision.rationale[:240]}",
+            remedy="set judge_llm.effort to a model-compatible canonical tier "
+            "(for example `low` when the model rejects `minimal`), then rerun "
+            "`gauntlet doctor`",
+        )
+    return ProbeResult(
+        OK,
+        f"classifier evaluated a live probe with model {model!r}, effort "
+        f"{effort!r} (verdict: {decision.decision})",
+    )
 
 
 def _api_profile_round_trip(name: str, profile) -> ProbeResult:
@@ -806,8 +853,16 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
             "`anthropic/claude-haiku-4-5`); an unresolvable model fails every "
             "classifier call closed",
         )
+    # A provider lookup is necessary but not sufficient: a resolvable model can
+    # reject the classifier's reasoning_effort only at call time. Drive the same
+    # bounded adapter + schema path the judge uses, through the injectable
+    # profile probe so unit tests remain offline (issue #83).
+    probe = probes.profile_model_probe("judge_llm", profile)
     return CheckResult(
-        "judge-classifier", OK, f"LLM classifier model {model!r} resolvable"
+        "judge-classifier",
+        probe.status,
+        f"LLM classifier model {model!r}: {probe.detail}",
+        remedy=probe.remedy,
     )
 
 
@@ -1004,9 +1059,13 @@ def _check_profiles(
     config, probes: DoctorProbes, repo_root: Path, reference_profiles: set[str]
 ) -> list[CheckResult]:
     """FR-6.4: one model probe per configured profile, plus a repo-read probe for
-    each profile a shipped pipeline uses in reference/`phase` mode."""
+    each profile a shipped pipeline uses in reference/`phase` mode. The
+    ``judge_llm`` profile is omitted here because ``judge-classifier`` already
+    performs its one live probe through the more exact classifier path (#83)."""
     results: list[CheckResult] = []
     for name in sorted(config.agents):
+        if name == "judge_llm":
+            continue
         profile = config.agents[name]
         results.append(_check_profile_model(name, profile, probes))
         if name in reference_profiles:

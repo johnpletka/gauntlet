@@ -399,7 +399,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason", "recovery_cause", "recovery_disposition"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason", "recovery_cause", "recovery_disposition", "judge_tool_calls"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -447,6 +447,16 @@
             "type": ["string", "null"],
             "enum": ["continue", "retry", "resume_session", "edit_then_retry", "restart_from_checkpoint", "adopt_commits", "snapshot_and_restart", "restore_snapshot", "continue_on_recovery_branch", "rebuild_projection", "human_decision", "abort_only", null],
             "description": "Orthogonal recovery disposition (recovery-redesign plan §4.1, APPENDED by P5): WHAT recovery strategy applies, stamped alongside recovery_cause. null on non-terminal steps and on manifests predating P5."
+          },
+          "judge_tool_calls": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allowed", "denied"],
+            "description": "Pre-execution judge authorization counts for the step's current agent invocation (issue #83). These are allow/deny decisions, not inferred post-execution success. Zeroes mean no judged tool calls were observed.",
+            "properties": {
+              "allowed": {"type": "integer", "minimum": 0},
+              "denied": {"type": "integer", "minimum": 0}
+            }
           }
         }
       }

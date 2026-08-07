@@ -51,6 +51,20 @@ def test_deny_decision_exit_2(monkeypatch, env):
     assert reason == "nope"
 
 
+def test_fail_closed_deny_is_labeled_as_judge_cannot_evaluate(monkeypatch, env):
+    patch_judge(monkeypatch, result={
+        "decision": "deny",
+        "source": "fail-closed",
+        "rationale": "judge LLM error, failing closed: unsupported effort",
+    })
+    decision, reason, code = hook_client.decide_from_payload(
+        {"tool_name": "Read", "tool_input": {"file_path": "README.md"}}, env=env
+    )
+    assert decision == "deny" and code == 2
+    assert reason.startswith("JUDGE CANNOT EVALUATE")
+    assert "unsupported effort" in reason
+
+
 def test_payload_forwarded_with_context(monkeypatch):
     fake = patch_judge(monkeypatch, result={"decision": "allow", "rationale": "ok"})
     env = {

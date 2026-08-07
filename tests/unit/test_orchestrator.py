@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -77,6 +78,75 @@ def test_linear_run_to_commit(fixture_repo):
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: implement phase"
     # work tree is clean; the run's own out.txt/manifest under runs/ is excluded
     assert gitops.is_clean(fixture_repo, exclude=["runs"])
+
+
+def test_agent_with_all_judge_calls_denied_fails_instead_of_done(fixture_repo):
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def write_denials(adapter, prompt, cwd):
+        rows = [
+            {
+                "step_id": "implement", "decision": "deny",
+                "source": "fail-closed",
+                "rationale": "judge LLM error: unsupported reasoning effort",
+            }
+            for _ in range(3)
+        ]
+        audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="I could not read any files", on_run=write_denials)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.FAILED
+    assert rec.halt_reason == M.HALT_REASON_JUDGE_DENY
+    assert rec.judge_tool_calls_allowed == 0
+    assert rec.judge_tool_calls_denied == 3
+    assert "judge cannot evaluate" in (rec.notes or "")
+    assert "unsupported reasoning effort" in (rec.notes or "")
+
+
+def test_agent_judge_counts_allow_done_when_at_least_one_call_allowed(fixture_repo):
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def write_mixed(adapter, prompt, cwd):
+        rows = [
+            {"step_id": "implement", "decision": "deny", "source": "fast-path",
+             "rationale": "blocked"},
+            {"step_id": "implement", "decision": "allow", "source": "fast-path",
+             "rationale": "safe"},
+        ]
+        audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="done", on_run=write_mixed)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.DONE
+    assert rec.judge_tool_calls_allowed == 1
+    assert rec.judge_tool_calls_denied == 1
 
 
 def test_when_skips_step(fixture_repo):
