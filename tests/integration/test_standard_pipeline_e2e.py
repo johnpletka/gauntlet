@@ -32,6 +32,8 @@ from gauntlet.engine.planphases import extract_phases, phase_section
 from gauntlet.engine.report import build_report
 from gauntlet.engine.run import RunManager
 
+from conftest import run_work_tree  # noqa: E402  (P7g run-tree resolver)
+
 pytestmark = [pytest.mark.integration]
 
 REPO = Path(__file__).resolve().parents[2]
@@ -384,7 +386,11 @@ def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
     assert any(
         p.split(".")[0].lstrip("P").isdigit() for p in (c.phase for c in man.commits)
     )
-    assert (repo / "slugify.py").exists()
+    # P7g: the builder writes in the RUN tree, not the operator's checkout.
+    work = run_work_tree(repo, "toy")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert (work / "slugify.py").exists()
+    assert not (repo / "slugify.py").exists()
 
     # the persisted implement prompt used scoped context (FR-1.1): paths present,
     # bodies not inlined, and the plan's CURRENT-PHASE excerpt sliced in.
@@ -475,11 +481,23 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     phases = [c.phase for c in man.commits]
     assert "PLAN" in phases
     assert any(p.split(".")[0].lstrip("P").isdigit() for p in phases)
-    # the toy was actually implemented and its tests pass
-    assert (repo / "slugify.py").exists()
+    # the toy was actually implemented and its tests pass — in the RUN tree
+    # (P7g), which is where a `dedicated` run's builder writes.
+    work = run_work_tree(repo, "toy")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert (work / "slugify.py").exists()
+    assert not (repo / "slugify.py").exists()
     # FR-9 clean history: the final tree is committed — only the run's own
     # bookkeeping under runs/ is excluded. Asserted directly, not vacuously
-    # (review F-006): a dirty worktree at run end is a hard failure.
+    # (review F-006): a dirty worktree at run end is a hard failure. Asserted on
+    # the RUN tree, which is the tree the run commits in; the operator's
+    # checkout is asserted separately below and for a different reason.
+    assert gitops.is_clean(work, exclude=["runs"]), gitops.status_porcelain(
+        work, exclude=["runs"]
+    )
+    # A1: the operator's checkout carries no source change at all. Its only
+    # sanctioned delta is under `runs/` — the governed artifacts the engine
+    # authors and back-publishes there by design — which `exclude` covers.
     assert gitops.is_clean(repo, exclude=["runs"]), gitops.status_porcelain(
         repo, exclude=["runs"]
     )

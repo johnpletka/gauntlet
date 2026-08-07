@@ -78,3 +78,39 @@ def fixture_repo(tmp_path):
         check=True,
     )
     return repo
+
+
+def run_work_tree(repo, slug: str = "demo", *, prefix: str = "gauntlet/"):
+    """The tree a run's agents edit and the engine commits in (P7g).
+
+    The deliberate twin of ``tests/unit/conftest.py``'s helper of the same name.
+    Duplicated rather than shared because a ``conftest.py`` is not importable
+    from a sibling test directory, and routing this through a third module would
+    put the check ON the engine further from the tests that make it.
+
+    P7g makes `dedicated` the default, so an assertion about a file an agent
+    wrote, or about the branch a run has checked out, must name THIS tree — for
+    a `dedicated` run it is not the operator's checkout, and asserting there is
+    asserting the very thing P7 exists to stop being true.
+
+    Resolved from git's own ``worktree list`` rather than from
+    ``gauntlet.engine.worktree``'s derivation: these helpers are the check on
+    the engine, and sharing its derivation would let one bug satisfy both sides.
+    Falls back to ``repo`` when no worktree holds the run branch, which is
+    exactly the `same_tree` answer.
+    """
+    from pathlib import Path
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return repo
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):])
+        elif line == f"branch refs/heads/{prefix}{slug}" and current is not None:
+            return current
+    return repo

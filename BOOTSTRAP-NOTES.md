@@ -1179,3 +1179,89 @@ ends "the halt stands until a human rules."
   `gauntlet migrate-worktree <slug>`, and that verb now relocates it. The
   refusal deliberately does **not** offer `--same-tree`: that action is correct
   for its own case and would, here, drive the run in the operator's checkout.
+
+## 2026-08-07 — P7 gate closure: three engine defects only a live run could find
+
+The verification tranche for P7g/P7h. Recorded because the interesting result
+is not that the gate closed, but *what closed it*: a 3020-test unit suite was
+green on the commit under test, and the gating dogfood still found three
+genuine engine defects in the first two stages of one live run.
+
+- **The unit suite was never the evidence it looked like.** `c165736` ran
+  `3020 passed, 3 skipped, 76 deselected` — the first whole-suite completion on
+  this branch, and green. It did not catch any of the three defects below. Two
+  of them are not even `dedicated`-specific; they were latent in `same_tree`
+  and had been for as long as the code existed. A component suite cannot
+  substitute for a run, which is the standing lesson of P7d and now has a
+  second, sharper instance.
+- **G-001, the artifact authority went stale.** Spike §14.2 option A's premise
+  — "the operator's checkout stays the authoring surface" — is true for
+  producer steps and FALSE for artifact-mode adversarial cycles: the fixer
+  agent's cwd is `work_root`, so it authors the governed artifact there and the
+  cycle commits it there. Nothing carried those bytes back. Under `dedicated`
+  that meant `artifact_root` kept the PRE-review artifact, which every
+  downstream step reads — so `standard.yaml`'s plan-author authored plan.md
+  from the un-reviewed prd.md, and the human ratifying at `prd-approve` was
+  shown a checkout that never held the version they were ratifying. Then
+  `_sync_governed_artifacts`, which re-publishes at every root resolution
+  (once per DRIVE, not once per run as its own docstring assumed), copied the
+  stale bytes back over the committed review fixes on the next `approve`, and
+  the FR-9.3 round-1 clean-handoff guard failed the run naming the file it had
+  just clobbered. **This is the EIGHTH ratified spike recommendation found
+  wrong when implemented.** The maintainer ratified the back-publish on
+  2026-08-07; the spike is not amended.
+- **G-002, a one-character corruption that hid for the life of the code.**
+  `status_porcelain` strips its whole report, so a FIRST entry whose status is
+  worktree-only (`" M"` — a leading space, and much the commonest status)
+  lost that space, and three callers slicing `line[3:]` then ate the path's
+  first character: `runs/toy/prd.md` arrived as `uns/toy/prd.md`. Two of the
+  three were functional, not cosmetic — `_only_artifact_dirty` never matched a
+  TRACKED artifact with unstaged edits, so the baseline commit silently
+  declined; and `commit_output` silently no-op'd the producer commit. It only
+  ever hit the FIRST entry, and every existing guard test used an UNTRACKED
+  artifact (`"??"`, no leading space), which is exactly why a suite this large
+  sailed past it. Fixed by parsing `-z` porcelain structurally
+  (`gitops.dirty_paths`) rather than slicing text anywhere.
+- **G-003, the plan gate wedged on the id shape this repo actually uses.**
+  `_FRS_TOKEN_RE` admitted a letter only as its own dot-separated segment
+  (`FR-5.1.a`), never appended to a numeric one. The comment directly above it
+  warns that rejecting a legitimate PRD id shape "would wedge the plan gate on
+  a contract technicality (#64's failure class)" — and it did. `FR-6.1a` is
+  cited 144 times in this repository, `FR-3.1a` 66, `FR-1.3a` 30, `FR-2.1a` 27,
+  plus `FR-3.1b/c` and `FR-2.1b`: close to 300 references to a shape the
+  validator refused. **No artifact was hand-edited to get past this**, though
+  the park sanctions it — the plan was citing the toy PRD's real ids, so the
+  edit would have made the artifact lie about P1's coverage to satisfy a
+  validator that was itself wrong. The park's fail-closed behaviour was correct
+  throughout; only its grammar was not.
+- **What the dogfood proved, with evidence rather than inference.** A real
+  `gauntlet run` with no `worktree` key anywhere in `.gauntlet/config.yaml` was
+  born `dedicated` at the 1A root and ran to `RUN_DONE`. The builder's
+  `slugify.py` and `tests/test_slugify.py` exist in the run worktree and do NOT
+  exist in the operator's checkout. The operator's branch and HEAD
+  (`29f7adc`) are byte-identical to the pre-run fingerprint, index unchanged;
+  the entire worktree delta is three paths under the operator-side `runs/`
+  artifact root (`prd.md` back-published, `plan.md` and `PR.md` untracked
+  outputs) and no source file at all. The phase commit `052ce7f P1: Implement
+  slugify()...` is on `gauntlet/toy` authored by `Gauntlet Builder (claude)`,
+  and the operator's HEAD does not contain that branch. A1/A2/A3 hold for runs
+  in general, with the A1 statement now correctly read as "the operator's
+  *code* checkout", since the ratified artifact authority lives under `runs/`
+  by design.
+- **A diagnostic worth keeping.** G-001 was diagnosed by hashing the three
+  copies rather than by reading code: work tree, operator copy and the SEED
+  commit all hashed `71a7cb7a` while `HEAD` on the run branch — the reviewed
+  version — hashed `605e4086`. That is a two-command test for "which copy is
+  authoritative?" and it beats inference every time under `dedicated`, where
+  there are always two of every governed artifact.
+- **The integration suite had never been migrated for P7g, and said so loudly.**
+  Four failures, all one `wrong`-class root cause: assertions that the builder's
+  output exists in the OPERATOR's checkout and that the operator's HEAD is the
+  phase commit. Under the default flip both are false by design — they are the
+  exact inverse of what the dogfood proves — so each was rewritten against the
+  RUN tree via a `run_work_tree` resolver, with the operator-side claim KEPT
+  rather than dropped: the migrated tests now assert the artifact is in the run
+  tree AND absent from the operator's checkout, which is a stronger statement
+  than the original made. Notably the known nondeterministic e2e failure
+  (`assert 'impl-cycle' == 'phase-gate'`) did NOT occur; the e2e failed
+  differently, and per the tranche's own rule that made it ours.

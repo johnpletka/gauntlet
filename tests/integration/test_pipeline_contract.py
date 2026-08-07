@@ -24,6 +24,8 @@ from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
 from gauntlet.engine.run import RunManager
 from gauntlet.judge.service import TOKEN_ENV_VAR
 
+from conftest import run_work_tree  # noqa: E402  (P7g run-tree resolver)
+
 pytestmark = [pytest.mark.integration]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -88,8 +90,15 @@ def test_engine_manages_judge_lifecycle_around_a_run(tmp_path):
     # including the per-step GAUNTLET_STEP_ID set by the orchestrator (F-009)
     for var in _MANAGED_ENV_VARS:
         assert var not in os.environ, f"{var} leaked into the parent env"
-    assert gitops.commit_subject(repo, "HEAD") == "P1: engine-managed judge run"
-    assert (repo / "artifact.txt").read_text().strip() == "work"
+    # P7g: the run drives its own worktree by default, so the phase commit is on
+    # the RUN branch and the shell step's output is in the RUN tree — asserting
+    # either in the operator's checkout asserts the thing P7 exists to prevent.
+    # The operator's own HEAD is asserted UNMOVED for the same reason (A1).
+    work = run_work_tree(repo, "demo")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert gitops.commit_subject(work, "HEAD") == "P1: engine-managed judge run"
+    assert (work / "artifact.txt").read_text().strip() == "work"
+    assert gitops.commit_subject(repo, "HEAD") == "init"
 
 
 CLAUDE_CONFIG = """
@@ -159,8 +168,13 @@ def test_real_pipeline_agent_shell_commit_with_live_judge(tmp_path):
         extra_context={},
     )
     assert status == M.RUN_DONE, mgr.status("demo").model_dump()
-    assert (repo / "hello.txt").exists()
-    assert gitops.commit_subject(repo, "HEAD") == "P1: pipeline writes hello"
+    # P7g: the live agent writes in the RUN tree and the phase commit lands on
+    # the run branch; the operator's checkout keeps neither (A1/A2).
+    work = run_work_tree(repo, "demo")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert (work / "hello.txt").exists()
+    assert not (repo / "hello.txt").exists()
+    assert gitops.commit_subject(work, "HEAD") == "P1: pipeline writes hello"
     # the judge gated the agent's tool call live and allowed the benign echo
     audit = mgr.layout("demo").active_run_dir() / "judge-audit.jsonl"
     assert audit.exists()
