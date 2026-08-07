@@ -549,6 +549,124 @@ def test_cleared_intent_is_never_replayed(fixture_repo):
     assert (fixture_repo / "after.txt").read_text() == "post-transaction work\n"
 
 
+# --- fault injection across the protected-restore boundary (plan §7) ------------
+
+# Plan §7's "before and after worktree/index restoration" points, inside the
+# executor transaction: the apply's final step is
+# ``git_snapshot.restore_protected`` — the scoped restoration that re-applies
+# protected deletions and re-materializes protected files after reset/clean.
+# A kill at any of its internal boundaries must leave the standard replayable
+# pair (durable snapshot + surviving intent), and the replay must converge —
+# including re-applying the protected deletion the interrupted reset just
+# resurrected, or finishing one the kill left half-applied.
+
+_PROTECTED_RESTORE_BOUNDARIES = [
+    # (boundary, git_snapshot attr to break)
+    ("before_protected_restore", "restore_protected"),
+    ("during_protected_deletion", "_safe_unlink"),
+    ("during_protected_materialize", "_prepare_destination"),
+]
+
+
+def _protected_env(repo: Path):
+    """The shared fault harness plus BOTH protected planes: a protected
+    deletion (PR.md committed, then deleted by a human) and an
+    excluded-but-protected operator file (runs/demo/PR.md)."""
+    run_dir, man, excludes = _env(repo)
+    (repo / "tracked.txt").write_text("committed\n")
+    (repo / "PR.md").write_text("committed notes\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "seed tracked + PR.md")
+    target = gitops.head_sha(repo)
+    (repo / "tracked.txt").write_text("dirty edit\n")
+    (repo / "junk.txt").write_text("untracked partial\n")
+    (repo / "PR.md").unlink()  # protected deletion vs HEAD
+    (repo / "runs" / "demo" / "PR.md").write_text("operator notes\n")
+    return run_dir, man, excludes, target
+
+
+def _assert_protected_convergence(repo: Path, run_dir: Path, target: str):
+    assert gitops.head_sha(repo) == target
+    assert (repo / "tracked.txt").read_text() == "committed\n"
+    assert not (repo / "junk.txt").exists()
+    # The protected deletion the reset resurrected is re-applied, and the
+    # excluded-but-protected operator file is back byte-exact.
+    assert not (repo / "PR.md").exists()
+    assert (repo / "runs" / "demo" / "PR.md").read_text() == "operator notes\n"
+    assert RX.load_intent(run_dir) is None  # cleared exactly once
+    # A cleared intent never replays again, and repeating changes nothing.
+    assert RX.replay_pending_intent(repo, run_dir) is None
+    assert not (repo / "PR.md").exists()
+    assert (repo / "runs" / "demo" / "PR.md").read_text() == "operator notes\n"
+
+
+@pytest.mark.parametrize(
+    "boundary,attr",
+    _PROTECTED_RESTORE_BOUNDARIES,
+    ids=[row[0] for row in _PROTECTED_RESTORE_BOUNDARIES],
+)
+def test_fault_injection_across_protected_restore(
+    fixture_repo, monkeypatch, boundary, attr
+):
+    run_dir, man, excludes, target = _protected_env(fixture_repo)
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+
+    def exploding(*args, **kwargs):
+        raise _Boom(f"killed at {boundary}")
+
+    monkeypatch.setattr(git_snapshot, attr, exploding)
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()  # the "next process" runs the real code
+
+    # The §7 replayable pair survives: a durable snapshot that captured BOTH
+    # protected planes, plus an intent to converge them.
+    intent = RX.load_intent(run_dir)
+    assert intent is not None
+    snapshot = git_snapshot.load_snapshot(fixture_repo, intent.snapshot_ref)
+    assert "PR.md" in snapshot.protected_deletions
+    assert "runs/demo/PR.md" in snapshot.protected_paths
+
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is not None
+    _assert_protected_convergence(fixture_repo, run_dir, target)
+
+
+def test_double_kill_across_protected_restore_converges_on_second_replay(
+    fixture_repo, monkeypatch
+):
+    """A second kill during the FIRST replay's own protected restore still
+    converges: the intent survives as evidence and the next replay finishes
+    the restoration — the §7 property holds under repeated crashes."""
+    run_dir, man, excludes, target = _protected_env(fixture_repo)
+    executor, assessment, action, spec, request, fp = _plan(
+        fixture_repo, run_dir, man, excludes, target=target
+    )
+
+    def _boom(*args, **kwargs):
+        raise _Boom("killed inside protected restore")
+
+    monkeypatch.setattr(git_snapshot, "restore_protected", _boom)
+    with pytest.raises(_Boom):
+        executor.apply(
+            assessment, action, spec=spec, snapshot_request=request, fingerprint=fp
+        )
+    monkeypatch.undo()
+
+    # Kill 2: the first replay dies inside the SAME restoration step.
+    monkeypatch.setattr(git_snapshot, "_safe_unlink", _boom)
+    with pytest.raises(_Boom):
+        RX.replay_pending_intent(fixture_repo, run_dir)
+    monkeypatch.undo()
+    assert RX.load_intent(run_dir) is not None  # evidence retained, not cleared
+
+    assert RX.replay_pending_intent(fixture_repo, run_dir) is not None
+    _assert_protected_convergence(fixture_repo, run_dir, target)
+
+
 # --- post-177d721 F-002: staged B + worktree C are separate recoverable planes --
 
 

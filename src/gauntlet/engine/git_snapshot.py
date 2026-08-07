@@ -284,10 +284,14 @@ def create_snapshot(
         gitops.run_with_temp_index(
             work_root, work_index, "add", "-A", *_exclude_pathspec(exclude)
         )
-        if protected and _patterns_match_temp_index(work_root, work_index, protected):
-            gitops.run_with_temp_index(
-                work_root, work_index, "add", "-A", "-f", "--", *protected
+        if protected:
+            addable = _patterns_matching_temp_index(
+                work_root, work_index, protected
             )
+            if addable:
+                gitops.run_with_temp_index(
+                    work_root, work_index, "add", "-A", "-f", "--", *addable
+                )
         # Drop excluded entries from the tree entirely (review F-001). The
         # HEAD seed pulled in committed versions of excluded paths; leaving
         # them there would make a full restore materialize their snapshot-time
@@ -417,30 +421,35 @@ def _ref_exists(work_root: Path, ref: str) -> bool:
         return False
 
 
-def _patterns_match_temp_index(
+def _patterns_matching_temp_index(
     work_root: Path, work_index: Path, patterns: list[str]
-) -> bool:
-    """True iff ``patterns`` still match anything the scoped force-add can act on.
+) -> list[str]:
+    """The subset of ``patterns`` the scoped force-add can act on.
 
-    ``git add`` errors on a pathspec that matches nothing, so the protected
-    force-include is gated on an actual match *in the temporary index's view*:
-    the general ``add -A`` may already have staged a protected deletion (the
-    entry is then gone from both the temp index and the worktree, and a scoped
-    add would error), while a protected path hidden by the exclusion pathspec
-    still sits in the HEAD-seeded temp index awaiting its update. ``ls-files``
+    ``git add`` errors on ANY pathspec that matches nothing — a single
+    combined add over all protected patterns is fatal whenever one pattern's
+    deletion is already staged (gone from both the temp index and the
+    worktree) while a sibling pattern still matches, so each pattern is
+    probed *in the temporary index's view* and only the matching subset is
+    force-added: the general ``add -A`` may already have staged a protected
+    deletion, while a protected path hidden by the exclusion pathspec still
+    sits in the HEAD-seeded temp index awaiting its update. ``ls-files``
     exits zero with empty output on no match, making it the safe probe;
     ``--others`` without ``--exclude-standard`` deliberately includes
     gitignored files.
     """
-    in_index = gitops.run_with_temp_index(
-        work_root, work_index, "ls-files", "-z", "--", *patterns
-    )
-    if in_index:
-        return True
-    others = gitops.run_with_temp_index(
-        work_root, work_index, "ls-files", "-z", "--others", "--", *patterns
-    )
-    return bool(others)
+    matching = []
+    for pattern in patterns:
+        in_index = gitops.run_with_temp_index(
+            work_root, work_index, "ls-files", "-z", "--", pattern
+        )
+        if not in_index:
+            in_index = gitops.run_with_temp_index(
+                work_root, work_index, "ls-files", "-z", "--others", "--", pattern
+            )
+        if in_index:
+            matching.append(pattern)
+    return matching
 
 
 def load_snapshot(repo: Path, ref: str) -> GitRecoverySnapshot:

@@ -697,7 +697,7 @@ def _cycle_fixture(fixture_repo):
     return fixture_repo
 
 
-def _run_cycle(repo, adapters, *, manifest=None):
+def _run_cycle(repo, adapters, *, manifest=None, dependency_retry_attempts=0):
     import yaml as _yaml
 
     from gauntlet.engine.config import RunConfig
@@ -706,7 +706,9 @@ def _run_cycle(repo, adapters, *, manifest=None):
 
     config = {
         "triage_concurrency": 1,
-        "dependency_retry_attempts": 0,  # exhaust immediately: park on first hit
+        # Default 0 = exhaust immediately: park on first hit. The in-process
+        # fan-out retry test raises it to exercise the retry branch.
+        "dependency_retry_attempts": dependency_retry_attempts,
         "agents": {
             "reviewer": {"adapter": "codex"},
             "triage": {"adapter": "api", "model": "h"},
@@ -816,6 +818,64 @@ def test_failing_fanout_leaf_evidence_logs_and_incomplete_only_resume(
     # A recovered leaf no longer reads as failing (marker cleared).
     assert not (leaf / "failure.json").exists()
     assert op.resolve_transcript_dir(run_dir, man2.record("cycle")) != leaf
+
+
+def test_fanout_leaf_transient_timeout_retries_in_process_and_completes(
+    fixture_repo, _no_retry_sleep
+):
+    """The retry half of issue #63 on its OWN code path: the bounded
+    in-process retry branch at the fan-out call site (cycle.py). A triage
+    leaf's transient timeout consumes one persisted retry, waits a real
+    backoff delay, and the SAME leaf re-runs in-process — the cycle completes
+    with no park, no human, and no re-run of the completed sibling leaves."""
+    from test_cycle import CONFIRM, CV, F, REVIEW, SeqAdapter, V, writer
+
+    repo = _cycle_fixture(fixture_repo)
+    timeout_exc = AgentFailedError(
+        "api call failed: Timeout: litellm.Timeout: APITimeoutError - "
+        "Request timed out.",
+        partial=AgentResult(text="", exit_code=1),
+        failure_info=FailureInfo(
+            kind=FAILURE_TRANSIENT_DEPENDENCY, marker="api_timeout"
+        ),
+    )
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001"), F("F-002"), F("F-003")),
+        CONFIRM(CV("F-001"), CV("F-002"), CV("F-003")),
+    )
+    triager = SeqAdapter(V("F-001"), timeout_exc, V("F-002"), V("F-003"))
+    fixer = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    status, man, run_dir = _run_cycle(
+        repo,
+        {"reviewer": reviewer, "triage": triager, "builder": fixer},
+        dependency_retry_attempts=2,
+    )
+    assert status == M.RUN_DONE  # no park, no --response, no operator page
+    assert len(triager.calls) == 4  # 3 leaves + exactly one in-process retry
+    assert "F-002" in triager.calls[1]["prompt"]  # the leaf that timed out...
+    assert "F-002" in triager.calls[2]["prompt"]  # ...is the leaf that retried
+    assert len(_no_retry_sleep) == 1 and _no_retry_sleep[0] > 0  # real backoff
+    triage = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    assert sorted(v["finding_id"] for v in triage["verdicts"]) == [
+        "F-001", "F-002", "F-003",
+    ]
+    rec = man.record("cycle")
+    assert rec.status == M.DONE
+    # A leaf recovered by an in-process retry never reads as failing.
+    leaf = run_dir / "steps" / "cycle" / "r1-triage" / "F-002"
+    assert not (leaf / "failure.json").exists()
+
+
+def test_dependency_retry_policy_defaults_are_the_shipped_fix():
+    """The shipped defaults ARE the #63 fix for real runs: every behavioral
+    test sets the knobs explicitly, so only this pin fails if the default
+    silently reverts to 0/off."""
+    from gauntlet.engine.config import RunConfig
+
+    cfg = RunConfig.model_validate({})
+    assert cfg.dependency_retry_attempts == 3
+    assert cfg.dependency_retry_base_s == 2.0
+    assert cfg.dependency_retry_max_delay_s == 30.0
 
 
 # =============================================================================
