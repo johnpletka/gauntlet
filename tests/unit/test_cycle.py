@@ -714,6 +714,99 @@ def test_review_prompt_embeds_artifact_in_artifact_mode(cycle_repo):
     assert "ARTIFACT-BODY-SENTINEL" in reviewer.calls[0]["prompt"]
 
 
+def test_review_against_inlines_the_spec_in_round_one(cycle_repo):
+    # Issue #80: artifact mode inlined ONLY the artifact under review, so a plan
+    # reviewer never had the PRD in context — the `api`-adapter panel member
+    # cannot read the repo at all, and the codex reviewer was never told the
+    # path. `review_against:` puts the spec in the prompt, which is what makes
+    # review-document.md's mandatory coverage sweep executable rather than
+    # answerable from the plan's own traceability claims.
+    (cycle_repo / "spec.md").write_text("SPEC-BODY-SENTINEL\nFR-1: do the thing\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "spec"], check=True)
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    status, _, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"review_against": "spec.md"}
+    )
+    assert status == M.RUN_DONE
+    prompt = reviewer.calls[0]["prompt"]
+    assert "approved spec the artifact above must fully cover: spec.md" in prompt
+    assert "SPEC-BODY-SENTINEL" in prompt
+    # the artifact under review is still there, and still first
+    assert prompt.index("ARTIFACT-BODY-SENTINEL") < prompt.index("SPEC-BODY-SENTINEL")
+
+
+def test_no_review_against_leaves_the_prompt_unchanged(cycle_repo):
+    # The block is opt-in per step: a PRD cycle (nothing upstream) and any
+    # adopter still on a pipeline without the key get a byte-identical prompt,
+    # and review-document.md's sweep is inert without the block to key on.
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    run_cycle(cycle_repo, adapters)
+    assert "approved spec" not in reviewer.calls[0]["prompt"]
+
+
+def test_review_against_fails_closed_when_the_spec_is_unreadable(cycle_repo):
+    # A spec approved at its own gate that has since vanished is a defect, never
+    # a silent degrade to a spec-less review (CLAUDE.md §2).
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, step_extra={"review_against": "gone.md"}
+    )
+    assert status != M.RUN_DONE
+    assert "unreadable" in man.record("cycle").notes
+    assert not reviewer.calls  # never reviewed without the spec
+
+
+def test_review_against_outside_the_repo_root_fails_closed(cycle_repo, tmp_path):
+    # Review F-001: the block inlines a whole file into the reviewer prompt and
+    # the transcripts. `validate_pipeline` rejects an escaping value at load; the
+    # runtime re-proves containment at the read rather than trusting that check,
+    # so a value that reaches here by any other route (a hand-edited pipeline, a
+    # validation call made without roots) still never leaks the file.
+    outside = tmp_path / "secret.md"
+    outside.write_text("CREDENTIALS-SENTINEL\n")
+
+    reviewer = SeqAdapter(REVIEW())
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
+    status, man, _ = run_cycle(
+        cycle_repo, adapters,
+        step_extra={"review_against": f"../{outside.name}"},
+    )
+    assert status != M.RUN_DONE
+    assert "outside the repo root" in man.record("cycle").notes
+    assert not reviewer.calls  # nothing was reviewed, nothing was inlined
+
+
+def test_review_against_is_round_one_only(cycle_repo):
+    # Rounds 2+ run cycle-rereview.md and are regression-scoped to the fix diff
+    # (FR-1.2); re-inlining the whole spec would only re-pay for it.
+    (cycle_repo / "spec.md").write_text("SPEC-BODY-SENTINEL\n")
+    subprocess.run(["git", "-C", str(cycle_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cycle_repo), "commit", "-qm", "spec"], check=True)
+
+    reviewer = SeqAdapter(
+        REVIEW(F("F-001", "blocking")), CONFIRM(CV("F-001", "unresolved")),  # r1 loops
+        REVIEW(),                                                            # r2 converges
+    )
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "esc": SeqAdapter(V("F-001")),          # blocking escalates (F-009)
+        "builder": SeqAdapter(writer("prd.md", "ARTIFACT-BODY-SENTINEL\nfixed\n", {})),
+    }
+    status, _, _ = run_cycle(
+        cycle_repo, adapters,
+        step_extra={"review_against": "spec.md", "escalation_agent": "esc"},
+    )
+    assert status == M.RUN_DONE
+    assert "SPEC-BODY-SENTINEL" in reviewer.calls[0]["prompt"]
+    assert "SPEC-BODY-SENTINEL" not in reviewer.calls[2]["prompt"]
+
+
 def test_rereview_artifact_mode_sends_diff_not_full_body(cycle_repo):
     # FR-1.2: round 1 embeds the full artifact; round 2+ sends only the diff
     # since the last-reviewed version (round-1 snapshot) + carried findings + the

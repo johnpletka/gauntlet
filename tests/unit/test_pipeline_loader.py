@@ -304,6 +304,146 @@ stages:
         validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
 
 
+# --- `review_against:` is a validated artifact reference (issue #80 / F-001) --
+# The cycle inlines the named artifact's WHOLE BODY into the round-1 reviewer
+# prompt and the transcripts, so an unvalidated value is a read primitive: it
+# resolves as `artifact_root / name` and would escape the run's artifacts (and
+# the repo) on an absolute or `../` value. It gets the same dataflow (FR-5.3) and
+# containment/existence (FR-1.3) checks as any other path-bearing reference.
+def _cycle_pipeline(review_against: str) -> str:
+    return f"""
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {{id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         reviewer: reviewer, triager: triage, fixer: builder, max_rounds: 1,
+         review_against: {review_against}}}
+"""
+
+
+def test_review_against_seed_passes(tmp_path):
+    repo = tmp_path / "repo"
+    ar = repo / "runs" / "demo"
+    ar.mkdir(parents=True)
+    (ar / "prd.md").write_text("the approved spec\n")
+    pipeline, _ = load_pipeline(_write(tmp_path, _cycle_pipeline("prd.md")))
+    report = validate_pipeline(
+        pipeline, RunConfig.model_validate(CONFIG),
+        repo_root=repo, artifact_root=ar,
+    )
+    assert report.ok()
+
+
+def test_review_against_dangling_name_rejected(tmp_path):
+    # A typo names an artifact no step produces: a load error, never a mid-run
+    # park (or worse, a silently spec-less review).
+    pipeline, _ = load_pipeline(_write(tmp_path, _cycle_pipeline("prd.mdx")))
+    with pytest.raises(PipelineValidationError, match="dangling"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
+def test_review_against_produced_artifact_passes(tmp_path):
+    # An artifact an EARLIER step writes is available even though it is not on
+    # disk at load — the existence check is skipped, containment still applies.
+    repo = tmp_path / "repo"
+    ar = repo / "runs" / "demo"
+    ar.mkdir(parents=True)
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, output: spec.md, prompt_text: go}
+      - {id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         reviewer: reviewer, triager: triage, fixer: builder, max_rounds: 1,
+         review_against: spec.md}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    report = validate_pipeline(
+        pipeline, RunConfig.model_validate(CONFIG),
+        repo_root=repo, artifact_root=ar,
+    )
+    assert report.ok()
+
+
+def test_review_against_parent_escaping_path_rejected(tmp_path):
+    # `../secret` — rejected on shape even when the value was smuggled into the
+    # available set (as an output here) and even with no roots to resolve against.
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, output: "../secret.md", prompt_text: go}
+      - {id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         reviewer: reviewer, triager: triage, fixer: builder, max_rounds: 1,
+         review_against: "../secret.md"}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError) as exc:
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+    assert "parent-escaping" in str(exc.value) and "../secret.md" in str(exc.value)
+
+
+def test_review_against_absolute_path_rejected(tmp_path):
+    text = """
+name: d
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: author, type: agent_task, agent: builder, output: /etc/passwd, prompt_text: go}
+      - {id: cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
+         reviewer: reviewer, triager: triage, fixer: builder, max_rounds: 1,
+         review_against: /etc/passwd}
+"""
+    pipeline, _ = load_pipeline(_write(tmp_path, text))
+    with pytest.raises(PipelineValidationError) as exc:
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+    assert "absolute" in str(exc.value) and "/etc/passwd" in str(exc.value)
+
+
+def test_review_against_symlink_escaping_repo_root_rejected(tmp_path):
+    # Shape alone is not enough: a benign-looking name inside the artifact root
+    # can be a symlink out of the repo. Containment resolves before it is read.
+    repo = tmp_path / "repo"
+    ar = repo / "runs" / "demo"
+    ar.mkdir(parents=True)
+    outside = tmp_path / "secret.md"
+    outside.write_text("credentials\n")
+    (ar / "prd.md").symlink_to(outside)
+    pipeline, _ = load_pipeline(_write(tmp_path, _cycle_pipeline("prd.md")))
+    with pytest.raises(PipelineValidationError, match="outside the repo root"):
+        validate_pipeline(
+            pipeline, RunConfig.model_validate(CONFIG),
+            repo_root=repo, artifact_root=ar,
+        )
+
+
+def test_review_against_missing_seed_rejected(tmp_path):
+    # A seed the cycle must inline that is not on disk at load: caught here, so
+    # the run never starts toward a spec-less review.
+    repo = tmp_path / "repo"
+    ar = repo / "runs" / "demo"
+    ar.mkdir(parents=True)
+    pipeline, _ = load_pipeline(_write(tmp_path, _cycle_pipeline("prd.md")))
+    with pytest.raises(PipelineValidationError, match="does not resolve to a file"):
+        validate_pipeline(
+            pipeline, RunConfig.model_validate(CONFIG),
+            repo_root=repo, artifact_root=ar,
+        )
+
+
+def test_review_against_empty_value_rejected(tmp_path):
+    pipeline, _ = load_pipeline(_write(tmp_path, _cycle_pipeline('""')))
+    with pytest.raises(PipelineValidationError, match="non-empty artifact name"):
+        validate_pipeline(pipeline, RunConfig.model_validate(CONFIG))
+
+
 def test_unknown_on_fail_target_rejected(tmp_path):
     text = """
 name: d

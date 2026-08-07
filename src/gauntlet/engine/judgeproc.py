@@ -315,6 +315,18 @@ class ManagedJudge:
             # global token rotates less often than a per-run one.)
             self.token = os.environ[TOKEN_ENV_VAR]
         child_env = {**os.environ, TOKEN_ENV_VAR: self.token}
+        # Guarantee HOME in the judge process. The policy engine expands `~` in
+        # candidate paths (credential + boundary checks); with HOME unset or
+        # empty that expansion is degraded, so a `~`-prefixed path is judged on
+        # its literal text alone. Path.home() falls back to the passwd entry, so
+        # this recovers the real home even when the driver was launched without
+        # HOME. Best-effort: if there is no home to be had, the judge still runs
+        # (policy._expand_user fails closed rather than raising).
+        if not child_env.get("HOME"):
+            try:
+                child_env["HOME"] = str(Path.home())
+            except RuntimeError:
+                pass
         argv = [
             sys.executable,
             "-m",

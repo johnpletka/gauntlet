@@ -38,6 +38,34 @@ failing `update-ref`/`log` degrades to a warning, never blocks the kill/audit
 finalization). Regression tests replay the incident at the recover, rollback,
 and full-stack resume level.
 
+**Plan reviews now sweep the PRD requirement by requirement, and can actually
+see it (#80).** A plan-cycle review of a 12-phase plan produced nine genuine
+findings and converged; a human then found four majors it had missed, all the
+same shape — a PRD requirement with no delivering phase (one FR's key event
+name had *zero* occurrences in the plan). An LLM reviewer finds contradictions
+in text it reads and misses requirements with no counterpart to collide with:
+absences generate no attention. Two coordinated changes. The document-mode
+review prompt now carries a **mandatory coverage sweep** — walk the spec clause
+by clause, name the delivering phase and acceptance clause for each, and raise
+anything unmappable as a `spec-gap` finding of at least `major`, with the
+resulting clause→phase map persisted in `summary` so the sweep is auditable;
+a plan's own FR→phase traceability table is an assertion to check, not
+evidence. And the sweep is now *executable*: artifact mode inlined only the
+artifact under review, so a plan reviewer never had the PRD in context at all —
+the codex reviewer was never told the path and the `api`-adapter panel member
+cannot read the repo — so the new `review_against:` step key (set to `prd.md`
+on `plan-cycle` in `pipelines/standard.yaml`) inlines the approved spec beside
+the plan for round 1, failing closed if it is unreadable. Because the key names
+a file whose whole body lands in a reviewer prompt and the transcripts, it is
+validated like any other path-bearing artifact reference: pipeline load rejects
+a dangling name, an absolute or `../` value, a path that resolves outside the
+repo root, and a seed that is not on disk — and the cycle re-proves containment
+at the read. Rounds 2+ are unaffected (regression-scoped, FR-1.2), as is the
+PRD cycle, which has no upstream spec. **Upgrade note:** the prompt half ships with the scaffold, but
+the sweep is keyed on the spec block's presence and stays inert without it — if
+your `pipelines/standard.yaml` is customized, `gauntlet upgrade` will not add
+the key for you; add `review_against: prd.md` to your `plan-cycle` step.
+
 **The engine's own bookkeeping commits no longer wedge resume and rollback
 (#62, #65).** `is_dirty_vs`'s HEAD leg demanded `HEAD == base_sha` exactly,
 but the engine itself advances HEAD during every drive — response checkpoints

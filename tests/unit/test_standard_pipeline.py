@@ -106,6 +106,17 @@ def test_prd_and_plan_cycles_carry_stage_phase_labels():
     assert steps["impl-cycle"].get("mode") == "code_review"
 
 
+def test_plan_cycle_reviews_against_the_approved_prd():
+    # Issue #80: the plan cycle inlines the approved PRD for round 1, which is
+    # what makes review-document.md's mandatory FR-by-FR coverage sweep
+    # executable. The PRD cycle has no upstream spec and must NOT set it.
+    pipeline, _, _ = _load()
+    steps = {st.id: st for st in pipeline.all_steps()}
+    assert steps["plan-cycle"].get("review_against") == "prd.md"
+    assert steps["prd-cycle"].get("review_against") is None
+    assert steps["impl-cycle"].get("review_against") is None
+
+
 def test_cycles_bind_all_roles_and_escalation():
     pipeline, _, _ = _load()
     for cid in ("prd-cycle", "plan-cycle", "impl-cycle"):
