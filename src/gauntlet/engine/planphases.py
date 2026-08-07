@@ -36,7 +36,17 @@ _PHASE_ID_RE = re.compile(r"^P\d+$")
 # nest deeper than the sweep's FR-<n>.<m> and may be lettered (real PRDs
 # subdivide, e.g. FR-5.1.a) — rejecting a legitimate PRD id shape here would
 # wedge the plan gate on a contract technicality (#64's failure class).
-_FRS_TOKEN_RE = re.compile(r"^FR-\d+(?:\.(?:\d+|[A-Za-z]\d*))*$")
+#
+# P7.2: it did exactly that. The pattern only admitted a letter as its OWN
+# dot-separated segment (`FR-5.1.a`), while the dominant convention in this very
+# repository appends the letter DIRECTLY to a numeric segment — `FR-6.1a` (144
+# references), `FR-3.1a` (66), `FR-1.3a` (30), `FR-2.1a` (27), `FR-3.1b/c`, and
+# `FR-2.1b`. Nearly 300 references to a shape the validator refused. A live
+# dogfood plan citing the toy PRD's own `FR-1a`/`FR-3a` parked the plan gate on
+# `artifact_invalid`, which is the failure class the paragraph above was written
+# to prevent. A numeric segment may now carry one trailing letter; the
+# letter-as-segment form is unchanged.
+_FRS_TOKEN_RE = re.compile(r"^FR-\d+[A-Za-z]?(?:\.(?:\d+[A-Za-z]?|[A-Za-z]\d*))*$")
 
 # An ATX markdown heading: 1–6 leading `#`, the heading text, optional trailing
 # `#` decoration. Used to slice a single phase's prose section out of plan.md
