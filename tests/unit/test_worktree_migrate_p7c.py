@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from gauntlet.engine import gitops
+from gauntlet.engine import locking
 from gauntlet.engine import manifest as M
 from gauntlet.engine import operator as op
 from gauntlet.engine import worktree as WT
@@ -35,6 +36,7 @@ from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
     MigrateWorktreeRefused,
     RunManager,
+    WorktreeLockError,
     _LockRecord,
 )
 from gauntlet.procident import read_process_identity
@@ -939,41 +941,124 @@ def test_a_rollback_refusal_never_claims_the_run_is_same_tree(fixture_repo):
 # --- A2 in the mixed population is not weakened by migration ------------------
 
 
-def test_a_migrated_run_still_writes_the_worktree_global_tree_guard(
+def test_a_migrated_run_drives_on_the_per_run_lock_alone(
     fixture_repo, monkeypatch
 ):
-    """P7c-1's Problem A resolution survives migration (spike §10 correction 1).
+    """P7h: the migrated run demotes to the per-run lock, like a born one.
 
-    P7c-1 kept the worktree-global tree guard because `same_tree` is still the
-    default: a `dedicated` run that stopped writing it would stop excluding a
-    concurrent `same_tree` run of ANOTHER slug on the operator's checkout, and
-    `finish` deliberately still merges there. A run that becomes dedicated by
-    MIGRATION lands in exactly that mixed population, so it must not be the
-    hole in the guard.
+    REWRITTEN AT P7g/P7h (was
+    `test_a_migrated_run_still_writes_the_worktree_global_tree_guard`). The
+    old claim was P7c-1's Problem A resolution, and its own docstring named the
+    precondition it rested on: "P7c-1 kept the worktree-global tree guard
+    **because `same_tree` is still the default**". P7g flips that default and
+    P7h retires the guard from drives, so the assertion encoded a `same_tree`
+    truth — the *wrong* class, not the vacuous one, because the path still runs
+    and still needs a claim.
+
+    The concern behind the old claim does not survive contact with P7g. It was
+    that a dedicated run which stopped writing the guard would stop excluding a
+    concurrent `same_tree` run of another slug **from the operator's
+    checkout**. A dedicated drive does not touch the operator's checkout, so
+    that exclusion was protecting a tree the drive never edits: over-exclusion,
+    which is exactly what P7h retired. What still needs cross-slug exclusion —
+    `finish` and `clean` — are operator-tree verbs and keep both scopes.
+
+    Migration is nonetheless its own birth path into `dedicated`, which is why
+    this file asserts it rather than leaning on
+    `test_a_dedicated_drive_holds_only_the_per_run_lock`'s born-dedicated run.
+    Asserted as the per-run lock GENUINELY being held — right slug, right run
+    id, this pid — rather than merely as the tree guard being absent, because
+    "no lock at all" would satisfy the weaker form.
     """
     mgr = _parked_same_tree_run(fixture_repo)
     _step_off_the_run_branch(fixture_repo)
     mgr.migrate_worktree("demo")
 
+    run_dir = mgr.layout("demo").active_run_dir()
+    man = Manifest.load(run_dir / "manifest.json")
     tree_guard = mgr._run_root_dir() / DRIVING_LOCK_NAME
-    seen: list[bool] = []
+    seen: list[dict] = []
     original_ensure = WT.ensure
 
     def spy(*a, **k):
-        # Sampled at the moment the run's tree is resolved — i.e. inside the
-        # driving verb, which is exactly when a concurrent same_tree run of
-        # another slug would need to be excluded.
-        seen.append(tree_guard.exists())
+        # Sampled at the moment the run's tree is resolved — i.e. INSIDE the
+        # driving verb, which is the only place the two scopes are
+        # distinguishable. Unchanged from the original test: the sampling point
+        # was never what was wrong with it.
+        seen.append({
+            "tree": locking.read_record(tree_guard),
+            "run": locking.read_record(run_dir / DRIVING_LOCK_NAME),
+        })
         return original_ensure(*a, **k)
 
     monkeypatch.setattr(WT, "ensure", spy)
     mgr.approve("demo", use_judge=False,
                 adapter_factory=lambda n: FakeAdapter())
-    assert seen and all(seen), (
-        "a migrated (dedicated) run drove without holding the worktree-global "
-        "tree guard, so a concurrent same_tree run of another slug would no "
-        "longer be excluded from the operator's checkout"
-    )
+
+    assert seen, "the drive never resolved its tree; the spy proves nothing"
+    for sample in seen:
+        run, tree = sample["run"], sample["tree"]
+        assert run is not None, sample      # the drive's own exclusion IS held
+        assert run.pid == os.getpid()
+        assert run.slug == "demo" and run.run_id == man.run_id
+        assert tree is None, (              # ...and the repo-wide one is not
+            "a migrated (dedicated) run still holds the worktree-global tree "
+            "guard for its drive; P7h demotes every dedicated run to the "
+            "per-run lock, however it became dedicated"
+        )
+    # Released, and nothing left behind at either scope.
+    assert not tree_guard.exists()
+    assert not (run_dir / DRIVING_LOCK_NAME).exists()
+
+
+def test_a_live_tree_guard_still_refuses_a_migrated_drive(fixture_repo):
+    """The half of the old claim that DOES survive: the READ direction.
+
+    P7h retired the tree guard from dedicated drives to read-only, not to
+    ignored. A holder is a driver that believes it owns the operator's shared
+    checkout — a legacy `same_tree` run of another slug, or a `finish`/`clean`
+    in flight — and a migrated run lands in exactly that mixed population, so
+    it must still refuse while one is live.
+
+    Added at P7g/P7h alongside the rewrite above so the mixed-population
+    concern the original test existed for keeps a test, rather than being
+    dropped along with the assertion that had encoded it.
+    """
+    mgr = _parked_same_tree_run(fixture_repo)
+    _step_off_the_run_branch(fixture_repo)
+    mgr.migrate_worktree("demo")
+    run_dir = mgr.layout("demo").active_run_dir()
+
+    # A live legacy holder, named for another slug — the half-migrated shape.
+    tree_guard = mgr._run_root_dir() / DRIVING_LOCK_NAME
+    ident = read_process_identity(os.getpid())
+    tree_guard.write_text(_LockRecord(
+        nonce="nonce-legacy",
+        slug="legacy-other",
+        run_id="run-legacy",
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        started_at="2026-08-05T10-00-00",
+        host=THIS_HOST,
+        proc_identity=ident.to_dict() if ident else None,
+    ).to_json())
+
+    with pytest.raises(WorktreeLockError, match="being driven by legacy-other"):
+        mgr.approve("demo", use_judge=False,
+                    adapter_factory=lambda n: FakeAdapter())
+    # Refused without writing anything: the guard still carries the legacy
+    # nonce and this run took no per-run lock.
+    assert locking.read_record(tree_guard).nonce == "nonce-legacy"
+    assert not (run_dir / DRIVING_LOCK_NAME).exists()
+    # R1: refusing must never wedge the run. Asserted directly rather than
+    # through `_still_fully_resumable`, whose claim is that a run which FAILED
+    # to migrate is still `same_tree` — this one migrated, so `dedicated` is
+    # the correct state and that helper would assert the opposite.
+    tree_guard.unlink()
+    mgr.approve("demo", use_judge=False, adapter_factory=lambda n: FakeAdapter())
+    man = Manifest.load(run_dir / "manifest.json")
+    assert mgr._effective_worktree_mode(man) == WT.MODE_DEDICATED
+    assert man.status != M.RUN_FAILED, man.model_dump()
 
 
 # --- the operator surface -----------------------------------------------------
