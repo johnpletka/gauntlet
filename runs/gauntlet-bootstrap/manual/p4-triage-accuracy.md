@@ -3,7 +3,7 @@
 - model: `gpt-5-mini`
 - corpus: `prompts/triage-corpus.jsonl` (37 hand-labeled findings)
 - verdict agreement: **94.6%** (35/37; exit ≥ 85%)
-- action agreement (secondary): 91.9%
+- action agreement (secondary): 89.2%
 - blocking→reject misses without escalation: **0** (exit: zero)
 - blocking→reject misses caught by escalation: 0
 - exit criteria: **PASS**
@@ -32,8 +32,8 @@
 
 ## Disagreements
 
-- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading is an unaudited code-execution surface; in a fail-closed safety harness this is a material security risk that can enable arbitrary code execution or supply-chain attacks. The plan must specify trust, allowlisting, and versioning policies before exposing dynamic extensions.
-- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence high) — Committing raw events.jsonl by default can expose large or sensitive raw streams to git and conflicts with a fail-closed safety posture; this is a material spec/process issue rather than a stylistic preference. The plan should make the safe default explicit (ignore raw streams unless opted in) in this implementation phase.
+- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading is an unbounded code-execution surface and therefore a genuine security risk for a fail-closed safety harness. The plan as cited lacks a trust model, allowlisting, version pinning, and auditing/warnings, so this must be specified before exposing dynamic extension loading.
+- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence high) — Defaulting events.jsonl to be commit-friendly can cause heavy or sensitive raw event streams to be placed in the repository, creating a material process/security/operability risk. The plan should change the default to ignore raw streams or require explicit opt-in (or at least document and enforce an explicit policy) in this phase so it is addressed before rollout.
 
 ## Corpus caveat (recorded honestly)
 

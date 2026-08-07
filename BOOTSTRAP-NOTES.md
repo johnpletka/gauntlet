@@ -1265,3 +1265,49 @@ genuine engine defects in the first two stages of one live run.
   than the original made. Notably the known nondeterministic e2e failure
   (`assert 'impl-cycle' == 'phase-gate'`) did NOT occur; the e2e failed
   differently, and per the tranche's own rule that made it ours.
+- **Then the suite kept paying out, one defect deeper each time.** Migrating
+  the four stale assertions did not end it; each full integration run simply
+  got further before failing, and found something new that only a live
+  `standard` run reaches. `G-008`: the fixture declares
+  `requires-python = '>=3.12'` but its own `test_command` uses
+  `uv run --no-project`, which decouples from the project and therefore from
+  that floor, so the step floated to whatever interpreter the machine defaulted
+  to (3.10 here). A builder that encoded the documented floor as a test — a
+  correct thing to do — failed its own suite for a reason the phase could not
+  control. `G-009`: `review_proposals`' cleanliness guard inspected the
+  operator's checkout, where a `dedicated` run's prd.md/plan.md sit
+  uncommitted forever, so FR-6.4/6.5 governed apply was unreachable in the
+  DEFAULT mode. The fix was not a new idea — `finish` already carries exactly
+  that exemption, in nearly those words. This is `P7h.1`'s shape again: an
+  established exemption applied at every site but one.
+- **The generalisable lesson, and it is the tranche's main one.** Every defect
+  here except `G-002` and `G-008` is one root cause wearing different clothes:
+  under `dedicated` there are TWO copies of every governed artifact, and each
+  consumer that predates the split had to be told which one it means. The sync
+  (`P7.1`), the cleanliness guards (`P7.5`, and `finish` before it), the
+  producer commit and the baseline commit (`P7.2`/`G-002`), the integration
+  assertions (`P7.3`) — all the same question, answered site by site. A grep
+  for the remaining consumers of `repo_root`/`operator_root` in artifact-facing
+  code is worth more than another round of testing, because the suite only
+  finds these one live run at a time, at roughly ninety minutes each.
+- **Where the gate actually landed.** Unit: `3029 passed, 3 skipped, 76
+  deselected` on `9593a29`, green. Dogfood: passed, described above. Full
+  integration: `1 failed, 69 passed, 6 skipped` in 1:20:47 — all four of the
+  stale-assertion failures fixed and confirmed across runs, with ONE failure
+  remaining that is not an engine defect and not a stale assertion. The FR-6
+  acceptance requires the live `escalation` model to synthesise a unified diff
+  that applies cleanly to a prompt asset; both proposals it drafted were
+  classified `invalid` with "diff does not apply cleanly to the current asset".
+  That classification is correct, and the engine behaving exactly as designed:
+  the retro deliberately "retains malformed diffs as invalid evidence".
+- **That last one was diagnosed rather than assumed, and the method matters.**
+  "A live model wrote a bad diff" is the convenient answer, so it was tested
+  instead of asserted: the diff was extracted and run through `git apply
+  --check`. Hunk 1's context matched `prompts/triage.md` byte-for-byte — which
+  is what rules out the interesting alternative, that the two-copy artifact
+  model had the engine validating against the wrong tree — while hunk 2
+  fabricated context at line 109 that does not exist in the file. git's own
+  refusal is the evidence. The remaining failure is therefore live-model
+  nondeterminism in diff synthesis, of the same character as the
+  `impl-cycle`/`phase-gate` park this tranche carried forward, and the
+  assertion was NOT loosened to make it pass.
