@@ -6,6 +6,8 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.8] — 2026-08-08
+
 **Recover, rollback, and the interrupted park now reconcile a branch left
 ahead of the manifest (#72).** `gauntlet recover` on a builder that had
 committed wip but never flushed the manifest left the branch ahead of the
