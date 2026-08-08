@@ -1952,6 +1952,12 @@ class WorktreeLockGuard:
         self.lock_path = (
             (run_dir / DRIVING_LOCK_NAME) if run_dir is not None else self.tree_lock_path
         )
+        # #86: the per-slug minting lock. A live holder there is a `start`
+        # minting a new run of THIS slug; checked read-only in hold() so the
+        # guard stays strictly stronger than the pre-#86 tree-guard check.
+        self.slug_lock_path = (
+            (run_dir.parent / DRIVING_LOCK_NAME) if run_dir is not None else None
+        )
 
     def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
@@ -2042,6 +2048,8 @@ class WorktreeLockGuard:
         # Absent is fine — an embedded caller has no RunManager verb around it.
         split = self.tree_lock_path != self.lock_path
         tree_state = self._check(self.tree_lock_path) if split else "ours"
+        if split and self.slug_lock_path is not None:
+            self._check(self.slug_lock_path)  # live foreign mint → raises (#86)
         if self._check(self.lock_path) == "ours":
             yield  # already held by this process (the normal verb path)
             return

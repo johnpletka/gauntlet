@@ -2245,6 +2245,20 @@ class RunManager:
         """
         return run_dir / DRIVING_LOCK_NAME
 
+    def _slug_lock_path(self, slug: str) -> Path:
+        """The per-slug minting lock: `<run_root>/<slug>/.driving.lock` (#86).
+
+        The scope that matches the invariant "one run being minted per slug".
+        It sits beside `active-run.txt` — the per-slug pointer it protects —
+        and covers exactly the window where the same-slug race lives: run-id
+        mint → branch prep → run dir → per-run lock → active-run pointer. A
+        dedicated `start` holds this instead of the repo-global tree guard, so
+        overlapping mints of DIFFERENT slugs never contend. Already ignored by
+        the engine-written run-root gitignore (its no-slash patterns match at
+        any depth), and skipped by the recovery fingerprint by name.
+        """
+        return self._run_root_dir() / slug / DRIVING_LOCK_NAME
+
     @staticmethod
     def _ensure_run_root_gitignore(run_root: Path) -> None:
         """Ignore the worktree-level bookkeeping under the run root (FR-10.5).
@@ -2412,9 +2426,15 @@ class RunManager:
 
     def _acquire_worktree_lock(
         self, slug: str, run_id: str | None, *, run_dir: Path | None = None,
-        tree_guard: bool = True,
+        tree_guard: bool = True, slug_scope: bool = False,
     ) -> _LockHandle:
         """Acquire the drive lock for a run and fail closed (FR-10.5).
+
+        ``slug_scope=True`` is the #86 minting scope: a dedicated `start`
+        READS the tree guard (fail closed on a live holder) and then holds
+        only `<run_root>/<slug>/.driving.lock` for the minting transaction,
+        demoting to the per-run lock once the run dir exists. It wins over the
+        other flags; ``tree_guard``/``run_dir`` are ignored when it is set.
 
         Takes the worktree-global **tree guard** first — the coarse exclusion
         that protects the OPERATOR's shared checkout — then, when ``run_dir`` is
@@ -2470,6 +2490,17 @@ class RunManager:
         record = self._new_lock_record(slug, run_id)
         payload = record.to_json()
         tree_path = self._tree_lock_path()
+        if slug_scope:
+            # #86: the minting window of a dedicated `start`. Same read-only
+            # tree-guard check a dedicated drive makes (a live `finish`/`clean`/
+            # legacy same_tree driver still blocks it), then the per-slug lock —
+            # so a concurrent mint of a DIFFERENT slug proceeds while a second
+            # mint of THIS slug fails closed at one shared path.
+            self._refuse_if_tree_guard_live()
+            slug_path = self._slug_lock_path(slug)
+            slug_path.parent.mkdir(parents=True, exist_ok=True)
+            self._acquire_one(slug_path, record, payload)
+            return self._take_handle(slug_path, record.nonce)
         if not tree_guard:
             self._refuse_if_tree_guard_live()
             if run_dir is None:  # every no-guard call site drives a known run
@@ -2660,12 +2691,22 @@ class RunManager:
                 run_id = f"run-{_utc_stamp()}-{suffix}"
                 suffix += 1
 
-        # Acquire the worktree-global tree guard FIRST — before any run dir /
-        # active-run.txt / git mutation (FR-10.5). Released in `finally` on
-        # park/done/error. The per-run lock (P7b) is attached below, the moment
-        # the run dir exists; until then this guard alone excludes every other
-        # driving verb on this tree, including a second `start` of this slug.
-        handle = self._acquire_worktree_lock(slug, run_id)
+        # Acquire the minting lock FIRST — before any run dir / active-run.txt /
+        # git mutation (FR-10.5). Released in `finally` on park/done/error. The
+        # per-run lock (P7b) is attached below, the moment the run dir exists;
+        # until then this lock alone excludes a second `start` of this slug.
+        #
+        # #86: a dedicated start scopes that exclusion to the SLUG being minted
+        # — the per-slug lock at `<run_root>/<slug>/.driving.lock`, beside the
+        # `active-run.txt` pointer it protects — and only READS the tree guard,
+        # so two `gauntlet run <different-slug>` mints never contend. A
+        # same_tree start keeps the repo-global tree guard: its whole drive
+        # mutates the operator's shared checkout, which is exactly the scope
+        # that guard exists for.
+        born_dedicated = self.configured_worktree_mode == WT.MODE_DEDICATED
+        handle = self._acquire_worktree_lock(
+            slug, run_id, slug_scope=born_dedicated
+        )
         try:
             self._refuse_if_active_run(layout)
             pipeline, phash = load_pipeline(pipeline_path)
@@ -4131,8 +4172,15 @@ class RunManager:
                 _unlink_durable(path)
 
     def _lock_paths_for(self, run_dir: Path | None) -> list[Path]:
-        """Every path this engine's drive lock can occupy, per-run first (P7b)."""
+        """Every path this engine's drive lock can occupy, per-run first (P7b).
+
+        The per-slug minting lock (#86) sits between the two: a driver wedged
+        during `start`'s minting window holds its nonce there, and release-by-
+        nonce must be able to find it or the slug stays unmintable forever.
+        """
         paths = [] if run_dir is None else [self._run_lock_path(run_dir)]
+        if run_dir is not None:
+            paths.append(run_dir.parent / DRIVING_LOCK_NAME)  # per-slug (#86)
         paths.append(self._tree_lock_path())
         return paths
 

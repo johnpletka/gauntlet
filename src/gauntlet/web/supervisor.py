@@ -696,6 +696,9 @@ class JobSupervisor:
         """
         paths = [self.run_root / DRIVING_LOCK_NAME]
         try:
+            # `*/` is the per-slug minting lock (#86); `*/*/` the per-run lock.
+            # Both globs, or a run being minted answers "no driver".
+            paths.extend(sorted(self.run_root.glob(f"*/{DRIVING_LOCK_NAME}")))
             paths.extend(sorted(self.run_root.glob(f"*/*/{DRIVING_LOCK_NAME}")))
         except OSError:
             pass

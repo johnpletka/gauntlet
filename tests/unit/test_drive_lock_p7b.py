@@ -1016,6 +1016,7 @@ def test_kill_at_every_lock_boundary_never_wedges_the_tree(tmp_path, sig, point)
     # reclaims rather than fails closed forever.
     stale = [p for p in (
         repo / "runs" / DRIVING_LOCK_NAME,
+        repo / "runs" / "demo" / DRIVING_LOCK_NAME,  # per-slug mint lock (#86)
         *(repo / "runs" / "demo").glob(f"run-*/{DRIVING_LOCK_NAME}"),
     ) if p.exists()]
     assert stale, f"boundary {point} left no lock to reclaim — nothing to prove"
@@ -1565,3 +1566,97 @@ def test_finish_takes_the_per_run_lock_of_its_own_run(fixture_repo):
     assert locking.read_record(
         run_dir / DRIVING_LOCK_NAME
     ).nonce == "nonce-live-driver"
+
+
+# =============================================================================
+# #86: the minting window is per-slug, not repo-global
+# =============================================================================
+
+
+def test_minting_excludes_per_slug_not_repo_globally(fixture_repo):
+    """#86 acceptance: a live mint of one slug never blocks a start of a
+    different slug, while a second mint of the SAME slug still fails closed at
+    the one shared per-slug path — and a dedicated start no longer writes the
+    repo-global tree guard at all."""
+    mgr = _prepare(fixture_repo)  # base config → dedicated (P7g default)
+    for slug in ("alpha", "beta"):
+        _author_prd(mgr, slug)
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "author PRDs")
+    linear = _pipeline(fixture_repo, LINEAR)
+
+    # A live holder mid-mint of alpha: its per-slug lock, held by this very
+    # process (provably alive, never reclaimable).
+    _write_lock(
+        fixture_repo / "runs" / "alpha" / DRIVING_LOCK_NAME,
+        pid=os.getpid(), identity=_live_identity(), slug="alpha",
+    )
+
+    # beta's whole run proceeds — different slugs no longer contend on a mint.
+    assert RunManager(fixture_repo).start(
+        "beta", linear, use_judge=False,
+        adapter_factory=lambda n: FakeAdapter(writes={"out.py": "x\n"}),
+    ) == M.RUN_DONE
+    # ...and it never wrote the repo-global tree guard.
+    assert not _tree_lock(fixture_repo).exists()
+
+    # alpha still cannot be double-minted.
+    with pytest.raises(WorktreeLockError):
+        RunManager(fixture_repo).start(
+            "alpha", linear, use_judge=False,
+            adapter_factory=lambda n: FakeAdapter(writes={"out.py": "x\n"}),
+        )
+
+
+def test_a_live_tree_guard_still_blocks_a_dedicated_mint(fixture_repo):
+    """#86 keeps §10 step 6: the mint READS the tree guard — a live legacy /
+    finish/clean holder of the operator's checkout blocks a new mint."""
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "alpha")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "author PRD")
+    linear = _pipeline(fixture_repo, LINEAR)
+
+    _write_lock(
+        _tree_lock(fixture_repo), pid=os.getpid(), identity=_live_identity(),
+        slug="other",
+    )
+    with pytest.raises(WorktreeLockError):
+        RunManager(fixture_repo).start(
+            "alpha", linear, use_judge=False,
+            adapter_factory=lambda n: FakeAdapter(writes={"out.py": "x\n"}),
+        )
+
+
+def test_driver_info_sees_a_run_being_minted(fixture_repo):
+    """#86 acceptance: during the minting window there is no run instance yet,
+    so the per-slug lock is the only evidence — driver_info must answer from
+    it, never 'no driver'."""
+    from gauntlet.engine import operator as op
+
+    (fixture_repo / "runs").mkdir(exist_ok=True)
+    _write_lock(
+        fixture_repo / "runs" / "alpha" / DRIVING_LOCK_NAME,
+        pid=os.getpid(), identity=_live_identity(), slug="alpha",
+    )
+    info = op.driver_info(fixture_repo / "runs", "alpha")
+    assert info.state == op.LIVENESS_ALIVE
+    assert info.pid == os.getpid()
+    # A different slug's question is untouched by alpha's mint lock.
+    assert op.driver_liveness(fixture_repo / "runs", "beta") == op.LIVENESS_NONE
+
+
+def test_supervisor_lock_scan_sees_a_minting_run(fixture_repo, tmp_path):
+    """#86 acceptance: web.supervisor.driving_lock must scan the per-slug
+    scope too — a run being minted is a live driver, not 'no driver'."""
+    from gauntlet.web.supervisor import JobSupervisor
+
+    (fixture_repo / "runs").mkdir(exist_ok=True)
+    _write_lock(
+        fixture_repo / "runs" / "alpha" / DRIVING_LOCK_NAME,
+        pid=os.getpid(), identity=_live_identity(), slug="alpha",
+    )
+    sup = JobSupervisor(fixture_repo)
+    info = sup.driving_lock()
+    assert info is not None and info.live
+    assert info.slug == "alpha"
