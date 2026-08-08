@@ -17,6 +17,7 @@ sandbox (test_codex_sandbox.py). Two layers here:
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import time
@@ -88,12 +89,18 @@ def _running_judge(policy_path, audit_path):
     port = _free_port()
     audit_path.unlink(missing_ok=True)
     env = dict(os.environ, GAUNTLET_JUDGE_TOKEN=TOKEN)
+    # start_new_session: `uv run` is a wrapper that forks the real
+    # `.venv/bin/gauntlet judge serve` as a child. Terminating only the
+    # wrapper reaps `uv` and orphans the server to init, permanently leaking
+    # one process (and its port) per fixture (#85). A fresh session gives the
+    # pair its own process group so teardown can signal both together.
     proc = subprocess.Popen(
         ["uv", "run", "gauntlet", "judge", "serve",
          "--policy", str(policy_path),
          "--audit", str(audit_path), "--port", str(port)],
         cwd=REPO_ROOT, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True,
     )
     url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 30
@@ -110,11 +117,18 @@ def _running_judge(policy_path, audit_path):
             pytest.fail(f"judge did not become healthy:\n{out}")
         yield {"url": url, "port": port, "audit": audit_path}
     finally:
-        proc.terminate()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10)
 
 
 @pytest.fixture(scope="module")

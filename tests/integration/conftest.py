@@ -10,11 +10,49 @@ these are the compensating control):
 """
 
 import os
+import signal
 import subprocess
 
 import pytest
 
 from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
+
+
+def _judge_serve_pids() -> set[int]:
+    """PIDs of every live `gauntlet judge serve` process on this machine."""
+    proc = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True
+    )
+    pids: set[int] = set()
+    for line in proc.stdout.splitlines():
+        pid_str, _, cmd = line.strip().partition(" ")
+        if "gauntlet judge serve" in cmd:
+            pids.add(int(pid_str))
+    return pids
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_leaked_judge_servers():
+    """Fail the session if it leaks a `gauntlet judge serve` process (#85).
+
+    The uv-run wrapper bug orphaned two servers per suite run for months and
+    was invisible to the suite itself — the wrapper exits cleanly, so nothing
+    reported the leak. Diff live server PIDs across the session so a
+    regression cannot hide again; kill any survivor so a failure here does
+    not itself accumulate orphans.
+    """
+    before = _judge_serve_pids()
+    yield
+    leaked = _judge_serve_pids() - before
+    for pid in leaked:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    assert not leaked, (
+        f"integration session leaked `gauntlet judge serve` PIDs {sorted(leaked)} "
+        "(killed); a fixture is terminating a wrapper instead of the process group"
+    )
 
 
 @pytest.fixture(autouse=True)
