@@ -1133,6 +1133,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             if note is not None:
                 resume_notes.append(note)
             fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
+            # #89: snapshot the judge audit boundary so a no-change round can be
+            # attributed. The byte offset (not step_id alone) scopes the count to
+            # THIS fix turn — every sub-agent in the cycle shares one step_id.
+            from gauntlet.engine import judgeaudit
+
+            judge_audit = ctx.run_dir / "judge-audit.jsonl"
+            fix_audit_offset = judgeaudit.audit_offset(judge_audit)
             try:
                 _run_sub(
                     ctx, fixer, fix_prompt, schema=None, usage=usage,
@@ -1142,6 +1149,41 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             except _ParkCycle as park:
                 return finish(park.result)
             if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
+                # #89: a clean tree is only a content-level failure when the fixer
+                # was ABLE to write. When the judge's own infrastructure failed
+                # (LLM unreachable -> every tool call denied fail-closed, source
+                # "fail-closed" in the audit), the round is an infrastructure
+                # outage: park provider_unavailable (plain-resumable, deadline,
+                # budget-counted) instead of a terminal failure that forces the
+                # operator to inject placebo `--response` text (R7 violation).
+                # Policy denials (fast-path/llm sources) stay terminal — the
+                # judge worked; the fixer attempted something it should not.
+                if ctx.judge_env:
+                    jc = judgeaudit.counts_since(
+                        judge_audit, offset=fix_audit_offset, step_id=ctx.record.id
+                    )
+                    if jc.all_denied and jc.fail_closed_denied == jc.denied:
+                        from gauntlet.engine import depretry
+
+                        reasons = "; ".join(jc.denial_reasons) or "(none recorded)"
+                        return finish(StepResult(
+                            status=PARKED,
+                            parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                            parked_substep=f"r{rnd}-fix",
+                            backoff_s=depretry.park_deadline_s(
+                                ctx.record, ctx.config, None
+                            ),
+                            notes=(
+                                f"judge could not evaluate during the round-{rnd} "
+                                f"fix turn: all {jc.denied} tool call(s) denied "
+                                "fail-closed (judge infrastructure error, not "
+                                "policy) and the fixer made no changes despite "
+                                f"{len(accepted)} accepted finding(s). Parking "
+                                "provider_unavailable — plain `gauntlet resume` "
+                                "retries once the judge's dependency recovers "
+                                f"(#89). Denial evidence: {reasons}"
+                            ),
+                        ))
                 return finish(StepResult(
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "

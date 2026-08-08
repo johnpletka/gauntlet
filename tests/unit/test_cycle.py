@@ -155,7 +155,7 @@ def cycle_step(**extra):
     return step
 
 
-def run_cycle(repo, adapters, *, step_extra=None, config=None):
+def run_cycle(repo, adapters, *, step_extra=None, config=None, judge_env=None):
     pipeline = Pipeline.model_validate({
         "name": "demo", "version": 1,
         "stages": [{"id": "s", "steps": [cycle_step(**(step_extra or {}))]}],
@@ -168,7 +168,7 @@ def run_cycle(repo, adapters, *, step_extra=None, config=None):
     orch = Orchestrator(
         repo_root=repo, run_dir=run_dir, artifact_root=artifact_root,
         config=cfg, pipeline=pipeline, manifest=man,
-        adapter_factory=lambda n: adapters[n],
+        adapter_factory=lambda n: adapters[n], judge_env=judge_env,
     )
     status = orch.drive()
     return status, man, run_dir
@@ -1180,6 +1180,62 @@ def test_fixer_making_no_changes_fails_closed(cycle_repo):
         "builder": SeqAdapter({"did": "nothing"}),  # no writes
     }
     status, man, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_FAILED
+    assert "fixer made no changes" in man.record("cycle").notes
+
+
+def _audit_writer(run_dir, *rows):
+    """A SeqAdapter callable: append judge-audit rows during the turn, write nothing."""
+    def _run(cwd):
+        audit = run_dir / "judge-audit.jsonl"
+        audit.parent.mkdir(parents=True, exist_ok=True)
+        with audit.open("a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        return {"did": "nothing"}
+    return _run
+
+
+def test_judge_outage_no_change_round_parks_provider_unavailable(cycle_repo):
+    """#89: every fix-turn tool call denied fail-closed (judge LLM unreachable)
+    + zero changes is an INFRASTRUCTURE failure — park provider_unavailable
+    (plain-resumable, concrete deadline), never the terminal 'fixer made no
+    changes' that forces placebo `--response` text (R7)."""
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    deny = {"step_id": "cycle", "decision": "deny", "source": "fail-closed",
+            "rationale": "judge LLM error, failing closed: Connection error."}
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(_audit_writer(run_dir, deny, deny, deny)),
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, judge_env={"GAUNTLET_JUDGE_URL": "http://127.0.0.1:1"}
+    )
+    assert status == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.parked_substep == "r1-fix"
+    assert rec.quota_reset_at is not None  # a park with a concrete deadline
+    assert "judge could not evaluate" in rec.notes
+    assert "fail-closed" in rec.notes
+
+
+def test_policy_denied_no_change_round_stays_terminal(cycle_repo):
+    """#89 boundary: when the denials are POLICY decisions (fast-path/llm), the
+    judge worked — a no-change round remains the terminal content-level failure."""
+    run_dir = cycle_repo / "runs" / "demo" / "run-1"
+    deny = {"step_id": "cycle", "decision": "deny", "source": "fast-path",
+            "rationale": "matched deny rule no-force-push"}
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(_audit_writer(run_dir, deny, deny)),
+    }
+    status, man, _ = run_cycle(
+        cycle_repo, adapters, judge_env={"GAUNTLET_JUDGE_URL": "http://127.0.0.1:1"}
+    )
     assert status == M.RUN_FAILED
     assert "fixer made no changes" in man.record("cycle").notes
 
