@@ -45,6 +45,7 @@ EXPECTED_ASSETS = {
     ".gauntlet/schemas/findings.json",
     ".gauntlet/schemas/triage.json",
     ".gauntlet/schemas/confirm.json",
+    ".gauntlet/schemas/acceptance-map.json",
     ".gauntlet/prompts/review-document.md",
     ".gauntlet/prompts/review-code.md",
     ".gauntlet/prompts/plan-author.md",
@@ -69,6 +70,34 @@ def test_init_fresh_repo_creates_full_asset_set(tmp_path):
     assert (tmp_path / ".gitignore").exists()
     for rel in EXPECTED_ASSETS:
         assert (tmp_path / rel).exists(), rel
+
+
+def test_every_asset_root_schema_the_engine_references_is_scaffolded(tmp_path):
+    """Issue #91: the scaffold pipeline's acceptance_gate named
+    schemas/acceptance-map.json but the scaffold schema set omitted it, so
+    every fresh adopter halted fail-closed at their first acceptance gate.
+    Every ``schemas/<name>.json`` literal in the step-implementation modules
+    (the references resolved under the ADOPTER's asset root — engine-internal
+    schemas like status.json resolve from the package instead) must exist in
+    a freshly scaffolded repo, so the next step type added to the scaffold
+    cannot repeat the omission."""
+    import re
+
+    from gauntlet.engine import cycle as cycle_mod
+    from gauntlet.engine import steptypes as steptypes_mod
+
+    init_repo(tmp_path)
+    referenced: set[str] = set()
+    for mod in (steptypes_mod, cycle_mod):
+        referenced |= set(
+            re.findall(r"schemas/[a-z][a-z-]*\.json", Path(mod.__file__).read_text())
+        )
+    assert "schemas/acceptance-map.json" in referenced  # the #91 witness
+    for rel in sorted(referenced):
+        assert (tmp_path / ".gauntlet" / rel).exists(), (
+            f"{rel} is referenced by a step implementation but missing from "
+            "the init scaffold (issue #91)"
+        )
 
 
 def test_scaffolded_config_and_pipeline_validate(tmp_path):
