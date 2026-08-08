@@ -1634,10 +1634,23 @@ def proposals_review(
 ) -> None:
     """Present pending proposals; approve/reject + apply approved diffs (FR-6.4)."""
     mgr = _manager()
+    everything = mgr.list_proposals(slug)
     pending = [
-        (rd, p) for rd, p in mgr.list_proposals(slug)
+        (rd, p) for rd, p in everything
         if getattr(p, "status", "") == "pending" and getattr(p, "valid", False)
     ]
+    # Invalid proposals are never approvable, but staying silent about them
+    # hid every synthesis whose diffs failed to apply (#55) — the operator saw
+    # "no pending, applyable proposals" and never learned proposals existed.
+    invalid = [
+        p for _, p in everything
+        if getattr(p, "status", "") == "invalid" or not getattr(p, "valid", True)
+    ]
+    if invalid:
+        typer.echo(f"note: {len(invalid)} invalid (non-applyable) proposal(s) on record:")
+        for p in invalid:
+            reason = (getattr(p, "invalid_reason", "") or "?")[:100]
+            typer.echo(f"  {p.name}: {reason}")
     if not pending:
         typer.echo("no pending, applyable proposals")
         return

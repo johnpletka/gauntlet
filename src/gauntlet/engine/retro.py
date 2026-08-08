@@ -42,6 +42,11 @@ _ASSET_GLOBS = (
 )
 _ASSET_FILES = ("policy.yaml",)
 _ASSET_SIZE_CAP = 16_384
+_ASSET_TAIL_BYTES = 2_048
+# Bounded re-asks when a schema-valid proposal's diff fails generation-time
+# apply validation (#55) — the same bounded-retry shape as the cycle's schema
+# re-ask; exhaustion falls closed to materializing the evidence as `invalid`.
+_PROPOSAL_REGEN_RETRIES = 2
 
 
 # --- the handler -------------------------------------------------------------
@@ -520,7 +525,7 @@ def _generate_proposals(
     feedback: Any, proposer: str, usage: Any,
 ) -> list[Any]:
     from gauntlet.engine.cycle import _run_sub, wrap_as_data
-    from gauntlet.engine.proposals import materialize_proposals
+    from gauntlet.engine.proposals import materialize_proposals, validate_item
     from gauntlet.engine.steptypes import step_logger
 
     template = _template(
@@ -550,12 +555,74 @@ def _generate_proposals(
         logger=logger, structured_name="proposals.json",
     )
     items = list((result.structured or {}).get("proposals") or [])
+    # Generation-time apply validation with bounded regeneration (#55): a
+    # schema-valid but non-applying diff used to go straight to disk as
+    # `invalid`, defeating the governed apply path exactly when the synthesis
+    # produced something worth applying. Dry-run the same validator that
+    # materialization runs, and re-ask the synthesiser — with git's concrete
+    # apply error and the verbatim current target asset — before writing.
+    # Mirrors the shape of the cycle's schema re-ask: bounded, evidence
+    # persisted per attempt, spend accounted, fail-closed at exhaustion (the
+    # surviving invalid proposals are still materialized as visible evidence).
+    for regen in range(1, _PROPOSAL_REGEN_RETRIES + 1):
+        rejected = [
+            (item, reason)
+            for item in items
+            for _, ok, reason in [validate_item(ctx.repo_root, item, ctx.config.asset_root)]
+            if not ok
+        ]
+        if not rejected or not items:
+            break
+        retry_prompt = prompt + _regen_feedback(ctx, rejected, attempt=regen)
+        result = _run_sub(
+            ctx, proposer, retry_prompt, schema=schema, usage=usage,
+            logger=logger, structured_name=f"proposals.regen{regen}.json",
+        )
+        items = list((result.structured or {}).get("proposals") or [])
     proposals_dir = ctx.run_dir / "retro" / "proposals"
     return materialize_proposals(
         ctx.repo_root, proposals_dir, items,
         source_run=ctx.manifest.run_id, writer=ctx.writer,
         asset_root=ctx.config.asset_root,
     )
+
+
+def _regen_feedback(
+    ctx: StepContext, rejected: list[tuple[dict, str]], *, attempt: int
+) -> str:
+    """The re-ask suffix: each rejection's concrete reason + the live asset.
+
+    The target assets are re-inlined VERBATIM and uncapped — the primary cause
+    of stale-context diffs is the size-capped asset listing omitting the very
+    file the prompt told the synthesiser to edit. Only allowlisted,
+    existing targets are read (the target_path is model-authored data)."""
+    from gauntlet.engine.proposals import path_allowed
+
+    lines = [
+        f"\n\n--- REJECTED PROPOSALS (attempt {attempt}) ---\n",
+        "The proposals below failed deterministic validation and were NOT "
+        "recorded. Re-emit the COMPLETE corrected proposals array (keep any "
+        "proposal not listed here unchanged; correct or drop each one that "
+        "is). Rebuild every corrected diff from the verbatim current asset "
+        "text included below — do not reuse your previous context lines.\n",
+    ]
+    targets: list[str] = []
+    for item, reason in rejected:
+        slug = item.get("slug", "?")
+        declared = (item.get("target_path") or "").strip()
+        lines.append(f"- {slug!r} -> {declared or '(no target_path)'}: {reason}\n")
+        if declared and declared not in targets:
+            targets.append(declared)
+    for declared in targets:
+        if not path_allowed(declared, ctx.config.asset_root):
+            continue
+        path = ctx.repo_root / declared
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        lines.append(f"\n### current verbatim content of {declared}\n```\n{text}\n```\n")
+    return "".join(lines)
 
 
 def _asset_context(repo_root: Path, asset_root: str) -> str:
@@ -581,7 +648,21 @@ def _asset_context(repo_root: Path, asset_root: str) -> str:
         except (OSError, UnicodeDecodeError):
             continue
         if len(text) > _ASSET_SIZE_CAP:
-            blocks.append(f"### {rel}\n(omitted: {len(text)} bytes exceeds the inline cap)\n")
+            # Don't omit the file outright: the synthesis prompt explicitly
+            # directs corpus-feeding appends at triage-corpus.jsonl, which is
+            # far over the cap — omitting it forced the model to invent the
+            # context lines its diff needs, which can never apply (#55). A
+            # verbatim tail (cut at a line boundary) is sufficient for
+            # append-style diffs, which is what oversized assets get.
+            tail = text[-_ASSET_TAIL_BYTES:]
+            if "\n" in tail:
+                tail = tail[tail.index("\n") + 1:]
+            blocks.append(
+                f"### {rel}\n(first {len(text) - len(tail)} of {len(text)} bytes "
+                "omitted — exceeds the inline cap; the verbatim TAIL below "
+                "supports append-style diffs only)\n"
+                f"```\n{tail}\n```\n"
+            )
             continue
         blocks.append(f"### {rel}\n```\n{text}\n```\n")
     return "\n".join(blocks) if blocks else "(no tunable assets found)\n"

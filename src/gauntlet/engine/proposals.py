@@ -234,18 +234,10 @@ def materialize_proposals(
     written: list[Proposal] = []
     number = next_proposal_number(proposals_dir)
     for item in items:
-        raw_diff = item.get("diff", "") or ""
-        # Structured-output models reliably reproduce literal patch content but
-        # sometimes miscount the old/new lines in an otherwise complete hunk.
-        # Canonicalize only that redundant arithmetic.  The raw response remains
-        # in the synthesis transcript/proposals.json; paths and semantic content
-        # are untouched, then the normal containment + git-apply check still
-        # decides whether the materialized proposal is safe and ratifiable.
-        diff = _normalize_unified_diff_hunk_counts(raw_diff)
+        diff, valid, reason = validate_item(repo_root, item, asset_root)
         slug = _slugify(item.get("slug", ""))
         declared = (item.get("target_path") or "").strip()
         targets = diff_target_paths(diff)
-        valid, reason = _validate_diff(repo_root, diff, declared, targets, asset_root)
         proposal = Proposal(
             number=number,
             slug=slug,
@@ -262,6 +254,31 @@ def materialize_proposals(
         written.append(proposal)
         number += 1
     return written
+
+
+def validate_item(
+    repo_root: Path, item: dict[str, Any], asset_root: str = "."
+) -> tuple[str, bool, str]:
+    """Normalize + validate one raw synthesiser proposal without writing it.
+
+    Returns ``(normalized_diff, valid, invalid_reason)``. Extracted from
+    :func:`materialize_proposals` so the retro's regeneration loop (#55) can
+    dry-run validation at generation time and re-ask the synthesiser with the
+    concrete failure, instead of discovering an unusable proposal only after it
+    is on disk.
+
+    Structured-output models reliably reproduce literal patch content but
+    sometimes miscount the old/new lines in an otherwise complete hunk.
+    Canonicalize only that redundant arithmetic.  The raw response remains
+    in the synthesis transcript/proposals.json; paths and semantic content
+    are untouched, then the normal containment + git-apply check still
+    decides whether the materialized proposal is safe and ratifiable.
+    """
+    diff = _normalize_unified_diff_hunk_counts(item.get("diff", "") or "")
+    declared = (item.get("target_path") or "").strip()
+    targets = diff_target_paths(diff)
+    valid, reason = _validate_diff(repo_root, diff, declared, targets, asset_root)
+    return diff, valid, reason
 
 
 def _normalize_unified_diff_hunk_counts(diff: str) -> str:
@@ -349,8 +366,22 @@ def _validate_diff(
                 "registry/supersessions.jsonl is append-only: the diff removes "
                 f"{len(removed)} line(s); supersession history is never rewritten"
             )
-    if not gitops.apply_patch_check(repo_root, _ensure_trailing_nl(diff)):
-        return False, "diff does not apply cleanly to the current asset"
+    # A context-only diff passes `git apply --check` as a no-op, producing a
+    # "valid" proposal that changes nothing and whose apply-time commit finds
+    # nothing staged (#55). Reject it before the human ever sees it.
+    changed = [
+        ln for ln in diff.splitlines()
+        if (ln.startswith("+") and not ln.startswith("+++"))
+        or (ln.startswith("-") and not ln.startswith("---"))
+    ]
+    if not changed:
+        return False, "diff makes no changes (context-only hunks)"
+    apply_err = gitops.apply_patch_error(repo_root, _ensure_trailing_nl(diff))
+    if apply_err is not None:
+        return False, (
+            "diff does not apply cleanly to the current asset: "
+            + apply_err.replace("\n", " | ")
+        )
     return True, ""
 
 
