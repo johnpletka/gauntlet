@@ -173,8 +173,10 @@ def _arm_lock_boundary_kill(spec: str) -> None:
     real_attach = RunManager._attach_run_lock
     real_release = RunManager._release_worktree_lock
 
-    def acquire(self, slug, run_id, *, run_dir=None):
-        handle = real_acquire(self, slug, run_id, run_dir=run_dir)
+    def acquire(self, slug, run_id, *, run_dir=None, tree_guard=True,
+                slug_scope=False):
+        handle = real_acquire(self, slug, run_id, run_dir=run_dir,
+                              tree_guard=tree_guard, slug_scope=slug_scope)
         if point == "after_tree":
             signal.raise_signal(sig)
         return handle

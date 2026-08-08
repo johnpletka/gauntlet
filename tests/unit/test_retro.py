@@ -443,3 +443,130 @@ def test_test_failure_loops_treats_attempts_as_failure_count():
     man.steps.append(StepRecord(id="tests", type="shell", attempts=0, iteration="2"))
     loops = R._test_failure_loops(man)
     assert loops == {"tests.0": 2, "tests.1": 1}  # the clean attempt is omitted
+
+
+# --- generation-time apply validation + bounded regeneration (#55) ------------
+def _stale_diff() -> str:
+    """Schema-valid, allowlisted, but built on invented context — never applies."""
+    return (
+        "--- a/prompts/triage.md\n+++ b/prompts/triage.md\n"
+        "@@ -1,2 +1,3 @@\n invented context line\n another invented line\n"
+        "+An extra rubric line.\n"
+    )
+
+
+def test_synthesis_regenerates_nonapplying_diffs(tmp_path: Path):
+    """#55: a non-applying diff triggers a bounded re-ask carrying git's error
+    and the verbatim target asset; the corrected attempt lands valid+pending."""
+    repo = _retro_repo(tmp_path)
+    good = _capture_diff(
+        repo, "prompts/triage.md",
+        (repo / "prompts/triage.md").read_text() + "\nAn extra rubric line.\n",
+    )
+    item = {"slug": "sharpen-rubric", "target_path": "prompts/triage.md",
+            "rationale": "stale on attempt 1, corrected on the re-ask"}
+
+    def correct_on_reask(adapter, prompt, cwd):
+        if "REJECTED PROPOSALS" in prompt:
+            adapter.structured = {"proposals": [{**item, "diff": good}]}
+
+    triage = FakeAdapter(
+        text="{}", structured={"proposals": [{**item, "diff": _stale_diff()}]},
+        on_run=correct_on_reask,
+    )
+    adapters = {
+        "builder": FakeAdapter(text="builder self-critique."),
+        "reviewer": FakeAdapter(text="reviewer self-critique."),
+        "triage": triage,
+    }
+    status, man, run_dir = _run_retro(repo, adapters)
+    assert status == M.RUN_DONE
+
+    [prop] = P.list_proposals(run_dir / "retro" / "proposals")
+    assert prop.valid and prop.status == P.PENDING, prop.invalid_reason
+
+    # exactly one re-ask happened, and it carried the concrete failure + the
+    # live asset verbatim (not the capped listing)
+    synth_prompts = [c["prompt"] for c in triage.calls
+                     if "REJECTED PROPOSALS" in c["prompt"]]
+    assert len(synth_prompts) == 1
+    reask = synth_prompts[0]
+    assert "does not apply cleanly" in reask
+    assert "current verbatim content of prompts/triage.md" in reask
+    assert "rubric" in reask  # the asset body itself is inlined
+
+
+def test_synthesis_regeneration_exhaustion_keeps_invalid_evidence(tmp_path: Path):
+    """#55 fail-closed terminus: when every re-ask still fails validation, the
+    invalid proposals are materialized as visible evidence (never dropped) and
+    the bounded loop stops at the retry cap."""
+    repo = _retro_repo(tmp_path)
+    item = {"slug": "never-applies", "target_path": "prompts/triage.md",
+            "rationale": "always stale", "diff": _stale_diff()}
+    triage = FakeAdapter(text="{}", structured={"proposals": [item]})
+    adapters = {
+        "builder": FakeAdapter(text="b."),
+        "reviewer": FakeAdapter(text="r."),
+        "triage": triage,
+    }
+    status, man, run_dir = _run_retro(repo, adapters)
+    assert status == M.RUN_DONE  # synthesis completed; invalidity is evidence
+
+    [prop] = P.list_proposals(run_dir / "retro" / "proposals")
+    assert not prop.valid and prop.status == P.INVALID
+    assert "does not apply cleanly" in prop.invalid_reason
+    # initial ask + exactly _PROPOSAL_REGEN_RETRIES bounded re-asks
+    assert len(triage.calls) == 1 + R._PROPOSAL_REGEN_RETRIES
+    assert man.record("retrospective").metrics["proposals_valid"] == 0
+
+
+def test_asset_context_includes_tail_of_oversized_asset(tmp_path: Path):
+    """#55 root cause: an over-cap asset used to be omitted entirely while the
+    synthesis prompt directed appends at it. The tail is now inlined verbatim."""
+    repo = tmp_path / "r"
+    (repo / "prompts").mkdir(parents=True)
+    big = "x" * (R._ASSET_SIZE_CAP + 100) + "\nfinal corpus line\n"
+    (repo / "prompts" / "triage-corpus.jsonl").write_text(big)
+    ctx = R._asset_context(repo, ".")
+    assert "omitted" in ctx and "TAIL" in ctx
+    assert "final corpus line" in ctx
+
+
+def test_regeneration_merges_never_replaces(tmp_path: Path):
+    """PR #93 review F-003: a retry can only repair the rejected proposals.
+    Already-valid proposals survive a retry that omits them, and a retry
+    returning an empty array keeps the rejected originals as invalid
+    evidence — the proposal set never silently shrinks."""
+    repo = _retro_repo(tmp_path)
+    good = _capture_diff(
+        repo, "prompts/triage.md",
+        (repo / "prompts/triage.md").read_text() + "\nAn extra rubric line.\n",
+    )
+    valid_item = {"slug": "keep-me", "target_path": "prompts/triage.md",
+                  "rationale": "valid from attempt 1", "diff": good}
+    stale_item = {"slug": "never-applies", "target_path": "prompts/triage.md",
+                  "rationale": "always stale", "diff": _stale_diff()}
+
+    def empty_on_reask(adapter, prompt, cwd):
+        if "REJECTED PROPOSALS" in prompt:
+            adapter.structured = {"proposals": []}  # model drops everything
+
+    triage = FakeAdapter(
+        text="{}", structured={"proposals": [valid_item, stale_item]},
+        on_run=empty_on_reask,
+    )
+    adapters = {
+        "builder": FakeAdapter(text="b."),
+        "reviewer": FakeAdapter(text="r."),
+        "triage": triage,
+    }
+    status, man, run_dir = _run_retro(repo, adapters)
+    assert status == M.RUN_DONE
+
+    props = {p.slug: p for p in P.list_proposals(run_dir / "retro" / "proposals")}
+    assert set(props) == {"keep-me", "never-applies"}
+    assert props["keep-me"].valid and props["keep-me"].status == P.PENDING
+    assert not props["never-applies"].valid
+    assert props["never-applies"].status == P.INVALID
+    # bounded: initial ask + the full retry budget (empty replies never converge)
+    assert len(triage.calls) == 1 + R._PROPOSAL_REGEN_RETRIES

@@ -964,6 +964,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # so a stale file is a correctness hazard, not just untidy: drop it
             # exactly as the review path drops a superseded triage.json.
             _invalidate_artifact(ctx, "confirm.json", artifact_writes)
+            if is_response_redrive:
+                vacuous = _vacuous_convergence_result(ctx, step, rnd)
+                if vacuous is not None:
+                    return finish(vacuous)
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
@@ -1129,6 +1133,13 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             if note is not None:
                 resume_notes.append(note)
             fix_prompt = _fix_prompt(step, ctx, by_id, accepted)
+            # #89: snapshot the judge audit boundary so a no-change round can be
+            # attributed. The byte offset (not step_id alone) scopes the count to
+            # THIS fix turn — every sub-agent in the cycle shares one step_id.
+            from gauntlet.engine import judgeaudit
+
+            judge_audit = ctx.run_dir / "judge-audit.jsonl"
+            fix_audit_offset = judgeaudit.audit_offset(judge_audit)
             try:
                 _run_sub(
                     ctx, fixer, fix_prompt, schema=None, usage=usage,
@@ -1138,6 +1149,41 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             except _ParkCycle as park:
                 return finish(park.result)
             if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
+                # #89: a clean tree is only a content-level failure when the fixer
+                # was ABLE to write. When the judge's own infrastructure failed
+                # (LLM unreachable -> every tool call denied fail-closed, source
+                # "fail-closed" in the audit), the round is an infrastructure
+                # outage: park provider_unavailable (plain-resumable, deadline,
+                # budget-counted) instead of a terminal failure that forces the
+                # operator to inject placebo `--response` text (R7 violation).
+                # Policy denials (fast-path/llm sources) stay terminal — the
+                # judge worked; the fixer attempted something it should not.
+                if ctx.judge_env:
+                    jc = judgeaudit.counts_since(
+                        judge_audit, offset=fix_audit_offset, step_id=ctx.record.id
+                    )
+                    if jc.all_denied and jc.fail_closed_denied == jc.denied:
+                        from gauntlet.engine import depretry
+
+                        reasons = "; ".join(jc.denial_reasons) or "(none recorded)"
+                        return finish(StepResult(
+                            status=PARKED,
+                            parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                            parked_substep=f"r{rnd}-fix",
+                            backoff_s=depretry.park_deadline_s(
+                                ctx.record, ctx.config, None
+                            ),
+                            notes=(
+                                f"judge could not evaluate during the round-{rnd} "
+                                f"fix turn: all {jc.denied} tool call(s) denied "
+                                "fail-closed (judge infrastructure error, not "
+                                "policy) and the fixer made no changes despite "
+                                f"{len(accepted)} accepted finding(s). Parking "
+                                "provider_unavailable — plain `gauntlet resume` "
+                                "retries once the judge's dependency recovers "
+                                f"(#89). Denial evidence: {reasons}"
+                            ),
+                        ))
                 return finish(StepResult(
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
@@ -2113,7 +2159,13 @@ def _human_decision_block(ctx: StepContext) -> str:
     response-less re-drive), so nothing changes for runs that never used
     ``--response``. Finding ids are not stable across re-drives (review is rerun
     from scratch), so the decision is injected as general guidance, not keyed to a
-    prior round's ids."""
+    prior round's ids.
+
+    The preamble mandates per-item classification (#79): its original wording
+    covered only the *settling* direction ("stop re-raising…"), so a reviewer
+    could file an entire gate-rejection change list under "already supplied
+    decisions", return zero findings, and vacuously converge — re-parking the
+    gate with a byte-identical artifact."""
     from gauntlet.engine.steptypes import render_human_responses
 
     responses = getattr(ctx.record, "human_responses", None)
@@ -2121,13 +2173,100 @@ def _human_decision_block(ctx: StepContext) -> str:
         return ""
     return (
         "\n\n--- AUTHORITATIVE HUMAN DECISION(S) (operator-supplied via "
-        "`gauntlet resume --response`; a trusted instruction — weigh it above "
-        "your default judgment where it bears on a finding: stop re-raising a "
-        "finding the operator has dismissed or accepted, and reclassify one the "
-        "operator has resolved, e.g. an upstream-invalidation the operator has "
-        "ruled in-scope) ---\n"
+        "`gauntlet resume --response` or a gate rejection; a trusted "
+        "instruction — weigh it above your default judgment where it bears on "
+        "a finding) ---\n"
+        "Classify EACH item in the response, then act per its class:\n"
+        "(a) it dismisses, accepts, or resolves a concern — treat it as "
+        "settled: stop re-raising a finding the operator has dismissed or "
+        "accepted, and reclassify one the operator has resolved, e.g. an "
+        "upstream-invalidation the operator has ruled in-scope;\n"
+        "(b) it reports a defect or demands a change NOT yet reflected in the "
+        "artifact under review — you MUST raise it as a finding of your own "
+        "(severity at least what the response states or implies) so triage "
+        "and the fixer act on it. Gate-rejection notes are change requests: "
+        "default to (b) unless an item explicitly settles something.\n"
+        "A response listing unaddressed defects is NEVER grounds for an "
+        "empty findings array.\n"
         + render_human_responses(responses)
         + "\n--- END HUMAN DECISION(S) ---"
+    )
+
+
+def _vacuous_convergence_result(
+    ctx: StepContext, step: Step, rnd: int
+) -> StepResult | None:
+    """Fail-closed guard on a zero-findings convergence of a response re-drive (#79).
+
+    The failure this forbids: a gate rejection carrying verified defect reports
+    is injected, the reviewer classifies the whole list as "already supplied
+    decisions", returns an empty findings array, and the cycle silently
+    re-parks the gate with the artifact byte-identical to the pre-rejection
+    commit — the human then re-reviews an unchanged document believing it was
+    revised.
+
+    Fires only when ALL of: this is a response re-drive (caller checks), the
+    cycle is artifact-mode, the pending response carries an artifact
+    fingerprint, and the artifact's bytes still match it (nothing was revised
+    since the response was recorded). The first such convergence parks for
+    response; the DIRECT reply to that park (the next response_attempt, with
+    the artifact still byte-identical to the park) proceeds with a loud
+    recorded warning instead of looping the park — "proceed unchanged" is a
+    decision the operator is entitled to make, once warned. The bypass is
+    scoped, never a standing latch (PR #93 review F-001): a later,
+    independent rejection/response on this step gets a fresh fail-closed
+    park, and a reply that follows a revision of the artifact stands the
+    guard down entirely (genuine convergence, no warning).
+
+    Returns ``None`` to let the normal converged-DONE result stand.
+    """
+    if step.get("mode") != "artifact":
+        return None
+    name = step.get("artifact")
+    if not name:
+        return None
+    pending = ctx.record.human_responses[-1]
+    recorded_fp = getattr(pending, "artifact_fingerprint", None)
+    if not recorded_fp:
+        return None  # response predates the fingerprint field: nothing to compare
+    path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+    try:
+        current_fp = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None  # unreadable artifact surfaces via its own validation path
+    if current_fp != recorded_fp:
+        return None  # the artifact WAS revised: genuine convergence
+    warned_attempt = ctx.record.vacuous_park_response_attempt
+    if warned_attempt is not None and pending.response_attempt == warned_attempt + 1:
+        if recorded_fp != ctx.record.vacuous_park_fingerprint:
+            # Revised between the warning park and this reply: the reviewer
+            # verified the revised artifact — genuine convergence, no warning.
+            return None
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"converged: round-{rnd} review returned no findings\n"
+                f"WARNING (vacuous-convergence guard, #79): response consumed, "
+                f"{name} unchanged since the response was recorded, zero "
+                "findings raised — proceeding on the operator's re-affirmation"
+            ),
+        )
+    ctx.record.vacuous_park_response_attempt = pending.response_attempt
+    ctx.record.vacuous_park_fingerprint = recorded_fp
+    return StepResult(
+        status=PARKED,
+        parked_reason=M.PARKED_REASON_RESPONSE,
+        notes=(
+            f"vacuous convergence (#79): the response was consumed, round-{rnd} "
+            f"review raised zero findings, and {name} is byte-identical to when "
+            "the response was recorded — nothing was revised. Failing closed "
+            "instead of re-parking the gate over an unchanged artifact. If the "
+            "response reported defects, the reviewer failed to raise them: "
+            "respond (or reject) again restating each item as an open defect. "
+            "If the artifact is intended to proceed unchanged, respond "
+            "confirming that — the next unchanged convergence proceeds with a "
+            "recorded warning."
+        ),
     )
 
 

@@ -2245,6 +2245,20 @@ class RunManager:
         """
         return run_dir / DRIVING_LOCK_NAME
 
+    def _slug_lock_path(self, slug: str) -> Path:
+        """The per-slug minting lock: `<run_root>/<slug>/.driving.lock` (#86).
+
+        The scope that matches the invariant "one run being minted per slug".
+        It sits beside `active-run.txt` — the per-slug pointer it protects —
+        and covers exactly the window where the same-slug race lives: run-id
+        mint → branch prep → run dir → per-run lock → active-run pointer. A
+        dedicated `start` holds this instead of the repo-global tree guard, so
+        overlapping mints of DIFFERENT slugs never contend. Already ignored by
+        the engine-written run-root gitignore (its no-slash patterns match at
+        any depth), and skipped by the recovery fingerprint by name.
+        """
+        return self._run_root_dir() / slug / DRIVING_LOCK_NAME
+
     @staticmethod
     def _ensure_run_root_gitignore(run_root: Path) -> None:
         """Ignore the worktree-level bookkeeping under the run root (FR-10.5).
@@ -2412,9 +2426,15 @@ class RunManager:
 
     def _acquire_worktree_lock(
         self, slug: str, run_id: str | None, *, run_dir: Path | None = None,
-        tree_guard: bool = True,
+        tree_guard: bool = True, slug_scope: bool = False,
     ) -> _LockHandle:
         """Acquire the drive lock for a run and fail closed (FR-10.5).
+
+        ``slug_scope=True`` is the #86 minting scope: a dedicated `start`
+        READS the tree guard (fail closed on a live holder) and then holds
+        only `<run_root>/<slug>/.driving.lock` for the minting transaction,
+        demoting to the per-run lock once the run dir exists. It wins over the
+        other flags; ``tree_guard``/``run_dir`` are ignored when it is set.
 
         Takes the worktree-global **tree guard** first — the coarse exclusion
         that protects the OPERATOR's shared checkout — then, when ``run_dir`` is
@@ -2470,6 +2490,17 @@ class RunManager:
         record = self._new_lock_record(slug, run_id)
         payload = record.to_json()
         tree_path = self._tree_lock_path()
+        if slug_scope:
+            # #86: the minting window of a dedicated `start`. Same read-only
+            # tree-guard check a dedicated drive makes (a live `finish`/`clean`/
+            # legacy same_tree driver still blocks it), then the per-slug lock —
+            # so a concurrent mint of a DIFFERENT slug proceeds while a second
+            # mint of THIS slug fails closed at one shared path.
+            self._refuse_if_tree_guard_live()
+            slug_path = self._slug_lock_path(slug)
+            slug_path.parent.mkdir(parents=True, exist_ok=True)
+            self._acquire_one(slug_path, record, payload)
+            return self._take_handle(slug_path, record.nonce)
         if not tree_guard:
             self._refuse_if_tree_guard_live()
             if run_dir is None:  # every no-guard call site drives a known run
@@ -2660,12 +2691,22 @@ class RunManager:
                 run_id = f"run-{_utc_stamp()}-{suffix}"
                 suffix += 1
 
-        # Acquire the worktree-global tree guard FIRST — before any run dir /
-        # active-run.txt / git mutation (FR-10.5). Released in `finally` on
-        # park/done/error. The per-run lock (P7b) is attached below, the moment
-        # the run dir exists; until then this guard alone excludes every other
-        # driving verb on this tree, including a second `start` of this slug.
-        handle = self._acquire_worktree_lock(slug, run_id)
+        # Acquire the minting lock FIRST — before any run dir / active-run.txt /
+        # git mutation (FR-10.5). Released in `finally` on park/done/error. The
+        # per-run lock (P7b) is attached below, the moment the run dir exists;
+        # until then this lock alone excludes a second `start` of this slug.
+        #
+        # #86: a dedicated start scopes that exclusion to the SLUG being minted
+        # — the per-slug lock at `<run_root>/<slug>/.driving.lock`, beside the
+        # `active-run.txt` pointer it protects — and only READS the tree guard,
+        # so two `gauntlet run <different-slug>` mints never contend. A
+        # same_tree start keeps the repo-global tree guard: its whole drive
+        # mutates the operator's shared checkout, which is exactly the scope
+        # that guard exists for.
+        born_dedicated = self.configured_worktree_mode == WT.MODE_DEDICATED
+        handle = self._acquire_worktree_lock(
+            slug, run_id, slug_scope=born_dedicated
+        )
         try:
             self._refuse_if_active_run(layout)
             pipeline, phash = load_pipeline(pipeline_path)
@@ -3076,21 +3117,50 @@ class RunManager:
         self, layout: "RunLayout", run_dir: Path, man: Manifest
     ) -> "RX.ProgressFingerprint":
         """The plan §4.5 fingerprint at the public-verb boundary."""
-        excludes = run_bookkeeping_excludes(
-            self.work_root, self._bookkeeping_root(run_dir),
-            self._artifact_root_in_work(layout),
-        )
-        record = None
-        for rec in man.steps:  # the last non-terminal step anchors the attempt
-            if rec.status not in (M.DONE, M.SKIPPED):
-                record = rec
         # The R5 fingerprint covers index and worktree planes, so it must watch
         # the tree the verb actually mutates (same family as F-002/F-007).
         # Against the operator's checkout it would report "nothing changed"
         # after a dedicated resume that did real work, and raise NoProgressError
-        # on a run that had progressed.
+        # on a run that had progressed. At this boundary the verb has not yet
+        # entered `_worktree_paths_or_park` (self._paths is None), so for a
+        # `dedicated` run `self.work_root` IS the operator's checkout — whose
+        # planes the A1 invariant pins byte-identical across the whole verb,
+        # blinding the guard (#90). Resolve the run's registered worktree
+        # read-only (observe; never ensure) and fingerprint THAT tree.
+        paths = self._paths
+        if paths is None:
+            entry = None
+            try:
+                entry = WT.observe(
+                    self.operator_root, man.branch,
+                    main_root=self._main_worktree_root(),
+                )
+            except gitops.GitError:
+                entry = None  # unreadable worktree list: fall back below
+            if entry is not None:
+                paths = RunPaths(
+                    repo_root=self.repo_root,
+                    work_root=entry.path,
+                    state_root=run_dir,
+                    artifact_root=layout.slug_dir,
+                )
+        if paths is not None:
+            work_root = paths.work_root
+            excludes = run_bookkeeping_excludes(
+                work_root, paths.bookkeeping_root, paths.artifact_root_in_work
+            )
+        else:
+            work_root = self.work_root
+            excludes = run_bookkeeping_excludes(
+                work_root, self._bookkeeping_root(run_dir),
+                self._artifact_root_in_work(layout),
+            )
+        record = None
+        for rec in man.steps:  # the last non-terminal step anchors the attempt
+            if rec.status not in (M.DONE, M.SKIPPED):
+                record = rec
         return RX.build_progress_fingerprint(
-            self.work_root, manifest=man, record=record, excludes=excludes
+            work_root, manifest=man, record=record, excludes=excludes
         )
 
     def _capture_progress(self, slug: str) -> "RX.ProgressFingerprint | None":
@@ -3105,8 +3175,24 @@ class RunManager:
             run_dir = layout.active_run_dir()
             man = Manifest.load(run_dir / "manifest.json")
             return self._progress_fingerprint_for(layout, run_dir, man)
-        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError) as exc:
+            # Advisory, but never silent (#90): a swallowed capture failure
+            # turns the R5 guard OFF for the invocation with nothing surfacing
+            # it — which is how the guard's absence on live runs went unseen.
+            self._warn_progress_guard_off(slug, exc)
             return None
+
+    def _warn_progress_guard_off(self, slug: str, exc: Exception) -> None:
+        """Durable warning that this invocation ran without the R5 guard (#90)."""
+        try:
+            run_dir = self.layout(slug).active_run_dir()
+            self._warn(
+                run_dir,
+                "R5 no-progress guard disabled for this invocation: progress "
+                f"fingerprint capture failed ({type(exc).__name__}: {exc})",
+            )
+        except Exception:  # the warning must never fail the verb it describes
+            pass
 
     def _require_progress_after(
         self,
@@ -3135,7 +3221,8 @@ class RunManager:
             run_dir = layout.active_run_dir()
             man = Manifest.load(run_dir / "manifest.json")
             after = self._progress_fingerprint_for(layout, run_dir, man)
-        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError) as exc:
+            self._warn_progress_guard_off(slug, exc)  # never silent (#90)
             return
         if after.digest != before.digest:
             return  # progress
@@ -4085,8 +4172,15 @@ class RunManager:
                 _unlink_durable(path)
 
     def _lock_paths_for(self, run_dir: Path | None) -> list[Path]:
-        """Every path this engine's drive lock can occupy, per-run first (P7b)."""
+        """Every path this engine's drive lock can occupy, per-run first (P7b).
+
+        The per-slug minting lock (#86) sits between the two: a driver wedged
+        during `start`'s minting window holds its nonce there, and release-by-
+        nonce must be able to find it or the slug stays unmintable forever.
+        """
         paths = [] if run_dir is None else [self._run_lock_path(run_dir)]
+        if run_dir is not None:
+            paths.append(run_dir.parent / DRIVING_LOCK_NAME)  # per-slug (#86)
         paths.append(self._tree_lock_path())
         return paths
 

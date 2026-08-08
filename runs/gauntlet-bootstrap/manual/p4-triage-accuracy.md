@@ -32,8 +32,8 @@
 
 ## Disagreements
 
-- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Allowing third-party adapter/step entry points without a defined trust model, allowlisting, version pinning, or explicit warnings creates an unbounded code-execution surface that can violate the plan's fail-closed safety posture. The plan must specify plugin trust and loading controls to avoid executing unvetted code in the harness.
-- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence medium) — Committing raw event streams by default can leak sensitive content and bloat repositories; that is a real spec/operability risk. The plan should make treating events.jsonl as non-commit-friendly by default or require explicit opt-in to avoid accidental commits.
+- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading creates an unbounded code-execution surface; for a fail-closed safety harness this is a material security risk that can lead to unauthorized code execution or supply-chain attacks. The plan must define trust boundaries (allowlisting, version pinning, signing/audit requirements and warnings) before exposing dynamic extension loading.
+- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence medium) — Committing raw events.jsonl by default can leak large or sensitive payloads and pollute repositories; this is a real spec/design gap around data-handling defaults. The plan should be updated to make raw-stream commits opt-in or document filtering/consent, but it is a plan-level decision rather than an immediate code fix so it can be deferred to a plan revision.
 
 ## Corpus caveat (recorded honestly)
 

@@ -131,6 +131,7 @@ ROOT_SCOPE: dict[str, str] = {
     "rewind_impl_preserving_bookkeeping": ROOT_SCOPE_WORK,
     "apply_patch": ROOT_SCOPE_WORK,
     "apply_patch_check": ROOT_SCOPE_WORK,
+    "apply_patch_error": ROOT_SCOPE_WORK,
     "git_index_path": ROOT_SCOPE_WORK,    # per-worktree index (spike E1/E7)
     "is_tracked": ROOT_SCOPE_WORK,        # reads the index
     "path_is_ignored": ROOT_SCOPE_WORK,
@@ -1553,11 +1554,23 @@ def apply_patch_check(repo: Path, patch: str) -> bool:
     ``git apply --check`` validates the unified diff against the current tree
     without touching a single byte — used to tell a human, before they approve a
     retro proposal (FR-6.4), whether the diff still applies."""
+    return apply_patch_error(repo, patch) is None
+
+
+def apply_patch_error(repo: Path, patch: str) -> str | None:
+    """``None`` iff ``patch`` applies cleanly; else git's own error text.
+
+    The concrete diagnostic ("patch does not apply", "corrupt patch at line N",
+    "while searching for: …") is what a synthesiser regeneration re-ask (#55)
+    needs to correct a stale-context diff — a bare boolean gave it nothing to
+    act on. Side-effect-free (``--check``)."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "apply", "--check", "-"],
         input=patch, capture_output=True, text=True,
     )
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return None
+    return (proc.stderr or proc.stdout).strip() or f"git apply --check exited {proc.returncode}"
 
 
 def apply_patch(repo: Path, patch: str) -> None:

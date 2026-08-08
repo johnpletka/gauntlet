@@ -430,3 +430,57 @@ def test_supersession_rewrite_proposal_is_invalid(asset_repo: Path):
     )
     assert not proposal.valid and proposal.status == P.INVALID
     assert "append-only" in proposal.invalid_reason
+
+
+def test_materialize_rejects_context_only_noop_diff(asset_repo: Path):
+    # #55: a context-only hunk passes `git apply --check` as a no-op, which
+    # used to produce a "valid" pending proposal that changes nothing and whose
+    # apply-time commit finds nothing staged. Rejected at validation instead.
+    noop = (
+        "--- a/prompts/triage.md\n+++ b/prompts/triage.md\n"
+        "@@ -1,2 +1,2 @@\n rubric line one\n rubric line two\n"
+    )
+    [proposal] = P.materialize_proposals(
+        asset_repo,
+        asset_repo / "runs/demo/run-1/retro/proposals",
+        [{"slug": "noop", "target_path": "prompts/triage.md",
+          "rationale": "changes nothing", "diff": noop}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+    assert not proposal.valid and proposal.status == P.INVALID
+    assert "makes no changes" in proposal.invalid_reason
+
+
+def test_apply_failure_reason_carries_git_diagnostic(asset_repo: Path):
+    # #55: the invalid_reason must quote git's own error so the regeneration
+    # re-ask (and the human reading the proposal file) can see WHY it failed,
+    # not just that it did.
+    stale = (
+        "--- a/prompts/triage.md\n+++ b/prompts/triage.md\n"
+        "@@ -1,2 +1,2 @@\n-invented stale context\n+replacement\n rubric line two\n"
+    )
+    [proposal] = P.materialize_proposals(
+        asset_repo,
+        asset_repo / "runs/demo/run-1/retro/proposals",
+        [{"slug": "stale", "target_path": "prompts/triage.md",
+          "rationale": "stale context", "diff": stale}],
+        source_run="run-1", writer=RedactingWriter(),
+    )
+    assert not proposal.valid and proposal.status == P.INVALID
+    assert "does not apply cleanly" in proposal.invalid_reason
+    # git's diagnostic names the file it failed against
+    assert "prompts/triage.md" in proposal.invalid_reason.split("cleanly", 1)[1]
+
+
+def test_validate_item_matches_materialize(asset_repo: Path):
+    # The dry-run validator (#55) and materialization must agree — it exists so
+    # the regeneration loop can pre-check without writing files.
+    good = _capture_diff(asset_repo, "prompts/triage.md",
+                         "rubric line one CHANGED\nrubric line two\n")
+    item = {"slug": "g", "target_path": "prompts/triage.md",
+            "rationale": "r", "diff": good}
+    diff, ok, reason = P.validate_item(asset_repo, item)
+    assert ok and reason == ""
+    bad_item = {**item, "diff": good.replace("rubric line two", "not the file")}
+    _, ok, reason = P.validate_item(asset_repo, bad_item)
+    assert not ok and "does not apply cleanly" in reason

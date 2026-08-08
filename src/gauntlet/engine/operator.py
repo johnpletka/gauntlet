@@ -334,17 +334,29 @@ def _lock_state(
 # TREE" (legitimate, FR-2.4 row b) from "another slug's record is sitting at
 # THIS RUN's authoritative path" (inconsistent evidence — review F-003).
 _SCOPE_RUN = "run"
+_SCOPE_SLUG = "slug"  # the #86 per-slug minting lock
 _SCOPE_TREE = "tree"
 
 
 def _lock_state_scoped(
-    run_root: Path, run_instance_dir: Path | None = None
+    run_root: Path, run_instance_dir: Path | None = None, *,
+    slug: str | None = None,
 ) -> tuple[str, _LockRecord | None, str]:
-    """:func:`_lock_state` plus which scope answered."""
+    """:func:`_lock_state` plus which scope answered.
+
+    ``slug`` (#86) inserts the per-slug minting lock between the per-run and
+    tree scopes: during `start`'s minting window no run instance exists yet, so
+    without this scope the answer for a run being minted would be "no driver" —
+    exactly the wrong moment for that answer.
+    """
     if run_instance_dir is not None:
         kind, rec = _lock_file_state(Path(run_instance_dir) / DRIVING_LOCK_NAME)
         if kind != locking.LOCK_ABSENT:
             return (kind, rec, _SCOPE_RUN)
+    if slug is not None:
+        kind, rec = _lock_file_state(Path(run_root) / slug / DRIVING_LOCK_NAME)
+        if kind != locking.LOCK_ABSENT:
+            return (kind, rec, _SCOPE_SLUG)
     return (*_lock_file_state(Path(run_root) / DRIVING_LOCK_NAME), _SCOPE_TREE)
 
 
@@ -411,15 +423,17 @@ def driver_info(
     mutating path will reject"). It is ``indeterminate``: fail closed, offer
     read-only actions, and let the operator look.
     """
-    kind, rec, scope = _lock_state_scoped(run_root, run_instance_dir)
+    kind, rec, scope = _lock_state_scoped(run_root, run_instance_dir, slug=slug)
     if kind == locking.LOCK_ABSENT:
         return DriverInfo(LIVENESS_NONE, None, None, None)  # row a
     if kind == locking.LOCK_MALFORMED:
         return DriverInfo(LIVENESS_INDETERMINATE, None, None, None)  # row g
     assert rec is not None
     if rec.slug != slug:
-        if scope == _SCOPE_RUN:
-            # Inconsistent evidence at this run's own path → fail closed.
+        if scope in (_SCOPE_RUN, _SCOPE_SLUG):
+            # Inconsistent evidence at this run's/slug's own path → fail closed
+            # (#86: a foreign record at THIS slug's mint path is misplacement,
+            # not another slug's legitimate tree hold).
             return DriverInfo(LIVENESS_INDETERMINATE, None, None, None)
         return DriverInfo(LIVENESS_NONE, None, None, None)  # row b — foreign tree hold
     state = _liveness_for_record(rec)

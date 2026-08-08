@@ -846,6 +846,14 @@ class ProgressFingerprint(_FrozenModel):
     pending_response_id: str | None = None
     pending_response_state: ResponseState | None = None
     latest_cycle_substep: str | None = None
+    # Hash of the anchor step's durable notes (#90). A verb whose only durable
+    # output is a recorded verdict — e.g. the first resume of a killed dirty
+    # step parking with the `--reset-interrupted` guidance — IS progress the
+    # operator can act on; before this field that progress was invisible and
+    # only registered by accident via the verb's own bookkeeping commit
+    # (which the git plane now rightly skips). Identical re-parks re-stamp
+    # byte-identical notes, so the repeat still reads unchanged.
+    step_notes_fingerprint: str | None = None
 
     @property
     def digest(self) -> str:

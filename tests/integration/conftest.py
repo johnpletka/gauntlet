@@ -10,11 +10,68 @@ these are the compensating control):
 """
 
 import os
+import signal
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from gauntlet.engine.judgeproc import _MANAGED_ENV_VARS
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _judge_serve_pids(owned_markers: tuple[str, ...]) -> set[int]:
+    """PIDs of live `gauntlet judge serve` processes THIS SUITE owns.
+
+    Ownership is proven by the server's own argv: every judge this suite
+    launches carries an `--audit` path that is either the repo test fixture
+    (`test-judge-audit.jsonl`) or under this pytest session's private temp
+    base. A machine-wide command-substring match would also catch a
+    legitimate operator run's judge started mid-suite — and killing that
+    false-parks a live run (PR #93 review F-002) — so only marker-matched
+    processes are ever counted or signalled.
+    """
+    proc = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True
+    )
+    pids: set[int] = set()
+    for line in proc.stdout.splitlines():
+        pid_str, _, cmd = line.strip().partition(" ")
+        if "gauntlet judge serve" not in cmd:
+            continue
+        if any(marker in cmd for marker in owned_markers):
+            pids.add(int(pid_str))
+    return pids
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_leaked_judge_servers(tmp_path_factory):
+    """Fail the session if it leaks a `gauntlet judge serve` process (#85).
+
+    The uv-run wrapper bug orphaned two servers per suite run for months and
+    was invisible to the suite itself — the wrapper exits cleanly, so nothing
+    reported the leak. Diff this suite's OWN live server PIDs across the
+    session so a regression cannot hide again; kill any owned survivor so a
+    failure here does not itself accumulate orphans. Never touches processes
+    whose audit path is not this suite's (see :func:`_judge_serve_pids`).
+    """
+    owned = (
+        str(_REPO_ROOT / ".gauntlet" / "test-judge-audit.jsonl"),
+        str(tmp_path_factory.getbasetemp()),
+    )
+    before = _judge_serve_pids(owned)
+    yield
+    leaked = _judge_serve_pids(owned) - before
+    for pid in leaked:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    assert not leaked, (
+        f"integration session leaked `gauntlet judge serve` PIDs {sorted(leaked)} "
+        "(killed); a fixture is terminating a wrapper instead of the process group"
+    )
 
 
 @pytest.fixture(autouse=True)

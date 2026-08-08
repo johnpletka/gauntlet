@@ -108,8 +108,22 @@ phase pass. If a test is wrong, fix the test in a separate commit with
 justification.
 
 Integration tests that require live CLI credentials are marked
-`@pytest.mark.integration`. CI runs `pytest -m "not integration"`. You run
-the integration suite locally before every review handoff.
+`@pytest.mark.integration`. CI runs `pytest -m "not integration"`. The
+integration suite is risk-tiered (#81); the three multi-hour live-pipeline
+e2e tests carry the additional `@pytest.mark.live_pipeline` marker:
+
+- **Fast tier — before every review handoff:**
+  `uv run pytest -m "integration and not live_pipeline"` (~15 min). This is
+  the default meaning of "run the integration suite". It keeps every
+  CLI-contract, provider, judge, sandbox, and suspend/resume test — the
+  coverage that watches for CLI drift never has a tier that skips it.
+- **Full tier — where it earns its ~2 h cost:** `uv run pytest -m
+  integration`. Required before any PR to `main`, and for any phase that
+  touches `engine/cycle.py`, `engine/steptypes.py`, `pipelines/`,
+  `prompts/`, or `src/gauntlet/adapters/`.
+- **Layout/lifecycle phases:** additionally prefer a targeted dogfood
+  `gauntlet run` in the mode under change — the e2e fixtures run
+  `same_tree` and structurally cannot see dedicated-worktree defects.
 
 ### What to decide vs. what to ask
 **Decide yourself:** module layout, library choices within the constraints in
