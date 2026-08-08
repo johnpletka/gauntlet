@@ -530,3 +530,43 @@ def test_asset_context_includes_tail_of_oversized_asset(tmp_path: Path):
     ctx = R._asset_context(repo, ".")
     assert "omitted" in ctx and "TAIL" in ctx
     assert "final corpus line" in ctx
+
+
+def test_regeneration_merges_never_replaces(tmp_path: Path):
+    """PR #93 review F-003: a retry can only repair the rejected proposals.
+    Already-valid proposals survive a retry that omits them, and a retry
+    returning an empty array keeps the rejected originals as invalid
+    evidence — the proposal set never silently shrinks."""
+    repo = _retro_repo(tmp_path)
+    good = _capture_diff(
+        repo, "prompts/triage.md",
+        (repo / "prompts/triage.md").read_text() + "\nAn extra rubric line.\n",
+    )
+    valid_item = {"slug": "keep-me", "target_path": "prompts/triage.md",
+                  "rationale": "valid from attempt 1", "diff": good}
+    stale_item = {"slug": "never-applies", "target_path": "prompts/triage.md",
+                  "rationale": "always stale", "diff": _stale_diff()}
+
+    def empty_on_reask(adapter, prompt, cwd):
+        if "REJECTED PROPOSALS" in prompt:
+            adapter.structured = {"proposals": []}  # model drops everything
+
+    triage = FakeAdapter(
+        text="{}", structured={"proposals": [valid_item, stale_item]},
+        on_run=empty_on_reask,
+    )
+    adapters = {
+        "builder": FakeAdapter(text="b."),
+        "reviewer": FakeAdapter(text="r."),
+        "triage": triage,
+    }
+    status, man, run_dir = _run_retro(repo, adapters)
+    assert status == M.RUN_DONE
+
+    props = {p.slug: p for p in P.list_proposals(run_dir / "retro" / "proposals")}
+    assert set(props) == {"keep-me", "never-applies"}
+    assert props["keep-me"].valid and props["keep-me"].status == P.PENDING
+    assert not props["never-applies"].valid
+    assert props["never-applies"].status == P.INVALID
+    # bounded: initial ask + the full retry budget (empty replies never converge)
+    assert len(triage.calls) == 1 + R._PROPOSAL_REGEN_RETRIES

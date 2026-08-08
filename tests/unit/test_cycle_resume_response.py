@@ -127,7 +127,7 @@ def test_reject_gate_redrives_upstream_cycle_with_note(cycle_repo):
     assert cyc.status == M.PARKED
     assert cyc.parked_reason == M.PARKED_REASON_RESPONSE
     assert "vacuous convergence" in (cyc.notes or "")
-    assert cyc.vacuous_parks == 1
+    assert cyc.vacuous_park_response_attempt == 1
     # The note is injected into the cycle as an audited decision that stamped
     # the artifact fingerprint the guard compared against.
     assert len(cyc.human_responses) == 1
@@ -278,8 +278,12 @@ def test_vacuous_convergence_guard(tmp_path):
             record=record, artifacts={"prd.md": art}, artifact_root=tmp_path
         )
 
-    resp = _response("fix items 1-7")
-    resp = resp.model_copy(update={"artifact_fingerprint": fp})
+    def _resp_with_fp(text, *, ordinal, fingerprint):
+        return _response(text, ordinal=ordinal).model_copy(
+            update={"artifact_fingerprint": fingerprint}
+        )
+
+    resp = _resp_with_fp("fix items 1-7", ordinal=1, fingerprint=fp)
     rec = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[resp])
 
     # 1. unchanged artifact + zero findings → fail-closed response park
@@ -287,24 +291,48 @@ def test_vacuous_convergence_guard(tmp_path):
     assert first is not None and first.status == "parked"
     assert first.parked_reason == M.PARKED_REASON_RESPONSE
     assert "vacuous convergence" in first.notes
-    assert rec.vacuous_parks == 1
+    assert rec.vacuous_park_response_attempt == 1
+    assert rec.vacuous_park_fingerprint == fp
 
-    # 2. re-affirmed (vacuous_parks >= 1) → converge with a recorded warning
+    # 2. the DIRECT reply (attempt 2), artifact still identical → converge
+    # with a recorded warning
+    rec.human_responses.append(
+        _resp_with_fp("proceed unchanged", ordinal=2, fingerprint=fp)
+    )
     second = _vacuous_convergence_result(_ctx(rec), step, 1)
     assert second is not None and second.status == "done"
     assert "WARNING" in second.notes and "unchanged" in second.notes
 
-    # 3. artifact revised since the response → guard stands down
+    # 3. a LATER, independent rejection (attempt 3) is never covered by the
+    # earlier re-affirmation — fresh fail-closed park, marker re-anchored
+    # (PR #93 review F-001: the bypass must not be a standing latch).
+    rec.human_responses.append(
+        _resp_with_fp("new defect list", ordinal=3, fingerprint=fp)
+    )
+    third = _vacuous_convergence_result(_ctx(rec), step, 1)
+    assert third is not None and third.status == "parked"
+    assert rec.vacuous_park_response_attempt == 3
+
+    # 4. a direct reply that FOLLOWS a revision of the artifact stands the
+    # guard down — genuine convergence, no warning
     art.write_text("REVISED BODY\n")
+    revised_fp = hashlib.sha256(art.read_bytes()).hexdigest()
+    rec.human_responses.append(
+        _resp_with_fp("revised as asked", ordinal=4, fingerprint=revised_fp)
+    )
+    assert _vacuous_convergence_result(_ctx(rec), step, 1) is None
+
+    # 5. artifact revised since the pending response → guard stands down
+    art.write_text("REVISED AGAIN\n")
     fresh = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[resp])
     assert _vacuous_convergence_result(_ctx(fresh), step, 1) is None
 
-    # 4. no fingerprint (pre-#79 response) → guard stands down
+    # 6. no fingerprint (pre-#79 response) → guard stands down
     old = StepRecord(
         id="cycle", type="adversarial_cycle", human_responses=[_response("X")]
     )
     assert _vacuous_convergence_result(_ctx(old), step, 1) is None
-    # 5. code_review mode has no governed artifact → guard stands down
+    # 7. code_review mode has no governed artifact → guard stands down
     assert _vacuous_convergence_result(
         _ctx(rec), {"mode": "code_review"}, 1
     ) is None

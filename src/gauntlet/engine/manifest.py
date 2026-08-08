@@ -425,13 +425,14 @@ class StepRecord(BaseModel):
     # of these is P3.
     retry_after_s: int | None = None
     quota_reset_at: str | None = None
-    # Count of vacuous-convergence fail-closed parks on this step (#79): a
-    # response re-drive that converged with zero findings while the governed
-    # artifact stayed byte-identical to the response checkpoint. The first such
-    # convergence parks for response; once the operator re-affirms (>= 1), the
-    # next one proceeds with a recorded warning instead of looping the park.
-    # Additive with default 0, so older manifests load unchanged.
-    vacuous_parks: int = 0
+    # Vacuous-convergence guard state (#79): the response_attempt and artifact
+    # fingerprint of the LAST fail-closed vacuous park on this step. The
+    # proceed-with-warning bypass applies ONLY to the direct reply to that park
+    # (attempt + 1) with the artifact still byte-identical — never as a
+    # standing latch, so a later, independent gate rejection gets a fresh
+    # fail-closed park (PR #93 review F-001). Additive/nullable.
+    vacuous_park_response_attempt: int | None = None
+    vacuous_park_fingerprint: str | None = None
     # Which adversarial_cycle sub-step produced the preserved ``session_id`` on a
     # usage-limit park (FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``. Current-state
     # like ``parked_reason`` — set on a usage-limit park, cleared on any other

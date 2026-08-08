@@ -2209,10 +2209,14 @@ def _vacuous_convergence_result(
     cycle is artifact-mode, the pending response carries an artifact
     fingerprint, and the artifact's bytes still match it (nothing was revised
     since the response was recorded). The first such convergence parks for
-    response; if the operator re-affirms and it happens again
-    (``vacuous_parks >= 1``), the cycle proceeds with a loud recorded warning
-    instead of looping the park — "proceed unchanged" is a decision the
-    operator is entitled to make, once warned.
+    response; the DIRECT reply to that park (the next response_attempt, with
+    the artifact still byte-identical to the park) proceeds with a loud
+    recorded warning instead of looping the park — "proceed unchanged" is a
+    decision the operator is entitled to make, once warned. The bypass is
+    scoped, never a standing latch (PR #93 review F-001): a later,
+    independent rejection/response on this step gets a fresh fail-closed
+    park, and a reply that follows a revision of the artifact stands the
+    guard down entirely (genuine convergence, no warning).
 
     Returns ``None`` to let the normal converged-DONE result stand.
     """
@@ -2232,7 +2236,12 @@ def _vacuous_convergence_result(
         return None  # unreadable artifact surfaces via its own validation path
     if current_fp != recorded_fp:
         return None  # the artifact WAS revised: genuine convergence
-    if ctx.record.vacuous_parks >= 1:
+    warned_attempt = ctx.record.vacuous_park_response_attempt
+    if warned_attempt is not None and pending.response_attempt == warned_attempt + 1:
+        if recorded_fp != ctx.record.vacuous_park_fingerprint:
+            # Revised between the warning park and this reply: the reviewer
+            # verified the revised artifact — genuine convergence, no warning.
+            return None
         return StepResult(
             status=DONE,
             notes=(
@@ -2242,7 +2251,8 @@ def _vacuous_convergence_result(
                 "findings raised — proceeding on the operator's re-affirmation"
             ),
         )
-    ctx.record.vacuous_parks += 1
+    ctx.record.vacuous_park_response_attempt = pending.response_attempt
+    ctx.record.vacuous_park_fingerprint = recorded_fp
     return StepResult(
         status=PARKED,
         parked_reason=M.PARKED_REASON_RESPONSE,

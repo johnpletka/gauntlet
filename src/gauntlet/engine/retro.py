@@ -565,20 +565,33 @@ def _generate_proposals(
     # persisted per attempt, spend accounted, fail-closed at exhaustion (the
     # surviving invalid proposals are still materialized as visible evidence).
     for regen in range(1, _PROPOSAL_REGEN_RETRIES + 1):
-        rejected = [
-            (item, reason)
-            for item in items
-            for _, ok, reason in [validate_item(ctx.repo_root, item, ctx.config.asset_root)]
-            if not ok
-        ]
-        if not rejected or not items:
+        kept: list[dict] = []
+        rejected: list[tuple[dict, str]] = []
+        for item in items:
+            _, ok, reason = validate_item(ctx.repo_root, item, ctx.config.asset_root)
+            (kept.append(item) if ok else rejected.append((item, reason)))
+        if not rejected:
             break
         retry_prompt = prompt + _regen_feedback(ctx, rejected, attempt=regen)
         result = _run_sub(
             ctx, proposer, retry_prompt, schema=schema, usage=usage,
             logger=logger, structured_name=f"proposals.regen{regen}.json",
         )
-        items = list((result.structured or {}).get("proposals") or [])
+        # Merge, never replace (PR #93 review F-003): the retry is asked for
+        # corrections of the REJECTED proposals only, matched back by slug.
+        # Already-valid proposals are retained verbatim (a fresh model call
+        # cannot be trusted to re-emit them), a rejected proposal the retry
+        # omits keeps its original bytes as invalid evidence, and stray
+        # additions with unknown slugs are dropped — a retry can only repair,
+        # never silently shrink or grow the proposal set.
+        corrections = {
+            c.get("slug"): c
+            for c in (result.structured or {}).get("proposals") or []
+            if c.get("slug")
+        }
+        items = kept + [
+            corrections.get(item.get("slug"), item) for item, _ in rejected
+        ]
     proposals_dir = ctx.run_dir / "retro" / "proposals"
     return materialize_proposals(
         ctx.repo_root, proposals_dir, items,
@@ -600,11 +613,13 @@ def _regen_feedback(
 
     lines = [
         f"\n\n--- REJECTED PROPOSALS (attempt {attempt}) ---\n",
-        "The proposals below failed deterministic validation and were NOT "
-        "recorded. Re-emit the COMPLETE corrected proposals array (keep any "
-        "proposal not listed here unchanged; correct or drop each one that "
-        "is). Rebuild every corrected diff from the verbatim current asset "
-        "text included below — do not reuse your previous context lines.\n",
+        "The proposals below failed deterministic validation. Re-emit ONLY "
+        "these rejected proposals, corrected — each keeping its EXACT slug "
+        "(the slug is the merge key; a changed or missing slug discards the "
+        "correction). Proposals not listed here are already recorded and "
+        "must NOT be re-emitted. Rebuild every corrected diff from the "
+        "verbatim current asset text included below — do not reuse your "
+        "previous context lines.\n",
     ]
     targets: list[str] = []
     for item, reason in rejected:
