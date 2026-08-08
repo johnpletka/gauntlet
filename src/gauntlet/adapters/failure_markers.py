@@ -28,6 +28,7 @@ from typing import Any
 
 from gauntlet.adapters.base import (
     FAILURE_TERMINAL,
+    FAILURE_TRANSIENT_DEPENDENCY,
     FAILURE_TRANSIENT_OVERLOAD,
     FAILURE_TRANSIENT_USAGE_LIMIT,
     FailureInfo,
@@ -108,6 +109,28 @@ CLAUDE_RULES: tuple[MarkerRule, ...] = (
         fixture="claude/overload.json",
         real_capture=True,
     ),
+    # P5 (plan §5.2): typed transport/dependency phrasings in the pinned
+    # ``result`` field. Deliberately NARROW: the real-captured
+    # "Connection closed mid-response" envelope stays TERMINAL (a truncated,
+    # partially-consumed response is not a clean pre-response transport fault)
+    # — that negative pin is contract-tested and this rule must not absorb it.
+    MarkerRule(
+        name="claude_dependency_message",
+        adapter="claude-code",
+        field="result",
+        rule="regex",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=(
+            r"request timed out",
+            r"fetch failed",
+            r"network error",
+            r"ECONNREFUSED",
+            r"ETIMEDOUT",
+            r"getaddrinfo",
+        ),
+        fixture="claude/dependency.json",
+        real_capture=False,  # synthesized: no live capture yet (tracked gap)
+    ),
 )
 
 # --- codex -------------------------------------------------------------------
@@ -155,6 +178,24 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
         fixture="codex/overload.json",
         real_capture=False,  # synthesized: no live overload capture yet
     ),
+    # P5 (plan §5.2): typed transport/dependency phrasings in the pinned
+    # ``error.message`` field.
+    MarkerRule(
+        name="codex_dependency_message",
+        adapter="codex",
+        field="error.message",
+        rule="regex",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=(
+            r"request timed out",
+            r"connection refused",
+            r"network error",
+            r"dns error",
+            r"error sending request",
+        ),
+        fixture="codex/dependency.json",
+        real_capture=False,  # synthesized: no live capture yet (tracked gap)
+    ),
 )
 
 # --- api (LiteLLM) -----------------------------------------------------------
@@ -180,6 +221,31 @@ API_RULES: tuple[MarkerRule, ...] = (
         kind=FAILURE_TRANSIENT_OVERLOAD,
         values=("InternalServerError", "ServiceUnavailableError"),
         fixture="api/overload.json",
+        real_capture=False,  # synthesized descriptor
+    ),
+    # P5 (plan §5.2, issue #63): a LiteLLM timeout raises ``litellm.Timeout``
+    # (class name "Timeout"; some providers surface ``APITimeoutError``). The
+    # fixture is the LIVE envelope from the #63 run (coaching-side-drawer
+    # r1-triage, gauntlet 0.7.0) that was mis-halted terminal.
+    MarkerRule(
+        name="api_timeout",
+        adapter="api",
+        field="exception_class",
+        rule="in",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=("Timeout", "APITimeoutError"),
+        fixture="api/timeout.json",
+        real_capture=True,  # harvested from issue #63's failed run
+    ),
+    # Connection/DNS failures: LiteLLM maps them to ``APIConnectionError``.
+    MarkerRule(
+        name="api_connection",
+        adapter="api",
+        field="exception_class",
+        rule="in",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=("APIConnectionError", "ConnectionError"),
+        fixture="api/connection.json",
         real_capture=False,  # synthesized descriptor
     ),
 )

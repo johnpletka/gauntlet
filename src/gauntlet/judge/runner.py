@@ -9,6 +9,7 @@ from __future__ import annotations
 import secrets
 from pathlib import Path
 
+from gauntlet.engine.config import map_effort
 from gauntlet.judge.classifier import LLMClassifier
 from gauntlet.judge.core import JudgeCore
 from gauntlet.judge.policy import Policy, PolicyEngine
@@ -31,35 +32,50 @@ JUDGE_LLM_MAX_TOKENS = 512
 JUDGE_LLM_REASONING_EFFORT = "minimal"
 
 
+def build_classifier(
+    *, judge_model: str, judge_effort: str | None = None
+) -> LLMClassifier:
+    """Build the exact bounded classifier used by the live judge.
+
+    ``judge_effort`` is the canonical ``judge_llm.effort`` profile value.  An
+    omitted value preserves the pre-issue-83 ``minimal`` default; setting it on
+    the profile lets operators select a model-compatible tier without a code
+    change.  Mapping/validation is shared with every other profile, so an
+    unknown tier fails at config/command startup rather than being silently
+    passed to LiteLLM.
+    """
+    from gauntlet.adapters.api import ApiAdapter
+
+    canonical = judge_effort or JUDGE_LLM_REASONING_EFFORT
+    _kwarg, reasoning_effort, _warning = map_effort("api", canonical)
+    return LLMClassifier(
+        ApiAdapter(
+            model=judge_model,
+            timeout_s=JUDGE_LLM_TIMEOUT_S,
+            max_tokens=JUDGE_LLM_MAX_TOKENS,
+            # No temperature: gpt-5-family models reject any non-default
+            # value. Determinism comes from the rubric, not temp=0.
+            reasoning_effort=reasoning_effort,
+            # A schema-invalid answer fails closed to deny rather than
+            # burning the timeout on retries.
+            max_schema_retries=0,
+        )
+    )
+
+
 def build_core(
     *,
     policy_path: Path,
     audit_path: Path | None = None,
     judge_model: str | None = None,
+    judge_effort: str | None = None,
     repo_root: Path | None = None,
 ) -> JudgeCore:
     engine = PolicyEngine(Policy.load(policy_path))
     classifier = None
     if judge_model:
-        from gauntlet.adapters.api import ApiAdapter
-
-        classifier = LLMClassifier(
-            ApiAdapter(
-                model=judge_model,
-                timeout_s=JUDGE_LLM_TIMEOUT_S,
-                max_tokens=JUDGE_LLM_MAX_TOKENS,
-                # No temperature: gpt-5-family models reject any non-default
-                # value, and litellm's UnsupportedParamsError made EVERY
-                # classifier rung fail closed — verified live and pinned
-                # (notes #26). Determinism comes from the rubric, not temp=0.
-                # "minimal" reasoning keeps verdicts at ~2-3 s — inside the
-                # 5 s single attempt that stays under the 8 s hook timeout
-                # (review F-007 round 2; default effort blew the budget).
-                reasoning_effort=JUDGE_LLM_REASONING_EFFORT,
-                # A schema-invalid answer fails closed to deny rather than
-                # burning the timeout on retries.
-                max_schema_retries=0,
-            )
+        classifier = build_classifier(
+            judge_model=judge_model, judge_effort=judge_effort
         )
     return JudgeCore(
         engine, classifier=classifier, audit_path=audit_path, repo_root=repo_root
@@ -105,6 +121,7 @@ def serve(
     policy_path: Path,
     audit_path: Path | None = None,
     judge_model: str | None = None,
+    judge_effort: str | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     token: str | None = None,
@@ -124,7 +141,7 @@ def serve(
     os.environ[TOKEN_ENV_VAR] = resolved_token
     core = build_core(
         policy_path=policy_path, audit_path=audit_path, judge_model=judge_model,
-        repo_root=repo_root,
+        judge_effort=judge_effort, repo_root=repo_root,
     )
     app = create_app(core, token=resolved_token, expected_run_id=run_id)
     print(f"gauntlet judge listening on http://{host}:{port}")
@@ -146,6 +163,7 @@ def serve(
 
 
 __all__ = [
+    "build_classifier",
     "build_core",
     "classifier_status_message",
     "generate_token",

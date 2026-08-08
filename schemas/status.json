@@ -3,7 +3,7 @@
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -41,6 +41,8 @@
     "current_step_freshness",
     "suspension",
     "gate",
+    "projection",
+    "worktree",
     "steps",
     "next_actions"
   ],
@@ -79,9 +81,10 @@
         "interrupted",
         "done",
         "aborted",
-        "unknown"
+        "unknown",
+        "parked_provider_unavailable"
       ],
-      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor)."
+      "description": "The computed composite run-state class (§6.3) — a total function of (run_status x driver liveness x descriptor). `parked_provider_unavailable` (recovery-redesign P5, plan §5.2) was APPENDED additively: a transport/dependency park after the bounded persisted retries; a plain `resume` retries after the recorded deadline."
     },
     "current_step": {
       "type": ["string", "null"],
@@ -117,7 +120,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["reset_at"],
-      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time) or a usage_window park (projected replenishment time); null otherwise.",
+      "description": "Provider usage-window reset info (harness-efficiency FR-7.1/FR-10.3), non-null only when parked on a usage_limit park (provider reset time), a usage_window park (projected replenishment time), or a provider_unavailable park (the recorded backoff/Retry-After retry deadline, recovery-redesign P5); null otherwise.",
       "properties": {
         "reset_at": {
           "type": ["string", "null"],
@@ -155,7 +158,7 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["step_id", "type", "reason"],
-      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid}, else null (enforced by the state-coupling allOf below).",
+      "description": "Present (object) iff state in {parked_gate, parked_for_response, parked_usage_limit, parked_usage_window, parked_artifact_invalid, parked_provider_unavailable}, else null (enforced by the state-coupling allOf below).",
       "properties": {
         "step_id": {
           "type": "string",
@@ -163,13 +166,13 @@
         },
         "type": {
           "type": "string",
-          "enum": ["human_gate", "agent_task", "adversarial_cycle"],
-          "description": "The parked step's type."
+          "enum": ["human_gate", "agent_task", "adversarial_cycle", "phase_lint", "shell", "commit", "acceptance_gate", "retrospective"],
+          "description": "The parked step's type. `phase_lint` and the remaining built-in types were APPENDED additively by recovery-redesign P5: a plan/lint defect now parks artifact_invalid on the responsible step (plan §5.1), and a drive-level plan-parse park lands on the step the stage walk stopped at, whatever its type."
         },
         "reason": {
           "type": "string",
-          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate"],
-          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
+          "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", "provider_unavailable"],
+          "description": "Normalized PRD park reason (harness-efficiency FR-7.2): `gate` for a human_gate; `response` for a builder UPSTREAM CONFLICT or a cycle escalation (agent_task vs adversarial_cycle recovered from `type`); `usage_limit` for a provider usage-limit park; `provider_unavailable` (APPENDED by recovery-redesign P5, plan §5.2) for a transport/dependency park after the bounded persisted retries — plain-resumable, never `--response`. Legacy on-disk values (upstream_conflict/cycle_escalation) and a pre-P3 null gate reason are mapped to this enum on read and never emitted verbatim."
         }
       }
     },
@@ -332,13 +335,71 @@
         }
       }
     },
+    "worktree": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["mode", "path", "registered", "present", "locked_reason", "prunable", "head"],
+      "description": "Which tree this run's agents edit (recovery-redesign P7c, spike \u00a76.2/\u00a713). Always present. `mode` is resolved from EVIDENCE and from what the run recorded at birth, never from the live `worktree.mode` config \u2014 flipping that config never moves an existing run (spike \u00a710: a pre-P7 run is never auto-migrated, and never wedged). A `same_tree` run reports mode `same_tree` with every other field null/false: it drives the operator's own checkout, which is the pre-P7 layout, the mode of every run started before P7c, and \u2014 since P7g made `dedicated` the default \u2014 an explicitly-selected fallback rather than the norm. A `dedicated` run reports the derived worktree path, `<main-worktree>/.gauntlet/worktrees/<slug>/<run-id>` (relocated out of the git directory by P7e). `registered` is whether git's worktree administration knows the tree; `present` is whether it is actually on disk \u2014 registered-but-absent is spike \u00a711 row 2 (the tree was swept or deleted while the branch ref and the journal survived) and is recreatable from refs plus journal state. `prunable` carries git's own reason string for that case. `locked_reason` is the `git worktree lock --reason` marker held for the life of a live run, which is the only thing that stops another run's prune from removing this run's admin entry. Observed facts only \u2014 never a recommendation; actions belong in next_actions.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["same_tree", "dedicated"],
+          "description": "The tree layout this run drives in."
+        },
+        "path": {
+          "type": ["string", "null"],
+          "description": "Absolute path of the run worktree; null for a `same_tree` run or a `dedicated` run with no registered tree."
+        },
+        "registered": {
+          "type": "boolean",
+          "description": "Whether `git worktree list` registers a worktree for this run's branch."
+        },
+        "present": {
+          "type": "boolean",
+          "description": "Whether the registered worktree is actually on disk."
+        },
+        "locked_reason": {
+          "type": ["string", "null"],
+          "description": "The `git worktree lock --reason` text, or null when unlocked."
+        },
+        "prunable": {
+          "type": ["string", "null"],
+          "description": "Git's own reason string when the admin entry is prunable (spike \u00a711 row 2), else null."
+        },
+        "head": {
+          "type": ["string", "null"],
+          "description": "The worktree's HEAD SHA as git reports it, or null."
+        }
+      }
+    },
+    "projection": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["health", "journal_seq", "rebuild_pending"],
+      "description": "Journal-vs-projection agreement (recovery-redesign P6, plan §4.6/R8): the append-only run journal is the authoritative state and manifest.json is its regenerated projection. Always present; null when the on-disk projection matches the journal head (or the run predates the journal). Non-null names the divergence: `stale` (an older journaled state — a kill window or a branch reset; the next mutating command catches it up from the journal head), `unjournaled` (a state the journal has never recorded — an out-of-band write: a branch reset onto a pre-journal committed manifest, a stale driver, or a hand-edit; the next mutating command preserves those bytes as evidence and restores the journal head, never adopting them as authority), or `corrupt`/`missing` (the next mutating command rebuilds the projection from the journal head, preserving the malformed original as recovery evidence — plan §5.5). Advisory: drives no automatic action.",
+      "properties": {
+        "health": {
+          "type": "string",
+          "enum": ["stale", "unjournaled", "corrupt", "missing"],
+          "description": "How the on-disk projection diverges from the journal head."
+        },
+        "journal_seq": {
+          "type": ["integer", "null"],
+          "description": "The journal head's monotonic sequence number (the authoritative state), or null when unavailable."
+        },
+        "rebuild_pending": {
+          "type": "boolean",
+          "description": "true when the next mutating command will rewrite manifest.json from the journal head (catch-up or full rebuild with evidence preservation)."
+        }
+      }
+    },
     "steps": {
       "type": "array",
       "description": "Authoritative ordered step list.",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason"],
+        "required": ["id", "iteration", "status", "duration_s", "notes", "halt_reason", "parked_reason", "recovery_cause", "recovery_disposition", "judge_tool_calls"],
         "properties": {
           "id": {"type": "string", "description": "Step id."},
           "iteration": {
@@ -374,8 +435,28 @@
           },
           "parked_reason": {
             "type": ["string", "null"],
-            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", null],
-            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim."
+            "enum": ["usage_limit", "usage_window", "artifact_invalid", "response", "gate", "provider_unavailable", null],
+            "description": "Normalized PRD park reason (harness-efficiency FR-7.2) on a PARKED step; null otherwise. DISJOINT from halt_reason. Legacy on-disk values are mapped to this enum on read, never emitted verbatim. `provider_unavailable` was APPENDED by recovery-redesign P5 (plan §5.2)."
+          },
+          "recovery_cause": {
+            "type": ["string", "null"],
+            "enum": ["none", "provider_unavailable", "quota_exhausted", "process_lost", "artifact_invalid", "precondition_unsatisfied", "worktree_partial", "branch_ahead", "branch_diverged", "state_inconsistent", "policy_denied", "internal_error", null],
+            "description": "Orthogonal recovery cause (recovery-redesign plan §4.1, APPENDED by P5): WHY this step needs recovery, stamped by the engine on every terminal/parked outcome from the outcome's own evidence. null on non-terminal steps and on manifests predating P5."
+          },
+          "recovery_disposition": {
+            "type": ["string", "null"],
+            "enum": ["continue", "retry", "resume_session", "edit_then_retry", "restart_from_checkpoint", "adopt_commits", "snapshot_and_restart", "restore_snapshot", "continue_on_recovery_branch", "rebuild_projection", "human_decision", "abort_only", null],
+            "description": "Orthogonal recovery disposition (recovery-redesign plan §4.1, APPENDED by P5): WHAT recovery strategy applies, stamped alongside recovery_cause. null on non-terminal steps and on manifests predating P5."
+          },
+          "judge_tool_calls": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allowed", "denied"],
+            "description": "Pre-execution judge authorization counts for the step's current agent invocation (issue #83). These are allow/deny decisions, not inferred post-execution success. Zeroes mean no judged tool calls were observed.",
+            "properties": {
+              "allowed": {"type": "integer", "minimum": 0},
+              "denied": {"type": "integer", "minimum": 0}
+            }
           }
         }
       }
@@ -434,7 +515,7 @@
       "description": "parked is an object iff the composite state is a parked class, else null.",
       "if": {
         "properties": {
-          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid"]}
+          "state": {"enum": ["parked_gate", "parked_for_response", "parked_usage_limit", "parked_usage_window", "parked_artifact_invalid", "parked_provider_unavailable"]}
         }
       },
       "then": {"properties": {"parked": {"type": "object"}}},

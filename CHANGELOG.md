@@ -6,6 +6,38 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**Recover, rollback, and the interrupted park now reconcile a branch left
+ahead of the manifest (#72).** `gauntlet recover` on a builder that had
+committed wip but never flushed the manifest left the branch ahead of the
+manifest's last recorded commit — then every sanctioned path deadlocked:
+`resume` re-parked, `rollback` refused on the FR-9.9 divergence guard, and the
+only escape was the exact `git reset --hard` the docs and harness forbid (the
+`scheduled-restart` run died this way). Three coordinated changes: `recover`
+now always snapshots the killed branch tip to a backup ref
+(`refs/gauntlet/backup/<run_id>/recover-…`) and records the tip + unmanifested
+range on the §6.4 audit record with a warning naming the ways out; `rollback`
+absorbs a tip that is a strict *descendant* of the last recorded commit
+(backed up first, absorption recorded as a warning) while still refusing
+genuine forks; and `gauntlet resume --reset-interrupted` gives the
+interrupted-park a native one-shot resolution — back up the partial work,
+rewind only to the latest committed `P<N> wip:` checkpoint, re-run cleanly —
+which the park message and `status` next-actions now name. Also:
+`interrupted_step` is finally validated (`park|reset_to_base`; a typo used to
+silently mean `park`), and the operator playbook documents rollback for the
+first time. Hardened per PR #77 review: rollback now takes the worktree lock
+and verifies + checks out the run branch explicitly before any guard reads a
+SHA (bare HEAD under the absorb tier would have hard-reset a checked-out
+merged `main`); every rewind site (interrupted reset, conflict-park restore,
+rollback, the cycle's fix-resume and mutation reverts) carries uncommitted
+edits and deletions to human-owned excluded files (`PR.md`) across the reset,
+and includes that state in the durable backup ref — they are hidden from the
+dirty checks by policy, but `reset --hard` is not policy-scoped. A cross-branch
+rollback now refuses with an actionable guard before checkout when such local
+state exists; and the recover reconciliation is best-effort end-to-end (a
+failing `update-ref`/`log` degrades to a warning, never blocks the kill/audit
+finalization). Regression tests replay the incident at the recover, rollback,
+and full-stack resume level.
+
 **Plan reviews now sweep the PRD requirement by requirement, and can actually
 see it (#80).** A plan-cycle review of a 12-phase plan produced nine genuine
 findings and converged; a human then found four majors it had missed, all the

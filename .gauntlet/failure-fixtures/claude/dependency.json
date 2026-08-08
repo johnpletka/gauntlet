@@ -1,0 +1,6 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "result": "API Error: Request timed out."
+}

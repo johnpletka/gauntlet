@@ -26,7 +26,8 @@ from gauntlet.engine.collectors import (
     run_bounded_enumeration,
 )
 from gauntlet.engine.config import RunConfig
-from gauntlet.engine.execution import DONE, HALTED, StepContext
+from gauntlet.engine.execution import DONE, HALTED, PARKED, StepContext
+from gauntlet.engine import manifest as M
 from gauntlet.engine.manifest import (
     HALT_REASON_PRECONDITION,
     Manifest,
@@ -137,8 +138,12 @@ def test_phase_lint_parks_on_clause_less_phase(fixture_repo):
     step = Step.model_validate({"id": "plan-lint", "type": "phase_lint",
                                 "artifact": "plan.md"})
     result = handle_phase_lint(step, ctx)
-    assert result.status == HALTED
-    assert result.halt_reason == HALT_REASON_PRECONDITION
+    # P5 (plan §5.1, issue #64): an artifact defect parks artifact_invalid
+    # (validator + diagnostic + content fingerprint) instead of a bare HALTED.
+    assert result.status == PARKED
+    assert result.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert result.revalidation is not None
+    assert result.revalidation.validator == "phase_lint"
     assert "acceptance" in result.notes and "P1" in result.notes
 
 
@@ -504,6 +509,39 @@ def test_resolve_command_derives_from_pytest_shaped_test_command():
     cfg = _cfg(test_command="uv run pytest")
     assert collectors.resolve_command(collector, cfg) == (
         "uv", "run", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider")
+
+
+@pytest.mark.parametrize(
+    "test_command",
+    [
+        "uv run pytest -q",
+        "uv run pytest --quiet --collect-only",
+        "uv run pytest -p no:cacheprovider -q",
+    ],
+)
+def test_resolve_command_normalizes_collector_owned_pytest_flags(test_command):
+    """Collection owns output-shaping flags and emits each exactly once.
+
+    Pytest interprets two quiet flags as ``-qq`` and suppresses node ids, so
+    blindly appending ``-q`` to a project command can make a valid suite fail
+    closed as unparseable.
+    """
+    collector = collectors.get_collector("pytest")
+    command = collectors.resolve_command(collector, _cfg(test_command=test_command))
+    assert command == (
+        "uv", "run", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider")
+
+
+def test_resolve_command_preserves_project_environment_arguments():
+    collector = collectors.get_collector("pytest")
+    command = collectors.resolve_command(
+        collector,
+        _cfg(test_command="uv run --with pytest pytest -q"),
+    )
+    assert command == (
+        "uv", "run", "--with", "pytest", "pytest",
+        "--collect-only", "-q", "-p", "no:cacheprovider",
+    )
 
 
 def test_resolve_command_falls_back_when_test_command_is_not_pytest():

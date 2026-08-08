@@ -33,3 +33,23 @@ string into a URL-safe "slug" so titles can be used in paths and filenames.
 `slugify("Hello, World!") == "hello-world"`;
 `slugify("  --Already-Sluggish-- ") == "already-sluggish"`;
 `slugify("") == ""`; `slugify("!!!") == ""`. Unit tests cover each FR.
+
+## 5. Delivery constraint
+
+The implementation plan contains exactly one implementation phase. This fixture
+is intentionally atomic so the required live end-to-end gate exercises the full
+PRD review, plan review, implementation, review/fix/confirm, phase gate,
+retrospective, and PR-draft path without making its runtime depend on how a model
+chooses to subdivide five small functional requirements.
+
+Because no later implementation phase exists, the P1 phase commit records
+`Deferrals: none`. Optional future product ideas remain non-goals; they must not
+be represented as deferrals to invented phase identifiers.
+
+The machine-readable P1 acceptance clauses cover product behavior that the
+builder can prove with pytest before the pipeline creates the phase commit.
+Post-commit facts—commit count/message, history shape, final worktree
+cleanliness, and phase diff scope—remain owned by the standard pipeline's commit
+and phase gates; they must not be repeated as pytest-mapped P1 acceptance
+clauses. Gauntlet evidence under `runs/` (including `artifacts/acceptance-map.json`)
+is engine bookkeeping, not a slugify product deliverable.

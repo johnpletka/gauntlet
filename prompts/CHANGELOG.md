@@ -20,3 +20,9 @@ apply, so the file reads oldest-first.
   that conflicts do not consume the retry budget. Adds the `resume-disposition`
   schema as the structured test oracle, bound invocation-locally on a `--response`
   resume so the approved pipeline definition is not mutated (FR-4.1).
+
+- **proposal-synthesis.md** (recovery redesign P1 review fix, FR-6.3): require
+  complete numeric unified-diff hunk headers and exact asset context. Proposal
+  materialization now canonicalizes only the redundant hunk-count arithmetic
+  before the existing deterministic `git apply --check` gate, while preserving
+  the raw model response and rejecting incomplete structure fail-closed.

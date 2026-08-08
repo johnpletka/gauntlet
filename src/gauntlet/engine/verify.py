@@ -56,7 +56,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from gauntlet.engine import gitops
+from gauntlet.engine import gitops, repolock
 from gauntlet.judge.hook_client import (
     DEFAULT_URL as _DEFAULT_JUDGE_URL,
     MODE_ENV_VAR,
@@ -784,8 +784,17 @@ def make_disposable_copy(repo_root: Path, *, parent_dir: Path | None = None) -> 
         raise CopyCreationError(f"verifier: could not create a temp root: {exc}") from exc
     copy = root / "worktree"
     try:
-        gitops.add_worktree(repo_root, copy, "HEAD")
-    except gitops.GitError as exc:
+        # P7b (spike §8.3 layer 2): `worktree add` mutates the SHARED worktree
+        # administration dir, which every linked worktree of this repository
+        # shares — and the drive lock does not cover that, because two linked
+        # worktrees have two different run roots and therefore two independent
+        # drive locks. E9-D shows a lost `worktree add` race leaving debris
+        # behind, so serialize the section repo-globally. Creation uses the
+        # RAISING form: a copy that could not be created must park the sub-step
+        # (FR-2.3), never proceed.
+        with repolock.repo_lock(repo_root, reason="verify:add-disposable-copy"):
+            gitops.add_worktree(repo_root, copy, "HEAD")
+    except (gitops.GitError, repolock.RepoLockError) as exc:
         shutil.rmtree(root, ignore_errors=True)
         raise CopyCreationError(
             f"verifier: disposable worktree copy could not be created: {exc} "
@@ -795,16 +804,41 @@ def make_disposable_copy(repo_root: Path, *, parent_dir: Path | None = None) -> 
 
 
 def discard_disposable_copy(repo_root: Path, copy: DisposableCopy) -> None:
-    """Tear down a disposable copy (best-effort; never raises)."""
-    try:
-        gitops.remove_worktree(repo_root, copy.path)
-    except gitops.GitError:
-        pass
-    shutil.rmtree(copy.root, ignore_errors=True)
-    try:
-        gitops.prune_worktrees(repo_root)
-    except gitops.GitError:
-        pass
+    """Tear down a disposable copy (best-effort; never raises).
+
+    The `prune` here is the reason the repo-global lock exists in P7b: spike
+    E8-C proves `git worktree prune` is repository-wide, so this teardown will
+    remove ANOTHER run's admin entry the moment that run's tree is momentarily
+    missing. Serializing add/remove/prune repo-globally is what keeps two
+    concurrent runs in two linked worktrees from pruning each other.
+
+    Best-effort ACQUISITION (:func:`repolock.repo_lock_best_effort`): this
+    function is contractually non-raising, so it must not turn an unobtainable
+    repo lock into a failed sub-step. But it must not run the shared-git
+    mutations unlocked either (review F-004) — doing so would reproduce E8-C at
+    exactly the moment the lock exists to prevent it, since a contended lock
+    means another run is inside its own add/remove/prune section right now.
+
+    So a failed acquisition SKIPS both git calls and removes only our own temp
+    root, which is not shared state. That leaves a `prunable` admin entry
+    behind, which is a benign, self-healing state: the next teardown that does
+    hold the lock prunes it. Leaking an admin entry is strictly safer than
+    pruning the repository concurrently.
+    """
+    with repolock.repo_lock_best_effort(
+        repo_root, reason="verify:discard-copy"
+    ) as acquired:
+        if acquired:
+            try:
+                gitops.remove_worktree(repo_root, copy.path)
+            except gitops.GitError:
+                pass
+        shutil.rmtree(copy.root, ignore_errors=True)
+        if acquired:
+            try:
+                gitops.prune_worktrees(repo_root)
+            except gitops.GitError:
+                pass
 
 
 # The collector-enumeration path is an ENGINE SUBPROCESS in a disposable copy

@@ -1,0 +1,10 @@
+{
+  "events": [
+    {
+      "type": "turn.failed",
+      "error": {
+        "message": "error sending request for url (https://chatgpt.com/backend-api/codex/responses): connection refused"
+      }
+    }
+  ]
+}

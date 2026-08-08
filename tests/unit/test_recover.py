@@ -414,7 +414,8 @@ def test_recover_aborts_when_nonce_changes_before_signal(tmp_path, procs, monkey
         proc_identity=verified.proc_identity,
     )
     reads = iter([verified, changed])  # step 1 capture, then step 3 re-read
-    monkeypatch.setattr(mgr, "_read_lock", lambda: next(reads))
+    # P7b: `_read_lock` takes the run dir (per-run path first, tree guard second).
+    monkeypatch.setattr(mgr, "_read_lock", lambda run_dir=None: next(reads))
 
     with pytest.raises(RecoverConcurrent, match="completed or relaunched"):
         mgr.recover("demo")
@@ -803,3 +804,118 @@ def test_reconcile_cleans_up_intent_when_signal_permission_denied(tmp_path, monk
     man = Manifest.load(run_dir / "manifest.json")
     assert man.status == M.RUN_RUNNING  # not mutated
     assert man.recoveries == []
+
+
+# ---- #72: branch↔manifest reconciliation evidence at finalize ---------------
+
+
+def _intent(pid: int = 4242, **kw) -> _RecoveryIntent:
+    defaults = dict(
+        ts="2026-06-25T16:44:03+00:00",
+        actor="tester",
+        actor_source="os_user",
+        reason=None,
+        lock_nonce="nonce-1",
+        pgid=pid,
+        host=THIS_HOST,
+        step_id="implement",
+        prior_step_status=M.RUNNING,
+        prior_run_status=M.RUN_RUNNING,
+        proc_identity=None,
+    )
+    defaults.update(kw)
+    return _RecoveryIntent(pid=pid, **defaults)
+
+
+def test_finalize_recovery_backs_up_and_records_unmanifested_range(fixture_repo):
+    """#72: recover snapshots the killed branch tip behind a backup ref ALWAYS,
+    and records branch_head + the unmanifested last-recorded..tip range on the
+    §6.4 record, with a warning naming the two sanctioned ways out — never an
+    inexplicable divergence the operator must solve with git surgery."""
+    from conftest import git
+
+    from gauntlet.engine import gitops
+
+    mgr = _mgr(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    (fixture_repo / "f1.py").write_text("phase one\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P1: phase one")
+    p1 = gitops.head_sha(fixture_repo)
+    # The builder committed wip the manifest never heard about (killed before
+    # a flush) — the exact #72 incident shape.
+    (fixture_repo / "wip.py").write_text("committed, unmanifested\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P2 wip: arm the thing")
+    tip = gitops.head_sha(fixture_repo)
+
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_RUNNING, current_step="implement",
+        steps=[StepRecord(id="implement", type="agent_task", status=M.RUNNING)],
+        commits=[M.CommitRecord(step_id="c1", phase="P1", sha=p1)],
+    )
+    man.write_atomic(run_dir / "manifest.json")
+
+    assert mgr._finalize_recovery(run_dir, _intent(), "terminated_sigterm") is True
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.record("implement").status == M.INTERRUPTED
+    rec = man.recoveries[-1]
+    assert rec.branch_head == tip
+    assert rec.unmanifested_range is not None
+    assert "P2 wip: arm the thing" in rec.unmanifested_range
+    assert any("ahead" in w and "--reset-interrupted" in w for w in man.warnings)
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(objectname) %(refname)",
+        "refs/gauntlet/backup/",
+    )
+    assert tip in refs
+    assert "recover-" in refs
+
+
+def test_finalize_recovery_survives_backup_ref_failure(fixture_repo, monkeypatch):
+    """PR #77 review / Copilot: git failures AFTER resolving the branch (a
+    failing update-ref or log) must degrade to a warning — the driver is
+    already dead by finalize time, so the kill/audit path never blocks."""
+    from conftest import git
+
+    from gauntlet.engine import gitops
+
+    mgr = _mgr(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    run_dir.mkdir(parents=True)
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="p", version=1, hash="h"),
+        status=M.RUN_RUNNING, current_step="implement",
+        steps=[StepRecord(id="implement", type="agent_task", status=M.RUNNING)],
+    )
+    man.write_atomic(run_dir / "manifest.json")
+
+    def boom(repo, ref, sha):
+        raise gitops.GitError(["update-ref", ref], 128, "refname broken")
+
+    monkeypatch.setattr(gitops, "create_ref", boom)
+    assert mgr._finalize_recovery(run_dir, _intent(), "terminated_sigterm") is True
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.record("implement").status == M.INTERRUPTED  # finalized anyway
+    assert man.recoveries[-1].branch_head is not None  # what WAS resolved, kept
+    assert any("reconciliation incomplete" in w for w in man.warnings)
+
+
+def test_finalize_recovery_without_git_warns_not_fails(tmp_path):
+    """A git-less run tree (or an unresolvable branch) still finalizes — the
+    kill/audit path must never be held hostage by the backup — but the missing
+    backup ref is a recorded warning, never a silent omission."""
+    mgr = _mgr(tmp_path)
+    run_dir = _setup_run(tmp_path)
+    assert mgr._finalize_recovery(run_dir, _intent(), "already_dead") is True
+    man = Manifest.load(run_dir / "manifest.json")
+    assert man.record("implement").status == M.INTERRUPTED
+    assert man.recoveries[-1].branch_head is None
+    assert man.recoveries[-1].unmanifested_range is None
+    assert any("no backup ref written" in w for w in man.warnings)

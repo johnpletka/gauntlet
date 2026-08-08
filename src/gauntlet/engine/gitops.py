@@ -10,10 +10,12 @@ treated as data (format-validated before it is used — see ``commit_format``).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # Intra-phase checkpoint-commit subject convention (harness-efficiency FR-11.1 /
 # §6): ``P<N> wip: <milestone>``. Matched at fixed field position (the subject
@@ -76,17 +78,336 @@ class GitError(RuntimeError):
         self.stderr = stderr
 
 
-def _run(repo: Path, *args: str, stdin: str | None = None) -> str:
+# --- root scope classification (P7a, spike §9) --------------------------------
+#
+# Every helper here takes a `repo` path, and that single parameter has silently
+# meant three different things since the bootstrap. Once a run gets its own
+# worktree (P7c) the three diverge, and passing the wrong one is invisible in a
+# same-tree test: the operation succeeds, against the wrong tree.
+#
+# So the scope is DATA, not documentation. `tests/unit/test_root_scope.py`
+# parses every `gitops.*` call in the engine and fails when a WORK-scoped helper
+# is handed anything but a work-tree root — and fails when a helper is missing
+# from this table, so the classification cannot silently rot as helpers are
+# added.
+#
+#   WORK   — operates on or observes a WORKING TREE: its index, its HEAD, its
+#            checked-out branch, its file contents. HEAD and the index are
+#            per-worktree (proved in spike E1), so even a read like `head_sha`
+#            is work-scoped: from the operator's checkout it answers about the
+#            operator's branch, not the run's.
+#   REPO   — a property of the REPOSITORY, identical from any worktree: refs,
+#            the object database, the commit graph, diffs between two SHAs.
+#   COMMON — the shared git dir / worktree administration itself.
+ROOT_SCOPE_WORK = "work"
+ROOT_SCOPE_REPO = "repo"
+ROOT_SCOPE_COMMON = "common"
+
+ROOT_SCOPE: dict[str, str] = {
+    # --- WORK: the tree the agent edits and the engine commits in -------------
+    "head_sha": ROOT_SCOPE_WORK,          # per-worktree HEAD
+    "current_branch": ROOT_SCOPE_WORK,    # per-worktree HEAD
+    "status_porcelain": ROOT_SCOPE_WORK,
+    "is_clean": ROOT_SCOPE_WORK,
+    "is_dirty_vs": ROOT_SCOPE_WORK,
+    "dirty_paths_matching": ROOT_SCOPE_WORK,
+    "dirty_paths": ROOT_SCOPE_WORK,
+    "worktree_tree_hash": ROOT_SCOPE_WORK,
+    "diff_head": ROOT_SCOPE_WORK,
+    "diff_worktree_vs": ROOT_SCOPE_WORK,
+    "commit_all": ROOT_SCOPE_WORK,
+    "commit_paths": ROOT_SCOPE_WORK,
+    "commit_run_bookkeeping": ROOT_SCOPE_WORK,
+    "commit_tracked_bookkeeping": ROOT_SCOPE_WORK,
+    "checkout_branch": ROOT_SCOPE_WORK,
+    "checkout_or_create_branch": ROOT_SCOPE_WORK,
+    "recreate_branch": ROOT_SCOPE_WORK,
+    "merge_branch": ROOT_SCOPE_WORK,
+    "merge_abort": ROOT_SCOPE_WORK,
+    "reset_hard": ROOT_SCOPE_WORK,
+    "reset_soft": ROOT_SCOPE_WORK,
+    "unstage": ROOT_SCOPE_WORK,
+    "clean_untracked": ROOT_SCOPE_WORK,
+    "rewind_impl_preserving_bookkeeping": ROOT_SCOPE_WORK,
+    "apply_patch": ROOT_SCOPE_WORK,
+    "apply_patch_check": ROOT_SCOPE_WORK,
+    "git_index_path": ROOT_SCOPE_WORK,    # per-worktree index (spike E1/E7)
+    "is_tracked": ROOT_SCOPE_WORK,        # reads the index
+    "path_is_ignored": ROOT_SCOPE_WORK,
+    "path_is_untracked": ROOT_SCOPE_WORK,
+    "wip_checkpoints": ROOT_SCOPE_WORK,   # walks from the tree's own HEAD
+    "run_with_temp_index": ROOT_SCOPE_WORK,
+    "validate_temp_index_path": ROOT_SCOPE_WORK,
+    "show_toplevel": ROOT_SCOPE_WORK,
+    # --- REPO: identical from any worktree -----------------------------------
+    "is_git_repo": ROOT_SCOPE_REPO,
+    "rev_parse": ROOT_SCOPE_REPO,
+    "branch_exists": ROOT_SCOPE_REPO,
+    "create_branch": ROOT_SCOPE_REPO,   # ref-store only; checks out nothing
+    "delete_branch": ROOT_SCOPE_REPO,
+    "tag_exists": ROOT_SCOPE_REPO,
+    "ref_is_valid_commit": ROOT_SCOPE_REPO,
+    "is_ancestor": ROOT_SCOPE_REPO,
+    "merge_base": ROOT_SCOPE_REPO,
+    "create_ref": ROOT_SCOPE_REPO,
+    "create_ref_exclusive": ROOT_SCOPE_REPO,
+    "delete_ref": ROOT_SCOPE_REPO,
+    "hash_object_write": ROOT_SCOPE_REPO,
+    "cat_file_blob": ROOT_SCOPE_REPO,
+    "object_exists": ROOT_SCOPE_REPO,
+    "mktree": ROOT_SCOPE_REPO,
+    "commit_tree": ROOT_SCOPE_REPO,
+    "commit_subject": ROOT_SCOPE_REPO,
+    "commit_parent": ROOT_SCOPE_REPO,
+    "commit_message": ROOT_SCOPE_REPO,
+    "log_range": ROOT_SCOPE_REPO,
+    "range_diff": ROOT_SCOPE_REPO,
+    "range_diff_path": ROOT_SCOPE_REPO,
+    "diff_range_empty": ROOT_SCOPE_REPO,
+    "any_tracked_at": ROOT_SCOPE_REPO,
+    "file_at_commit": ROOT_SCOPE_REPO,
+    "file_bytes_at_commit": ROOT_SCOPE_REPO,
+    "file_mode_at_commit": ROOT_SCOPE_REPO,
+    "advance_is_engine_bookkeeping": ROOT_SCOPE_REPO,
+    "remote_url": ROOT_SCOPE_REPO,
+    "remote_default_branch": ROOT_SCOPE_REPO,
+    # --- COMMON: the shared git dir / worktree administration ----------------
+    #
+    # Every entry below mutates or reads the ONE worktree administration dir the
+    # whole repository shares, so the root passed in selects the *repository*,
+    # never a tree — any worktree of the repo answers identically (spike E1/E8).
+    # That is also why each of these runs inside the repo-global lock
+    # (`repolock`): the admin dir has no per-worktree isolation to fall back on.
+    "git_common_dir": ROOT_SCOPE_COMMON,
+    "add_worktree": ROOT_SCOPE_COMMON,
+    "add_worktree_branch": ROOT_SCOPE_COMMON,
+    "remove_worktree": ROOT_SCOPE_COMMON,
+    "prune_worktrees": ROOT_SCOPE_COMMON,
+    "lock_worktree": ROOT_SCOPE_COMMON,
+    "unlock_worktree": ROOT_SCOPE_COMMON,
+    "repair_worktree": ROOT_SCOPE_COMMON,
+    "list_worktrees": ROOT_SCOPE_COMMON,
+    "worktree_for_branch": ROOT_SCOPE_COMMON,
+    # Reads `worktree list --porcelain`, which every worktree of a repository
+    # answers identically — that vantage-independence is the whole reason P7e
+    # anchors the derived run-worktree root here rather than on `show_toplevel`,
+    # which is WORK-scoped precisely because it does NOT have it.
+    "main_worktree_root": ROOT_SCOPE_COMMON,
+    # `submodule status` reads the SUPERPROJECT's index and the on-disk
+    # submodule dirs, so it is genuinely a property of one tree — but the tree
+    # it must be asked about is always the RUN worktree (that is the point of
+    # spike §7: the superproject's own checkout has its submodules populated
+    # while a fresh linked worktree does not), so it is work-scoped and the
+    # static audit holds callers to naming a work root.
+    "submodule_status": ROOT_SCOPE_WORK,
+    "uninitialized_submodules": ROOT_SCOPE_WORK,
+}
+
+
+def _run(
+    repo: Path, *args: str, stdin: str | None = None, _env: dict[str, str] | None = None
+) -> str:
     argv = ["git", "-C", str(repo), *args]
     proc = subprocess.run(
         argv,
         input=stdin,
         capture_output=True,
         text=True,
+        env=_env,
     )
     if proc.returncode != 0:
         raise GitError(list(args), proc.returncode, proc.stderr)
     return proc.stdout
+
+
+def _run_bytes(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    """Binary-safe variant of :func:`_run` for object I/O (index bytes, blobs)."""
+    argv = ["git", "-C", str(repo), *args]
+    proc = subprocess.run(argv, input=stdin, capture_output=True)
+    if proc.returncode != 0:
+        raise GitError(
+            list(args), proc.returncode, proc.stderr.decode("utf-8", "replace")
+        )
+    return proc.stdout
+
+
+class TempIndexPathError(ValueError):
+    """A temporary-index path failed the containment validation (fail closed)."""
+
+
+def validate_temp_index_path(repo: Path, index_file: Path) -> None:
+    """Validate a ``GIT_INDEX_FILE`` target before any git command may use it.
+
+    The recovery-snapshot machinery (P2, plan §4.4) is the only sanctioned user
+    of a substitute index. Containment rules, all fail-closed:
+
+    * the path must be absolute — a relative path would resolve against git's
+      cwd, not a location this validation inspected;
+    * it must resolve OUTSIDE the repository worktree — a temp index inside the
+      worktree would itself dirty the tree the snapshot must observe untouched
+      (R3: snapshot creation is observational);
+    * it must resolve OUTSIDE the git dir — nothing under ``.git`` (the real
+      index, refs, packed objects) may ever be the scratch target. BOTH git
+      dirs are checked: in a *linked* worktree ``--absolute-git-dir`` names only
+      that worktree's private admin dir (``.git/worktrees/<name>``), while the
+      real index, refs and object database live in the SHARED
+      ``--git-common-dir``. Checking only the former accepts a scratch path
+      inside the shared ``.git`` — the identical path this same function
+      rejects when called against the main worktree, because there the shared
+      dir happens to sit under the toplevel. The two dirs coincide in a main
+      worktree, so this costs nothing there and closes the gap everywhere else
+      (P7 spike §9.2, experiment E7).
+
+    ``resolve()`` is applied to the parent directory (the leaf may not exist
+    yet) so a symlinked temp path cannot smuggle the file into either tree.
+    """
+    if not index_file.is_absolute():
+        raise TempIndexPathError(
+            f"temporary index path must be absolute: {index_file}"
+        )
+    resolved = index_file.parent.resolve() / index_file.name
+    top = Path(show_toplevel(repo)).resolve()
+    git_dir = Path(_run(repo, "rev-parse", "--absolute-git-dir").strip()).resolve()
+    common_dir = git_common_dir(repo)
+    for forbidden in (top, git_dir, common_dir):
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise TempIndexPathError(
+                f"temporary index path {index_file} resolves inside {forbidden}; "
+                "a substitute index must live outside the worktree and git dir"
+            )
+
+
+def run_with_temp_index(
+    repo: Path, index_file: Path, *args: str, stdin: str | None = None
+) -> str:
+    """Run ONE git command against a validated substitute index file.
+
+    This is the narrow environment extension P2 requires (plan §4.4): the only
+    variable that can be injected is ``GIT_INDEX_FILE``, its value is a path
+    the caller supplies and :func:`validate_temp_index_path` has contained, and
+    the rest of the environment is inherited untouched. There is deliberately
+    no generic "run git with env overrides" surface.
+    """
+    validate_temp_index_path(repo, index_file)
+    env = {**os.environ, "GIT_INDEX_FILE": str(index_file)}
+    return _run(repo, *args, stdin=stdin, _env=env)
+
+
+def git_common_dir(repo: Path) -> Path:
+    """Absolute path of the SHARED git dir (``rev-parse --git-common-dir``).
+
+    In a main worktree this is the same directory ``--absolute-git-dir``
+    reports. In a *linked* worktree the two differ: ``--absolute-git-dir`` is
+    the worktree's private admin dir under ``.git/worktrees/<name>``, and this
+    is the shared dir holding the object database, the refs and the main
+    index. Any containment rule about "the git dir" must consider both.
+
+    ``--git-common-dir`` answers relatively (``.git``) when invoked from a main
+    worktree's top level, so the result is joined onto ``repo`` when it is not
+    already absolute — the same idiom :func:`git_index_path` uses, chosen over
+    ``--path-format=absolute`` so no minimum git version is implied.
+    """
+    out = _run(repo, "rev-parse", "--git-common-dir").strip()
+    path = Path(out)
+    return (path if path.is_absolute() else (repo / path)).resolve()
+
+
+def main_worktree_root(repo: Path) -> Path:
+    """Absolute path of the repository's MAIN worktree, from any vantage point.
+
+    The anchor the run-worktree root is derived from (P7e). It is deliberately
+    not ``rev-parse --show-toplevel``: that answers *the checkout you are
+    standing in*, so an operator driving from their own linked worktree — or
+    anything running inside a run worktree — would derive a different root and
+    the containment rules built on it (``worktree.is_inside_worktrees_root``,
+    the §14.4 refusal, ``_run_tree_excludes``) would stop agreeing with each
+    other. Spike §6.2 got that vantage-independence for free from the shared
+    git common dir; anchoring at the main worktree is how it survives the move
+    out of ``.git/``.
+
+    ``git worktree list --porcelain`` reports the main worktree FIRST — before
+    the linked worktrees, and independently of creation order or of which
+    worktree the command runs from (measured at P7e from the main checkout, an
+    adopter's linked worktree, and a run worktree). For a bare repository the
+    first entry is the bare directory itself, which keeps spike §7's "P7 must
+    not accidentally forbid a bare repo" true.
+
+    Raises :class:`GitError` when the list is unreadable or empty rather than
+    guessing: a wrong answer here relocates every run worktree.
+    """
+    entries = list_worktrees(repo)
+    if not entries:
+        raise GitError(
+            f"`git worktree list` reported no worktrees for {repo}; cannot "
+            "derive the main worktree root"
+        )
+    return entries[0].path.resolve()
+
+
+def git_index_path(repo: Path) -> Path:
+    """Absolute path of the REAL index file (``rev-parse --git-path index``).
+
+    Read-only discovery for the raw-index snapshot: the snapshot hashes these
+    bytes into a blob and never writes them back except during an explicit
+    exact restoration.
+    """
+    out = _run(repo, "rev-parse", "--git-path", "index").strip()
+    path = Path(out)
+    return path if path.is_absolute() else (repo / path)
+
+
+def hash_object_write(repo: Path, data: bytes) -> str:
+    """Store ``data`` as a blob in the object database; return its object id."""
+    return _run_bytes(
+        repo, "hash-object", "-w", "--stdin", stdin=data
+    ).decode().strip()
+
+
+def cat_file_blob(repo: Path, oid: str) -> bytes:
+    """The raw bytes of blob ``oid`` (binary-safe)."""
+    return _run_bytes(repo, "cat-file", "blob", oid)
+
+
+def object_exists(repo: Path, oid: str) -> bool:
+    """True iff ``oid`` names an object present in the object database."""
+    try:
+        _run(repo, "cat-file", "-e", oid)
+        return True
+    except GitError:
+        return False
+
+
+def mktree(repo: Path, entries: list[str]) -> str:
+    """Build a tree object from ``ls-tree``-format entry lines; return its id.
+
+    Entry names in the recovery-snapshot wrapper tree are fixed engine strings
+    (``metadata.json``, ``index.raw``, ``worktree`` …), never model- or
+    user-derived, so the newline format is safe here.
+    """
+    return _run(repo, "mktree", stdin="".join(f"{e}\n" for e in entries)).strip()
+
+
+def commit_tree(
+    repo: Path,
+    tree: str,
+    parents: list[str],
+    message: str,
+    *,
+    identity: Identity,
+) -> str:
+    """Create a commit object for ``tree`` with explicit parents and identity.
+
+    Pure object creation: no ref moves, no checkout, no index or worktree
+    change. The message arrives on stdin, never argv.
+    """
+    args = [
+        "-c", f"user.name={identity.name}",
+        "-c", f"user.email={identity.email}",
+        "commit-tree", tree,
+    ]
+    for parent in parents:
+        args += ["-p", parent]
+    return _run(repo, *args, stdin=message).strip()
 
 
 def is_git_repo(repo: Path) -> bool:
@@ -127,7 +448,11 @@ def _exclude_pathspec(exclude: list[str] | None) -> list[str]:
 
 
 def status_porcelain(
-    repo: Path, *, exclude: list[str] | None = None, untracked_all: bool = False
+    repo: Path,
+    *,
+    exclude: list[str] | None = None,
+    untracked_all: bool = False,
+    paths: list[str] | None = None,
 ) -> str:
     """Porcelain status; empty string means a clean worktree.
 
@@ -148,16 +473,70 @@ def status_porcelain(
     ``.gauntlet/runs/`` before anything under it is tracked, so a path-equality
     check never sees the file. Callers that match on individual paths must pass
     ``untracked_all=True``.
+
+    ``paths`` narrows the report to a repo-relative pathspec. It lets a caller
+    ask about ONE path without string-matching git's own output, which is quoted
+    and rename-aware and therefore parses wrong exactly where it matters least
+    and breaks worst. Combines with ``exclude``; git applies both pathspecs.
     """
     mode = "all" if untracked_all else "normal"
+    scope = ["--", *paths] if paths else []
     return _run(
         repo, "status", "--porcelain", f"--untracked-files={mode}",
-        *_exclude_pathspec(exclude),
+        *_exclude_pathspec(exclude), *scope,
     ).strip()
 
 
 def is_clean(repo: Path, *, exclude: list[str] | None = None) -> bool:
     return status_porcelain(repo, exclude=exclude) == ""
+
+
+def dirty_paths(
+    repo: Path,
+    *,
+    exclude: list[str] | None = None,
+    untracked_all: bool = True,
+) -> list[str]:
+    """Repo-relative paths with any uncommitted state, parsed STRUCTURALLY.
+
+    The safe way to answer "which paths are dirty?". Callers used to slice
+    :func:`status_porcelain`'s text as ``line[3:]``, which is wrong in a way
+    that hides: that function ``.strip()``s the whole report, so when the FIRST
+    entry's status is worktree-only — ``" M"``, ``" D"``, ``" A"``, a leading
+    SPACE, and much the most common kind — the leading space is eaten and
+    ``[3:]`` then eats the first character of the path too. ``runs/toy/prd.md``
+    arrives as ``uns/toy/prd.md``.
+
+    That was not merely cosmetic. :func:`~gauntlet.engine.cycle._only_artifact_dirty`
+    compares the parsed list against the artifact's own path, so a tracked
+    artifact with unstaged edits — the exact state an artifact-mode cycle
+    reviews — never matched, the FR-9.3 baseline commit silently declined, and
+    the round-1 clean-handoff guard failed the run while naming a corrupted
+    path. Only the first entry is affected, so it survived every test whose
+    fixture happened to dirty something else first.
+
+    Uses ``-z`` like :func:`dirty_paths_matching`: NUL-delimited, never quoted,
+    no leading-status ambiguity, and rename/copy entries report the live
+    (destination) path with their source field skipped.
+    """
+    mode = "all" if untracked_all else "normal"
+    out = _run(
+        repo, "status", "--porcelain", "-z", f"--untracked-files={mode}",
+        *_exclude_pathspec(exclude),
+    )
+    fields = out.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if not entry:
+            continue
+        status, rel = entry[:2], entry[3:]
+        paths.append(rel)
+        if "R" in status or "C" in status:
+            i += 1  # skip the rename/copy source field
+    return paths
 
 
 def is_dirty_vs(
@@ -196,7 +575,7 @@ def is_dirty_vs(
 
 
 def advance_is_engine_bookkeeping(
-    repo: Path, base_sha: str, *, bookkeeping: list[str]
+    repo: Path, base_sha: str, *, bookkeeping: list[str], tip: str | None = None
 ) -> bool:
     """True iff ``base_sha..HEAD`` is nothing but engine bookkeeping (#62/#65).
 
@@ -218,8 +597,13 @@ def advance_is_engine_bookkeeping(
        An allowlist, not the dirty-check exclusions: those exclusions also
        hide human-owned paths (every slug's ``PR.md``) that must never be
        classified as engine bookkeeping (PR #76 review F-001).
+
+    ``tip`` names the range end explicitly (default: HEAD). The pre-checkout
+    rollback validation (P3, plan §6: validate everything before checkout)
+    classifies ``base..refs/heads/<run-branch>`` without touching the
+    operator's checkout, so it must not read a bare HEAD.
     """
-    head = head_sha(repo)
+    head = tip if tip is not None else head_sha(repo)
     if head == base_sha:
         return True
     if not is_ancestor(repo, base_sha, head):
@@ -234,6 +618,38 @@ def advance_is_engine_bookkeeping(
     changed = _run(repo, "diff", "--name-only", base_sha, head).splitlines()
     allowed = set(bookkeeping)
     return all(path in allowed for path in changed if path)
+
+
+def dirty_paths_matching(repo: Path, patterns: list[str]) -> list[str]:
+    """Paths matching ``patterns`` with any uncommitted index/worktree state.
+
+    The read-only probe the rollback checkout guard uses for human-owned
+    excluded files (``PR.md``): they are hidden from the generic dirty guard
+    by policy, but a branch checkout can still refuse or clobber their
+    uncommitted state, so the guard needs to *detect* them without capturing
+    bytes (the durable preservation is the recovery snapshot's job now).
+    ``-z`` porcelain so special characters never arrive quoted; rename
+    entries report the live (destination) path.
+    """
+    if not patterns:
+        return []
+    out = _run(
+        repo, "status", "--porcelain", "-z", "--untracked-files=all",
+        "--", *patterns,
+    )
+    fields = out.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if not entry:
+            continue
+        status, rel = entry[:2], entry[3:]
+        paths.append(rel)
+        if "R" in status or "C" in status:
+            i += 1  # skip the rename/copy source field
+    return sorted(set(paths))
 
 
 def worktree_tree_hash(repo: Path) -> str:
@@ -265,9 +681,201 @@ def remove_worktree(repo: Path, path: Path) -> None:
     _run(repo, "worktree", "remove", "--force", str(path))
 
 
-def prune_worktrees(repo: Path) -> None:
-    """Prune stale worktree administrative entries (best-effort cleanup)."""
-    _run(repo, "worktree", "prune")
+def prune_worktrees(repo: Path, *, expire: str = "now") -> None:
+    """Prune stale worktree administrative entries.
+
+    ``expire`` is passed EXPLICITLY on every call (spike §11 row 7). A bare
+    ``git worktree prune`` consults ``gc.worktreePruneExpire``, which is
+    adopter-configurable: a repo that sets it to ``3.days.ago`` would silently
+    leave a freshly-missing entry registered, and the recreate path (§11 row 2)
+    would then hit ``already registered worktree`` instead of succeeding. Pinning
+    the value is the same fail-closed reasoning as ``status_porcelain``'s pinned
+    ``--untracked-files``: never let an adopter's config change the engine's
+    observed answer.
+
+    Repository-wide by construction (spike E8-C): this removes the ``prunable``
+    entry of EVERY worktree of the repository, not just the caller's. That is
+    why a live run worktree is held under :func:`lock_worktree` for its whole
+    life, and why every call here runs inside the repo-global lock.
+    """
+    _run(repo, "worktree", "prune", f"--expire={expire}")
+
+
+def add_worktree_branch(repo: Path, path: Path, branch: str) -> None:
+    """Check ``branch`` out into a NEW linked worktree at ``path`` (P7c, §6.2).
+
+    Deliberately not :func:`add_worktree`: that one is the verifier's
+    ``--detach --force`` disposable copy. A run worktree is the opposite on both
+    counts — it is *attached* to the run branch (so git's own
+    one-branch-one-worktree rule supplies acceptance A2 for free, spike E2-A),
+    and it is never ``--force``d (spike §11 rows 1 and 6: ``add -f`` would
+    silently adopt a registered admin entry the recovery assessment has not
+    explained, and ``add`` refusing a non-empty path is information, not an
+    obstacle).
+
+    Raises :class:`GitError` on every refusal — branch already checked out
+    elsewhere, path exists and is non-empty, stale admin entry, or a
+    leading-directory failure — so the caller parks with git's own stderr
+    preserved rather than guessing.
+    """
+    _run(repo, "worktree", "add", str(path), branch)
+
+
+def lock_worktree(repo: Path, path: Path, *, reason: str) -> None:
+    """``git worktree lock --reason`` — the git-native anti-prune marker (§8.3).
+
+    The ONLY thing that stops another run's ``prune_worktrees`` from removing
+    this run's admin entry while its tree is momentarily missing (spike E8-C),
+    and it also blocks ``worktree remove --force`` (E6-B), so a teardown must
+    :func:`unlock_worktree` first. Held for the LIFE of the run worktree, not
+    for a critical section — it is a marker, not a mutex.
+    """
+    _run(repo, "worktree", "lock", "--reason", reason, str(path))
+
+
+def unlock_worktree(repo: Path, path: Path) -> None:
+    """``git worktree unlock``. Raises :class:`GitError` if it was not locked."""
+    _run(repo, "worktree", "unlock", str(path))
+
+
+def repair_worktree(repo: Path, path: Path) -> str:
+    """``git worktree repair`` for a worktree whose paths moved (§11 row 9).
+
+    Preferred over prune+recreate when the tree is intact but the pointer pair
+    is broken (spike E6-F), because it preserves uncommitted work.
+    """
+    return _run(repo, "worktree", "repair", str(path))
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    """One record from ``git worktree list --porcelain``.
+
+    ``prunable`` carries git's own machine-readable reason string (e.g.
+    ``gitdir file points to non-existent location``) — the discovery signal
+    spike §4.2 identifies for "the tree is gone but the branch survives", which
+    is what the recreate action (§11 row 2) keys on. ``locked`` carries the
+    ``--reason`` text, so the holder of a lock is self-describing.
+    """
+
+    path: Path
+    head: str | None
+    branch: str | None  # short name; None for a detached or bare entry
+    bare: bool
+    detached: bool
+    locked: str | None  # the lock reason ("" when locked with no reason)
+    prunable: str | None  # git's reason string
+
+
+def list_worktrees(repo: Path) -> list[WorktreeEntry]:
+    """Parse ``git worktree list --porcelain`` into records.
+
+    The porcelain format is one blank-line-separated stanza per worktree, whose
+    first line is always ``worktree <path>``. ``locked``/``prunable`` appear as
+    a bare keyword or ``<keyword> <reason>``; both forms are preserved (a bare
+    keyword becomes ``""``, which is falsy-but-not-None, so "locked with no
+    reason" stays distinguishable from "not locked").
+
+    Paths are recorded AS GIT REPORTS THEM — git does not resolve symlinks here
+    (spike E9-B) — so any containment or identity comparison against an entry
+    must ``resolve()`` both sides itself.
+    """
+    out = _run(repo, "worktree", "list", "--porcelain")
+    entries: list[WorktreeEntry] = []
+    cur: dict[str, Any] = {}
+
+    def flush() -> None:
+        if not cur.get("path"):
+            return
+        branch_ref = cur.get("branch")
+        entries.append(
+            WorktreeEntry(
+                path=Path(cur["path"]),
+                head=cur.get("HEAD"),
+                branch=(
+                    branch_ref[len("refs/heads/"):]
+                    if isinstance(branch_ref, str)
+                    and branch_ref.startswith("refs/heads/")
+                    else branch_ref
+                ),
+                bare=bool(cur.get("bare")),
+                detached=bool(cur.get("detached")),
+                locked=cur.get("locked"),
+                prunable=cur.get("prunable"),
+            )
+        )
+        cur.clear()
+
+    for raw in out.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip():
+            flush()
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            flush()
+            cur["path"] = value
+        elif key in ("HEAD", "branch", "locked", "prunable"):
+            cur[key] = value
+        elif key in ("bare", "detached"):
+            cur[key] = True
+    flush()
+    return entries
+
+
+def worktree_for_branch(repo: Path, branch: str) -> WorktreeEntry | None:
+    """The registered worktree holding ``branch``, or ``None``.
+
+    The evidence half of the spike §10 detection rule ("a run is `same_tree` iff
+    its journal carries no ``WorktreeAdopted`` event AND ``worktree list``
+    registers no worktree for ``man.branch``") and the discovery half of §11
+    rows 2 and 4. Read-only and available when the driver is dead, which is what
+    makes it usable from a recovery assessment.
+    """
+    for entry in list_worktrees(repo):
+        if entry.branch == branch:
+            return entry
+    return None
+
+
+def submodule_status(repo: Path) -> list[tuple[str, str]]:
+    """``git submodule status`` → ``[(state_prefix, path)]`` (spike §7).
+
+    A worktree of a superproject checks out the submodule *gitlink* but leaves
+    the directory EMPTY, and ``git status`` reports the tree CLEAN — so a
+    builder would see failing tests with no signal pointing at the cause. The
+    leading ``-`` in this command's output is the machine-readable
+    "uninitialized" marker and is the only reliable detection.
+
+    ``state_prefix`` is ``"-"`` (uninitialized), ``"+"`` (checked out at a
+    different SHA than the index), ``"U"`` (merge conflicts) or ``""`` (in
+    sync). A repository with no submodules yields an empty list.
+    """
+    out = _run(repo, "submodule", "status")
+    rows: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        prefix = line[0] if line[0] in "-+U" else ""
+        rest = line[1:] if prefix else line
+        parts = rest.split()
+        if len(parts) >= 2:
+            rows.append((prefix, parts[1]))
+    return rows
+
+
+def uninitialized_submodules(repo: Path) -> list[str]:
+    """Submodule paths reporting the ``-`` (uninitialized) marker (spike §7).
+
+    Empty when the repository has no submodules, and empty when a
+    ``submodule`` invocation is not meaningful here — a repository without the
+    command's preconditions must not be misreported as having uninitialized
+    submodules, which would park every run on a repo that has none.
+    """
+    try:
+        return [path for prefix, path in submodule_status(repo) if prefix == "-"]
+    except GitError:
+        return []
 
 
 def branch_exists(repo: Path, branch: str) -> bool:
@@ -301,6 +909,24 @@ def recreate_branch(repo: Path, branch: str, start_point: str) -> None:
     unmerged work would orphan those commits.
     """
     _run(repo, "checkout", "-B", branch, start_point)
+
+
+def create_branch(repo: Path, branch: str, start_point: str, *, force: bool = False) -> None:
+    """Create (or with ``force``, reset) ``branch`` at ``start_point``.
+
+    The no-checkout sibling of :func:`checkout_or_create_branch`, added for the
+    dedicated-worktree start path (P7c): the run worktree does not exist yet
+    when the branch is minted, so there is no tree to check it out into — and
+    checking it out in the OPERATOR's tree is precisely what acceptance A1
+    forbids. ``git branch`` touches only the ref store, so it is repo-scoped.
+
+    ``force`` is the ``-f`` form used to recycle a *spent* run branch (one
+    already merged into its base). Git refuses it outright if the branch is
+    checked out in any worktree (spike E2-E), which is the correct fail-closed
+    answer and is why the caller does not need a lock of its own.
+    """
+    args = ["branch"] + (["-f"] if force else []) + [branch, start_point]
+    _run(repo, *args)
 
 
 def delete_branch(repo: Path, branch: str) -> None:
@@ -594,6 +1220,36 @@ def file_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
         return None
 
 
+def file_mode_at_commit(repo: Path, sha: str, relpath: str) -> str | None:
+    """The git mode of ``relpath`` at ``sha`` (e.g. ``100644``), or ``None``.
+
+    The executable bit and the regular-file/symlink distinction are their own
+    state plane (plan §7), so a caller proving "this file is a redundant copy of
+    what is committed" has not proved it from the bytes alone: a `100755` local
+    file and a `100644` blob compare byte-equal and are different objects.
+    """
+    try:
+        out = _run(repo, "ls-tree", sha, "--", relpath).strip()
+    except GitError:
+        return None
+    return out.split()[0] if out else None
+
+
+def file_bytes_at_commit(repo: Path, sha: str, relpath: str) -> bytes | None:
+    """:func:`file_at_commit`, but the RAW BYTES, or ``None`` if absent there.
+
+    The text variant decodes, which is fine for reading an artifact but not for
+    *proving two files are the same object*. `finish` uses this to establish
+    that an operator's untracked file is byte-identical to the copy the merge is
+    about to bring in before it will touch that file at all (P7d) — and a proof
+    that survives a decode round-trip is not a proof of the bytes.
+    """
+    try:
+        return _run_bytes(repo, "show", f"{sha}:{relpath}")
+    except GitError:
+        return None
+
+
 def range_diff_path(repo: Path, base: str, head: str, relpath: str) -> str:
     """`base..head` diff scoped to a single path (harness-efficiency FR-1.2).
 
@@ -770,6 +1426,20 @@ def create_ref(repo: Path, ref: str, sha: str) -> None:
     _run(repo, "update-ref", ref, sha)
 
 
+def create_ref_exclusive(repo: Path, ref: str, sha: str) -> None:
+    """Atomically create ``ref`` at ``sha`` ONLY if it does not already exist.
+
+    ``git update-ref --stdin`` with the ``create`` verb makes git's own ref
+    store enforce creation semantics (the transaction fails when the ref
+    exists), closing the check-then-write race a bare ``update-ref <ref>
+    <sha>`` leaves open: two writers could both observe an absent ref and the
+    later one would silently replace the earlier — for a recovery snapshot,
+    displacing the only anchor of its unique objects (P2 review F-003).
+    Raises :class:`GitError` when the ref already exists.
+    """
+    _run(repo, "update-ref", "--stdin", stdin=f"create {ref} {sha}\n")
+
+
 def delete_ref(repo: Path, ref: str) -> None:
     """Delete an arbitrary ref, tolerating an already-absent one.
 
@@ -912,21 +1582,3 @@ def clean_untracked(repo: Path, *, exclude: list[str] | None = None) -> None:
     for pattern in exclude or []:
         args += ["-e", pattern]
     _run(repo, *args)
-
-
-def backup_dirty_worktree(
-    repo: Path, ref: str, message: str, *, exclude: list[str] | None = None
-) -> str:
-    """Snapshot the full dirty worktree (tracked + untracked) to a backup ref.
-
-    Captures partial work that ``reset --hard`` would otherwise destroy
-    (review F-003 / F-010 safety). ``exclude`` (the run root) is left out so the
-    snapshot — and the subsequent reset — never touch the run bookkeeping.
-    Returns the backup commit SHA.
-    """
-    _run(repo, "add", "-A", *_exclude_pathspec(exclude))
-    tree = _run(repo, "write-tree").strip()
-    parent = head_sha(repo)
-    backup = _run(repo, "commit-tree", tree, "-p", parent, "-m", message).strip()
-    _run(repo, "update-ref", ref, backup)
-    return backup

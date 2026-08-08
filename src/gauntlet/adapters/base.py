@@ -72,12 +72,33 @@ class AdapterCapabilities(BaseModel):
 # the harness never auto-continues past an unrecognized error.
 FAILURE_TRANSIENT_USAGE_LIMIT = "transient_usage_limit"
 FAILURE_TRANSIENT_OVERLOAD = "transient_overload"
+# A typed transport/dependency failure (plan §5.2, P5): provider timeout,
+# connection/DNS failure, or a non-overload server-side fault. Recoverable
+# infrastructure, not a semantic agent failure — the engine retries it with
+# bounded backoff and, on exhaustion, parks ``provider_unavailable`` for a
+# plain resume (never ``--response``; R7, issue #63).
+FAILURE_TRANSIENT_DEPENDENCY = "transient_dependency"
 FAILURE_TERMINAL = "terminal"
 
 # The transient kinds, as a set, for the "is this a park-and-resume condition?"
 # test the orchestrator and cycle make.
 TRANSIENT_FAILURE_KINDS = frozenset(
-    {FAILURE_TRANSIENT_USAGE_LIMIT, FAILURE_TRANSIENT_OVERLOAD}
+    {
+        FAILURE_TRANSIENT_USAGE_LIMIT,
+        FAILURE_TRANSIENT_OVERLOAD,
+        FAILURE_TRANSIENT_DEPENDENCY,
+    }
+)
+
+# The transient kinds the P5 dependency-retry policy (plan §5.2) covers with
+# bounded in-process retries and, on exhaustion, a ``provider_unavailable``
+# park: transport/dependency faults (timeout / connection / DNS / 5xx) and
+# provider overload. A ``transient_usage_limit`` (quota/429) deliberately stays
+# OUT of this set — it parks immediately with the provider's reset deadline and
+# retries through the existing plain-resume / FR-3.4 scheduled-resume path
+# (its persisted budget is ``ScheduledResume.attempts``).
+DEPENDENCY_FAILURE_KINDS = frozenset(
+    {FAILURE_TRANSIENT_OVERLOAD, FAILURE_TRANSIENT_DEPENDENCY}
 )
 
 
@@ -85,7 +106,7 @@ class FailureInfo(BaseModel):
     """Adapter → engine classification of one failed invocation (FR-3.1, §6).
 
     Built by the adapter's ``classify_failure`` from the pinned marker allowlist
-    and carried on :class:`AgentFailedError`. ``kind`` is one of the three
+    and carried on :class:`AgentFailedError`. ``kind`` is one of the four
     ``FAILURE_*`` values above; ``retry_after_s`` is populated ONLY from a
     structured field on the error envelope (a typed ``retry_after`` / a
     ``Retry-After`` header), never scraped from prose (§7), and is ``None`` when
@@ -95,7 +116,10 @@ class FailureInfo(BaseModel):
     """
 
     kind: Literal[
-        "transient_usage_limit", "transient_overload", "terminal"
+        "transient_usage_limit",
+        "transient_overload",
+        "transient_dependency",
+        "terminal",
     ] = FAILURE_TERMINAL
     retry_after_s: int | None = None
     marker: str = "unmatched"

@@ -61,6 +61,24 @@ class ClaudeCodeAdapter:
         reads_repo=True,  # FR-1.3: the CLI runs in the repo and can Read files
     )
 
+    # P7f: this CLI applies its OWN permission rules after Gauntlet's PreToolUse
+    # hook, and refuses writes to any path carrying a literal `.git` segment —
+    # non-uniformly across write mechanisms, so the failure is model-dependent
+    # and invisible to the judge audit (`proposals/P7d-gate-blocker.md` §2).
+    # This is the adapter the writability preflight exists for.
+    probes_writability = True
+
+    @staticmethod
+    def writability_flags(tools: tuple[str, ...]) -> list[str]:
+        """Narrow the tool set for one probe turn, so the model has no choice.
+
+        The probe's determinism rests first on the prompt naming one mechanism
+        and forbidding the others; this is the enforcement behind it, and it is
+        adapter-specific CLI knowledge, which is why it lives here rather than
+        in the probe.
+        """
+        return ["--allowedTools", ",".join(tools)]
+
     def __init__(
         self,
         *,

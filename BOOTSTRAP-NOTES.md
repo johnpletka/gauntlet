@@ -1057,3 +1057,257 @@ branch the run *launched from*, and that branch later diverged. The guard is
 right to fail closed, but the operator's proof (`git merge-base --is-ancestor
 <run-branch> main`) suggests the check could also accept containment in the
 repo's default branch before demanding `--force`.
+
+## 2026-08-06 — P7d gating dogfood: `dedicated` runs cannot be written to under `.git/`
+
+The P7d gate (`proposals/P7c-split-seam.md` §6) makes flipping
+`worktree.mode` to `dedicated` conditional on a dogfood run exercising spike
+§11 rows 2, 5 and 10. The dogfood was run — a real `gauntlet run` in
+`dedicated` mode on the toy PRD with live agents and the judge on, driven from
+the CLI. **All three rows passed. The flip did not happen anyway**, because the
+run itself failed for a reason none of the three rows covers. Full write-up and
+the maintainer's options: `proposals/P7d-gate-blocker.md`.
+
+- **What blocks it:** the `claude` CLI refuses to write any file whose path
+  contains a `.git/` component — *"which is a sensitive file"* — and spike §6.2
+  puts every run worktree at `<git-common-dir>/gauntlet/worktrees/…`, i.e.
+  inside `.git/`. Reproduced with no Gauntlet, no judge and no hook in the path;
+  the control (same branch, same repo, same flags, linked worktree at a sibling
+  path *outside* `.git/`) writes fine.
+- **Why it was not caught before P7d:** every experiment in the spike's Appendix
+  A measures *git* — visibility to `status`, survival of `clean -xdff`, prune
+  cross-talk, `EXDEV`. This is a property of the **agent CLI that drives every
+  builder and verifier step**, and nothing in the spike or the unit suite
+  exercises an agent writing inside a run worktree. The P7c suites drive real
+  verbs in dedicated mode with *fake* adapters, which is exactly the seam.
+- **Why it is worse than a hard refusal:** the guard is not uniform. `Write`,
+  `Edit` and `printf > file` are refused; `cat > file <<EOF` and `tee file` are
+  not. So a dedicated run fails **iff the model does not improvise a write form
+  the guard misses**. Both happened in the same dogfood, same pipeline, same
+  tree: the opus round was refused and failed closed with "fixer made no changes
+  in round 1 despite 7 accepted finding(s)"; a haiku round found `tee` and
+  completed normally, committing a real fix to the run branch.
+- **Manual intervention it forced, which is the point of this file:** none was
+  possible from inside the run. The operator-visible symptom is a generic
+  fail-closed message that reads as a model failure. Recovery was to abandon the
+  round, not to fix anything.
+- **The evidence lies, and that is its own defect.** Gauntlet's judge is a
+  **PreToolUse** hook, so it adjudicates *before* the CLI applies its own
+  permission rules. `judge-audit.jsonl` therefore records `Write … allow` for
+  writes that never happened. Nothing in the manifest, journal, audit or
+  transcript names the refusal. Same family as the stale-driver entry above: the
+  durable record is confidently wrong about what occurred.
+- **What the three rows did prove** (details and commands in the proposal):
+  row 5 — `git worktree lock` is exactly what stops another run's
+  `prune --expire now`, with the unlocked control pruned immediately, and a
+  locked worktree is never reported `prunable` (confirming P7c-1's CORRECTION 2
+  in the wild); row 2 — a deleted tree was recreated by a real `gauntlet resume`
+  with `WorktreeAdopted{recreated: true}` and the HEAD verified against the
+  journal's own `branch_sha`, after which the run made real progress; row 10 —
+  a dirty run worktree was captured into `refs/gauntlet/recovery/…` with
+  `reason: worktree-teardown` before the forced removal, and the builder's
+  uncommitted bytes were recovered from the snapshot.
+- **Measured, separately, what the flip would have cost the suite** (on a
+  throwaway worktree, discarded): `101 failed, 2874 passed, 3 skipped … 13
+  errors`. The 13 errors are the autouse A1 property firing at teardown — the
+  signal P7d exists to produce. Spot-checked, they are not all engine defects:
+  `test_lock_released_on_done_and_park` trips it by committing in the operator's
+  checkout *between two runs*, and the fixture captures its baseline once, at
+  the first tree's creation. A phase that does the flip should re-base the A1
+  baseline per run, or that shape will be miscounted as a violation.
+- **Suggested durable mitigation, independent of where the worktree ends up:**
+  a start-time preflight (and a `doctor` check) that parks with a named reason
+  when the run worktree is not writable — the fail-closed shape of the §7
+  submodule park. It must exercise **each** adapter write mechanism by name
+  (`Write`, `Edit`, a shell redirection) and read the *post-tool* permission
+  outcome; a probe that lets a model choose how to write inherits the same
+  nondeterminism and can pass via `tee` while the real task fails on `Write`.
+  A detector, not a fix — moving the worktree out of `.git/` is the fix.
+
+## 2026-08-06 — P7e: the maintainer ratified 1A, and the root moved out of `.git/`
+
+The decision the P7d halt was waiting on. Recorded here because
+`proposals/P7d-gate-blocker.md` is a *proposal* — it lists options and
+recommends one; it does not and cannot ratify itself, and every P7d commit body
+ends "the halt stands until a human rules."
+
+- **The ratification.** The maintainer chose sub-option **1A**,
+  `<repo>/.gauntlet/worktrees/<slug>/<run-id>`, on 2026-08-06, in the session
+  that opened the P7-completion tranche, answering a direct question that named
+  all four options with their costs. This note plus the P7e commit body are
+  where that authority lives; `proposals/P7-worktree-spike.md` §6.2 is **not**
+  amended and still reads as ratified, exactly as P7d left it.
+- **The precondition was checked, not assumed.** Before starting, the tranche
+  searched every `*.md` in the repo, the P7d/P7d.1/P7d.2 commit bodies, this
+  file, all 18 GitHub issues, and any `decisions/`/`adr/` directory. No
+  ratification existed. The phase prompt's own instruction — "if it has not
+  happened, say so and stop" — was followed, and the run stopped and asked. That
+  is the process working: agents propose, humans ratify.
+- **§6.2's properties were RE-MEASURED at the new root (E11), not inherited.**
+  Kept: same filesystem (so `EXDEV` stays structurally unreachable), inside the
+  repository (so `RECOVERY-REDESIGN-PLAN.md` §7 survives unamended — the thing
+  1A buys over the two outside-the-repo options), no outer-repo contamination,
+  no repo-identity map, `fsck`/`gc` tolerance, and a valid parent for the
+  verifier's disposable copy. **Fixed:** agent-writability — `Write`, `Edit` and
+  a shell redirection all land at the new root (E12), the same three that were
+  refused under `.git/`. **Traded, and named as trades:** invisibility to `git
+  status` is now *maintained* by an engine-owned marker rather than structural;
+  `git status --ignored` now lists the tree; and `git clean -xdff` now deletes
+  it.
+- **`clean -xdff` was demonstrated recoverable rather than argued to be.** E11
+  produced the §11-row-2 shape — registered-and-`prunable`, branch ref intact —
+  and a real `prune` + `add` rebuilt the tree on its branch with its commits.
+  A test now asserts the recovery instead of the old immunity.
+- **Two things that surprised the implementation and are worth knowing.**
+  (a) `git worktree lock` does **not** protect against `git clean` — clean is
+  not worktree-aware — so the lock is not a mitigation here, only against
+  `prune`/`remove`. (b) The root had to be anchored at the **main worktree**
+  (`git worktree list --porcelain`'s first entry, which every vantage point
+  reports identically) rather than at the invoking checkout. `rev-parse
+  --show-toplevel` answers *the tree you are standing in*, so anchoring there
+  would have made the §14.4 "you are inside a run worktree" refusal unreachable
+  from the only place it ever fires, and would have grown two disjoint sets of
+  run worktrees for an operator who drives from their own linked worktree.
+  §6.2 got that vantage-independence for free from the shared git dir; it had to
+  be re-established deliberately.
+- **The legacy population is handled explicitly, not by a backstop.** An
+  adopter who opted into `dedicated` before this commit has a tree at the old
+  root, which the new containment check cannot see. Resolver rule 2 (an
+  unreleased `WorktreeAdopted`) would keep such a run `dedicated` — but resting
+  the safety property on a backstop is not the same as deciding it, so the
+  engine detects the old root by name, refuses to drive with a message naming
+  `gauntlet migrate-worktree <slug>`, and that verb now relocates it. The
+  refusal deliberately does **not** offer `--same-tree`: that action is correct
+  for its own case and would, here, drive the run in the operator's checkout.
+
+## 2026-08-07 — P7 gate closure: three engine defects only a live run could find
+
+The verification tranche for P7g/P7h. Recorded because the interesting result
+is not that the gate closed, but *what closed it*: a 3020-test unit suite was
+green on the commit under test, and the gating dogfood still found three
+genuine engine defects in the first two stages of one live run.
+
+- **The unit suite was never the evidence it looked like.** `c165736` ran
+  `3020 passed, 3 skipped, 76 deselected` — the first whole-suite completion on
+  this branch, and green. It did not catch any of the three defects below. Two
+  of them are not even `dedicated`-specific; they were latent in `same_tree`
+  and had been for as long as the code existed. A component suite cannot
+  substitute for a run, which is the standing lesson of P7d and now has a
+  second, sharper instance.
+- **G-001, the artifact authority went stale.** Spike §14.2 option A's premise
+  — "the operator's checkout stays the authoring surface" — is true for
+  producer steps and FALSE for artifact-mode adversarial cycles: the fixer
+  agent's cwd is `work_root`, so it authors the governed artifact there and the
+  cycle commits it there. Nothing carried those bytes back. Under `dedicated`
+  that meant `artifact_root` kept the PRE-review artifact, which every
+  downstream step reads — so `standard.yaml`'s plan-author authored plan.md
+  from the un-reviewed prd.md, and the human ratifying at `prd-approve` was
+  shown a checkout that never held the version they were ratifying. Then
+  `_sync_governed_artifacts`, which re-publishes at every root resolution
+  (once per DRIVE, not once per run as its own docstring assumed), copied the
+  stale bytes back over the committed review fixes on the next `approve`, and
+  the FR-9.3 round-1 clean-handoff guard failed the run naming the file it had
+  just clobbered. **This is the EIGHTH ratified spike recommendation found
+  wrong when implemented.** The maintainer ratified the back-publish on
+  2026-08-07; the spike is not amended.
+- **G-002, a one-character corruption that hid for the life of the code.**
+  `status_porcelain` strips its whole report, so a FIRST entry whose status is
+  worktree-only (`" M"` — a leading space, and much the commonest status)
+  lost that space, and three callers slicing `line[3:]` then ate the path's
+  first character: `runs/toy/prd.md` arrived as `uns/toy/prd.md`. Two of the
+  three were functional, not cosmetic — `_only_artifact_dirty` never matched a
+  TRACKED artifact with unstaged edits, so the baseline commit silently
+  declined; and `commit_output` silently no-op'd the producer commit. It only
+  ever hit the FIRST entry, and every existing guard test used an UNTRACKED
+  artifact (`"??"`, no leading space), which is exactly why a suite this large
+  sailed past it. Fixed by parsing `-z` porcelain structurally
+  (`gitops.dirty_paths`) rather than slicing text anywhere.
+- **G-003, the plan gate wedged on the id shape this repo actually uses.**
+  `_FRS_TOKEN_RE` admitted a letter only as its own dot-separated segment
+  (`FR-5.1.a`), never appended to a numeric one. The comment directly above it
+  warns that rejecting a legitimate PRD id shape "would wedge the plan gate on
+  a contract technicality (#64's failure class)" — and it did. `FR-6.1a` is
+  cited 144 times in this repository, `FR-3.1a` 66, `FR-1.3a` 30, `FR-2.1a` 27,
+  plus `FR-3.1b/c` and `FR-2.1b`: close to 300 references to a shape the
+  validator refused. **No artifact was hand-edited to get past this**, though
+  the park sanctions it — the plan was citing the toy PRD's real ids, so the
+  edit would have made the artifact lie about P1's coverage to satisfy a
+  validator that was itself wrong. The park's fail-closed behaviour was correct
+  throughout; only its grammar was not.
+- **What the dogfood proved, with evidence rather than inference.** A real
+  `gauntlet run` with no `worktree` key anywhere in `.gauntlet/config.yaml` was
+  born `dedicated` at the 1A root and ran to `RUN_DONE`. The builder's
+  `slugify.py` and `tests/test_slugify.py` exist in the run worktree and do NOT
+  exist in the operator's checkout. The operator's branch and HEAD
+  (`29f7adc`) are byte-identical to the pre-run fingerprint, index unchanged;
+  the entire worktree delta is three paths under the operator-side `runs/`
+  artifact root (`prd.md` back-published, `plan.md` and `PR.md` untracked
+  outputs) and no source file at all. The phase commit `052ce7f P1: Implement
+  slugify()...` is on `gauntlet/toy` authored by `Gauntlet Builder (claude)`,
+  and the operator's HEAD does not contain that branch. A1/A2/A3 hold for runs
+  in general, with the A1 statement now correctly read as "the operator's
+  *code* checkout", since the ratified artifact authority lives under `runs/`
+  by design.
+- **A diagnostic worth keeping.** G-001 was diagnosed by hashing the three
+  copies rather than by reading code: work tree, operator copy and the SEED
+  commit all hashed `71a7cb7a` while `HEAD` on the run branch — the reviewed
+  version — hashed `605e4086`. That is a two-command test for "which copy is
+  authoritative?" and it beats inference every time under `dedicated`, where
+  there are always two of every governed artifact.
+- **The integration suite had never been migrated for P7g, and said so loudly.**
+  Four failures, all one `wrong`-class root cause: assertions that the builder's
+  output exists in the OPERATOR's checkout and that the operator's HEAD is the
+  phase commit. Under the default flip both are false by design — they are the
+  exact inverse of what the dogfood proves — so each was rewritten against the
+  RUN tree via a `run_work_tree` resolver, with the operator-side claim KEPT
+  rather than dropped: the migrated tests now assert the artifact is in the run
+  tree AND absent from the operator's checkout, which is a stronger statement
+  than the original made. Notably the known nondeterministic e2e failure
+  (`assert 'impl-cycle' == 'phase-gate'`) did NOT occur; the e2e failed
+  differently, and per the tranche's own rule that made it ours.
+- **Then the suite kept paying out, one defect deeper each time.** Migrating
+  the four stale assertions did not end it; each full integration run simply
+  got further before failing, and found something new that only a live
+  `standard` run reaches. `G-008`: the fixture declares
+  `requires-python = '>=3.12'` but its own `test_command` uses
+  `uv run --no-project`, which decouples from the project and therefore from
+  that floor, so the step floated to whatever interpreter the machine defaulted
+  to (3.10 here). A builder that encoded the documented floor as a test — a
+  correct thing to do — failed its own suite for a reason the phase could not
+  control. `G-009`: `review_proposals`' cleanliness guard inspected the
+  operator's checkout, where a `dedicated` run's prd.md/plan.md sit
+  uncommitted forever, so FR-6.4/6.5 governed apply was unreachable in the
+  DEFAULT mode. The fix was not a new idea — `finish` already carries exactly
+  that exemption, in nearly those words. This is `P7h.1`'s shape again: an
+  established exemption applied at every site but one.
+- **The generalisable lesson, and it is the tranche's main one.** Every defect
+  here except `G-002` and `G-008` is one root cause wearing different clothes:
+  under `dedicated` there are TWO copies of every governed artifact, and each
+  consumer that predates the split had to be told which one it means. The sync
+  (`P7.1`), the cleanliness guards (`P7.5`, and `finish` before it), the
+  producer commit and the baseline commit (`P7.2`/`G-002`), the integration
+  assertions (`P7.3`) — all the same question, answered site by site. A grep
+  for the remaining consumers of `repo_root`/`operator_root` in artifact-facing
+  code is worth more than another round of testing, because the suite only
+  finds these one live run at a time, at roughly ninety minutes each.
+- **Where the gate actually landed.** Unit: `3029 passed, 3 skipped, 76
+  deselected` on `9593a29`, green. Dogfood: passed, described above. Full
+  integration: `1 failed, 69 passed, 6 skipped` in 1:20:47 — all four of the
+  stale-assertion failures fixed and confirmed across runs, with ONE failure
+  remaining that is not an engine defect and not a stale assertion. The FR-6
+  acceptance requires the live `escalation` model to synthesise a unified diff
+  that applies cleanly to a prompt asset; both proposals it drafted were
+  classified `invalid` with "diff does not apply cleanly to the current asset".
+  That classification is correct, and the engine behaving exactly as designed:
+  the retro deliberately "retains malformed diffs as invalid evidence".
+- **That last one was diagnosed rather than assumed, and the method matters.**
+  "A live model wrote a bad diff" is the convenient answer, so it was tested
+  instead of asserted: the diff was extracted and run through `git apply
+  --check`. Hunk 1's context matched `prompts/triage.md` byte-for-byte — which
+  is what rules out the interesting alternative, that the two-copy artifact
+  model had the engine validating against the wrong tree — while hunk 2
+  fabricated context at line 109 that does not exist in the file. git's own
+  refusal is the evidence. The remaining failure is therefore live-model
+  nondeterminism in diff synthesis, of the same character as the
+  `impl-cycle`/`phase-gate` park this tranche carried forward, and the
+  assertion was NOT loosened to make it pass.

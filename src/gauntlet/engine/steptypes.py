@@ -19,7 +19,11 @@ import re
 import subprocess
 from pathlib import Path
 
-from gauntlet.adapters.base import AdapterError, SessionNotFoundError
+from gauntlet.adapters.base import (
+    AdapterError,
+    AgentFailedError,
+    SessionNotFoundError,
+)
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
 from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
@@ -34,6 +38,7 @@ from gauntlet.engine.execution import (
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
+    HALT_REASON_JUDGE_DENY,
     HALT_REASON_PRECONDITION,
     HALT_REASON_TIMEOUT,
     PARKED_REASON_ARTIFACT_INVALID,
@@ -190,7 +195,9 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
         proc = subprocess.run(
             command,
             shell=True,
-            cwd=ctx.repo_root,
+            # The tree this step acts on (P7a): a shell step runs the repo's
+            # own tests/tooling against the work tree, not the repository.
+            cwd=ctx.work_root,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -226,6 +233,38 @@ def handle_human_gate(step: Step, ctx: StepContext) -> StepResult:
 
 
 # --- phase_lint --------------------------------------------------------------
+def _phase_lint_park(artifact: str, text: str, diagnostic: str) -> StepResult:
+    """An ``artifact_invalid`` park for a plan.md structural defect (§5.1, P5).
+
+    One coherent transition carrying artifact + validator + verbatim diagnostic
+    + content fingerprint, replacing the pre-P5 HALTED/precondition halt (which
+    issue #64 showed re-lints the unchanged artifact in a zero-cost loop and
+    renders under the wrong meaning line). The revalidation record's hash is
+    what folds into the progress fingerprint, so an unchanged plain resume
+    exits nonzero (R5) while an edited plan re-lints and continues.
+    """
+    return StepResult(
+        status=PARKED,
+        parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+        revalidation=RevalidationRecord(
+            artifact=artifact,
+            hash_at_park=_sha256(text),
+            validator="phase_lint",
+            diagnostic=diagnostic,
+        ),
+        notes=(
+            f"phase lint: {diagnostic}\n"
+            f"Parked artifact_invalid (plan §5.1): a PRE-approval plan defect. "
+            f"Fix {artifact} (a hand-edit is sanctioned and audited via the "
+            "revalidation hashes) or reject the plan gate to route the defect "
+            "list back into the plan cycle's author/fix loop. A plain "
+            "`gauntlet resume` re-runs ONLY this lint against the edited "
+            "bytes; an unchanged artifact exits nonzero (no-progress) instead "
+            "of re-linting in a loop (issue #64)."
+        ),
+    )
+
+
 def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     """Structurally validate plan.md's ``gauntlet-phases`` block at the plan gate.
 
@@ -237,35 +276,45 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     no-agent check closes that gap: it runs the *same* parser the foreach uses,
     so a plan can only pass the gate if the engine can actually execute it.
 
-    Fail closed (CLAUDE.md §2): a missing/empty/malformed block HALTS — which
-    parks the run for a human (HALTED -> RUN_PARKED) with the precise reason —
-    rather than letting a known-unrunnable plan reach human approval.
+    Fail closed (CLAUDE.md §2): a missing/empty/malformed block parks the run
+    ``artifact_invalid`` (plan §5.1, P5) — one coherent step/run transition
+    recording the artifact, the validator, the exact diagnostic, and a content
+    fingerprint — rather than letting a known-unrunnable plan reach human
+    approval. This is a PRE-approval defect: the note routes it back into the
+    artifact's author loop (hand-edit sanctioned; or reject the plan gate so
+    the plan cycle re-runs with the defect list injected). A plain resume
+    re-runs ONLY this deterministic lint against the edited bytes; an
+    UNCHANGED artifact exits nonzero through the R5 no-progress guard instead
+    of re-linting in a zero-cost loop (issue #64).
     """
     artifact = step.get("artifact", "plan.md")
     path = ctx.artifact_root / artifact
     if not path.exists():
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=f"phase lint: {artifact} is missing at the plan gate",
+        return _phase_lint_park(
+            artifact, "", f"{artifact} is missing at the plan gate"
         )
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except (OSError, ValueError) as exc:
+        # P5.1 review F-006: an unreadable/wrong-kind artifact (permissions, a
+        # directory where a file belongs, undecodable bytes) is a REPAIRABLE
+        # artifact defect, not a terminal handler fault — a bare exception here
+        # would land FAILED on a non-respondable step whose only exit is
+        # abort, wedging a run a file repair should resume.
+        return _phase_lint_park(
+            artifact, "", f"{artifact} is unreadable at the plan gate: {exc}"
+        )
     try:
         phases = extract_phases(text)
     except PlanPhasesError as exc:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=f"phase lint: {artifact} gauntlet-phases block is invalid — {exc}",
+        return _phase_lint_park(
+            artifact, text, f"{artifact} gauntlet-phases block is invalid — {exc}"
         )
     if not phases:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} declares no gauntlet-phases block; the "
-                "phases stage would have nothing to fan out over (FR-5.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} declares no gauntlet-phases block; the phases stage "
+            "would have nothing to fan out over (FR-5.1)",
         )
     # FR-1.1: the implement step slices each phase's prose section out of plan.md
     # by its ATX heading (`phase`-mode context). A phase declared in the list but
@@ -275,15 +324,12 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     # never reaches human approval.
     missing = missing_phase_sections(text, phases)
     if missing:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} has no locatable prose section for "
-                f"phase(s) {', '.join(missing)}; every phase in the "
-                "gauntlet-phases list needs a matching '## <id> …' heading so "
-                "`phase`-mode context can slice it (FR-1.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} has no locatable prose section for phase(s) "
+            f"{', '.join(missing)}; every phase in the gauntlet-phases list "
+            "needs a matching '## <id> …' heading so `phase`-mode context can "
+            "slice it (FR-1.1)",
         )
     # FR-3.1: every phase must carry a well-formed `acceptance:` list of testable
     # clauses (the acceptance_gate's input). A clause-less/malformed phase fails
@@ -291,14 +337,10 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
     # unmappable-at-gate plan never reaches human approval.
     acc_errors = acceptance_clause_errors(phases)
     if acc_errors:
-        return StepResult(
-            status=HALTED,
-            halt_reason=HALT_REASON_PRECONDITION,
-            notes=(
-                f"phase lint: {artifact} has acceptance-clause defects — "
-                + "; ".join(acc_errors)
-                + " (FR-3.1)"
-            ),
+        return _phase_lint_park(
+            artifact, text,
+            f"{artifact} has acceptance-clause defects — "
+            + "; ".join(acc_errors) + " (FR-3.1)",
         )
     # FR-3.4: the phase-size lint. A phase carrying more than `max_frs_per_phase`
     # (default 3) distinct FR references is oversized — the scope where partial
@@ -340,10 +382,7 @@ def handle_phase_lint(step: Step, ctx: StepContext) -> StepResult:
             + " — oversized phases hide partial delivery (FR-3.4)"
         )
         if size_mode == SIZE_LINT_PARK:
-            return StepResult(
-                status=HALTED, halt_reason=HALT_REASON_PRECONDITION,
-                notes=f"phase lint: {detail}",
-            )
+            return _phase_lint_park(artifact, text, detail)
         # warn mode: not a blocker — surface the finding in the notes so it lands
         # in RUN.md / status without stopping the plan gate.
         return StepResult(
@@ -430,7 +469,13 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
     # enumeration runs. It never "parks closed after running an unsupported
     # collector" (FR-3.2 / P2-A5).
     map_name = step.get("map", _ACCEPTANCE_MAP_DEFAULT)
-    map_path = ctx.artifact_root / map_name
+    # In the WORK tree, not the operator's checkout (P7g). Unlike prd.md/plan.md
+    # this artifact has no authoring surface: the block comment above
+    # `_ACCEPTANCE_MAP_DEFAULT` records that "the builder writes it with its file
+    # tools", and a builder's cwd IS the work tree — the whole point of P7. Read
+    # from `artifact_root` this gate halted every `dedicated` run with "no
+    # acceptance map", pointing at a path the builder was never asked to write.
+    map_path = ctx.artifact_root_in_work / map_name
     if not map_path.exists():
         return _acceptance_gate_halt(
             f"acceptance gate: phase {phase_id} has no acceptance map at "
@@ -565,7 +610,7 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
     # `test_command` env, else the engine interpreter.
     command = resolve_command(collector, ctx.config)
     try:
-        copy = verify.make_disposable_copy(ctx.repo_root)
+        copy = verify.make_disposable_copy(ctx.work_root)
     except verify.CopyCreationError as exc:
         return _acceptance_gate_halt(
             f"acceptance gate ({collector_kind}): could not create a disposable "
@@ -583,7 +628,7 @@ def handle_acceptance_gate(step: Step, ctx: StepContext) -> StepResult:
             f"{phase_id} — {exc}"
         )
     finally:
-        verify.discard_disposable_copy(ctx.repo_root, copy)
+        verify.discard_disposable_copy(ctx.work_root, copy)
     missing_ids = sorted(cited - enumerated)
     if missing_ids:
         return _acceptance_gate_halt(
@@ -835,13 +880,28 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                 "would be silently skipped — failing closed (FR-2.1 / review F-003)"
             ),
         )
+    # Snapshot the append-only judge audit before this invocation. The delta is
+    # the adapter-independent record of its PreToolUse allow/deny decisions
+    # (Claude/Codex expose different and sometimes incomplete event shapes).
+    from gauntlet.engine.judgeaudit import audit_offset
+
+    judge_audit = ctx.run_dir / "judge-audit.jsonl"
+    judge_offset = audit_offset(judge_audit) if ctx.judge_env else 0
     # FR-2.2: a plain `gauntlet resume` of an artifact_invalid park re-runs ONLY
     # the validator against the (possibly hand-edited) on-disk artifact — no
     # adapter invocation. Done here, before the adapter is even built, so a
     # hand-edit-then-resume never re-runs the author. `parked_reason` is still the
     # park's value at handler time (the orchestrator clears it only in _finalize),
-    # exactly like the usage-limit resume discriminator below.
-    if ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID:
+    # exactly like the usage-limit resume discriminator below. Scoped to a step
+    # that OWNS a validator (P5, plan §5.1): a drive-level plan-parse park
+    # (`_park_plan_artifact_invalid`) can legitimately land on an agent_task
+    # with no `validate:`/`output:` — the stage walk already re-validated the
+    # plan before re-reaching this handler, so that step runs normally.
+    if (
+        ctx.record.parked_reason == PARKED_REASON_ARTIFACT_INVALID
+        and step.get("validate")
+        and step.get("output")
+    ):
         return _revalidate_on_resume(step, ctx, agent_name)
     # FR-10: while this invocation is consuming a pending `--response`, bind the
     # resume-disposition schema invocation-locally and let the structured
@@ -905,33 +965,68 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         distinct attempt (e.g. ``-repair1``) so a repair never overwrites the
         initial attempt's prompt/events (lossless, FR-4).
         """
+        from gauntlet.engine import depretry
+
         logger.log_text(f"prompt{log_suffix}.md", call_prompt)
-        # Live-observability streaming (live-run-observability FR-2): when enabled
-        # and the adapter is line-streamable, thread a per-line sink so the events
-        # file grows during the step. sink is passed ONLY when streaming — the
-        # buffered path's call shape (and existing fakes) stay untouched. The
-        # suffix keeps a repair attempt's stream off the initial attempt's file.
-        stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
-        kwargs: dict = {"session": session, "schema": schema, "cwd": ctx.repo_root}
-        if stream is not None:
-            kwargs["sink"] = stream.append_line
-        try:
-            return adapter.run(call_prompt, **kwargs)
-        except AdapterError as exc:
-            # FR-4.2 is lossless for failures too (P4.r1 F-007): persist whatever
-            # partial evidence the adapter salvaged before it is re-raised (the
-            # orchestrator classifies transient-vs-terminal, FR-3.1).
-            if exc.partial is not None:
-                logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
-            logger.log_text(f"failure{log_suffix}.txt", str(exc))
-            raise
-        finally:
-            # A streaming sink fault surfaces as a StreamSinkError (not an
-            # AdapterError) that propagates past the except above; the
-            # orchestrator records the step FAILED (fail closed, FR-6.2). Close
-            # the stream either way so it is never left half-open.
+        while True:
+            # Live-observability streaming (live-run-observability FR-2): when
+            # enabled and the adapter is line-streamable, thread a per-line sink
+            # so the events file grows during the step. sink is passed ONLY when
+            # streaming — the buffered path's call shape (and existing fakes)
+            # stay untouched. The suffix keeps a repair attempt's stream off the
+            # initial attempt's file. Opened fresh per dependency retry.
+            stream = open_step_stream(ctx, adapter, logger, suffix=log_suffix)
+            kwargs: dict = {
+                # The tree the agent edits (P7a).
+                "session": session, "schema": schema, "cwd": ctx.work_root,
+            }
             if stream is not None:
-                stream.close()
+                kwargs["sink"] = stream.append_line
+            try:
+                return adapter.run(call_prompt, **kwargs)
+            except AdapterError as exc:
+                # FR-4.2 is lossless for failures too (P4.r1 F-007): persist
+                # whatever partial evidence the adapter salvaged before it is
+                # re-raised (the orchestrator classifies transient-vs-terminal,
+                # FR-3.1).
+                if exc.partial is not None:
+                    logger.log_result(exc.partial, suffix=f"{log_suffix}-failed")
+                logger.log_text(f"failure{log_suffix}.txt", str(exc))
+                # P5 (plan §5.2): a typed transport/dependency failure gets a
+                # bounded, PERSISTED in-process retry with backoff + jitter
+                # before it can park — the budget lives on the step record and
+                # is flushed write-ahead, so a crash between retries never
+                # resets it.
+                info = getattr(exc, "failure_info", None)
+                if isinstance(exc, AgentFailedError) and depretry.is_dependency_failure(info):
+                    delay = depretry.consume_retry(
+                        ctx, info, site=f"{ctx.record.id}{log_suffix}"
+                    )
+                    if delay is not None:
+                        depretry.wait(delay)
+                        continue
+                # Authoritative failure evidence in THIS step's dir (issue
+                # #63): the files `gauntlet logs` reads must name the failure,
+                # never fall back to a sibling. A SessionNotFoundError is not
+                # a failure — the caller falls back to a full re-run (FR-3.3).
+                if not isinstance(exc, SessionNotFoundError):
+                    logger.log_failure(
+                        error=str(exc),
+                        agent=ctx.record.agent,
+                        failure_kind=info.kind if info is not None else None,
+                        marker=info.marker if info is not None else None,
+                        partial_events=(
+                            exc.partial.raw_events if exc.partial else None
+                        ),
+                    )
+                raise
+            finally:
+                # A streaming sink fault surfaces as a StreamSinkError (not an
+                # AdapterError) that propagates past the except above; the
+                # orchestrator records the step FAILED (fail closed, FR-6.2).
+                # Close the stream either way so it is never left half-open.
+                if stream is not None:
+                    stream.close()
 
     fallback_note = ""
     try:
@@ -1006,6 +1101,40 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         result = result.model_copy(update={"usage": spend.result()})
         usage_by_agent = spend.by_agent()
 
+    from gauntlet.engine.judgeaudit import JudgeToolCounts, counts_since
+
+    judge_counts = (
+        counts_since(judge_audit, offset=judge_offset, step_id=ctx.record.id)
+        if ctx.judge_env
+        else JudgeToolCounts()
+    )
+    # An exit-0 agent whose every requested tool was denied did not complete an
+    # implementation turn. Marking it DONE launders a judge/config failure into
+    # a vacuous green and defers the real cause to phase-commit (issue #83).
+    if judge_counts.all_denied:
+        if judge_counts.fail_closed_denied == judge_counts.denied:
+            headline = "judge cannot evaluate tool calls"
+        else:
+            headline = "judge denied every tool call"
+        reason = (
+            f" Last denial: {judge_counts.denial_reasons[-1]}"
+            if judge_counts.denial_reasons else ""
+        )
+        return StepResult(
+            status=FAILED,
+            session_id=result.session_id,
+            usage=result.usage,
+            usage_by_agent=usage_by_agent,
+            halt_reason=HALT_REASON_JUDGE_DENY,
+            judge_tool_calls_allowed=judge_counts.allowed,
+            judge_tool_calls_denied=judge_counts.denied,
+            notes=(
+                f"{headline}: 0 allowed, {judge_counts.denied} denied during "
+                f"agent {agent_name!r}; refusing to record a successful step."
+                f"{reason}"
+            ),
+        )
+
     # FR-3/FR-5/FR-10: on a `--response` resume the STRUCTURED disposition is
     # authoritative for the outcome, not the textual `halt_on` marker (which only
     # signals the FIRST conflict, before any response). Map it to the step status
@@ -1020,6 +1149,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         # and the `output:` artifact write (review F-004 — a re-park must not
         # produce the step's declared artifact).
         if outcome.status != DONE:
+            outcome.judge_tool_calls_allowed = judge_counts.allowed
+            outcome.judge_tool_calls_denied = judge_counts.denied
             return outcome
         # proceed_*: the structured disposition resolved the conflict and is
         # authoritative, so the obsolete textual UPSTREAM CONFLICT marker is
@@ -1045,6 +1176,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             status=status, session_id=result.session_id, usage=result.usage,
             usage_by_agent=usage_by_agent, notes=note,
             parked_reason=parked_reason, halt_reason=halt_reason,
+            judge_tool_calls_allowed=judge_counts.allowed,
+            judge_tool_calls_denied=judge_counts.denied,
         )
 
     artifact_writes: dict[str, Path] = {}
@@ -1063,14 +1196,29 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             park, result, summed = _validate_output(
                 step, ctx, _invoke, logger, validate_name, output, out_path, result,
             )
+            # Repair attempts are part of the same step invocation; refresh the
+            # append-only delta so the persisted counts include them too.
+            if ctx.judge_env:
+                judge_counts = counts_since(
+                    judge_audit, offset=judge_offset, step_id=ctx.record.id
+                )
             final_usage = summed
             usage_by_agent = {agent_name: summed} if summed else {}
             if park is not None:
                 park.session_id = result.session_id
                 park.usage = summed
                 park.usage_by_agent = usage_by_agent
+                park.judge_tool_calls_allowed = judge_counts.allowed
+                park.judge_tool_calls_denied = judge_counts.denied
                 return park
         artifact_writes[output] = out_path
+        # P7g: publish the validated bytes into the tree the run branch commits
+        # in. Same-tree this is a no-op; under `dedicated` it is the only thing
+        # that puts a mid-drive artifact where `commit_output` (and the
+        # downstream cycle's baseline commit and reviewer) can see it. Runs
+        # AFTER validation, so an invalid artifact is never published — it
+        # stays in the operator's checkout for the sanctioned hand-edit.
+        ctx.publish_artifact(output)
         # Prevent-at-source (report #3): a producer that opts in commits its own
         # declared deliverable as it finalizes, so HEAD advances at production
         # time. The deliverable then survives a crash before the next step AND
@@ -1082,6 +1230,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         if step.get("commit_output"):
             outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
             if isinstance(outcome, StepResult):  # fail-closed format/commit error
+                outcome.judge_tool_calls_allowed = judge_counts.allowed
+                outcome.judge_tool_calls_denied = judge_counts.denied
                 return outcome
             commit_sha, commit_phase = outcome
     return StepResult(
@@ -1096,6 +1246,8 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             f"agent {agent_name!r} completed\n{fallback_note}"
             if fallback_note else f"agent {agent_name!r} completed"
         ),
+        judge_tool_calls_allowed=judge_counts.allowed,
+        judge_tool_calls_denied=judge_counts.denied,
     )
 
 
@@ -1170,7 +1322,8 @@ def _validate_output(step, ctx, invoke, logger, validate_name, output, out_path,
         status=PARKED,
         parked_reason=PARKED_REASON_ARTIFACT_INVALID,
         revalidation=RevalidationRecord(
-            artifact=output, hash_at_park=_sha256(out_path.read_text())
+            artifact=output, hash_at_park=_sha256(out_path.read_text()),
+            validator=validate_name, diagnostic=error,
         ),
         notes=(
             f"artifact {output!r} failed validation ({validate_name}) after "
@@ -1206,7 +1359,26 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
             ),
         )
     out_path = ctx.artifact_root / output
-    text = out_path.read_text() if out_path.exists() else ""
+    try:
+        text = out_path.read_text() if out_path.exists() else ""
+    except (OSError, ValueError) as exc:
+        # P5.1 review F-006: an unreadable/wrong-kind artifact on the
+        # revalidation path re-parks artifact_invalid (repairable, resumable)
+        # instead of surfacing as a terminal handler fault.
+        return StepResult(
+            status=PARKED,
+            parked_reason=PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=RevalidationRecord(
+                artifact=output, hash_at_park=_sha256(""),
+                validator=validate_name,
+                diagnostic=f"artifact is unreadable: {exc}",
+            ),
+            notes=(
+                f"artifact {output!r} is unreadable on resume ({exc}); repair "
+                "the file, then `gauntlet resume` re-runs the validator "
+                "(FR-2.2)"
+            ),
+        )
     hash_at_resume = _sha256(text)
     prior = ctx.record.revalidation
     hash_at_park = prior.hash_at_park if prior is not None else hash_at_resume
@@ -1227,7 +1399,8 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
             status=PARKED,
             parked_reason=PARKED_REASON_ARTIFACT_INVALID,
             revalidation=RevalidationRecord(
-                artifact=output, hash_at_park=hash_at_resume
+                artifact=output, hash_at_park=hash_at_resume,
+                validator=validate_name, diagnostic=error,
             ),
             notes=(
                 f"artifact {output!r} still fails validation ({validate_name}) on "
@@ -1244,12 +1417,18 @@ def _revalidate_on_resume(step: Step, ctx: StepContext, agent_name: str) -> Step
         hash_at_resume=hash_at_resume,
         changed_while_parked=changed,
         passed_on_resume=True,
+        validator=validate_name,
     )
     # Valid on resume — complete the step with no adapter call. Commit the
     # now-valid deliverable if the step opted into commit_output (the normal path
     # committed only on validity; the resume path must too, to keep the
     # clean-handoff invariant for the downstream cycle).
     commit_sha = commit_phase = None
+    # P7g: the hand-edit landed in the operator's checkout (the playbook's one
+    # sanctioned edit, and it says to make it there). Publish it into the work
+    # tree whether or not this step commits, so the downstream reviewer is
+    # handed the bytes the human actually wrote.
+    ctx.publish_artifact(output)
     if step.get("commit_output"):
         outcome = _commit_output_artifact(step, ctx, agent_name, output, out_path)
         if isinstance(outcome, StepResult):  # fail-closed format/commit error
@@ -1280,6 +1459,12 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
     Stages exactly the one path (never ``git add -A``), so an unrelated dirty
     file is neither swept into this commit nor able to defeat it — it stays
     uncommitted for the downstream clean-handoff guard to name.
+
+    ``out_path`` is the AUTHORITY (the operator's checkout, §4.4); what gets
+    committed is its work-tree counterpart, which
+    :meth:`StepContext.publish_artifact` has already materialised. Relativising
+    the authority against ``work_root`` is what produced "resolves outside the
+    repo" for every `dedicated` producer step (P7g).
     """
     phase = step.get("phase")
     if not phase:
@@ -1289,20 +1474,19 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
             "the producer commit needs a phase prefix (e.g. PLAN) for the "
             "enforced header format",
         )
+    in_work = ctx.publish_artifact(output)
     try:
-        rel = out_path.resolve().relative_to(ctx.repo_root.resolve()).as_posix()
+        rel = in_work.resolve().relative_to(ctx.work_root.resolve()).as_posix()
     except ValueError:
         return StepResult(
             status=FAILED,
-            notes=f"commit_output: artifact {output!r} resolves outside the repo",
+            notes=(
+                f"commit_output: artifact {output!r} resolves to {in_work}, "
+                f"which is outside the tree this run commits in "
+                f"({ctx.work_root})"
+            ),
         )
-    dirty = {
-        ln[3:].strip()
-        for ln in gitops.status_porcelain(
-            ctx.repo_root, exclude=ctx.excludes, untracked_all=True
-        ).splitlines()
-        if ln.strip()
-    }
+    dirty = set(gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes))
     if rel not in dirty:
         return None, None  # identical to HEAD — nothing to commit, no empty commit
     message = (
@@ -1325,7 +1509,7 @@ def _commit_output_artifact(step: Step, ctx: StepContext, agent_name: str,
     # bubble out as the orchestrator's generic "handler error: ...".
     try:
         sha = gitops.commit_paths(
-            ctx.repo_root, message, [rel], identity=ctx.config.identity(agent_name),
+            ctx.work_root, message, [rel], identity=ctx.config.identity(agent_name),
         )
     except gitops.GitError as exc:
         return StepResult(
@@ -1791,7 +1975,9 @@ def _disposition_value(structured) -> str | None:
 
 # --- commit (FR-9.2/9.7) -----------------------------------------------------
 def handle_commit(step: Step, ctx: StepContext) -> StepResult:
-    repo = ctx.repo_root
+    # The tree the phase was built in (P7a). The commit-message drafter already
+    # reads this tree; the commit itself must land in the same one.
+    repo = ctx.work_root
     # Narrow exclusion (review F-001): commit real artifacts (plan.md, outputs);
     # keep only the engine's own bookkeeping out of the commit and the checks.
     exclude = ctx.excludes
@@ -2013,7 +2199,9 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     usage = _UsageAccumulator()  # sum across ALL draft attempts, incl. rejected
     session_id = None
     for _attempt in range(1 + max_redrafts):
-        result = adapter.run(prompt, cwd=ctx.repo_root)
+        # The commit-message drafter reads the staged diff of the tree the
+        # phase was built in (P7a).
+        result = adapter.run(prompt, cwd=ctx.work_root)
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
@@ -2115,7 +2303,7 @@ def _change_context(ctx: StepContext, *, diff_base=None) -> str:
     base — pass ``diff_base`` (the squash base) so the drafted message reflects
     the whole phase, not an empty residual tree.
     """
-    repo = ctx.repo_root
+    repo = ctx.work_root
     if diff_base:
         diff = gitops.diff_worktree_vs(repo, diff_base, exclude=ctx.excludes)
         label = f"diff (tracked, vs phase base {diff_base[:10]})"

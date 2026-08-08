@@ -23,7 +23,17 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
-from gauntlet.engine import gitops, ledger as L, manifest as M
+
+# git_snapshot is not called directly here since P3 (the executor owns
+# snapshot creation), but the module attribute stays importable so the pilot
+# ordering tests can keep patching `orchestrator.git_snapshot.create_snapshot`.
+from gauntlet.engine import (
+    git_snapshot,  # noqa: F401 — see comment above
+    gitops,
+    ledger as L,
+    manifest as M,
+    recovery_exec as RX,
+)
 from gauntlet.engine.config import RESUME_ON_QUOTA_AUTO, RunConfig
 from gauntlet.engine.execution import (
     DONE,
@@ -32,10 +42,13 @@ from gauntlet.engine.execution import (
     INTERRUPTED,
     PARKED,
     SKIPPED,
+    RunPaths,
     StepContext,
     StepResult,
     engine_bookkeeping_candidates,
     get_spec,
+    governed_artifact_paths,
+    human_owned_excludes,
     run_bookkeeping_excludes,
     run_bookkeeping_paths,
 )
@@ -144,10 +157,27 @@ class Orchestrator:
         clock: Callable[[], str] = _utcnow,
         response_action: "ResponseAction | None" = None,
         ledger_path: Path | None = None,
+        interrupted_override: str | None = None,
+        state_outside_worktree: bool = False,
+        artifacts_outside_worktree: bool = False,
+        work_root: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
+        # The tree this run's agents edit and the engine commits in (P7a).
+        # `None` means the pre-P7 same-tree layout, where it IS the repo root;
+        # P7c passes the run's dedicated worktree. Resolved once here so no
+        # handler has to decide, and so `work_root is repo_root` stops being an
+        # assumption 25 call sites each re-made independently (spike §9).
+        self.work_root = work_root or repo_root
         self.run_dir = run_dir
         self.artifact_root = artifact_root
+        # `gauntlet review` drives this orchestrator with an out-of-repo state
+        # dir by design (review.resolve_state_dir); a `gauntlet run` never
+        # does. The flag makes that difference declared rather than inferred
+        # from a swallowed ValueError — see execution.StateDirNotContained.
+        self.state_outside_worktree = state_outside_worktree
+        # Independent of the above (review F-002) — see StepContext.
+        self.artifacts_outside_worktree = artifacts_outside_worktree
         self.config = config
         self.pipeline = pipeline
         self.manifest = manifest
@@ -157,6 +187,13 @@ class Orchestrator:
         self.extra_context = extra_context or {}
         self.clock = clock
         self.response_action = response_action
+        # One-shot `resume --reset-interrupted` override (#72): forces the
+        # reset_to_base disposition for THIS drive only, giving the
+        # interrupted-park state a sanctioned, non-destructive operator verb
+        # (backup ref + checkpoint-preserving rewind) instead of git surgery.
+        # Never persisted — the configured `interrupted_step` policy resumes
+        # effect on the next drive.
+        self.interrupted_override = interrupted_override
         # Machine-global usage ledger (FR-10.1): resolved once (honors
         # GAUNTLET_LEDGER_PATH) so the append/admission paths agree on one file.
         self.ledger_path = ledger_path or L.default_ledger_path()
@@ -165,9 +202,60 @@ class Orchestrator:
         self.artifacts: dict[str, Path] = {}
         # Narrow exclusion: only the engine's own bookkeeping is hidden from
         # dirty checks / commits — real run artifacts stay visible (review F-001).
-        self.excludes = run_bookkeeping_excludes(repo_root, run_dir, artifact_root)
+        # The single roots policy object for this drive (P7c, problem B). Every
+        # bookkeeping path below asks IT "relative to which root?" rather than
+        # each site re-deriving the answer from `work_root`/`run_dir` — which is
+        # exactly the conflation P7a named and P7c makes observable, because
+        # under `dedicated` the run-instance dir is NOT in the tree we commit in.
+        self.paths = RunPaths(
+            repo_root=repo_root,
+            work_root=self.work_root,
+            state_root=run_dir,
+            artifact_root=artifact_root,
+            state_outside_worktree=state_outside_worktree,
+        )
+        self.excludes = run_bookkeeping_excludes(
+            self.work_root, self.bookkeeping_root, self.artifact_root_in_work,
+            state_outside_worktree=state_outside_worktree,
+        )
         self._ignore_run_dir()
         self._seed_artifacts()
+
+    @property
+    def bookkeeping_root(self) -> Path:
+        """Where this drive's committable bookkeeping lives IN THE WORK TREE.
+
+        ``run_dir`` same-tree; the run worktree's two-file export dir under
+        `dedicated` (spike §4.4). See :attr:`RunPaths.bookkeeping_root`.
+        """
+        return self.paths.bookkeeping_root
+
+    @property
+    def artifact_root_in_work(self) -> Path:
+        """The governed artifacts' location in the work tree (spike §14.2)."""
+        return self.paths.artifact_root_in_work
+
+    def _refresh_bookkeeping_export(self) -> None:
+        """Re-materialize the export dir from the live projection (§4.4).
+
+        A no-op same-tree. Under `dedicated` this is the ONLY writer of the
+        exported ``manifest.json``/``RUN.md``, and it runs immediately before
+        every bookkeeping commit — so the committed audit trail is always the
+        state as of that commit, and the export is never read back to make a
+        decision. See ``worktree.write_bookkeeping_export`` for why that
+        asymmetry is the design.
+        """
+        if not self.paths.dedicated_worktree:
+            return
+        from gauntlet.engine import worktree as WT
+
+        WT.write_bookkeeping_export(
+            self.work_root,
+            self.run_dir,
+            self.config.run_root,
+            self.manifest.slug,
+            self.manifest.run_id,
+        )
 
     def _ignore_run_dir(self) -> None:
         """Keep the engine's own live run-instance dir out of the worktree state.
@@ -192,6 +280,14 @@ class Orchestrator:
         Idempotent and resumable: steps already ``done``/``skipped`` in the
         manifest are not re-run. Returns the resulting run status.
         """
+        # Flush the latest response step's checkpoint against the PRE-DRIVE
+        # persisted state FIRST (crash recovery, FR-7.1/F-002) — before the
+        # RUNNING write-ahead dirties the manifest. P4: the terminal persist
+        # now carries the mapped run status in the same write as the consumed
+        # flip, so the prior invocation's `consumed` checkpoint holds the
+        # PARKED state; flushing after the RUNNING flip would re-commit that
+        # same checkpoint message on every later resume (a duplicate).
+        self._reconcile_response_checkpoint()
         self.manifest.status = M.RUN_RUNNING
         self._persist()
         # Apply any planned `--response` transition BEFORE the stage walk and
@@ -200,6 +296,11 @@ class Orchestrator:
         # raise PlanPhasesError, and the parked step it re-arms must be in place
         # before the walk re-executes it.
         self._apply_response_action()
+        # P5 (plan §5.1): a surviving drive-level plan-parse park re-arms so the
+        # stage walk re-runs ONLY the parse — continuing when the plan was
+        # fixed, re-parking (identical fingerprint → the verb's R5 guard exits
+        # nonzero) when it was not.
+        self._reconcile_plan_parse_park()
         try:
             for stage in self.pipeline.stages:
                 status = self._run_stage(stage)
@@ -207,18 +308,167 @@ class Orchestrator:
                     return self._set_run_status(status)
             return self._set_run_status(DONE)
         except PlanPhasesError as exc:
-            # A malformed `gauntlet-phases` block in plan.md is a builder-authored
-            # artifact defect, not an orchestrator fault — and `_plan_context`
-            # parses it while building the context for *any* step (a gate, a
-            # foreach), so an uncaught raise here kills `drive()` mid-walk and
-            # leaves the write-ahead RUN_RUNNING status persisted: `gauntlet
-            # status` then reads as a live run that is actually dead. Fail closed
-            # (CLAUDE.md §2): record the precise parse error and park for a human
-            # via HALTED -> RUN_PARKED, the same terminal-park path a budget/
-            # timeout halt takes. The human fixes plan.md and `gauntlet resume`
-            # re-drives — reaching the plan gate and parking normally.
-            self.manifest.warnings.append(f"plan.md gauntlet-phases unparseable: {exc}")
-            return self._set_run_status(HALTED)
+            # A malformed `gauntlet-phases` block in plan.md is an ARTIFACT
+            # defect (plan §5.1, P5): it lands as one coherent step/run
+            # transition classified artifact_invalid — never the pre-P5 bare
+            # HALTED-with-a-warning (which left no parked/halted step for the
+            # classifier and read as `unknown`), and never a persisted
+            # RUN_RUNNING after a parser exception. The park records the
+            # responsible artifact, the validator, the exact diagnostic, and a
+            # content fingerprint; a plain resume re-runs ONLY this parse
+            # against the (hand-edited) bytes — an UNCHANGED artifact repeats
+            # the identical fingerprint and exits nonzero through the R5
+            # no-progress guard instead of looping.
+            return self._park_plan_artifact_invalid(exc)
+
+    def _park_plan_artifact_invalid(self, exc: PlanPhasesError) -> str:
+        """Park a malformed plan.md phase list as ``artifact_invalid`` (§5.1, P5).
+
+        The parse ran while resolving ``plan.phases`` for the stage walk, so
+        the park attaches to the step the walk stopped at (the record a resume
+        re-enters), carrying the full evidence set: artifact path, validator,
+        verbatim diagnostic, and the plan's content fingerprint. The phases
+        stage only runs AFTER the plan gate, so the defective plan.md here is
+        an APPROVED artifact: the note surfaces the governance posture loudly —
+        a manual edit is sanctioned and ratified through the artifact's own
+        loop (R9/FR-10.4), never refused. Step terminalization and the run
+        park land in one durable write (:meth:`_finalize_terminal`).
+        """
+        import hashlib
+
+        plan_path = self.artifact_root / "plan.md"
+        try:
+            text = plan_path.read_text()
+        except OSError:
+            text = ""
+        digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        rec = self._walk_stop_record()
+        try:
+            artifact_rel = plan_path.resolve().relative_to(
+                self.repo_root.resolve()
+            ).as_posix()
+        except ValueError:
+            artifact_rel = "plan.md"
+        result = StepResult(
+            status=PARKED,
+            parked_reason=M.PARKED_REASON_ARTIFACT_INVALID,
+            revalidation=M.RevalidationRecord(
+                artifact=artifact_rel,
+                hash_at_park=digest,
+                validator="plan_phases",
+                diagnostic=str(exc),
+            ),
+            notes=(
+                f"artifact_invalid park (plan §5.1): {artifact_rel} "
+                f"gauntlet-phases block is unparseable — {exc}\n"
+                f"Content fingerprint {digest}. plan.md is an APPROVED "
+                "artifact here: editing it is a sanctioned governance event, "
+                "surfaced loudly and ratified through the artifact's own loop "
+                "(R9/FR-10.4) — never refused. Fix the block, then a plain "
+                "`gauntlet resume` re-runs ONLY this parse and continues; an "
+                "unchanged file exits nonzero (no-progress) instead of "
+                "re-parking in a loop."
+            ),
+        )
+        self._finalize_terminal(rec, result)
+        return self.manifest.status
+
+    def _reconcile_plan_parse_park(self) -> None:
+        """Re-arm a drive-level plan-parse park for the validator-only re-run.
+
+        A ``_park_plan_artifact_invalid`` park lands on the walk-stop step —
+        a step that does NOT own a ``validate:``/``output:`` pair (those parks
+        belong to the FR-2.2 in-step path and are left alone). The validator
+        (the same parse the foreach runs) re-runs here against the current
+        bytes: still broken → the park stays armed (the walk re-parks with
+        fresh evidence, and an unchanged file trips the R5 guard at the verb);
+        now valid → the sanctioned hand-edit of the APPROVED plan is adopted
+        LOUDLY (P5.1 review F-004): a durable manifest warning retains BOTH
+        content fingerprints (park → adoption) so the governance event is
+        auditable — surfaced and preserved per R9/FR-10.4 and the standing
+        operator direction, never refused, never silent — before the step is
+        re-armed and the walk continues. Nothing but the validator ran either
+        way (plan §5.1).
+        """
+        import hashlib
+
+        from gauntlet.engine.planphases import load_plan_phases
+
+        for rec in self.manifest.steps:
+            if (
+                rec.status != M.PARKED
+                or rec.parked_reason != M.PARKED_REASON_ARTIFACT_INVALID
+                or rec.revalidation is None
+                or rec.revalidation.validator != "plan_phases"
+            ):
+                continue
+            step = self._pipeline_step_by_id(rec.id)
+            if step is not None and step.get("validate") and step.get("output"):
+                continue  # the step's own FR-2.2 validator park — not ours
+            plan_path = self.artifact_root / "plan.md"
+            try:
+                phases = load_plan_phases(plan_path)
+            except PlanPhasesError:
+                return  # still invalid: the walk re-parks with fresh evidence
+            if phases is None:
+                return  # block/plan removed entirely — that is not a repair
+            try:
+                text = plan_path.read_text()
+            except OSError:
+                text = ""
+            digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+            prior = rec.revalidation
+            note = (
+                f"resume: {prior.artifact} (an APPROVED artifact) was "
+                f"hand-edited while parked artifact_invalid and now passes the "
+                f"{prior.validator} validator ({prior.hash_at_park} -> "
+                f"{digest}); the edit is SANCTIONED and adopted LOUDLY "
+                "(R9/FR-10.4, standing operator direction) — both fingerprints "
+                "retained here as the governance audit trail"
+            )
+            if note not in self.manifest.warnings:
+                self.manifest.warnings.append(note)
+            rec.status = M.PENDING
+            rec.parked_reason = None
+            rec.revalidation = None
+            rec.recovery_cause = None
+            rec.recovery_disposition = None
+            rec.ended = None
+            self._persist()
+            return
+
+    def _pipeline_step_by_id(self, step_id: str) -> Step | None:
+        for stage in self.pipeline.stages:
+            for step in stage.steps:
+                if step.id == step_id:
+                    return step
+        return None
+
+    def _walk_stop_record(self) -> StepRecord:
+        """The record the stage walk stopped at — where a resume re-enters.
+
+        The first step, in declared stage/step order, with no record at all or
+        with any non-``done``/``skipped`` record. Falls back to the last known
+        record (or a record for the first pipeline step) so a park always has
+        a step to land on — a run-level park with NO step descriptor is the
+        exact unclassifiable shape P5 removes.
+        """
+        for stage in self.pipeline.stages:
+            for step in stage.steps:
+                recs = [r for r in self.manifest.steps if r.id == step.id]
+                if not recs:
+                    return self.manifest.upsert(
+                        StepRecord(id=step.id, type=step.type, agent=step.agent)
+                    )
+                live = [r for r in recs if r.status not in (M.DONE, M.SKIPPED)]
+                if live:
+                    return live[-1]
+        if self.manifest.steps:
+            return self.manifest.steps[-1]
+        first = self.pipeline.stages[0].steps[0]
+        return self.manifest.upsert(
+            StepRecord(id=first.id, type=first.type, agent=first.agent)
+        )
 
     def approve_gate(self, step_id: str, notes: str | None = None) -> str:
         rec = self._find_parked_gate(step_id)
@@ -444,7 +694,22 @@ class Orchestrator:
     def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:
         spec = get_spec(step.type)
         rec = self.manifest.record(step.id, iteration)
-        resuming = rec is not None and rec.status in (M.RUNNING, M.INTERRUPTED)
+        # A TIMEOUT-halted step re-enters through the same disposition as an
+        # interruption (P5.1 review F-001): the CLI child was killed mid-turn
+        # by its deadline, so a repo-writing agent may have left partial edits
+        # exactly like a signal kill. Without this, the advertised plain
+        # resume would re-run the agent OVER that partial work with no dirty
+        # check and no snapshot (plan §5.2: side-effecting failures go
+        # through snapshot/reconciliation, never a blind re-run). A clean
+        # timeout re-runs as before; budget/judge/precondition halts keep
+        # their existing direct re-entry (their handlers checkpointed).
+        resuming = rec is not None and (
+            rec.status in (M.RUNNING, M.INTERRUPTED)
+            or (
+                rec.status == M.HALTED
+                and rec.halt_reason == M.HALT_REASON_TIMEOUT
+            )
+        )
         if rec is None:
             rec = StepRecord(
                 id=step.id, type=step.type, agent=step.agent, iteration=iteration
@@ -454,7 +719,12 @@ class Orchestrator:
         if resuming:
             short = self._resume_disposition(step, spec, rec, item)
             if short is not None:
-                self._finalize(rec, short)
+                # P4 (#62 bug 2): the short-circuit finalization hole — this
+                # path used to return with the terminal step state mutated
+                # only in memory, relying on a later drive-level persist. The
+                # step's terminal status and the mapped run status now land in
+                # the same single durable transition as every other outcome.
+                self._finalize_terminal(rec, short)
                 return short
 
         # NOTE: `rec.attempts` is NO LONGER incremented here. FR-6 redefines it
@@ -473,6 +743,12 @@ class Orchestrator:
         if rec.status == M.FAILED and rec.failure_kind in M.RERUNNABLE_FAILURE_KINDS:
             rec.base_sha = None
             rec.failure_kind = None
+        # A plain resume of a provider_unavailable park starts a NEW dependency
+        # retry episode (plan §5.2): the operator/deadline chose to retry, so
+        # the persisted budget resets. A crash mid-retries (step still RUNNING)
+        # deliberately does NOT reset — the budget survives the crash.
+        if rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE:
+            rec.dependency_attempts = 0
         rec.status = M.RUNNING
         rec.started = rec.started or self.clock()
         self.manifest.current_step = step.id
@@ -489,6 +765,11 @@ class Orchestrator:
         # session — the judge's env snapshot then sees it already restored.
         prior_step_id = os.environ.get("GAUNTLET_STEP_ID")
         os.environ["GAUNTLET_STEP_ID"] = step.id
+        # The write-ahead persists a RUNNING step under a RUNNING run — one
+        # coherent pair (P4/#62): an on_fail retry re-entering after a FAILED
+        # terminal persist must not write-ahead a running step under a failed
+        # run status.
+        self.manifest.status = M.RUN_RUNNING
         self._persist()  # WRITE-AHEAD: before any side effect
 
         try:
@@ -520,14 +801,15 @@ class Orchestrator:
                         notes=f"timeout halt (FR-3.3/FR-5.2): {exc}",
                     )
                 except AgentFailedError as exc:
-                    # FR-3.2: a TRANSIENT failure (usage limit / overload) is not
-                    # a step failure — park (not FAILED) with
-                    # parked_reason=usage_limit, preserving the worktree (no reset
-                    # on this park kind) and the CLI session so a plain `gauntlet
-                    # resume` continues it (FR-3.3). A TERMINAL or unclassified
-                    # failure fails closed → FAILED (a human decides), exactly as
-                    # an unclassified handler fault would.
-                    result = self._agent_failure_result(exc)
+                    # FR-3.2: a TRANSIENT failure is not a step failure — park
+                    # (not FAILED): usage limits park `usage_limit` preserving
+                    # the worktree and CLI session (a plain `gauntlet resume`
+                    # continues it, FR-3.3); exhausted transport/dependency
+                    # retries park `provider_unavailable` with a concrete
+                    # backoff deadline (plan §5.2, P5). A TERMINAL or
+                    # unclassified failure fails closed → FAILED, with the
+                    # attempt's Git side effects assessed rather than assumed.
+                    result = self._agent_failure_result(exc, step, spec, rec)
                 except Exception as exc:  # fail closed: a handler fault halts it
                     result = StepResult(
                         status=FAILED,
@@ -545,8 +827,7 @@ class Orchestrator:
             # clean tree (backed up, lossless) BEFORE finalizing the park, so a later
             # `--response` resume never re-runs over — and commits — stale edits.
             result = self._restore_clean_after_conflict_park(step, spec, rec, result)
-            consumed = self._finalize(rec, result)
-            self._persist()  # WRITE-AHEAD: after the side effect, terminal state
+            consumed = self._finalize_terminal(rec, result)
             # The consume flip, the FAILED attempt-increment, and the status all
             # landed in the single `_persist` above — one atomic on-disk transaction
             # (FR-2.2/F-003 dedup boundary). Only AFTER it is durable do we commit
@@ -615,8 +896,11 @@ class Orchestrator:
         # partial *artifact* under the run root (not just a repo-root file) is
         # still seen as a mid-edit interruption (review F-001).
         if not gitops.is_dirty_vs(
-            self.repo_root, rec.base_sha, exclude=self.excludes,
-            bookkeeping=engine_bookkeeping_candidates(self.repo_root, self.run_dir),
+            self.work_root, rec.base_sha, exclude=self.excludes,
+            bookkeeping=engine_bookkeeping_candidates(
+                self.work_root, self.bookkeeping_root,
+                state_outside_worktree=self.state_outside_worktree,
+            ),
         ):
             # Clean re-entry: the agent left no partial edits, and any HEAD
             # advance past base_sha is engine bookkeeping only (is_dirty_vs
@@ -629,18 +913,8 @@ class Orchestrator:
             # existed) — destructive by construction.
             rec.base_sha = None
             return None  # agent never progressed; safe to re-run
-        if self.config.interrupted_step == "reset_to_base":
-            ts = self.clock().replace(":", "-")
-            backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-{ts}"
-            # Snapshot the partial work (tracked + untracked) before discarding.
-            gitops.backup_dirty_worktree(
-                self.repo_root, backup, f"interrupted {rec.id} partial work",
-                exclude=self.excludes,
-            )
-            # Flush the authoritative in-memory manifest to disk BEFORE the
-            # rewind, so the bookkeeping the rewind preserves carries the latest
-            # response state (e.g. a still-`pending` entry the re-run consumes).
-            self._persist()
+        if (self.interrupted_override or self.config.interrupted_step) == "reset_to_base":
+            ts = self.clock().replace(":", "-").replace("+", "-")
             # FR-11.2: rewind to the latest intra-phase checkpoint commit that is
             # a descendant of base_sha (a `P<N> wip:` milestone) rather than all
             # the way to base_sha, so completed milestones survive the rewind and
@@ -652,43 +926,81 @@ class Orchestrator:
                 rec, self._expected_phase(step, item)
             )
             rec.resumed_from_checkpoint = checkpoint_subject
+            # Flush the authoritative in-memory manifest to disk BEFORE the
+            # rewind, so the bookkeeping the rewind preserves carries the latest
+            # response state (e.g. a still-`pending` entry the re-run consumes).
+            self._persist()
             # F-001: the rewind target predates the engine bookkeeping commits
             # stacked on top of it — notably the pending-response checkpoint
             # (FR-2.2/FR-7.1). A plain `reset --hard target` would delete the
             # force-committed manifest from disk AND orphan that checkpoint, so a
             # kill in the gap before it was re-persisted would lose the human
-            # response. Instead, rewind the implementation to the target in a
-            # single reset whose target commit still carries the manifest — the
-            # response is never, even for an instant, absent from both disk and
-            # reachable history. Label that commit with the canonical
-            # response-checkpoint subject so it stands in as the pending
-            # checkpoint itself (the post-rewind reconcile below is then a no-op
-            # rather than stacking a duplicate).
+            # response. The bookkeeping-preserving mode rewinds the
+            # implementation in a single reset whose target commit still carries
+            # the manifest, labelled with the canonical response-checkpoint
+            # subject so it stands in as the pending checkpoint itself (the
+            # post-rewind reconcile below is then a no-op, not a duplicate).
+            # P7g: materialize the export BEFORE resolving the paths, for the
+            # same reason `commit_run_bookkeeping` does (see its comment). Under
+            # `dedicated` the bookkeeping paths live inside the run worktree and
+            # `run_bookkeeping_paths` filters by EXISTENCE, so without this the
+            # list comes back empty, `preserving` goes False, and the rewind
+            # silently degrades to a plain `reset --hard` — which orphans the
+            # pending-response checkpoint this whole block exists to preserve.
+            # F-001 was not re-broken by the flip; it was re-broken by the
+            # export not being on disk yet, and the flip made that the default.
+            self._refresh_bookkeeping_export()
             paths = self._bookkeeping_paths()
-            if paths and gitops.head_sha(self.repo_root) != target:
-                message = (
-                    self._response_checkpoint_message()
-                    or f"gauntlet: rewind implementation to {target[:10]} "
-                    f"for re-run ({rec.id})"
+            preserving = bool(paths) and gitops.head_sha(self.work_root) != target
+            message = (
+                self._response_checkpoint_message()
+                or f"gauntlet: rewind implementation to {target[:10]} "
+                f"for re-run ({rec.id})"
+            ) if preserving else None
+            # P3 (plan §4.3): the executor owns the mutation ordering — lock,
+            # fingerprint re-check, validation, durable snapshot (a snapshot
+            # failure aborts before any destructive verb), intent, then the
+            # rewind. `clean` is broader than the dirty check on purpose: it
+            # spares the whole run root so the reset never wipes the run
+            # pointer, manifests, the authored prd.md, or prior declared
+            # artifacts — the re-run regenerates its own outputs over them.
+            try:
+                self._apply_recovery_rewind(
+                    rec,
+                    site="orchestrator.reset_to_base",
+                    target_sha=target,
+                    cause=RX.RecoveryCause.PROCESS_LOST,
+                    reason=f"interrupted {rec.id} partial work",
+                    snapshot_id=f"{rec.id}-reset-{ts}",
+                    reset_mode=(
+                        RX.RESET_BOOKKEEPING_PRESERVING if preserving
+                        else RX.RESET_PLAIN
+                    ),
+                    bookkeeping_paths=paths if preserving else (),
+                    rewind_message=message,
+                    clean_excludes=(self.config.run_root,),
+                    # The rewind restored the on-disk manifest to the target's
+                    # tree + the preserved bookkeeping; re-persist the
+                    # authoritative in-memory state over it (transaction step 7).
+                    persist=lambda _result: self._persist(),
                 )
-                gitops.rewind_impl_preserving_bookkeeping(
-                    self.repo_root, target, paths, message,
-                    identity=ENGINE_IDENTITY,
+            except RX.RecoveryPreconditionError as exc:
+                # A refused rewind plan (e.g. the range holds an operator
+                # commit modifying a governed artifact, R9/FR-10.4 — post-P3
+                # review F-004) is a fail-closed PARK, not a crash: nothing
+                # was mutated, the evidence names the conflict, and the
+                # operator resolves it through the artifact's own loop or the
+                # explicit rollback verb.
+                return StepResult(
+                    status=INTERRUPTED,
+                    halt_reason=M.HALT_REASON_PRECONDITION,
+                    notes=(
+                        "reset_to_base refused fail-closed before any "
+                        f"mutation: {exc}"
+                    ),
                 )
-            else:
-                # Nothing to preserve above the target (HEAD == target, or no
-                # bookkeeping on disk): the plain rewind is already crash-safe.
-                gitops.reset_hard(self.repo_root, target)
-            # `clean` is broader than the dirty check on purpose: it spares the
-            # whole run root so the reset never wipes the run pointer, manifests,
-            # the authored prd.md, or prior declared artifacts — the re-run
-            # regenerates its own outputs over them.
-            gitops.clean_untracked(self.repo_root, exclude=[self.config.run_root])
-            # The rewind restored the on-disk manifest to base_sha's tree + the
-            # overlaid bookkeeping; re-persist the authoritative in-memory state
-            # over it and idempotently flush the checkpoint (still `pending` here
-            # — the re-run consumes it and lands the `consumed` checkpoint).
-            self._persist()
+            # Idempotently flush the checkpoint (still `pending` here — the
+            # re-run consumes it and lands the `consumed` checkpoint).
             self._reconcile_response_checkpoint()
             return None  # tree restored to base; checkpoints preserved; re-run cleanly
         return StepResult(
@@ -699,9 +1011,136 @@ class Orchestrator:
             notes=(
                 "interrupted mid-edit: worktree dirty vs base SHA "
                 f"{rec.base_sha[:10]}; parked for a human (F-003, "
-                "interrupted_step=park)."
+                "interrupted_step=park). To discard the interrupted attempt "
+                "and re-run cleanly (partial work is preserved as a recovery "
+                "snapshot under refs/gauntlet/recovery/ first, and committed "
+                f"checkpoints are preserved): `gauntlet resume {self.manifest.slug} "
+                "--reset-interrupted`."
                 + self._dirty_verdict_detail(rec.base_sha)
             ),
+        )
+
+    def _apply_recovery_rewind(
+        self,
+        rec: StepRecord,
+        *,
+        site: str,
+        target_sha: str,
+        cause: "RX.RecoveryCause",
+        reason: str,
+        snapshot_id: str,
+        reset_mode: str,
+        bookkeeping_paths: tuple[str, ...] | list[str] = (),
+        rewind_message: str | None = None,
+        clean_excludes: tuple[str, ...] = (),
+        snapshot_exclude: list[str] | None = None,
+        persist=None,
+    ) -> "RX.RecoveryResult":
+        """Route one orchestrator rewind through the shared transaction (P3).
+
+        Assessment is read-only (observation + planner); every mutation —
+        snapshot, intent, checkout/reset/clean, protected restore — happens
+        inside :meth:`RecoveryExecutor.apply` under the canonical ordering.
+        Human-owned excluded files (PR.md) are protected paths in the durable
+        snapshot and restored from it after the rewind, replacing the
+        in-memory overlay a process kill could lose (PR #77 review).
+        """
+        repo = self.work_root
+        # These in-drive rewinds never switch branches: they observe and
+        # mutate the CURRENT checkout — the run branch during a real drive
+        # (resume checks it out first), but possibly another branch when the
+        # engine is embedded directly. Observing the checked-out branch is
+        # what makes the commit inventory (and its governance evidence,
+        # F-004) reflect the range the rewind actually discards.
+        checked_out = gitops.current_branch(repo)
+        observe_branch = (
+            self.manifest.branch if checked_out == "HEAD" else checked_out
+        )
+        git_obs = RX.observe_git(
+            repo,
+            run_branch=observe_branch,
+            recorded_sha=rec.base_sha,
+            excludes=self.excludes,
+            bookkeeping_candidates=engine_bookkeeping_candidates(
+                repo, self.bookkeeping_root,
+                state_outside_worktree=self.state_outside_worktree,
+            ),
+            approved_artifacts=governed_artifact_paths(
+                repo, self.artifact_root_in_work,
+                artifacts_outside_worktree=self.artifacts_outside_worktree,
+            ),
+        )
+        state_obs = RX.observe_state(
+            self.manifest, rec, liveness=RX.DriverLiveness.ALIVE
+        )
+
+        def fingerprint() -> "RX.ProgressFingerprint":
+            return RX.build_progress_fingerprint(
+                repo, manifest=self.manifest, record=rec, excludes=self.excludes
+            )
+
+        # The action names the ref this rewind actually mutates (F-003).
+        target_ref = "HEAD" if checked_out == "HEAD" else f"refs/heads/{checked_out}"
+        action = RX.SnapshotAndRestartAction(
+            description=f"snapshot the worktree and restart from {target_sha[:10]}",
+            target_ref=target_ref,
+            target_sha=target_sha,
+            reason=reason,
+        )
+        assessment = RX.RecoveryPlanner(repo).assess_rewind(
+            git_obs=git_obs,
+            state_obs=state_obs,
+            fingerprint=fingerprint(),
+            action=action,
+            cause=cause,
+        )
+        # Loud governance audit (R9/FR-10.4): a discarded operator commit
+        # touching a governed artifact (prd.md/plan.md) is surfaced as a
+        # manifest warning — never refused; manual PRD/plan edits are a
+        # sanctioned operator workflow, and the snapshot preserves the state.
+        for note in assessment.evidence:
+            if note.startswith(RX.GOVERNED_DISCARD_EVIDENCE_PREFIX):
+                warn = f"[{site}] {note}"
+                if warn not in self.manifest.warnings:
+                    self.manifest.warnings.append(warn)
+        spec = RX.RewindSpec(
+            site=site,
+            target_sha=target_sha,
+            reset_mode=reset_mode,
+            bookkeeping_paths=tuple(bookkeeping_paths),
+            rewind_message=rewind_message,
+            clean=True,
+            clean_excludes=tuple(clean_excludes),
+        )
+        executor = RX.RecoveryExecutor(
+            # repo_root is the OPERATOR's checkout — it resolves the run-instance
+            # dir, the drive lock and the projection, all of which stay there by
+            # design (spike §4.4). work_root is the tree the rewind mutates.
+            self.repo_root,
+            self.run_dir,
+            run_id=self.manifest.run_id,
+            run_root=self.config.run_root,
+            excludes=self.excludes,
+            clock=self.clock,
+            work_root=self.work_root,
+        )
+        return executor.apply(
+            assessment,
+            action,
+            spec=spec,
+            snapshot_request=RX.SnapshotRequest(
+                snapshot_id=snapshot_id,
+                reason=reason,
+                attempt_id=f"{rec.id}#{rec.attempts}",
+                run_branch=self.manifest.branch,
+                exclude=(
+                    snapshot_exclude if snapshot_exclude is not None
+                    else self.excludes
+                ),
+                protected=human_owned_excludes(self.excludes),
+            ),
+            fingerprint=fingerprint,
+            persist=persist,
         )
 
     def _dirty_verdict_detail(self, base_sha: str) -> str:
@@ -714,12 +1153,12 @@ class Orchestrator:
         """
         parts: list[str] = []
         try:
-            porcelain = gitops.status_porcelain(self.repo_root, exclude=self.excludes)
+            porcelain = gitops.status_porcelain(self.work_root, exclude=self.excludes)
             if porcelain:
                 parts.append(f"uncommitted changes:\n{porcelain}")
-            head = gitops.head_sha(self.repo_root)
+            head = gitops.head_sha(self.work_root)
             if head != base_sha:
-                rng = gitops.log_range(self.repo_root, base_sha, head)
+                rng = gitops.log_range(self.work_root, base_sha, head)
                 parts.append(
                     f"commits in {base_sha[:10]}..{head[:10]}:\n"
                     + (rng or "(none — HEAD is behind or forked from the base)")
@@ -779,24 +1218,35 @@ class Orchestrator:
         # use). A clean result here means the builder honored the
         # classify-don't-implement contract — nothing to restore.
         run_root = [self.config.run_root]
-        if gitops.is_clean(self.repo_root, exclude=run_root):
+        if gitops.is_clean(self.work_root, exclude=run_root):
             return result
-        ts = self.clock().replace(":", "-")
-        backup = f"refs/gauntlet/backup/{self.manifest.run_id}/{rec.id}-conflict-{ts}"
-        gitops.backup_dirty_worktree(
-            self.repo_root,
-            backup,
-            f"conflict-park partial work for {rec.id} (F-001)",
-            exclude=run_root,
+        ts = self.clock().replace(":", "-").replace("+", "-")
+        # P2 piloted this rewind on GitRecoverySnapshot; P3 routes it through
+        # the shared executor transaction (plan §4.3): the snapshot captures
+        # the full dirty state (staged vs worktree separately, modes,
+        # symlinks, raw index bytes) plus human-owned protected paths, a
+        # snapshot failure aborts before reset/clean touch anything (fail
+        # closed, R2), and the reset-to-HEAD + clean + protected restore run
+        # under the executor's lock/fingerprint/intent ordering. Resetting to
+        # HEAD (NOT base_sha) discards only the builder's uncommitted edits
+        # while preserving every checkpoint. `clean` spares the whole run root
+        # so the manifest/transcripts/authored artifacts under it survive.
+        result_rewind = self._apply_recovery_rewind(
+            rec,
+            site="orchestrator.conflict_park",
+            target_sha=self._head_sha(),
+            cause=RX.RecoveryCause.WORKTREE_PARTIAL,
+            reason=f"conflict-park partial work for {rec.id} (F-001)",
+            snapshot_id=f"{rec.id}-conflict-{ts}",
+            reset_mode=RX.RESET_PLAIN,
+            clean_excludes=(self.config.run_root,),
+            snapshot_exclude=run_root,
         )
-        gitops.reset_hard(self.repo_root, self._head_sha())
-        # `reset --hard` leaves untracked files; clear the builder's untracked
-        # edits too, sparing the whole run root so the manifest/transcripts/
-        # authored artifacts under it survive.
-        gitops.clean_untracked(self.repo_root, exclude=run_root)
+        snapshot = result_rewind.snapshot
         note = (
-            f"conflict park left an uncommitted worktree; backed up to {backup} "
-            "and restored the clean tree before handoff (F-001)"
+            "conflict park left an uncommitted worktree; preserved as recovery "
+            f"snapshot {snapshot.ref} and restored the clean tree before "
+            "handoff (F-001)"
         )
         result.notes = f"{result.notes}\n{note}" if result.notes else note
         return result
@@ -941,20 +1391,55 @@ class Orchestrator:
         except Exception:
             pass
 
-    def _agent_failure_result(self, exc: AgentFailedError) -> StepResult:
+    def _agent_failure_result(
+        self, exc: AgentFailedError, step: Step, spec, rec: StepRecord
+    ) -> StepResult:
         """Turn a classified adapter failure into a park (transient) or FAILED.
 
-        FR-3.2: a ``transient_*`` classification parks the step with
+        FR-3.2: a ``transient_usage_limit`` classification parks the step with
         ``parked_reason=usage_limit``, the failing call's ``session_id`` preserved
         (so a plain ``gauntlet resume`` continues it, FR-3.3) and its usage
-        accounted (the failed call still cost tokens). The worktree is left
-        untouched — this park kind bypasses the reset/conflict-restore paths (both
-        key on other reasons). An absent/terminal ``failure_info`` fails closed to
-        FAILED (never auto-continued past an unknown error, §7).
+        accounted (the failed call still cost tokens). A transport/dependency
+        kind (plan §5.2, P5 — timeout / connection / DNS / 5xx / overload,
+        reached only after the call-site's bounded persisted retries were
+        exhausted) parks ``provider_unavailable`` with a concrete backoff /
+        Retry-After deadline recorded, so a plain resume retries it — never
+        ``--response`` (R7, issue #63). The worktree is left untouched on both
+        park kinds.
+
+        An absent/terminal ``failure_info`` fails closed to FAILED — but the
+        engine assesses the attempt's Git/worktree side effects rather than
+        deciding retryability from the exception name (plan §5.2): an attempt
+        that provably left no side effects is stamped
+        ``failure_kind=side_effect_free_unknown`` so a plain resume may re-run
+        it (a deterministic repeat then trips the R5 no-progress guard); a
+        side-effecting or unprovable attempt stays terminal — its recovery goes
+        through the snapshot/reconciliation verbs.
         """
+        from gauntlet.engine import depretry
+
         info = exc.failure_info
         partial = exc.partial
         if info is not None and info.is_transient:
+            if depretry.is_dependency_failure(info):
+                deadline_s = depretry.park_deadline_s(rec, self.config, info)
+                return StepResult(
+                    status=PARKED,
+                    parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                    session_id=partial.session_id if partial else None,
+                    usage=partial.usage if partial else None,
+                    retry_after_s=info.retry_after_s,
+                    backoff_s=deadline_s,
+                    notes=(
+                        f"provider-unavailable park (plan §5.2): {info.kind} "
+                        f"[{info.marker}] after "
+                        f"{rec.dependency_attempts} bounded in-process "
+                        f"retr{'y' if rec.dependency_attempts == 1 else 'ies'} "
+                        f"(persisted); retry deadline ~{deadline_s}s. A plain "
+                        "`gauntlet resume` retries the step — no `--response` "
+                        "decision is at stake (R7)"
+                    ),
+                )
             after = (
                 f"; provider retry hint ~{info.retry_after_s}s"
                 if info.retry_after_s else ""
@@ -971,13 +1456,62 @@ class Orchestrator:
                     "continues the session" + after
                 ),
             )
+        side_effects = self._attempt_side_effects(step, spec, rec)
+        if side_effects is None:
+            assessment_note = (
+                "side-effect assessment: unprovable (no recorded attempt "
+                "boundary or git unavailable) — fail closed, terminal"
+            )
+            failure_kind = None
+        elif side_effects:
+            assessment_note = (
+                "side-effect assessment: the attempt left Git/worktree "
+                "changes — terminal; recover through the snapshot-backed "
+                "verbs, never a blind re-run (plan §5.2)"
+            )
+            failure_kind = None
+        else:
+            assessment_note = (
+                "side-effect assessment: no Git/worktree side effects — a "
+                "plain `gauntlet resume` may safely retry this unknown "
+                "failure (plan §5.2; an unchanged repeat raises the R5 "
+                "no-progress guard instead of looping)"
+            )
+            failure_kind = M.FAILURE_KIND_SIDE_EFFECT_FREE
         return StepResult(
             status=FAILED,
             halt_reason=M.HALT_REASON_ADAPTER_ERROR,
+            failure_kind=failure_kind,
             usage=partial.usage if partial else None,
             session_id=partial.session_id if partial else None,
-            notes=f"agent failed (terminal, FR-3.1): {exc}",
+            notes=f"agent failed (terminal, FR-3.1): {exc}\n{assessment_note}",
         )
+
+    def _attempt_side_effects(
+        self, step: Step, spec, rec: StepRecord
+    ) -> bool | None:
+        """Did this attempt produce Git/worktree side effects? (plan §5.2, P5)
+
+        ``False`` — provably side-effect-free: the step type cannot touch the
+        worktree at all, or the tree is clean against the attempt's recorded
+        ``base_sha`` (engine bookkeeping tolerated, same rule as the resume
+        disposition). ``True`` — the tree moved. ``None`` — unprovable (no
+        recorded boundary / git failure) → the caller fails closed to terminal.
+        """
+        if not spec.step_touches_worktree(step):
+            return False  # by construction: no repo access, no side effects
+        if rec.base_sha is None:
+            return None
+        try:
+            return gitops.is_dirty_vs(
+                self.work_root, rec.base_sha, exclude=self.excludes,
+                bookkeeping=engine_bookkeeping_candidates(
+                    self.work_root, self.bookkeeping_root,
+                    state_outside_worktree=self.state_outside_worktree,
+                ),
+            )
+        except gitops.GitError:
+            return None
 
     def _quota_reset_at(self, retry_after_s: int | None) -> str | None:
         """Absolute UTC reset time = now + ``retry_after_s`` (FR-3.2 "when reported").
@@ -1083,9 +1617,35 @@ class Orchestrator:
         # clock) so both the agent_task and cycle park paths get it uniformly;
         # an explicit ``quota_reset_at`` on the result (rare) still wins.
         rec.retry_after_s = result.retry_after_s
-        rec.quota_reset_at = result.quota_reset_at or self._quota_reset_at(
-            result.retry_after_s
+        # The park deadline: an explicit reset time wins, else the provider's
+        # structured retry hint, else (P5, plan §5.2) the engine-computed
+        # backoff deadline of a provider_unavailable park — so a dependency
+        # park always carries the concrete deadline the P4.1 F-006 no-progress
+        # exemption requires (retry_after_s itself stays structured-only).
+        rec.quota_reset_at = (
+            result.quota_reset_at
+            or self._quota_reset_at(result.retry_after_s)
+            or self._quota_reset_at(result.backoff_s)
         )
+        # P5 (plan §6): stamp the orthogonal recovery cause/disposition from the
+        # outcome's own evidence — current-state, cleared (None) on DONE/SKIPPED.
+        # The planner treats a recorded pair as refining evidence over the
+        # coarse state→cause map; old manifests without the fields classify
+        # exactly as before (plan §8).
+        rec.recovery_cause, rec.recovery_disposition = RX.outcome_classification(
+            rec.status,
+            parked_reason=rec.parked_reason,
+            halt_reason=rec.halt_reason,
+            failure_kind=rec.failure_kind,
+        )
+        # The persisted dependency-retry budget (plan §5.2) is episode-scoped:
+        # it survives ONLY into a provider_unavailable park (the episode it
+        # counts); any other finalization ends the episode and resets it.
+        if not (
+            rec.status == M.PARKED
+            and rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+        ):
+            rec.dependency_attempts = 0
         # The parked sub-step is current-state alongside the usage-limit stamps
         # (FR-3.3): set on a usage-limit cycle park so resume continues the
         # preserved session in the matching sub-step, cleared on any other
@@ -1147,6 +1707,11 @@ class Orchestrator:
             rec.agent_usage.setdefault(agent_name, M.UsageTotals()).add(agent_usage)
         if result.notes:
             rec.notes = result.notes
+        # Current-invocation authorization accounting (#83). Assignment (not
+        # accumulation) keeps a resumed step's status tied to the attempt whose
+        # status/notes are currently displayed.
+        rec.judge_tool_calls_allowed = result.judge_tool_calls_allowed
+        rec.judge_tool_calls_denied = result.judge_tool_calls_denied
         if result.metrics:
             rec.metrics = dict(result.metrics)  # trend outcome counts (FR-6.6)
         if result.commit_sha:
@@ -1199,6 +1764,7 @@ class Orchestrator:
     ) -> StepContext:
         return StepContext(
             repo_root=self.repo_root,
+            work_root=self.work_root,
             run_dir=self.run_dir,
             artifact_root=self.artifact_root,
             config=self.config,
@@ -1209,6 +1775,8 @@ class Orchestrator:
             judge_env=self.judge_env,
             artifacts=dict(self.artifacts),
             excludes=self.excludes,
+            state_outside_worktree=self.state_outside_worktree,
+            artifacts_outside_worktree=self.artifacts_outside_worktree,
             iteration_item=item,
             iteration_index=int(iteration) if iteration is not None else None,
             adapter_factory=self.adapter_factory,
@@ -1284,7 +1852,7 @@ class Orchestrator:
         )
 
     def _head_sha(self) -> str:
-        return gitops.head_sha(self.repo_root)
+        return gitops.head_sha(self.work_root)
 
     # ---- evidence-tiered gates (FR-4, P8) -----------------------------------
     def _maybe_auto_approve(
@@ -1424,7 +1992,7 @@ class Orchestrator:
         today's reset-to-base behavior. Only reached with a non-null ``base_sha``
         (the caller guards it).
         """
-        wips = gitops.wip_checkpoints(self.repo_root, base=rec.base_sha, phase=phase)
+        wips = gitops.wip_checkpoints(self.work_root, base=rec.base_sha, phase=phase)
         if wips:
             sha, subject = wips[0]  # newest first
             return sha, subject
@@ -1443,19 +2011,43 @@ class Orchestrator:
         self._persist()
         return self.manifest.status
 
+    def _finalize_terminal(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
+        """Finalize a step AND its mapped run status in ONE durable write (P4).
+
+        Issue #62 bug 2: the step's terminal status used to land in one
+        `_persist` while the run status landed in a later drive-level one — a
+        kill in the gap persisted ``RUN_RUNNING`` plus a terminal step, a shape
+        the classifier called ``unknown``. Folding the run-status mapping into
+        the same atomic manifest write closes the gap: every persisted state is
+        either (running step, running run) — recoverable by liveness — or
+        (terminal step, mapped run status). A DONE/SKIPPED step maps to
+        ``RUN_RUNNING`` (the stage walk continues; the final ``RUN_DONE`` is
+        the drive-level completion transition), which a dead driver reads as
+        ``orphaned`` → plain resume continues from the next step.
+        """
+        consumed = self._finalize(rec, result)
+        self.manifest.status = {
+            PARKED: M.RUN_PARKED,
+            HALTED: M.RUN_PARKED,  # FR-3.3: a halt parks the run for a human
+            INTERRUPTED: M.RUN_PARKED,  # F-003: a mid-edit interruption parks
+            FAILED: M.RUN_FAILED,
+        }.get(result.status, M.RUN_RUNNING)
+        self._persist()
+        return consumed
+
     # ---- response handling (FR-2, FR-2.2, FR-7.1) ---------------------------
     def _apply_response_action(self) -> None:
         """Apply a planned `--response` transition at the start of a resume.
 
-        Order matters for crash recovery (FR-7.1): FIRST flush the latest
-        response step's CURRENT state to git, so a crash between an atomic
-        manifest write and its checkpoint commit can never leave that state
-        unreachable in history — and, for a recovered `pending` entry, so a
-        distinct `pending` commit always precedes the later `consumed` one
-        (F-002). THEN, only for a brand-new response, append the `pending` entry
-        and commit it before the stage walk re-executes the parked step.
+        Order matters for crash recovery (FR-7.1): the latest response step's
+        CURRENT state is flushed to git first — by ``drive()``, against the
+        pre-drive persisted state (P4) — so a crash between an atomic manifest
+        write and its checkpoint commit can never leave that state unreachable
+        in history, and a recovered `pending` entry's distinct `pending` commit
+        always precedes the later `consumed` one (F-002). Here, only for a
+        brand-new response, append the `pending` entry and commit it before
+        the stage walk re-executes the parked step.
         """
-        self._reconcile_response_checkpoint()
         action = self.response_action
         if action is None or action.kind in ("none", "recover"):
             return
@@ -1535,11 +2127,17 @@ class Orchestrator:
         # Keep RUN.md consistent with the manifest we are about to commit (the
         # manifest is authoritative; RUN.md is its derived index).
         write_run_index(self.run_dir, self.manifest, self.writer)
+        # Materialize the export dir BEFORE resolving the paths to stage: under
+        # `dedicated` those paths are inside the run worktree and would not
+        # exist yet, so `run_bookkeeping_paths`' existence filter would return
+        # [] and this commit would silently no-op — the exact FR-2.2 audit-trail
+        # loss spike §9.3 catalogued.
+        self._refresh_bookkeeping_export()
         paths = self._bookkeeping_paths()
         if not paths:
             return None
         return gitops.commit_run_bookkeeping(
-            self.repo_root, message, paths, identity=ENGINE_IDENTITY
+            self.work_root, message, paths, identity=ENGINE_IDENTITY
         )
 
     def _bookkeeping_paths(self) -> list[str]:
@@ -1549,7 +2147,10 @@ class Orchestrator:
         definition of what every engine bookkeeping commit (and the F-001 /
         fix-rerun rewinds) force-stages.
         """
-        return run_bookkeeping_paths(self.repo_root, self.run_dir)
+        return run_bookkeeping_paths(
+            self.work_root, self.bookkeeping_root,
+            state_outside_worktree=self.state_outside_worktree,
+        )
 
     def _persist(self) -> None:
         self.manifest.write_atomic(self.manifest_path)

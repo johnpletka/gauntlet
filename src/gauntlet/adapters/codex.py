@@ -62,6 +62,22 @@ class CodexAdapter:
         max_input_chars=1_048_576,
     )
 
+    # P7f: probed, and probed SEPARATELY. `codex exec --sandbox workspace-write`
+    # was measured NOT to be subject to the `.git`-segment guard that blocks
+    # `claude` (§2.5 probe 2) — which is exactly why the preflight must never
+    # generalize one adapter's verdict to another. A codex-only check would have
+    # called the P7d dogfood's tree healthy while every claude builder and fixer
+    # step was silently refused, which is the shape that failure actually had.
+    probes_writability = True
+
+    @staticmethod
+    def writability_flags(tools: tuple[str, ...]) -> list[str]:
+        """No per-turn tool narrowing: `codex exec`'s sandbox flags already bound
+        what it may touch, and it has no `--allowedTools` equivalent. The probe's
+        determinism here rests on the prompt naming one mechanism and on the
+        verdict being the specific file that mechanism was told to produce."""
+        return []
+
     def __init__(
         self,
         *,

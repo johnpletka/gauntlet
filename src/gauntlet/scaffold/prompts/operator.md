@@ -55,6 +55,15 @@ behind that output. Drive every decision off the reported state class:
   `providers.<name>` window with `enforce: true`) parked *before* launching a
   step predicted not to fit the remaining window. Nothing is in flight; zero
   work is lost. Action: `gauntlet resume <slug>` when headroom returns.
+- **`parked_provider_unavailable`** — a transport/dependency failure (provider
+  timeout, connection/DNS failure, 5xx/overload) exhausted the engine's bounded
+  in-process retries (the consumed budget is persisted on the step, so crashes
+  never reset it). This is infrastructure, not content: no decision is at
+  stake. Action: plain `gauntlet resume <slug>` after the retry deadline
+  `status` prints — **never** `--response` (retry intent is not a human
+  decision). For a cycle fan-out, completed sub-steps and per-finding leaves
+  are checkpointed; the resume retries only the incomplete work, and
+  `gauntlet logs <slug>` points at the failing leaf's own evidence.
 - **`parked_artifact_invalid`** — an agent-authored structured artifact (e.g.
   the plan's `gauntlet-phases` block) failed validation after bounded in-session
   repair attempts; the exact validator error is in the step `notes`. Action:
@@ -62,6 +71,12 @@ behind that output. Drive every decision off the reported state class:
   named artifact file directly, then plain `gauntlet resume <slug>` re-runs
   **only the validator** (no agent re-run). The edit is audited: content hashes
   at park and at resume are recorded in the manifest.
+  **Edit the copy in YOUR OWN checkout**, always — never one inside a run
+  worktree. Your checkout is the authoring surface for `prd.md`/`plan.md`: it
+  is what the engine reads, validates and hashes, and the resume publishes your
+  bytes into the run's tree for you. A dedicated run's tree also holds those
+  files, but editing them there edits a disposable copy the next sync
+  overwrites.
 - **`failed`** — a step failed. Action: read the evidence with `gauntlet logs
   <slug>` (and the failed step's `notes` + engine-stamped `halt_reason`), then
   recover by failure kind:
@@ -83,6 +98,98 @@ behind that output. Drive every decision off the reported state class:
   halt means the *agent* genuinely exceeded its budget, not that the laptop lid
   closed. Action: `logs`, then `resume`.
 - **`interrupted`** — a step was killed mid-run. Action: `logs`, then `resume`.
+  A plain `resume` first reconciles a run branch left *ahead* of the manifest
+  by proven commit class: engine bookkeeping is tolerated, a committed
+  `P<N> wip:` checkpoint or phase/fix commit is **adopted** into the manifest
+  (the audit warning names the range) and the run continues from it, and an
+  operator commit becomes the next attempt's base — a hand-committed
+  `prd.md`/`plan.md` edit is surfaced loudly through the artifact's own gate,
+  never refused or discarded. It re-parks (fast, zero agent work) only when
+  the killed attempt left *uncommitted* work vs the step's recorded base — the
+  park message shows the dirty verdict (uncommitted paths). **Check which tree
+  those paths are in.** For a dedicated run they are in the run worktree, not
+  your checkout — so `git status` where you are standing can read *clean* while
+  the verb refuses on dirtiness, and the two are not in conflict. `status
+  --json` prints `worktree.path`; inspect with `git -C <that path> status`.
+  Repeating a resume
+  that changes nothing exits nonzero, naming the unchanged state and the
+  executable safe actions — never a silent re-park loop. The
+  sanctioned exit is `gauntlet resume <slug> --reset-interrupted`: it preserves
+  the partial work as a complete recovery snapshot under
+  `refs/gauntlet/recovery/`, rewinds only to the latest
+  committed `P<N> wip:` checkpoint (committed milestones survive), and re-runs
+  the step cleanly. One-shot — the configured `interrupted_step` policy is
+  unchanged. Never reach for `git reset` on a run branch instead.
+- **`worktree_unavailable`** — the run drives a dedicated worktree (the
+  default since P7g; `worktree.mode: same_tree` opts back out) and that tree
+  could not be created, locked, or verified: the path was taken, the branch is checked out somewhere else, the
+  disk filled, or the repo has uninitialized submodules. **Nothing was moved
+  or modified** — the run is exactly where it was, and the engine did *not*
+  quietly fall back to your checkout. `status` names the reason and the git
+  error verbatim. Action: fix what the message names and `gauntlet resume
+  <slug>`, or take the operator-chosen fallback `gauntlet resume <slug>
+  --same-tree`, which drives THIS resume in your own checkout. `--same-tree` is
+  one-shot: it is never persisted and never applied automatically.
+- **a dedicated run whose tree is at the OLD location** — only on repositories
+  that opted into `dedicated` before the run worktree moved out of the git
+  directory. The refusal names the tree it found, the new path, and the verb:
+  `gauntlet migrate-worktree <slug>` relocates it. Take that action rather than
+  `--same-tree` here — the tree is fine, it is simply somewhere the `claude` CLI
+  refuses to write, which is why the run could not be driven. Relocating rebuilds
+  the tree at the new root from the branch, so **commit or discard uncommitted
+  work in the old tree first**; the verb refuses while any exists rather than
+  sweeping it into a recovery ref you would have to know to look for. Nothing is
+  moved until you run it, and a live driver blocks it.
+- **`worktree missing`** (a dedicated run whose tree is gone) — `status --json`
+  shows `worktree.registered: true` with `present: false`; plain `status`
+  prints `worktree: MISSING at <path>`. Note `prunable` is usually **null**
+  here, not a reason string: a live run's tree is held under `git worktree
+  lock` for its whole life, and git does not report a locked worktree as
+  prunable. Registered-and-absent is the signal, not `prunable`.
+  The tree was swept (a reboot, a `/tmp` clean, an `rm -rf`)
+  while the branch ref and the journal — the authoritative state — survived.
+  This is recoverable by construction: action is plain `gauntlet resume
+  <slug>`, which recreates the worktree from the branch plus journal state and
+  verifies the recreated HEAD matches the journal head before driving. Do
+  **not** hand-run `git worktree add`; the engine also re-establishes the
+  anti-prune lock that stops another run's cleanup from removing it again.
+- **a `same_tree` run offered migration** — not a park and not a problem, and
+  since P7g it is the *exception* rather than the norm: a run that started
+  before the dedicated layout became the default, or one an adopter deliberately
+  pinned to `worktree.mode: same_tree`, drives your checkout, and `status`
+  offers the **optional** action `gauntlet migrate-worktree <slug>` to give it a
+  tree of its own. Nothing moves a run for you — the config `mode` only decides
+  what *new* runs are born as, so an existing run keeps driving `same_tree`
+  until you run this by name. That asymmetry is deliberate: a default flip must
+  never relocate a run that is already under way.
+  Copy, never move: the branch, its commits, the journal, the manifest and the
+  run dir all stay exactly where they are; only the tree the agents edit
+  changes. Undo with `gauntlet migrate-worktree <slug> --rollback`, which
+  removes the tree and returns the run to `same_tree` with everything else
+  intact.
+  Two preconditions, both checked before anything is touched — so `status` only
+  offers the action once it would actually run. **Step off the run branch
+  first**: a `same_tree` run leaves `gauntlet/<slug>` checked out in your tree,
+  and git refuses a second worktree for a checked-out branch, so
+  `git checkout <base>` and then migrate. The engine will not check out or move
+  a branch in your checkout to make this succeed, by design. **Commit or stash
+  uncommitted work first**: a `same_tree` run's work-in-progress lives in your
+  checkout, and migration builds the run's new tree from the committed branch
+  tip — so anything uncommitted would be stranded with you while the agents
+  carried on elsewhere. Your `prd.md`/`plan.md` are not affected; they are
+  republished into the run tree.
+  `gauntlet finish` then handles your local untracked `prd.md` for you when it
+  is byte-identical to what the run branch committed: it clears the duplicate,
+  the merge restores the same bytes as a tracked file, and the result line says
+  which paths it replaced. If your copy has **diverged** from the branch's, it
+  refuses instead and names both resolutions — a disagreement about an approved
+  artifact is yours to settle, not the engine's.
+  Migration is refused, with the blocker named, while a driver is `alive` or
+  `indeterminate`, and for a terminal run. **A refusal never wedges anything**:
+  the run is left exactly as it was and stays fully drivable in `same_tree`. If
+  a failure ever leaves the tree behind, the refusal says so explicitly and
+  names the mode the run is actually in — it never claims `same_tree` without
+  having verified it.
 - **`done`** — the run completed. No action; a lingering lock is harmless residue.
 - **`aborted`** — an operator aborted the run. No action.
 - **`unknown`** — an unrecognized or internally contradictory manifest. Action:
@@ -102,7 +209,11 @@ Work top-down; stop at the first branch that matches.
    → supply the response (§3). A gate decision is the only routine pause; make it
    deliberately, never reflexively.
 3. **Did it fail?** `failed` / `halted` / `interrupted` → `gauntlet logs <slug>`
-   to see the failing step's transcript and dir, diagnose, then `resume`.
+   to see the failing step's transcript and dir, diagnose, then `resume`. An
+   `interrupted` step that re-parks on a dirty base has a sanctioned exit:
+   `resume --reset-interrupted` (§1); a branch left ahead of the manifest by a
+   killed builder is adopted by a plain `resume` (§1), or rewound instead by
+   `rollback` / that same verb (§4/§4a).
 4. **Does the manifest say running?** Then trust *liveness*, not the manifest:
    - `in_progress` → it is genuinely working; wait and observe. If it looks
      stalled, read the stall classification before acting: the driver heartbeat
@@ -124,6 +235,23 @@ Work top-down; stop at the first branch that matches.
    could not classify.
 
 ## 3. Gates and responses (the routine pauses)
+
+**Reading the diff a gate is gating.** Do this from your own checkout, without
+checking anything out:
+
+```
+git log --oneline <base>..gauntlet/<slug>
+git diff <base>...gauntlet/<slug>
+git show gauntlet/<slug>
+```
+
+All three are read-only and disturb nothing — this is the better habit in every
+mode. For a **dedicated** run it is the only one that works: the run branch is
+checked out in the run's own worktree, and git refuses a second checkout of the
+same branch (`fatal: 'gauntlet/<slug>' is already used by worktree at ...`).
+Never `git checkout gauntlet/<slug>`. If you want a browsable copy, make your
+own worktree off the branch's tip — never adopt or edit the run's.
+
 
 - **Approve** a parked `human_gate` only after you have actually reviewed what it
   is gating: `gauntlet approve <slug>`. Approval is a human ratification, not a
@@ -149,6 +277,37 @@ group, and it refuses on any unverifiable datum. It does **not** auto-resume:
 after it marks the step `interrupted`, run `gauntlet resume <slug>` as a separate,
 deliberate step. Never reach for `recover` on an `orphaned` run (that is
 `resume`'s job) or an `indeterminate`/`unknown` one (inspect first).
+
+Recover also reconciles the branch↔manifest pair it leaves behind: it snapshots
+the killed branch tip to a backup ref (`refs/gauntlet/backup/<run_id>/recover-…`)
+and, when the killed driver had committed work the manifest never recorded (a
+builder killed before a flush), records that unmanifested range on the §6.4
+audit record and as a manifest warning naming the ways out: a plain `resume`
+(adopts the recognized range into the manifest and continues), `rollback`
+(absorbs the unmanifested commits to a phase boundary, after backup), or
+`resume --reset-interrupted` (discards the interrupted attempt,
+checkpoint-preserving). All are native verbs; none needs git surgery.
+
+## 4a. Rollback (rewinding to a phase boundary)
+
+`gauntlet rollback <slug> --phase N` rewinds the run branch AND the manifest to
+the end-of-phase-N boundary together (FR-9.9) — they never disagree afterward.
+Before any rewind it writes a backup ref and a manifest snapshot, so every
+rollback is reversible. The guards, in order:
+
+- **Dirty worktree** → refuses; commit or discard first. The refusal names the
+  tree it inspected — for a dedicated run that is the run worktree
+  (`status --json` → `worktree.path`), not your checkout (only engine
+  bookkeeping and `PR.md` are exempt).
+- **Branch tip vs last recorded commit:** equal, or ahead by only engine
+  bookkeeping commits → proceeds. Ahead by *real* unmanifested commits that
+  descend from the last recorded commit (the recover-left-ahead shape) →
+  proceeds by **absorbing** them: they are captured in the backup ref and the
+  absorption is recorded as a manifest warning naming the ref. A tip that has
+  **forked** from (or lost) the recorded history → refuses; restore the branch
+  before rewinding.
+- Rolling back past an auto-approved gate reverses it and disables
+  auto-approval for the rest of the run (FR-4.2).
 
 ## 5. Evidence on demand
 
@@ -189,6 +348,27 @@ defeats the safety the pipeline is built on.
   explicitly invites you to hand-fix the named artifact — that path is designed
   for it, and the resume revalidates and records the edit (content-hash audit)
   rather than trusting it blindly. No other state licenses an edit.
+
+  Since P7g this guardrail is **structural rather than behavioural for every
+  new run**, with no configuration: the builder's tree is a separate directory —
+  `.gauntlet/worktrees/<slug>/<run-id>` inside your repo, gitignored by an
+  engine-owned marker — that you have no reason to open, rather than files
+  sitting in your own editor. That is the clearest operator-facing win of the
+  dedicated layout, and it now applies by default. The trade, stated plainly: the agent's work no longer
+  appears in the files you are already editing. It is still browsable when you
+  want it (`status --json` → `worktree.path` names the exact directory), but
+  reach for `gauntlet logs <slug>` for the live transcript and `git diff
+  <base>...gauntlet/<slug>` for committed progress first — both answer the
+  question without disturbing anything.
+
+  Two things about that directory are worth knowing before they surprise you.
+  It is **gitignored, not hidden**: `git status` stays clean, but `git status
+  --ignored` lists it. And `git clean -xdff` **will** delete it — double-force
+  ignores the "skip repositories" rule that `-xdf` respects. That is recoverable
+  rather than fatal: the branch and the journal both survive, so `gauntlet
+  resume <slug>` rebuilds the tree and verifies its HEAD against the state the
+  run recorded. Uncommitted work in the tree at that instant is the one thing
+  that does not survive.
 
 ## 7. Operating a `gauntlet review` run (the lightweight surface)
 

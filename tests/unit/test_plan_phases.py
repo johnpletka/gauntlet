@@ -139,6 +139,25 @@ def test_deep_and_lettered_frs_tokens_accepted():
     assert phases[0]["frs"] == ["FR-5.1.a", "FR-1.1.1", "FR-2.3.b2"]
 
 
+def test_letter_suffixed_frs_tokens_accepted():
+    """A letter appended DIRECTLY to a numeric segment is a legitimate id (P7.2).
+
+    This repository's own dominant convention: `FR-6.1a` (144 references),
+    `FR-3.1a` (66), `FR-1.3a` (30), `FR-2.1a` (27), plus `FR-3.1b`, `FR-3.1c`
+    and `FR-2.1b`. The pattern admitted a letter only as its own dot-separated
+    segment, so all ~300 of those were rejected, and a live dogfood plan citing
+    the toy PRD's `FR-1a`/`FR-3a` parked the plan gate on `artifact_invalid` —
+    #64's failure class, which the neighbouring test exists to prevent.
+
+    The first segment is covered too (`FR-1a`), not just deeper ones: that is
+    the shape the dogfood actually tripped on.
+    """
+    phases = extract_phases(
+        _phase_with_frs("[FR-1a, FR-3a, FR-6.1a, FR-3.1c, FR-2.1b]")
+    )
+    assert phases[0]["frs"] == ["FR-1a", "FR-3a", "FR-6.1a", "FR-3.1c", "FR-2.1b"]
+
+
 def test_absent_frs_is_fine():
     phases = extract_phases("```gauntlet-phases\n- id: P1\n  title: x\n  goal: g\n```\n")
     assert "frs" not in phases[0]

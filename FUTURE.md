@@ -99,3 +99,46 @@ restarts when target repo == engine repo; running the driver from an
 installed snapshot; or a source-tree-hash park as a detection floor.
 Candidate for a small PRD or a `pipeline-effectiveness` follow-up — an engine
 lifecycle change, so it wants adversarial review, not a quick patch.
+
+**From the recovery-redesign run (P6 review) — recorded 2026-08-04:**
+
+**Journal rebuild for out-of-repository state dirs** — P6 makes the
+append-only journal authoritative for every run whose manifest goes through
+`Manifest.write_atomic`, including lightweight `gauntlet review` runs. Review
+runs now reconcile (genesis, catch-up, out-of-band preserve/restore,
+torn/duplicate quarantine) on their mutating resume path and read the
+authoritative head during discovery. The remaining half is the
+missing/corrupt-projection **rebuild**: `RebuildProjectionAction` requires
+repo-relative contained `journal_path`/`projection_path` (the P1 containment
+validator), so a review state dir outside the repository cannot express one
+and `projection_rebuild_assessment` returns `None` there. Such a run degrades
+to exactly its pre-P6 behavior (an unloadable manifest is as unrecoverable as
+it was before the journal existed) — never worse. Closing it means either a
+contained non-repo-relative action payload or a separate file-plane rebuild
+verb; both change a P1 model or add a verb, so they want the recovery plan's
+own review loop rather than an in-phase patch.
+
+**From PR #87 review (P7 verification gate) — recorded 2026-08-07:**
+
+**Ref restoration is a guarded git command, not a driven Gauntlet
+transaction** — the review's third P1 asked for two things, and the fix
+delivered one of them. Both branch-relation restore forms now carry the
+observed ref value and render a compare-and-swap (`git update-ref <ref> <new>
+<expected>`, empty expected for the create-only forms), so a ref that moved
+between the assessment and the operator running the printed command makes git
+refuse the stale update atomically instead of rewinding a tip and orphaning
+its commits. `ContinueOnRecoveryBranchAction.requires_snapshot` was corrected
+to `False` to match: with the guard, every form either creates a ref that did
+not exist or fast-forwards one that is provably still where it was observed,
+so there is nothing for a pre-mutation snapshot to preserve.
+
+What is deferred is the other half — rendering a *Gauntlet verb* that
+re-observes under the run lock and applies the restoration through
+`RecoveryExecutor`, with an intent, a journal audit record and the §6.4
+evidence every other mutating verb leaves. That is a new mutating verb and a
+new executor site (the existing `apply`/`apply_rebuild` sites are the Git
+rewind and file planes; a ref plane is a third), so it wants the recovery
+plan's own review loop rather than an in-phase patch. Until it exists, the
+restoration's audit trail is the command in the `status` output plus git's own
+reflog, and its safety is structural rather than archival. Natural home: the
+§10 closing tranche alongside the fault-injection matrix.

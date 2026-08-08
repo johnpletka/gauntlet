@@ -20,6 +20,10 @@ Provenance of each fixture is recorded in the `real_capture` flag on its
       2026-06-30; a NEGATIVE fixture: a typed `is_error` envelope whose only
       signal is an unlisted message ⇒ `terminal` (fail-closed).
     - `codex/usage-limit.json` — gauntlet-ui run 2026-06-17 (`turn.failed`).
+    - `api/timeout.json` — coaching-side-drawer run 2026-07-24 (right-quote
+      repo, gauntlet 0.7.0; issue #63): the `litellm.Timeout` envelope that was
+      mis-classified terminal in the r1-triage fan-out. Pinned
+      `transient_dependency` by P5 (plan §5.2).
 - **`real_capture: false`** — synthesized from the documented CLI/exception
   shape, pending a live capture. Fail-closed-safe: a real error that does not
   match still halts terminally. Re-pin with a live capture when observed.
@@ -29,6 +33,13 @@ Provenance of each fixture is recorded in the `real_capture` flag on its
       `error.code`/`error.type` matches (0.139.0 carries only `error.message`).
     - `codex/overload.json` — codex overload message shape.
     - `api/rate-limit.json`, `api/overload.json` — LiteLLM exception descriptors.
+    - `api/connection.json` — LiteLLM `APIConnectionError` descriptor
+      (connection/DNS class, P5 plan §5.2).
+    - `claude/dependency.json`, `codex/dependency.json` — synthesized
+      transport-failure phrasings in the pinned message fields (P5 plan §5.2);
+      NARROW by design — the real-captured `claude/terminal-connection-closed.json`
+      ("Connection closed mid-response", a truncated partially-consumed
+      response) stays pinned TERMINAL and must never match these.
 
 > **Tracked coverage gap (F-002 / plan.md:33 — "one per adapter per kind").**
 > Three required `(adapter, kind)` pairs — `codex`/overload,

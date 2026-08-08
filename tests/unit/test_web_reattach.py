@@ -53,7 +53,7 @@ from gauntlet.web.supervisor import (
 )
 
 # Reuse the P3 supervisor + engine crash fixtures rather than re-deriving them.
-from conftest import git
+from conftest import await_sentinel, git, run_work_tree
 from test_resume_crash import CHILD, RecoverAdapter
 from test_resume_crash import _build_repo as _build_crash_repo
 from test_web_supervisor import LONG_PIPELINE, SLEEP_PIPELINE, _build_repo
@@ -349,12 +349,9 @@ def test_orphaned_owned_run_resumes_to_done(tmp_path, kill_delay):
     if ready.exists():
         ready.unlink()
     proc = subprocess.Popen([sys.executable, str(CHILD), str(repo), "demo"])
-    deadline = time.monotonic() + 30
-    while not ready.exists() and time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"child exited early ({proc.returncode})")
-        time.sleep(0.01)
-    assert ready.exists(), "child never reached the mid-step sentinel"
+    # P7g: the sentinel lands in whichever tree the run drives — the RUN's
+    # worktree under the dedicated default (see `conftest.await_sentinel`).
+    await_sentinel(repo, ".crash_ready", proc)
 
     # Model console ownership: write the sidecar with the child's real identity.
     run_dir = mgr.layout("demo").active_run_dir()
@@ -379,10 +376,14 @@ def test_orphaned_owned_run_resumes_to_done(tmp_path, kill_delay):
     assert status == M.RUN_DONE
     final = mgr.status("demo")
     assert [c.phase for c in final.commits] == ["P1"]
-    assert gitops.commit_subject(repo, "HEAD") == "P1: crash phase"
-    assert (repo / "feature.py").read_text() == "RECOVERED — final content\n"
-    assert gitops.is_clean(repo, exclude=["runs"])
-    assert gitops._run(repo, "log", "--format=%s").count("P1: crash phase") == 1
+    # P7g: recovered effects land on the run BRANCH and in the RUN's tree.
+    work = run_work_tree(repo)
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
+    assert gitops.is_clean(work, exclude=["runs"])
+    assert gitops._run(
+        repo, "log", "--format=%s", "gauntlet/demo"
+    ).count("P1: crash phase") == 1
 
 
 # ---- kill-timing matrix: before-manifest & between-step (review F-002) -------
@@ -440,12 +441,7 @@ def test_orphaned_between_steps_resumes_to_done(tmp_path, kill_delay):
         [sys.executable, str(CHILD), str(repo), "demo", "between_step"],
         start_new_session=True,
     )
-    deadline = time.monotonic() + 30
-    while not ready.exists() and time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"child exited early ({proc.returncode})")
-        time.sleep(0.01)
-    assert ready.exists(), "child never reached the between-step sentinel"
+    await_sentinel(repo, "runs/.between_ready", proc)
 
     run_dir = mgr.layout("demo").active_run_dir()
     # The defining property of this timing case: implement is already done.
@@ -468,10 +464,14 @@ def test_orphaned_between_steps_resumes_to_done(tmp_path, kill_delay):
     assert status == M.RUN_DONE
     final = mgr.status("demo")
     assert [c.phase for c in final.commits] == ["P1"]
-    assert gitops.commit_subject(repo, "HEAD") == "P1: crash phase"
-    assert (repo / "feature.py").read_text() == "RECOVERED — final content\n"
-    assert gitops.is_clean(repo, exclude=["runs"])
-    assert gitops._run(repo, "log", "--format=%s").count("P1: crash phase") == 1
+    # P7g: recovered effects land on the run BRANCH and in the RUN's tree.
+    work = run_work_tree(repo)
+    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
+    assert gitops.is_clean(work, exclude=["runs"])
+    assert gitops._run(
+        repo, "log", "--format=%s", "gauntlet/demo"
+    ).count("P1: crash phase") == 1
 
 
 # ---- server startup runs re-attach (lifespan wiring) ------------------------
@@ -536,3 +536,87 @@ def test_reattach_per_job_failure_is_skipped_not_fatal(tmp_path, monkeypatch):
     assert outs[0].disposition == INTERRUPTED
     assert not _sidecar(good).exists()  # good's stale sidecar reclaimed
     assert _sidecar(bad).exists()  # bad left untouched (skipped, not reconciled)
+
+
+# ---- P7h: "is anything driving this repository?" spans both lock scopes -----
+
+from gauntlet.engine.run import DRIVING_LOCK_NAME
+
+
+def _write_drive_lock(path: Path, *, pid: int, slug: str, run_id: str | None) -> None:
+    from gauntlet.engine import locking
+    from gauntlet.procident import read_process_identity
+
+    ident = read_process_identity(pid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        locking.LockRecord(
+            nonce="n", slug=slug, run_id=run_id, pid=pid, pgid=pid,
+            started_at="2026-08-06T00-00-00", host=os.uname().nodename,
+            proc_identity=ident.to_dict() if ident else None,
+        ).to_json()
+    )
+
+
+def test_driving_lock_sees_a_live_per_run_holder(tmp_path):
+    """P7h / design problem E: the console must not answer "no driver" for a
+    live run.
+
+    A dedicated run stopped writing the worktree-global tree guard, so reading
+    that path alone would report nothing while agents are running — and the
+    console would then offer Launch/Resume/Approve against a live drive, every
+    one of which the engine fails closed. That is the R4 disagreement in its
+    worst direction, and it is worse than over-refusing.
+    """
+    sup = _bare_supervisor(tmp_path)
+    run_dir = sup.run_root / "alpha" / "run-1"
+    _write_drive_lock(
+        run_dir / DRIVING_LOCK_NAME, pid=os.getpid(), slug="alpha", run_id="run-1"
+    )
+    # nothing at the retired tree-guard path at all
+    assert not (sup.run_root / DRIVING_LOCK_NAME).exists()
+
+    lock = sup.driving_lock()
+    assert lock is not None, "a live per-run holder reads as no driver"
+    assert (lock.slug, lock.run_id, lock.live) == ("alpha", "run-1", True)
+
+
+def test_a_live_tree_guard_still_wins_over_a_per_run_holder(tmp_path):
+    """The read half of the retirement keeps its priority.
+
+    A holder of the tree guard is the BROADER claim — it owns the operator's
+    shared checkout — so it is what the banner should name when both exist.
+    """
+    sup = _bare_supervisor(tmp_path)
+    _write_drive_lock(
+        sup.run_root / DRIVING_LOCK_NAME, pid=os.getpid(),
+        slug="legacy", run_id=None,
+    )
+    _write_drive_lock(
+        sup.run_root / "alpha" / "run-1" / DRIVING_LOCK_NAME,
+        pid=os.getpid(), slug="alpha", run_id="run-1",
+    )
+    lock = sup.driving_lock()
+    assert lock is not None and lock.slug == "legacy"
+
+
+def test_a_stale_tree_guard_does_not_hide_a_live_per_run_holder(tmp_path):
+    """The scan must not stop at the first readable file.
+
+    A dead tree guard left by a crashed legacy driver is exactly the debris the
+    engine reclaims on its own. Returning it and stopping would report a stale,
+    non-live holder while a real drive was under way — the console would enable
+    its controls, and the live run's per-run lock would refuse them.
+    """
+    sup = _bare_supervisor(tmp_path)
+    _write_drive_lock(
+        sup.run_root / DRIVING_LOCK_NAME, pid=2_000_000_000,  # never live
+        slug="dead-legacy", run_id=None,
+    )
+    _write_drive_lock(
+        sup.run_root / "alpha" / "run-1" / DRIVING_LOCK_NAME,
+        pid=os.getpid(), slug="alpha", run_id="run-1",
+    )
+    lock = sup.driving_lock()
+    assert lock is not None
+    assert (lock.slug, lock.live) == ("alpha", True), lock

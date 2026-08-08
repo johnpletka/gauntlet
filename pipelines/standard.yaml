@@ -112,7 +112,7 @@ stages:
       # message is a MECHANICAL draft — the cheap `mechanic` profile drafts it
       # (still format-validated + redrafted), not the builder.
       - {id: phase-commit, type: commit, message_agent: mechanic,
-         prompt: prompts/commit-message.md}
+         prompt: prompts/commit-message.md, plan_section: plan.md}
       # Deterministic completeness gate (FR-3.2): the implement step's completion
       # contract produces artifacts/acceptance-map.json, mapping every acceptance
       # clause of this phase to >=1 real pytest node id. This gate proves citation

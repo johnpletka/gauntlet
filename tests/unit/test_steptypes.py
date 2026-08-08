@@ -222,6 +222,33 @@ stages:
     assert orch.manifest.record("commit").session_id == "draft-sess"
 
 
+def test_commit_draft_receives_configured_plan_section(fixture_repo):
+    (fixture_repo / "work.py").write_text("print('new')\n")
+    plan = fixture_repo / "runs" / "demo" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Plan\n\nP1 is the only phase. The P1 commit records Deferrals: none.\n"
+    )
+    drafter = RecordingDrafter()
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage,
+         plan_section: plan.md}
+"""
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, text, config=cfg, adapters={"triage": drafter})
+
+    assert orch.drive() == M.RUN_DONE
+    prompt = drafter.prompts[0]
+    assert "--- plan section: plan.md ---" in prompt
+    assert "P1 is the only phase" in prompt
+    assert "Deferrals: none" in prompt
+
+
 class RedraftUsageAdapter:
     """Bad draft (with usage) then a good one (with usage) — usage must sum."""
 
@@ -583,10 +610,16 @@ def test_phase_lint_halts_on_malformed_block(fixture_repo):
         "  goal: the implement step has no schema: field and must not change\n"
         "```\n"
     )
-    # A structurally unrunnable plan must not reach approval: it parks here.
+    # A structurally unrunnable plan must not reach approval: it parks here —
+    # since P5 (plan §5.1, issue #64) as an artifact_invalid park carrying the
+    # validator + diagnostic + content fingerprint, not a bare HALTED.
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("plan-lint")
-    assert rec.status == M.HALTED
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert rec.revalidation is not None
+    assert rec.revalidation.validator == "phase_lint"
+    assert rec.revalidation.hash_at_park.startswith("sha256:")
     assert "invalid" in rec.notes
 
 
@@ -595,7 +628,9 @@ def test_phase_lint_halts_when_block_absent(fixture_repo):
     (orch.artifact_root / "plan.md").write_text("# Plan\n\nProse only, no block.\n")
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("plan-lint")
-    assert rec.status == M.HALTED
+    # P5 (plan §5.1, issue #64): an artifact defect parks artifact_invalid.
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
     assert "no gauntlet-phases block" in rec.notes
 
 
@@ -611,5 +646,7 @@ def test_phase_lint_halts_when_phase_has_no_prose_section(fixture_repo):
     )
     assert orch.drive() == M.RUN_PARKED
     rec = orch.manifest.record("plan-lint")
-    assert rec.status == M.HALTED
+    # P5 (plan §5.1, issue #64): an artifact defect parks artifact_invalid.
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
     assert "no locatable prose section" in rec.notes and "P2" in rec.notes

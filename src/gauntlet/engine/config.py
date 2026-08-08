@@ -51,6 +51,15 @@ _CHECKPOINT_COMMIT_MODES = frozenset(
     {CHECKPOINT_COMMITS_KEEP, CHECKPOINT_COMMITS_SQUASH}
 )
 
+# Interrupted-step disposition on resume of a dirty transaction boundary
+# (F-003 / #72). ``park`` (default) parks for a human; ``reset_to_base`` backs
+# up the partial work and rewinds to the latest committed checkpoint.
+INTERRUPTED_STEP_PARK = "park"
+INTERRUPTED_STEP_RESET = "reset_to_base"
+_INTERRUPTED_STEP_MODES = frozenset(
+    {INTERRUPTED_STEP_PARK, INTERRUPTED_STEP_RESET}
+)
+
 DEFAULT_CONFIG_PATH = Path(".gauntlet/config.yaml")
 
 
@@ -468,6 +477,56 @@ class ReviewConfig(BaseModel):
     state_dir: str | None = None
 
 
+class WorktreeConfig(BaseModel):
+    """The optional `worktree:` block (P7c, spike §13).
+
+    ``mode`` chooses which tree a run's agents edit and the engine commits in:
+
+    * ``same_tree`` — the pre-P7 layout: the run drives the operator's own
+      checkout. Every run started before P7c is this mode forever (spike
+      §10/§16), and it stays the documented fallback for any adopter layout
+      that cannot host a worktree. **Not removed by the flip** — selecting it
+      explicitly is supported, and is the one way an adopter opts back out.
+    * ``dedicated`` (**the default since P7g**) — the run gets its own linked
+      worktree at the derived path
+      ``<main-worktree>/.gauntlet/worktrees/<slug>/<run-id>`` (§6.2 as corrected
+      by P7e; the ratified §6.2 location under the git dir is unusable because
+      the `claude` CLI refuses to write any path carrying a ``.git`` segment —
+      see `proposals/P7d-gate-blocker.md`). There is deliberately **no path
+      knob**: a configurable root would need a ``resolve()``-based containment
+      validator, and spike E9-C proves the string-based check this module
+      already has is defeated by a symlink (§6.4, deferral D2).
+
+    **P7g flipped the default**, which is the whole of that phase's production
+    change. §13 made the flip a separate stage gated on a dogfood run; P7d ran
+    it, found spike §6.2's root unwritable by the `claude` CLI, and halted. P7e
+    relocated the root, P7f added the per-adapter writability preflight, and
+    this line is what P7g changes. From here P7's acceptance criteria A1/A2/A3
+    hold for runs **in general** rather than only for runs a human opted in.
+
+    Setting a mode never moves an EXISTING run: `RunManager` reads this in
+    exactly one place (`start`), records it on the manifest, and resolves every
+    later verb from that record plus observed evidence. Flipping a default that
+    silently relocated live runs would be the auto-migration spike §10 forbids.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    mode: str = "dedicated"
+
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v: str) -> str:
+        from gauntlet.engine.worktree import MODES
+
+        value = (v or "").strip()
+        if value not in MODES:
+            raise ValueError(
+                f"worktree.mode must be one of {sorted(MODES)}; got {v!r}"
+            )
+        return value
+
+
 class CollectorConfig(BaseModel):
     """Per-collector enumeration overrides (FR-3.2, PR #59 review F4).
 
@@ -509,6 +568,10 @@ class RunConfig(BaseModel):
     # repos with `asset_root: .gauntlet` so every gauntlet-owned file lives under
     # one .gauntlet/ dir. Run output is `run_root` (a separate knob).
     asset_root: str = "."
+    # Which tree a run's agents edit (P7c, spike §13). Defaults to `dedicated`
+    # since P7g; `same_tree` stays selectable as the legacy/fallback mode. See
+    # WorktreeConfig — the worktree PATH is derived and has no knob (§6.4).
+    worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
     test_command: str = "uv run pytest"
     # Per-collector enumeration command overrides (FR-3.2, PR #59 review F4):
     # `collectors: {pytest: {command: "hatch run pytest"}}`. Absent, the pytest
@@ -569,6 +632,19 @@ class RunConfig(BaseModel):
     # Spaced auto-resume attempts before falling back to a plain usage_limit park
     # with an exhaustion note (FR-3.4) — a persistent limit is not a hot loop.
     max_auto_resume_attempts: int = 3
+
+    # --- dependency retry policy (recovery-redesign plan §5.2, P5) -----------
+    # Bounded in-process retries for typed transport/dependency failures
+    # (timeout / connection / DNS / 5xx / overload) before the step parks
+    # ``provider_unavailable``. The consumed budget is PERSISTED on
+    # ``StepRecord.dependency_attempts`` write-ahead, so a crash between
+    # retries never resets it. Delays are exponential (base * 2^attempt) with
+    # deterministic jitter, honoring a structured Retry-After; a delay past
+    # ``dependency_retry_max_delay_s`` parks immediately with that deadline
+    # recorded instead of hot-waiting in process.
+    dependency_retry_attempts: int = 3
+    dependency_retry_base_s: float = 2.0
+    dependency_retry_max_delay_s: float = 30.0
 
     # Live run observability (live-run-observability PRD, FR-6.1): stream each
     # CLI agent's NDJSON stdout to events.jsonl incrementally as it arrives,
@@ -648,6 +724,23 @@ class RunConfig(BaseModel):
         if name not in _RESUME_ON_QUOTA_MODES:
             raise ValueError(
                 f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
+                f"got {v!r}"
+            )
+        return name
+
+    @field_validator("interrupted_step")
+    @classmethod
+    def _validate_interrupted_step(cls, v: str) -> str:
+        """Only ``park``/``reset_to_base`` are valid; fail closed (F-003/#72).
+
+        Previously unvalidated: any typo (``reset-to-base``, ``RESET_TO_BASE``)
+        silently meant ``park`` at the single ``== "reset_to_base"`` check —
+        the operator's configured recovery policy just didn't happen.
+        """
+        name = (v or "").strip().lower()
+        if name not in _INTERRUPTED_STEP_MODES:
+            raise ValueError(
+                f"interrupted_step must be one of {sorted(_INTERRUPTED_STEP_MODES)}; "
                 f"got {v!r}"
             )
         return name

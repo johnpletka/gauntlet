@@ -206,9 +206,9 @@ def test_recovery_rewinds_to_latest_checkpoint_preserving_milestones(fixture_rep
     # The re-run prompt names the checkpoint it resumes from.
     assert builder.calls and "P3 wip: model layer" in builder.calls[0]
 
-    # A pre-rewind backup ref preserves the discarded dirty work.
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs
+    # A pre-rewind recovery snapshot preserves the discarded dirty work (P3).
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/recovery/")
+    assert "refs/gauntlet/recovery/" in refs
 
     # The final phase commit builds on the preserved checkpoint.
     head = gitops.head_sha(fixture_repo)

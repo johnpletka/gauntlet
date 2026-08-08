@@ -62,8 +62,12 @@ def test_reason_fields_disjoint():
 
 
 def test_enum_sets_are_the_prd_sets():
+    # `provider_unavailable` APPENDED by recovery-redesign P5 (plan §5.2):
+    # a transport/dependency park after the bounded persisted retries —
+    # additive, schema_version stays 1.
     assert M.PARKED_REASONS == {
         "usage_limit", "usage_window", "artifact_invalid", "response", "gate",
+        "provider_unavailable",
     }
     assert M.HALT_REASONS == {
         "timeout", "budget", "judge_deny", "signal_kill", "adapter_error",

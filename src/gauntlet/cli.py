@@ -39,10 +39,13 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
     from gauntlet.engine.config import ConfigLoadError, ConfigNotFoundError
     from gauntlet.engine.operator import RunResolutionError, StatusContractError
     from gauntlet.engine.planphases import PlanPhasesError
+    from gauntlet.engine.recovery import NoProgressError
+    from gauntlet.engine.recovery_exec import RecoveryExecError
     from gauntlet.engine.review import ReviewFailClosed
     from gauntlet.engine.run import (
         AbortGuardError,
         EntryContractError,
+        MigrateWorktreeRefused,
         RecoverError,
         RollbackGuardError,
         UnsafeRunSegment,
@@ -61,6 +64,19 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         RunResolutionError,
         StatusContractError,
         PlanPhasesError,
+        # P7c-2 (spike §10): every migration refusal is an operational
+        # condition with a named blocker AND a named safe action — the run
+        # stays fully resumable in `same_tree` — so it prints one line, never
+        # a traceback.
+        MigrateWorktreeRefused,
+        # R5 (plan §4.5): a mutating verb that returned to an identical
+        # progress fingerprint without a legitimate live wait — exits nonzero
+        # naming what is unchanged and the executable safe actions.
+        NoProgressError,
+        # Fail-closed recovery refusals (locks, unrepresentable observations
+        # such as a merge inside the inventoried range, surviving intents):
+        # operational conditions with named evidence, not bugs.
+        RecoveryExecError,
         ReviewFailClosed,
     )
 
@@ -170,12 +186,26 @@ def init(
 
 @app.command()
 @_friendly_errors
-def doctor() -> None:
+def doctor(
+    writability: bool = typer.Option(
+        False,
+        "--writability",
+        help=(
+            "Also probe whether each configured agent CLI can actually WRITE "
+            "under the run-worktree root. Spends a real agent turn per write "
+            "mechanism per adapter, which is why it is opt-in."
+        ),
+    ),
+) -> None:
     """Validate the environment: CLIs, auth, hooks, judge, keys (FR-1.3, FR-1.5)."""
-    from gauntlet.engine.doctor import FAIL, OK, WARN, has_failure, run_doctor
+    from gauntlet.engine.doctor import (
+        FAIL, OK, WARN, check_writability, has_failure, run_doctor,
+    )
 
     glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
     results = run_doctor(Path.cwd())
+    if writability:
+        results += check_writability(Path.cwd())
     for r in results:
         line = f"  {glyph.get(r.status, '?')} {r.name}: {r.detail}"
         typer.echo(line)
@@ -187,10 +217,157 @@ def doctor() -> None:
     typer.echo("\nenvironment OK")
 
 
+def _echo_worktree_line(mgr, man) -> None:
+    """Render the run's tree on the human `status` footer (F-012).
+
+    Silent for a `same_tree` run: "this run drives your own checkout" is the
+    pre-P7 default and printing it on every status would be noise. Loud for
+    every other case, including the ones an operator must act on — a missing
+    tree, and an unreadable worktree list.
+    """
+    from gauntlet.engine import worktree as WT
+
+    try:
+        mode = mgr._effective_worktree_mode(man)
+        if mode != WT.MODE_DEDICATED:
+            return
+        state = WT.describe(mgr.operator_root, mode=mode, branch=man.branch)
+    except Exception:
+        typer.echo("  worktree: unknown (could not read git's worktree list)")
+        return
+    if state.missing:
+        typer.echo(
+            f"  worktree: MISSING at {state.path} — `gauntlet resume "
+            f"{man.slug}` recreates it from the branch and journal"
+        )
+    elif state.path is not None:
+        typer.echo(f"  worktree: {state.path}")
+    else:
+        typer.echo(
+            "  worktree: none registered (this run is configured dedicated "
+            "but has no tree yet)"
+        )
+
+
+def _status_work_root(mgr, man) -> Path:
+    """The tree a run drives, for read-only surfaces (F-007).
+
+    Read-only and fail-soft by design: `status` is what an operator reaches for
+    when things are already wrong, so an unresolvable mode or an unobservable
+    worktree falls back to the operator's checkout rather than failing the
+    whole command. The `worktree` block reports the observation honestly
+    (including `null` for "unknown"), so the operator still sees that something
+    could not be read — the assessment just declines to guess.
+    """
+    from gauntlet.engine import worktree as WT
+
+    try:
+        mode = mgr._effective_worktree_mode(man)
+        if mode != WT.MODE_DEDICATED:
+            return mgr.operator_root
+        entry = WT.observe(
+            mgr.operator_root, man.branch,
+            main_root=mgr._main_worktree_root(),
+        )
+    except Exception:
+        return mgr.operator_root
+    if entry is None or not entry.path.is_dir():
+        return mgr.operator_root
+    return entry.path
+
+
+def _append_migration_action(mgr, man, liveness: str, rstate, slug: str) -> None:
+    """Offer `gauntlet migrate-worktree <slug>` when the run is eligible (P7c-2).
+
+    Read-only and fail-soft, for the same reason as :func:`_status_work_root`:
+    `status` is what an operator reaches for when things are already wrong, so
+    an unreadable worktree list or an unrecognized recorded mode declines to
+    OFFER the optional action rather than failing the whole command. The
+    `worktree` block still reports the observation honestly, so nothing is
+    hidden — only the recommendation is withheld, which is the correct
+    direction when the tool cannot prove the verb would succeed.
+    """
+    from gauntlet.engine import operator
+
+    try:
+        if mgr.migration_blocker(man, liveness=liveness) is not None:
+            return
+    except Exception:
+        return
+    rstate.next_actions.append(operator.migrate_worktree_action(slug))
+
+
+def _refuse_inside_run_worktree(cwd: Path) -> None:
+    """Refuse any verb invoked from INSIDE a run worktree (spike §14.4).
+
+    Ratified as a deliberate new CLI refusal. The hazard is specific and quiet:
+    a run worktree contains a tracked ``<run_root>/<slug>/{prd.md, plan.md,
+    <run-id>/manifest.json}`` (the §4.4 export), so ``gauntlet status`` run from
+    in there would read the COMMITTED projection at the branch tip instead of
+    the authoritative journal in the operator's checkout — and report a
+    plausible, stale answer with no indication anything was wrong. Every
+    mutating verb has the same problem one layer down: it would resolve the run
+    dir, the drive lock and the active-run pointer inside a disposable tree.
+
+    Detection is the engine's own layout, not a guess: the run worktree root is
+    derived (§6.2 as corrected by P7e), so "am I under
+    ``<main-worktree>/.gauntlet/worktrees``?" is answerable without reading any
+    run state, works when the run is dead, and cannot false-positive on an
+    adopter's own linked worktree — theirs is not under the engine's directory.
+    Symlinks are resolved on both sides (spike E9-B/E9-C).
+
+    **The anchor must be the MAIN worktree, not this one (P7e).** Under §6.2
+    the root hung off the git common dir, which every worktree of a repository
+    reports identically — so the containment test worked from inside a run
+    worktree, which is the only place it ever fires. ``rev-parse
+    --show-toplevel`` does not have that property: from inside a run worktree it
+    answers *that tree*, so the root would derive to
+    ``<run-worktree>/.gauntlet/worktrees``, the test would never match, and this
+    refusal would become unreachable exactly where it is needed.
+
+    Deliberately silent for every adopter layout in §7 that is NOT a run
+    worktree: a nested repo, a bare/mirror clone, a submodule, and a plain
+    worktree-of-worktree all resolve their own common dir and fail the
+    containment test, so they are unaffected.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine import worktree as WT
+
+    try:
+        main_root = gitops.main_worktree_root(cwd)
+    except (gitops.GitError, OSError):
+        return  # not a git repo (or unreadable) — other errors own that case
+    if not WT.is_inside_worktrees_root(cwd, main_root):
+        return
+    try:
+        toplevel = Path(gitops.show_toplevel(cwd))
+    except (gitops.GitError, OSError):
+        toplevel = cwd
+    # The main worktree IS the operator's checkout, observed rather than
+    # reconstructed. P7e retires the previous `common.parent if common.name ==
+    # ".git"` heuristic, which guessed wrong for `--separate-git-dir` layouts
+    # and had no answer at all for a bare repository.
+    operator_checkout = main_root
+    typer.echo(
+        f"error: this is a Gauntlet run worktree ({toplevel}), not your "
+        "checkout.\n"
+        "  A run worktree is the disposable tree the run's agents edit. Run "
+        "gauntlet verbs from your own checkout instead:\n"
+        f"      cd {operator_checkout}\n"
+        "  Reading run state from in here would answer from the committed "
+        "copy at this branch's tip rather than the authoritative journal "
+        "(spike §14.4).",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
 def _manager() -> "object":
     from gauntlet.engine.run import RunManager
 
-    return RunManager(Path.cwd())
+    cwd = Path.cwd()
+    _refuse_inside_run_worktree(cwd)
+    return RunManager(cwd)
 
 
 def _resolve_run_instance_dir(mgr, slug: str) -> Path:
@@ -684,19 +861,42 @@ def status(
     # (F-002). Shared with `status --interactive` via `_resolve_run_instance_dir`.
     run_instance_dir = _resolve_run_instance_dir(mgr, slug)
 
-    # A missing/unreadable/invalid manifest is an actual error (FR-4.3 — exit
-    # non-zero), surfaced on stderr so `--json` stdout stays a lone object (or
-    # empty on error), never an interleaved traceback.
+    # P6 (plan §4.6/§5.5, R4/R8): the journal is the authoritative state and
+    # manifest.json its projection. Status classifies from the AUTHORITATIVE
+    # state — the on-disk projection when healthy, else the journal head
+    # parsed in memory (read-only: no quarantine, no rewrite) — and renders
+    # the pending reconciliation/rebuild, so the read-only surface and the
+    # mutating verbs can never disagree. A run with neither a loadable
+    # manifest nor a journal (a pre-P6 corrupt manifest) errors exactly as
+    # before (FR-4.3 — exit non-zero, stderr only).
     try:
-        man = Manifest.load(run_instance_dir / "manifest.json")
+        view = operator.load_projection_view(
+            mgr.repo_root, run_instance_dir, slug=slug
+        )
     except (OSError, ValueError) as exc:
         typer.echo(
             f"error: cannot load manifest for {slug!r}: {exc}", err=True
         )
         raise typer.Exit(1) from exc
+    if view.manifest is None:
+        try:
+            Manifest.load(run_instance_dir / "manifest.json")
+        except (OSError, ValueError) as exc:
+            typer.echo(
+                f"error: cannot load manifest for {slug!r}: {exc} "
+                "(and no journal state exists to classify from)",
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+        raise typer.Exit(1)  # defensive: view without manifest or error
+    man = view.manifest
 
     run_root = mgr.repo_root / mgr.config.run_root
-    driver = operator.driver_info(run_root, slug)
+    # P7b: the drive lock is per-run now, so the liveness read is scoped to the
+    # instance `_resolve_run_instance_dir` already proved contained (never a raw
+    # path join off active-run.txt's bytes). Legacy runs, whose lock is still at
+    # the worktree-global path, are answered by driver_info's own fallback.
+    driver = operator.driver_info(run_root, slug, run_instance_dir=run_instance_dir)
     # A persisted-state contract violation (a non-canonical iteration, an unsafe
     # step id, or a payload that fails schema validation) is an actual error
     # (FR-4.3 — exit non-zero) surfaced on stderr, so `--json` stdout stays empty
@@ -716,7 +916,20 @@ def status(
         except (OSError, ValueError):
             pipeline = None
 
-        rstate = operator.compute_run_state(man, driver.state)
+        # P4 (plan §4.2 / R4): status → assess → render. The shared recovery
+        # assessment — the same observe_git/fingerprint machinery the mutating
+        # verbs consume — refines the rendered next actions with the proven
+        # branch relation (adoption / checkpoint continuation / recovery-ref
+        # workflow). Fail-soft: an unobservable repo renders the pure table.
+        assessment = operator.compute_status_assessment(
+            mgr.repo_root, man, driver.state, run_instance_dir=run_instance_dir,
+            # F-007/R4: assess the tree this run actually drives, so status and
+            # the mutating verbs can never describe different trees.
+            work_root=_status_work_root(mgr, man),
+        )
+        rstate = operator.compute_run_state(
+            man, driver.state, assessment=assessment
+        )
         # FR-8.2 / F-001: when parked at a gate, name the cycle a reject would
         # ACTUALLY re-drive — resolved from the pipeline snapshot with the same
         # rule as the reject path (same non-foreach stage), not the manifest-order
@@ -737,7 +950,30 @@ def status(
                 rstate = operator.compute_run_state(
                     man, driver.state,
                     gate_cycle_id=upstream_cycle_id_for_gate(pipeline, gate_rec0.id),
+                    assessment=assessment,
                 )
+        # P6 (R4): a pending projection catch-up/rebuild renders as the FIRST
+        # next action — built from the same shared assessment the mutating
+        # verbs apply (RX.projection_rebuild_assessment), so status can never
+        # advertise a repair resume refuses (plan §5.5).
+        if view.rebuild_pending:
+            if view.action is not None:
+                rstate.next_actions.insert(
+                    0, operator.projection_rebuild_action(slug, view.action)
+                )
+            else:
+                rstate.next_actions.insert(
+                    0, operator.projection_catchup_action(slug, view.detail)
+                )
+        # P7c-2 / spike §10 row 2: offer migration to a run that is eligible
+        # for it. APPENDED, never inserted: migration is optional and the run
+        # is fully drivable without it, so it must not displace the action that
+        # moves the run forward. Eligibility is the engine's own
+        # `migration_blocker` — the negation of the single mode-resolution rule
+        # — so `status` can never advertise a migration the verb would refuse
+        # (R4), which is the same discipline the projection-rebuild action
+        # follows above.
+        _append_migration_action(mgr, man, driver.state, rstate, slug)
         recon, anomaly = operator.read_recovery_intent(run_root, run_instance_dir, slug)
 
         # Advisory freshness (live-run-observability FR-5): the single I/O point
@@ -821,6 +1057,15 @@ def status(
                 gate=gate_ctx,
                 now=now,
                 current_step_timeout_s=current_step_timeout_s,
+                projection=view.payload_block(),
+                # P7c: which tree this run drives. The mode comes from the
+                # manager's single resolution rule (evidence + what the run was
+                # born as), so `status` and the mutating verbs can never
+                # disagree about it (R4).
+                worktree=operator.compute_worktree_block(
+                    mgr.operator_root, man,
+                    mode=mgr._effective_worktree_mode(man),
+                ),
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -832,13 +1077,22 @@ def status(
     for rec in man.steps:
         it = f"[{rec.iteration}]" if rec.iteration is not None else ""
         typer.echo(f"  {rec.id}{it}: {rec.status}")
+    if view.detail:  # P6: journal ↔ projection divergence, loudly (plan §4.6)
+        typer.echo(f"  projection: {view.detail}")
+    # F-012 / spike §18.2 addition 2: the HUMAN surface must name the tree too.
+    # Only `--json` carried it, so an operator reading plain `status` had no way
+    # to discover that a dirty verdict referred to a tree they were not
+    # standing in.
+    _echo_worktree_line(mgr, man)
 
     # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
     # usage limit — the reset time, all sourced from the manifest so no parked
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
     if rstate.state in (
-        operator.STATE_PARKED_USAGE_LIMIT, operator.STATE_PARKED_USAGE_WINDOW
+        operator.STATE_PARKED_USAGE_LIMIT,
+        operator.STATE_PARKED_USAGE_WINDOW,
+        operator.STATE_PARKED_PROVIDER_UNAVAILABLE,
     ) and rstate.parked is not None:
         pr = next(
             (r for r in man.steps
@@ -1106,6 +1360,24 @@ def resume(
              'parsing.',
     ),
     no_judge: bool = typer.Option(False, "--no-judge"),
+    reset_interrupted: bool = typer.Option(
+        False, "--reset-interrupted",
+        help="One-shot: discard an INTERRUPTED step's partial work and re-run "
+             "it cleanly (#72). Preserves the partial work as a complete "
+             "recovery snapshot under refs/gauntlet/recovery/ first and "
+             "rewinds only to the latest committed checkpoint (never past "
+             "committed milestones). Applies to this resume only — the "
+             "configured interrupted_step policy is unchanged. A no-op when "
+             "nothing is interrupted-dirty.",
+    ),
+    same_tree: bool = typer.Option(
+        False, "--same-tree",
+        help="Drive THIS resume in your own checkout instead of the run's "
+             "dedicated worktree. The operator-chosen fallback for a "
+             "`worktree_unavailable` park (spike §13) — one-shot, never "
+             "persisted, and never applied automatically. A no-op for a run "
+             "already in same_tree mode.",
+    ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
@@ -1125,7 +1397,10 @@ def resume(
         _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
         return
     try:
-        status = mgr.resume(slug, response=response, use_judge=not no_judge)
+        status = mgr.resume(
+            slug, response=response, use_judge=not no_judge,
+            reset_interrupted=reset_interrupted, same_tree=same_tree,
+        )
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and
@@ -1231,6 +1506,40 @@ def finish(slug: str) -> None:
     aborted and surfaced for a manual merge.
     """
     typer.echo(_manager().finish(slug))
+
+
+@app.command(name="migrate-worktree")
+@_friendly_errors
+def migrate_worktree(
+    slug: str,
+    rollback: bool = typer.Option(
+        False, "--rollback",
+        help="Undo a migration: unlock and remove the run's worktree and "
+             "return the run to same_tree mode. The branch, its commits, the "
+             "journal and the run dir are untouched. Refuses if the run "
+             "worktree has uncommitted work.",
+    ),
+) -> None:
+    """Move an existing run into its own dedicated worktree (spike §10).
+
+    Explicit and opt-in: a run that started before `dedicated` became the
+    default (P7g), or one deliberately pinned to `worktree.mode: same_tree`,
+    keeps driving your checkout until you run this, and nothing in the engine
+    ever moves it for you — not even changing `worktree.mode` in config, which
+    only decides what NEW runs are born as. That asymmetry is what kept the
+    default flip from relocating any run already under way.
+
+    Copy, never move: the branch, the journal, the manifest, the transcripts
+    and the run dir all stay exactly where they are. Only the tree the run's
+    agents edit changes. Refused under a live or unprovable driver, and for a
+    terminal run; a run that cannot migrate for any reason stays fully
+    resumable in same_tree mode with the blocker named.
+    """
+    mgr = _manager()
+    if rollback:
+        typer.echo(mgr.rollback_worktree_migration(slug))
+        return
+    typer.echo(mgr.migrate_worktree(slug))
 
 
 @app.command()
@@ -1480,6 +1789,10 @@ def judge_serve(
     judge_model: str = typer.Option(
         None, help="LiteLLM model for the LLM classifier rung (omit to fail-closed)."
     ),
+    judge_effort: str = typer.Option(
+        None, help="Canonical reasoning effort for the classifier rung; defaults "
+        "to minimal for backward compatibility."
+    ),
     host: str = typer.Option("127.0.0.1", help="Bind host (loopback only)."),
     port: int = typer.Option(8787, help="Bind port."),
     repo_root: Path = typer.Option(
@@ -1500,6 +1813,7 @@ def judge_serve(
         policy_path=policy,
         audit_path=audit,
         judge_model=judge_model,
+        judge_effort=judge_effort,
         host=host,
         port=port,
         repo_root=repo_root,

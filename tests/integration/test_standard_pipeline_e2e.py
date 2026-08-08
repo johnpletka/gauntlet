@@ -7,15 +7,18 @@ gates (which the test approves programmatically). It needs the real claude +
 codex CLIs authenticated and an API key for the cheap tier, so it is marked
 `integration` and skipped by default (`uv run pytest` runs units only).
 
-Convergence depends on live models, so the assertions are deliberately
-structural — the PRD/plan cycles ran, the phase loop produced `slugify.py` with
+Convergence depends on live models, so the completion assertions are deliberately
+structural — the PRD/plan cycles ran, the phase loop produced ``slugify.py`` with
 passing tests, the branch history matches FR-9, and the cost report attributes
-spend per profile with classification well under the run total (FR-3).
+spend per profile with classification well under the run total (FR-3). A separate
+bounded test verifies that non-convergence stops only at a governed boundary; it
+does not substitute for this suite's full live completion gate.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +31,8 @@ from gauntlet.engine.pipeline import content_hash, load_pipeline
 from gauntlet.engine.planphases import extract_phases, phase_section
 from gauntlet.engine.report import build_report
 from gauntlet.engine.run import RunManager
+
+from conftest import run_work_tree  # noqa: E402  (P7g run-tree resolver)
 
 pytestmark = [pytest.mark.integration]
 
@@ -42,7 +47,29 @@ CONFIG = """\
 base_branch: main
 branch_prefix: "gauntlet/"
 run_root: runs
-test_command: "uv run pytest -q"
+# This fixture's human-authored PRD requires exactly one implementation phase.
+# Give that atomic phase enough capacity for the original five FRs plus any
+# clarifying requirements ratified during the live PRD review. The default
+# production bound is exercised elsewhere; leaving it at three here creates a
+# plan-author conflict that can only be resolved by changing this very fixture.
+max_frs_per_phase: 10
+# `--with pytest` makes both the normal test step and the disposable collector
+# independent of an ambient activated venv and of which dev-dependency table a
+# live builder happens to author. The collector preserves this project-owned
+# launcher argument while normalizing only its own output flags.
+#
+# `--python 3.12` pins the INTERPRETER to this fixture's own declared floor
+# (`requires-python = '>=3.12'`, written by `_scaffold` below and cited by the
+# toy PRD). `--no-project` is what makes the pin necessary: it deliberately
+# decouples the runner from the project, and therefore from its
+# `requires-python` too, so the step floated to whatever ambient interpreter
+# the machine happened to default to — 3.10 on the gate machine. A live builder
+# that encodes the documented floor as a test (a correct thing to do) then
+# failed its own suite on a version mismatch the fixture created, failing the
+# phase for a reason the phase had no control over. Found by the P7 gate's full
+# integration run; not a P7 regression, a latent fixture inconsistency that
+# only a builder making that particular choice surfaces.
+test_command: "uv run --no-project --python 3.12 --with pytest pytest -q"
 agents:
   builder:
     adapter: claude-code
@@ -76,12 +103,65 @@ identities:
   triage: {name: "Gauntlet Triage", email: "triage@gauntlet.local"}
 """
 
+SCOPED_PHASE_PLAN = """\
+# Scoped-context integration plan
+
+**Status:** Approved test fixture.
+
+## P1 — Implement the slug utility
+
+Create `slugify.py` and unit tests implementing every requirement in the toy
+PRD. Keep the implementation dependency-free.
+
+```gauntlet-phases
+- id: P1
+  title: Implement the slug utility
+  goal: Implement and test the dependency-free slugify function.
+  frs: [FR-1, FR-2, FR-3, FR-4, FR-5]
+  acceptance:
+    - id: P1-A1
+      clause: slugify implements all five functional requirements with unit tests.
+```
+"""
+
+SCOPED_PHASE_PIPELINE = """\
+name: scoped-phase
+version: 1
+stages:
+  - id: phases
+    foreach: plan.phases
+    steps:
+      - {id: implement, type: agent_task, agent: builder,
+         prompt: prompts/implement-phase.md,
+         inputs: [{name: prd.md, mode: reference}, {name: plan.md, mode: phase}],
+         halt_on: "UPSTREAM CONFLICT"}
+      - {id: tests, type: shell, run: "{{config.test_command}}", timeout_s: 1800}
+      - {id: phase-commit, type: commit,
+         message: "P1: Implement scoped slug utility\\n\\nExercise reference and phase context through the live builder."}
+"""
+
+
+def _bounded_live_standard_pipeline() -> str:
+    """Use the shipped pipeline with a one-round live-model test budget.
+
+    This fixture exercises the explicit fail-closed path independently from the
+    full completion gate. If a blocking finding remains after the bounded round,
+    the expected result is the standard human escalation.
+    """
+    source = (REPO / "pipelines" / "standard.yaml").read_text()
+    return re.sub(r"max_rounds:\s*\d+", "max_rounds: 1", source)
+
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
-def _scaffold(tmp_path: Path) -> Path:
+def _scaffold(
+    tmp_path: Path,
+    *,
+    pipeline_text: str | None = None,
+    plan_text: str | None = None,
+) -> Path:
     """A scratch repo carrying the real assets + the human toy PRD (FR-10.1)."""
     repo = tmp_path / "toyrepo"
     repo.mkdir()
@@ -92,7 +172,11 @@ def _scaffold(tmp_path: Path) -> Path:
     for d in ("schemas", "prompts"):
         shutil.copytree(REPO / d, repo / d)
     (repo / "pipelines").mkdir()
-    shutil.copy2(REPO / "pipelines" / "standard.yaml", repo / "pipelines" / "standard.yaml")
+    pipeline_path = repo / "pipelines" / "standard.yaml"
+    if pipeline_text is None:
+        shutil.copy2(REPO / "pipelines" / "standard.yaml", pipeline_path)
+    else:
+        pipeline_path.write_text(pipeline_text)
     shutil.copy2(REPO / "policy.yaml", repo / "policy.yaml")
     (repo / ".gauntlet").mkdir()
     (repo / ".gauntlet" / "config.yaml").write_text(CONFIG)
@@ -102,6 +186,9 @@ def _scaffold(tmp_path: Path) -> Path:
     )
     (repo / "tests").mkdir()
     (repo / "tests" / "__init__.py").write_text("")
+    (repo / ".gitignore").write_text(
+        "__pycache__/\n*.py[cod]\n.pytest_cache/\nuv.lock\nruns/*/artifacts/\n"
+    )
     (repo / ".claude").mkdir()
     (repo / ".claude" / "settings.json").write_text(json.dumps({
         "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
@@ -109,6 +196,8 @@ def _scaffold(tmp_path: Path) -> Path:
     }))
     (repo / "runs" / "toy").mkdir(parents=True)
     (repo / "runs" / "toy" / "prd.md").write_text(TOY_PRD)  # human-authored (FR-10.1)
+    if plan_text is not None:
+        (repo / "runs" / "toy" / "plan.md").write_text(plan_text)
     (repo / "README.md").write_text("toy\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "seed toy project")
@@ -116,30 +205,190 @@ def _scaffold(tmp_path: Path) -> Path:
     return repo
 
 
+def _assert_sanctioned_human_park(mgr: RunManager) -> None:
+    """Assert the standard pipeline stopped at a designed human boundary.
+
+    Whether independent live reviewers agree within three rounds is not a
+    deterministic property of Gauntlet. The deterministic contract is that an
+    unresolved blocking finding parks with durable evidence and a required
+    human response instead of silently continuing or failing incoherently. A
+    builder may likewise discover that implementation contradicts an approved
+    artifact; FR-10.4 requires that conflict to park rather than be worked
+    around.
+    """
+    man = mgr.status("toy")
+    assert man.status == M.RUN_PARKED, man.model_dump()
+    parked = [
+        step
+        for step in man.steps
+        if step.id == man.current_step and step.status == M.PARKED
+    ]
+    assert parked, man.model_dump()
+    step = parked[-1]
+    assert step.halt_reason is None
+    notes = step.notes or ""
+    if step.parked_reason == M.PARKED_REASON_GATE:
+        assert step.type == "human_gate" and step.id == "phase-gate"
+        assert "awaiting human decision" in notes
+        iteration = step.iteration
+        cycle = man.record("impl-cycle", iteration)
+        acceptance = man.record("acceptance-recheck", iteration)
+        tests = man.record("tests-recheck", iteration)
+        assert cycle and cycle.status == M.DONE and "converged" in (cycle.notes or "")
+        assert acceptance and acceptance.status == M.DONE
+        assert tests and tests.status == M.DONE
+    elif step.type == "adversarial_cycle":
+        assert step.parked_reason == M.PARKED_REASON_RESPONSE
+        if "max_rounds=" in notes:
+            assert "human must resolve" in notes
+        else:
+            assert "escalation: finding(s)" in notes
+            assert "upstream artifact (FR-10.4 upstream invalidation)" in notes
+    else:
+        assert step.parked_reason == M.PARKED_REASON_RESPONSE
+        assert step.type == "agent_task" and step.id == "implement"
+        assert "UPSTREAM CONFLICT" in notes
+        # P2/P3: the conflict-park rewind preserves the dirty tree as a
+        # complete recovery snapshot (refs/gauntlet/recovery/), no longer a
+        # legacy backup ref.
+        assert "preserved as recovery snapshot refs/gauntlet/recovery/" in notes
+        assert "restored the clean tree" in notes
+
+
+def _assert_governed_live_stop(mgr: RunManager) -> None:
+    """Accept only an explicit human boundary or a pinned fail-closed fault."""
+    man = mgr.status("toy")
+    if man.status == M.RUN_PARKED:
+        current = [step for step in man.steps if step.id == man.current_step]
+        assert current, man.model_dump()
+        step = current[-1]
+        if step.status == M.HALTED:
+            # A live one-phase run can produce artifacts the acceptance gate
+            # must reject, and the gate failing closed on them is a governed
+            # outcome — not an end-to-end completion substitute.
+            #
+            # BROADENED (P7d review F-007). This branch used to pin ONE gate id
+            # and ONE precondition, and both pins were narrower than the
+            # contract they stand for, so a correct fail-closed halt failed the
+            # test:
+            #
+            # * `standard.yaml` carries TWO acceptance gates — `acceptance-gate`
+            #   pre-cycle and `acceptance-recheck` post-cycle (PR #59 review
+            #   F1). Either can be the one that fires; the id is not the
+            #   contract, the TYPE and the fail-closed shape are.
+            # * the gate has more than one precondition. The observed halt was
+            #   FR-3.2 (an acceptance map carrying clause ids absent from the
+            #   plan phase), while the pin named only FR-3.3 (deferrals to
+            #   nonexistent phases).
+            #
+            # Enumerating the messages was the mistake, not the choice of which
+            # one: the gate has more than a dozen distinct preconditions, so any
+            # list of them is a list that goes stale. This asserts the CONTRACT
+            # those messages share — an acceptance-gate step, halted on a
+            # precondition, carrying the gate's own engine-authored fail-closed
+            # explanation, with the tree left clean.
+            #
+            # Still a real assertion, and it is the one that matters: an
+            # incidental crash, an adapter error, or a halt from some other step
+            # type all fail here. What it stops doing is failing when a live run
+            # trips a governed precondition this file had not thought of.
+            assert step.type == "acceptance_gate"
+            assert step.id in ("acceptance-gate", "acceptance-recheck"), step.id
+            assert step.halt_reason == M.HALT_REASON_PRECONDITION
+            notes = step.notes or ""
+            assert notes.startswith("acceptance gate:"), notes
+            assert "fail closed" in notes or "FR-3." in notes, (
+                "the halt must carry the gate's own governed explanation, not a "
+                f"bare error: {notes!r}"
+            )
+            assert len(notes) > len("acceptance gate:") + 20, (
+                f"and it must actually say what failed: {notes!r}"
+            )
+            assert gitops.is_clean(
+                mgr.repo_root, exclude=["runs"]
+            ), gitops.status_porcelain(mgr.repo_root, exclude=["runs"])
+            return
+        _assert_sanctioned_human_park(mgr)
+        return
+
+    assert man.status == M.RUN_FAILED, man.model_dump()
+    failed = [
+        step
+        for step in man.steps
+        if step.id == man.current_step and step.status == M.FAILED
+    ]
+    assert failed, man.model_dump()
+    step = failed[-1]
+    assert step.type == "adversarial_cycle"
+    assert step.halt_reason == M.HALT_REASON_ADAPTER_ERROR
+    notes = step.notes or ""
+    assert "fixer made no changes" in notes
+    assert "accepted finding(s)" in notes
+    assert "failing closed" in notes
+    assert gitops.is_clean(mgr.repo_root, exclude=["runs"]), gitops.status_porcelain(
+        mgr.repo_root, exclude=["runs"]
+    )
+
+
+def _resume_fixture_plan_escalation(mgr: RunManager) -> str:
+    """Resolve one plan-review ownership mistake through the public workflow.
+
+    Live reviewers sometimes classify tests or commands that P1 is supposed to
+    create as an already-approved upstream artifact.  The fixture's human policy
+    is explicit: neither the ratified PRD nor the test harness may be rewritten;
+    the plan must make the requested deterministic check a P1 deliverable.  This
+    exercises the sanctioned ``resume --response`` recovery path and does not
+    relax the completion assertion.
+    """
+    man = mgr.status("toy")
+    assert man.status == M.RUN_PARKED, man.model_dump()
+    assert man.current_step == "plan-cycle", man.model_dump()
+    cycle = man.record("plan-cycle")
+    assert cycle is not None and cycle.status == M.PARKED
+    assert cycle.type == "adversarial_cycle"
+    assert cycle.parked_reason == M.PARKED_REASON_RESPONSE
+    notes = cycle.notes or ""
+    assert "escalation: finding(s)" in notes
+    assert "upstream artifact (FR-10.4 upstream invalidation)" in notes
+
+    decision = (
+        "Keep the approved toy PRD and this test fixture unchanged. Tests, "
+        "commands, or acceptance scripts that P1 is expected to create are P1 "
+        "deliverables, not already-approved upstream artifacts. Resolve the "
+        "escalated finding inside plan.md by specifying its deterministic P1 "
+        "acceptance check; do not defer it upstream."
+    )
+    return mgr.resume("toy", response=decision, use_judge=True)
+
+
 @pytest.mark.skipif(
-    shutil.which("claude") is None or shutil.which("codex") is None,
-    reason="scoped-context end-to-end needs both claude and codex CLIs",
+    shutil.which("claude") is None,
+    reason="scoped-context end-to-end needs the claude CLI",
 )
 def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
     """P6 FR-1.1: a real implement phase completes with scoped context.
 
-    The shipped `standard.yaml` implement step passes prd.md by `reference` and
-    plan.md by `phase`. This drives the full pipeline through the CLI/run path
-    (the P6 test-strategy integration case the unit tests could not cover) and
-    asserts the phase completes normally AND the persisted implement prompt
-    carries the repo-relative paths + this phase's plan excerpt — not the full
-    documents inlined. Guards F-001's fail-closed contract end-to-end: an empty
-    excerpt would surface here, not silently.
+    A one-phase pipeline using the shipped implement prompt passes prd.md by
+    `reference` and plan.md by `phase`.  Plan-author/reviewer convergence is
+    deliberately outside this test (and covered by the full standard-pipeline
+    case below), so a model's opinion of a generated plan cannot obscure the
+    scoped-context contract this case is meant to exercise.
+
+    The persisted implement prompt must carry the repo-relative paths + this
+    phase's plan excerpt — not the full documents inlined. Guards F-001's
+    fail-closed contract end-to-end: an empty excerpt surfaces here, not
+    silently.
     """
-    repo = _scaffold(tmp_path)
+    repo = _scaffold(
+        tmp_path,
+        pipeline_text=SCOPED_PHASE_PIPELINE,
+        plan_text=SCOPED_PHASE_PLAN,
+    )
     mgr = RunManager(repo)
     pipe = repo / "pipelines" / "standard.yaml"
 
-    assert mgr.start("toy", pipe, use_judge=True) == M.RUN_PARKED   # PRD gate
-    assert mgr.approve("toy", use_judge=True) == M.RUN_PARKED        # plan gate
     plan = (repo / "runs" / "toy" / "plan.md").read_text()
-    # phases → done: the implement phase(s) run through the real CLI path.
-    assert mgr.approve("toy", use_judge=True) == M.RUN_DONE, (
+    assert mgr.start("toy", pipe, use_judge=True) == M.RUN_DONE, (
         mgr.status("toy").model_dump()
     )
 
@@ -149,7 +398,11 @@ def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
     assert any(
         p.split(".")[0].lstrip("P").isdigit() for p in (c.phase for c in man.commits)
     )
-    assert (repo / "slugify.py").exists()
+    # P7g: the builder writes in the RUN tree, not the operator's checkout.
+    work = run_work_tree(repo, "toy")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert (work / "slugify.py").exists()
+    assert not (repo / "slugify.py").exists()
 
     # the persisted implement prompt used scoped context (FR-1.1): paths present,
     # bodies not inlined, and the plan's CURRENT-PHASE excerpt sliced in.
@@ -172,7 +425,35 @@ def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
     shutil.which("claude") is None or shutil.which("codex") is None,
     reason="standard end-to-end needs both claude and codex CLIs",
 )
+def test_bounded_live_standard_pipeline_stops_only_at_governed_boundary(tmp_path):
+    repo = _scaffold(tmp_path, pipeline_text=_bounded_live_standard_pipeline())
+    mgr = RunManager(repo)
+    pipe = repo / "pipelines" / "standard.yaml"
+
+    status = mgr.start("toy", pipe, use_judge=True)
+    if mgr.status("toy").current_step != "prd-approve":
+        _assert_governed_live_stop(mgr)
+        return
+    assert status == M.RUN_PARKED, mgr.status("toy").model_dump()
+
+    status = mgr.approve("toy", use_judge=True)
+    if mgr.status("toy").current_step != "plan-approve":
+        _assert_governed_live_stop(mgr)
+        return
+    assert status == M.RUN_PARKED
+
+    status = mgr.approve("toy", use_judge=True)
+    if status == M.RUN_DONE:
+        return
+    _assert_governed_live_stop(mgr)
+
+
+@pytest.mark.skipif(
+    shutil.which("claude") is None or shutil.which("codex") is None,
+    reason="standard end-to-end needs both claude and codex CLIs",
+)
 def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
+    """The shipped standard pipeline completes through real adapter boundaries."""
     repo = _scaffold(tmp_path)
     mgr = RunManager(repo)
     pipe = repo / "pipelines" / "standard.yaml"
@@ -182,16 +463,29 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     assert status == M.RUN_PARKED, mgr.status("toy").model_dump()
     assert mgr.status("toy").current_step == "prd-approve"
 
-    # plan gate: builder authors plan.md (with its gauntlet-phases block), the
-    # cycle reviews it, parks for ratification.
+    # Plan gate: builder authors plan.md, the cycle reviews it, then parks for
+    # ratification.
     status = mgr.approve("toy", use_judge=True)
-    assert status == M.RUN_PARKED
+    if status == M.RUN_PARKED and mgr.status("toy").current_step == "plan-cycle":
+        status = _resume_fixture_plan_escalation(mgr)
+    assert status == M.RUN_PARKED, mgr.status("toy").model_dump()
     assert mgr.status("toy").current_step == "plan-approve"
     plan = (repo / "runs" / "toy" / "plan.md").read_text()
-    assert "gauntlet-phases" in plan  # the structured phase list the loop fans over
+    assert "gauntlet-phases" in plan
+    phase_ids = [phase["id"] for phase in extract_phases(plan)]
+    assert phase_ids == ["P1"], phase_ids
 
-    # phases → retro → done: each phase implements, tests, commits, reviews.
+    # The phase implements, tests, commits, and completes review/fix/confirm.
+    # A non-clean but converged evidence set parks at the explicit phase gate;
+    # approve that human boundary, but no other parked state, then require the
+    # standard pipeline to complete retro and PR drafting.
     status = mgr.approve("toy", use_judge=True)
+    if status == M.RUN_PARKED:
+        assert mgr.status("toy").current_step == "phase-gate", (
+            mgr.status("toy").model_dump()
+        )
+        _assert_sanctioned_human_park(mgr)
+        status = mgr.approve("toy", use_judge=True)
     assert status == M.RUN_DONE, mgr.status("toy").model_dump()
 
     man = mgr.status("toy")
@@ -199,18 +493,26 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     phases = [c.phase for c in man.commits]
     assert "PLAN" in phases
     assert any(p.split(".")[0].lstrip("P").isdigit() for p in phases)
-    # the toy was actually implemented and its tests pass
-    assert (repo / "slugify.py").exists()
+    # the toy was actually implemented and its tests pass — in the RUN tree
+    # (P7g), which is where a `dedicated` run's builder writes.
+    work = run_work_tree(repo, "toy")
+    assert work != repo, "the run must not have driven the operator's checkout"
+    assert (work / "slugify.py").exists()
+    assert not (repo / "slugify.py").exists()
     # FR-9 clean history: the final tree is committed — only the run's own
     # bookkeeping under runs/ is excluded. Asserted directly, not vacuously
-    # (review F-006): a dirty worktree at run end is a hard failure.
+    # (review F-006): a dirty worktree at run end is a hard failure. Asserted on
+    # the RUN tree, which is the tree the run commits in; the operator's
+    # checkout is asserted separately below and for a different reason.
+    assert gitops.is_clean(work, exclude=["runs"]), gitops.status_porcelain(
+        work, exclude=["runs"]
+    )
+    # A1: the operator's checkout carries no source change at all. Its only
+    # sanctioned delta is under `runs/` — the governed artifacts the engine
+    # authors and back-publishes there by design — which `exclude` covers.
     assert gitops.is_clean(repo, exclude=["runs"]), gitops.status_porcelain(
         repo, exclude=["runs"]
     )
-
-    # FR-9.8: PR.md drafted, not opened/pushed.
-    pr = repo / "runs" / "toy" / "PR.md"
-    assert pr.exists() and "Not opened, not pushed" in pr.read_text()
 
     # FR-3 acceptance: classification (triage) is a small, measured share of
     # total cost. The triage row and its percentage MUST be present — a missing
@@ -224,6 +526,10 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     assert tri is not None, "no triage cost row; classification spend not attributed"
     assert tri.pct_cost is not None, "triage percentage is null; cannot verify FR-3"
     assert tri.pct_cost < 5.0
+
+    # FR-9.8: a completed run drafts PR.md but does not open or push it.
+    pr = repo / "runs" / "toy" / "PR.md"
+    assert pr.exists() and "Not opened, not pushed" in pr.read_text()
 
     # --- FR-6 acceptance: feedback (captured after the run) drives a real,
     # human-reviewed proposal (P7 plan §"Real-data", review F-001/F-006) -------
@@ -248,7 +554,16 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     ), run_dir=run_dir)
 
     # Late feedback drives proposal generation (FR-6.1 → FR-6.3): re-synthesise.
-    generated = mgr.regenerate_proposals("toy")
+    # The normal retrospective deliberately uses the cheap triage profile and
+    # retains malformed diffs as invalid evidence. This acceptance path goes
+    # further: it requires a real diff that can be human-approved and applied,
+    # so route only this late-feedback synthesis call through the configured
+    # strong escalation profile. Classification during the run remains cheap,
+    # preserving the FR-3 cost assertion above.
+    generated = mgr.regenerate_proposals(
+        "toy",
+        adapter_factory=lambda _name: mgr.config.profile("escalation").build_adapter(),
+    )
     assert generated, "no proposals generated from seeded feedback (FR-6 acceptance)"
     pending = [p for p in P.list_proposals(run_dir / "retro" / "proposals")
                if p.status == P.PENDING and p.valid]

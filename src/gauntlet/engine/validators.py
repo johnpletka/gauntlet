@@ -146,7 +146,17 @@ def _validate_against_schema(
             f"validator schema {ref!r} not found at {path} (asset_root "
             f"{asset_root!r}); check the step's `validate:` reference"
         )
-    schema = json.loads(path.read_text())
+    try:
+        schema = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        # P5.1 review F-006: an unreadable or non-JSON SCHEMA file is a
+        # pipeline-ASSET misconfiguration (fail closed with the precise
+        # defect named), never an artifact defect — editing the artifact
+        # cannot repair a broken schema, so it must not park artifact_invalid.
+        raise UnknownValidatorError(
+            f"validator schema {ref!r} at {path} could not be read/parsed: "
+            f"{exc}; repair the schema asset"
+        ) from exc
     try:
         instance = extract_json(text)
     except ValueError as exc:

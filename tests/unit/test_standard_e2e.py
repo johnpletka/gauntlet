@@ -24,6 +24,8 @@ from gauntlet.engine import gitops, manifest as M
 from gauntlet.engine.report import build_report
 from gauntlet.engine.run import RunManager
 
+from conftest import run_work_tree
+
 REPO = Path(__file__).resolve().parents[2]
 
 PLAN_MD = """# Toy implementation plan
@@ -280,13 +282,18 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     phases = [c.phase for c in man.commits]
     assert "PLAN" in phases
     assert "P1" in phases
-    # branch holds the work
+    # branch holds the work. P7g: the RUN BRANCH holds it, not the operator's
+    # HEAD — a `dedicated` run leaves the operator on `main` by construction
+    # (acceptance A1), so naming the branch is both the same claim and the one
+    # that is vantage-independent (refs are shared across worktrees, spike E1).
     assert man.branch == "gauntlet/toy"
-    assert gitops.commit_subject(repo, "HEAD") in (
+    assert gitops.commit_subject(repo, man.branch) in (
         "P1: build the widget", "PLAN: Author plan.md for adversarial review",
     )
-    # every cycle converged; the phase implemented the widget
-    assert (repo / "widget.py").exists()
+    # every cycle converged; the phase implemented the widget — in the tree the
+    # builder actually edits, which under the P7g default is the run worktree.
+    work = run_work_tree(repo, "toy")
+    assert (work / "widget.py").exists()
     # the structured phase list drove exactly one iteration
     assert man.record("implement", "0").status == M.DONE
     assert man.record("retrospective").status == M.DONE

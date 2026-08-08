@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
 
 from gauntlet.adapters.base import Usage
-from gauntlet.engine import gitops, manifest as M
+from gauntlet.engine import git_snapshot, gitops, manifest as M
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.engine.orchestrator import Orchestrator
@@ -77,6 +78,75 @@ def test_linear_run_to_commit(fixture_repo):
     assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: implement phase"
     # work tree is clean; the run's own out.txt/manifest under runs/ is excluded
     assert gitops.is_clean(fixture_repo, exclude=["runs"])
+
+
+def test_agent_with_all_judge_calls_denied_fails_instead_of_done(fixture_repo):
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def write_denials(adapter, prompt, cwd):
+        rows = [
+            {
+                "step_id": "implement", "decision": "deny",
+                "source": "fail-closed",
+                "rationale": "judge LLM error: unsupported reasoning effort",
+            }
+            for _ in range(3)
+        ]
+        audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="I could not read any files", on_run=write_denials)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.FAILED
+    assert rec.halt_reason == M.HALT_REASON_JUDGE_DENY
+    assert rec.judge_tool_calls_allowed == 0
+    assert rec.judge_tool_calls_denied == 3
+    assert "judge cannot evaluate" in (rec.notes or "")
+    assert "unsupported reasoning effort" in (rec.notes or "")
+
+
+def test_agent_judge_counts_allow_done_when_at_least_one_call_allowed(fixture_repo):
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def write_mixed(adapter, prompt, cwd):
+        rows = [
+            {"step_id": "implement", "decision": "deny", "source": "fast-path",
+             "rationale": "blocked"},
+            {"step_id": "implement", "decision": "allow", "source": "fast-path",
+             "rationale": "safe"},
+        ]
+        audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="done", on_run=write_mixed)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.DONE
+    assert rec.judge_tool_calls_allowed == 1
+    assert rec.judge_tool_calls_denied == 1
 
 
 def test_when_skips_step(fixture_repo):
@@ -298,9 +368,18 @@ stages:
     assert orch.drive() == M.RUN_DONE
     assert adapter.calls  # re-ran after reset
     assert not (fixture_repo / "partial.py").exists()  # partial work discarded
-    # a backup ref preserved the discarded partial work (F-010-style safety)
-    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/backup/")
-    assert "refs/gauntlet/backup/" in refs
+    # a complete recovery snapshot preserved the discarded partial work
+    # (F-010-style safety; P3: refs/gauntlet/recovery/ via the executor)
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    assert refs
+    snapshot = git_snapshot.load_snapshot(fixture_repo, refs[0])
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "partial.py" in tree
 
 
 def test_resume_dirty_artifact_under_runroot_is_detected(fixture_repo):
@@ -400,6 +479,145 @@ def test_engine_marked_commit_touching_implementation_still_parks(fixture_repo):
     assert orch.drive() == M.RUN_PARKED
     assert orch.manifest.record("implement").status == M.INTERRUPTED
     assert adapter.calls == []
+
+
+def test_reset_interrupted_override_forces_reset_under_park_policy(fixture_repo):
+    """#72: `resume --reset-interrupted` is a one-shot override — the config
+    says park, the override discards the interrupted attempt (backed up) and
+    re-runs cleanly. The park state gains a sanctioned exit."""
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "partial.py").write_text("half written")
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    orch.interrupted_override = "reset_to_base"
+    assert orch.drive() == M.RUN_DONE
+    assert adapter.calls  # re-ran after the reset
+    assert not (fixture_repo / "partial.py").exists()  # partial work discarded
+    refs = gitops._run(fixture_repo, "for-each-ref", "refs/gauntlet/recovery/")
+    assert "refs/gauntlet/recovery/" in refs  # ...but snapshotted first
+
+
+def test_reset_interrupted_override_preserves_wip_checkpoints(fixture_repo):
+    """#72: the override rewinds to the latest committed `P<N> wip:` milestone
+    (FR-11.2), never past it — committed builder work survives the discard."""
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "milestone.py").write_text("committed milestone\n")
+    gitops.commit_all(
+        fixture_repo, "P2 wip: arm the thing\n\nbody",
+        identity=gitops.Identity("Builder", "b@g.local"),
+    )
+    (fixture_repo / "partial.py").write_text("uncommitted partial")
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="park")
+    orch.interrupted_override = "reset_to_base"
+    assert orch.drive() == M.RUN_DONE
+    assert adapter.calls
+    assert (fixture_repo / "milestone.py").exists()  # committed wip preserved
+    assert not (fixture_repo / "partial.py").exists()  # partial discarded
+    assert orch.manifest.record("implement").resumed_from_checkpoint == (
+        "P2 wip: arm the thing"
+    )
+
+
+def test_reset_policy_preserves_uncommitted_pr_md_edits(fixture_repo):
+    """PR #77 review (blocking): a tracked PR.md with uncommitted human edits
+    is invisible to the dirty check AND the backup (policy exclusion), but
+    reset --hard is not policy-scoped — the edit must be carried across the
+    rewind, byte-for-byte, not silently destroyed."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("PR draft v1\n")
+    gitops.commit_all(
+        fixture_repo, "P1: track the PR draft\n\nbody",
+        identity=gitops.Identity("Human", "h@g.local"),
+    )
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "partial.py").write_text("half written")  # killed mid-edit
+    pr.write_text("PR draft v2 — human edited, uncommitted\n")
+    adapter = FakeAdapter(writes={"clean.py": "real output\n"})
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": adapter},
+                  manifest=man, interrupted="reset_to_base")
+    assert orch.drive() == M.RUN_DONE
+    assert not (fixture_repo / "partial.py").exists()  # partial work discarded
+    assert pr.read_text() == "PR draft v2 — human edited, uncommitted\n"
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    ref = next(r for r in refs if "/implement-" in r)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    assert "runs/demo/PR.md" in snapshot.protected_paths
+    assert gitops._run(
+        fixture_repo, "show", f"{snapshot.worktree_tree}:runs/demo/PR.md"
+    ) == "PR draft v2 — human edited, uncommitted\n"
+
+
+def test_reset_policy_preserves_and_backs_up_pr_md_deletion(fixture_repo):
+    """A tracked PR.md deletion is an uncommitted human edit: reset must not
+    resurrect it, and the backup ref must durably represent the deletion."""
+    pr = fixture_repo / "runs" / "demo" / "PR.md"
+    pr.parent.mkdir(parents=True)
+    pr.write_text("PR draft to delete\n")
+    gitops.commit_all(
+        fixture_repo, "P1: track the PR draft\n\nbody",
+        identity=gitops.Identity("Human", "h@g.local"),
+    )
+    base = gitops.head_sha(fixture_repo)
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    (fixture_repo / "partial.py").write_text("half written")
+    pr.unlink()
+    orch = _build(
+        fixture_repo,
+        _RESUME_PIPELINE,
+        adapters={"builder": FakeAdapter(writes={"clean.py": "real output\n"})},
+        manifest=man,
+        interrupted="reset_to_base",
+    )
+
+    assert orch.drive() == M.RUN_DONE
+    assert not pr.exists()
+    refs = gitops._run(
+        fixture_repo, "for-each-ref", "--format=%(refname)",
+        "refs/gauntlet/recovery/",
+    ).splitlines()
+    ref = next(r for r in refs if "/implement-" in r)
+    snapshot = git_snapshot.load_snapshot(fixture_repo, ref)
+    # The deletion is durably represented: recorded as a protected deletion,
+    # and the path is absent from the snapshot's worktree tree.
+    assert "runs/demo/PR.md" in snapshot.protected_deletions
+    tree = gitops._run(
+        fixture_repo, "ls-tree", "-r", "--name-only", snapshot.worktree_tree
+    )
+    assert "runs/demo/PR.md" not in tree
+
+
+def test_interrupted_park_notes_name_the_reset_verb(fixture_repo):
+    # The park message must point at a REAL command, not implied git surgery
+    # (#72): `gauntlet resume <slug> --reset-interrupted`.
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "partial.py").write_text("half written")
+    man = _seed_running_step(fixture_repo, "implement", "agent_task", base)
+    orch = _build(fixture_repo, _RESUME_PIPELINE, adapters={"builder": FakeAdapter()},
+                  manifest=man, interrupted="park")
+    assert orch.drive() == M.RUN_PARKED
+    notes = orch.manifest.record("implement").notes
+    assert "gauntlet resume demo --reset-interrupted" in notes
+
+
+def test_interrupted_step_config_rejects_unknown_value():
+    # F-003/#72: previously unvalidated — a typo silently meant `park` and the
+    # configured recovery policy just didn't happen. Fail closed at load.
+    import pytest
+
+    with pytest.raises(ValueError, match="interrupted_step must be one of"):
+        RunConfig.model_validate({**BUILDER_CFG, "interrupted_step": "reset-to-base"})
+    cfg = RunConfig.model_validate({**BUILDER_CFG, "interrupted_step": "RESET_TO_BASE"})
+    assert cfg.interrupted_step == "reset_to_base"  # case-normalized, valid
 
 
 def test_reset_for_retry_rearms_transaction_boundary(fixture_repo):
@@ -821,10 +1039,17 @@ stages:
     # (which would leave the write-ahead RUN_RUNNING persisted); it parks.
     assert orch.drive() == M.RUN_PARKED
     # The persisted manifest reflects the park — never a stale "running" that
-    # `gauntlet status` would report as a live run.
+    # `gauntlet status` would report as a live run. Since P5 (plan §5.1) the
+    # park is a classified artifact_invalid STEP transition (with validator,
+    # diagnostic, and content fingerprint) instead of a bare warning + HALTED.
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
-    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+    rec = reloaded.record("implement")
+    assert rec is not None and rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert rec.revalidation is not None
+    assert rec.revalidation.validator == "plan_phases"
+    assert "gauntlet-phases" in (rec.notes or "")
 
 
 def test_malformed_plan_does_not_block_steps_that_ignore_phases(fixture_repo):
@@ -849,10 +1074,15 @@ stages:
     assert orch.drive() == M.RUN_PARKED
     # The phases-agnostic step ran instead of being pre-empted by the parse...
     assert orch.manifest.record("noop").status == M.DONE
-    # ...and the run still failed closed at the foreach, with the reason persisted.
+    # ...and the run still failed closed at the foreach, with the reason
+    # persisted as a classified artifact_invalid park on the stopped step
+    # (P5, plan §5.1) rather than a bare warning.
     reloaded = Manifest.load(orch.manifest_path)
     assert reloaded.status == M.RUN_PARKED
-    assert any("gauntlet-phases" in w for w in reloaded.warnings), reloaded.warnings
+    rec = reloaded.record("implement")
+    assert rec is not None and rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
+    assert "gauntlet-phases" in (rec.notes or "")
 
 
 AGENT_STEP = """

@@ -21,7 +21,10 @@ dependencies = [
     "pydantic>=2.7",
     "fastapi>=0.111",
     "uvicorn>=0.30",
-    "litellm>=1.40",
+    # Keep fresh installs within the release family exercised by the lockfile
+    # and Python 3.10 baseline. Newer LiteLLM sdists pull Rust lockfile-v4
+    # dependencies that the supported bootstrap toolchain cannot build.
+    "litellm>=1.40,<1.89",
     "jsonschema>=4.21",
     "pyyaml>=6.0",
     # Console (web/) promotes two already-transitive deps to explicit so a
@@ -71,6 +74,7 @@ dev-dependencies = [
 testpaths = ["tests"]
 markers = [
     "integration: requires live CLI/API credentials; excluded by default",
+    "operator_tree_verb: drives `finish`/`clean`, which mutate the operator's checkout by design (spike §9.4) — exempt from the A1 invariance fixture",
 ]
 # `uv run pytest` runs units only; `uv run pytest -m integration` overrides.
 addopts = "-m 'not integration'"

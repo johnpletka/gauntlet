@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- park reasons (PRD FR-7.2 enum) ------------------------------------------
 # The canonical ``parked_reason`` enum a PARKED step carries (harness-efficiency
@@ -49,8 +49,19 @@ PARKED_REASON_ARTIFACT_INVALID = "artifact_invalid"
 PARKED_REASON_RESPONSE = "response"
 # A park at a human ratification gate (``human_gate``): awaiting approve/reject.
 PARKED_REASON_GATE = "gate"
+# A transport/dependency park (plan §5.2, P5): the provider itself was
+# unreachable or failing — typed timeout / connection / DNS / 5xx /
+# service-unavailable / overload — and the bounded in-process dependency
+# retries (persisted on ``StepRecord.dependency_attempts``) were exhausted.
+# DISTINCT from ``usage_limit`` (a quota wall): no human decision is at stake
+# and a PLAIN ``gauntlet resume`` retries the step — NEVER ``--response``
+# (R7; issue #63). The park always records a concrete backoff/Retry-After
+# deadline on ``quota_reset_at`` so it is a legitimate wait, not a wedge
+# (P4.1 F-006).
+PARKED_REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 # The complete PRD parked_reason enum (the only values written / emitted).
+# ``provider_unavailable`` was APPENDED by P5 (additive; schema_version stays 1).
 PARKED_REASONS = frozenset(
     {
         PARKED_REASON_USAGE_LIMIT,
@@ -58,6 +69,7 @@ PARKED_REASONS = frozenset(
         PARKED_REASON_ARTIFACT_INVALID,
         PARKED_REASON_RESPONSE,
         PARKED_REASON_GATE,
+        PARKED_REASON_PROVIDER_UNAVAILABLE,
     }
 )
 
@@ -187,10 +199,21 @@ def reason_fields_disjoint(
 # just-finished execution's `failure_kind`, so any non-precondition finalization
 # clears a stale value.
 FAILURE_KIND_CLEAN_HANDOFF = "clean_handoff_precondition"
+# An UNKNOWN adapter failure whose attempt provably produced no Git/worktree
+# side effects (plan §5.2, P5): the engine assessed the tree against the
+# attempt's ``base_sha`` — not the exception name — and found it unchanged, so
+# re-running cannot re-run over partial work. Such a failure is plain-resumable
+# (no ``--response``, R7); a deterministic repeat then trips the R5 no-progress
+# guard rather than looping. A side-effecting unknown failure stays terminal —
+# its recovery goes through the snapshot/reconciliation paths (P3 executor).
+FAILURE_KIND_SIDE_EFFECT_FREE = "side_effect_free_unknown"
 # Failure kinds a plain (response-less) `gauntlet resume` may safely re-execute
 # once the operator has fixed the named precondition — they cost nothing and
-# re-run the guard, not the adapter.
-RERUNNABLE_FAILURE_KINDS = frozenset({FAILURE_KIND_CLEAN_HANDOFF})
+# re-run the guard, not the adapter — plus the P5 side-effect-free unknown
+# failure, whose retry provably cannot re-run over partial work.
+RERUNNABLE_FAILURE_KINDS = frozenset(
+    {FAILURE_KIND_CLEAN_HANDOFF, FAILURE_KIND_SIDE_EFFECT_FREE}
+)
 
 # --- human-response lifecycle states (FR-2, FR-7.1) --------------------------
 # A `--response` entry is born ``pending`` (appended before the agent launches)
@@ -293,6 +316,14 @@ class RevalidationRecord(BaseModel):
     hash_at_resume: str | None = None
     changed_while_parked: bool = False
     passed_on_resume: bool = False
+    # P5 (plan §5.1, issue #63/#64 class): WHICH validator judged the artifact
+    # invalid (``plan_phases``, ``phase_lint``, a ``schema:<ref>``, or the
+    # drive-level ``gauntlet-phases`` parse) and its exact diagnostic, so the
+    # park is self-explaining without a transcript read and the audit trail
+    # records the precise check a hand-edit answered. Additive/nullable —
+    # pre-P5 manifests load unchanged.
+    validator: str | None = None
+    diagnostic: str | None = None
 
 
 class Suspension(BaseModel):
@@ -404,6 +435,26 @@ class StepRecord(BaseModel):
     # Additive/nullable — ``None`` on every other outcome, so older manifests load
     # unchanged.
     revalidation: RevalidationRecord | None = None
+    # Orthogonal recovery taxonomy (plan §4.1/§6 P5): WHY this step needs
+    # recovery (a ``RecoveryCause`` value) and WHAT strategy applies (a
+    # ``RecoveryDisposition`` value), stamped by ``_finalize`` on every
+    # terminal/parked outcome from the outcome's own evidence
+    # (``recovery_exec.outcome_classification``). CURRENT-STATE like the reason
+    # fields: cleared (None) on DONE/SKIPPED. The planner treats a recorded pair
+    # as refining evidence over the coarse state→cause map; a pre-P5 manifest
+    # carries ``None`` and classifies exactly as before (plan §8 — additive,
+    # nullable, never required).
+    recovery_cause: str | None = None
+    recovery_disposition: str | None = None
+    # Persisted dependency-retry budget (plan §5.2, P5): how many bounded
+    # in-process retries this step's CURRENT failure episode has consumed for
+    # transport/dependency failures (timeout / connection / 5xx / overload).
+    # Incremented and flushed WRITE-AHEAD before each retry sleep, so a crash
+    # between retries never resets the budget; reset to 0 when a new episode
+    # starts (a plain resume of a ``provider_unavailable`` park) and on any
+    # finalization that is not a ``provider_unavailable`` park. Additive —
+    # older manifests load with 0.
+    dependency_attempts: int = 0
     # Append-only audit trail of human `--response` decisions on this step
     # (FR-2). Recording/consume wiring is P3; P1 carries the schema only.
     human_responses: list[HumanResponse] = Field(default_factory=list)
@@ -423,6 +474,11 @@ class StepRecord(BaseModel):
     # tallies here so trend math reads the manifest, never the log dirs (the
     # plan's P7 test strategy is "trend-metric math from fixture manifests").
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Current invocation's PreToolUse authorization counts (issue #83). Kept as
+    # explicit data so status can expose a bricked/all-denied agent without an
+    # operator mining its transcript. Older manifests load with zeroes.
+    judge_tool_calls_allowed: int = 0
+    judge_tool_calls_denied: int = 0
     # Write-ahead adversarial-cycle sub-step checkpoints (harness-efficiency
     # FR-4.1). Appended (and the manifest flushed) as each round sub-step
     # completes, so a mid-round interruption — a usage-limit park (P1) or a kill —
@@ -627,6 +683,13 @@ class RecoveryRecord(BaseModel):
     prior_run_status: str
     resulting_step_status: str
     resulting_run_status: str
+    # Branch↔manifest reconciliation evidence (#72): the run-branch tip at
+    # recovery time, and — when that tip is strictly ahead of the manifest's
+    # last recorded commit (a builder killed after committing but before a
+    # manifest flush) — the unmanifested ``last..tip`` commit list, one line
+    # per commit. ``None`` on pre-#72 records or when git was unavailable.
+    branch_head: str | None = None
+    unmanifested_range: str | None = None
 
 
 class Manifest(BaseModel):
@@ -681,6 +744,42 @@ class Manifest(BaseModel):
     # the fork manual-push note. Absent (``None``) for branch mode / heavyweight
     # runs; additive, so older manifests load unchanged.
     pr: ReviewPrRecord | None = None
+    # Which tree layout this run was BORN into (P7c, spike §13). Set once by
+    # `start()` from `config.worktree.mode` and never rewritten by a later
+    # verb. Additive and optional, so every pre-P7c manifest loads unchanged
+    # with ``None`` — which resolves to `same_tree`, the legacy population's
+    # mode forever (§16).
+    #
+    # This field exists to make auto-migration STRUCTURALLY impossible. A run's
+    # effective mode is resolved from evidence and from THIS record, never from
+    # the live config (`RunManager._effective_worktree_mode`): otherwise an
+    # operator flipping `worktree.mode: dedicated` on a repo with existing runs
+    # would silently move every one of them into a worktree on its next resume,
+    # which is exactly the auto-migration spike §10 forbids. `config` is read in
+    # exactly one place — `start()`, choosing what a NEW run is born as.
+    worktree_mode: str | None = None
+
+    @field_validator("worktree_mode")
+    @classmethod
+    def _worktree_mode(cls, v: str | None) -> str | None:
+        """Reject a mode this engine cannot act on (F-006, fail closed).
+
+        Validated at LOAD as well as at construction, because the dangerous
+        direction is reading a manifest someone else wrote — a corrupt file, or
+        one from a forward version that knows a third mode. `None` stays valid:
+        it is every pre-P7c run.
+        """
+        if v is None:
+            return None
+        from gauntlet.engine.worktree import MODES
+
+        if v not in MODES:
+            raise ValueError(
+                f"worktree_mode must be one of {sorted(MODES)} or absent; got "
+                f"{v!r} — refusing to load a manifest whose tree layout this "
+                "engine cannot determine"
+            )
+        return v
 
     # ---- record lookup -------------------------------------------------------
     def record(self, step_id: str, iteration: str | None = None) -> StepRecord | None:
@@ -697,33 +796,78 @@ class Manifest(BaseModel):
         self.steps.append(rec)
         return rec
 
-    # ---- atomic persistence (FR-8.2) ----------------------------------------
+    # ---- atomic persistence (FR-8.2; journaled write-ahead since P6) --------
     def write_atomic(self, path: Path) -> None:
-        """Write the manifest atomically: temp file in the same dir + replace.
+        """Persist the manifest as one durable, journaled transition.
 
-        ``os.replace`` is atomic on POSIX within a filesystem, so a reader (or a
-        resume after kill) always sees a whole manifest — the prior one until
-        the instant the new one lands. ``fsync`` before replace so the bytes are
-        durable, not just in the page cache, before the rename is visible.
+        This is the single atomic-persist primitive every write-ahead site
+        uses, so P6 anchors the authoritative state journal here (plan §4.6):
+        the exact payload about to land is first appended to the append-only
+        journal under the run-instance state dir (``journal.record_transition``
+        — write-ahead, the journal is the authority), then the projection file
+        is atomically replaced (:func:`_replace_atomic`). One logical
+        transition, two ordered durable writes, no new kill window: a kill
+        between them leaves ``manifest.json`` exactly one journaled state
+        behind, which the next mutating contact catches up idempotently
+        (``journal.reconcile_projection``) — never a torn file, never an
+        unclassifiable state.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = self.model_dump_json(indent=2)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            # On any failure (including KeyboardInterrupt) leave the prior
-            # manifest untouched and clean up the temp file.
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+        # Lazy import: journal is stdlib-only and imports nothing from this
+        # module, but the low-level model module must not pull it (or anything)
+        # in at import time.
+        from gauntlet.engine import journal
+
+        journal.record_transition(path, payload, validate=validate_projection_text)
+        _replace_atomic(path, payload)
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
         return cls.model_validate_json(path.read_text())
+
+
+def validate_projection_text(text: str) -> bool:
+    """Can the engine actually LOAD this manifest text? (P6.1, review F-002)
+
+    The journal's injected state validator: only bytes that pass the full
+    model validation may become an authoritative journal state (a genesis
+    migration) or be reasoned about as a candidate projection. Bytes that
+    merely happen to be JSON would otherwise wedge a run — every later
+    ``Manifest.load`` of the authoritative head would raise, with nothing
+    valid left to rebuild from. Kept here (not in :mod:`journal`) so the
+    journal module stays free of engine imports; injected at every call site
+    that can promote bytes to authority.
+    """
+    try:
+        Manifest.model_validate_json(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _replace_atomic(path: Path, payload: str) -> None:
+    """Atomically replace ``path`` with ``payload`` (temp + fsync + replace).
+
+    ``os.replace`` is atomic on POSIX within a filesystem, so a reader (or a
+    resume after kill) always sees a whole manifest — the prior one until the
+    instant the new one lands. ``fsync`` before replace so the bytes are
+    durable, not just in the page cache, before the rename is visible. Module
+    level (not a method) so the P6 crash harness can kill a real process at
+    the exact event-append/projection-write boundary.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # On any failure (including KeyboardInterrupt) leave the prior
+        # manifest untouched and clean up the temp file.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise

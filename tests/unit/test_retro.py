@@ -70,6 +70,22 @@ def _capture_diff(repo: Path, rel: str, new_content: str) -> str:
     return diff
 
 
+def test_synthesis_prompts_require_complete_applyable_hunks():
+    """The tunable prompt and fixture fallback pin the same concrete diff contract.
+
+    A syntactically unified-looking diff with a bare ``@@`` header is rejected by
+    Git.  Naming the exact numeric-hunk and context requirements prevents the
+    live proposer from repeatedly producing artifacts that can never be
+    ratified, while materialization remains the deterministic enforcement gate.
+    """
+    shipped = (REPO / "prompts" / "proposal-synthesis.md").read_text()
+    for prompt in (shipped, R._BUILTIN_SYNTHESIS):
+        assert "git apply --check" in prompt
+        assert "@@ -12,3 +12,7 @@" in prompt
+        assert "bare `@@`" in prompt or "bare @@" in prompt
+        assert "context" in prompt
+
+
 def _run_retro(repo: Path, adapters: dict, *, feedback=None, step_extra=None,
                cycle_human_responses=None):
     step = {

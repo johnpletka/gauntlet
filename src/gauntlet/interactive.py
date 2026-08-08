@@ -244,10 +244,10 @@ def _await_judge_record(
         sleep(poll_interval_s)
 
 
-def _default_liveness(run_root: Path, slug: str) -> str:
+def _default_liveness(run_root: Path, slug: str, run_dir: Path | None = None) -> str:
     from gauntlet.engine import operator
 
-    return operator.driver_liveness(run_root, slug)
+    return operator.driver_liveness(run_root, slug, run_instance_dir=run_dir)
 
 
 def _stderr(message: str) -> None:
@@ -297,7 +297,15 @@ def launch_monitor(
         if use_judge
         else None
     )
-    liveness = (liveness_fn or _default_liveness)(run_root, slug)
+    # P7b: the drive lock is per-run, so the liveness read is scoped to this
+    # run's instance dir. An injected `liveness_fn` keeps the two-argument shape
+    # it has always had — the run dir is passed only to the default reader, so
+    # existing test doubles are unaffected.
+    liveness = (
+        liveness_fn(run_root, slug)
+        if liveness_fn is not None
+        else _default_liveness(run_root, slug, run_dir)
+    )
     gated = use_judge and record is not None and liveness == "alive"
 
     if gated:

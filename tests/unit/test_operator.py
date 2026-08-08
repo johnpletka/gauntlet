@@ -78,11 +78,12 @@ def _manifest(status: str, steps: list[StepRecord], *, slug: str = "demo") -> Ma
 
 
 def _step(id: str, type: str, status: str, *, reason=None, iteration=None,
-          metrics=None, failure_kind=None, halt_reason=None) -> StepRecord:
+          metrics=None, failure_kind=None, halt_reason=None,
+          ended=None) -> StepRecord:
     return StepRecord(
         id=id, type=type, status=status, parked_reason=reason,
         iteration=iteration, metrics=metrics or {}, failure_kind=failure_kind,
-        halt_reason=halt_reason,
+        halt_reason=halt_reason, ended=ended,
     )
 
 
@@ -284,7 +285,9 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
         (M.RUN_FAILED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_FAILED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
-         op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+         op.STATE_INTERRUPTED,
+         ["gauntlet logs demo", "gauntlet resume demo",
+          "gauntlet resume demo --reset-interrupted"]),
         # The ACTUAL engine representation (orchestrator._set_run_status, FR-3.3):
         # a budget/timeout halt or a mid-step interruption parks the *run*
         # (RUN_PARKED) while the *step* keeps its HALTED/INTERRUPTED status. These
@@ -292,7 +295,9 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
         (M.RUN_PARKED, [_step("s", "agent_task", M.HALTED)], op.LIVENESS_NONE,
          op.STATE_HALTED, ["gauntlet logs demo", "gauntlet resume demo"]),
         (M.RUN_PARKED, [_step("s", "agent_task", M.INTERRUPTED)], op.LIVENESS_NONE,
-         op.STATE_INTERRUPTED, ["gauntlet logs demo", "gauntlet resume demo"]),
+         op.STATE_INTERRUPTED,
+         ["gauntlet logs demo", "gauntlet resume demo",
+          "gauntlet resume demo --reset-interrupted"]),
         (M.RUN_DONE, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,
          op.STATE_DONE, []),
         (M.RUN_ABORTED, [_step("s", "agent_task", M.DONE)], op.LIVENESS_NONE,
@@ -354,8 +359,18 @@ def test_parked_run_with_halted_step_reports_failure_descriptor():
          [_step("a", "agent_task", M.HALTED), _step("b", "agent_task", M.INTERRUPTED)]),
         # failed run with no terminal failure step
         (M.RUN_FAILED, [_step("s", "agent_task", M.DONE)]),
-        # descriptor present under a `—` status (running with a failed step)
+        # P4 amendment (plan §5.3): this row's meaning NARROWED. A failed step
+        # under a running run WITH an end timestamp is now the RECOGNIZED
+        # kill-window persist shape (step terminal state flushed, run status
+        # not yet) and classifies recoverably by liveness — see
+        # test_running_plus_one_ended_failure_step_is_recoverable below. Only
+        # the ended-LESS variant remains a contradiction: no end timestamp
+        # means the step never finalized, so a terminal status is unexplained.
         (M.RUN_RUNNING, [_step("s", "agent_task", M.FAILED)]),
+        # two ended failure steps under a running run is still ambiguous
+        (M.RUN_RUNNING,
+         [_step("a", "agent_task", M.FAILED, ended="t1"),
+          _step("b", "agent_task", M.HALTED, ended="t2")]),
         # done with a parked step is contradictory
         (M.RUN_DONE, [_step("s", "human_gate", M.PARKED)]),
     ],
@@ -365,6 +380,34 @@ def test_contradictions_map_to_unknown_readonly(status, steps):
     rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
     assert rstate.state == op.STATE_UNKNOWN
     assert {a.kind for a in rstate.next_actions} == {"observe"}
+
+
+# --- P4 (plan §5.3): the recognized historical kill-window shape -------------
+@pytest.mark.parametrize("step_status", [M.FAILED, M.HALTED, M.INTERRUPTED])
+@pytest.mark.parametrize(
+    "liveness, expected",
+    [
+        (op.LIVENESS_ALIVE, op.STATE_IN_PROGRESS),  # driver mid-transition
+        (op.LIVENESS_ORPHANED, None),  # None → the step's own state
+        (op.LIVENESS_NONE, None),
+        (op.LIVENESS_INDETERMINATE, op.STATE_INDETERMINATE),
+    ],
+)
+def test_running_plus_one_ended_failure_step_is_recoverable(
+    step_status, liveness, expected
+):
+    """RUN_RUNNING + exactly one ENDED interrupted/halted/failed step is the
+    kill-window persist shape (step terminal state durable, run status not
+    yet) — recoverable by liveness, never `unknown` (plan §5.3, issue #62)."""
+    man = _manifest(
+        M.RUN_RUNNING,
+        [_step("s", "agent_task", step_status, ended="t1")],
+    )
+    rstate = op.compute_run_state(man, liveness)
+    assert rstate.state == (expected if expected is not None else step_status)
+    if expected is None:  # the dead-driver rows: descriptor + a mutating verb
+        assert rstate.failure is not None and rstate.failure.step_id == "s"
+        assert any(a.kind != "observe" for a in rstate.next_actions)
 
 
 # --- FR-1.2: footer commands == next_actions command fields ------------------

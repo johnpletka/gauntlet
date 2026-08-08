@@ -80,6 +80,8 @@ agents:
   judge_llm:
     adapter: api
     model: gpt-5-mini
+    # The runtime and doctor both consume this canonical profile value.
+    effort: minimal
   # Cheap profile for MECHANICAL emissions (FR-6.3): commit-message drafting and
   # resume-disposition emission run here instead of on the builder, keeping the
   # builder's constrained provider window for building. Effort *value* is Q2

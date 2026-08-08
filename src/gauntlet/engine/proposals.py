@@ -47,6 +47,9 @@ REJECTED = "rejected"
 INVALID = "invalid"  # path-escape or non-applying diff: never approvable
 
 _CHANGELOG_ANCHOR = "<!-- gauntlet:changelog -->"
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$", re.MULTILINE
+)
 
 
 # --- path containment (the security control) ---------------------------------
@@ -231,7 +234,14 @@ def materialize_proposals(
     written: list[Proposal] = []
     number = next_proposal_number(proposals_dir)
     for item in items:
-        diff = item.get("diff", "") or ""
+        raw_diff = item.get("diff", "") or ""
+        # Structured-output models reliably reproduce literal patch content but
+        # sometimes miscount the old/new lines in an otherwise complete hunk.
+        # Canonicalize only that redundant arithmetic.  The raw response remains
+        # in the synthesis transcript/proposals.json; paths and semantic content
+        # are untouched, then the normal containment + git-apply check still
+        # decides whether the materialized proposal is safe and ratifiable.
+        diff = _normalize_unified_diff_hunk_counts(raw_diff)
         slug = _slugify(item.get("slug", ""))
         declared = (item.get("target_path") or "").strip()
         targets = diff_target_paths(diff)
@@ -252,6 +262,47 @@ def materialize_proposals(
         written.append(proposal)
         number += 1
     return written
+
+
+def _normalize_unified_diff_hunk_counts(diff: str) -> str:
+    """Recompute numeric hunk counts without changing patch paths or content.
+
+    A complete hunk header supplies the old/new start positions; its counts are
+    redundant with the following context, removal, and addition lines.  Models
+    occasionally get only those counts wrong, which makes Git reject a
+    semantically precise patch as corrupt.  Bare ``@@`` headers and malformed
+    bodies are returned unchanged so the existing fail-closed validator rejects
+    them rather than guessing missing structure.
+    """
+    lines = diff.splitlines(keepends=True)
+    normalized = list(lines)
+    hunk_starts = [i for i, line in enumerate(lines) if _HUNK_HEADER_RE.match(line.rstrip("\r\n"))]
+    for pos, start in enumerate(hunk_starts):
+        match = _HUNK_HEADER_RE.match(lines[start].rstrip("\r\n"))
+        if match is None:  # pragma: no cover - guaranteed by hunk_starts
+            continue
+        end = hunk_starts[pos + 1] if pos + 1 < len(hunk_starts) else len(lines)
+        body = lines[start + 1:end]
+        # A second file header terminates the hunk.  Multi-file proposals are
+        # rejected separately, but count only this hunk's own body here.
+        for offset, line in enumerate(body):
+            if line.startswith("diff --git ") or line.startswith("--- "):
+                body = body[:offset]
+                break
+        if not body or any(
+            not line.startswith((" ", "+", "-", "\\")) for line in body
+        ):
+            continue
+        old_count = sum(line.startswith((" ", "-")) for line in body)
+        new_count = sum(line.startswith((" ", "+")) for line in body)
+        newline = "\r\n" if lines[start].endswith("\r\n") else (
+            "\n" if lines[start].endswith("\n") else ""
+        )
+        normalized[start] = (
+            f"@@ -{match.group(1)},{old_count} +{match.group(2)},{new_count} "
+            f"@@{match.group(3)}{newline}"
+        )
+    return "".join(normalized)
 
 
 def _validate_diff(

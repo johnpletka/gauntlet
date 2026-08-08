@@ -34,7 +34,7 @@ import hashlib
 import json
 import re
 import secrets
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ from gauntlet.adapters.base import (
 from gauntlet.engine import ensemble
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
+from gauntlet.engine import recovery_exec as RX
 from gauntlet.engine import verify
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
@@ -57,6 +58,7 @@ from gauntlet.engine.execution import (
     StepContext,
     StepResult,
     StepSpec,
+    human_owned_excludes,
     run_bookkeeping_paths,
 )
 from gauntlet.engine.pipeline import Step
@@ -151,6 +153,10 @@ def _persist_manifest(ctx: StepContext) -> None:
         ctx.persist()
     else:  # pragma: no cover - exercised only outside the orchestrator
         ctx.manifest.write_atomic(ctx.run_dir / "manifest.json")
+    # Every cycle site that stages bookkeeping paths flushes through here
+    # first, so this is the one place the run worktree's export dir has to be
+    # refreshed to keep those paths existing-and-current (P7c, spike §4.4).
+    ctx.refresh_bookkeeping_export()
 
 
 def _checkpoint(
@@ -297,7 +303,7 @@ def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
     manual commit during the park moves HEAD off every tip, so reuse would build on
     a stale base; the round then restarts fresh.
     """
-    head = gitops.head_sha(ctx.repo_root)
+    head = gitops.head_sha(ctx.work_root)
     tips = {c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id}
     tips.update(
         c.result_sha for c in ctx.record.checkpoints
@@ -350,7 +356,7 @@ def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | Non
             "checkpointed (manual commit during the park?); re-running the cycle "
             "from a clean handoff"
         )
-    if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not (
+    if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes) and not (
         _dirty_expected_at_reentry(ctx)
     ):
         return (
@@ -359,6 +365,126 @@ def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | Non
             "re-running the cycle from a clean handoff"
         )
     return None
+
+
+def _apply_cycle_rewind(
+    ctx: StepContext,
+    *,
+    site: str,
+    target_sha: str,
+    recorded_sha: str,
+    cause: "RX.RecoveryCause",
+    reason: str,
+    snapshot_id: str,
+    reset_mode: str,
+    bookkeeping_paths: tuple[str, ...] = (),
+    rewind_message: str | None = None,
+) -> "RX.RecoveryResult":
+    """Route one cycle rewind through the shared recovery transaction (P3).
+
+    Assessment is read-only; the executor owns the mutation ordering (lock →
+    fingerprint re-check → validation → durable snapshot → intent →
+    reset/clean → protected restore → intent clear). Human-owned excluded
+    files (PR.md) are protected paths in the snapshot and restored from it,
+    so their preservation survives a process kill (PR #77 review).
+    """
+    from gauntlet.engine.execution import (
+        engine_bookkeeping_candidates,
+        governed_artifact_paths,
+    )
+
+    repo = ctx.work_root
+    rec = ctx.record
+    # The cycle never switches branches: it observes and mutates the CURRENT
+    # checkout (the run branch during a real drive), so the commit inventory
+    # — and its governance evidence (F-004) — reflects the range the rewind
+    # actually discards.
+    checked_out = gitops.current_branch(repo)
+    observe_branch = ctx.manifest.branch if checked_out == "HEAD" else checked_out
+    git_obs = RX.observe_git(
+        repo,
+        run_branch=observe_branch,
+        recorded_sha=recorded_sha,
+        excludes=ctx.excludes,
+        bookkeeping_candidates=engine_bookkeeping_candidates(
+            repo, ctx.bookkeeping_root,
+            state_outside_worktree=ctx.state_outside_worktree,
+        ),
+        approved_artifacts=governed_artifact_paths(
+            repo, ctx.artifact_root_in_work,
+            artifacts_outside_worktree=ctx.artifacts_outside_worktree,
+        ),
+    )
+    state_obs = RX.observe_state(
+        ctx.manifest, rec, liveness=RX.DriverLiveness.ALIVE
+    )
+
+    def fingerprint() -> "RX.ProgressFingerprint":
+        return RX.build_progress_fingerprint(
+            repo, manifest=ctx.manifest, record=rec, excludes=ctx.excludes
+        )
+
+    # The action names the ref this rewind actually mutates (F-003).
+    target_ref = "HEAD" if checked_out == "HEAD" else f"refs/heads/{checked_out}"
+    action = RX.SnapshotAndRestartAction(
+        description=f"snapshot the worktree and restart from {target_sha[:10]}",
+        target_ref=target_ref,
+        target_sha=target_sha,
+        reason=reason,
+    )
+    assessment = RX.RecoveryPlanner(repo).assess_rewind(
+        git_obs=git_obs,
+        state_obs=state_obs,
+        fingerprint=fingerprint(),
+        action=action,
+        cause=cause,
+    )
+    # Loud governance audit (R9/FR-10.4): a discarded operator commit touching
+    # a governed artifact is surfaced as a manifest warning — never refused
+    # (manual PRD/plan edits are sanctioned); the snapshot preserves the state.
+    for note in assessment.evidence:
+        if note.startswith(RX.GOVERNED_DISCARD_EVIDENCE_PREFIX):
+            warn = f"[{site}] {note}"
+            if warn not in ctx.manifest.warnings:
+                ctx.manifest.warnings.append(warn)
+    spec = RX.RewindSpec(
+        site=site,
+        target_sha=target_sha,
+        reset_mode=reset_mode,
+        bookkeeping_paths=bookkeeping_paths,
+        rewind_message=rewind_message,
+        # Clean with the SAME narrow excludes as mutation detection (P4.r1
+        # F-006): a stray file under the run root but outside the live
+        # bookkeeping must be removed, or it rides into the next fix commit.
+        # The live run dir survives regardless (self-.gitignore; no -x).
+        clean=True,
+        clean_excludes=tuple(ctx.excludes or ()),
+    )
+    executor = RX.RecoveryExecutor(
+        # repo_root is the OPERATOR's checkout (run-instance dir, drive lock,
+        # projection — all of which stay there, spike §4.4); work_root is the
+        # tree this rewind mutates. `repo` above is already the work tree.
+        ctx.repo_root,
+        ctx.run_dir,
+        run_id=ctx.manifest.run_id,
+        run_root=ctx.config.run_root,
+        excludes=ctx.excludes,
+        work_root=repo,
+    )
+    return executor.apply(
+        assessment,
+        action,
+        spec=spec,
+        snapshot_request=RX.SnapshotRequest(
+            snapshot_id=snapshot_id,
+            reason=reason,
+            attempt_id=f"{rec.id}#{rec.attempts}",
+            run_branch=ctx.manifest.branch,
+            exclude=ctx.excludes,
+            protected=human_owned_excludes(ctx.excludes),
+        ),
+        fingerprint=fingerprint,
+    )
 
 
 def _reset_dirty_to_handoff(
@@ -389,27 +515,29 @@ def _reset_dirty_to_handoff(
     still carries the on-disk bookkeeping — the same mechanism as the
     orchestrator's F-001 dirty-base rewind.
     """
-    if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes) and not force:
+    if gitops.is_clean(ctx.work_root, exclude=ctx.excludes) and not force:
         return None
-    backup = (
-        f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
-        f"{ctx.record.id}-r{rnd}-fix-resume"
-    )
-    gitops.backup_dirty_worktree(
-        ctx.repo_root, backup,
+    reason = (
         f"resume: partial fixer edits / stale fix commit for {ctx.record.id} "
-        f"round {rnd} (P5 re-enter at fix)",
-        exclude=ctx.excludes,
+        f"round {rnd} (P5 re-enter at fix)"
     )
-    paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
-    if (
-        paths
-        and gitops.head_sha(ctx.repo_root) != handoff
-        and gitops.any_tracked_at(ctx.repo_root, "HEAD", paths)
-    ):
-        # Flush first so the overlaid bookkeeping carries the latest state.
+    paths = run_bookkeeping_paths(
+        ctx.work_root, ctx.bookkeeping_root,
+        state_outside_worktree=ctx.state_outside_worktree,
+    )
+    preserving = (
+        bool(paths)
+        and gitops.head_sha(ctx.work_root) != handoff
+        and gitops.any_tracked_at(ctx.work_root, "HEAD", paths)
+    )
+    message: str | None = None
+    if preserving:
+        # Flush first so the preserved bookkeeping carries the latest state.
         _persist_manifest(ctx)
-        paths = run_bookkeeping_paths(ctx.repo_root, ctx.run_dir)
+        paths = run_bookkeeping_paths(
+            ctx.work_root, ctx.bookkeeping_root,
+            state_outside_worktree=ctx.state_outside_worktree,
+        )
         entry = (
             ctx.record.human_responses[-1] if ctx.record.human_responses else None
         )
@@ -422,16 +550,24 @@ def _reset_dirty_to_handoff(
             else f"gauntlet: rewind implementation to {handoff[:10]} "
             f"for fix re-run ({ctx.record.id})"
         )
-        gitops.rewind_impl_preserving_bookkeeping(
-            ctx.repo_root, handoff, paths, message,
-            identity=gitops.ENGINE_IDENTITY,
-        )
-    else:
-        gitops.reset_hard(ctx.repo_root, handoff)
-    gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
+    result = _apply_cycle_rewind(
+        ctx,
+        site="cycle.fix_resume",
+        target_sha=handoff,
+        recorded_sha=handoff,
+        cause=RX.RecoveryCause.WORKTREE_PARTIAL,
+        reason=reason,
+        snapshot_id=f"{ctx.record.id}-r{rnd}-fix-resume",
+        reset_mode=(
+            RX.RESET_BOOKKEEPING_PRESERVING if preserving else RX.RESET_PLAIN
+        ),
+        bookkeeping_paths=tuple(paths) if preserving else (),
+        rewind_message=message,
+    )
     return (
         f"resume: reset round-{rnd} worktree to the handoff "
-        f"(backed up at {backup}) before re-running the fix sub-step (FR-4.1)"
+        f"(preserved as recovery snapshot {result.snapshot.ref}) before "
+        "re-running the fix sub-step (FR-4.1)"
     )
 
 
@@ -556,6 +692,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             return _finish(baseline, usage, commits, artifact_writes, metrics)
         commits.append((phase, baseline))
         handoff = baseline
+        # The baseline commit froze the work tree's copy; bring the authority
+        # copy the engine reads and hashes level with it (§14.2 correction).
+        _adopt_artifact(ctx, step)
 
     # --- FR-4.1/FR-4.2 resume: reuse completed sub-step checkpoints -----------
     # A cycle that parked (usage-limit, P1) or was killed mid-round left write-
@@ -658,13 +797,16 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # rather than reusing — correct, if slightly less efficient.
             _persist_manifest(ctx)  # commit the CURRENT state, not a stale flush
             gitops.commit_tracked_bookkeeping(
-                ctx.repo_root,
+                ctx.work_root,
                 f"gauntlet: flush run bookkeeping before "
                 f"{phase or ctx.record.id} round-{rnd} review handoff",
-                run_bookkeeping_paths(ctx.repo_root, ctx.run_dir),
+                run_bookkeeping_paths(
+                    ctx.work_root, ctx.bookkeeping_root,
+                    state_outside_worktree=ctx.state_outside_worktree,
+                ),
                 identity=gitops.ENGINE_IDENTITY,
             )
-            if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
                 return finish(_clean_handoff_failure(ctx, rnd))
 
         # ---- 1. review (single reviewer OR ensemble panel) --------------------
@@ -995,7 +1137,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 )
             except _ParkCycle as park:
                 return finish(park.result)
-            if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+            if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
                 return finish(StepResult(
                     status=FAILED,
                     notes=f"fixer made no changes in round {rnd} despite "
@@ -1006,7 +1148,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 return finish(StepResult(
                     status=FAILED, notes=f"fix-round commit message invalid: {err.reason}"))
             fix_sha = gitops.commit_all(
-                ctx.repo_root, message,
+                ctx.work_root, message,
                 identity=ctx.config.identity(fixer), exclude=ctx.excludes,
             )
             # An ordered-prefix rerun (F-001) that reset a stale fix commit off HEAD
@@ -1019,6 +1161,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 if not (c.step_id == ctx.record.id and c.phase == phase_tag)
             ]
             commits.append((phase_tag, fix_sha))
+            # Artifact mode only: the fixer authored the governed artifact in
+            # the work tree, so the authority copy must follow it (§14.2
+            # correction). Code mode has no governed artifact to carry back.
+            _adopt_artifact(ctx, step)
             _checkpoint(ctx, "fix", rnd, handoff, result_sha=fix_sha)
 
         # ---- 4. diff-scoped confirm (FR-9.5) ----------------------------------
@@ -1178,6 +1324,7 @@ def _run_sub(
     cycle-level ``effort:``; it wins over the role profile's own effort (``None``
     uses the profile's value). Mapped to the adapter's accepted flag at build.
     """
+    from gauntlet.engine import depretry
     from gauntlet.engine.steptypes import open_step_stream
 
     adapter = ctx.build_adapter(agent_name, effort=effort)
@@ -1189,7 +1336,10 @@ def _run_sub(
     logger.log_prompt(prompt)
     attempt_prompt = prompt
     last_exc: MalformedOutputError | None = None
-    for attempt in range(1, 2 + max_retries):
+    attempt = 0
+    malformed = 0
+    while True:
+        attempt += 1
         # Live-observability streaming (live-run-observability FR-2): open a
         # fresh stream per attempt (open_stream truncates), so events.jsonl
         # reflects the current attempt; a failed attempt's authoritative evidence
@@ -1199,7 +1349,7 @@ def _run_sub(
         # The verifier sub-step (FR-2.1) overrides ``cwd`` to the disposable copy
         # and passes network-deny/setting-source ``extra_flags``; every other
         # sub-agent runs in the real run worktree with no extra flags (unchanged).
-        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.repo_root}
+        run_kwargs: dict = {"schema": schema, "cwd": cwd or ctx.work_root}
         if extra_flags:
             run_kwargs["extra_flags"] = list(extra_flags)
         if session is not None:
@@ -1213,6 +1363,14 @@ def _run_sub(
             if after_attempt is not None:
                 after_attempt()
             last_exc = exc
+            malformed += 1
+            if malformed > max_retries:
+                # Fail closed after the bounded schema re-asks — with the
+                # authoritative failure evidence in THIS leaf's dir (P5,
+                # issue #63): `gauntlet logs` must resolve the failing leaf,
+                # never a successful sibling.
+                _log_leaf_failure(logger, exc, agent_name, None)
+                raise last_exc
             attempt_prompt = (
                 f"{prompt}\n\nYour previous response was rejected: {exc}. "
                 "Respond again with only the corrected JSON."
@@ -1225,20 +1383,51 @@ def _run_sub(
             _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:
                 after_attempt()
-            # FR-3.2: a TRANSIENT sub-agent failure (usage limit / overload) is
-            # the observed real cycle-death mode. Park the whole CYCLE step with
-            # parked_reason=usage_limit (worktree untouched, the failing
-            # sub-agent's session preserved) instead of failing it — a plain
-            # `gauntlet resume` re-drives the cycle. The write-ahead sub-step
-            # checkpoints (FR-4.1) already recorded on the record let that resume
-            # re-enter at the first INCOMPLETE sub-step (`substep` records which
-            # sub-step owns the preserved session). Raised as a _ParkCycle so the
-            # round-loop wrapper returns it uniformly for any sub-role.
+            # FR-3.2: a TRANSIENT sub-agent failure is the observed real
+            # cycle-death mode. A usage-limit kind parks the whole CYCLE step
+            # with parked_reason=usage_limit (worktree untouched, the failing
+            # sub-agent's session preserved) — a plain `gauntlet resume`
+            # re-drives the cycle, re-entering at the first INCOMPLETE
+            # sub-step via the write-ahead checkpoints (FR-4.1). A
+            # transport/dependency kind (plan §5.2, P5) first gets bounded,
+            # PERSISTED in-process retries with backoff; on exhaustion it
+            # parks provider_unavailable with a concrete deadline — plain
+            # resume retries only the incomplete work (checkpoints + the
+            # triage fragment), never `--response` (R7, issue #63).
             if isinstance(exc, AgentFailedError) and (
                 exc.failure_info is not None and exc.failure_info.is_transient
             ):
                 info = exc.failure_info
                 sess = exc.partial.session_id if exc.partial else None
+                if depretry.is_dependency_failure(info):
+                    delay = depretry.consume_retry(
+                        ctx, info, site=substep or agent_name
+                    )
+                    if delay is not None:
+                        depretry.wait(delay)
+                        continue  # bounded, persisted retry (plan §5.2)
+                    _log_leaf_failure(logger, exc, agent_name, info)
+                    raise _ParkCycle(
+                        StepResult(
+                            status=PARKED,
+                            parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                            parked_substep=substep,
+                            retry_after_s=info.retry_after_s,
+                            backoff_s=depretry.park_deadline_s(
+                                ctx.record, ctx.config, info
+                            ),
+                            notes=(
+                                f"provider-unavailable park (plan §5.2): "
+                                f"{agent_name} sub-agent hit {info.kind} "
+                                f"[{info.marker}] after "
+                                f"{ctx.record.dependency_attempts} persisted "
+                                "in-process retries; completed sub-steps and "
+                                "fan-out leaves are checkpointed — a plain "
+                                "`gauntlet resume` retries only the "
+                                "incomplete work (no `--response`, R7)"
+                            ),
+                        )
+                    ) from exc
                 raise _ParkCycle(
                     StepResult(
                         status=PARKED,
@@ -1254,6 +1443,13 @@ def _run_sub(
                         ),
                     )
                 ) from exc
+            if not isinstance(exc, SessionNotFoundError):
+                # Authoritative failure evidence in THIS leaf's dir (issue
+                # #63): a terminal/timeout leaf must never be silent while a
+                # successful sibling's transcript stands in for it.
+                _log_leaf_failure(
+                    logger, exc, agent_name, getattr(exc, "failure_info", None)
+                )
             raise
         finally:
             # Close the per-attempt stream regardless of outcome (a StreamSinkError
@@ -1265,7 +1461,6 @@ def _run_sub(
         if after_attempt is not None:
             after_attempt()
         return result
-    raise last_exc  # fail closed after bounded retries
 
 
 def _resume_review(
@@ -1326,6 +1521,25 @@ def _log_partial(
         suffix=f"-attempt{attempt}",
     )
     logger.log_text(f"attempt{attempt}-error.txt", str(exc))
+
+
+def _log_leaf_failure(logger: Any, exc: Exception, agent_name: str, info: Any) -> None:
+    """Authoritative failure evidence IN the failing leaf's dir (P5, issue #63).
+
+    Writes the leaf's own ``transcript.md``/``events.jsonl`` (the exact files
+    ``gauntlet logs`` reads) plus the ``failure.json`` marker the failing-leaf
+    selection keys on — so a failed fan-out leaf (a timed-out triage call, an
+    exhausted schema re-ask) can never be silent while a successful sibling's
+    transcript is surfaced in its place.
+    """
+    partial = getattr(exc, "partial", None)
+    logger.log_failure(
+        error=str(exc),
+        agent=agent_name,
+        failure_kind=info.kind if info is not None else None,
+        marker=info.marker if info is not None else None,
+        partial_events=partial.raw_events if partial is not None else None,
+    )
 
 
 # --- round pieces ----------------------------------------------------------------
@@ -1754,11 +1968,11 @@ def _run_verifier(
         )) from exc
 
     # 2. Witness the real worktree BEFORE (FR-2.5 / P5-A4).
-    before = gitops.worktree_tree_hash(ctx.repo_root)
+    before = gitops.worktree_tree_hash(ctx.work_root)
 
     # 3. Disposable copy (FR-2.1/2.3). Failure parks — never "skipped, proceed".
     try:
-        copy = verify.make_disposable_copy(ctx.repo_root)
+        copy = verify.make_disposable_copy(ctx.work_root)
     except verify.CopyCreationError as exc:
         raise _ParkCycle(StepResult(
             status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
@@ -1779,7 +1993,7 @@ def _run_verifier(
         # on unproven confinement).
         verifier_step_id = f"verify:r{rnd}:{secrets.token_hex(8)}"
         lease = verify.register_boundary(ctx.judge_env, verifier_step_id, copy.path)
-        verify.confirm_boundary_enforced(lease, ctx.repo_root)
+        verify.confirm_boundary_enforced(lease, ctx.work_root)
         scratch_home = verify.make_scratch_home(copy.root)
         # Pin the claude-code verifier posture: confined allowed_tools (no network),
         # permission mode, --setting-sources project (so the judge hook fires), and
@@ -1828,10 +2042,10 @@ def _run_verifier(
     finally:
         if lease is not None:
             verify.clear_boundary(lease)
-        verify.discard_disposable_copy(ctx.repo_root, copy)
+        verify.discard_disposable_copy(ctx.work_root, copy)
 
     # 4. The real worktree must be byte-identical after verification (P5-A4).
-    after = gitops.worktree_tree_hash(ctx.repo_root)
+    after = gitops.worktree_tree_hash(ctx.work_root)
     if after != before:
         raise _ParkCycle(StepResult(
             status=PARKED, parked_reason=M.PARKED_REASON_RESPONSE,
@@ -1849,7 +2063,7 @@ def _run_verifier(
 
 
 def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
-    head = gitops.head_sha(ctx.repo_root)
+    head = gitops.head_sha(ctx.work_root)
     explicit = step.get("phase")
     if ctx.manifest.commits:
         last = ctx.manifest.commits[-1]
@@ -2170,7 +2384,7 @@ def _review_prompt(
             # Rounds 2+ are regression-scoped (see the round-1 vs 2+ note above):
             # the handoff is the fix commit, so `handoff^` diffs only that fix.
             base = f"{handoff}^"
-        diff = gitops.range_diff(ctx.repo_root, base, handoff)
+        diff = gitops.range_diff(ctx.work_root, base, handoff)
         section = (
             f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}"
         )
@@ -2214,8 +2428,20 @@ def _review_prompt(
         # tree is clean at every handoff, FR-9.3), so the diff is deterministic
         # and lossless-by-path: unchanged context is one `git show` away.
         if rnd > 1 and prev_review_sha is not None:
-            rel = Path(path).resolve().relative_to(ctx.repo_root.resolve()).as_posix()
-            diff = gitops.range_diff_path(ctx.repo_root, prev_review_sha, handoff, rel)
+            # P7g: the DIFF is taken in the work tree and the path is handed to
+            # a reviewer whose cwd is that tree, so it must be work-relative.
+            # `path` above resolves the AUTHORITY (the operator's copy — what
+            # the engine reads and hashes, §4.4) and under `dedicated` that is
+            # outside `work_root`, so relativising it raised `ValueError`
+            # outright. `artifact_root_in_work` is the same file's location in
+            # the tree the reviewer is standing in.
+            rel = (
+                (ctx.artifact_root_in_work / name)
+                .resolve()
+                .relative_to(ctx.work_root.resolve())
+                .as_posix()
+            )
+            diff = gitops.range_diff_path(ctx.work_root, prev_review_sha, handoff, rel)
             parts.append(
                 f"\n--- artifact under review: {name} (diff since round {rnd - 1}; "
                 f"read the full file at {rel} for unchanged context) ---\n{diff}"
@@ -2264,10 +2490,10 @@ class _MutationGuard:
 
     def check(self) -> None:
         ctx = self.ctx
-        if gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
+        if gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
             return
         self.seq += 1
-        status = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+        status = gitops.status_porcelain(ctx.work_root, exclude=ctx.excludes)
         if self.policy == "halt":
             raise _ParkCycle(StepResult(
                 status=PARKED,
@@ -2284,23 +2510,24 @@ class _MutationGuard:
 
     def _revert(self, status: str) -> None:
         ctx = self.ctx
-        backup = (
-            f"refs/gauntlet/backup/{ctx.manifest.run_id}/"
-            f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}"
+        # P3 (plan §4.3): the revert routes through the shared recovery
+        # transaction — durable complete-format snapshot (which preserves the
+        # reviewer's edits AND human-owned PR.md state past a process kill)
+        # before the reset, then reset to the round handoff + narrow clean +
+        # protected restore under the executor's lock/fingerprint/intent
+        # ordering.
+        result = _apply_cycle_rewind(
+            ctx,
+            site="cycle.reviewer_mutation_revert",
+            target_sha=self.handoff,
+            recorded_sha=self.handoff,
+            cause=RX.RecoveryCause.POLICY_DENIED,
+            reason=f"reviewer mutation during {ctx.record.id} round {self.rnd}",
+            snapshot_id=f"{ctx.record.id}-r{self.rnd}-mutation-{self.seq}",
+            reset_mode=RX.RESET_PLAIN,
         )
-        gitops.backup_dirty_worktree(
-            ctx.repo_root, backup,
-            f"reviewer mutation during {ctx.record.id} round {self.rnd}",
-            exclude=ctx.excludes,
-        )
-        gitops.reset_hard(ctx.repo_root, self.handoff)
-        # Clean with the SAME narrow excludes as detection (P4.r1 F-006): a
-        # reviewer file under the run root but outside the live bookkeeping
-        # must be removed, or it rides into the next fix commit. The live run
-        # dir survives regardless (self-.gitignore; clean has no -x).
-        gitops.clean_untracked(ctx.repo_root, exclude=ctx.excludes)
-        if not gitops.is_clean(ctx.repo_root, exclude=ctx.excludes):
-            residue = gitops.status_porcelain(ctx.repo_root, exclude=ctx.excludes)
+        if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
+            residue = gitops.status_porcelain(ctx.work_root, exclude=ctx.excludes)
             raise _ParkCycle(StepResult(  # fail closed on residue
                 status=PARKED,
                 notes="reviewer-mutation revert left residue the engine could "
@@ -2312,7 +2539,7 @@ class _MutationGuard:
             "category": "principle-violation",
             "location": "worktree",
             "claim": "reviewer modified the worktree during a read-only review "
-            f"step (reverted; snapshot kept at {backup})",
+            f"step (reverted; snapshot kept at {result.snapshot.ref})",
             "evidence": "git status at detection (policy revert, FR-9.6):\n"
             + status,
             "suggested_fix": None,
@@ -2331,12 +2558,12 @@ class _MutationGuard:
             f"git status at detection:\n{status}\n"
         )
         sha = gitops.commit_all(
-            ctx.repo_root, message,
+            ctx.work_root, message,
             identity=ctx.config.identity(self.reviewer), exclude=ctx.excludes,
         )
         self.commits.append((f"{self.phase}.r{self.rnd}", sha))
         # Triage must see the mutation, not just git history (F-005).
-        diff = gitops.range_diff(ctx.repo_root, f"{sha}^", sha)
+        diff = gitops.range_diff(ctx.work_root, f"{sha}^", sha)
         self.synthetic_findings.append({
             "id": self._finding_id(),
             "severity": "major",
@@ -2540,8 +2767,14 @@ def _triage(
             }
             # Wait for EVERY submitted call before deciding: a failure must not
             # abandon in-flight verdicts (they belong in the fragment). Collect
-            # each finding's outcome; never re-raise inside the pool.
-            for fut in futures:
+            # each finding's outcome; never re-raise inside the pool. Each
+            # SUCCESSFUL leaf is folded into `done` and the checkpoint fragment
+            # persisted the moment its future completes (P5.1 review F-003):
+            # per-leaf completion must be DURABLE while sibling leaves are
+            # still running, so a kill mid-round loses at most the in-flight
+            # leaves — never a completed verdict (plan §5.2: persist
+            # successful leaves, retry only incomplete leaves).
+            for fut in as_completed(futures):
                 i = futures[fut]
                 try:
                     outcomes[i] = ("ok", fut.result())
@@ -2549,19 +2782,22 @@ def _triage(
                     outcomes[i] = ("park", park)
                 except (MalformedOutputError, AdapterError) as exc:
                     outcomes[i] = ("error", exc)
+                if outcomes[i][0] == "ok":
+                    payload = outcomes[i][1]
+                    done[payload["finding_id"]] = payload["verdict"]
+                    needs_human_by_id[payload["finding_id"]] = payload["needs_human"]
+                    _persist_triage_fragment(ctx, rnd, findings, done)
         # Deterministic merge order (finding order), independent of completion
         # order, so the round total matches the sequential run.
         for acc in task_usages:
             usage.merge(acc)
-        # Fold successful verdicts into `done`; keep the FIRST problematic outcome
-        # in finding order so a re-raise/park is deterministic across runs.
+        # Keep the FIRST problematic outcome in finding order so a re-raise/
+        # park is deterministic across runs (successful verdicts were already
+        # folded into `done` — and persisted — as each future completed).
         first_problem: Any = None
         for i, finding in enumerate(pending):
             kind, payload = outcomes[i]
-            if kind == "ok":
-                done[payload["finding_id"]] = payload["verdict"]
-                needs_human_by_id[payload["finding_id"]] = payload["needs_human"]
-            elif first_problem is None:
+            if kind != "ok" and first_problem is None:
                 first_problem = payload
         if first_problem is not None:
             # FR-9.2: persist the completed verdicts (incl. any resume-seeded ones)
@@ -2695,10 +2931,10 @@ def _confirm_prompt(
     plus the prior findings and triage verdicts — scoped, cheap, unambiguous."""
     template = _template(ctx, step, "confirm_prompt", "prompts/cycle-confirm.md",
                          _BUILTIN_CONFIRM)
-    diff = gitops.range_diff(ctx.repo_root, handoff, fix_sha)
+    diff = gitops.range_diff(ctx.work_root, handoff, fix_sha)
     # Commit list with authors: reviewer-attributed PN.rX mutation commits in
     # the range stay distinguishable from fixer commits (FR-9.6 / F-005).
-    commit_list = gitops.log_range(ctx.repo_root, handoff, fix_sha)
+    commit_list = gitops.log_range(ctx.work_root, handoff, fix_sha)
     return (
         template
         + f"\n\n--- commits in range ({handoff[:10]}..{fix_sha[:10]}) ---\n{commit_list}"
@@ -2940,10 +3176,7 @@ def _clean_handoff_failure(ctx: StepContext, rnd: int) -> StepResult:
     internal cycle residue (a fixer/reviewer mutation that escaped a commit), a
     genuine defect, so it stays terminal — re-running the guard would not fix it.
     """
-    status = gitops.status_porcelain(
-        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
-    )
-    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
+    paths = gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes)
     listed = ", ".join(paths) if paths else "(no paths reported)"
     if rnd == 1:
         # Upstream precondition: something before the cycle left the tree dirty
@@ -2987,21 +3220,52 @@ def _only_artifact_dirty(ctx: StepContext, step: Step) -> bool:
     round-1 clean-handoff check with a misleading "worktree dirty" error
     instead of committing the baseline. (This is the adopter-layout failure
     mode; gauntlet's own root layout happened to dodge it.)
+
+    **The artifact is located in the WORK tree, not in the operator's checkout**
+    (P7g). ``ctx.artifact_root`` never moves (spike §4.4): under `dedicated` it
+    names the human's authoring copy, which does not live under ``work_root`` at
+    all. Resolving there raised ``ValueError`` and the ``except`` degraded to
+    "more than the artifact is dirty", so the baseline commit never fired and
+    EVERY artifact-mode cycle failed the round-1 clean-handoff guard — naming
+    the very file :meth:`RunManager._sync_governed_artifacts` had just published
+    into that tree. That is spike §9.3's silent-degrade family in a fourth
+    module, and it is what the P7g flip exposed. ``artifact_root_in_work`` is
+    the mirror the sync writes to, so the two now agree by construction.
+
+    The ``except`` is kept and still returns ``False``, which is fail-closed
+    here: the caller's only alternative to a baseline commit is the FR-9.3
+    refusal, so an unresolvable artifact stops the handoff rather than passing
+    an uncommitted tree to a reviewer.
     """
     name = step.get("artifact")
     if not name:
         return False
     try:
-        rel = (ctx.artifact_root / name).resolve().relative_to(
-            ctx.repo_root.resolve()
+        rel = (ctx.artifact_root_in_work / name).resolve().relative_to(
+            ctx.work_root.resolve()
         ).as_posix()
     except ValueError:
         return False
-    status = gitops.status_porcelain(
-        ctx.repo_root, exclude=ctx.excludes, untracked_all=True
-    )
-    paths = [ln[3:].strip() for ln in status.splitlines() if ln.strip()]
-    return paths == [rel]
+    return gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes) == [rel]
+
+
+def _adopt_artifact(ctx: StepContext, step: Step) -> None:
+    """Carry an artifact-mode cycle's committed edits back to the authority copy.
+
+    Fires only in artifact mode and only for the artifact under review; a
+    code-mode cycle has no governed artifact and this is a no-op, as it is
+    same-tree (where the two paths are one file). See
+    :meth:`StepContext.adopt_artifact` for why the copy is needed at all.
+
+    Called AFTER the commit, never before: the commit is what makes the work
+    tree's bytes the reviewed, durable version. Copying earlier would publish
+    a tree state that no commit vouches for.
+    """
+    if step.get("mode", "artifact") != "artifact":
+        return
+    name = step.get("artifact")
+    if name:
+        ctx.adopt_artifact(name)
 
 
 def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):
@@ -3028,7 +3292,7 @@ def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):
             notes=f"artifact-mode baseline commit message invalid: {err.reason}",
         )
     sha = gitops.commit_all(
-        ctx.repo_root, message,
+        ctx.work_root, message,
         identity=ctx.config.identity(fixer), exclude=ctx.excludes,
     )
     return sha

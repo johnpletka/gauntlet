@@ -53,6 +53,14 @@ GITIGNORE_GUIDANCE = """\
 
 _SANDBOX_REFUSAL_MARKER = "operation not permitted"
 
+# Failure-evidence marker written by :meth:`StepLogger.log_failure` into the
+# FAILING leaf's dir (P5, issue #63): a structured record of the error that
+# ended the leaf. The operator's default-leaf selection
+# (``operator.resolve_transcript_dir``) prefers a leaf carrying this marker,
+# so `gauntlet logs` can never surface a successful sibling's transcript in
+# place of the failure. Cleared by an authoritative successful `log_result`.
+FAILURE_MARKER_NAME = "failure.json"
+
 # Live-stream sidecar marker (live-run-observability FR-5, F-002). `open_stream`
 # writes ``events.jsonl`` + this empty sibling to mark that a per-line stream is
 # OPEN for the step *right now*; `StepStream.close()` removes it. The freshness
@@ -165,6 +173,14 @@ class StepLogger:
         self.writer.write_text(events_path, "")
         for event in result.raw_events:
             self.writer.append_jsonl(events_path, event)
+        if not suffix:
+            # An authoritative (un-suffixed) success render supersedes any
+            # failure evidence from a prior episode of this leaf (P5): a leaf
+            # retried to success after a park must not still read as failing.
+            try:
+                (self.step_dir / FAILURE_MARKER_NAME).unlink()
+            except OSError:
+                pass
         if result.structured is not None:
             self.writer.write_text(
                 self.step_dir / structured_name,
@@ -173,6 +189,48 @@ class StepLogger:
 
     def log_text(self, name: str, text: str) -> None:
         self.writer.write_text(self.step_dir / name, text)
+
+    def log_failure(
+        self,
+        *,
+        error: str,
+        agent: str | None = None,
+        failure_kind: str | None = None,
+        marker: str | None = None,
+        partial_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Authoritative failure evidence for a call that FAILED (P5, issue #63).
+
+        A failed invocation used to leave the leaf's ``transcript.md``/
+        ``events.jsonl`` absent (or empty from a truncated stream), so
+        ``gauntlet logs`` fell back to a successful sibling — actively
+        misleading triage. This writes the failing leaf's own record: any
+        salvaged partial events plus one structured ``gauntlet.failure`` event
+        into the authoritative files, and a ``failure.json`` marker
+        (:data:`FAILURE_MARKER_NAME`) the operator's failing-leaf selection
+        keys on. A later SUCCESSFUL :meth:`log_result` (an un-suffixed,
+        authoritative render — e.g. a retried leaf that recovered after a
+        park) clears the marker, so a recovered leaf never reads as failing.
+        """
+        event = {
+            "type": "gauntlet.failure",
+            "agent": agent,
+            "failure_kind": failure_kind,
+            "marker": marker,
+            "error": error,
+        }
+        events = list(partial_events or []) + [event]
+        self.writer.write_text(
+            self.step_dir / "transcript.md", render_transcript(events)
+        )
+        events_path = self.step_dir / "events.jsonl"
+        self.writer.write_text(events_path, "")
+        for ev in events:
+            self.writer.append_jsonl(events_path, ev)
+        self.writer.write_text(
+            self.step_dir / FAILURE_MARKER_NAME,
+            json.dumps(event, indent=2, ensure_ascii=False),
+        )
 
 
 # --- transcript rendering (FR-4.2) -------------------------------------------

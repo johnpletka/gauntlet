@@ -113,6 +113,11 @@ def _real_profile_model_probe(name: str, profile) -> ProbeResult:
                 remedy="use a valid LiteLLM model id; an unresolvable model fails "
                 "every call closed (FR-6.4)",
             )
+        # The judge gets a specialized probe through its exact classifier
+        # construction + schema path. A generic "ping" would miss a runtime-only
+        # classifier parameter mismatch (issue #83).
+        if name == "judge_llm":
+            return _judge_classifier_round_trip(profile)
         # A model can RESOLVE offline yet REJECT the configured reasoning_effort at
         # call time (not every provider/model accepts the param). FR-6.4 requires a
         # live round trip per profile that verifies effort acceptance, so probe it
@@ -121,6 +126,48 @@ def _real_profile_model_probe(name: str, profile) -> ProbeResult:
     if adapter in _CLI_BY_ADAPTER:
         return _cli_profile_round_trip(name, profile)
     return ProbeResult(WARN, f"no model probe for adapter {adapter!r}")
+
+
+def _judge_classifier_round_trip(profile) -> ProbeResult:
+    """Exercise the real judge classifier path with its effective effort (#83).
+
+    A valid ALLOW *or* DENY answer proves the classifier evaluated the request;
+    ``source=fail-closed`` means the judge could not evaluate it (provider,
+    parameter, timeout, or schema failure) and must fail doctor loudly.
+    """
+    from gauntlet.judge.runner import (
+        JUDGE_LLM_REASONING_EFFORT,
+        build_classifier,
+    )
+
+    model = profile.model
+    effort = getattr(profile, "effort", None) or JUDGE_LLM_REASONING_EFFORT
+    try:
+        decision = build_classifier(
+            judge_model=model, judge_effort=getattr(profile, "effort", None)
+        ).classify("Read", {"file_path": ".gauntlet/config.yaml"})
+    except Exception as exc:
+        first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return ProbeResult(
+            FAIL,
+            f"judge classifier could not be constructed for model {model!r}, "
+            f"effort {effort!r}: {first[:200]}",
+            remedy="set judge_llm.effort to a canonical tier the model accepts",
+        )
+    if decision.source == "fail-closed":
+        return ProbeResult(
+            FAIL,
+            f"judge classifier cannot evaluate with model {model!r}, effort "
+            f"{effort!r}: {decision.rationale[:240]}",
+            remedy="set judge_llm.effort to a model-compatible canonical tier "
+            "(for example `low` when the model rejects `minimal`), then rerun "
+            "`gauntlet doctor`",
+        )
+    return ProbeResult(
+        OK,
+        f"classifier evaluated a live probe with model {model!r}, effort "
+        f"{effort!r} (verdict: {decision.decision})",
+    )
 
 
 def _api_profile_round_trip(name: str, profile) -> ProbeResult:
@@ -806,8 +853,16 @@ def _check_judge_classifier(config, probes: DoctorProbes) -> CheckResult:
             "`anthropic/claude-haiku-4-5`); an unresolvable model fails every "
             "classifier call closed",
         )
+    # A provider lookup is necessary but not sufficient: a resolvable model can
+    # reject the classifier's reasoning_effort only at call time. Drive the same
+    # bounded adapter + schema path the judge uses, through the injectable
+    # profile probe so unit tests remain offline (issue #83).
+    probe = probes.profile_model_probe("judge_llm", profile)
     return CheckResult(
-        "judge-classifier", OK, f"LLM classifier model {model!r} resolvable"
+        "judge-classifier",
+        probe.status,
+        f"LLM classifier model {model!r}: {probe.detail}",
+        remedy=probe.remedy,
     )
 
 
@@ -1004,9 +1059,13 @@ def _check_profiles(
     config, probes: DoctorProbes, repo_root: Path, reference_profiles: set[str]
 ) -> list[CheckResult]:
     """FR-6.4: one model probe per configured profile, plus a repo-read probe for
-    each profile a shipped pipeline uses in reference/`phase` mode."""
+    each profile a shipped pipeline uses in reference/`phase` mode. The
+    ``judge_llm`` profile is omitted here because ``judge-classifier`` already
+    performs its one live probe through the more exact classifier path (#83)."""
     results: list[CheckResult] = []
     for name in sorted(config.agents):
+        if name == "judge_llm":
+            continue
         profile = config.agents[name]
         results.append(_check_profile_model(name, profile, probes))
         if name in reference_profiles:
@@ -1177,3 +1236,100 @@ def run_doctor(
 
 def has_failure(results: list[CheckResult]) -> bool:
     return any(r.status == FAIL for r in results)
+
+
+def check_writability(repo_root: Path) -> list[CheckResult]:
+    """Probe each adapter's ability to write under the run-worktree root (P7f).
+
+    **Opt-in, and deliberately not part of `run_doctor`.** Every other check
+    here is offline and near-instant; this one spends a real agent turn per
+    write mechanism per adapter, because reading the *post-tool* outcome is the
+    only way to see a refusal at all (`proposals/P7d-gate-blocker.md` §2.4 — the
+    judge is a PreToolUse hook, so the audit records `allow` for writes that
+    never happened). Wiring that into the default `gauntlet doctor` would turn a
+    diagnostic an operator runs reflexively into one that costs tokens and
+    minutes, so it lives behind `gauntlet doctor --writability`.
+
+    Probes directly under the derived worktrees root rather than creating a run
+    worktree: the guard measured at P7d keys on the PATH (a literal `.git`
+    segment), so the root's prefix is what determines the answer, and probing it
+    needs no run, no branch and no lock.
+    """
+    from gauntlet.engine import gitops
+    from gauntlet.engine import worktree as WT
+    from gauntlet.engine import writability as W
+    from gauntlet.engine.config import RunConfig
+
+    try:
+        config = RunConfig.load(repo_root / ".gauntlet" / "config.yaml")
+    except Exception as exc:
+        return [CheckResult("writability", FAIL, f"config not loadable: {exc}",
+                            remedy="run `gauntlet init` to scaffold a config")]
+    try:
+        root = WT.worktrees_root(gitops.main_worktree_root(repo_root))
+    except Exception as exc:
+        return [CheckResult("writability", FAIL, f"cannot derive the run-worktree "
+                            f"root: {exc}")]
+
+    probe_root = root / ".doctor-probe"
+    # The third site of post-review F-001's class, and the same answer: the
+    # derived root is only contained if every segment of it is a real
+    # directory. `mkdir(exist_ok=True)` would otherwise create this probe —
+    # and the seed bytes the writability probe puts in it — through a symlink,
+    # outside the repository, on a read-only diagnostic command.
+    try:
+        WT.require_contained(gitops.main_worktree_root(repo_root), probe_root)
+    except WT.WorktreeUnavailable as exc:
+        return [CheckResult(
+            "writability", FAIL, str(exc),
+            remedy="replace the symlinked segment with a real directory",
+        )]
+    results: list[CheckResult] = []
+    seen: set[str] = set()
+    try:
+        probe_root.mkdir(parents=True, exist_ok=True)
+        WT.ensure_root_marker(gitops.main_worktree_root(repo_root))
+        for name, profile in (config.agents or {}).items():
+            kind = getattr(profile, "adapter", None)
+            if not kind or kind in seen:
+                continue
+            seen.add(kind)
+            try:
+                adapter = profile.build_adapter()
+            except Exception as exc:
+                results.append(CheckResult(
+                    f"writability[{kind}]", WARN,
+                    f"adapter {kind!r} could not be built: {exc}",
+                ))
+                continue
+            if not W.should_probe(adapter):
+                continue
+            report = W.probe(adapter, probe_root, adapter_name=kind)
+            if report.ok:
+                results.append(CheckResult(
+                    f"writability[{kind}]", OK, report.summary()))
+            elif report.refused:
+                results.append(CheckResult(
+                    f"writability[{kind}]", FAIL,
+                    f"{report.summary()} under {root}",
+                    remedy=(
+                        "the run worktree root is not writable by this agent "
+                        "CLI; a `.git` segment in the path is the known cause "
+                        "(proposals/P7d-gate-blocker.md §2)"
+                    ),
+                ))
+            else:
+                results.append(CheckResult(
+                    f"writability[{kind}]", WARN, report.summary(),
+                    remedy="the adapter could not run; check its CLI and auth",
+                ))
+    finally:
+        import shutil
+
+        shutil.rmtree(probe_root, ignore_errors=True)
+    if not results:
+        results.append(CheckResult(
+            "writability", WARN,
+            "no configured adapter declares a real CLI permission layer to probe",
+        ))
+    return results

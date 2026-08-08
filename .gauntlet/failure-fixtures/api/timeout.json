@@ -1,0 +1,5 @@
+{
+  "exception_class": "Timeout",
+  "message": "litellm.Timeout: APITimeoutError - Request timed out. Error_str: Request timed out.",
+  "retry_after": null
+}
