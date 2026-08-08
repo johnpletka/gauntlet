@@ -2495,20 +2495,17 @@ def _worktree_matches_snapshot(
             *gitops._exclude_pathspec(excludes),
         )
         if protected:
-            protected_dirty = gitops._run(
-                work_root,
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                *protected,
-            )
-            if protected_dirty or git_snapshot._patterns_match_temp_index(
+            # Force-add only the patterns that still match something in the
+            # temp index's view: `git add` is fatal on any unmatched pathspec,
+            # and a protected deletion already reflected in the seed tree
+            # leaves its pattern with nothing to act on (mixed protected
+            # states in the §7 restoration fault matrix).
+            addable = git_snapshot._patterns_matching_temp_index(
                 work_root, index_path, protected
-            ):
+            )
+            if addable:
                 gitops.run_with_temp_index(
-                    work_root, index_path, "add", "-A", "-f", "--", *protected
+                    work_root, index_path, "add", "-A", "-f", "--", *addable
                 )
         remove_control_locks(index_path)
         live_tree = gitops.run_with_temp_index(

@@ -827,3 +827,175 @@ def test_temp_index_symlinked_parent_is_resolved_before_containment(recovery_git
     link_dir.symlink_to(repo)
     with pytest.raises(TempIndexPathError):
         gitops.validate_temp_index_path(repo, link_dir / "index")
+
+
+# --- fault injection across restoration boundaries (plan §7) --------------------
+#
+# Plan §7 lists "before and after worktree/index restoration" among the
+# transaction fault injection points. At this library boundary the §7 global
+# acceptance property specializes to: a restoration killed at ANY internal
+# boundary leaves the durable snapshot ref fully loadable and writes nothing
+# outside the repository, and re-running the restoration — the library-level
+# replay — converges to the exact captured state, idempotently. (The executor
+# transaction's protected-restore step has its own boundary rows in
+# test_recovery_executor.py; these rows cover the full restoration verb.)
+
+
+class _RestoreBoom(RuntimeError):
+    pass
+
+
+def _build_restore_rich_state(g: RecoveryGitFixture, outside: Path) -> None:
+    """Every restoration code path in one state: staged-B-vs-worktree-C
+    divergence, a tracked deletion, an executable bit, an untracked directory,
+    a gitignored protected file, a protected deletion, and an untracked
+    symlink to an outside target (the containment witness)."""
+    g.write("dual.txt", "A\n")
+    g.write("gone.txt", "present\n")
+    g.write("tool.sh", "#!/bin/sh\n")
+    g.write("PR.md", "committed notes\n")
+    g.write(".gitignore", "NOTES.md\n")
+    g.stage()
+    g.commit("rich baseline")
+    g.write("dual.txt", "B\n")
+    g.stage("dual.txt")
+    g.write("dual.txt", "C\n")
+    g.delete("gone.txt")
+    g.write("tool.sh", "#!/bin/sh\n", executable=True)
+    g.delete("PR.md")  # protected deletion vs HEAD
+    g.write("NOTES.md", "human notes\n")  # gitignored, protected
+    g.write("newdir/inner.txt", "inner\n")
+    g.symlink("evil", outside)
+
+
+def _assert_rich_state(g: RecoveryGitFixture, outside: Path) -> None:
+    repo = g.repo
+    assert (repo / "dual.txt").read_text() == "C\n"  # worktree plane
+    assert git(repo, "show", ":dual.txt") == "B\n"  # staged plane
+    assert not (repo / "gone.txt").exists()
+    assert (repo / "tool.sh").stat().st_mode & stat.S_IXUSR
+    assert not (repo / "PR.md").exists()  # protected deletion reproduced
+    assert (repo / "NOTES.md").read_text() == "human notes\n"
+    assert (repo / "newdir" / "inner.txt").read_text() == "inner\n"
+    evil = repo / "evil"
+    assert evil.is_symlink() and os.readlink(evil) == str(outside)
+    assert outside.read_text() == "secret\n"  # never written through
+
+
+def _fault_before_read_tree(monkeypatch):
+    real = gitops.run_with_temp_index
+
+    def exploding(work_root, index, *args, **kwargs):
+        if "read-tree" in args:
+            raise _RestoreBoom("killed before read-tree")
+        return real(work_root, index, *args, **kwargs)
+
+    monkeypatch.setattr(gitops, "run_with_temp_index", exploding)
+
+
+def _fault_before_checkout_index(monkeypatch):
+    real = gitops.run_with_temp_index
+
+    def exploding(work_root, index, *args, **kwargs):
+        if "checkout-index" in args:
+            raise _RestoreBoom("killed before checkout-index")
+        return real(work_root, index, *args, **kwargs)
+
+    monkeypatch.setattr(gitops, "run_with_temp_index", exploding)
+
+
+def _nth_call_fault(monkeypatch, name: str, nth: int):
+    """Let ``nth - 1`` real calls of ``git_snapshot.<name>`` run, then explode
+    — a kill landing partway through a multi-entry pass, not before it."""
+    real = getattr(git_snapshot, name)
+    calls = {"n": 0}
+
+    def exploding(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= nth:
+            raise _RestoreBoom(f"killed at {name} call {nth}")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(git_snapshot, name, exploding)
+
+
+def _fault_mid_extraneous_removal(monkeypatch):
+    _nth_call_fault(monkeypatch, "_safe_unlink", 2)
+
+
+def _fault_mid_destination_prep(monkeypatch):
+    _nth_call_fault(monkeypatch, "_prepare_destination", 2)
+
+
+def _fault_before_raw_index_restore(monkeypatch):
+    _nth_call_fault(monkeypatch, "_restore_raw_index", 1)
+
+
+def _fault_mid_raw_index_replace(monkeypatch):
+    # The raw-index bytes are written to a temp file, then os.replace'd. A
+    # kill between the two must not corrupt the index nor block a replay.
+    def exploding(*args, **kwargs):
+        raise _RestoreBoom("killed between temp write and replace")
+
+    monkeypatch.setattr(os, "replace", exploding)
+
+
+_RESTORE_FAULTS = [
+    # (boundary, fault installer, expectation)
+    ("before_read_tree", _fault_before_read_tree, "untouched"),
+    ("mid_extraneous_removal", _fault_mid_extraneous_removal, "partial"),
+    ("before_checkout_index", _fault_before_checkout_index, "partial"),
+    ("mid_destination_prep", _fault_mid_destination_prep, "partial"),
+    ("before_raw_index_restore", _fault_before_raw_index_restore, "partial"),
+    ("mid_raw_index_replace", _fault_mid_raw_index_replace, "partial"),
+]
+
+
+@pytest.mark.parametrize(
+    "boundary,install_fault,expectation",
+    _RESTORE_FAULTS,
+    ids=[row[0] for row in _RESTORE_FAULTS],
+)
+def test_restore_killed_at_each_boundary_replays_to_convergence(
+    recovery_git, tmp_path, monkeypatch, boundary, install_fault, expectation
+):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n")
+    g = recovery_git
+    _build_restore_rich_state(g, outside)
+    repo = g.repo
+    _settle(repo)
+    before_status = _status(repo)
+    before_stages = _index_stage_listing(repo)
+
+    snapshot = _snap(repo, f"fault-{boundary}", protected=["PR.md", "NOTES.md"])
+    assert snapshot.protected_deletions == ("PR.md",)  # both planes captured
+    assert "NOTES.md" in snapshot.protected_paths
+    _wreck(repo)
+    wrecked_status = _status(repo)
+
+    install_fault(monkeypatch)
+    with pytest.raises(_RestoreBoom):
+        restore_snapshot(repo, snapshot)
+    monkeypatch.undo()  # the "next process" runs the real code
+
+    # Whatever partial worktree state the kill left, the durable snapshot is
+    # untouched and fully loadable, and nothing left the repository.
+    assert git(repo, "rev-parse", snapshot.ref).strip() == snapshot.snapshot_commit
+    reloaded = load_snapshot(repo, snapshot.ref)
+    assert reloaded.worktree_tree == snapshot.worktree_tree
+    assert outside.read_text() == "secret\n"
+    if expectation == "untouched":
+        assert _status(repo) == wrecked_status  # crashed before any mutation
+
+    # The replay — the same restoration, re-run — converges exactly...
+    restore_snapshot(repo, snapshot)
+    assert _status(repo) == before_status
+    assert _index_stage_listing(repo) == before_stages
+    _assert_rich_state(g, outside)
+
+    # ...and repeating it converges again (idempotent, no damage).
+    restore_snapshot(repo, snapshot)
+    assert _status(repo) == before_status
+    assert _index_stage_listing(repo) == before_stages
+    _assert_rich_state(g, outside)
