@@ -161,9 +161,16 @@ def _sha256(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
-def index_fingerprint(repo: Path) -> str:
-    """Stable content fingerprint of the real index (paths, modes, oids, stages)."""
-    out = gitops._run(repo, "ls-files", "--stage", "-z")
+def index_fingerprint(repo: Path, *, exclude: list[str] | None = None) -> str:
+    """Stable content fingerprint of the real index (paths, modes, oids, stages).
+
+    ``exclude`` drops the engine's own bookkeeping paths (#90): a verb-own
+    bookkeeping commit re-stages those paths, and without the exclusion every
+    resume's checkpoint commit moved this plane and read as progress.
+    """
+    out = gitops._run(
+        repo, "ls-files", "--stage", "-z", *gitops._exclude_pathspec(exclude)
+    )
     return _sha256(out.encode("utf-8", "surrogateescape"))
 
 
@@ -202,13 +209,18 @@ def _dirty_paths(repo: Path, *, exclude: list[str] | None) -> list[str]:
     return sorted(set(paths))
 
 
-def worktree_fingerprint(repo: Path, *, exclude: list[str] | None = None) -> str:
+def worktree_fingerprint(
+    repo: Path, *, exclude: list[str] | None = None, anchor: str | None = None
+) -> str:
     """Content-true fingerprint of the worktree plane relative to HEAD.
 
     Porcelain alone is lossy (two different byte contents of one modified path
     fingerprint identically), so every dirty path's live content identity is
     folded in: symlinks by target (never followed), files by byte hash,
-    missing paths as deletions. HEAD's tree id anchors the committed plane.
+    missing paths as deletions. HEAD's tree id anchors the committed plane —
+    unless ``anchor`` names a different commit to anchor on (the R5 guard
+    passes the last substantive commit so verb-own bookkeeping commits do not
+    read as progress, #90).
     """
     entries: list[tuple[str, str, str]] = []
     for rel in _dirty_paths(repo, exclude=exclude):
@@ -227,7 +239,7 @@ def worktree_fingerprint(repo: Path, *, exclude: list[str] | None = None) -> str
             entries.append((rel, f"file:{mode}", _sha256(path.read_bytes())))
         else:
             entries.append((rel, f"other:{info.st_mode:o}", ""))
-    head_tree = gitops._run(repo, "rev-parse", "HEAD^{tree}").strip()
+    head_tree = gitops._run(repo, "rev-parse", f"{anchor or 'HEAD'}^{{tree}}").strip()
     payload = json.dumps([head_tree, entries], sort_keys=True).encode()
     return _sha256(payload)
 
@@ -526,6 +538,35 @@ def observe_state(
     )
 
 
+# Engine-authored commit subjects all carry this prefix (response checkpoints,
+# bookkeeping flushes, rewind markers). They are created BY the very verbs the
+# R5 guard wraps, so treating them as branch movement lets every resume mint a
+# "fresh" fingerprint and the no-progress guard never fires (#90).
+_ENGINE_COMMIT_SUBJECT_PREFIX = "gauntlet: "
+_ENGINE_COMMIT_WALK_LIMIT = 100
+
+
+def _skip_engine_bookkeeping_commits(repo: Path, sha: str) -> str:
+    """First ancestor of ``sha`` that is not an engine bookkeeping commit.
+
+    A rewind marker's parent IS the rewind target, so skipping it still
+    registers the rewind (the substantive ancestor changed); a response
+    checkpoint's parent is whatever the branch already held, so skipping it
+    correctly reads "no substantive movement". The walk is bounded and any
+    git failure returns the sha reached — fail toward the raw tip, never
+    toward silence.
+    """
+    for _ in range(_ENGINE_COMMIT_WALK_LIMIT):
+        try:
+            subject = gitops.commit_subject(repo, sha)
+            if not subject.startswith(_ENGINE_COMMIT_SUBJECT_PREFIX):
+                return sha
+            sha = gitops.commit_parent(repo, sha)
+        except gitops.GitError:
+            return sha  # root commit or unreadable history: stop here
+    return sha
+
+
 def build_progress_fingerprint(
     repo: Path,
     *,
@@ -548,7 +589,9 @@ def build_progress_fingerprint(
     """
     run_branch_sha = None
     if gitops.branch_exists(repo, manifest.branch):
-        run_branch_sha = gitops.rev_parse(repo, f"refs/heads/{manifest.branch}")
+        run_branch_sha = _skip_engine_bookkeeping_commits(
+            repo, gitops.rev_parse(repo, f"refs/heads/{manifest.branch}")
+        )
     pending_id = None
     pending_state = None
     artifact_fp = None
@@ -571,6 +614,9 @@ def build_progress_fingerprint(
     if record is not None:
         counter = "" if record.status == M.FAILED else f"#{record.attempts}"
         attempt_id = f"{record.id}{counter}"
+    notes_fp = None
+    if record is not None and record.notes:
+        notes_fp = _sha256(record.notes.encode("utf-8", "surrogateescape"))
     return ProgressFingerprint(
         run_id=manifest.run_id,
         current_step=manifest.current_step,
@@ -579,12 +625,15 @@ def build_progress_fingerprint(
         run_status=RunStatus(manifest.status),
         step_status=StepStatus(record.status) if record is not None else None,
         run_branch_sha=run_branch_sha,
-        index_fingerprint=index_fingerprint(repo),
-        worktree_fingerprint=worktree_fingerprint(repo, exclude=excludes),
+        index_fingerprint=index_fingerprint(repo, exclude=excludes),
+        worktree_fingerprint=worktree_fingerprint(
+            repo, exclude=excludes, anchor=run_branch_sha
+        ),
         artifact_fingerprint=artifact_fp,
         pending_response_id=pending_id,
         pending_response_state=pending_state,
         latest_cycle_substep=latest_cycle_substep,
+        step_notes_fingerprint=notes_fp,
     )
 
 

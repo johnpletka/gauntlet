@@ -3076,21 +3076,50 @@ class RunManager:
         self, layout: "RunLayout", run_dir: Path, man: Manifest
     ) -> "RX.ProgressFingerprint":
         """The plan §4.5 fingerprint at the public-verb boundary."""
-        excludes = run_bookkeeping_excludes(
-            self.work_root, self._bookkeeping_root(run_dir),
-            self._artifact_root_in_work(layout),
-        )
-        record = None
-        for rec in man.steps:  # the last non-terminal step anchors the attempt
-            if rec.status not in (M.DONE, M.SKIPPED):
-                record = rec
         # The R5 fingerprint covers index and worktree planes, so it must watch
         # the tree the verb actually mutates (same family as F-002/F-007).
         # Against the operator's checkout it would report "nothing changed"
         # after a dedicated resume that did real work, and raise NoProgressError
-        # on a run that had progressed.
+        # on a run that had progressed. At this boundary the verb has not yet
+        # entered `_worktree_paths_or_park` (self._paths is None), so for a
+        # `dedicated` run `self.work_root` IS the operator's checkout — whose
+        # planes the A1 invariant pins byte-identical across the whole verb,
+        # blinding the guard (#90). Resolve the run's registered worktree
+        # read-only (observe; never ensure) and fingerprint THAT tree.
+        paths = self._paths
+        if paths is None:
+            entry = None
+            try:
+                entry = WT.observe(
+                    self.operator_root, man.branch,
+                    main_root=self._main_worktree_root(),
+                )
+            except gitops.GitError:
+                entry = None  # unreadable worktree list: fall back below
+            if entry is not None:
+                paths = RunPaths(
+                    repo_root=self.repo_root,
+                    work_root=entry.path,
+                    state_root=run_dir,
+                    artifact_root=layout.slug_dir,
+                )
+        if paths is not None:
+            work_root = paths.work_root
+            excludes = run_bookkeeping_excludes(
+                work_root, paths.bookkeeping_root, paths.artifact_root_in_work
+            )
+        else:
+            work_root = self.work_root
+            excludes = run_bookkeeping_excludes(
+                work_root, self._bookkeeping_root(run_dir),
+                self._artifact_root_in_work(layout),
+            )
+        record = None
+        for rec in man.steps:  # the last non-terminal step anchors the attempt
+            if rec.status not in (M.DONE, M.SKIPPED):
+                record = rec
         return RX.build_progress_fingerprint(
-            self.work_root, manifest=man, record=record, excludes=excludes
+            work_root, manifest=man, record=record, excludes=excludes
         )
 
     def _capture_progress(self, slug: str) -> "RX.ProgressFingerprint | None":
@@ -3105,8 +3134,24 @@ class RunManager:
             run_dir = layout.active_run_dir()
             man = Manifest.load(run_dir / "manifest.json")
             return self._progress_fingerprint_for(layout, run_dir, man)
-        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError) as exc:
+            # Advisory, but never silent (#90): a swallowed capture failure
+            # turns the R5 guard OFF for the invocation with nothing surfacing
+            # it — which is how the guard's absence on live runs went unseen.
+            self._warn_progress_guard_off(slug, exc)
             return None
+
+    def _warn_progress_guard_off(self, slug: str, exc: Exception) -> None:
+        """Durable warning that this invocation ran without the R5 guard (#90)."""
+        try:
+            run_dir = self.layout(slug).active_run_dir()
+            self._warn(
+                run_dir,
+                "R5 no-progress guard disabled for this invocation: progress "
+                f"fingerprint capture failed ({type(exc).__name__}: {exc})",
+            )
+        except Exception:  # the warning must never fail the verb it describes
+            pass
 
     def _require_progress_after(
         self,
@@ -3135,7 +3180,8 @@ class RunManager:
             run_dir = layout.active_run_dir()
             man = Manifest.load(run_dir / "manifest.json")
             after = self._progress_fingerprint_for(layout, run_dir, man)
-        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError):
+        except (OSError, ValueError, gitops.GitError, RX.RecoveryExecError) as exc:
+            self._warn_progress_guard_off(slug, exc)  # never silent (#90)
             return
         if after.digest != before.digest:
             return  # progress

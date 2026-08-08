@@ -1253,7 +1253,9 @@ def test_manifest_is_human_readable_json(tmp_path):
     raw = (_run_dir(mgr) / "manifest.json").read_text()
     data = json.loads(raw)  # structure, not binary
     entry = data["steps"][0]["human_responses"][0]
+    # artifact_fingerprint joined the durable shape with #79 (the
+    # vacuous-convergence guard's comparison anchor); additive/nullable.
     assert set(entry) == {
         "response_id", "response_text", "timestamp", "user",
-        "response_attempt", "state",
+        "response_attempt", "state", "artifact_fingerprint",
     }
