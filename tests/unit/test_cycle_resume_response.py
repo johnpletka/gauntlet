@@ -84,8 +84,14 @@ def _drive_with_record(repo, adapters, cycle_record, *, step_extra=None):
 # --- reject re-drives the upstream cycle with the note (report 2nd trigger) -----
 def test_reject_gate_redrives_upstream_cycle_with_note(cycle_repo):
     """A rejected gate downstream of an adversarial_cycle injects the rejection
-    note into that cycle as a new round and re-parks the gate — it does NOT
-    terminally fail the run (matches the operator playbook)."""
+    note into that cycle as a new round — it does NOT terminally fail the run
+    (matches the operator playbook).
+
+    #79 changed the terminus of THIS script: the scripted reviewer ignores the
+    injected note and re-converges with zero findings while prd.md stays
+    byte-identical to the rejection checkpoint — the exact vacuous convergence
+    that used to re-park the gate over an unrevised artifact. The engine now
+    fails closed: the cycle parks for response instead of reporting DONE."""
     pipeline = Pipeline.model_validate({
         "name": "demo", "version": 1,
         "stages": [{"id": "s", "steps": [
@@ -113,16 +119,21 @@ def test_reject_gate_redrives_upstream_cycle_with_note(cycle_repo):
     status = orch.reject_gate(
         "gate", notes="tighten the threat-model section", user="op@example.com"
     )
-    # Re-driven, not terminally failed: the gate re-parks for a fresh decision.
+    # Re-driven, not terminally failed — but the re-drive converged with zero
+    # findings on a byte-identical artifact, so the cycle fails closed (#79)
+    # rather than re-parking the gate over an unrevised document.
     assert status == M.RUN_PARKED
-    assert man.record("gate").status == M.PARKED
     cyc = man.record("cycle")
-    assert cyc.status == M.DONE  # cycle re-ran and re-converged
-    # The note is injected into the cycle as an audited, consumed decision.
+    assert cyc.status == M.PARKED
+    assert cyc.parked_reason == M.PARKED_REASON_RESPONSE
+    assert "vacuous convergence" in (cyc.notes or "")
+    assert cyc.vacuous_parks == 1
+    # The note is injected into the cycle as an audited decision that stamped
+    # the artifact fingerprint the guard compared against.
     assert len(cyc.human_responses) == 1
     assert cyc.human_responses[0].response_text == "tighten the threat-model section"
     assert cyc.human_responses[0].user == "op@example.com"
-    assert cyc.human_responses[0].state == M.RESPONSE_CONSUMED
+    assert cyc.human_responses[0].artifact_fingerprint
 
 
 def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
@@ -240,6 +251,63 @@ def test_human_decision_block_helper():
     seeded = SimpleNamespace(record=SimpleNamespace(human_responses=[_response("X")]))
     block = _human_decision_block(seeded)
     assert "AUTHORITATIVE HUMAN DECISION" in block and "X" in block
+    # #79: the preamble must mandate settled-vs-change-request classification —
+    # the settling-only wording let a reviewer file a whole gate-rejection
+    # change list as "already supplied decisions" and vacuously converge.
+    assert "NOT yet reflected" in block
+    assert "MUST raise it as a finding" in block
+    assert "NEVER grounds for an empty findings array" in block
+    assert "Gate-rejection notes are change requests" in block
+
+
+def test_vacuous_convergence_guard(tmp_path):
+    """#79 engine guard, all four legs: unchanged artifact parks first, the
+    operator's re-affirmation proceeds with a recorded warning, a revised
+    artifact skips the guard, and a fingerprint-less response skips it."""
+    import hashlib
+
+    from gauntlet.engine.cycle import _vacuous_convergence_result
+
+    art = tmp_path / "prd.md"
+    art.write_text("ARTIFACT BODY\n")
+    fp = hashlib.sha256(art.read_bytes()).hexdigest()
+    step = {"mode": "artifact", "artifact": "prd.md"}
+
+    def _ctx(record):
+        return SimpleNamespace(
+            record=record, artifacts={"prd.md": art}, artifact_root=tmp_path
+        )
+
+    resp = _response("fix items 1-7")
+    resp = resp.model_copy(update={"artifact_fingerprint": fp})
+    rec = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[resp])
+
+    # 1. unchanged artifact + zero findings → fail-closed response park
+    first = _vacuous_convergence_result(_ctx(rec), step, 1)
+    assert first is not None and first.status == "parked"
+    assert first.parked_reason == M.PARKED_REASON_RESPONSE
+    assert "vacuous convergence" in first.notes
+    assert rec.vacuous_parks == 1
+
+    # 2. re-affirmed (vacuous_parks >= 1) → converge with a recorded warning
+    second = _vacuous_convergence_result(_ctx(rec), step, 1)
+    assert second is not None and second.status == "done"
+    assert "WARNING" in second.notes and "unchanged" in second.notes
+
+    # 3. artifact revised since the response → guard stands down
+    art.write_text("REVISED BODY\n")
+    fresh = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[resp])
+    assert _vacuous_convergence_result(_ctx(fresh), step, 1) is None
+
+    # 4. no fingerprint (pre-#79 response) → guard stands down
+    old = StepRecord(
+        id="cycle", type="adversarial_cycle", human_responses=[_response("X")]
+    )
+    assert _vacuous_convergence_result(_ctx(old), step, 1) is None
+    # 5. code_review mode has no governed artifact → guard stands down
+    assert _vacuous_convergence_result(
+        _ctx(rec), {"mode": "code_review"}, 1
+    ) is None
 
 
 # --- 3. RunManager._plan_response_action accepts a parked cycle -----------------

@@ -2107,6 +2107,7 @@ class Orchestrator:
             user=user,
             response_attempt=ordinal,
             state=M.RESPONSE_PENDING,
+            artifact_fingerprint=self._governed_artifact_fingerprint(rec),
         )
         rec.human_responses.append(entry)
         self._persist()  # atomic write-ahead of the pending entry (FR-2.2)
@@ -2114,6 +2115,31 @@ class Orchestrator:
             f"gauntlet: response {entry.response_id} pending"
         )
         return entry
+
+    def _governed_artifact_fingerprint(self, rec: StepRecord) -> str | None:
+        """SHA-256 of ``rec``'s governed artifact right now, else ``None``.
+
+        Stamped onto each :class:`HumanResponse` at append time (#79) so the
+        cycle's vacuous-convergence guard can tell "the artifact was revised
+        after the response" from "the response was consumed and nothing
+        changed". Resolves the artifact exactly the way the cycle's reviewer
+        will on the re-drive, so the two reads compare the same file.
+        """
+        import hashlib
+
+        step = next(
+            (s for s in self.pipeline.all_steps() if s.get("id") == rec.id), None
+        )
+        if step is None or step.get("type") != "adversarial_cycle":
+            return None
+        name = step.get("artifact")
+        if not name:
+            return None  # code_review mode: no single governed artifact
+        path = self.artifacts.get(name) or (self.artifact_root / name)
+        try:
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            return None
 
     def _commit_manifest_checkpoint(self, message: str) -> str | None:
         """Commit run bookkeeping (manifest.json + RUN.md) as an engine commit.

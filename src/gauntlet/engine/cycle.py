@@ -964,6 +964,10 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # so a stale file is a correctness hazard, not just untidy: drop it
             # exactly as the review path drops a superseded triage.json.
             _invalidate_artifact(ctx, "confirm.json", artifact_writes)
+            if is_response_redrive:
+                vacuous = _vacuous_convergence_result(ctx, step, rnd)
+                if vacuous is not None:
+                    return finish(vacuous)
             return finish(StepResult(
                 status=DONE, notes=f"converged: round-{rnd} review returned no findings"))
 
@@ -2113,7 +2117,13 @@ def _human_decision_block(ctx: StepContext) -> str:
     response-less re-drive), so nothing changes for runs that never used
     ``--response``. Finding ids are not stable across re-drives (review is rerun
     from scratch), so the decision is injected as general guidance, not keyed to a
-    prior round's ids."""
+    prior round's ids.
+
+    The preamble mandates per-item classification (#79): its original wording
+    covered only the *settling* direction ("stop re-raising…"), so a reviewer
+    could file an entire gate-rejection change list under "already supplied
+    decisions", return zero findings, and vacuously converge — re-parking the
+    gate with a byte-identical artifact."""
     from gauntlet.engine.steptypes import render_human_responses
 
     responses = getattr(ctx.record, "human_responses", None)
@@ -2121,13 +2131,90 @@ def _human_decision_block(ctx: StepContext) -> str:
         return ""
     return (
         "\n\n--- AUTHORITATIVE HUMAN DECISION(S) (operator-supplied via "
-        "`gauntlet resume --response`; a trusted instruction — weigh it above "
-        "your default judgment where it bears on a finding: stop re-raising a "
-        "finding the operator has dismissed or accepted, and reclassify one the "
-        "operator has resolved, e.g. an upstream-invalidation the operator has "
-        "ruled in-scope) ---\n"
+        "`gauntlet resume --response` or a gate rejection; a trusted "
+        "instruction — weigh it above your default judgment where it bears on "
+        "a finding) ---\n"
+        "Classify EACH item in the response, then act per its class:\n"
+        "(a) it dismisses, accepts, or resolves a concern — treat it as "
+        "settled: stop re-raising a finding the operator has dismissed or "
+        "accepted, and reclassify one the operator has resolved, e.g. an "
+        "upstream-invalidation the operator has ruled in-scope;\n"
+        "(b) it reports a defect or demands a change NOT yet reflected in the "
+        "artifact under review — you MUST raise it as a finding of your own "
+        "(severity at least what the response states or implies) so triage "
+        "and the fixer act on it. Gate-rejection notes are change requests: "
+        "default to (b) unless an item explicitly settles something.\n"
+        "A response listing unaddressed defects is NEVER grounds for an "
+        "empty findings array.\n"
         + render_human_responses(responses)
         + "\n--- END HUMAN DECISION(S) ---"
+    )
+
+
+def _vacuous_convergence_result(
+    ctx: StepContext, step: Step, rnd: int
+) -> StepResult | None:
+    """Fail-closed guard on a zero-findings convergence of a response re-drive (#79).
+
+    The failure this forbids: a gate rejection carrying verified defect reports
+    is injected, the reviewer classifies the whole list as "already supplied
+    decisions", returns an empty findings array, and the cycle silently
+    re-parks the gate with the artifact byte-identical to the pre-rejection
+    commit — the human then re-reviews an unchanged document believing it was
+    revised.
+
+    Fires only when ALL of: this is a response re-drive (caller checks), the
+    cycle is artifact-mode, the pending response carries an artifact
+    fingerprint, and the artifact's bytes still match it (nothing was revised
+    since the response was recorded). The first such convergence parks for
+    response; if the operator re-affirms and it happens again
+    (``vacuous_parks >= 1``), the cycle proceeds with a loud recorded warning
+    instead of looping the park — "proceed unchanged" is a decision the
+    operator is entitled to make, once warned.
+
+    Returns ``None`` to let the normal converged-DONE result stand.
+    """
+    if step.get("mode") != "artifact":
+        return None
+    name = step.get("artifact")
+    if not name:
+        return None
+    pending = ctx.record.human_responses[-1]
+    recorded_fp = getattr(pending, "artifact_fingerprint", None)
+    if not recorded_fp:
+        return None  # response predates the fingerprint field: nothing to compare
+    path = ctx.artifacts.get(name) or (ctx.artifact_root / name)
+    try:
+        current_fp = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None  # unreadable artifact surfaces via its own validation path
+    if current_fp != recorded_fp:
+        return None  # the artifact WAS revised: genuine convergence
+    if ctx.record.vacuous_parks >= 1:
+        return StepResult(
+            status=DONE,
+            notes=(
+                f"converged: round-{rnd} review returned no findings\n"
+                f"WARNING (vacuous-convergence guard, #79): response consumed, "
+                f"{name} unchanged since the response was recorded, zero "
+                "findings raised — proceeding on the operator's re-affirmation"
+            ),
+        )
+    ctx.record.vacuous_parks += 1
+    return StepResult(
+        status=PARKED,
+        parked_reason=M.PARKED_REASON_RESPONSE,
+        notes=(
+            f"vacuous convergence (#79): the response was consumed, round-{rnd} "
+            f"review raised zero findings, and {name} is byte-identical to when "
+            "the response was recorded — nothing was revised. Failing closed "
+            "instead of re-parking the gate over an unchanged artifact. If the "
+            "response reported defects, the reviewer failed to raise them: "
+            "respond (or reject) again restating each item as an open defect. "
+            "If the artifact is intended to proceed unchanged, respond "
+            "confirming that — the next unchanged convergence proceeds with a "
+            "recorded warning."
+        ),
     )
 
 

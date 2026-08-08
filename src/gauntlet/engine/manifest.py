@@ -281,6 +281,13 @@ class HumanResponse(BaseModel):
     user: str
     response_attempt: int
     state: Literal["pending", "consumed"]
+    # SHA-256 of the governed artifact's bytes at the moment the response was
+    # recorded (#79). The vacuous-convergence guard compares it against the
+    # artifact at a zero-findings convergence on the re-drive: byte-identical
+    # means the response produced no revision. ``None`` when the responding
+    # step has no governed artifact (code_review mode) or on entries predating
+    # the field — the guard skips rather than guesses. Additive/nullable.
+    artifact_fingerprint: str | None = None
 
 
 class ScheduledResume(BaseModel):
@@ -418,6 +425,13 @@ class StepRecord(BaseModel):
     # of these is P3.
     retry_after_s: int | None = None
     quota_reset_at: str | None = None
+    # Count of vacuous-convergence fail-closed parks on this step (#79): a
+    # response re-drive that converged with zero findings while the governed
+    # artifact stayed byte-identical to the response checkpoint. The first such
+    # convergence parks for response; once the operator re-affirms (>= 1), the
+    # next one proceeds with a recorded warning instead of looping the park.
+    # Additive with default 0, so older manifests load unchanged.
+    vacuous_parks: int = 0
     # Which adversarial_cycle sub-step produced the preserved ``session_id`` on a
     # usage-limit park (FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``. Current-state
     # like ``parked_reason`` — set on a usage-limit park, cleared on any other
