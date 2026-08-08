@@ -361,6 +361,7 @@ def _resume_fixture_plan_escalation(mgr: RunManager) -> str:
     return mgr.resume("toy", response=decision, use_judge=True)
 
 
+@pytest.mark.live_pipeline
 @pytest.mark.skipif(
     shutil.which("claude") is None,
     reason="scoped-context end-to-end needs the claude CLI",
@@ -421,6 +422,7 @@ def test_implement_phase_runs_with_scoped_reference_and_phase_context(tmp_path):
     assert section.splitlines()[0] in prompt    # the phase heading is injected
 
 
+@pytest.mark.live_pipeline
 @pytest.mark.skipif(
     shutil.which("claude") is None or shutil.which("codex") is None,
     reason="standard end-to-end needs both claude and codex CLIs",
@@ -448,6 +450,7 @@ def test_bounded_live_standard_pipeline_stops_only_at_governed_boundary(tmp_path
     _assert_governed_live_stop(mgr)
 
 
+@pytest.mark.live_pipeline
 @pytest.mark.skipif(
     shutil.which("claude") is None or shutil.which("codex") is None,
     reason="standard end-to-end needs both claude and codex CLIs",
