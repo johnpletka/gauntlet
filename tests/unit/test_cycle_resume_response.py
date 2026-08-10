@@ -155,6 +155,13 @@ def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
     assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
     assert man.record("gate").status == M.FAILED
     assert "no upstream adversarial_cycle" in man.record("gate").notes
+    # #100 invariant: the terminal reject lands step + run status in one
+    # write and the persisted shape is classifiable (never `unknown`).
+    from gauntlet.engine import recovery_exec as RX
+    assert man.status == M.RUN_FAILED
+    state, _, failure = RX.classify_composite(man, "none")
+    assert state == RX.STATE_FAILED
+    assert failure is not None and failure.id == "gate"
 
 
 # --- 1. parked_reason discriminator on cycle parks ------------------------------

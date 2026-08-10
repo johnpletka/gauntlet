@@ -524,8 +524,14 @@ class Orchestrator:
                 f"state ({cyc_rec.status if cyc_rec else 'no record'})"
             )
             rec.notes = f"rejected ({why}): {notes}"
+            # #62 discipline: map the run status in the SAME durable write as
+            # the step's terminal status — a kill between two persists would
+            # otherwise land `parked` + a failed gate + zero parked steps,
+            # which classifies `unknown`. The #100 invariant guards the write.
+            self.manifest.status = M.RUN_FAILED
+            RX.require_classifiable(self.manifest, verb="reject")
             self._persist()
-            return self._set_run_status(FAILED)
+            return self.manifest.status
         # Iterate: append the rejection note to the upstream cycle as a pending
         # `--response` (audited + checkpoint-committed like any decision), then
         # reset the cycle and everything after it in the stage — including this
