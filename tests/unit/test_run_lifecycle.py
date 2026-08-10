@@ -974,3 +974,60 @@ def test_pr_draft_not_attempted_when_run_not_done(fixture_repo, monkeypatch):
                         lambda *a, **k: pytest.fail("should not draft when parked"))
     mgr._maybe_draft_pr(layout, run_dir, man, M.RUN_PARKED)  # no raise, no draft
     assert man.warnings == []
+
+
+FOREACH_PHASES = """
+name: p
+version: 1
+stages:
+  - id: phases
+    foreach: vars.phases
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: a}
+      - {id: phase-commit, type: commit, message: "placeholder"}
+      - {id: impl-cycle, type: agent_task, agent: builder, prompt_text: b}
+"""
+
+
+def test_rollback_rewind_resets_later_foreach_iterations(tmp_path):
+    """#101: foreach iterations share static step ids, so the id keep-set
+    alone left LATER-iteration records (done/failed) in a manifest rewound to
+    an earlier phase boundary — a contradictory, unclassifiable state that a
+    journal-first reconcile then faithfully resurrected."""
+    from gauntlet.engine.run import _rewind_manifest_state
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "pipeline.yaml").write_text(FOREACH_PHASES)
+    man = M.Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=M.PipelineRef(name="p", version=1, hash="sha256:x"),
+    )
+    # Chronological log: a PLAN-cycle commit (excluded from phase ranking by
+    # shape), phases P1 (iteration 0) and P2 (iteration 1); iteration 2
+    # produced NO commit — the vacuous-phase shape #101 wedged on.
+    man.commits = [
+        M.CommitRecord(step_id="plan-cycle", phase="PLAN.1", sha="aaa"),
+        M.CommitRecord(step_id="phase-commit", phase="P1", sha="bbb"),
+        M.CommitRecord(step_id="impl-cycle", phase="P1.1", sha="ccc"),
+        M.CommitRecord(step_id="phase-commit", phase="P2", sha="ddd"),
+    ]
+    for it in ("0", "1"):
+        for sid in ("implement", "phase-commit", "impl-cycle"):
+            man.upsert(M.StepRecord(id=sid, type="", status=M.DONE, iteration=it))
+    man.upsert(M.StepRecord(id="implement", type="", status=M.DONE, iteration="2"))
+    man.upsert(M.StepRecord(id="phase-commit", type="", status=M.FAILED, iteration="2"))
+
+    _rewind_manifest_state(man, run_dir, target="ddd")
+
+    assert [c.sha for c in man.commits] == ["aaa", "bbb", "ccc", "ddd"]
+    # Iteration 2 — past the P2 boundary — is fully pending again, even though
+    # its step ids sit inside the static keep-set.
+    assert man.record("implement", "2").status == M.PENDING
+    assert man.record("phase-commit", "2").status == M.PENDING
+    # Iterations at or before the boundary are untouched.
+    for it in ("0", "1"):
+        for sid in ("implement", "phase-commit", "impl-cycle"):
+            assert man.record(sid, it).status == M.DONE
+    assert man.status == M.RUN_PARKED
+    assert man.current_step is None
