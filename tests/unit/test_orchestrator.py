@@ -117,15 +117,20 @@ stages:
     assert "unsupported reasoning effort" in (rec.notes or "")
 
 
-def test_agent_judge_counts_allow_done_when_at_least_one_call_allowed(fixture_repo):
+def test_agent_judge_counts_allow_done_when_mutating_call_allowed(fixture_repo):
+    # Issue #101 amended this pin: the pre-#101 rows carried no tool_name, so
+    # the "one allow defeats the guard" behavior it froze was exactly the
+    # vacuous-done bug when that allow was read-only. The invariant it now
+    # proves is the corrected one: at least one allowed MUTATING call ⇒ DONE,
+    # even alongside a denied mutating call.
     audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
 
     def write_mixed(adapter, prompt, cwd):
         rows = [
             {"step_id": "implement", "decision": "deny", "source": "fast-path",
-             "rationale": "blocked"},
+             "tool_name": "Bash", "rationale": "blocked"},
             {"step_id": "implement", "decision": "allow", "source": "fast-path",
-             "rationale": "safe"},
+             "tool_name": "Write", "rationale": "safe"},
         ]
         audit.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
@@ -144,6 +149,150 @@ stages:
     orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
     assert orch.drive() == M.RUN_DONE
     rec = orch.manifest.record("implement")
+    assert rec.status == M.DONE
+    assert rec.judge_tool_calls_allowed == 1
+    assert rec.judge_tool_calls_denied == 1
+
+
+def _append_audit(audit: Path, rows: list[dict]) -> None:
+    with audit.open("a", encoding="utf-8") as fh:
+        fh.write("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def test_repo_write_agent_parks_when_judge_outage_denies_all_mutating(fixture_repo):
+    # Issue #101: the judge's LLM stopped resolving mid-run, so every mutating
+    # call was denied fail-closed while read-only allows (fast-path Reads) kept
+    # succeeding. The builder honestly reported the blockage and exited clean —
+    # and the engine marked the step DONE. The step must instead park
+    # provider_unavailable (judge outage, plain-resumable), never report done.
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+    judge_ok = {"up": False}
+
+    def on_run(adapter, prompt, cwd):
+        if judge_ok["up"]:
+            _append_audit(audit, [
+                {"step_id": "implement", "decision": "allow",
+                 "source": "fast-path", "tool_name": "Write",
+                 "rationale": "safe"},
+            ])
+            return
+        _append_audit(audit, [
+            {"step_id": "implement", "decision": "allow", "source": "fast-path",
+             "tool_name": "Read", "rationale": "read-only"},
+            {"step_id": "implement", "decision": "allow", "source": "fast-path",
+             "tool_name": "Read", "rationale": "read-only"},
+            {"step_id": "implement", "decision": "deny", "source": "fail-closed",
+             "tool_name": "Write",
+             "rationale": "judge LLM error: LLM Provider NOT provided"},
+            {"step_id": "implement", "decision": "deny", "source": "fail-closed",
+             "tool_name": "Bash",
+             "rationale": "judge LLM error: LLM Provider NOT provided"},
+        ])
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(
+            text="environment blockage: every write was denied", on_run=on_run,
+        )},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_PARKED
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.halt_reason is None
+    assert rec.judge_tool_calls_allowed == 2  # the read-only allows
+    assert rec.judge_tool_calls_denied == 2
+    assert rec.quota_reset_at is not None  # concrete deadline (F-006)
+    assert "vacuous" in (rec.notes or "")
+    assert "gauntlet resume" in (rec.notes or "")
+    assert "--response" not in (rec.notes or "").replace(
+        "no `--response` decision is at stake", "")
+    # Judge dependency recovers: the plain re-drive re-runs the step to DONE.
+    judge_ok["up"] = True
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None
+
+
+def test_repo_write_agent_fails_when_policy_denies_all_mutating(fixture_repo):
+    # #101, real-deny shape: the judge WORKED — policy denied the mutating
+    # calls. A read-only allow must not launder that into DONE; the step fails
+    # terminal with judge_deny exactly like the #83 all-denied guard.
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def on_run(adapter, prompt, cwd):
+        _append_audit(audit, [
+            {"step_id": "implement", "decision": "allow", "source": "fast-path",
+             "tool_name": "Read", "rationale": "read-only"},
+            {"step_id": "implement", "decision": "deny", "source": "fast-path",
+             "tool_name": "Write", "rationale": "write outside repo boundary"},
+            {"step_id": "implement", "decision": "deny", "source": "llm",
+             "tool_name": "Bash", "rationale": "destructive command"},
+        ])
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="blocked", on_run=on_run)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_FAILED
+    rec = orch.manifest.record("implement")
+    assert rec.status == M.FAILED
+    assert rec.halt_reason == M.HALT_REASON_JUDGE_DENY
+    assert rec.judge_tool_calls_allowed == 1
+    assert rec.judge_tool_calls_denied == 2
+    assert "mutating" in (rec.notes or "")
+    assert "destructive command" in (rec.notes or "")
+
+
+def test_read_only_agent_task_unaffected_by_mutating_guard(fixture_repo):
+    # A reviewer-style step (`repo_write: false`) legitimately has zero allowed
+    # mutating calls — and a denied Write there is the judge doing its job
+    # (read-only contract), not an implementation blockage. The #101 guard must
+    # not fire.
+    audit = fixture_repo / "runs" / "demo" / "run-1" / "judge-audit.jsonl"
+
+    def on_run(adapter, prompt, cwd):
+        _append_audit(audit, [
+            {"step_id": "review", "decision": "allow", "source": "fast-path",
+             "tool_name": "Read", "rationale": "read-only"},
+            {"step_id": "review", "decision": "deny", "source": "fast-path",
+             "tool_name": "Write", "rationale": "reviewer is read-only"},
+        ])
+
+    pipeline = """
+name: demo
+version: 1
+stages:
+  - id: phase
+    steps:
+      - {id: review, type: agent_task, agent: builder, repo_write: false, prompt_text: go}
+"""
+    orch = _build(
+        fixture_repo, pipeline,
+        adapters={"builder": FakeAdapter(text="findings", on_run=on_run)},
+    )
+    orch.judge_env = {"GAUNTLET_JUDGE_TOKEN": "tok"}
+    assert orch.drive() == M.RUN_DONE
+    rec = orch.manifest.record("review")
     assert rec.status == M.DONE
     assert rec.judge_tool_calls_allowed == 1
     assert rec.judge_tool_calls_denied == 1

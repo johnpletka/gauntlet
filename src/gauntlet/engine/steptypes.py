@@ -43,6 +43,7 @@ from gauntlet.engine.manifest import (
     HALT_REASON_TIMEOUT,
     PARKED_REASON_ARTIFACT_INVALID,
     PARKED_REASON_GATE,
+    PARKED_REASON_PROVIDER_UNAVAILABLE,
     PARKED_REASON_RESPONSE,
     PARKED_REASON_USAGE_LIMIT,
     RESPONSE_CONSUMED,
@@ -1132,6 +1133,62 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                 f"{headline}: 0 allowed, {judge_counts.denied} denied during "
                 f"agent {agent_name!r}; refusing to record a successful step."
                 f"{reason}"
+            ),
+        )
+
+    # Issue #101 (sibling of #83): the guard above is defeated by a single
+    # allowed READ-ONLY call. Classify per-tool for a repo-write agent task —
+    # an invocation whose every MUTATING call (Write/Edit/Bash/...) was denied
+    # made zero observable changes through judged tools, so `done` would be
+    # vacuous: tests then pass vacuously and only phase-commit fails loud on
+    # the clean tree. Disposition mirrors the #89 cycle-side precedent
+    # (cycle.py fix-turn park): denials that are ALL `source: fail-closed`
+    # are a judge-infrastructure outage → park provider_unavailable
+    # (plain-resumable, concrete deadline); any real policy deny in the mix
+    # stays terminal exactly like the #83 guard — the judge worked, the agent
+    # attempted something it should not, and a human decision is at stake.
+    if bool(step.get("repo_write", True)) and judge_counts.all_mutating_denied:
+        evidence = "; ".join(judge_counts.denial_reasons) or "(none recorded)"
+        if judge_counts.mutating_fail_closed_denied == judge_counts.mutating_denied:
+            from gauntlet.engine import depretry
+
+            return StepResult(
+                status=PARKED,
+                parked_reason=PARKED_REASON_PROVIDER_UNAVAILABLE,
+                session_id=result.session_id,
+                usage=result.usage,
+                usage_by_agent=usage_by_agent,
+                backoff_s=depretry.park_deadline_s(ctx.record, ctx.config, None),
+                judge_tool_calls_allowed=judge_counts.allowed,
+                judge_tool_calls_denied=judge_counts.denied,
+                notes=(
+                    f"judge could not evaluate agent {agent_name!r}'s mutating "
+                    f"tool calls: all {judge_counts.mutating_denied} denied "
+                    "fail-closed (judge infrastructure error, not policy) and "
+                    "0 mutating calls allowed "
+                    f"({judge_counts.allowed} read-only call(s) allowed), so "
+                    "the step made no observable change — refusing to record "
+                    "a vacuous `done` (#101). Parking provider_unavailable: a "
+                    "plain `gauntlet resume` retries the step once the judge's "
+                    "dependency recovers — no `--response` decision is at "
+                    f"stake. Denial evidence: {evidence}"
+                ),
+            )
+        return StepResult(
+            status=FAILED,
+            session_id=result.session_id,
+            usage=result.usage,
+            usage_by_agent=usage_by_agent,
+            halt_reason=HALT_REASON_JUDGE_DENY,
+            judge_tool_calls_allowed=judge_counts.allowed,
+            judge_tool_calls_denied=judge_counts.denied,
+            notes=(
+                "judge denied every mutating tool call during agent "
+                f"{agent_name!r}: {judge_counts.mutating_denied} denied, 0 "
+                f"allowed ({judge_counts.allowed} read-only call(s) allowed). "
+                "A repo-write step with no allowed mutating call implemented "
+                "nothing; refusing to record a successful step (#101). "
+                f"Denial evidence: {evidence}"
             ),
         )
 
