@@ -19,6 +19,7 @@ import shutil
 import signal
 import socket
 import sys
+import threading
 import time
 import warnings
 from contextlib import contextmanager
@@ -3689,9 +3690,11 @@ class RunManager:
             # before the approval drives anything (post-P3 review F-002).
             # A driving verb runs in the run's own tree (P7c). Resolved from
             # evidence + what the run was born as, never from live config.
+            # The approve drive does not route through `_drive`, so it carries
+            # its own agent-liveness watchdog span (issue #103).
             with self._worktree_paths_or_park(
                 layout, run_dir, man, mode=self._effective_worktree_mode(man)
-            ):
+            ), self._agent_watchdog(run_dir):
                 if RX.replay_pending_intent(self.work_root, run_dir) is not None:
                     man = Manifest.load(run_dir / "manifest.json")
                 gate = explicit_gate or man.current_step
@@ -3733,9 +3736,11 @@ class RunManager:
             # before the rejection re-drives anything (post-P3 review F-002).
             # A driving verb runs in the run's own tree (P7c). Resolved from
             # evidence + what the run was born as, never from live config.
+            # The reject drive does not route through `_drive`, so it carries
+            # its own agent-liveness watchdog span (issue #103).
             with self._worktree_paths_or_park(
                 layout, run_dir, man, mode=self._effective_worktree_mode(man)
-            ):
+            ), self._agent_watchdog(run_dir):
                 if RX.replay_pending_intent(self.work_root, run_dir) is not None:
                     man = Manifest.load(run_dir / "manifest.json")
                 gate = explicit_gate or man.current_step
@@ -4017,7 +4022,15 @@ class RunManager:
         self._require_progress_after(
             slug, before_fp, verb="recover", exempt_human_waits=False
         )
-        return Manifest.load(manifest_path).status
+        # Issue #103 papercut 1: report the COMPOSITE state this recovery
+        # produced — `interrupted` — not the raw manifest run_status (`failed`).
+        # §4 promises "marks the step INTERRUPTED", and the operator should not
+        # need `status --json` to learn which state the run actually landed in.
+        final_man = Manifest.load(manifest_path)
+        liveness = operator.driver_liveness(
+            self._run_root_dir(), slug, run_instance_dir=run_dir
+        )
+        return operator.composite_state(final_man, liveness)
 
     @staticmethod
     def _recover_actor() -> tuple[str, str]:
@@ -6386,7 +6399,11 @@ class RunManager:
             interval_s=self.config.heartbeat_interval_s,
             credit_cap_s=self.config.suspend_credit_cap_s,
         )
-        with KeepAwake(enabled=self.config.keep_awake), writer:
+        # The agent-liveness watchdog rides the same span as the heartbeat
+        # (issue #103): a dead-agent wedge inside any step self-converts into
+        # the interrupted → resume path instead of blocking forever.
+        with KeepAwake(enabled=self.config.keep_awake), writer, \
+                self._agent_watchdog(run_dir):
             try:
                 if not use_judge:
                     orch = self._orchestrator(
@@ -6419,6 +6436,169 @@ class RunManager:
             M.Suspension(start=s.start, end=s.end, gap_s=s.gap_s) for s in intervals
         )
         man.write_atomic(run_dir / "manifest.json")
+
+    # ---- agent-liveness watchdog (issue #103) --------------------------------
+    @contextlib.contextmanager
+    def _agent_watchdog(self, run_dir: Path):
+        """Agent-liveness self-recovery spanning a drive (issue #103).
+
+        Two coupled protections around every drive segment that can run agents
+        (`_drive`, and the approve/reject drive paths, which do not go through
+        `_drive`):
+
+        * a SIGTERM forwarder so a driver terminated from outside (`gauntlet
+          recover`'s SIGTERM, a shell kill) takes its spawned agent's DETACHED
+          process group with it — the agent runs in its own session, so the
+          driver-group signal alone orphans it and the survivor collides with
+          the builder the next resume spawns. Installed only from the main
+          thread (signal.signal's own constraint); a worker-thread drive (the
+          web console) simply keeps today's behavior.
+        * the :class:`heartbeat.AgentLivenessWatchdog`, whose trip self-marks
+          the running step interrupted through the exact FR-5.6 machinery
+          `gauntlet recover` uses and then terminates this driver — converting
+          a dead-agent wedge into the normal interrupted → resume path.
+          ``agent_watchdog_silence_s <= 0`` disables the watchdog (the SIGTERM
+          forwarder stays: it protects against orphaned agents regardless).
+        """
+        from gauntlet.adapters import process as P
+        from gauntlet.engine.heartbeat import (
+            AGENT_PROCESS_FILENAME,
+            AgentLivenessWatchdog,
+        )
+
+        prev_term = None
+        installed = threading.current_thread() is threading.main_thread()
+        if installed:
+            def _forward_term(signum, frame):  # pragma: no cover - signal path
+                P.kill_active_agent_group()
+                signal.signal(signum, prev_term if prev_term is not None
+                              else signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+            prev_term = signal.signal(signal.SIGTERM, _forward_term)
+        try:
+            silence_s = self.config.agent_watchdog_silence_s
+            if silence_s <= 0:
+                yield
+                return
+            watchdog = AgentLivenessWatchdog(
+                silence_s=silence_s,
+                on_trip=lambda probe: self._watchdog_trip(run_dir, probe),
+                record_path=run_dir / AGENT_PROCESS_FILENAME,
+            )
+            with watchdog:
+                yield
+        finally:
+            if installed:
+                try:
+                    signal.signal(signal.SIGTERM, prev_term)
+                except (ValueError, OSError, TypeError):
+                    pass
+
+    def _watchdog_trip(self, run_dir: Path, probe) -> None:
+        """The watchdog's one-shot action: finalize, then terminate this driver."""
+        intent = self._watchdog_self_interrupt(run_dir, probe)
+        if intent is not None:
+            self._watchdog_exit(intent, probe.silence_s())
+
+    def _watchdog_self_interrupt(
+        self, run_dir: Path, probe
+    ) -> "_RecoveryIntent | None":
+        """Self-convert a wedged agent call into interrupted → resume (issue #103).
+
+        Runs on the watchdog thread INSIDE the wedged driver, applying the
+        exact FR-5.6 sequence `gauntlet recover` applies from outside — durable
+        intent, then :meth:`_finalize_recovery` (step INTERRUPTED + §6.4 record
+        + intent cleared + lock released under the nonce guard) — so every
+        existing resume/recovery semantic holds unchanged. The identity gate is
+        replaced by its degenerate self-form: only OUR OWN live lock record
+        (recorded pid == this process) authorizes a self-interrupt, and the
+        TRIPPED probe must still be the registered in-flight call after the
+        intent write — a call that concluded (or was replaced) in the last
+        instant stands the watchdog down.
+
+        Returns the finalized intent (caller terminates the driver), or
+        ``None`` on ANY verification failure — fail open, nothing mutated, no
+        stranded intent, the drive keeps waiting.
+        """
+        from gauntlet.adapters import process as P
+        from gauntlet.engine import operator
+
+        try:
+            silent_s = probe.silence_s()
+            rec = self._read_lock(run_dir)
+            if rec is None or rec.pid != os.getpid():
+                return None
+            manifest_path = self._guard_run_file(run_dir, "manifest.json")
+            man = Manifest.load(manifest_path)
+            target = self._recover_target_step(man)
+            intent = _RecoveryIntent(
+                ts=_utc_stamp(),
+                actor="agent-liveness-watchdog",
+                actor_source="driver_watchdog",
+                reason=(
+                    f"agent call silent {int(silent_s)}s with its recorded "
+                    "process provably gone; self-marked interrupted by the "
+                    "driver's agent-liveness watchdog (issue #103) — resume "
+                    "with `gauntlet resume`"
+                ),
+                lock_nonce=rec.nonce,
+                pid=rec.pid,
+                pgid=rec.pgid,
+                proc_identity=rec.proc_identity,
+                host=rec.host,
+                step_id=operator.render_step_id(target),
+                prior_step_status=target.status,
+                prior_run_status=man.status,
+            )
+            intent_path = run_dir / RECOVERY_INTENT_NAME
+            _atomic_write_durable(intent_path, intent.to_json())
+            # Last fail-open gate: the TRIPPED call must STILL be the one in
+            # flight. A cleared or replaced probe means the adapter returned
+            # (and possibly a new attempt started) — unwind and stand down.
+            if P.active_agent_probe() is not probe:
+                _unlink_durable(intent_path)
+                return None
+            # The agent is already dead by proof (that is the trip condition),
+            # and the driver terminates itself in `_watchdog_exit` — so the
+            # recorded signal outcome is `already_dead`, exactly what an
+            # outside `recover` records for a target it never had to signal.
+            if not self._finalize_recovery(run_dir, intent, M.SIGNAL_ALREADY_DEAD):
+                _unlink_durable(intent_path)
+                return None
+            return intent
+        except (RecoverError, UnsafeRunSegment, OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _watchdog_exit(intent: "_RecoveryIntent", silent_s: float) -> None:
+        """Terminate the wedged driver after a finalized self-interrupt.
+
+        Mirrors what an outside `gauntlet recover` would have done to this
+        driver: first take the spawned agent's own (detached) process group —
+        provably dead, but a straggler forked worker must not survive to
+        collide with the next resume's builder — then SIGKILL the driver's
+        recorded group, the same blast radius recover signals. `os._exit` is
+        the belt for a platform where the self-killpg does not land. Never
+        called in-process by tests (they exercise `_watchdog_self_interrupt`);
+        everything durable is already on disk before the first signal.
+        """
+        from gauntlet.adapters import process as P
+
+        print(
+            f"gauntlet: agent-liveness watchdog: step {intent.step_id!r} "
+            f"agent silent {int(silent_s)}s with its process provably gone; "
+            "step marked interrupted and this driver is exiting — resume with "
+            "`gauntlet resume` (issue #103)",
+            file=sys.stderr,
+            flush=True,
+        )
+        P.kill_active_agent_group()
+        try:
+            os.killpg(intent.pgid, signal.SIGKILL)
+        except OSError:  # pragma: no cover - platform-dependent fallback
+            pass
+        os._exit(70)  # pragma: no cover - unreachable once the killpg lands
 
     def _maybe_draft_pr(self, layout, run_dir, man, status: str) -> None:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.

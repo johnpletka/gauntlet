@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from gauntlet.engine import execution, manifest as M
+from gauntlet.engine import execution, manifest as M, operator
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.engine.run import (
     DRIVING_LOCK_NAME,
@@ -310,7 +310,12 @@ def test_recover_terminates_group_and_records(tmp_path, procs):
 
     status = _recover_with_reaper(mgr, proc, reason="wedged on model timeout")
 
-    assert status == M.RUN_FAILED
+    # Issue #103 papercut 1: `recover` reports the COMPOSITE state it produced
+    # (`interrupted` — the step it marked), not the raw manifest run_status
+    # (`failed`), so the printed line matches what §4 promises without a
+    # `status --json` round-trip. The manifest itself still records RUN_FAILED,
+    # asserted below.
+    assert status == operator.STATE_INTERRUPTED
     assert proc.poll() is not None  # the group was terminated (FR-5.2)
 
     man = Manifest.load(run_dir / "manifest.json")

@@ -30,6 +30,7 @@ from gauntlet.config import lint_flags
 from gauntlet.engine.gitops import Identity
 from gauntlet.engine.heartbeat import (
     DEFAULT_AGENT_SILENCE_S,
+    DEFAULT_AGENT_WATCHDOG_SILENCE_S,
     DEFAULT_HEARTBEAT_INTERVAL_S,
     DEFAULT_SUSPEND_CREDIT_CAP_S,
 )
@@ -615,6 +616,13 @@ class RunConfig(BaseModel):
     # `agent_silent` threshold (FR-5.3): a healthy driver whose adapter child has
     # produced no output for longer than this is classified hung, not asleep.
     agent_silence_s: float = DEFAULT_AGENT_SILENCE_S
+    # Agent-liveness watchdog bound (issue #103): an in-flight CLI agent call
+    # silent past this AND whose recorded pid is provably gone is self-marked
+    # interrupted through the same FR-5.6 machinery `gauntlet recover` uses, so
+    # a dead-agent wedge converts into the normal interrupted → resume path.
+    # Silence alone never trips it (long silent-but-working turns are
+    # legitimate); ≤ 0 disables the watchdog entirely. Default 20 minutes.
+    agent_watchdog_silence_s: float = DEFAULT_AGENT_WATCHDOG_SILENCE_S
     # Keep the host awake for the driver's lifetime via `caffeinate -i` on darwin
     # (FR-5.4). Default false — changing host power behavior is an explicit human
     # choice (CLAUDE.md machine-state rule). Ignored (with a warning) off darwin.

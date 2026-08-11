@@ -55,6 +55,25 @@ DEFAULT_SUSPEND_CREDIT_CAP_S = 12 * 3600.0
 # A running step whose adapter child has produced no output for this long, on a
 # healthy driver with a continuous clock, is `agent_silent` (FR-5.3). Default 5m.
 DEFAULT_AGENT_SILENCE_S = 300.0
+# Agent-liveness watchdog bound (issue #103): an in-flight CLI agent call whose
+# output has been silent this long AND whose recorded pid is provably gone is
+# self-converted into the interrupted → resume path. Deliberately far above the
+# FR-5.3 advisory threshold: 40+ minute silent-but-working turns are normal and
+# legitimate, and silence alone NEVER trips the watchdog — this bound only
+# delays action once the agent process is already proven dead. ≤ 0 disables.
+DEFAULT_AGENT_WATCHDOG_SILENCE_S = 20 * 60.0
+# Watchdog poll cadence, and the confirmation window a provably-gone probe must
+# survive (re-observed gone, same call still in flight) before the trip fires —
+# so the benign instant between a child's exit and its waiter returning can
+# never race the trip (fail open).
+AGENT_WATCHDOG_POLL_S = 30.0
+AGENT_WATCHDOG_CONFIRM_S = 60.0
+# The run-instance sidecar recording the spawned agent's pid/pgid while a call
+# is in flight (issue #103, "data over inference"): operators get the real pid
+# to point forensics at — the agent is DETACHED from the driver's group, so
+# group-scoped `ps` proves nothing — and a future `recover` can kill the
+# recorded agent group instead of orphaning it.
+AGENT_PROCESS_FILENAME = "agent-process.json"
 
 # --- stall classifications (FR-5.3) ------------------------------------------
 STALL_HOST_SUSPENDED = "host_suspended"
@@ -554,3 +573,174 @@ class HeartbeatWriter:
             except FileNotFoundError:
                 pass
             raise
+
+
+# --- agent-liveness watchdog (issue #103) ------------------------------------
+class AgentLivenessWatchdog:
+    """A daemon thread that self-recovers a driver wedged on a vanished agent.
+
+    Issue #103, twice-observed: an agent-executing step's process/stream died
+    but the wait never returned — the driver blocked forever at 0% CPU while
+    ``status`` reported ``in_progress`` and the FR-5.3 classifier said
+    ``agent_silent``, which nothing acted on. A human had to run forensics and
+    apply ``gauntlet recover`` by hand. This watchdog converts that wedge into
+    the normal ``interrupted → resume`` path from INSIDE the driver.
+
+    It acts ONLY when every one of these holds, sampled together on each poll:
+
+    * a CLI agent call is in flight (:func:`adapters.process.active_agent_probe`);
+    * its output has been silent past ``silence_s`` (config
+      ``agent_watchdog_silence_s``, default 20 min);
+    * the RECORDED agent pid is provably gone
+      (:meth:`~gauntlet.adapters.process.AgentCallProbe.agent_gone` — child
+      reaped, or ``kill -0`` proves no such process). The agent runs DETACHED
+      in its own group, so driver-group emptiness / socket silence are NOT
+      evidence and are never consulted (the #103 second-occurrence false
+      positive);
+    * all of it re-observed, same call still in flight, across ``confirm_s``.
+
+    Everything else fails open — a silent-but-live agent (40+ minute working
+    turns are legitimate), an API-mode call (no subprocess, so liveness cannot
+    be disproven — no probe is ever registered), any probe error: the watchdog
+    keeps waiting, and a healthy long-running agent is never killed.
+
+    ``on_trip`` is invoked at most once, with the tripped probe (so the
+    action can re-verify the SAME call is still in flight); the RunManager
+    wires it to the same FR-5.6 machinery ``gauntlet recover`` applies from
+    outside, so every existing resume/recovery semantic holds unchanged.
+    ``record_path`` (optional) is the :data:`AGENT_PROCESS_FILENAME` sidecar
+    this thread keeps current — best-effort forensic data, never a safety
+    input.
+    """
+
+    def __init__(
+        self,
+        *,
+        silence_s: float,
+        on_trip: Callable[[object], object],
+        poll_s: float = AGENT_WATCHDOG_POLL_S,
+        confirm_s: float = AGENT_WATCHDOG_CONFIRM_S,
+        record_path: Path | None = None,
+        probe_source: "Callable[[], object | None] | None" = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.silence_s = silence_s
+        self.on_trip = on_trip
+        self.poll_s = poll_s
+        self.confirm_s = confirm_s
+        self.record_path = record_path
+        self._probe_source = probe_source or self._default_probe_source
+        self._mono = monotonic_clock
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._observed: object | None = None
+        self._gone_since: float | None = None
+        self._recorded_pid: int | None = None
+
+    @staticmethod
+    def _default_probe_source() -> "object | None":
+        # Imported lazily so the engine module graph never hard-couples to the
+        # adapter layer at import time (mirrors process.py's inverse import).
+        from gauntlet.adapters import process as P
+
+        return P.active_agent_probe()
+
+    # -- lifecycle -------------------------------------------------------------
+    def start(self) -> "AgentLivenessWatchdog":
+        self._thread = threading.Thread(
+            target=self._loop, name="gauntlet-agent-watchdog", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_s + 5.0)
+        self._clear_record()
+
+    def __enter__(self) -> "AgentLivenessWatchdog":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- internals -------------------------------------------------------------
+    def _loop(self) -> None:
+        while not self._stop.wait(self.poll_s):
+            self._poll_once()
+
+    def _poll_once(self) -> None:
+        """One watchdog observation; every uncertainty resets and fails open."""
+        if self._stop.is_set():
+            return  # stopped or already tripped — one-shot, never re-armed
+        try:
+            probe = self._probe_source()
+            self._record_probe(probe)
+            if probe is None or probe is not self._observed:
+                # No call in flight, or a NEW call since the last poll: start
+                # fresh — trip evidence never carries across attempts.
+                self._observed = probe
+                self._gone_since = None
+                return
+            if probe.silence_s() < self.silence_s or not probe.agent_gone():
+                self._gone_since = None
+                return
+            now = self._mono()
+            if self._gone_since is None:
+                self._gone_since = now  # first gone observation: arm, don't act
+                return
+            if now - self._gone_since < self.confirm_s:
+                return
+            # Confirmed: same call, silent past the bound, pid provably gone
+            # across the window. Re-read the registry once more so a call that
+            # concluded in the last instant stands the watchdog down.
+            if self._probe_source() is not probe:
+                self._observed = None
+                self._gone_since = None
+                return
+            self._stop.set()  # one-shot: never a second trip attempt
+            self.on_trip(probe)
+        except Exception:
+            # Fail open: an internal error must never trip, crash the thread,
+            # or count toward gone-ness.
+            self._gone_since = None
+
+    def _record_probe(self, probe: "object | None") -> None:
+        """Keep the ``agent-process.json`` sidecar current (best-effort)."""
+        if self.record_path is None:
+            return
+        try:
+            if probe is None:
+                self._clear_record()
+                return
+            pid = getattr(probe, "pid", None)
+            pgid = getattr(probe, "pgid", None)
+            if not isinstance(pid, int) or pid == self._recorded_pid:
+                return
+            import json
+
+            self.record_path.write_text(
+                json.dumps(
+                    {
+                        "pid": pid,
+                        "pgid": pgid if isinstance(pgid, int) else pid,
+                        "recorded_at": format_wallclock(
+                            datetime.now(timezone.utc)
+                        ),
+                    },
+                    indent=2,
+                )
+            )
+            self._recorded_pid = pid
+        except OSError:
+            pass  # forensic data only — never a reason to fail the watchdog
+
+    def _clear_record(self) -> None:
+        if self.record_path is None or self._recorded_pid is None:
+            return
+        try:
+            os.unlink(self.record_path)
+        except OSError:
+            pass
+        self._recorded_pid = None

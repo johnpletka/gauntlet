@@ -29,6 +29,7 @@ import os
 import selectors
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -58,6 +59,155 @@ _DEADLINE_POLL_S = 5.0
 # a cleanly-completing child. Kept small so it never materially loosens the hard
 # timeout (FR-3.3) — a child that stays alive past it is a genuine post-EOF hang.
 _REAP_GRACE_S = 0.5
+
+
+# --- in-flight agent-call probe (issue #103) ---------------------------------
+# The engine's agent-liveness watchdog (engine/heartbeat.py) needs two live
+# observables for the CLI call currently in flight: how long since the child
+# last produced output, and whether the RECORDED child pid still exists. The
+# child is spawned with ``start_new_session=True`` — it runs DETACHED in its
+# own process group, so nothing group- or socket-scoped on the DRIVER can ever
+# be evidence about the agent (the issue #103 second-occurrence false positive:
+# a healthy detached builder looks exactly like a dead one from the driver's
+# group). Registered here — the one chokepoint every CLI invocation passes
+# through — as a single process-global slot, mirroring the heartbeat's
+# active-writer registry: only one driver runs per process (the worktree lock
+# guarantees it) and the adapters run agent calls sequentially, so one slot is
+# sufficient and there is no cross-run leakage.
+_probe_lock = threading.Lock()
+_active_probe: "AgentCallProbe | None" = None
+
+
+class AgentCallProbe:
+    """Live observables of one in-flight CLI agent invocation (issue #103).
+
+    ``pid``/``pgid`` are the spawned child's — with ``start_new_session=True``
+    the child is its own session and group leader, so ``pgid == pid`` by
+    construction and no post-spawn ``getpgid`` race exists. ``touch()`` is
+    called by the streaming reader on every stdout/stderr chunk; the buffered
+    path cannot observe output incrementally, so its silence age runs from
+    spawn — which only makes the watchdog MORE conservative (silence is a
+    necessary, never sufficient, trip condition).
+    """
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        *,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._proc = proc
+        self.pid = proc.pid
+        self.pgid = proc.pid  # start_new_session=True: the child leads its group
+        self._mono = monotonic_clock
+        now = monotonic_clock()
+        self.started_monotonic = now
+        self._output_lock = threading.Lock()
+        self._last_output = now
+
+    def touch(self) -> None:
+        """Record that the child just produced output (any stdout/stderr bytes)."""
+        with self._output_lock:
+            self._last_output = self._mono()
+
+    def silence_s(self) -> float:
+        """Seconds since the child last produced observable output (or spawned)."""
+        with self._output_lock:
+            return max(0.0, self._mono() - self._last_output)
+
+    def agent_gone(self) -> bool:
+        """True ONLY when the agent is provably gone: pid dead AND group empty.
+
+        Two conditions, BOTH required (each strictly narrows, never widens):
+
+        * the recorded pid no longer exists — a non-blocking ``poll()`` that
+          has reaped the child (we hold the exit status), or ``kill -0``
+          failing with ``ProcessLookupError`` (a zombie still holds its pid,
+          so ESRCH means dead AND reaped);
+        * the agent's OWN process group is empty — ``killpg -0`` on the
+          child's group (it leads its own group) raising
+          ``ProcessLookupError``: a forked worker still in the group may be
+          doing the real work while holding the output pipes, so a dead
+          leader alone is not proof the attempt is unowned.
+
+        Everything else fails open to "not provably gone": a live child, an
+        unreaped zombie, a lock-contended ``poll`` (the waiting caller is
+        about to consume the exit), a permission error, a recycled pid, a
+        surviving group member. The DRIVER's group membership and socket
+        state are deliberately NOT consulted — the child is detached by
+        construction, so their absence is not evidence (issue #103, second
+        occurrence reclassified: a healthy detached builder looks exactly
+        like a dead one from the driver's group).
+        """
+        gone = False
+        try:
+            # Reap-if-reapable (non-blocking; a lock held by a concurrently
+            # waiting caller makes this a no-op) so a dead child cannot linger
+            # unreaped forever when the waiter itself is the wedged party.
+            gone = self._proc.poll() is not None
+        except OSError:
+            return False
+        if not gone:
+            try:
+                os.kill(self.pid, 0)
+                return False  # pid exists (live or zombie) → not provably gone
+            except ProcessLookupError:
+                gone = True
+            except OSError:
+                return False  # unprovable (EPERM etc.) → fail open
+        try:
+            os.killpg(self.pgid, 0)
+            return False  # a group member survives (worker/straggler) → fail open
+        except ProcessLookupError:
+            return True  # pid dead AND its whole group gone: provably unowned
+        except OSError:
+            return False
+
+    def kill_group(self) -> None:
+        """Best-effort SIGKILL of the agent's own (detached) process group.
+
+        The termination-path counterpart of the detached spawn (issue #103):
+        a driver that is being torn down must take its spawned agent's group
+        with it, or the orphaned agent keeps editing the tree and collides
+        with the builder the next resume spawns. Swallows every error — the
+        group being already gone is the common case.
+        """
+        try:
+            os.killpg(self.pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _register_probe(proc: subprocess.Popen) -> AgentCallProbe:
+    global _active_probe
+    probe = AgentCallProbe(proc)
+    with _probe_lock:
+        _active_probe = probe
+    return probe
+
+
+def _clear_active_probe() -> None:
+    global _active_probe
+    with _probe_lock:
+        _active_probe = None
+
+
+def active_agent_probe() -> AgentCallProbe | None:
+    """The probe for the CLI agent call currently in flight, or ``None``."""
+    with _probe_lock:
+        return _active_probe
+
+
+def kill_active_agent_group() -> None:
+    """SIGKILL the in-flight agent call's detached process group, if any.
+
+    Called from the driver's termination paths (the SIGTERM forwarder the
+    drive installs, and the watchdog's self-interrupt) so a detached agent
+    never outlives the driver that spawned it (issue #103).
+    """
+    probe = active_agent_probe()
+    if probe is not None:
+        probe.kill_group()
 
 
 @dataclass(frozen=True)
@@ -118,21 +268,28 @@ def run_with_timeout(
     from gauntlet.engine.heartbeat import build_active_deadline
 
     deadline = build_active_deadline(timeout_s)
-    if sink is None:
-        return _run_buffered(
-            argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
-            deadline=deadline, preexec_fn=preexec_fn,
+    # The in-flight probe (issue #103) is registered by each path right after
+    # its Popen and cleared here unconditionally, so no exit — return, timeout,
+    # sink fault, unexpected reader error — can leave a stale probe behind for
+    # the agent-liveness watchdog to misread as a still-in-flight call.
+    try:
+        if sink is None:
+            return _run_buffered(
+                argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
+                deadline=deadline, preexec_fn=preexec_fn,
+            )
+        return _run_streaming(
+            argv,
+            timeout_s=timeout_s,
+            stdin_text=stdin_text,
+            cwd=cwd,
+            env=env,
+            sink=sink,
+            deadline=deadline,
+            preexec_fn=preexec_fn,
         )
-    return _run_streaming(
-        argv,
-        timeout_s=timeout_s,
-        stdin_text=stdin_text,
-        cwd=cwd,
-        env=env,
-        sink=sink,
-        deadline=deadline,
-        preexec_fn=preexec_fn,
-    )
+    finally:
+        _clear_active_probe()
 
 
 def _run_buffered(
@@ -165,6 +322,7 @@ def _run_buffered(
         start_new_session=True,  # own process group, so killpg reaps children
         preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
     )
+    _register_probe(proc)  # issue #103: expose the recorded child pid live
     if deadline is None:
         try:
             stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
@@ -272,6 +430,7 @@ def _run_streaming(
         start_new_session=True,
         preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
     )
+    probe = _register_probe(proc)  # issue #103: recorded child pid + output age
 
     # Raw byte buffers, maintained independently of the line sink: every byte
     # read is appended here regardless of newline framing, so a trailing
@@ -360,6 +519,7 @@ def _run_streaming(
                 pass
             open_tags.discard(key.data)
             return
+        probe.touch()  # any stdout/stderr bytes are agent liveness (issue #103)
         if key.data == "stdout":
             raw_stdout.extend(chunk)
             line_buf.extend(chunk)

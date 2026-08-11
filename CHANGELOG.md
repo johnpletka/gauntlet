@@ -6,6 +6,31 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+**The driver now self-recovers from a vanished agent (#103).** Twice on run
+`job-platform-base` an agent-executing step's process died but the wait never
+returned: the driver blocked forever at 0% CPU while `status` reported
+`in_progress` and the FR-5.3 classifier said `agent_silent`, which nothing
+acted on — a human had to run `ps` forensics and apply §4 `recover` by hand.
+An agent-liveness watchdog now rides every drive segment (including the
+approve/reject drives): while a CLI agent call is in flight it polls the
+call's recorded child pid, and only when the output has been silent past
+`agent_watchdog_silence_s` (default 20 min; ≤ 0 disables) AND the agent is
+*provably* gone (pid dead — reaped or `kill -0` ESRCH — AND its own process
+group empty, so a forked worker still owning the attempt fails open),
+re-confirmed on the same call across a grace window, does it self-mark the
+step INTERRUPTED through the exact FR-5.6 machinery `gauntlet recover` uses
+(durable intent → §6.4 record → lock release) and terminate the driver — so
+the wedge converts into the normal `interrupted → resume` path. Everything
+uncertain fails open: silence alone never trips it (40+ minute
+silent-but-working turns are legitimate), and the agent runs DETACHED in its
+own process group, so driver-group emptiness / driver-socket silence are never
+consulted (the #103 second-occurrence false positive). The in-flight agent's
+pid/pgid are recorded in the run dir (`agent-process.json`) for forensics, a
+SIGTERM'd driver now takes its detached agent's group with it (no more
+orphaned builder colliding with the next resume's builder), and `recover`
+reports the composite state it produced (`interrupted`) instead of the raw
+manifest status (`failed`) — papercut 1 of #103.
+
 ## [1.0.8] — 2026-08-08
 
 **Recover, rollback, and the interrupted park now reconcile a branch left
