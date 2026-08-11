@@ -280,6 +280,13 @@ class Orchestrator:
         Idempotent and resumable: steps already ``done``/``skipped`` in the
         manifest are not re-run. Returns the resulting run status.
         """
+        restore_sigterm = self._install_sigterm_flush()
+        try:
+            return self._drive_inner()
+        finally:
+            restore_sigterm()
+
+    def _drive_inner(self) -> str:
         # Flush the latest response step's checkpoint against the PRE-DRIVE
         # persisted state FIRST (crash recovery, FR-7.1/F-002) — before the
         # RUNNING write-ahead dirties the manifest. P4: the terminal persist
@@ -320,6 +327,65 @@ class Orchestrator:
             # the identical fingerprint and exits nonzero through the R5
             # no-progress guard instead of looping.
             return self._park_plan_artifact_invalid(exc)
+
+    def _install_sigterm_flush(self) -> Callable[[], None]:
+        """Best-effort SIGTERM bookkeeping flush for the drive (#95, fix 4).
+
+        A driver killed by a shell timeout's SIGTERM used to die with its last
+        in-memory manifest delta (a re-armed ``base_sha``, cycle checkpoints,
+        response state) unflushed — the seed of the #95 chain: the next plain
+        resume compared against a stale attempt boundary and read the cycle's
+        own committed rounds as dirt. During a drive, SIGTERM now best-effort
+        persists the manifest and then dies by the DEFAULT consequence:
+
+        * the flush is ``write_atomic`` — atomic + journaled; an event file
+          torn by the interrupted outer persist is quarantined by the journal,
+          so the handler's own append can never corrupt state;
+        * the signal is never swallowed: the handler restores ``SIG_DFL`` and
+          re-raises SIGTERM against this process, so it still dies with the
+          signal exit status;
+        * no locks are held across it: the manifest/journal writes take none,
+          and the drive locks are reclaimed by liveness detection exactly as
+          on any other death.
+
+        Installed only in the main thread and only over the DEFAULT
+        disposition — a host's custom handler or an inherited ``SIG_IGN`` is
+        never stomped. Returns the restore callable for the drive's finally.
+        """
+        import signal as _signal
+        import threading
+
+        _noop = lambda: None  # noqa: E731 — trivial restore for every bail-out
+        if threading.current_thread() is not threading.main_thread():
+            return _noop
+        try:
+            prior = _signal.getsignal(_signal.SIGTERM)
+        except (ValueError, OSError):  # pragma: no cover — exotic embedding
+            return _noop
+        if prior is not _signal.SIG_DFL:
+            return _noop  # never stomp a custom handler / SIG_IGN
+
+        def _flush_and_die(signum: int, frame: Any) -> None:
+            try:
+                self._persist()
+            except Exception:  # noqa: BLE001 — dying is the contract
+                pass  # the flush is best-effort; never mask the termination
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            os.kill(os.getpid(), _signal.SIGTERM)
+
+        try:
+            _signal.signal(_signal.SIGTERM, _flush_and_die)
+        except (ValueError, OSError):  # pragma: no cover — race with embed
+            return _noop
+
+        def _restore() -> None:
+            try:
+                if _signal.getsignal(_signal.SIGTERM) is _flush_and_die:
+                    _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            except (ValueError, OSError):  # pragma: no cover
+                pass
+
+        return _restore
 
     def _park_plan_artifact_invalid(self, exc: PlanPhasesError) -> str:
         """Park a malformed plan.md phase list as ``artifact_invalid`` (§5.1, P5).
@@ -892,6 +958,34 @@ class Orchestrator:
         ) or step.type == "adversarial_cycle"
         if not is_agent_write:
             return None
+        # #95 (defect C): a cycle killed in the checkpoint-less window (e.g. a
+        # `--response` re-drive killed right after `_Resume.invalidate()`
+        # cleared the checkpoints) still has its committed round commits
+        # recorded in manifest.commits. Those rounds are finished, manifested
+        # work — never this attempt's dirt — but a stale base_sha (stamped at
+        # the run base) makes the dirty check below read them as a mid-edit
+        # interruption, insta-re-parking forever. Adopt: re-arm the attempt
+        # boundary at the newest manifested round commit BEFORE judging dirt,
+        # mirroring the #62/#65 bookkeeping tolerance and the checkpoint_ahead
+        # adoption in reconcile_branch_ahead (whose non-agent_task deferral
+        # assumed the step-owned mechanisms cover this — they cannot when the
+        # checkpoints are empty).
+        if step.type == "adversarial_cycle":
+            adopted = RX.latest_cycle_round_commit(
+                self.work_root, self.manifest, rec,
+                tip=gitops.head_sha(self.work_root),
+            )
+            if adopted is not None and adopted != rec.base_sha:
+                note = (
+                    f"resume: adopted committed cycle round {adopted[:10]} as "
+                    f"the attempt boundary for {rec.id} — round commits "
+                    "recorded in the manifest above the stale base are "
+                    "committed work, not the interrupted attempt's dirt (#95; "
+                    "mirrors the #62/#65 tolerance and checkpoint adoption)"
+                )
+                if note not in self.manifest.warnings:
+                    self.manifest.warnings.append(note)
+                rec.base_sha = adopted
         # Detect partial work against the narrow bookkeeping exclusion, so a
         # partial *artifact* under the run root (not just a repo-root file) is
         # still seen as a mid-edit interruption (review F-001).
@@ -925,6 +1019,14 @@ class Orchestrator:
             target, checkpoint_subject = self._checkpoint_rewind_target(
                 rec, self._expected_phase(step, item)
             )
+            # #95 (defect B): validate BEFORE applying — a reset that strands
+            # any rewind target the cycle's recorded state still references
+            # turns the NEXT drive into a terminal adapter_error after minutes
+            # of agent work. Refuse up front instead: nothing mutated, no
+            # snapshot consumed, run still parked and drivable.
+            refusal = self._refuse_reset_with_dangling_cycle_targets(rec, target)
+            if refusal is not None:
+                return refusal
             rec.resumed_from_checkpoint = checkpoint_subject
             # Flush the authoritative in-memory manifest to disk BEFORE the
             # rewind, so the bookkeeping the rewind preserves carries the latest
@@ -1019,6 +1121,74 @@ class Orchestrator:
                 + self._dirty_verdict_detail(rec.base_sha)
             ),
         )
+
+    def _refuse_reset_with_dangling_cycle_targets(
+        self, rec: StepRecord, target: str
+    ) -> StepResult | None:
+        """Fail-closed backstop for #95 (defect B): validate BEFORE applying.
+
+        A reset on an ``adversarial_cycle`` step must leave every rewind
+        target the cycle's recorded state still references — each recorded
+        checkpoint's ``handoff_sha`` and ``result_sha``, and the last
+        manifested round commit (the ``--response`` round base) — an ancestor
+        of (or equal to) the intended post-reset tip. A stranded target makes
+        the NEXT drive burn agent time and then die terminal on "rewind
+        target X is not an ancestor of the tip" with no verb that can ever
+        advance the run. Refuse up front instead, naming the offending sha
+        and the alternatives, with nothing mutated and no snapshot consumed —
+        the run stays parked and drivable. With the cycle-aware target
+        selection in :meth:`_checkpoint_rewind_target` this refusal should be
+        unreachable in the #95 shape; it is the backstop, not the mechanism.
+        """
+        if rec.type != "adversarial_cycle":
+            return None
+        recorded: dict[str, str] = {}
+        for cp in rec.checkpoints:
+            if cp.handoff_sha:
+                recorded.setdefault(
+                    cp.handoff_sha,
+                    f"checkpoint r{cp.round}-{cp.sub_step} handoff_sha",
+                )
+            if cp.result_sha:
+                recorded.setdefault(
+                    cp.result_sha,
+                    f"checkpoint r{cp.round}-{cp.sub_step} result_sha",
+                )
+        last_round = None
+        for commit in self.manifest.commits:
+            if commit.step_id == rec.id:
+                last_round = commit
+        if last_round is not None:
+            recorded.setdefault(
+                last_round.sha,
+                f"manifested round commit {last_round.phase} "
+                "(the response round base)",
+            )
+        for sha, origin in recorded.items():
+            try:
+                ok = sha == target or gitops.is_ancestor(
+                    self.work_root, sha, target
+                )
+            except gitops.GitError:
+                ok = False  # unprovable ancestry refuses, never assumes
+            if not ok:
+                return StepResult(
+                    status=INTERRUPTED,
+                    halt_reason=M.HALT_REASON_PRECONDITION,
+                    notes=(
+                        "reset refused fail-closed before any mutation (#95): "
+                        f"the cycle's recorded rewind target {sha[:10]} "
+                        f"({origin}) would not survive a reset to "
+                        f"{target[:10]} — applying it would strand the "
+                        "target and the next drive would fail terminally "
+                        "mid-cycle. Nothing was mutated and no snapshot was "
+                        "consumed; the run stays parked and drivable: plain "
+                        f"`gauntlet resume {self.manifest.slug}` re-enters "
+                        "the cycle through its own recovery, or `gauntlet "
+                        f"abort {self.manifest.slug}` preserves all evidence."
+                    ),
+                )
+        return None
 
     def _apply_recovery_rewind(
         self,
@@ -1156,7 +1326,17 @@ class Orchestrator:
             porcelain = gitops.status_porcelain(self.work_root, exclude=self.excludes)
             if porcelain:
                 parts.append(f"uncommitted changes:\n{porcelain}")
-            head = gitops.head_sha(self.work_root)
+            # #95 (defect C): anchor the evidence on the bookkeeping-skipped
+            # head. Each resume's reconcile flush stamps a `gauntlet:` commit,
+            # so raw-HEAD notes differ bytewise on every identical re-park —
+            # the R5 fingerprint's notes plane then reads "progress" forever
+            # and the no-progress guard never fires (exit 0, another
+            # bookkeeping commit, repeat). Skipping the engine's own commits
+            # makes an identical re-park produce byte-identical notes; the
+            # git/index planes are already bookkeeping-blind.
+            head = RX.skip_engine_bookkeeping_commits(
+                self.work_root, gitops.head_sha(self.work_root)
+            )
             if head != base_sha:
                 rng = gitops.log_range(self.work_root, base_sha, head)
                 parts.append(
@@ -1991,7 +2171,33 @@ class Orchestrator:
         Falls back to ``(base_sha, None)`` when the phase landed no checkpoint —
         today's reset-to-base behavior. Only reached with a non-null ``base_sha``
         (the caller guards it).
+
+        #95 (defect A): an ``adversarial_cycle`` step's checkpoint analog is
+        its committed round commits (``PRD.n:``/``P<N>.n: Address review``,
+        and the artifact baseline) — none of which match the ``P<N> wip:``
+        subject shape, so the generic discovery degenerated to "reset to the
+        run base", discarding every committed round and stranding the cycle's
+        recorded rewind targets. Cycle steps therefore target the newest
+        committed round commit recorded for THIS step (``manifest.commits`` /
+        checkpoint ``result_sha``/``handoff_sha`` — the manifest entries
+        survive even when ``_Resume.invalidate()`` cleared the checkpoints,
+        the exact #95 window), with base_sha as the no-round-ever-committed
+        fallback.
         """
+        if rec.type == "adversarial_cycle":
+            sha = RX.latest_cycle_round_commit(
+                self.work_root, self.manifest, rec,
+                tip=gitops.head_sha(self.work_root),
+            )
+            if sha is not None:
+                try:
+                    subject: str | None = gitops.commit_subject(
+                        self.work_root, sha
+                    )
+                except gitops.GitError:
+                    subject = None
+                return sha, subject
+            return rec.base_sha, None
         wips = gitops.wip_checkpoints(self.work_root, base=rec.base_sha, phase=phase)
         if wips:
             sha, subject = wips[0]  # newest first
