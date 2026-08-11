@@ -6,6 +6,16 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-08-11
+
+This release hardens long-running agent recovery and closes the remaining
+release-blocking failures found by the `job-platform-base` dogfood run. Vanished
+agents, interrupted cycles, governed-artifact publication, commit-message
+sanitization, and human-authorized FR-10.4 resumes now converge through explicit,
+auditable recovery paths instead of wedging or silently losing state.
+
+### Fixed
+
 - A vanished CLI agent now exits the adapter wait through the existing
   interrupted/resume path, with proof-gated process-group checks, agent-silence
   status evidence, and truthful `recover` state output (#103 / PR #113).
@@ -22,6 +32,9 @@ All notable changes to Gauntlet are recorded here. The format follows
 - A human-approved FR-10.4 response now consumes the same prior finding-root and
   upstream-target question after the response-disposition gate says to proceed;
   a different root or artifact still re-parks fail-closed (#106).
+
+### Tests and documentation
+
 - The full live-pipeline test now resolves bounded FR-10.4 variance through the
   public response workflow and treats a proven plain-resumable provider/quota
   park as environment variance rather than an engine failure (#116).
