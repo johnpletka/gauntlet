@@ -987,6 +987,71 @@ class Identity:
 ENGINE_IDENTITY = Identity(name="Gauntlet Engine", email="engine@gauntlet.local")
 
 
+# --- commit-message byte hygiene (#105) ---------------------------------------
+#
+# The commit message is the one model-authored value that reaches git (on
+# stdin, via ``-F -``), and git hard-rejects a NUL byte in a log message
+# (exit 128: "a NUL byte in commit log message not allowed"). A drafted
+# message containing a literal 0x00 failed the commit step `adapter_error`
+# and stranded the finished fix round uncommitted (#105). Sanitize at this
+# single choke point, before the message is piped to git: NUL becomes the
+# readable escape ``\x00`` so the stored message still reads sensibly,
+# CR/CRLF normalize to LF, and the remaining C0 controls (plus DEL) become
+# readable escapes too — git tolerates those, but they scramble logs.
+# TAB and LF pass through untouched.
+_CTRL_ESCAPES = {
+    i: f"\\x{i:02x}" for i in range(0x20) if i not in (0x09, 0x0A)
+}
+_CTRL_ESCAPES[0x7F] = "\\x7f"
+
+
+def _sanitize_commit_message(message: str) -> str:
+    """Replace control bytes a drafted message must never carry into git.
+
+    CRLF/CR normalize to LF first; every other C0 control (and DEL) except
+    TAB/LF is replaced with its readable ``\\xNN`` escape. Printable text —
+    including non-ASCII — is untouched.
+    """
+    message = message.replace("\r\n", "\n").replace("\r", "\n")
+    return message.translate(_CTRL_ESCAPES)
+
+
+def _ascii_printable_message(message: str) -> str:
+    """Aggressive last-resort redraft: printable ASCII + LF only (#105).
+
+    Every other character becomes ``?``. Only used when git rejects a message
+    that already passed :func:`_sanitize_commit_message` — landing the
+    finished work with a flattened message beats failing the step with the
+    work stranded uncommitted.
+    """
+    return "".join(
+        ch if ch == "\n" or 0x20 <= ord(ch) <= 0x7E else "?" for ch in message
+    )
+
+
+def _commit_stdin(repo: Path, args: list[str], message: str) -> None:
+    """Pipe a sanitized commit message to a fixed ``git commit -F -`` argv.
+
+    Belt and braces (#105): if git still rejects the sanitized message
+    (a byte sequence the sanitizer did not anticipate), retry ONCE with the
+    aggressively-flattened redraft instead of failing the step with the
+    completed work stranded. The retry fires only when the failure looks like
+    a log-message rejection AND the redraft actually differs; every other
+    failure (nothing staged, hooks, locks) re-raises unchanged.
+    """
+    msg = _sanitize_commit_message(message)
+    try:
+        _run(repo, *args, stdin=msg)
+    except GitError as err:
+        fallback = _ascii_printable_message(msg)
+        rejected_message = err.returncode == 128 and (
+            "log message" in err.stderr or "NUL" in err.stderr
+        )
+        if fallback == msg or not rejected_message:
+            raise
+        _run(repo, *args, stdin=fallback)
+
+
 def commit_all(
     repo: Path,
     message: str,
@@ -1013,7 +1078,7 @@ def commit_all(
     ]
     if allow_empty:
         args.append("--allow-empty")
-    _run(repo, *args, stdin=message)
+    _commit_stdin(repo, args, message)
     return head_sha(repo)
 
 
@@ -1041,7 +1106,7 @@ def commit_paths(
         "-c", f"user.email={identity.email}",
         "commit", "-F", "-", "--", *paths,
     ]
-    _run(repo, *args, stdin=message)
+    _commit_stdin(repo, args, message)
     return head_sha(repo)
 
 
@@ -1070,7 +1135,7 @@ def commit_run_bookkeeping(
         "-c", f"user.email={identity.email}",
         "commit", "-F", "-", "--", *paths,
     ]
-    _run(repo, *args, stdin=message)
+    _commit_stdin(repo, args, message)
     return head_sha(repo)
 
 
@@ -1124,7 +1189,7 @@ def commit_tracked_bookkeeping(
         "-c", f"user.email={identity.email}",
         "commit", "-F", "-", "--", *tracked,
     ]
-    _run(repo, *args, stdin=message)
+    _commit_stdin(repo, args, message)
     return head_sha(repo)
 
 
