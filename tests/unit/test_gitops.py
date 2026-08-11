@@ -515,3 +515,88 @@ def test_dirty_paths_honours_exclude(fixture_repo):
     (fixture_repo / "code.py").write_text("x = 1\n")
 
     assert gitops.dirty_paths(fixture_repo, exclude=["runs"]) == ["code.py"]
+
+
+# --- commit-message byte hygiene (#105) ---------------------------------------
+
+
+def test_commit_all_sanitizes_nul_byte_in_message(fixture_repo):
+    """A drafted message carrying a literal 0x00 must still commit (#105).
+
+    git hard-rejects a NUL in the log message (exit 128: "a NUL byte in commit
+    log message not allowed"), which failed the commit step `adapter_error` and
+    stranded a finished fix round uncommitted. The stdin choke point now
+    replaces the NUL with the readable escape ``\\x00`` before the message
+    reaches ``commit -F -``.
+    """
+    (fixture_repo / "f.py").write_text("code\n")
+    message = (
+        "P3.1: Address review — NUL handling\n"
+        "\n"
+        "Describes a literal \x00 byte in prose.\n"
+    )
+    sha = gitops.commit_all(
+        fixture_repo, message, identity=Identity("Builder", "b@g.local")
+    )
+    stored = gitops._run(fixture_repo, "log", "-1", "--format=%B", sha)
+    assert "\x00" not in stored
+    assert "Describes a literal \\x00 byte in prose." in stored
+    # Printable text — including the non-ASCII em dash — is untouched.
+    assert gitops.commit_subject(fixture_repo, sha) == (
+        "P3.1: Address review — NUL handling"
+    )
+
+
+def test_commit_all_normalizes_cr_to_lf(fixture_repo):
+    """CRLF/CR in a drafted message normalize to LF at the same choke point."""
+    (fixture_repo / "g.py").write_text("code\n")
+    sha = gitops.commit_all(
+        fixture_repo,
+        "P1: crlf message\r\n\r\nBody line one.\r\nBody line two.\rEnd.\n",
+        identity=Identity("Builder", "b@g.local"),
+    )
+    # Bytes, not text: _run's text mode would itself translate \r\n on read,
+    # making a CR assertion vacuous.
+    stored = gitops._run_bytes(fixture_repo, "log", "-1", "--format=%B", sha)
+    assert b"\r" not in stored
+    assert b"Body line one.\nBody line two.\nEnd." in stored
+
+
+def test_commit_retries_once_with_flattened_redraft_on_git_rejection(
+    fixture_repo, monkeypatch
+):
+    """Belt and braces (#105): a byte the sanitizer missed must not strand work.
+
+    Simulated by disabling the first-pass sanitizer so a raw NUL genuinely
+    reaches git and git genuinely rejects it (exit 128). The single retry must
+    land the commit with the printable-ASCII redraft instead of failing the
+    step with the finished changes uncommitted.
+    """
+    monkeypatch.setattr(gitops, "_sanitize_commit_message", lambda m: m)
+    (fixture_repo / "h.py").write_text("code\n")
+    sha = gitops.commit_all(
+        fixture_repo,
+        "P1: nul \x00 survived sanitize\n\nBody — with a dash.\n",
+        identity=Identity("Builder", "b@g.local"),
+    )
+    stored = gitops._run_bytes(fixture_repo, "log", "-1", "--format=%B", sha)
+    assert b"\x00" not in stored
+    # Aggressive redraft: NUL and the non-ASCII dash both flattened to "?".
+    assert b"P1: nul ? survived sanitize" in stored
+    assert b"Body ? with a dash." in stored
+
+
+def test_unrelated_git_failure_is_not_masked_by_the_redraft_retry(fixture_repo):
+    """Only a log-message rejection triggers the redraft retry.
+
+    A clean tree (nothing to commit) with a non-ASCII message must still raise
+    GitError — not silently land a flattened surprise commit.
+    """
+    before = gitops.head_sha(fixture_repo)
+    with pytest.raises(gitops.GitError):
+        gitops.commit_all(
+            fixture_repo,
+            "P1: nothing staged — clean tree\n\nBody.\n",
+            identity=Identity("Builder", "b@g.local"),
+        )
+    assert gitops.head_sha(fixture_repo) == before
