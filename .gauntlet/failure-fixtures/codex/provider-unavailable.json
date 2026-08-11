@@ -1,0 +1,7 @@
+{
+  "events": [
+    {"type": "thread.started", "thread_id": "th_mno345"},
+    {"type": "turn.started"},
+    {"type": "error", "message": "Reconnecting... 2/5 (unexpected status 503 Service Unavailable)"}
+  ]
+}

@@ -259,6 +259,37 @@ def test_overload_message_classified_transient(monkeypatch):
     assert excinfo.value.failure_info.kind == "transient_overload"
 
 
+def test_transport_503_agent_error_event_classified_transient(monkeypatch):
+    # Issue #96 live shape: codex's websocket retry loop gave up against an
+    # upstream 503 and surfaced it as an agent error EVENT carrying a bare
+    # `message` (no `error` sub-object). That is provider unavailability —
+    # transient_dependency, routed to the persisted retry budget and the R7
+    # provider_unavailable park — never terminal/unmatched.
+    events = [
+        {"type": "thread.started", "thread_id": THREAD_ID},
+        {"type": "turn.started"},
+        {"type": "error",
+         "message": "Reconnecting... 2/5 (unexpected status 503 "
+                    "Service Unavailable)"},
+    ]
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    info = excinfo.value.failure_info
+    assert info is not None and info.kind == "transient_dependency"
+    assert info.marker == "codex_provider_unavailable_message"
+
+
+def test_connection_reset_classified_transient(monkeypatch):
+    events = _failed_events(
+        {"message": "stream disconnected: connection reset by peer"}
+    )
+    patch_run(monkeypatch, fake_output(events))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    assert excinfo.value.failure_info.kind == "transient_dependency"
+
+
 def test_unlisted_error_classified_terminal(monkeypatch):
     events = _failed_events({"message": "disk full writing scratch file"})
     patch_run(monkeypatch, fake_output(events))
