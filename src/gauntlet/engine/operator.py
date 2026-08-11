@@ -476,19 +476,24 @@ def _decide_reject(slug: str, *, gate_cycle_id: str | None = None) -> Action:
     # `--notes` is a flag with no value here; the operator supplies the reason,
     # so the action is non-executable and `command` carries a placeholder.
     # FR-8.2 consequence: a reject downstream of an adversarial_cycle injects the
-    # notes into that cycle and re-runs it (reject_gate); with no upstream cycle to
-    # iterate it is a terminal reject.
+    # notes into that cycle and re-runs it (reject_gate); with no upstream cycle
+    # to iterate it is a terminal reject, which is refused unless the explicit
+    # `--terminal` flag is given (#98) — the annotation IS the footgun warning.
     if gate_cycle_id:
         consequence = (
             f"re-runs the '{gate_cycle_id}' adversarial cycle with your notes "
             "injected as a new round"
         )
+        command = f'gauntlet reject {slug} --notes "<your reason>"'
     else:
-        consequence = "terminally rejects the gate (no upstream cycle to re-run)"
+        consequence = (
+            "TERMINALLY fails the run (no upstream cycle to re-run — the notes "
+            "are not injected anywhere); refused without the explicit "
+            "--terminal flag"
+        )
+        command = f'gauntlet reject {slug} --notes "<your reason>" --terminal'
     return Action("reject", "decide", ["gauntlet", "reject", slug, "--notes"],
-                  ["notes"], False,
-                  f'gauntlet reject {slug} --notes "<your reason>"',
-                  consequence=consequence)
+                  ["notes"], False, command, consequence=consequence)
 
 
 def _decide_resume_response(slug: str) -> Action:
@@ -1283,8 +1288,9 @@ def compute_run_state(
     authoritative resolution is over the run's *pipeline snapshot* (same rule as
     ``Orchestrator._upstream_cycle_for_gate``), so the I/O-bearing caller resolves
     it via :func:`gauntlet.engine.pipeline.upstream_cycle_id_for_gate` and threads
-    it in — passing ``None`` when a reject is terminal (a foreach gate, or a gate
-    with no same-stage cycle). Left unset, this function falls back to a pure
+    it in — passing ``None`` when a reject is terminal (a gate with no same-stage
+    cycle; foreach gates resolve like any other since #98). Left unset, this
+    function falls back to a pure
     manifest-order heuristic (``_upstream_cycle_record``) so pure/no-pipeline
     callers still get a shaped consequence; the CLI/web always resolve from the
     pipeline so their surfaces name the cycle a reject *actually* re-runs (F-001).
@@ -2137,16 +2143,23 @@ def _resolve_upstream_cycle(
     """The cycle record a gate ratifies, resolved for a content-bearing surface.
 
     With a ``pipeline`` snapshot, resolve the cycle *id* by the same rule the
-    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
-    stage) and return that manifest record, so the gate context names exactly the
-    cycle a reject re-runs (F-001). A foreach gate / a gate with no same-stage
-    cycle resolves to ``None`` (terminal reject, no convergence to show). Without
-    a snapshot, fall back to the pure manifest-order heuristic (fail-soft)."""
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same stage, foreach
+    included since #98) and return the manifest record at the GATE's own
+    iteration (the one a reject re-arms), so the gate context names exactly the
+    cycle a reject re-runs (F-001). A gate with no same-stage cycle resolves to
+    ``None`` (terminal reject, no convergence to show). Without a snapshot, fall
+    back to the pure manifest-order heuristic (fail-soft)."""
     if pipeline is None:
         return _upstream_cycle_record(man, gate_rec)
     cyc_id = upstream_cycle_id_for_gate(pipeline, gate_rec.id)
     if cyc_id is None:
         return None
+    same_iter = next(
+        (r for r in man.steps
+         if r.id == cyc_id and r.iteration == gate_rec.iteration), None
+    )
+    if same_iter is not None:
+        return same_iter
     return next((r for r in man.steps if r.id == cyc_id), None)
 
 
@@ -2346,10 +2359,10 @@ def compute_gate_context(
 
     ``pipeline`` is the run's pipeline snapshot (loaded by the I/O-bearing
     caller). When given, the upstream cycle is resolved by the *same* rule the
-    reject path re-drives (``upstream_cycle_id_for_gate`` — same non-``foreach``
-    stage), so ``cycle_step_id`` names the cycle a reject actually re-runs and
-    never a cross-stage/foreach cycle it does not (F-001). Absent a snapshot it
-    falls back to the pure manifest-order heuristic (fail-soft).
+    reject path re-drives (``upstream_cycle_id_for_gate`` — same stage, foreach
+    included since #98), so ``cycle_step_id`` names the cycle a reject actually
+    re-runs and never a cross-stage cycle it does not (F-001). Absent a snapshot
+    it falls back to the pure manifest-order heuristic (fail-soft).
 
     ``redaction`` is the run's configured redaction list (``RunConfig.redaction``).
     It must be threaded through: with it omitted, a secret whose env-var name

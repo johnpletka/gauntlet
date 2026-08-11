@@ -1282,7 +1282,10 @@ def test_gate_verbs_reconcile_surviving_intents_first(
     if verb == "approve":
         assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
     else:
-        mgr.reject("demo", "not yet", use_judge=False)
+        # #98: this gate has no upstream cycle, so a reject is terminal and
+        # needs the explicit flag — this test's concern is only that the
+        # intent-reconciliation hook ran first.
+        mgr.reject("demo", "not yet", use_judge=False, allow_terminal=True)
     assert calls == [verb]
 
 

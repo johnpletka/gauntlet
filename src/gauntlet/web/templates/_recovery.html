@@ -220,11 +220,11 @@
          plain-text form is carried on the form (data-reject-consequence) so the
          JS confirm prompt states the SAME consequence as the rendered control —
          never a stale "the run fails" that contradicts the re-drive (F-003). #}
-      {% set reject_consequence = ("re-runs the '" ~ gate_cycle ~ "' cycle with your notes injected as a new round") if gate_cycle else "terminally rejects the gate (no upstream cycle to re-run)" %}
+      {% set reject_consequence = ("re-runs the '" ~ gate_cycle ~ "' cycle with your notes injected as a new round") if gate_cycle else "TERMINALLY fails the run (no upstream cycle to re-run); the flag-less web reject is refused — use the CLI with --terminal (#98)" %}
       <form data-reject data-reject-consequence="{{ reject_consequence }}">
         <input type="text" name="notes" placeholder="rejection notes (required)" required>
         <button type="submit" class="danger">Reject…</button>
-        <span class="muted">→ {% if gate_cycle %}re-runs the <strong>{{ gate_cycle }}</strong> cycle with your notes injected{% else %}terminally rejects the gate{% endif %}</span>
+        <span class="muted">→ {% if gate_cycle %}re-runs the <strong>{{ gate_cycle }}</strong> cycle with your notes injected{% else %}TERMINALLY fails the run — refused without the CLI's --terminal flag{% endif %}</span>
       </form>
     {% endif %}
     {% if "resume" in controls %}

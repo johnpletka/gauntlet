@@ -26,3 +26,10 @@ apply, so the file reads oldest-first.
   materialization now canonicalizes only the redundant hunk-count arithmetic
   before the existing deterministic `git apply --check` gate, while preserving
   the raw model response and rejecting incomplete structure fail-closed.
+
+- **operator.md** (#98, FR-8.1/FR-8.2): §3 reject bullet now documents that the
+  gate→cycle re-drive covers gates inside a `foreach` phase group (the standard
+  pipeline's `phase-gate` → same-iteration `impl-cycle`), and that a genuinely
+  terminal reject (no upstream cycle to iterate) is refused unless the explicit
+  `--terminal` flag is given — a flag-less reject can no longer end a run by
+  surprise.

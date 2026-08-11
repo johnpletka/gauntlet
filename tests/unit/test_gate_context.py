@@ -270,10 +270,12 @@ def test_gate_context_pipeline_ignores_prior_stage_cycle(tmp_path):
     assert ctx["convergence"] is None
 
 
-def test_gate_context_pipeline_foreach_gate_names_no_cycle(tmp_path):
-    # F-001: a gate inside a foreach stage is a terminal reject (iteration re-arming
-    # out of scope), so it must name no cycle even though one precedes it.
-    man, _, gate_rec, run_dir = _write_cycle_run(tmp_path)
+def test_gate_context_pipeline_foreach_gate_names_same_iteration_cycle(tmp_path):
+    # #98: a gate inside a foreach stage now resolves its same-stage cycle (a
+    # reject re-drives it), so the gate context names the cycle record at the
+    # GATE's own iteration — F-001 still holds: what is advertised is exactly
+    # what a reject performs.
+    man, cycle_rec, gate_rec, run_dir = _write_cycle_run(tmp_path)
     pipeline = Pipeline.model_validate({
         "name": "standard", "version": 1, "stages": [
             {"id": "phases", "foreach": "plan.phases", "steps": [
@@ -283,8 +285,23 @@ def test_gate_context_pipeline_foreach_gate_names_no_cycle(tmp_path):
         ],
     })
     ctx = op.compute_gate_context(man, run_dir, gate_rec, pipeline=pipeline)
-    assert ctx["cycle_step_id"] is None
-    assert ctx["convergence"] is None
+    assert ctx["cycle_step_id"] == "plan-cycle"
+    assert ctx["convergence"]["rounds"] == 2
+
+    # Iteration matching: with per-iteration records, the context resolves the
+    # cycle at the gate's iteration, not the first record with the right id.
+    cycle_rec.iteration = "0"
+    gate_rec.iteration = "1"
+    other = StepRecord(id="plan-cycle", type="adversarial_cycle", status=M.DONE,
+                       iteration="1",
+                       metrics={"rounds": 1, "findings_total": 1,
+                                "accepted_total": 1,
+                                "accepted_resolved_total": 1,
+                                "verdict_counts": {}, "confirm_counts": {}})
+    man.steps.insert(1, other)
+    ctx = op.compute_gate_context(man, run_dir, gate_rec, pipeline=pipeline)
+    assert ctx["cycle_step_id"] == "plan-cycle"
+    assert ctx["convergence"]["rounds"] == 1  # iteration "1" record, not "0"
 
 
 def test_gate_context_redacts_extra_env_var_only_secret(tmp_path, monkeypatch):
@@ -342,7 +359,9 @@ def test_gate_next_actions_consequence_names_cycle(tmp_path):
 
 
 def test_gate_reject_consequence_terminal_without_cycle():
-    # A gate with no upstream cycle: reject is terminal, and the consequence says so.
+    # A gate with no upstream cycle: reject is terminal, and the consequence
+    # names both the run-ending outcome and the --terminal requirement (#98) —
+    # the status annotation IS the footgun warning.
     man = Manifest(
         run_id="r", slug="s", branch="gauntlet/s", base_branch="main",
         pipeline=PipelineRef(name="p", version=1, hash="h"),
@@ -351,7 +370,9 @@ def test_gate_reject_consequence_terminal_without_cycle():
     )
     rstate = op.compute_run_state(man, op.LIVENESS_NONE)
     reject = next(a for a in rstate.next_actions if a.label == "reject")
-    assert reject.consequence == "terminally rejects the gate (no upstream cycle to re-run)"
+    assert "TERMINALLY fails the run" in reject.consequence
+    assert "--terminal" in reject.consequence
+    assert reject.command.endswith("--terminal")
 
 
 def test_non_gate_actions_carry_null_consequence():

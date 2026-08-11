@@ -444,7 +444,7 @@ Notes:
 | `gauntlet logs <slug> [--follow]` | Surface a step's dir + transcript (read-only); `--follow` tails its `events.jsonl` live. |
 | `gauntlet serve [--host …] [--port 8765]` | Run the loopback-only supervisory console (FR-11). |
 | `gauntlet approve <slug> [--gate ID] [--notes …]` | Approve a parked gate, continue the run. |
-| `gauntlet reject <slug> --notes … [--gate ID]` | Reject a parked gate. |
+| `gauntlet reject <slug> --notes … [--gate ID] [--terminal]` | Reject a parked gate: the note re-runs the gate's upstream review cycle as a new fix round. A gate with no upstream cycle would fail the run terminally — that requires the explicit `--terminal` flag. |
 | `gauntlet resume <slug>` | Resume an interrupted run at its last incomplete step. |
 | `gauntlet resume <slug> --response "…"` | Decide a step parked on an upstream conflict (FR-10.4); records the decision and re-runs the builder with it. Required for conflict parks. |
 | `gauntlet recover <slug>` | Terminate a verified-wedged live driver and mark its step `INTERRUPTED` (guarded; FR-5). |
@@ -633,4 +633,3 @@ contract suite, which requires authenticated CLIs and API keys.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
   `gauntlet resume <slug>`.
-```

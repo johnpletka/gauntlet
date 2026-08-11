@@ -38,6 +38,7 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
     """
     from gauntlet.engine.config import ConfigLoadError, ConfigNotFoundError
     from gauntlet.engine.operator import RunResolutionError, StatusContractError
+    from gauntlet.engine.orchestrator import TerminalRejectRefusedError
     from gauntlet.engine.planphases import PlanPhasesError
     from gauntlet.engine.recovery import NoProgressError
     from gauntlet.engine.recovery_exec import RecoveryExecError
@@ -78,6 +79,10 @@ def _known_user_errors() -> tuple[type[BaseException], ...]:
         # operational conditions with named evidence, not bugs.
         RecoveryExecError,
         ReviewFailClosed,
+        # #98: a flag-less reject that would terminally fail the run is refused
+        # with the consequence and the `--terminal` flag named — an operational
+        # refusal the operator acts on, not a bug.
+        TerminalRejectRefusedError,
     )
 
 
@@ -932,10 +937,10 @@ def status(
         )
         # FR-8.2 / F-001: when parked at a gate, name the cycle a reject would
         # ACTUALLY re-drive — resolved from the pipeline snapshot with the same
-        # rule as the reject path (same non-foreach stage), not the manifest-order
-        # heuristic which can name a cross-stage/foreach cycle a reject never
-        # touches. Recompute the actions with the pipeline-resolved id (fail-soft
-        # to the pure default when the snapshot is unavailable).
+        # rule as the reject path (same stage, foreach included since #98), not
+        # the manifest-order heuristic which can name a cross-stage cycle a
+        # reject never touches. Recompute the actions with the pipeline-resolved
+        # id (fail-soft to the pure default when the snapshot is unavailable).
         if (
             pipeline is not None
             and rstate.state == operator.STATE_PARKED_GATE
@@ -1275,6 +1280,13 @@ def reject(
     slug: str,
     notes: str = typer.Option(..., help="Why the gate was rejected."),
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
+    terminal: bool = typer.Option(
+        False, "--terminal",
+        help="Allow a TERMINAL reject: when the gate has no upstream "
+        "adversarial_cycle to iterate, rejecting fails the run permanently "
+        "(the notes are not injected anywhere). Without this flag such a "
+        "reject is refused and the run stays parked (#98).",
+    ),
     no_judge: bool = typer.Option(
         False, "--no-judge",
         help="Drive the re-driven cycle without the judge (testing/diagnosis only; "
@@ -1284,13 +1296,16 @@ def reject(
     """Reject a parked human_gate (FR-8.1).
 
     A rejection is not a dead end: when the gate sits downstream of an
-    adversarial_cycle (the PRD/plan review loops), the note is injected into that
+    adversarial_cycle (the PRD/plan review loops, or the phase loop's impl-cycle
+    for a phase-gate — same-iteration, #98), the note is injected into that
     cycle as a new fix round and the run is re-driven, re-parking the gate for a
-    fresh decision. Re-drives agents, so it honors the judge like `approve`. Only
-    a gate with no upstream cycle to iterate ends the run (terminal reject).
+    fresh decision. Re-drives agents, so it honors the judge like `approve`.
+    A gate with no upstream cycle to iterate ends the run — that terminal
+    reject requires the explicit `--terminal` flag; without it the verb refuses
+    and nothing changes.
     """
     typer.echo(
-        f"run status: {_manager().reject(slug, notes, gate, use_judge=not no_judge)}"
+        f"run status: {_manager().reject(slug, notes, gate, use_judge=not no_judge, allow_terminal=terminal)}"
     )
 
 

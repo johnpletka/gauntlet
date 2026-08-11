@@ -156,3 +156,17 @@ reflog, and its safety is structural rather than archival. Natural home: the
   (`cycle.py` `_Resume` granularity plus the FR-9.3 clean-handoff interaction
   with the dead agent's uncommitted paths) — a state-machine redesign that
   wants its own review loop, not a rider on a liveness-watchdog patch.
+
+## From issue #101 (vacuous implement under total judge denial) — deferred 2026-08-10
+
+**A `gauntlet retry-step` verb for the done-but-vacuous shape.** Issue #101's
+third ask was a dedicated verb to re-run a step the engine already recorded
+`done` when its outcome later proves vacuous. The #101 fix removes the primary
+motivation at the source — a repo-write agent_task with denied mutating calls
+and zero allowed mutating calls now parks `provider_unavailable` (judge
+outage) or fails `judge_deny` (real policy denies) instead of reporting done —
+and PR #102's rollback verb already covers the general "re-run from an earlier
+step" path for any residual done-but-wrong outcomes. A bespoke retry-step verb
+would be a new mutating verb (intent, journal audit record, §6.4 evidence like
+every other mutating verb), so if the shape recurs it wants the recovery
+plan's own review loop rather than an in-phase patch. Deferred, not rejected.

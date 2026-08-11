@@ -14,6 +14,7 @@ import getpass
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -28,6 +29,7 @@ from pathlib import Path
 
 from gauntlet.engine import (
     gitops,
+    govsync as GS,
     journal as J,
     locking,
     manifest as M,
@@ -286,6 +288,9 @@ _BASE_CURRENT_SENTINELS = frozenset({"current", "@current"})
 # `start()`. Any other state (running / parked) is still live — starting over it
 # would orphan it and risk competing agents against one worktree.
 _TERMINAL_RUN_STATES = frozenset({M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED})
+
+# Foreach phase commits carry "P<n>[.x]" labels; PRD/PLAN cycle commits do not.
+_PHASE_HEAD_RE = re.compile(r"P\d+")
 
 
 def _utc_stamp() -> str:
@@ -1075,8 +1080,15 @@ class RunManager:
         branch: str,
         mode: str,
         same_tree: bool = False,
+        initial_publish: bool = False,
     ):
         """Resolve this run's roots for one verb, ensuring the tree exists.
+
+        ``initial_publish`` is True for exactly one verb — ``start`` — where the
+        run branch was just created and the operator's checkout IS the
+        authoritative authoring surface being published for the first time
+        (§14.2 option A). Every later verb runs the #97 three-way compare in
+        :meth:`_sync_governed_artifacts` instead of assuming checkout authority.
 
         The single place a run's `work_root` is decided, and the mechanism the
         P7b reviewer's F-001 was deferred here for. Everything downstream —
@@ -1179,7 +1191,9 @@ class RunManager:
         self._paths = paths
         try:
             if dedicated:
-                self._sync_governed_artifacts(paths, layout)
+                self._sync_governed_artifacts(
+                    paths, layout, initial=initial_publish
+                )
             yield paths
         finally:
             self._paths = prior
@@ -1265,6 +1279,7 @@ class RunManager:
         *,
         mode: str,
         same_tree: bool = False,
+        initial_publish: bool = False,
     ):
         """:meth:`_run_paths`, converting an unavailable tree into a park (§13).
 
@@ -1285,7 +1300,7 @@ class RunManager:
             with self._run_paths(
                 layout, run_dir, man,
                 slug=man.slug, run_id=man.run_id, branch=man.branch,
-                mode=mode, same_tree=same_tree,
+                mode=mode, same_tree=same_tree, initial_publish=initial_publish,
             ) as paths:
                 yield paths
         except WT.WorktreeUnavailable as exc:
@@ -1388,7 +1403,9 @@ class RunManager:
             return man.commits[-1].sha
         return None
 
-    def _sync_governed_artifacts(self, paths: RunPaths, layout: "RunLayout") -> None:
+    def _sync_governed_artifacts(
+        self, paths: RunPaths, layout: "RunLayout", *, initial: bool = False
+    ) -> None:
         """Publish the operator's governed artifacts into the run worktree.
 
         Spike §14.2 option A, ratified: **the operator's checkout stays the
@@ -1397,6 +1414,33 @@ class RunManager:
         (``artifact_root`` never moves, §4.4), and this copies the current bytes
         into the run's tree so the run branch commits what the human actually
         wrote.
+
+        **The publish is no longer unconditional (issue #97).** Mid-phase fix
+        rounds legitimately AMEND the governed artifact on the run branch
+        (amendments-ledger entries, FR-10.4 upstream fixes), so the checkout
+        copy can lag the branch — and republishing it then is a git-visible
+        pure deletion of ratified amendments that fails the FR-9.3
+        clean-handoff guard on every subsequent resume. So every non-``start``
+        resolution runs a three-way compare between the checkout bytes, the
+        LAST-PUBLISHED hash (:mod:`~gauntlet.engine.govsync`, recorded durably
+        beside the manifest) and the run branch's committed bytes:
+
+        * checkout == last-published, branch moved → the operator made no
+          edit: the publish is a NO-OP and the checkout is back-synced from
+          the run tree instead (mirroring the gate-time
+          :meth:`~gauntlet.engine.execution.StepContext.adopt_artifact`).
+        * checkout != last-published, branch unmoved → a real operator edit:
+          publish as before, advance the baseline.
+        * both moved → :class:`GS.GovernedArtifactDivergence`, loudly, with
+          nothing mutated — the engine never silently overwrites either side.
+        * no baseline recorded (a run predating #97): the RUN TREE is the
+          baseline, never the checkout — republishing there is exactly the
+          clobber this exists to prevent. Divergent checkout bytes are backed
+          up and a durable warning names them.
+
+        ``initial=True`` (the ``start`` verb only) keeps the original
+        checkout-authoritative publish: the branch was created this instant and
+        the checkout is the artifact the human just authored.
 
         Copy, never link: §14.2 option C (symlinking the artifact dir in) was
         rejected because the run worktree gets ``reset --hard``, and a symlinked
@@ -1410,15 +1454,238 @@ class RunManager:
         """
         dest_dir = paths.artifact_root_in_work
         dest_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("prd.md", "plan.md"):
+        state_root = paths.state_root
+        published = GS.load_published(state_root)
+        for name in GS.GOVERNED_ARTIFACT_NAMES:
             src = layout.slug_dir / name
             if not src.exists():
                 continue
             dest = dest_dir / name
-            text = src.read_text()
-            if dest.exists() and dest.read_text() == text:
+            checkout = src.read_bytes()
+            checkout_h = GS.digest(checkout)
+            dest_bytes = dest.read_bytes() if dest.exists() else None
+            committed = self._committed_artifact_bytes(paths, dest)
+            committed_h = None if committed is None else GS.digest(committed)
+            if initial:
+                if dest_bytes != checkout:
+                    dest.write_bytes(checkout)
+                GS.record_published(
+                    state_root, name, published=checkout_h, branch=committed_h
+                )
                 continue
-            dest.write_text(text)
+            rec = published.get(name)
+            if rec is None:
+                self._first_contact_sync(
+                    state_root, name, src=src, dest=dest,
+                    checkout=checkout, checkout_h=checkout_h,
+                    dest_bytes=dest_bytes, committed=committed,
+                    committed_h=committed_h,
+                )
+                continue
+            checkout_moved = checkout_h != rec["published"]
+            moved = GS.branch_moved(rec, committed_h)
+            if not checkout_moved and not moved:
+                # Steady state — the publish is a no-op. Re-materialize the
+                # published bytes only where the tree provably lost them (a
+                # `reset --hard` dropping an uncommitted publish, or a deleted
+                # copy); a tree copy dirty with anything else is not ours to
+                # explain and is left for the clean-handoff guard to name.
+                if dest_bytes != checkout and (
+                    dest_bytes is None or dest_bytes == committed
+                ):
+                    dest.write_bytes(checkout)
+                continue
+            if not checkout_moved and moved:
+                # (a) The operator made NO edit since the last publish; the
+                # run branch moved (mid-phase amendments, FR-10.4 upstream
+                # fixes). The publish is a NO-OP and the checkout catches up
+                # from the run tree instead (#97).
+                run_state = committed if committed is not None else dest_bytes
+                if run_state is None:
+                    # The branch dropped the artifact and the tree holds
+                    # nothing: re-materialize the checkout copy.
+                    dest.write_bytes(checkout)
+                    GS.record_published(
+                        state_root, name,
+                        published=checkout_h, branch=committed_h,
+                    )
+                    continue
+                self._adopt_run_artifact_state(
+                    state_root, name, src=src, dest=dest,
+                    checkout=checkout, run_state=run_state,
+                    dest_bytes=dest_bytes, committed_h=committed_h,
+                )
+                continue
+            if checkout_moved and not moved:
+                # (b) A real operator edit; the branch has not moved since the
+                # last publish. Publish as before, advance the baseline.
+                dest.write_bytes(checkout)
+                GS.record_published(
+                    state_root, name, published=checkout_h, branch=committed_h
+                )
+                continue
+            # Both sides moved since the last publish.
+            if checkout_h == committed_h:
+                # …to the SAME bytes: the operator already adopted one side by
+                # hand. Agreement is the new baseline.
+                if dest_bytes is None:
+                    dest.write_bytes(checkout)
+                GS.record_published(
+                    state_root, name, published=checkout_h, branch=committed_h
+                )
+                continue
+            # (c) A true three-way divergence. Refuse loudly with all three
+            # states named; nothing is mutated, and the run stays drivable
+            # once the operator adopts one side explicitly.
+            raise GS.GovernedArtifactDivergence(
+                self._divergence_message(
+                    name, paths, src=src, dest=dest,
+                    checkout_h=checkout_h, recorded=rec["published"],
+                    branch_h=committed_h,
+                )
+            )
+
+    def _first_contact_sync(
+        self,
+        state_root: Path,
+        name: str,
+        *,
+        src: Path,
+        dest: Path,
+        checkout: bytes,
+        checkout_h: str,
+        dest_bytes: bytes | None,
+        committed: bytes | None,
+        committed_h: str | None,
+    ) -> None:
+        """The no-baseline rule: the RUN TREE is the baseline, never the checkout.
+
+        A run predating the #97 record (or one whose record file was lost) has
+        no way to say which side moved. Assuming operator authority here is
+        exactly the clobber the record exists to prevent, so the run tree's
+        state wins; a divergent checkout copy is backed up and named in a
+        durable warning rather than silently overwritten. The one exception is
+        a run tree that holds NOTHING — then the checkout copy is the only
+        version in existence and is materialized as before.
+        """
+        run_state = committed if committed is not None else dest_bytes
+        if run_state is None:
+            dest.write_bytes(checkout)
+            GS.record_published(
+                state_root, name, published=checkout_h, branch=committed_h
+            )
+            return
+        if GS.digest(run_state) == checkout_h:
+            if dest_bytes is None:
+                dest.write_bytes(run_state)
+            GS.record_published(
+                state_root, name, published=checkout_h, branch=committed_h
+            )
+            return
+        saved = GS.backup_checkout_copy(state_root, name, checkout)
+        self._warn(
+            state_root,
+            f"governed artifact {name!r}: the operator checkout copy disagreed "
+            "with the run branch and no publish baseline was recorded (a run "
+            "predating issue #97). The run branch's version was kept and the "
+            "checkout copy was refreshed from it; the previous checkout bytes "
+            f"are preserved at {saved}.",
+        )
+        self._adopt_run_artifact_state(
+            state_root, name, src=src, dest=dest, checkout=checkout,
+            run_state=run_state, dest_bytes=dest_bytes, committed_h=committed_h,
+        )
+
+    def _committed_artifact_bytes(
+        self, paths: RunPaths, dest: Path
+    ) -> bytes | None:
+        """``dest``'s bytes as committed on the run branch, or ``None``.
+
+        The run worktree has the run branch checked out, so ``HEAD`` there IS
+        the branch tip — and ``git show`` reads the committed object, which is
+        the precise form: the worktree file can carry uncommitted dirt (e.g. a
+        stale pre-#97 publish sitting over committed amendments) and must not
+        be mistaken for branch state. ``None`` when untracked or unreadable.
+        """
+        try:
+            rel = dest.resolve().relative_to(
+                Path(paths.work_root).resolve()
+            ).as_posix()
+        except ValueError:
+            return None
+        return gitops.file_bytes_at_commit(paths.work_root, "HEAD", rel)
+
+    def _adopt_run_artifact_state(
+        self,
+        state_root: Path,
+        name: str,
+        *,
+        src: Path,
+        dest: Path,
+        checkout: bytes,
+        run_state: bytes,
+        dest_bytes: bytes | None,
+        committed_h: str | None,
+    ) -> None:
+        """Make the run tree's version the baseline: back-sync, heal, record.
+
+        The engine-side half of #97's case (a): the publish is a no-op, the
+        operator's authoring copy is refreshed from the run tree (the same
+        carry-back :meth:`~gauntlet.engine.execution.StepContext.adopt_artifact`
+        performs at gates), and the recorded baseline advances to the adopted
+        bytes so the next resolution reads the agreement correctly.
+
+        Healing: when the tree copy sits uncommitted at exactly the stale
+        checkout bytes — the residue a pre-fix publish left over committed
+        amendments — it is restored to the committed bytes, which is what
+        un-false-fires the rollback dirty-tree guard (#99). A tree copy dirty
+        with any OTHER bytes is not ours to explain and is left untouched for
+        the clean-handoff guard to name.
+        """
+        if checkout != run_state:
+            src.write_bytes(run_state)
+        if dest_bytes != run_state and (
+            dest_bytes is None or dest_bytes == checkout
+        ):
+            dest.write_bytes(run_state)
+        GS.record_published(
+            state_root, name, published=GS.digest(run_state), branch=committed_h
+        )
+
+    def _divergence_message(
+        self,
+        name: str,
+        paths: RunPaths,
+        *,
+        src: Path,
+        dest: Path,
+        checkout_h: str,
+        recorded: str,
+        branch_h: str | None,
+    ) -> str:
+        return (
+            f"governed artifact {name!r} has diverged three ways since the "
+            "engine last published it (issue #97 guard):\n"
+            f"  operator checkout: {src}\n"
+            f"      sha256 {checkout_h}\n"
+            f"  last published:\n"
+            f"      sha256 {recorded}\n"
+            f"  run branch:        {dest}\n"
+            f"      sha256 {branch_h or '<untracked on the run branch>'}\n"
+            "Both the operator's authoring copy AND the run branch have moved "
+            "since the engine last published, so publishing either side would "
+            "silently overwrite the other. Nothing was modified; the run stays "
+            "drivable once the two files agree.\n"
+            "Resolve explicitly:\n"
+            f"  1. inspect both:  diff {src} {dest}\n"
+            "  2. adopt ONE side (or hand-merge), making the files "
+            "byte-identical:\n"
+            f"     keep the run branch's version:  cp {dest} {src}\n"
+            f"     keep the checkout's version:    cp {src} {dest} && "
+            f"git -C {paths.work_root} commit -am 'adopt operator {name}'\n"
+            "  3. re-run the verb; the agreement is adopted as the new "
+            "baseline."
+        )
 
     # The two journal kinds that record a run's tree lifecycle. Counted
     # together to form the GENERATION below, because they alternate: the Nth
@@ -2841,7 +3108,11 @@ class RunManager:
                 worktree_mode=self.configured_worktree_mode,
             )
             with self._worktree_paths_or_park(
-                layout, run_dir, man, mode=man.worktree_mode
+                layout, run_dir, man, mode=man.worktree_mode,
+                # `start` is the one legitimate checkout-authoritative publish:
+                # the human just authored these files and the run branch was
+                # created this instant, so there are no amendments to protect.
+                initial_publish=True,
             ) as paths:
                 self._writability_preflight(paths, adapter_factory)
                 status = self._drive(
@@ -3711,7 +3982,8 @@ class RunManager:
             self._release_worktree_lock(handle)
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
-               *, use_judge: bool = True, adapter_factory=None) -> str:
+               *, use_judge: bool = True, allow_terminal: bool = False,
+               adapter_factory=None) -> str:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -3745,20 +4017,21 @@ class RunManager:
                 if use_judge:
                     return self._with_judge(man, run_dir, lambda env: self._reject_drive(
                         layout, run_dir, pipeline, man, gate, notes, user, env,
-                        adapter_factory))
+                        adapter_factory, allow_terminal=allow_terminal))
                 orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                           adapter_factory=adapter_factory)
-                status = orch.reject_gate(gate, notes, user)
+                status = orch.reject_gate(gate, notes, user,
+                                          allow_terminal=allow_terminal)
                 self._maybe_draft_pr(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
 
     def _reject_drive(self, layout, run_dir, pipeline, man, gate, notes, user, env,
-                      adapter_factory):
+                      adapter_factory, *, allow_terminal: bool = False):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.reject_gate(gate, notes, user)
+        status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
         self._maybe_draft_pr(layout, run_dir, man, status)
         return status
 
@@ -4304,6 +4577,7 @@ class RunManager:
                     unmanifested_range=unmanifested,
                 )
             )
+            RX.require_classifiable(man, verb="recover")
             man.write_atomic(manifest_path)
             _fsync_dir(run_dir)
         # Step 7: clear the intent only after step 6 is durable — its content is
@@ -6621,6 +6895,26 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
     branch and manifest disagree (FR-9.9). Idempotent: a manifest already
     rewound to ``target`` is unchanged.
 
+    Foreach iterations share their static step ids, so the id keep-set alone
+    cannot tell "this loop body, the target phase" from "this loop body, a
+    later phase" — records from iterations AFTER the target boundary must be
+    reset even though their ids sit inside the keep-set. Left in place they
+    make the rewound manifest contradictory (later-iteration records done or
+    failed, ``current_step`` cleared) — an unclassifiable state, and one a
+    journal-first reconcile then faithfully resurrects (#101). The executed
+    iteration order is recovered from the kept chronological commit log: the
+    k-th distinct ``P<n>`` phase head corresponds to foreach index k, because
+    iterations run in item order and every completed iteration records at
+    least its phase commit; PRD/PLAN cycle commits are excluded by shape.
+
+    Kept records that are not settled successes (failed/parked/halted/
+    interrupted/running) also reset: they hold no committed work, they are the
+    frontier the rollback exists to re-run, and left in place they either
+    re-wedge the run (#99: a failed gate with no response path) or make the
+    stamped state contradictory. The final stamp is therefore always
+    ``running`` + ``current_step=None`` over done/skipped/pending records —
+    a shape the FR-5 composite classifier reads as `orphaned` → `resume`.
+
     Module-level (not a RunManager method) so the registered recovery-intent
     replay finisher can re-run it from a fresh process after a crash between
     the executor's apply and this persist.
@@ -6640,13 +6934,61 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
     except ValueError:  # pragma: no cover - defensive
         cutoff = len(order) - 1
     keep_ids = set(order[: cutoff + 1])
+
+    phase_heads: list[str] = []
+    for commit in keep:
+        head = commit.phase.split(".")[0]
+        if _PHASE_HEAD_RE.fullmatch(head) and head not in phase_heads:
+            phase_heads.append(head)
+    target_head = keep[-1].phase.split(".")[0]
+    target_rank = (
+        phase_heads.index(target_head) if target_head in phase_heads else None
+    )
+
     for rec in man.steps:
-        if rec.id not in keep_ids:
+        if (
+            target_rank is not None
+            and rec.iteration is not None
+            and rec.iteration.isdigit()
+        ):
+            # Foreach record: the iteration ordering IS the boundary test.
+            # The whole target iteration (and every earlier one) stays — its
+            # later-in-body steps ran before the boundary even when the
+            # boundary commit came from an earlier step in the loop body —
+            # and every later iteration resets, id keep-set notwithstanding.
+            past = int(rec.iteration) > target_rank
+        else:
+            past = rec.id not in keep_ids
+        # Beyond the pruned range, reset every kept record that is not a
+        # settled success (#99): a FAILED gate, a PARKED step, or a stale
+        # RUNNING frontier inside the kept range holds no committed work —
+        # it is exactly the state the operator is rolling back to re-run,
+        # and left in place it re-wedges the rewound run (a failed
+        # `human_gate` accepts no response; a kept park re-parks on stale
+        # facts). Nothing can be DONE *before* a later boundary and also
+        # FAILED — a non-success kept record is always the frontier.
+        if past or rec.status not in (M.DONE, M.SKIPPED, M.PENDING):
             rec.status = M.PENDING
             rec.base_sha = None
             rec.session_id = None
             rec.ended = None
-    man.status = M.RUN_PARKED
+            # Current-state discriminators (FR-2.1/FR-7.2): a pending record
+            # carries no park/halt residue, or the composite classifier and
+            # the resume dispositions read a state the run is no longer in.
+            rec.parked_reason = None
+            rec.halt_reason = None
+            rec.failure_kind = None
+            rec.recovery_cause = None
+            rec.recovery_disposition = None
+
+    # Stamp a state the FR-5 composite classifier recognizes (#99). Every
+    # record is now done/skipped/pending, so the truthful status is `running`
+    # with no live driver — which classifies `orphaned`, whose one advertised
+    # mutating verb is plain `resume`: the documented next step after a
+    # rollback. The old unconditional ``parked`` + ``current_step=None`` stamp
+    # classified `unknown` (a parked run with zero parked steps), which
+    # fail-closed forbids every mutating verb — including that resume.
+    man.status = M.RUN_RUNNING
     man.current_step = None
 
 
@@ -6674,6 +7016,7 @@ def _apply_rollback_manifest_transition(
             f"auto-approval disabled for the remainder of the run: {reversed_n} "
             f"auto-approved gate(s) reversed by rollback to P{phase} (FR-4.2)"
         )
+    RX.require_classifiable(man, verb="rollback")
     man.write_atomic(run_dir / "manifest.json")
 
 
