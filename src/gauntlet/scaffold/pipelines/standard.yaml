@@ -135,8 +135,12 @@ stages:
       # (engine/verify.py). Its behavioral findings join the merged panel and flow
       # through triage/fix/confirm; `metrics.verifier.*` records the §9
       # behavioral-signal instrument (legit findings + verifier cost).
+      # `disposition_agent` classifies an FR-10.4 response before the paid panel
+      # re-drive. A proceed decision also authorizes the engine to consume the
+      # exact prior finding-root/target pair if triage repeats it (#106); a new
+      # root or artifact still parks fail-closed.
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
-         triager: triage, fixer: builder,
+         triager: triage, fixer: builder, disposition_agent: mechanic,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: gemini, lens: spec-coverage}],
          verifier: verifier,

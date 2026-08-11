@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from gauntlet.engine import gitops, manifest as M, proposals as P
+from gauntlet.engine import gitops, manifest as M, operator, proposals as P
 from gauntlet.engine.feedback import FeedbackData, TriageCorrection
 from gauntlet.engine.pipeline import content_hash, load_pipeline
 from gauntlet.engine.planphases import extract_phases, phase_section
@@ -308,6 +308,20 @@ def _assert_governed_live_stop(mgr: RunManager) -> None:
                 mgr.repo_root, exclude=["runs"]
             ), gitops.status_porcelain(mgr.repo_root, exclude=["runs"])
             return
+        if step.parked_reason in {
+            M.PARKED_REASON_USAGE_LIMIT,
+            M.PARKED_REASON_USAGE_WINDOW,
+            M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+        }:
+            # #116: live account/provider variance is a valid, resumable engine
+            # outcome — not evidence that the standard pipeline is broken. Pin
+            # the contract: no terminal halt and a plain, executable resume
+            # action (never `--response`).
+            assert step.halt_reason is None
+            actions = operator.next_actions(man, operator.LIVENESS_NONE)
+            resumes = [a for a in actions if a.argv == ["gauntlet", "resume", "toy"]]
+            assert resumes and resumes[0].executable, [a.command for a in actions]
+            return
         _assert_sanctioned_human_park(mgr)
         return
 
@@ -359,6 +373,85 @@ def _resume_fixture_plan_escalation(mgr: RunManager) -> str:
         "acceptance check; do not defer it upstream."
     )
     return mgr.resume("toy", response=decision, use_judge=True)
+
+
+_LIVE_RESPONSE_REDRIVE_LIMIT = 3
+
+
+def _fixture_cycle_decision(step_id: str) -> str:
+    """Deterministic operator policy for this toy run's FR-10.4 parks."""
+    if step_id == "prd-cycle":
+        return (
+            "This is prd.md's own review loop. Treat a valid missing requirement "
+            "as an amendment to the current toy PRD, apply it here, and re-review "
+            "before the PRD gate; do not defer it to another artifact."
+        )
+    if step_id == "plan-cycle":
+        return (
+            "Keep the approved toy PRD and test fixture unchanged. Tests and "
+            "commands P1 must create are P1 deliverables. Resolve the finding in "
+            "plan.md's own loop and do not defer it upstream."
+        )
+    return (
+        "Keep the approved toy PRD and plan unchanged. Resolve this finding in "
+        "the current implementation phase; if no code change is needed, record "
+        "the deviation and proceed. Do not re-open the same upstream question."
+    )
+
+
+def _drive_through_live_variance(
+    mgr: RunManager,
+    status: str,
+    *,
+    expected_step: str,
+    allow_done: bool = False,
+) -> str:
+    """Reach the next human gate despite bounded, legitimate live variance.
+
+    FR-10.4 response parks are resolved through the public workflow at most
+    three times. Provider/account parks are asserted resumable and skip this
+    completion-only test: an immediate retry cannot manufacture quota and must
+    not turn a correct engine park into a false product failure (#116).
+    """
+    for _attempt in range(_LIVE_RESPONSE_REDRIVE_LIMIT + 1):
+        man = mgr.status("toy")
+        if allow_done and status == M.RUN_DONE:
+            return status
+        expected = [
+            s for s in man.steps if s.id == expected_step and s.status == M.PARKED
+        ]
+        if (
+            status == M.RUN_PARKED
+            and man.current_step == expected_step
+            and expected
+        ):
+            return status
+
+        current = [s for s in man.steps if s.id == man.current_step]
+        assert current, man.model_dump()
+        step = current[-1]
+        if step.parked_reason in {
+            M.PARKED_REASON_USAGE_LIMIT,
+            M.PARKED_REASON_USAGE_WINDOW,
+            M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+        }:
+            _assert_governed_live_stop(mgr)
+            pytest.skip(
+                f"live dependency/account park is correctly plain-resumable: "
+                f"{step.parked_reason} at {step.id}"
+            )
+        assert step.parked_reason == M.PARKED_REASON_RESPONSE, man.model_dump()
+        if _attempt == _LIVE_RESPONSE_REDRIVE_LIMIT:
+            break
+        status = mgr.resume(
+            "toy", response=_fixture_cycle_decision(step.id), use_judge=True
+        )
+
+    pytest.fail(
+        f"live run did not reach {expected_step!r} after "
+        f"{_LIVE_RESPONSE_REDRIVE_LIMIT} governed response re-drives: "
+        f"{mgr.status('toy').model_dump()}"
+    )
 
 
 @pytest.mark.live_pipeline
@@ -463,14 +556,18 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
 
     # PRD gate: the cycle reviews the human PRD, then parks for ratification.
     status = mgr.start("toy", pipe, use_judge=True)
+    status = _drive_through_live_variance(
+        mgr, status, expected_step="prd-approve"
+    )
     assert status == M.RUN_PARKED, mgr.status("toy").model_dump()
     assert mgr.status("toy").current_step == "prd-approve"
 
     # Plan gate: builder authors plan.md, the cycle reviews it, then parks for
     # ratification.
     status = mgr.approve("toy", use_judge=True)
-    if status == M.RUN_PARKED and mgr.status("toy").current_step == "plan-cycle":
-        status = _resume_fixture_plan_escalation(mgr)
+    status = _drive_through_live_variance(
+        mgr, status, expected_step="plan-approve"
+    )
     assert status == M.RUN_PARKED, mgr.status("toy").model_dump()
     assert mgr.status("toy").current_step == "plan-approve"
     plan = (repo / "runs" / "toy" / "plan.md").read_text()
@@ -483,6 +580,9 @@ def test_standard_pipeline_end_to_end_on_toy_prd(tmp_path):
     # approve that human boundary, but no other parked state, then require the
     # standard pipeline to complete retro and PR drafting.
     status = mgr.approve("toy", use_judge=True)
+    status = _drive_through_live_variance(
+        mgr, status, expected_step="phase-gate", allow_done=True
+    )
     if status == M.RUN_PARKED:
         assert mgr.status("toy").current_step == "phase-gate", (
             mgr.status("toy").model_dump()
