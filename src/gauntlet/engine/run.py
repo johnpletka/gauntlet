@@ -3715,7 +3715,8 @@ class RunManager:
             self._release_worktree_lock(handle)
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
-               *, use_judge: bool = True, adapter_factory=None) -> str:
+               *, use_judge: bool = True, allow_terminal: bool = False,
+               adapter_factory=None) -> str:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -3749,20 +3750,21 @@ class RunManager:
                 if use_judge:
                     return self._with_judge(man, run_dir, lambda env: self._reject_drive(
                         layout, run_dir, pipeline, man, gate, notes, user, env,
-                        adapter_factory))
+                        adapter_factory, allow_terminal=allow_terminal))
                 orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                           adapter_factory=adapter_factory)
-                status = orch.reject_gate(gate, notes, user)
+                status = orch.reject_gate(gate, notes, user,
+                                          allow_terminal=allow_terminal)
                 self._maybe_draft_pr(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
 
     def _reject_drive(self, layout, run_dir, pipeline, man, gate, notes, user, env,
-                      adapter_factory):
+                      adapter_factory, *, allow_terminal: bool = False):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.reject_gate(gate, notes, user)
+        status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
         self._maybe_draft_pr(layout, run_dir, man, status)
         return status
 
@@ -4308,6 +4310,7 @@ class RunManager:
                     unmanifested_range=unmanifested,
                 )
             )
+            RX.require_classifiable(man, verb="recover")
             man.write_atomic(manifest_path)
             _fsync_dir(run_dir)
         # Step 7: clear the intent only after step 6 is durable — its content is
@@ -6637,6 +6640,14 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
     iterations run in item order and every completed iteration records at
     least its phase commit; PRD/PLAN cycle commits are excluded by shape.
 
+    Kept records that are not settled successes (failed/parked/halted/
+    interrupted/running) also reset: they hold no committed work, they are the
+    frontier the rollback exists to re-run, and left in place they either
+    re-wedge the run (#99: a failed gate with no response path) or make the
+    stamped state contradictory. The final stamp is therefore always
+    ``running`` + ``current_step=None`` over done/skipped/pending records —
+    a shape the FR-5 composite classifier reads as `orphaned` → `resume`.
+
     Module-level (not a RunManager method) so the registered recovery-intent
     replay finisher can re-run it from a fresh process after a crash between
     the executor's apply and this persist.
@@ -6681,12 +6692,36 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
             past = int(rec.iteration) > target_rank
         else:
             past = rec.id not in keep_ids
-        if past:
+        # Beyond the pruned range, reset every kept record that is not a
+        # settled success (#99): a FAILED gate, a PARKED step, or a stale
+        # RUNNING frontier inside the kept range holds no committed work —
+        # it is exactly the state the operator is rolling back to re-run,
+        # and left in place it re-wedges the rewound run (a failed
+        # `human_gate` accepts no response; a kept park re-parks on stale
+        # facts). Nothing can be DONE *before* a later boundary and also
+        # FAILED — a non-success kept record is always the frontier.
+        if past or rec.status not in (M.DONE, M.SKIPPED, M.PENDING):
             rec.status = M.PENDING
             rec.base_sha = None
             rec.session_id = None
             rec.ended = None
-    man.status = M.RUN_PARKED
+            # Current-state discriminators (FR-2.1/FR-7.2): a pending record
+            # carries no park/halt residue, or the composite classifier and
+            # the resume dispositions read a state the run is no longer in.
+            rec.parked_reason = None
+            rec.halt_reason = None
+            rec.failure_kind = None
+            rec.recovery_cause = None
+            rec.recovery_disposition = None
+
+    # Stamp a state the FR-5 composite classifier recognizes (#99). Every
+    # record is now done/skipped/pending, so the truthful status is `running`
+    # with no live driver — which classifies `orphaned`, whose one advertised
+    # mutating verb is plain `resume`: the documented next step after a
+    # rollback. The old unconditional ``parked`` + ``current_step=None`` stamp
+    # classified `unknown` (a parked run with zero parked steps), which
+    # fail-closed forbids every mutating verb — including that resume.
+    man.status = M.RUN_RUNNING
     man.current_step = None
 
 
@@ -6714,6 +6749,7 @@ def _apply_rollback_manifest_transition(
             f"auto-approval disabled for the remainder of the run: {reversed_n} "
             f"auto-approved gate(s) reversed by rollback to P{phase} (FR-4.2)"
         )
+    RX.require_classifiable(man, verb="rollback")
     man.write_atomic(run_dir / "manifest.json")
 
 

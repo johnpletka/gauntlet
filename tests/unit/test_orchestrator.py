@@ -294,6 +294,13 @@ stages:
 
 
 def test_reject_gate_fails_run(fixture_repo):
+    # #98: a terminal reject (no upstream cycle to iterate) is a run-ending
+    # decision, so it requires the explicit allow_terminal (CLI --terminal).
+    # The flag-less call refuses drivably; the explicit call fails the run.
+    import pytest
+
+    from gauntlet.engine.orchestrator import TerminalRejectRefusedError
+
     text = """
 name: demo
 version: 1
@@ -304,7 +311,10 @@ stages:
 """
     orch = _build(fixture_repo, text)
     assert orch.drive() == M.RUN_PARKED
-    assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
+    with pytest.raises(TerminalRejectRefusedError):
+        orch.reject_gate("gate", notes="no")
+    assert orch.manifest.record("gate").status == M.PARKED  # nothing persisted
+    assert orch.reject_gate("gate", notes="no", allow_terminal=True) == M.RUN_FAILED
 
 
 # ---- resume transaction boundary (review F-003) ----------------------------
@@ -884,7 +894,8 @@ stages:
     orch = _build(fixture_repo, text)
     assert orch.drive() == M.RUN_PARKED
     orch.manifest.record("gate").parked_reason = M.PARKED_REASON_UPSTREAM_CONFLICT
-    assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
+    # #98: terminal path (no upstream cycle) needs the explicit flag.
+    assert orch.reject_gate("gate", notes="no", allow_terminal=True) == M.RUN_FAILED
     rec = orch.manifest.record("gate")
     assert rec.status == M.FAILED
     assert rec.parked_reason is None

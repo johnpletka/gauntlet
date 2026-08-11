@@ -1029,5 +1029,133 @@ def test_rollback_rewind_resets_later_foreach_iterations(tmp_path):
     for it in ("0", "1"):
         for sid in ("implement", "phase-commit", "impl-cycle"):
             assert man.record(sid, it).status == M.DONE
-    assert man.status == M.RUN_PARKED
+    # #99: the rewound state must be one the composite classifier recognizes.
+    # All records are done/pending → `running`, which a dead driver classifies
+    # `orphaned` — plain `resume` is the advertised next verb.
+    assert man.status == M.RUN_RUNNING
     assert man.current_step is None
+    from gauntlet.engine import recovery_exec as RX
+    state, _, _ = RX.classify_composite(man, "none")
+    assert state == RX.STATE_ORPHANED
+
+
+FOREACH_WITH_GATE = """
+name: p
+version: 1
+stages:
+  - id: phases
+    foreach: vars.phases
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: a}
+      - {id: phase-commit, type: commit, message: "placeholder"}
+      - {id: impl-cycle, type: agent_task, agent: builder, prompt_text: b}
+      - {id: acceptance-recheck, type: agent_task, agent: builder, prompt_text: c}
+      - {id: phase-gate, type: human_gate}
+"""
+
+
+def _gate_rewind_manifest(tmp_path, gate_record):
+    """The #99 wedge shape: two foreach iterations, iteration-1 gate ended
+    badly, rollback targets the P2 boundary (iteration 1's fix commit)."""
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "pipeline.yaml").write_text(FOREACH_WITH_GATE)
+    man = M.Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=M.PipelineRef(name="p", version=1, hash="sha256:x"),
+    )
+    man.commits = [
+        M.CommitRecord(step_id="phase-commit", phase="P1", sha="bbb"),
+        M.CommitRecord(step_id="phase-commit", phase="P2", sha="ddd"),
+        M.CommitRecord(step_id="impl-cycle", phase="P2.2", sha="eee"),
+    ]
+    for it in ("0", "1"):
+        for sid in ("implement", "phase-commit", "impl-cycle",
+                    "acceptance-recheck"):
+            man.upsert(M.StepRecord(id=sid, type="", status=M.DONE, iteration=it))
+    man.upsert(M.StepRecord(id="phase-gate", type="human_gate", status=M.DONE,
+                            iteration="0"))
+    man.upsert(gate_record)
+    man.status = M.RUN_FAILED
+    return run_dir, man
+
+
+def test_rollback_rewind_clears_a_failed_frontier_gate(tmp_path):
+    """#99/#100: a FAILED no-commit frontier record inside the kept iteration
+    (the #98 terminally-rejected gate) must reset with its reason residue —
+    kept FAILED it re-wedges the rewound run (a failed human_gate accepts no
+    response), and the old stamp classified the whole manifest `unknown`."""
+    from gauntlet.engine import recovery_exec as RX
+    from gauntlet.engine.run import _rewind_manifest_state
+
+    run_dir, man = _gate_rewind_manifest(tmp_path, M.StepRecord(
+        id="phase-gate", type="human_gate", status=M.FAILED, iteration="1",
+        halt_reason=M.HALT_REASON_PRECONDITION,
+        recovery_disposition="human_decision",
+        notes="rejected (no upstream adversarial_cycle to iterate): fix it",
+    ))
+
+    _rewind_manifest_state(man, run_dir, target="eee")
+
+    gate = man.record("phase-gate", "1")
+    assert gate.status == M.PENDING
+    assert gate.halt_reason is None
+    assert gate.recovery_disposition is None
+    # Settled successes in the kept range stay settled — including the
+    # later-in-body recheck that ran after the boundary commit.
+    assert man.record("acceptance-recheck", "1").status == M.DONE
+    assert man.record("phase-gate", "0").status == M.DONE
+    assert man.status == M.RUN_RUNNING
+    state, _, _ = RX.classify_composite(man, "none")
+    assert state == RX.STATE_ORPHANED  # → plain `resume` re-drives the gate
+
+
+def test_rollback_rewind_resets_a_kept_parked_record(tmp_path):
+    """A park surviving inside the kept range resets to pending: the rewound
+    run re-derives the park from fresh facts on resume instead of waiting on
+    a decision about state the rollback just discarded."""
+    from gauntlet.engine import recovery_exec as RX
+    from gauntlet.engine.run import _rewind_manifest_state
+
+    run_dir, man = _gate_rewind_manifest(tmp_path, M.StepRecord(
+        id="phase-gate", type="human_gate", status=M.PARKED, iteration="1",
+        parked_reason=M.PARKED_REASON_GATE,
+    ))
+    man.status = M.RUN_PARKED
+
+    _rewind_manifest_state(man, run_dir, target="eee")
+
+    gate = man.record("phase-gate", "1")
+    assert gate.status == M.PENDING
+    assert gate.parked_reason is None
+    assert man.status == M.RUN_RUNNING
+    state, _, _ = RX.classify_composite(man, "none")
+    assert state == RX.STATE_ORPHANED
+
+
+def test_require_classifiable_refuses_an_unknown_shape():
+    """#100's invariant: a state-writing boundary must fail the VERB, never
+    persist a state the composite classifier calls `unknown` for every
+    liveness (the wedge with no native exit)."""
+    from gauntlet.engine import recovery_exec as RX
+
+    man = M.Manifest(
+        run_id="r", slug="demo", branch="b", base_branch="main",
+        pipeline=M.PipelineRef(name="p", version=1, hash="h"),
+    )
+    # The exact #99/#100 wedge shape: parked run, zero parked steps.
+    man.status = M.RUN_PARKED
+    man.upsert(M.StepRecord(id="s", type="agent_task", status=M.DONE))
+    with pytest.raises(RX.StateInvariantError) as exc:
+        RX.require_classifiable(man, verb="rollback")
+    assert "rollback" in str(exc.value)
+    assert "unknown" in str(exc.value)
+
+    # A recognizable shape passes for at least one liveness: no raise.
+    man.status = M.RUN_RUNNING
+    RX.require_classifiable(man, verb="rollback")
+    # A live-driver write-ahead shape (running + one ended failure) is
+    # liveness-sensitive, classifiable, and must never be refused.
+    man.upsert(M.StepRecord(id="f", type="agent_task", status=M.FAILED,
+                            ended="2026-08-10T00:00:00Z"))
+    RX.require_classifiable(man, verb="resume")

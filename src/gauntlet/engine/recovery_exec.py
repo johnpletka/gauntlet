@@ -141,6 +141,16 @@ class RecoveryPreconditionError(RecoveryExecError):
     """A precondition failed between assess and apply; nothing was mutated."""
 
 
+class StateInvariantError(RecoveryExecError):
+    """A verb tried to persist a run state the classifier calls `unknown`.
+
+    #100: an `unknown` composite state forbids every mutating verb but has no
+    counterpart repair affordance — so a verb that WRITES such a state wedges
+    the run permanently. The invariant fails the verb (loudly, before any
+    durable write), never the run.
+    """
+
+
 class RecoveryObservationError(RecoveryExecError):
     """The repository state cannot be represented by the P1 contracts.
 
@@ -1225,6 +1235,42 @@ def classify_composite(
         return fs.status, None, fs
 
     return STATE_UNKNOWN, None, None  # any unrecognized run_status
+
+
+def require_classifiable(man: "M.Manifest", *, verb: str) -> None:
+    """Refuse a state that classifies `unknown` for EVERY liveness (#100).
+
+    The invariant check at every recovering state-writing boundary (rollback,
+    reject, recover): a composite `unknown` forbids all mutating verbs and has
+    no native repair path, so persisting one converts a recoverable run into a
+    permanent wedge. Call this immediately before the boundary's durable write
+    — a raise fails the VERB with the manifest on disk untouched, leaving the
+    run exactly as drivable as it was before the verb started.
+
+    Only shapes that are `unknown` regardless of liveness are refused; the
+    ``running`` rows are liveness-sensitive by design and a live driver must
+    never be failed by its own write-ahead.
+    """
+    verdicts = {
+        lv: classify_composite(man, lv)[0]
+        for lv in (_LIVENESS_ALIVE, _LIVENESS_NONE)
+    }
+    if all(v == STATE_UNKNOWN for v in verdicts.values()):
+        parked = [s.id for s in man.steps if s.status == M.PARKED]
+        failures = [
+            f"{s.id}={s.status}"
+            for s in man.steps
+            if s.status in (*_FAILURE_STATUSES,)
+        ]
+        raise StateInvariantError(
+            f"{verb}: refusing to persist a run state the composite "
+            f"classifier cannot recognize (would be `unknown`, forbidding "
+            f"every mutating verb): run_status={man.status!r}, "
+            f"current_step={man.current_step!r}, parked_steps={parked!r}, "
+            f"failure_steps={failures!r}. The manifest on disk is unchanged; "
+            f"the run remains in its pre-{verb} state. This is an engine "
+            f"invariant violation — report it with the run's journal."
+        )
 
 
 # The state → mutating-action-kind table (§6.3 next-action column, mutating

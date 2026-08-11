@@ -84,6 +84,18 @@ ENGINE_IDENTITY = gitops.ENGINE_IDENTITY
 _NUMERIC_PHASE_RE = re.compile(r"P\d+")
 
 
+class TerminalRejectRefusedError(ValueError):
+    """A flag-less ``reject`` would terminally fail the run — refused (#98).
+
+    Raised by :meth:`Orchestrator.reject_gate` when the gate has no upstream
+    ``adversarial_cycle`` to iterate (or its record is not re-runnable) and the
+    caller did not pass ``--terminal``. Nothing is persisted: the gate stays
+    PARKED and the run remains exactly as drivable as before the verb. The
+    message names the consequence and the flag, so the CLI's one-line error is
+    itself the missing footgun warning.
+    """
+
+
 @dataclass
 class ResponseAction:
     """A planned ``gauntlet resume --response`` transition (FR-1/FR-2/FR-7.1).
@@ -482,57 +494,100 @@ class Orchestrator:
         self._persist()
         return self.drive()
 
-    def reject_gate(self, step_id: str, notes: str, user: str = "operator") -> str:
+    def reject_gate(
+        self, step_id: str, notes: str, user: str = "operator",
+        *, allow_terminal: bool = False,
+    ) -> str:
         """Reject a parked gate (FR-8.1).
 
         A rejection is actionable feedback, not a dead end: when the gate sits
-        downstream of an ``adversarial_cycle`` (the PRD/plan review loops), inject
-        the rejection note into that cycle as a new round and re-drive — the same
-        way ``resume --response`` re-drives a parked cycle escalation. This matches
-        the operator playbook ("reject with a reason the builder can act on") and
-        removes the trap where a rejected gate terminally failed the run while
-        ``status`` still recommended a `resume` that no-op'd.
+        downstream of an ``adversarial_cycle`` (the PRD/plan review loops, and —
+        since #98 — the ``foreach`` phase loop's ``phase-gate`` over its own
+        iteration's ``impl-cycle``), inject the rejection note into that cycle as
+        a new round and re-drive — the same way ``resume --response`` re-drives a
+        parked cycle escalation. This matches the operator playbook ("reject with
+        a reason the builder can act on") and removes the trap where a rejected
+        gate terminally failed the run while ``status`` still recommended a
+        `resume` that no-op'd. Inside a ``foreach`` stage the cycle record is the
+        one at the GATE's iteration; other iterations are untouched.
 
-        Falls back to a terminal reject (the prior behavior) only when there is no
-        upstream cycle to iterate — a gate not preceded by an ``adversarial_cycle``
-        in its stage, or one inside a ``foreach`` fan-out (iteration re-arming is
-        out of scope) — so the verb is never silently a no-op.
+        A terminal reject — no upstream cycle to iterate, or its record is not
+        re-runnable — requires ``allow_terminal=True`` (the CLI's ``--terminal``
+        flag, #98): without it the verb raises
+        :class:`TerminalRejectRefusedError` naming the consequence, persists
+        nothing, and leaves the gate PARKED and the run drivable. With it, the
+        run fails terminally in one classifiable write (never silently a no-op).
         """
         rec = self._find_parked_gate(step_id)
         cycle_step, stage = self._upstream_cycle_for_gate(step_id)
+        # The cycle record at the GATE's iteration (#98): inside a foreach stage
+        # every step of the iteration carries the same iteration key, so the
+        # gate's own record qualifies the lookup (None outside a foreach —
+        # identical to the old behavior there).
         cyc_rec = (
-            self.manifest.record(cycle_step.id, None)
+            self.manifest.record(cycle_step.id, rec.iteration)
             if cycle_step is not None else None
         )
         # Iterate only when the upstream cycle actually ran to DONE. A missing
         # record (defensive) or a non-DONE one — e.g. a `when:`-skipped cycle, the
         # only path that leaves a SKIPPED record before the gate — has nothing to
         # re-arm: re-driving would just re-skip it and orphan the injected note.
-        # Fall back to a terminal reject with a clear reason (never a crash, never
-        # a silent no-op).
         if cyc_rec is None or cyc_rec.status != M.DONE:
-            rec.status = M.FAILED
-            rec.ended = self.clock()
-            rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
-            # FR-7.2: a terminal reject has no re-runnable path (no upstream cycle
-            # to iterate) — the precondition to proceed past the gate is unmet.
-            rec.halt_reason = M.HALT_REASON_PRECONDITION
             why = (
                 "no upstream adversarial_cycle to iterate"
                 if cycle_step is None
                 else f"upstream cycle {cycle_step.id!r} is not in a re-runnable "
                 f"state ({cyc_rec.status if cyc_rec else 'no record'})"
             )
-            rec.notes = f"rejected ({why}): {notes}"
+            # #98: a terminal reject is a run-ending decision, not a routine
+            # next-action — refuse it unless the operator asked for it by name.
+            # Raising persists nothing: the gate stays PARKED, the run stays
+            # exactly as drivable as before the verb.
+            if not allow_terminal:
+                raise TerminalRejectRefusedError(
+                    f"rejecting gate {step_id!r} would TERMINALLY FAIL the run "
+                    f"({why}); the note would not be injected anywhere. If that "
+                    "is what you want, re-run with --terminal; otherwise use "
+                    f"`gauntlet abort {self.manifest.slug}` to end the run "
+                    "retaining evidence, or approve the gate."
+                )
+            rec.status = M.FAILED
+            rec.ended = self.clock()
+            rec.parked_reason = None  # current-state invariant (FR-2.1, F-001)
+            # FR-7.2: a terminal reject has no re-runnable path (no upstream cycle
+            # to iterate) — the precondition to proceed past the gate is unmet.
+            rec.halt_reason = M.HALT_REASON_PRECONDITION
+            # #98 (issue item 3): stamp the recorded classification to match the
+            # affordances actually offered. A failed human_gate takes no
+            # `--response` (not a RESPONDABLE_STEP_TYPE — the action surface
+            # offers only abort, F-007), so the honest disposition is
+            # `abort_only`, not the generic FAILED+PRECONDITION `human_decision`
+            # that advertised a decision channel the step cannot accept.
+            rec.recovery_cause = RX.RecoveryCause.PRECONDITION_UNSATISFIED.value
+            rec.recovery_disposition = RX.RecoveryDisposition.ABORT_ONLY.value
+            rec.notes = (
+                f"rejected ({why}): {notes} — terminal; the exit is "
+                f"`gauntlet abort {self.manifest.slug}` (a failed human_gate "
+                "accepts no --response)"
+            )
+            # #62 discipline: map the run status in the SAME durable write as
+            # the step's terminal status — a kill between two persists would
+            # otherwise land `parked` + a failed gate + zero parked steps,
+            # which classifies `unknown`. The #100 invariant guards the write.
+            self.manifest.status = M.RUN_FAILED
+            RX.require_classifiable(self.manifest, verb="reject")
             self._persist()
-            return self._set_run_status(FAILED)
+            return self.manifest.status
         # Iterate: append the rejection note to the upstream cycle as a pending
         # `--response` (audited + checkpoint-committed like any decision), then
-        # reset the cycle and everything after it in the stage — including this
+        # reset the cycle and everything after it in the stage — including any
+        # intervening steps (e.g. acceptance-recheck / tests-recheck) and this
         # gate — so the stage walk re-runs the cycle (consuming the note as
-        # authoritative round guidance) and re-parks the gate for a fresh decision.
+        # authoritative round guidance), re-proves the evidence steps, and
+        # re-parks the gate for a fresh decision. The reset is scoped to the
+        # gate's iteration (#98): other foreach iterations are untouched.
         self._append_response(cyc_rec, notes, user)
-        self._reset_for_retry(stage, cycle_step.id, None)
+        self._reset_for_retry(stage, cycle_step.id, rec.iteration)
         return self.drive()
 
     def _upstream_cycle_for_gate(self, gate_id: str):
