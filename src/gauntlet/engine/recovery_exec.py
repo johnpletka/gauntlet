@@ -556,7 +556,7 @@ _ENGINE_COMMIT_SUBJECT_PREFIX = "gauntlet: "
 _ENGINE_COMMIT_WALK_LIMIT = 100
 
 
-def _skip_engine_bookkeeping_commits(repo: Path, sha: str) -> str:
+def skip_engine_bookkeeping_commits(repo: Path, sha: str) -> str:
     """First ancestor of ``sha`` that is not an engine bookkeeping commit.
 
     A rewind marker's parent IS the rewind target, so skipping it still
@@ -565,6 +565,12 @@ def _skip_engine_bookkeeping_commits(repo: Path, sha: str) -> str:
     correctly reads "no substantive movement". The walk is bounded and any
     git failure returns the sha reached — fail toward the raw tip, never
     toward silence.
+
+    Public since #95: the orchestrator's dirty-verdict detail anchors its
+    park evidence on the same bookkeeping-skipped head, so an identical
+    re-park whose only delta is the engine's own commits produces
+    byte-identical notes and the R5 fingerprint reads the repeat as
+    unchanged.
     """
     for _ in range(_ENGINE_COMMIT_WALK_LIMIT):
         try:
@@ -575,6 +581,64 @@ def _skip_engine_bookkeeping_commits(repo: Path, sha: str) -> str:
         except gitops.GitError:
             return sha  # root commit or unreadable history: stop here
     return sha
+
+
+def latest_cycle_round_commit(
+    repo: Path,
+    manifest: "M.Manifest",
+    rec: "M.StepRecord",
+    *,
+    tip: str | None = None,
+) -> str | None:
+    """Newest committed adversarial-cycle round commit recorded for ``rec`` (#95).
+
+    A cycle's committed round commits (the ``PRD.n:``/``P<N>.n: Address
+    review — …`` fix rounds and the artifact baseline) are its checkpoint
+    analog, but they never match the ``P<N> wip:`` subject shape the generic
+    checkpoint discovery keys on — so a ``--reset-interrupted`` on a cycle
+    step used to degenerate to "reset to the run base", discarding every
+    committed round and stranding the cycle's own recorded rewind targets.
+
+    Candidates come from BOTH durable records so the selection works even in
+    the #95 window where ``rec.checkpoints`` is empty (killed before the
+    first checkpoint, or right after ``_Resume.invalidate()`` cleared them on
+    a ``--response`` re-drive): ``manifest.commits`` entries attributed to
+    this step, plus every checkpoint's ``result_sha``/``handoff_sha``. A
+    candidate must resolve to a real commit, descend from ``rec.base_sha``
+    (when recorded), and — when ``tip`` is given — be reachable from it. The
+    descendant-most valid candidate wins; ``None`` when no round ever
+    committed (the caller falls back to ``base_sha``, today's behavior).
+    Read-only and fail-closed: any git failure disqualifies the candidate,
+    never raises.
+    """
+    if rec.type != "adversarial_cycle":
+        return None
+    candidates: list[str] = [
+        c.sha for c in manifest.commits if c.step_id == rec.id
+    ]
+    for cp in rec.checkpoints:
+        if cp.result_sha:
+            candidates.append(cp.result_sha)
+        if cp.handoff_sha:
+            candidates.append(cp.handoff_sha)
+    best: str | None = None
+    for sha in candidates:
+        if not sha:
+            continue
+        try:
+            if not gitops.ref_is_valid_commit(repo, sha):
+                continue
+            if tip is not None and sha != tip and not gitops.is_ancestor(
+                repo, sha, tip
+            ):
+                continue  # discarded/foreign history: not a reachable round
+            if rec.base_sha and not gitops.is_ancestor(repo, rec.base_sha, sha):
+                continue  # predates the attempt boundary: not this cycle's work
+            if best is None or gitops.is_ancestor(repo, best, sha):
+                best = sha
+        except gitops.GitError:
+            continue  # fail closed toward the base_sha fallback
+    return best
 
 
 def build_progress_fingerprint(
@@ -599,7 +663,7 @@ def build_progress_fingerprint(
     """
     run_branch_sha = None
     if gitops.branch_exists(repo, manifest.branch):
-        run_branch_sha = _skip_engine_bookkeeping_commits(
+        run_branch_sha = skip_engine_bookkeeping_commits(
             repo, gitops.rev_parse(repo, f"refs/heads/{manifest.branch}")
         )
     pending_id = None
@@ -774,9 +838,22 @@ class RecoveryPlanner:
                     )
             elif kind is RecoveryActionKind.SNAPSHOT_AND_RESTART:
                 target_sha = None
-                if rec is not None and rec.base_sha:
+                # #95 (defect A): on an adversarial_cycle step the executing
+                # reset targets the latest committed round commit, never the
+                # raw base — the advertised action must name the SAME sha so
+                # status shows what the reset would actually do (R4: the
+                # read-only view and the mutating path cannot disagree).
+                if rec is not None and rec.type == "adversarial_cycle":
+                    target_sha = latest_cycle_round_commit(
+                        self.repo, manifest, rec,
+                        tip=git_obs.run_branch_sha if git_obs is not None
+                        else None,
+                    )
+                if target_sha is None and rec is not None and rec.base_sha:
                     target_sha = rec.base_sha
-                elif git_obs is not None and git_obs.run_branch_sha:
+                elif target_sha is None and git_obs is not None and (
+                    git_obs.run_branch_sha
+                ):
                     target_sha = git_obs.run_branch_sha
                 if target_sha is None:
                     continue  # no executable payload → cannot advertise it
