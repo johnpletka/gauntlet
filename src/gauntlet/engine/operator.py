@@ -1675,7 +1675,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "suspension": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "required": ["classification", "last_heartbeat_age_s", "agent_output_age_s", "intervals"],
       "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
       "properties": {
         "classification": {
@@ -1686,6 +1686,10 @@ _STATUS_SCHEMA_JSON = r'''{
         "last_heartbeat_age_s": {
           "type": ["number", "null"],
           "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "agent_output_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds since the current running step's adapter child last appended output (now - mtime of its events.jsonl) — the exact sampled input the agent_silent classification consumed (#103). null when not applicable (no running step / no output yet). APPENDED additively for the agent-silent age surfacing."
         },
         "intervals": {
           "type": "array",
@@ -2766,12 +2770,13 @@ def compute_suspension_view(
         current = next(
             (iv for iv in intervals if iv["end"] == hb.wallclock_utc), None
         )
+    agent_output_age = _agent_output_age_s(man, run_instance_dir, now)
     classification = HB.classify_stall(
         pid_alive=(liveness == LIVENESS_ALIVE),
         pair_gap_s=(current["gap_s"] if current is not None else None),
         clock_skew=current is not None,
         hb_age_s=hb_age_s,
-        agent_output_age_s=_agent_output_age_s(man, run_instance_dir, now),
+        agent_output_age_s=agent_output_age,
         interval_s=interval_s,
         threshold_s=threshold_s,
         agent_silence_s=agent_silence_s,
@@ -2779,6 +2784,11 @@ def compute_suspension_view(
     return {
         "classification": classification,
         "last_heartbeat_age_s": hb_age_s,
+        # The `agent_silent` signal's own input (#103): the SAME sampled value
+        # the classification consumed, surfaced so the human footer and --json
+        # can name HOW LONG the agent has been silent — never a re-read that
+        # could disagree with the classification.
+        "agent_output_age_s": agent_output_age,
         "intervals": intervals,
     }
 
@@ -3258,6 +3268,13 @@ def _state_meaning(rstate: RunState) -> str:
     return _MEANING.get(rstate.state, "")
 
 
+def _fmt_age(age_s: float) -> str:
+    """A human age: seconds under a minute, whole minutes past it (`34m`)."""
+    if age_s < 60:
+        return f"{age_s:.0f}s"
+    return f"{age_s / 60:.0f}m"
+
+
 def render_footer(
     driver: DriverInfo,
     rstate: RunState,
@@ -3269,6 +3286,7 @@ def render_footer(
     run_elapsed_s: float | None = None,
     cost_usd: float | None = None,
     quota_reset_at: str | None = None,
+    slug: str | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -3344,6 +3362,22 @@ def render_footer(
             f"suspension: {classification if classification else 'none'} "
             "(stall classification, FR-5.3)"
         )
+        # Agent-silent age surfacing (#103): once the classifier says
+        # `agent_silent` the silence is by definition past the FR-5.3
+        # threshold — name HOW LONG, and point at §4 `recover` so the
+        # operator does not need `ps` forensics to justify the judgment.
+        # The value is the SAME sampled input the classification consumed.
+        if classification == HB.STALL_AGENT_SILENT:
+            silent_age = suspension.get("agent_output_age_s")
+            if silent_age is not None:
+                verb = (
+                    f"`gauntlet recover {slug}`" if slug else "`gauntlet recover`"
+                )
+                lines.append(
+                    f"agent silent: no adapter output for "
+                    f"{_fmt_age(silent_age)} — if this persists, see §4 "
+                    f"recover ({verb})"
+                )
         age = suspension.get("last_heartbeat_age_s")
         if age is not None:
             lines.append(f"heartbeat: last written {age:.1f}s ago")

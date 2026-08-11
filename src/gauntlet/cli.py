@@ -1111,6 +1111,7 @@ def status(
         run_elapsed_s=operator._run_elapsed_s(man, now),
         cost_usd=man.totals.cost_usd,
         quota_reset_at=quota_reset_at,
+        slug=slug,  # names the §4 recover verb in the agent-silent line (#103)
     ):
         typer.echo(line)
 
@@ -1493,6 +1494,37 @@ def recover(
         typer.echo(f"recover refused: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"run status: {status}")
+    _echo_recover_composite(mgr, slug)
+
+
+def _echo_recover_composite(mgr, slug: str) -> None:
+    """After a successful recover, print the composite truth (#103 papercut).
+
+    The raw run status alone misleads: recover marks the step INTERRUPTED (§4's
+    promise) but the manifest ``run_status`` it leaves reads ``failed``, so the
+    bare ``run status: failed`` echo sent operators to ``status --json`` to
+    learn the state was actually ``interrupted``. Print the computed composite
+    state — the same :func:`operator.composite_state` classification `status`
+    renders — plus the next verb. Best-effort read-only reporting: a failure
+    here never masks the recover outcome (recover already succeeded).
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine.manifest import Manifest
+
+    try:
+        run_instance_dir = _resolve_run_instance_dir(mgr, slug)
+        man = Manifest.load(run_instance_dir / "manifest.json")
+        run_root = mgr.repo_root / mgr.config.run_root
+        liveness = operator.driver_liveness(
+            run_root, slug, run_instance_dir=run_instance_dir
+        )
+        state = operator.composite_state(man, liveness)
+    except Exception:
+        return
+    typer.echo(
+        f"state: {state} — recover does not auto-resume; continue with "
+        f"`gauntlet resume {slug}`"
+    )
 
 
 @app.command()

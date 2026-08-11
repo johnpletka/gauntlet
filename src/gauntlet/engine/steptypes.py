@@ -953,6 +953,14 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
     timeout = resolve_step_timeout_s(step, agent_name, ctx.config)
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
+    # Agent-liveness watchdog bound (FR-5.3, #103), armed the same way from the
+    # profile; unset keeps the adapter's default (engine default bound). A
+    # vanished child raises AgentVanishedError → the orchestrator parks the
+    # step INTERRUPTED for a plain resume, never a silent 2h wait.
+    if agent_name and agent_name in ctx.config.agents:
+        watchdog = ctx.config.profile(agent_name).agent_silent_timeout_s
+        if watchdog is not None and hasattr(adapter, "watchdog_silence_s"):
+            adapter.watchdog_silence_s = watchdog
     logger = step_logger(ctx)
 
     def _invoke(call_prompt: str, session: str | None, *, log_suffix: str = ""):

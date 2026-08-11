@@ -216,6 +216,14 @@ class AgentProfile(BaseModel):
     max_turns: int | None = None
     budget_usd: float | None = None
     step_timeout_s: float | None = None
+    # Agent-liveness watchdog bound (FR-5.3, #103): how long the adapter wait
+    # may sit on a child that is PROVABLY gone (leader reaped, process group
+    # empty) with its output stream still open and silent, before the step
+    # self-marks INTERRUPTED. Distinct from `step_timeout_s` (a wall-clock
+    # budget on a live child, subject to FR-5.2 suspend credit). None → the
+    # engine default (heartbeat.DEFAULT_AGENT_SILENT_TIMEOUT_S, 15 min); 0
+    # disables. A live child is never affected, however silent.
+    agent_silent_timeout_s: float | None = None
 
     @field_validator("effort")
     @classmethod
@@ -248,7 +256,10 @@ class AgentProfile(BaseModel):
         return get_adapter_class(self.adapter)
 
     def _adapter_kwargs(self, effort_override: str | None = None) -> dict[str, Any]:
-        guard_fields = {"max_turns", "budget_usd", "step_timeout_s", "effort"}
+        guard_fields = {
+            "max_turns", "budget_usd", "step_timeout_s",
+            "agent_silent_timeout_s", "effort",
+        }
         data = self.model_dump(exclude_none=True)
         data.pop("adapter", None)
         for f in guard_fields:

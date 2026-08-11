@@ -215,7 +215,7 @@ def _streaming_run_double(events, *, exit_code=0, stderr="", timed_out=False):
     stdout = "".join(json.dumps(e) + "\n" for e in events)
 
     def fake_run(argv, *, timeout_s, stdin_text=None, cwd=None, env=None, sink=None,
-                 preexec_fn=None):
+                 preexec_fn=None, watchdog_silence_s=None):
         if sink is not None:
             for line in stdout.splitlines(keepends=True):
                 sink(line)

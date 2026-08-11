@@ -22,6 +22,7 @@ from gauntlet.adapters.base import (
     AgentFailedError,
     AgentResult,
     AgentTimeoutError,
+    AgentVanishedError,
     MalformedOutputError,
     SessionNotFoundError,
     Usage,
@@ -30,7 +31,11 @@ from gauntlet.adapters.failure_markers import (
     classify_codex_failure,
     looks_like_session_not_found,
 )
-from gauntlet.adapters.process import ProcessOutput, run_with_timeout
+from gauntlet.adapters.process import (
+    ProcessOutput,
+    effective_watchdog_silence_s,
+    run_with_timeout,
+)
 from gauntlet.config import lint_flags
 
 DEFAULT_TIMEOUT_S = 600.0
@@ -87,6 +92,7 @@ class CodexAdapter:
         skip_git_repo_check: bool = False,
         executable: str = "codex",
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        watchdog_silence_s: float | None = None,
         base_flags: list[str] | None = None,
     ) -> None:
         self.model = model
@@ -95,6 +101,10 @@ class CodexAdapter:
         self.skip_git_repo_check = skip_git_repo_check
         self.executable = executable
         self.timeout_s = timeout_s
+        # Agent-liveness watchdog bound (FR-5.3, #103): None → the engine
+        # default; 0 disables. The engine overrides this from the profile's
+        # `agent_silent_timeout_s` the same way it arms `timeout_s`.
+        self.watchdog_silence_s = watchdog_silence_s
         self.base_flags = list(base_flags or [])
         lint_flags(self._build_argv(session=None, schema_path=None, output_path=None))
 
@@ -136,9 +146,19 @@ class CodexAdapter:
             out = run_with_timeout(
                 argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
                 sink=effective_sink,
+                watchdog_silence_s=self.watchdog_silence_s,
             )
             last_message = (
                 output_path.read_text() if output_path.exists() else None
+            )
+        if out.agent_vanished:
+            raise AgentVanishedError(
+                "agent-liveness watchdog (FR-5.3, #103): the codex child "
+                "process was provably gone (reaped, process group empty) with "
+                "its output stream still open and silent past the "
+                f"{effective_watchdog_silence_s(self.watchdog_silence_s):.0f}s "
+                f"bound; stopped waiting after {out.duration_s:.0f}s.",
+                partial=self._partial_result(out),
             )
         if out.timed_out:
             raise AgentTimeoutError(

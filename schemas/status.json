@@ -233,7 +233,7 @@
     "suspension": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["classification", "last_heartbeat_age_s", "intervals"],
+      "required": ["classification", "last_heartbeat_age_s", "agent_output_age_s", "intervals"],
       "description": "Suspend/sleep view (harness-efficiency FR-5.3): driver heartbeat age, detected host-suspension intervals, and the fail-closed stall classification. null only when there is neither a heartbeat nor any recorded interval.",
       "properties": {
         "classification": {
@@ -244,6 +244,10 @@
         "last_heartbeat_age_s": {
           "type": ["number", "null"],
           "description": "Age in seconds of the newest driver heartbeat (now - its wallclock), or null when no heartbeat exists yet."
+        },
+        "agent_output_age_s": {
+          "type": ["number", "null"],
+          "description": "Age in seconds since the current running step's adapter child last appended output (now - mtime of its events.jsonl) — the exact sampled input the agent_silent classification consumed (#103). null when not applicable (no running step / no output yet). APPENDED additively for the agent-silent age surfacing."
         },
         "intervals": {
           "type": "array",

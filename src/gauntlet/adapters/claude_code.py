@@ -22,6 +22,7 @@ from gauntlet.adapters.base import (
     AgentFailedError,
     AgentResult,
     AgentTimeoutError,
+    AgentVanishedError,
     MalformedOutputError,
     SessionNotFoundError,
     Usage,
@@ -30,7 +31,11 @@ from gauntlet.adapters.failure_markers import (
     classify_claude_failure,
     looks_like_session_not_found,
 )
-from gauntlet.adapters.process import ProcessOutput, run_with_timeout
+from gauntlet.adapters.process import (
+    ProcessOutput,
+    effective_watchdog_silence_s,
+    run_with_timeout,
+)
 from gauntlet.config import lint_flags
 
 DEFAULT_TIMEOUT_S = 600.0
@@ -92,6 +97,7 @@ class ClaudeCodeAdapter:
         output_format: str = "json",
         executable: str = "claude",
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        watchdog_silence_s: float | None = None,
         base_flags: list[str] | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
@@ -107,6 +113,10 @@ class ClaudeCodeAdapter:
         self.output_format = output_format
         self.executable = executable
         self.timeout_s = timeout_s
+        # Agent-liveness watchdog bound (FR-5.3, #103): None → the engine
+        # default; 0 disables. The engine overrides this from the profile's
+        # `agent_silent_timeout_s` the same way it arms `timeout_s`.
+        self.watchdog_silence_s = watchdog_silence_s
         self.base_flags = list(base_flags or [])
         # A fully-rebuilt child environment (pipeline-effectiveness FR-2.5, P5): the
         # behavioral verifier spawns claude from an explicit allowlist with every
@@ -149,7 +159,17 @@ class ClaudeCodeAdapter:
         out = run_with_timeout(
             argv, timeout_s=self.timeout_s, stdin_text=prompt, cwd=cwd,
             sink=effective_sink, env=self.env, preexec_fn=self.spawn_preexec,
+            watchdog_silence_s=self.watchdog_silence_s,
         )
+        if out.agent_vanished:
+            raise AgentVanishedError(
+                "agent-liveness watchdog (FR-5.3, #103): the claude child "
+                "process was provably gone (reaped, process group empty) with "
+                "its output stream still open and silent past the "
+                f"{effective_watchdog_silence_s(self.watchdog_silence_s):.0f}s "
+                f"bound; stopped waiting after {out.duration_s:.0f}s.",
+                partial=self._partial_result(out),
+            )
         if out.timed_out:
             raise AgentTimeoutError(
                 f"claude killed after {self.timeout_s}s timeout",
