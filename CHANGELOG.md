@@ -6,6 +6,27 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+- A vanished CLI agent now exits the adapter wait through the existing
+  interrupted/resume path, with proof-gated process-group checks, agent-silence
+  status evidence, and truthful `recover` state output (#103 / PR #113).
+- Recovery now preserves coherent foreach state, re-drives rejected phase gates,
+  resumes killed adversarial cycles without losing completed rounds, and fails
+  closed when a mutating implementation attempt was entirely denied (PRs #102,
+  #108, #111, and #112).
+- Governed-artifact publish-back uses a three-way comparison, while provider
+  outage markers and engine bookkeeping dirt are classified without masking real
+  failures (PRs #107 and #109).
+- Agent-authored commit messages are sanitized at the shared `git commit -F -`
+  stdin boundary; NUL/control bytes no longer strand completed work (#105 /
+  PR #114).
+- A human-approved FR-10.4 response now consumes the same prior finding-root and
+  upstream-target question after the response-disposition gate says to proceed;
+  a different root or artifact still re-parks fail-closed (#106).
+- The full live-pipeline test now resolves bounded FR-10.4 variance through the
+  public response workflow and treats a proven plain-resumable provider/quota
+  park as environment variance rather than an engine failure (#116).
+- Removed the stray closing code fence from the README (PR #115).
+
 ## [1.0.8] — 2026-08-08
 
 **Recover, rollback, and the interrupted park now reconcile a branch left

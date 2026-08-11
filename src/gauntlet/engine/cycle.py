@@ -720,10 +720,20 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # normal re-drive below. Unset `disposition_agent` → today's behavior (the
     # cycle re-drives with the decision injected, unchanged).
     disposition_agent = step.get("disposition_agent")
+    settled_upstream: set[tuple[str, str]] = set()
     if is_response_redrive and disposition_agent:
-        gate = _response_disposition_gate(step, ctx, disposition_agent, usage)
+        # Snapshot the exact upstream question BEFORE fresh review invalidates
+        # the prior round's findings/triage artifacts.  A proceeding disposition
+        # settles only this (finding-root, target-artifact) pair; a genuinely new
+        # question still parks below (issue #106).
+        prior_upstream = _prior_upstream_fingerprints(ctx)
+        gate, disposition = _response_disposition_gate(
+            step, ctx, disposition_agent, usage
+        )
         if gate is not None:  # non-proceed: return without re-driving the cycle
             return _finish(gate, usage, commits, artifact_writes, metrics)
+        if disposition in ("proceed_in_place", "proceed_with_deviation"):
+            settled_upstream = prior_upstream
     is_quota_resume = ctx.record.parked_reason == M.PARKED_REASON_USAGE_LIMIT
     resume = _Resume(
         ctx, active=bool(ctx.record.checkpoints) and not is_response_redrive
@@ -1019,6 +1029,8 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             except _ParkCycle as park:
                 return finish(park.result)
             verdicts = carried_verdicts + fresh_verdicts
+        if settled_upstream:
+            _consume_settled_upstream_targets(verdicts, settled_upstream)
         metrics.record_verdicts(verdicts)
         if rematched_ids:  # injected precedents the triager overrode to legitimate (§9)
             metrics.add_registry_overrides(sum(
@@ -2276,9 +2288,67 @@ def _vacuous_convergence_result(
     )
 
 
+def _finding_root(finding_id: object) -> str:
+    """Stable suffix used to correlate one finding across panel re-drives.
+
+    Ensemble/verifier ids can change their member prefix across reviews (for
+    example ``verifier:F-001`` → ``1-reviewer-spec-coverage:F-001``), while the
+    reviewer's root id remains the final component.  Keeping the full suffix
+    when there is no colon makes ordinary ids unchanged.
+    """
+    return str(finding_id or "").rsplit(":", 1)[-1]
+
+
+def _prior_upstream_fingerprints(ctx: StepContext) -> set[tuple[str, str]]:
+    """Read the upstream questions that caused the immediately prior park.
+
+    The latest authoritative ``triage.json`` still describes the parked round
+    when a response re-drive begins.  It is snapshotted before fresh review
+    deliberately invalidates that file.  Missing/malformed evidence yields an
+    empty set, so uncertainty preserves the normal FR-10.4 park (fail closed).
+    """
+    path = ctx.run_dir / "artifacts" / "triage.json"
+    try:
+        verdicts = json.loads(path.read_text()).get("verdicts") or []
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return set()
+    return {
+        (_finding_root(v.get("finding_id")), str(v["target_artifact"]).strip())
+        for v in verdicts
+        if isinstance(v, dict) and str(v.get("target_artifact") or "").strip()
+    }
+
+
+def _consume_settled_upstream_targets(
+    verdicts: list[dict[str, Any]], settled: set[tuple[str, str]]
+) -> None:
+    """Normalize re-triage of a human-settled FR-10.4 question in place.
+
+    Reaching this helper means the configured disposition agent already
+    classified the response as a proceeding decision.  If re-triage repeats
+    the same finding root and target artifact, ``target_artifact`` no longer
+    represents an undecided upstream invalidation: clear it so the current
+    cycle can honor the decision.  The audit stays explicit in ``reasoning``.
+    A new root or target is untouched and therefore re-parks normally.
+    """
+    for verdict in verdicts:
+        target = str(verdict.get("target_artifact") or "").strip()
+        fingerprint = (_finding_root(verdict.get("finding_id")), target)
+        if not target or fingerprint not in settled:
+            continue
+        verdict["target_artifact"] = None
+        note = (
+            "Engine: the response-disposition gate classified the operator's "
+            f"decision as proceeding and consumed the prior FR-10.4 target "
+            f"{target!r} for this finding root (issue #106)."
+        )
+        reasoning = str(verdict.get("reasoning") or "").rstrip()
+        verdict["reasoning"] = f"{reasoning} {note}".strip()
+
+
 def _response_disposition_gate(
     step: Step, ctx: StepContext, disposition_agent: str, usage: Any
-) -> StepResult | None:
+) -> tuple[StepResult | None, str | None]:
     """Classify a `--response` resume through a cheap `disposition_agent` before
     re-driving the full cycle (FR-3/FR-6.3/FR-10).
 
@@ -2289,12 +2359,10 @@ def _response_disposition_gate(
     enforces the conflict object-vs-null shape, response-awareness, and the
     amendment-artifact rule). Returns:
 
-    * ``None`` — a ``proceed`` disposition: the block is resolved, so the caller
-      re-drives the full review→triage→fix→confirm cycle to apply it (only the
-      primary roles can do the actual work; a cheap non-writing emitter cannot).
-    * a PARKED/FAILED :class:`StepResult` — a re-park (amendment_required/
-      new_conflict) or a malformed disposition: returned so the caller finishes
-      WITHOUT invoking the expensive roles (the builder-window-saving common case).
+    Returns ``(None, disposition)`` for a proceeding decision so the caller can
+    re-drive the primary roles and remember what authorized that re-drive.
+    Returns ``(PARKED/FAILED, disposition)`` for amendment/new-conflict/malformed
+    output so the caller finishes without invoking the expensive roles.
 
     The emitter's spend is added to ``usage`` (FR-3.2), so it is accounted even
     when the roles never run. A transient sub-agent failure parks the cycle
@@ -2316,13 +2384,14 @@ def _response_disposition_gate(
             substep="response-disposition",
         )
     except _ParkCycle as park:
-        return park.result
+        return park.result, None
     usage_by_agent = {disposition_agent: result.usage} if result.usage else {}
     outcome = _resume_disposition_result(
         disposition_agent, result, usage_by_agent, ctx.record.human_responses
     )
-    # proceed → None (fall through to the full re-drive); re-park/fail → return it.
-    return None if outcome.status == DONE else outcome
+    disposition = (result.structured or {}).get("disposition")
+    # proceed → fall through to the full re-drive; re-park/fail → return it.
+    return (None, disposition) if outcome.status == DONE else (outcome, disposition)
 
 
 def _disposition_prompt(ctx: StepContext) -> str:

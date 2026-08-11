@@ -14,6 +14,7 @@ any such run. These tests cover the three pieces of the fix:
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -793,6 +794,82 @@ def test_cycle_routed_proceed_classifies_then_redrives_roles(tmp_path):
     assert len(mechanic.calls) == 1
     assert resume_reviewer.calls, "a proceed must re-drive the primary roles"
     assert decision in resume_reviewer.calls[0]["prompt"]
+
+
+def test_cycle_routed_proceed_consumes_same_upstream_question(tmp_path):
+    """#106: a settled FR-10.4 pair cannot charge another identical re-park.
+
+    The panel prefix changes across the re-drive, as in the live incident, but
+    the root finding id and target artifact are the same.  A proceeding mechanic
+    disposition authorizes the current cycle to consume that exact question;
+    the normalized verdict is persisted for audit and reaches the fixer.  A new
+    root or target remains covered by the ordinary fail-closed park path.
+    """
+    repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
+    mechanic = SeqAdapter(_disposition("proceed_in_place"))
+    finding_id = "1-reviewer-spec-coverage:F-001"
+    resume_reviewer = SeqAdapter(
+        REVIEW(F(finding_id)), CONFIRM(CV(finding_id, "resolved"))
+    )
+    builder = SeqAdapter(writer("src.py", "fixed\n", {"done": True}))
+    resume = {
+        "reviewer": resume_reviewer,
+        "triage": SeqAdapter(
+            V(finding_id, action="fix_now", target_artifact="plan.md")
+        ),
+        "builder": builder,
+        "mechanic": mechanic,
+    }
+
+    status = mgr.resume(
+        "demo",
+        response="F-001 is a P1 implementation concern; fix it in this cycle.",
+        use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+
+    assert status == M.RUN_DONE
+    rec = mgr.status("demo").record("cycle")
+    assert rec.status == M.DONE and rec.parked_reason is None
+    assert len(builder.calls) == 1
+    triage = json.loads(
+        (mgr.layout("demo").active_run_dir() / "artifacts" / "triage.json").read_text()
+    )
+    verdict = triage["verdicts"][0]
+    assert verdict["finding_id"] == finding_id
+    assert verdict["target_artifact"] is None
+    assert "consumed the prior FR-10.4 target" in verdict["reasoning"]
+
+
+def test_cycle_routed_proceed_reparks_new_upstream_question(tmp_path):
+    """#106 negative control: a new root/target is not covered by the decision."""
+    repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
+    mechanic = SeqAdapter(_disposition("proceed_in_place"))
+    resume = {
+        "reviewer": SeqAdapter(REVIEW(F("F-002"))),
+        "triage": SeqAdapter(
+            V("F-002", action="defer", target_artifact="prd.md")
+        ),
+        "builder": SeqAdapter(),
+        "mechanic": mechanic,
+    }
+
+    status = mgr.resume(
+        "demo",
+        response="Resolve only the previously escalated plan.md question.",
+        use_judge=False,
+        adapter_factory=lambda n: resume[n],
+    )
+
+    assert status == M.RUN_PARKED
+    rec = mgr.status("demo").record("cycle")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_RESPONSE
+    assert "FR-10.4 upstream invalidation" in (rec.notes or "")
+    triage = json.loads(
+        (mgr.layout("demo").active_run_dir() / "artifacts" / "triage.json").read_text()
+    )
+    assert triage["verdicts"][0]["target_artifact"] == "prd.md"
 
 
 def test_cycle_routed_malformed_disposition_fails_without_roles(tmp_path):
