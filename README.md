@@ -633,4 +633,3 @@ contract suite, which requires authenticated CLIs and API keys.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
   `gauntlet resume <slug>`.
-```
