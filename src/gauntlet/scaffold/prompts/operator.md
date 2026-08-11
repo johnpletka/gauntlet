@@ -258,10 +258,13 @@ own worktree off the branch's tip — never adopt or edit the run's.
   formality — see the guardrails.
 - **Reject** with a reason the builder can act on: `gauntlet reject <slug>
   --notes "<why>"`. The note is required and consequential: when the gate sits
-  downstream of an adversarial_cycle (the PRD/plan loops), reject injects your
+  downstream of an adversarial_cycle (the PRD/plan loops, and the phase loop's
+  `phase-gate` over its own iteration's `impl-cycle` — #98), reject injects your
   note into that cycle as a new fix round and re-drives, then re-parks the gate
-  for a fresh decision — so a bare rejection wastes a cycle. (A gate with no
-  upstream cycle to iterate ends the run.) Reject re-drives agents, so it honors
+  for a fresh decision — so a bare rejection wastes a cycle. A gate with no
+  upstream cycle to iterate ends the run permanently; that terminal reject is
+  refused unless you add the explicit `--terminal` flag, so a flag-less reject
+  can never end a run by surprise. Reject re-drives agents, so it honors
   the judge like `approve`.
 - **Respond** to a `parked_for_response` park with the human's decision:
   `gauntlet resume <slug> --response "<decision>"`. The text is passed verbatim

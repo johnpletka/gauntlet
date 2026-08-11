@@ -135,10 +135,12 @@ def upstream_cycle_for_gate(
     """The ``adversarial_cycle`` step a gate ratifies, and its stage (FR-8.2).
 
     The cycle is the last ``adversarial_cycle`` before ``gate_id`` in the same
-    non-``foreach`` stage (``prd-cycle`` for ``prd-approve``, ``plan-cycle`` for
-    ``plan-approve`` in ``standard.yaml``). Returns ``(None, None)`` when the gate
-    is in a ``foreach`` stage (iteration re-arming is out of scope) or has no
-    same-stage cycle before it.
+    stage (``prd-cycle`` for ``prd-approve``, ``impl-cycle`` for ``phase-gate``
+    inside the ``foreach`` phase loop in ``standard.yaml``). ``foreach`` stages
+    resolve like any other (#98): the *step* relationship is iteration-invariant
+    — callers that touch manifest records qualify them with the gate record's
+    own iteration. Returns ``(None, None)`` only when the gate has no same-stage
+    cycle before it.
 
     This is the *single* definition of the gate→cycle relationship. The reject
     path re-drives exactly this cycle (``Orchestrator.reject_gate``), and the
@@ -146,15 +148,13 @@ def upstream_cycle_for_gate(
     gate decision context (``operator.compute_gate_context``), so the advertised
     action and the performed action can never diverge (F-001). Resolving over the
     pipeline — not manifest step order — is what makes the two agree: a manifest
-    "last cycle before the gate" walk would name a prior-stage or foreach cycle
-    that a reject never touches.
+    "last cycle before the gate" walk would name a prior-stage cycle that a
+    reject never touches.
     """
     for stage in pipeline.stages:
         ids = [s.id for s in stage.steps]
         if gate_id not in ids:
             continue
-        if stage.foreach is not None:
-            return None, None  # iteration re-arming is out of scope
         gate_idx = ids.index(gate_id)
         for step in reversed(stage.steps[:gate_idx]):
             if step.type == "adversarial_cycle":

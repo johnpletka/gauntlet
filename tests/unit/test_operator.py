@@ -263,9 +263,12 @@ def test_running_manifest_with_null_identity_live_pid_is_indeterminate(
          op.STATE_ORPHANED, ["gauntlet resume demo"]),
         (M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)], op.LIVENESS_INDETERMINATE,
          op.STATE_INDETERMINATE, ["gauntlet logs demo", "gauntlet status demo --json"]),
+        # #98: a gate with no upstream cycle renders the reject command with the
+        # explicit --terminal flag its (terminal) reject now requires.
         (M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)], op.LIVENESS_NONE,
          op.STATE_PARKED_GATE,
-         ["gauntlet approve demo", 'gauntlet reject demo --notes "<your reason>"']),
+         ["gauntlet approve demo",
+          'gauntlet reject demo --notes "<your reason>" --terminal']),
         (M.RUN_PARKED,
          [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_UPSTREAM_CONFLICT)],
          op.LIVENESS_NONE, op.STATE_PARKED_FOR_RESPONSE,

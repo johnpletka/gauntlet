@@ -3715,7 +3715,8 @@ class RunManager:
             self._release_worktree_lock(handle)
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
-               *, use_judge: bool = True, adapter_factory=None) -> str:
+               *, use_judge: bool = True, allow_terminal: bool = False,
+               adapter_factory=None) -> str:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -3749,20 +3750,21 @@ class RunManager:
                 if use_judge:
                     return self._with_judge(man, run_dir, lambda env: self._reject_drive(
                         layout, run_dir, pipeline, man, gate, notes, user, env,
-                        adapter_factory))
+                        adapter_factory, allow_terminal=allow_terminal))
                 orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                           adapter_factory=adapter_factory)
-                status = orch.reject_gate(gate, notes, user)
+                status = orch.reject_gate(gate, notes, user,
+                                          allow_terminal=allow_terminal)
                 self._maybe_draft_pr(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
 
     def _reject_drive(self, layout, run_dir, pipeline, man, gate, notes, user, env,
-                      adapter_factory):
+                      adapter_factory, *, allow_terminal: bool = False):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.reject_gate(gate, notes, user)
+        status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
         self._maybe_draft_pr(layout, run_dir, man, status)
         return status
 

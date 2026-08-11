@@ -699,10 +699,11 @@ def test_reject_form_consequence_terminal_without_cycle(fixture_repo):
     _gate_run_with_artifacts(fixture_repo)  # impl-gate, no preceding cycle
     client = _client(fixture_repo)
     html = client.get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
-    assert (
-        'data-reject-consequence="terminally rejects the gate '
-        '(no upstream cycle to re-run)"' in html
-    )
+    # #98: the terminal consequence names the run-ending outcome and the
+    # --terminal requirement (the web reject posts flag-less, which refuses).
+    assert "data-reject-consequence=" in html
+    assert "TERMINALLY fails the run" in html
+    assert "--terminal" in html
 
 
 def test_control_js_confirm_is_not_stale_run_fails():

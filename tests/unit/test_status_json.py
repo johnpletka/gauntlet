@@ -258,8 +258,10 @@ def test_section_6_2_example_validates():
             {"label": "reject", "kind": "decide",
              "argv": ["gauntlet", "reject", "operator-aids", "--notes"],
              "required_inputs": ["notes"], "executable": False,
-             "command": 'gauntlet reject operator-aids --notes "<your reason>"',
-             "consequence": "terminally rejects the gate (no upstream cycle to re-run)"},
+             "command": 'gauntlet reject operator-aids --notes "<your reason>" --terminal',
+             "consequence": "TERMINALLY fails the run (no upstream cycle to "
+             "re-run — the notes are not injected anywhere); refused without "
+             "the explicit --terminal flag"},
         ],
     }
     validate_schema(example, STATUS_SCHEMA)

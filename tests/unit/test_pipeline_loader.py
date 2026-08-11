@@ -76,10 +76,12 @@ stages:
     assert upstream_cycle_id_for_gate(pipeline, "plan-approve") == "plan-cycle"
 
 
-def test_upstream_cycle_foreach_gate_is_none(tmp_path):
-    # A gate inside a foreach stage is terminal on reject (iteration re-arming is
-    # out of scope), so it must NOT name a cycle — status/web would otherwise
-    # advertise a re-run reject never performs (F-001).
+def test_upstream_cycle_foreach_gate_resolves_same_stage_cycle(tmp_path):
+    # #98: a gate inside a foreach stage resolves its same-stage cycle like any
+    # other — the step relationship is iteration-invariant (callers qualify
+    # manifest lookups with the gate record's iteration). This is the standard
+    # pipeline's phase-gate → impl-cycle shape; the old (None, None) carve-out
+    # made every phase-gate reject terminal.
     text = """
 name: d
 version: 1
@@ -91,8 +93,10 @@ stages:
       - {id: phase-approve, type: human_gate}
 """
     pipeline, _ = load_pipeline(_write(tmp_path, text))
-    assert upstream_cycle_for_gate(pipeline, "phase-approve") == (None, None)
-    assert upstream_cycle_id_for_gate(pipeline, "phase-approve") is None
+    step, stage = upstream_cycle_for_gate(pipeline, "phase-approve")
+    assert step is not None and step.id == "phase-cycle"
+    assert stage.id == "phases"
+    assert upstream_cycle_id_for_gate(pipeline, "phase-approve") == "phase-cycle"
 
 
 def test_upstream_cycle_prior_stage_cycle_is_not_named(tmp_path):

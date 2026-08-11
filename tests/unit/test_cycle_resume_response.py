@@ -30,7 +30,7 @@ from gauntlet.engine.manifest import (
     PipelineRef,
     StepRecord,
 )
-from gauntlet.engine.orchestrator import Orchestrator
+from gauntlet.engine.orchestrator import Orchestrator, TerminalRejectRefusedError
 from gauntlet.engine.pipeline import Pipeline
 from gauntlet.engine.run import RunManager
 
@@ -136,9 +136,7 @@ def test_reject_gate_redrives_upstream_cycle_with_note(cycle_repo):
     assert cyc.human_responses[0].artifact_fingerprint
 
 
-def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
-    """A gate with no upstream adversarial_cycle still fails terminally (no
-    iterate path) — reject is never a silent no-op."""
+def _no_upstream_gate_orch(cycle_repo):
     pipeline = Pipeline.model_validate({
         "name": "demo", "version": 1,
         "stages": [{"id": "s", "steps": [{"id": "gate", "type": "human_gate"}]}],
@@ -151,10 +149,47 @@ def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
         artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
         adapter_factory=lambda n: {}[n],
     )
+    return orch, man
+
+
+def test_reject_gate_without_upstream_cycle_refuses_without_terminal(cycle_repo):
+    """#98: a flag-less reject that would terminally fail the run is REFUSED —
+    typed error naming the consequence and the flag, gate still PARKED, the
+    composite state still parked_gate, and the manifest on disk untouched."""
+    orch, man = _no_upstream_gate_orch(cycle_repo)
     assert orch.drive() == M.RUN_PARKED
-    assert orch.reject_gate("gate", notes="no") == M.RUN_FAILED
+    manifest_path = cycle_repo / "runs" / "demo" / "run-1" / "manifest.json"
+    on_disk_before = manifest_path.read_bytes()
+    with pytest.raises(TerminalRejectRefusedError) as exc:
+        orch.reject_gate("gate", notes="no")
+    msg = str(exc.value)
+    assert "TERMINALLY FAIL" in msg and "--terminal" in msg
+    assert "gauntlet abort demo" in msg  # the evidence-retaining alternative
+    # Nothing persisted; the run is exactly as drivable as before the verb.
+    assert man.record("gate").status == M.PARKED
+    assert man.status == M.RUN_PARKED
+    assert manifest_path.read_bytes() == on_disk_before
+    from gauntlet.engine import recovery_exec as RX
+    state, parked, _ = RX.classify_composite(man, "none")
+    assert state == RX.STATE_PARKED_GATE
+    assert parked is not None and parked.id == "gate"
+
+
+def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
+    """A gate with no upstream adversarial_cycle fails terminally when the
+    operator asks for it explicitly (allow_terminal / --terminal, #98) — the
+    verb is never a silent no-op."""
+    orch, man = _no_upstream_gate_orch(cycle_repo)
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.reject_gate("gate", notes="no", allow_terminal=True) == M.RUN_FAILED
     assert man.record("gate").status == M.FAILED
     assert "no upstream adversarial_cycle" in man.record("gate").notes
+    # #98 (issue item 3): the failed gate's record and notes name the honest
+    # exit — a failed human_gate accepts no --response, so `abort` is the way
+    # out and the stamped disposition matches the offered affordances.
+    assert "gauntlet abort demo" in man.record("gate").notes
+    assert man.record("gate").recovery_disposition == "abort_only"
+    assert man.record("gate").recovery_cause == "precondition_unsatisfied"
     # #100 invariant: the terminal reject lands step + run status in one
     # write and the persisted shape is classifiable (never `unknown`).
     from gauntlet.engine import recovery_exec as RX
@@ -162,6 +197,86 @@ def test_reject_gate_without_upstream_cycle_is_terminal(cycle_repo):
     state, _, failure = RX.classify_composite(man, "none")
     assert state == RX.STATE_FAILED
     assert failure is not None and failure.id == "gate"
+
+
+# --- reject inside a foreach phase group (#98) ----------------------------------
+def test_reject_gate_inside_foreach_redrives_same_iteration_cycle(cycle_repo):
+    """#98: rejecting a gate parked inside a `foreach` stage injects the note
+    into the SAME-iteration upstream cycle and re-drives — intervening steps
+    (the rechecks) reset and re-run, the gate re-parks for a fresh decision,
+    and OTHER iterations' records are untouched. This is the standard
+    pipeline's phase-gate → impl-cycle shape, which used to terminally fail
+    ("no upstream adversarial_cycle to iterate")."""
+    pipeline = Pipeline.model_validate({
+        "name": "demo", "version": 1,
+        "stages": [{"id": "s", "foreach": "vars.items", "steps": [
+            cycle_step(),
+            # the intervening evidence step between cycle and gate (stands in
+            # for acceptance-recheck / tests-recheck); leaves an execution
+            # trace OUTSIDE the repo (../) so the cycle's clean-handoff check
+            # never sees it
+            {"id": "recheck", "type": "shell",
+             "run": "echo ran >> ../recheck.log"},
+            {"id": "gate", "type": "human_gate"},
+        ]}],
+    })
+    cfg = RunConfig.model_validate(BASE_CONFIG)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    adapters = {
+        # iter0 review converges; iter1 review converges; on the re-drive the
+        # reviewer raises F-001 (so the note demonstrably changed the round),
+        # then confirms the fix resolved.
+        "reviewer": SeqAdapter(
+            REVIEW(), REVIEW(),
+            REVIEW(F("F-001")), CONFIRM(CV("F-001", "resolved")),
+        ),
+        "triage": SeqAdapter(V("F-001", action="fix_now")),
+        "builder": SeqAdapter(writer("prd.md", "REVISED-AFTER-REJECT\n",
+                                     {"done": True})),
+    }
+    orch = Orchestrator(
+        repo_root=cycle_repo, run_dir=cycle_repo / "runs" / "demo" / "run-1",
+        artifact_root=cycle_repo, config=cfg, pipeline=pipeline, manifest=man,
+        adapter_factory=lambda n: adapters[n],
+        extra_context={"items": ["a", "b"]},
+    )
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("gate", "0").status == M.PARKED
+    # approve iteration 0; iteration 1 runs and parks at ITS gate
+    assert orch.approve_gate("gate") == M.RUN_PARKED
+    assert man.record("gate", "0").status == M.DONE
+    assert man.record("gate", "1").status == M.PARKED
+    assert man.record("cycle", "1").status == M.DONE
+    recheck_log = cycle_repo.parent / "recheck.log"
+    assert recheck_log.read_text().count("ran") == 2  # once per iteration
+
+    note = "phase gate rejected: tighten the FR-3 wording"
+    status = orch.reject_gate("gate", notes=note, user="op@example.com")
+    assert status == M.RUN_PARKED
+
+    # The note landed on the SAME-iteration cycle record and was consumed by
+    # the re-driven round.
+    cyc1 = man.record("cycle", "1")
+    assert cyc1.status == M.DONE
+    assert len(cyc1.human_responses) == 1
+    assert cyc1.human_responses[0].response_text == note
+    assert cyc1.human_responses[0].user == "op@example.com"
+    assert cyc1.human_responses[0].state == M.RESPONSE_CONSUMED
+    # The intervening recheck reset to pending and RE-RAN after the new round
+    # (3 executions total: iter0, iter1, iter1 re-drive).
+    assert man.record("recheck", "1").status == M.DONE
+    assert recheck_log.read_text().count("ran") == 3
+    # The gate re-parked for a fresh decision (fresh park, not the old one).
+    assert man.record("gate", "1").status == M.PARKED
+    # OTHER iterations' records are untouched: iteration 0 kept its terminal
+    # states and took no response.
+    cyc0 = man.record("cycle", "0")
+    assert cyc0.status == M.DONE and cyc0.human_responses == []
+    assert man.record("gate", "0").status == M.DONE
+    # No iteration-less phantom record was created by the reject path (the old
+    # bug looked the cycle up at iteration=None).
+    assert man.record("cycle", None) is None
 
 
 # --- 1. parked_reason discriminator on cycle parks ------------------------------
