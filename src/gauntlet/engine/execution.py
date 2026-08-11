@@ -371,7 +371,54 @@ class StepContext:
         data = src.read_bytes()
         if not dest.exists() or dest.read_bytes() != data:
             dest.write_bytes(data)
+        self._record_governed_publish(name, data, in_work=dest)
         return dest
+
+    def _record_governed_publish(
+        self, name: str, data: bytes, *, in_work: Path
+    ) -> None:
+        """Advance the #97 publish baseline when this write made the two copies agree.
+
+        Every writer that brings the checkout and run-tree copies of a governed
+        artifact into agreement must move the recorded last-published hash with
+        them (:mod:`~gauntlet.engine.govsync`), or the next root resolution's
+        three-way compare misreads the agreement: a mid-drive
+        :meth:`publish_artifact` would read as an operator edit over a moved
+        branch, and a gate-time :meth:`adopt_artifact` as a branch move over an
+        operator edit — both landing in the divergence refusal this record
+        exists to keep honest. Non-governed step outputs never re-enter that
+        compare and are not recorded.
+
+        ``in_work`` is the artifact's path in the WORK tree, used to read the
+        run branch's committed hash at this moment (the record's second half —
+        what "the branch has not moved" is later measured against).
+        """
+        from gauntlet.engine import govsync as GS
+
+        if name not in GS.GOVERNED_ARTIFACT_NAMES:
+            return
+        GS.record_published(
+            self.run_dir, name,
+            published=GS.digest(data),
+            branch=self._work_committed_hash(in_work),
+        )
+
+    def _work_committed_hash(self, path_in_work: Path) -> str | None:
+        """SHA-256 of ``path_in_work``'s committed bytes at the work tree's HEAD.
+
+        ``None`` when untracked, outside the work tree, or unreadable — the
+        same encoding :mod:`~gauntlet.engine.govsync` records for "the branch
+        does not carry this artifact".
+        """
+        from gauntlet.engine import gitops, govsync as GS
+
+        work = Path(self.work_root or self.repo_root)
+        try:
+            rel = path_in_work.resolve().relative_to(work.resolve()).as_posix()
+        except ValueError:
+            return None
+        committed = gitops.file_bytes_at_commit(work, "HEAD", rel)
+        return None if committed is None else GS.digest(committed)
 
     def adopt_artifact(self, name: str) -> Path:
         """Copy an artifact the CYCLE authored in the work tree back; return its path.
@@ -411,6 +458,7 @@ class StepContext:
         data = src.read_bytes()
         if not dest.exists() or dest.read_bytes() != data:
             dest.write_bytes(data)
+        self._record_governed_publish(name, data, in_work=src)
         return dest
 
     def refresh_bookkeeping_export(self) -> None:
