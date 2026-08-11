@@ -14,6 +14,7 @@ import getpass
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -286,6 +287,9 @@ _BASE_CURRENT_SENTINELS = frozenset({"current", "@current"})
 # `start()`. Any other state (running / parked) is still live — starting over it
 # would orphan it and risk competing agents against one worktree.
 _TERMINAL_RUN_STATES = frozenset({M.RUN_DONE, M.RUN_ABORTED, M.RUN_FAILED})
+
+# Foreach phase commits carry "P<n>[.x]" labels; PRD/PLAN cycle commits do not.
+_PHASE_HEAD_RE = re.compile(r"P\d+")
 
 
 def _utc_stamp() -> str:
@@ -6621,6 +6625,18 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
     branch and manifest disagree (FR-9.9). Idempotent: a manifest already
     rewound to ``target`` is unchanged.
 
+    Foreach iterations share their static step ids, so the id keep-set alone
+    cannot tell "this loop body, the target phase" from "this loop body, a
+    later phase" — records from iterations AFTER the target boundary must be
+    reset even though their ids sit inside the keep-set. Left in place they
+    make the rewound manifest contradictory (later-iteration records done or
+    failed, ``current_step`` cleared) — an unclassifiable state, and one a
+    journal-first reconcile then faithfully resurrects (#101). The executed
+    iteration order is recovered from the kept chronological commit log: the
+    k-th distinct ``P<n>`` phase head corresponds to foreach index k, because
+    iterations run in item order and every completed iteration records at
+    least its phase commit; PRD/PLAN cycle commits are excluded by shape.
+
     Module-level (not a RunManager method) so the registered recovery-intent
     replay finisher can re-run it from a fresh process after a crash between
     the executor's apply and this persist.
@@ -6640,8 +6656,32 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
     except ValueError:  # pragma: no cover - defensive
         cutoff = len(order) - 1
     keep_ids = set(order[: cutoff + 1])
+
+    phase_heads: list[str] = []
+    for commit in keep:
+        head = commit.phase.split(".")[0]
+        if _PHASE_HEAD_RE.fullmatch(head) and head not in phase_heads:
+            phase_heads.append(head)
+    target_head = keep[-1].phase.split(".")[0]
+    target_rank = (
+        phase_heads.index(target_head) if target_head in phase_heads else None
+    )
+
     for rec in man.steps:
-        if rec.id not in keep_ids:
+        if (
+            target_rank is not None
+            and rec.iteration is not None
+            and rec.iteration.isdigit()
+        ):
+            # Foreach record: the iteration ordering IS the boundary test.
+            # The whole target iteration (and every earlier one) stays — its
+            # later-in-body steps ran before the boundary even when the
+            # boundary commit came from an earlier step in the loop body —
+            # and every later iteration resets, id keep-set notwithstanding.
+            past = int(rec.iteration) > target_rank
+        else:
+            past = rec.id not in keep_ids
+        if past:
             rec.status = M.PENDING
             rec.base_sha = None
             rec.session_id = None
