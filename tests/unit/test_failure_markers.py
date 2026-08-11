@@ -63,10 +63,14 @@ _UNCAPTURED_PENDING_LIVE = frozenset({
     ("api", FAILURE_TRANSIENT_USAGE_LIMIT),
     ("api", FAILURE_TRANSIENT_OVERLOAD),
     # P5 dependency pins (plan §5.2): the api pair carries the LIVE issue-#63
-    # timeout capture (api/timeout.json), so only the CLI adapters remain
-    # synthesized — no live CLI transport-failure envelope has been observed.
+    # timeout capture (api/timeout.json), so only claude-code remains
+    # synthesized — no live claude transport-failure envelope has been
+    # observed. The codex pair was REMOVED from this set (conscious "we now
+    # have a real capture") when issue #96 delivered a live envelope: the
+    # 2026-08-09 websocket-503 agent error event pinned as
+    # codex/provider-unavailable.json (rule codex_provider_unavailable_message,
+    # real_capture=True).
     ("claude-code", FAILURE_TRANSIENT_DEPENDENCY),
-    ("codex", FAILURE_TRANSIENT_DEPENDENCY),
 })
 
 
@@ -130,6 +134,54 @@ def test_typed_envelope_with_only_an_unlisted_message_is_terminal():
         {"type": "turn.failed", "error": {"message": "disk full writing scratch file"}}
     ]
     assert fm.classify_codex_failure(codex_unknown, 1).kind == FAILURE_TERMINAL
+
+
+def test_agent_error_event_503_classifies_provider_unavailable():
+    # Issue #96: provider unavailability surfaced through the agent's own
+    # error event (codex's websocket retry loop giving up against an upstream
+    # 503) must classify to the dependency kind — routing into the persisted
+    # retry budget and the R7 provider_unavailable park — never
+    # terminal/unmatched, which forces a human `--response` for pure
+    # infrastructure. The message is the live capture from the #96 run.
+    events = [
+        {"type": "thread.started", "thread_id": "th_abc123"},
+        {"type": "error",
+         "message": "Reconnecting... 2/5 (unexpected status 503 "
+                    "Service Unavailable)"},
+    ]
+    info = fm.classify_codex_failure(events, 1)
+    assert info.kind == FAILURE_TRANSIENT_DEPENDENCY
+    assert info.marker == "codex_provider_unavailable_message"
+
+
+@pytest.mark.parametrize("message", [
+    "unexpected status 502 Bad Gateway",
+    "upstream returned 503 Service Unavailable",
+    "Reconnecting... 5/5 (stream closed)",
+    "stream disconnected: connection reset by peer",
+])
+def test_provider_unavailability_signatures_in_error_message(message):
+    # The pinned 5xx / Service Unavailable / reconnect-exhaustion /
+    # connection-reset signatures all classify dependency-transient whether
+    # they arrive via `turn.failed` or the bare-message error event.
+    events = [{"type": "turn.failed", "error": {"message": message}}]
+    info = fm.classify_codex_failure(events, 1)
+    assert info.kind == FAILURE_TRANSIENT_DEPENDENCY
+    assert info.marker == "codex_provider_unavailable_message"
+
+
+@pytest.mark.parametrize("message", [
+    "disk full writing scratch file",
+    "user asked about reconnecting the printer",
+    "unexpected status 404 Not Found",
+])
+def test_provider_unavailable_rule_does_not_absorb_unlisted_errors(message):
+    # Fail closed: prose that merely mentions reconnecting (no n/m retry
+    # counter), a client-side 4xx, and genuinely unlisted errors all stay
+    # terminal — the #96 rule must not widen the allowlist past provider
+    # unavailability.
+    events = [{"type": "error", "message": message}]
+    assert fm.classify_codex_failure(events, 1).kind == FAILURE_TERMINAL
 
 
 def test_unknown_or_unstructured_error_is_terminal():

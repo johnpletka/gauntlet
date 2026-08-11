@@ -565,9 +565,26 @@ def is_dirty_vs(
     (fail closed). Real commits above the base — wip checkpoints, operator
     commits, anything not engine bookkeeping — still read as dirty; so does a
     HEAD behind or forked from the base.
+    The same allowlist governs the UNCOMMITTED leg (issue #96): once a
+    response checkpoint force-tracks ``manifest.json``/``RUN.md``, the
+    engine's own live re-projection of those files sits modified between
+    flush commits — engine bookkeeping, not agent side effects, even where
+    the ``exclude`` pathspec does not happen to hide it. Only paths in the
+    exact ``bookkeeping`` allowlist are tolerated; any other dirty path
+    (structurally parsed — an untracked directory reports as ``dir/`` and
+    never matches) still reads dirty, and ``bookkeeping=None`` keeps the
+    prior fail-closed behaviour on this leg too.
     """
-    if status_porcelain(repo, exclude=exclude) != "":
-        return True
+    if bookkeeping is None:
+        if status_porcelain(repo, exclude=exclude) != "":
+            return True
+    else:
+        allowed = set(bookkeeping)
+        if any(
+            path not in allowed
+            for path in dirty_paths(repo, exclude=exclude, untracked_all=False)
+        ):
+            return True
     if head_sha(repo) == base_sha:
         return False
     if bookkeeping is None:

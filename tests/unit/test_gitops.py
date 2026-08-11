@@ -441,6 +441,41 @@ def test_bookkeeping_tolerance_is_an_allowlist_not_the_exclusions(fixture_repo):
     )
 
 
+def test_uncommitted_bookkeeping_only_dirt_is_not_side_effects(fixture_repo):
+    """Issue #96 (2): uncommitted state confined to the engine's OWN
+    bookkeeping allowlist — the tracked manifest.json the engine re-projects
+    between checkpoint commits — is engine bookkeeping, not agent side
+    effects, even where the exclude pathspec does not happen to hide it. The
+    exact allowlist that already governs the HEAD-advance leg governs the
+    uncommitted leg too; before the fix this shape steered operators toward
+    snapshot verbs ("left Git/worktree changes") for no reason."""
+    base = _bookkeeping_commit(fixture_repo)  # manifest.json now force-tracked
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    (run_dir / "manifest.json").write_text('{"status": "running"}\n')
+    # Visible dirt (no excludes passed): tolerated because it is
+    # allowlist-only — the engine writing its own projection.
+    assert not gitops.is_dirty_vs(fixture_repo, base, bookkeeping=_BK_PATHS)
+    # Fail closed without the allowlist: the same dirt still reads dirty.
+    assert gitops.is_dirty_vs(fixture_repo, base)
+    # Any non-allowlisted path poisons the tolerance (real agent dirt).
+    (fixture_repo / "partial.py").write_text("half written\n")
+    assert gitops.is_dirty_vs(fixture_repo, base, bookkeeping=_BK_PATHS)
+
+
+def test_uncommitted_bookkeeping_plus_engine_advance_is_clean(fixture_repo):
+    # The #96 attempt shape end-to-end: engine bookkeeping commits ahead of
+    # the attempt's base AND the live manifest re-projected on disk since the
+    # last flush — nothing but engine-owned state; the attempt reads
+    # side-effect-free on both legs.
+    base = gitops.head_sha(fixture_repo)
+    _bookkeeping_commit(
+        fixture_repo, "gauntlet: flush run bookkeeping before review handoff"
+    )
+    run_dir = fixture_repo / "runs" / "demo" / "run-1"
+    (run_dir / "manifest.json").write_text('{"status": "failed"}\n')
+    assert not gitops.is_dirty_vs(fixture_repo, base, bookkeeping=_BK_PATHS)
+
+
 def test_bookkeeping_tolerance_mixed_range_is_dirty(fixture_repo):
     # One real commit anywhere in the range poisons the whole tolerance.
     base = gitops.head_sha(fixture_repo)

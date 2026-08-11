@@ -196,6 +196,31 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
         fixture="codex/dependency.json",
         real_capture=False,  # synthesized: no live capture yet (tracked gap)
     ),
+    # Issue #96: provider unavailability surfaced through the agent's own
+    # error event, not the transport-retry path. The live capture is codex's
+    # websocket retry loop giving up against an upstream 503 — "Reconnecting...
+    # 2/5 (unexpected status 503 Service Unavailable)" (gauntlet 1.0.8,
+    # 2026-08-09, cf-ray a28855dbc8007a0f-ATL). Same pinned message position
+    # as every other codex rule; kind ``transient_dependency`` so it takes the
+    # persisted retry budget and, on exhaustion, the R7 provider_unavailable
+    # park — never a terminal halt that forces ``--response`` for pure
+    # infrastructure. The "Reconnecting" pattern requires the ``n/m`` retry
+    # counter so ordinary prose mentioning reconnection never matches.
+    MarkerRule(
+        name="codex_provider_unavailable_message",
+        adapter="codex",
+        field="error.message",
+        rule="regex",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=(
+            r"unexpected status 5\d\d",
+            r"service unavailable",
+            r"reconnecting\.*\s*\d+\s*/\s*\d+",
+            r"connection reset",
+        ),
+        fixture="codex/provider-unavailable.json",
+        real_capture=True,  # harvested from the issue-#96 run (2026-08-09)
+    ),
 )
 
 # --- api (LiteLLM) -----------------------------------------------------------

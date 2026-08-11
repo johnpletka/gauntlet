@@ -434,6 +434,14 @@ DEPENDENCY_MATRIX = {
     "connection_dns": (FAILURE_TRANSIENT_DEPENDENCY, "api_connection", None),
     "overload_5xx": (FAILURE_TRANSIENT_OVERLOAD, "api_overload", None),
     "overload_retry_after": (FAILURE_TRANSIENT_OVERLOAD, "api_overload", 3),
+    # Issue #96: a codex transport 503 surfaced through the agent's own error
+    # event ("Reconnecting... 2/5 (unexpected status 503 ...)") classifies to
+    # this marker and must take the SAME persisted retry budget +
+    # provider_unavailable park path as the transport-layer shapes — never a
+    # terminal halt that forces `--response`.
+    "codex_agent_error_503": (
+        FAILURE_TRANSIENT_DEPENDENCY, "codex_provider_unavailable_message", None
+    ),
 }
 
 
@@ -656,6 +664,47 @@ def test_unknown_failure_without_side_effects_is_plain_resumable(fixture_repo):
     assert [a.argv[:3] for a in mutating] == [["gauntlet", "resume", "demo"]]
     assert not any("--response" in a.command for a in rstate.next_actions)
 
+    recovered = UnknownFailureAdapter(fail_times=0)
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: recovered
+    ) == M.RUN_DONE
+
+
+def test_unknown_failure_with_only_engine_bookkeeping_is_plain_resumable(
+    fixture_repo,
+):
+    """Issue #96 (2): an attempt whose only Git/worktree change is the
+    engine's OWN bookkeeping — a `gauntlet:` manifest checkpoint commit plus
+    the re-projected manifest.json on disk — is side-effect-free. The
+    assessment must record failure_kind=side_effect_free_unknown (plain
+    resume retries) instead of "left Git/worktree changes" steering the
+    operator toward snapshot verbs for the engine's own state."""
+    mgr, man, run_dir = _seed(fixture_repo, AGENT_PIPELINE)
+
+    class BookkeepingThenFailAdapter(UnknownFailureAdapter):
+        def run(self, prompt, **kwargs):
+            # Simulate the engine's own mid-attempt bookkeeping: a
+            # force-tracked manifest checkpoint commit (FR-2.2 shape) and a
+            # later on-disk re-projection that outruns the last flush.
+            gitops.commit_run_bookkeeping(
+                fixture_repo, "gauntlet: response implement-resp-1 pending",
+                ["runs/demo/run-1/manifest.json"],
+                identity=gitops.ENGINE_IDENTITY,
+            )
+            (run_dir / "manifest.json").write_text(
+                (run_dir / "manifest.json").read_text() + "\n"
+            )
+            return super().run(prompt, **kwargs)
+
+    adapter = BookkeepingThenFailAdapter(fail_times=None)
+    assert mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter
+    ) == M.RUN_FAILED
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.failure_kind == M.FAILURE_KIND_SIDE_EFFECT_FREE
+    assert "no Git/worktree side effects" in (rec.notes or "")
+    assert "left Git/worktree changes" not in (rec.notes or "")
+    # The plain resume the note promises actually re-runs the step.
     recovered = UnknownFailureAdapter(fail_times=0)
     assert mgr.resume(
         "demo", use_judge=False, adapter_factory=lambda n: recovered
