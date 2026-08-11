@@ -142,3 +142,17 @@ plan's own review loop rather than an in-phase patch. Until it exists, the
 restoration's audit trail is the command in the `status` output plus git's own
 reflog, and its safety is structural rather than archival. Natural home: the
 §10 closing tranche alongside the fault-injection matrix.
+
+## From #103 (agent-liveness watchdog) — deferred 2026-08-10
+
+- **Post-recover/watchdog resume restarts the whole cycle round instead of the
+  interrupted sub-step.** When an impl-cycle fix sub-step is interrupted (by §4
+  `recover` or the new agent-liveness watchdog), a plain `resume` re-drives the
+  cycle from the round's first incomplete checkpoint — the r1 reviewers and
+  triage re-run from scratch even though their verdicts are already journaled,
+  costing a full review round. Resuming at the interrupted sub-step (r1-fix,
+  seeded with the prior triage verdicts) would save that round. Deferred from
+  the #103 fix because it changes the cycle's checkpoint/re-entry model
+  (`cycle.py` `_Resume` granularity plus the FR-9.3 clean-handoff interaction
+  with the dead agent's uncommitted paths) — a state-machine redesign that
+  wants its own review loop, not a rider on a liveness-watchdog patch.

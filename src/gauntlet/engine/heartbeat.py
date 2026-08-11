@@ -55,6 +55,15 @@ DEFAULT_SUSPEND_CREDIT_CAP_S = 12 * 3600.0
 # A running step whose adapter child has produced no output for this long, on a
 # healthy driver with a continuous clock, is `agent_silent` (FR-5.3). Default 5m.
 DEFAULT_AGENT_SILENCE_S = 300.0
+# Agent-liveness watchdog bound (FR-5.3, #103): once the adapter child is
+# PROVABLY gone (leader reaped AND its process group empty) but its output
+# stream never hit EOF, the adapter wait stops after this much silence and the
+# step self-marks INTERRUPTED instead of blocking until a human runs `ps`
+# forensics + §4 `recover`. Deliberately larger than the `agent_silent`
+# classification threshold above: `status` names the stall well before the
+# watchdog acts. Never applied to a live child — long silent thinking is
+# normal; only proof of a vanished child arms this bound.
+DEFAULT_AGENT_SILENT_TIMEOUT_S = 900.0
 
 # --- stall classifications (FR-5.3) ------------------------------------------
 STALL_HOST_SUSPENDED = "host_suspended"
@@ -278,6 +287,49 @@ def classify_stall(
         if hb_stale:  # live driver, stale heartbeat, no skew → ambiguous → hung
             return STALL_AGENT_SILENT
     return None
+
+
+def watchdog_should_fire(
+    *,
+    child_alive: bool | None,
+    group_alive: bool | None,
+    silence_s: float | None,
+    silence_bound_s: float | None,
+) -> bool:
+    """Should the agent-liveness watchdog stop waiting on a vanished child? (#103)
+
+    The decision core for the adapter wait loop's watchdog, kept next to
+    :func:`classify_stall` so the FR-5.3 silence semantics live in one place
+    (the ``agent_silent`` signal `status` computes and the bound this consumes
+    share this module — no parallel computation). Pure over observables the
+    caller samples together:
+
+    * ``child_alive`` — is the spawned CLI leader still running (``proc.poll()
+      is None``)? ``None`` when unreadable.
+    * ``group_alive`` — does ANY process remain in the child's process group
+      (``killpg(pgid, 0)``)? ``None`` when unreadable.
+    * ``silence_s`` — seconds since the later of (a) the last observed output
+      progress and (b) the moment the child's death was first observed; ``None``
+      when no observation exists.
+    * ``silence_bound_s`` — the configured bound; ``None``/``<= 0`` disables.
+
+    Fail-closed discipline (CLAUDE.md §2): the watchdog acts only on PROOF.
+    A live child never fires regardless of silence (long silent thinking is
+    normal); an unreadable liveness or group probe never fires (keep waiting);
+    a dead child within the bound waits (pipes may still EOF normally). Only
+    child provably reaped AND group provably empty AND silence past the bound
+    — the observed #103 shape: a finished/vanished agent whose stream never
+    delivered EOF — returns True.
+    """
+    if silence_bound_s is None or silence_bound_s <= 0:
+        return False  # disabled
+    if child_alive is not False:
+        return False  # alive, or unknowable → keep waiting (fail closed)
+    if group_alive is not False:
+        return False  # workers may survive the leader, or unknowable → wait
+    if silence_s is None:
+        return False  # no silence observation → no proof
+    return silence_s > silence_bound_s
 
 
 class SuspendAwareDeadline:

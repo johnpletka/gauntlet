@@ -22,7 +22,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from gauntlet.adapters.base import AgentFailedError, AgentTimeoutError
+from gauntlet.adapters.base import (
+    AgentFailedError,
+    AgentTimeoutError,
+    AgentVanishedError,
+)
 
 # git_snapshot is not called directly here since P3 (the executor owns
 # snapshot creation), but the module attribute stays importable so the pilot
@@ -792,6 +796,28 @@ class Orchestrator:
                 auto = self._maybe_auto_approve(step, iteration, item)
                 try:
                     result = auto if auto is not None else spec.handler(step, ctx)
+                except AgentVanishedError as exc:
+                    # Agent-liveness watchdog (FR-5.3, #103): the adapter child
+                    # was PROVABLY gone while its stream stayed open — an
+                    # interruption, not a budget expiry. Park INTERRUPTED
+                    # through the existing F-003 plumbing (signal-kill halt
+                    # reason: the agent died out from under the driver), so a
+                    # plain `gauntlet resume` re-enters via the normal
+                    # interruption disposition — never a 2h human-detected
+                    # wedge needing `ps` forensics + §4 `recover`.
+                    result = StepResult(
+                        status=INTERRUPTED,
+                        halt_reason=M.HALT_REASON_SIGNAL_KILL,
+                        usage=exc.partial.usage if exc.partial else None,
+                        session_id=exc.partial.session_id if exc.partial else None,
+                        notes=(
+                            f"agent-liveness watchdog park (FR-5.3, #103): {exc} "
+                            "The interrupted attempt's evidence is preserved; "
+                            "`gauntlet resume` continues the run (a dirty tree "
+                            "re-parks through the F-003 disposition with its "
+                            "own exits)."
+                        ),
+                    )
                 except AgentTimeoutError as exc:
                     result = StepResult(
                         status=HALTED,

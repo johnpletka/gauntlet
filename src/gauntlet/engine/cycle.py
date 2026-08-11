@@ -1375,10 +1375,16 @@ def _run_sub(
 
     adapter = ctx.build_adapter(agent_name, effort=effort)
     timeout = None
+    watchdog = None
     if agent_name in ctx.config.agents:
         timeout = ctx.config.profile(agent_name).step_timeout_s
+        watchdog = ctx.config.profile(agent_name).agent_silent_timeout_s
     if timeout is not None and hasattr(adapter, "timeout_s"):
         adapter.timeout_s = timeout
+    # Agent-liveness watchdog bound (FR-5.3, #103), armed the same way as the
+    # step timeout; unset keeps the adapter's default (engine default bound).
+    if watchdog is not None and hasattr(adapter, "watchdog_silence_s"):
+        adapter.watchdog_silence_s = watchdog
     logger.log_prompt(prompt)
     attempt_prompt = prompt
     last_exc: MalformedOutputError | None = None

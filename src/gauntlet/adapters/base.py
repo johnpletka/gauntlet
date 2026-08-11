@@ -176,6 +176,20 @@ class AgentTimeoutError(AdapterError):
     """The CLI invocation exceeded its hard timeout and was killed (FR-3.3)."""
 
 
+class AgentVanishedError(AdapterError):
+    """The agent-liveness watchdog stopped the wait on a vanished child (#103).
+
+    Raised when the CLI child was PROVABLY gone (leader reaped, process group
+    empty) while its output stream stayed silent past the configured bound and
+    never delivered EOF — the dropped-stream / unreaped-child / provider-
+    disconnect shape FR-5.3 classifies ``agent_silent``. Distinct from
+    :class:`AgentTimeoutError` (budget expiry on a live child → HALTED) so the
+    orchestrator can park the step INTERRUPTED instead: the vanished attempt is
+    an interruption to resume through the normal F-003 disposition, not a
+    timeout to halt on. Never raised for a live child, however silent.
+    """
+
+
 class AgentFailedError(AdapterError):
     """The CLI ran and produced parseable output, but reported failure
     (nonzero exit, is_error, turn.failed). Fail closed: a failed call never
