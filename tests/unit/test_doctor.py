@@ -365,6 +365,23 @@ def test_codex_cache_partial_json_warns_actionably(tmp_path):
     assert cache.remedy and "retry doctor" in cache.remedy
 
 
+def test_codex_cache_invalid_utf8_warns_actionably(tmp_path):
+    repo = _healthy_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    cache_dir = home / ".codex"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "models_cache.json").write_bytes(
+        b'{"client_version":"0.139.0","models":["\xe2\x82'
+    )
+    env = {**_GOOD_ENV, "HOME": str(home)}
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, env))
+    cache = _by_name(results)["codex-cache"]
+    assert cache.status == WARN
+    assert "UnicodeDecodeError" in cache.detail
+    assert "mid-rewrite" in cache.detail
+    assert cache.remedy and "retry doctor" in cache.remedy
+
+
 def test_missing_claude_hook_fails(tmp_path):
     repo = _healthy_repo(tmp_path)
     (repo / ".claude/settings.json").unlink()

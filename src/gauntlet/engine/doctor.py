@@ -520,11 +520,11 @@ def _check_codex_cache(probes: DoctorProbes, pins: PinFile | None) -> CheckResul
     try:
         if not path.exists():
             return CheckResult("codex-cache", OK, f"not present at {path}")
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         # A concurrent writer may replace/remove the cache between exists/read.
         return CheckResult("codex-cache", OK, f"not present at {path}")
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return CheckResult(
             "codex-cache",
             WARN,
