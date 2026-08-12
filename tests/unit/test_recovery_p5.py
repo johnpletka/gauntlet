@@ -442,6 +442,16 @@ DEPENDENCY_MATRIX = {
     "codex_agent_error_503": (
         FAILURE_TRANSIENT_DEPENDENCY, "codex_provider_unavailable_message", None
     ),
+    # Issue #119 live Codex shapes: final model-capacity verdict and the
+    # pre-event shared models-cache schema fatal take this same persisted budget.
+    "codex_capacity": (
+        FAILURE_TRANSIENT_OVERLOAD, "codex_capacity_message", None
+    ),
+    "codex_models_cache_schema": (
+        FAILURE_TRANSIENT_DEPENDENCY,
+        "codex_models_cache_schema_startup",
+        None,
+    ),
 }
 
 

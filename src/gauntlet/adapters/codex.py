@@ -29,6 +29,7 @@ from gauntlet.adapters.base import (
 )
 from gauntlet.adapters.failure_markers import (
     classify_codex_failure,
+    codex_failure_event,
     looks_like_session_not_found,
 )
 from gauntlet.adapters.process import (
@@ -220,10 +221,10 @@ class CodexAdapter:
             # resumes; a resume against a session codex no longer knows falls back
             # to a full re-run (only when a session was requested and the failure
             # is not itself transient).
-            failure_info = classify_codex_failure(events, out.exit_code)
-            failed_event = next(
-                (e for e in events if e.get("type") in ("turn.failed", "error")), None
+            failure_info = classify_codex_failure(
+                events, out.exit_code, stderr=out.stderr
             )
+            failed_event = codex_failure_event(events)
             err = (failed_event or {}).get("error")
             err_msg = err.get("message") if isinstance(err, dict) else (
                 err if isinstance(err, str) else (failed_event or {}).get("message")
@@ -315,10 +316,10 @@ class CodexAdapter:
     ) -> str | None:
         if out.exit_code != 0:
             return f"exit code {out.exit_code}"
-        for event in events:
-            if event.get("type") in ("turn.failed", "error"):
-                detail = event.get("error") or event.get("message") or event
-                return f"{event['type']} event: {str(detail)[:300]}"
+        event = codex_failure_event(events)
+        if event is not None:
+            detail = event.get("error") or event.get("message") or event
+            return f"{event['type']} event: {str(detail)[:300]}"
         return None
 
     @staticmethod

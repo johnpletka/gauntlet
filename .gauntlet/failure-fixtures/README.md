@@ -20,6 +20,15 @@ Provenance of each fixture is recorded in the `real_capture` flag on its
       2026-06-30; a NEGATIVE fixture: a typed `is_error` envelope whose only
       signal is an unlisted message ⇒ `terminal` (fail-closed).
     - `codex/usage-limit.json` — gauntlet-ui run 2026-06-17 (`turn.failed`).
+    - `codex/capacity.json` — job-platform-base P13 run 2026-08-11 (issue
+      #119): stream disconnect/reconnect diagnostics followed by the
+      authoritative `turn.failed` model-capacity verdict.
+    - `codex/models-cache-schema.json` — job-platform-base P13 run 2026-08-11
+      (issue #119): pre-event CLI startup fatal when a shared cache written in
+      the newer `model_messages` schema omitted the older reader's required
+      `base_instructions` field.
+    - `codex/provider-unavailable.json` — issue #96 run 2026-08-09: websocket
+      reconnect exhaustion against an upstream HTTP 503.
     - `api/timeout.json` — coaching-side-drawer run 2026-07-24 (right-quote
       repo, gauntlet 0.7.0; issue #63): the `litellm.Timeout` envelope that was
       mis-classified terminal in the r1-triage fan-out. Pinned
@@ -42,8 +51,8 @@ Provenance of each fixture is recorded in the `real_capture` flag on its
       response) stays pinned TERMINAL and must never match these.
 
 > **Tracked coverage gap (F-002 / plan.md:33 — "one per adapter per kind").**
-> Three required `(adapter, kind)` pairs — `codex`/overload,
-> `api`/usage-limit (`rate-limit.json`), and `api`/overload — have **no** live
+> Two required `(adapter, kind)` pairs — `api`/usage-limit
+> (`rate-limit.json`) and `api`/overload — have **no** live
 > capture: those adapter failure-modes were never exercised in a real failed
 > run, so the harvestable transcripts hold no envelope to redact and pin. They
 > are covered only by synthesized fixtures **as a knowing, tracked phase

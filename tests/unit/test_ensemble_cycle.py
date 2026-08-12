@@ -16,6 +16,13 @@ import json
 import shutil
 from pathlib import Path
 
+from gauntlet.adapters.base import (
+    FAILURE_TRANSIENT_DEPENDENCY,
+    FAILURE_TRANSIENT_OVERLOAD,
+    AgentFailedError,
+    AgentResult,
+    FailureInfo,
+)
 from gauntlet.engine import gitops, manifest as M
 
 from conftest import git
@@ -90,6 +97,14 @@ def _fx(fid, sev, cat, loc, claim):
 
 def _members_dir(run_dir):
     return run_dir / "artifacts" / "r1" / "members"
+
+
+def _dependency_exc(kind, marker):
+    return AgentFailedError(
+        f"transient infrastructure failure [{marker}]",
+        partial=AgentResult(text="", exit_code=1),
+        failure_info=FailureInfo(kind=kind, marker=marker),
+    )
 
 
 # ===========================================================================
@@ -454,6 +469,101 @@ def test_member_usage_limit_parks_resumably(fixture_repo):
     status, man, _ = run_cycle(repo, adapters, step_extra=PANEL, config=ENS_CONFIG)
     assert status == M.RUN_PARKED
     assert man.record("cycle").parked_reason == M.PARKED_REASON_USAGE_LIMIT
+
+
+def test_member_capacity_failure_retries_in_process_without_human_park(
+    fixture_repo, monkeypatch
+):
+    # Issue #119: once the exact capacity envelope is classified transient, the
+    # existing _run_sub/depretry path retries the missing member in-process. The
+    # full panel completes and triage proceeds without a parked_for_response turn.
+    from gauntlet.engine import depretry
+
+    waits = []
+    monkeypatch.setattr(depretry, "_sleep", waits.append)
+    repo = _ens_repo(fixture_repo)
+    fid = "0-reviewer-correctness:F-001"
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "correctness", "src.py:1", "defect")),
+        CONFIRM(CV(fid, "resolved")),
+    )
+    gemini = SeqAdapter(
+        _dependency_exc(FAILURE_TRANSIENT_OVERLOAD, "codex_capacity_message"),
+        REVIEW(),
+    )
+    triage = SeqAdapter(V(fid))
+    adapters = {
+        "reviewer": reviewer,
+        "gemini": gemini,
+        "triage": triage,
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+        "esc": SeqAdapter(),
+    }
+    config = {
+        **ENS_CONFIG,
+        "dependency_retry_attempts": 2,
+        "dependency_retry_base_s": 0.01,
+        "dependency_retry_max_delay_s": 1.0,
+    }
+    status, man, _ = run_cycle(repo, adapters, step_extra=PANEL, config=config)
+    assert status == M.RUN_DONE
+    assert len(gemini.calls) == 2 and len(waits) == 1
+    assert len(triage.calls) == 1
+    assert man.record("cycle").dependency_attempts == 0
+
+
+def test_member_cache_failure_exhaustion_parks_provider_then_plain_resumes(
+    fixture_repo, monkeypatch
+):
+    # Exhaustion stays fail-closed (no panel shrink) but is an infrastructure
+    # park with a plain resume. The completed first member is content-addressed
+    # and reused; only the cache-failing member is repaid after recovery.
+    from gauntlet.engine import depretry
+
+    waits = []
+    monkeypatch.setattr(depretry, "_sleep", waits.append)
+    repo = _ens_repo(fixture_repo)
+    fid = "0-reviewer-correctness:F-001"
+    reviewer = SeqAdapter(
+        REVIEW(_fx("F-001", "major", "correctness", "src.py:1", "defect")),
+        CONFIRM(CV(fid, "resolved")),
+    )
+    failure = lambda: _dependency_exc(
+        FAILURE_TRANSIENT_DEPENDENCY,
+        "codex_models_cache_schema_startup",
+    )
+    gemini = SeqAdapter(failure(), failure(), failure(), REVIEW())
+    triage = SeqAdapter(V(fid))
+    adapters = {
+        "reviewer": reviewer,
+        "gemini": gemini,
+        "triage": triage,
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+        "esc": SeqAdapter(),
+    }
+    config = {
+        **ENS_CONFIG,
+        "dependency_retry_attempts": 2,
+        "dependency_retry_base_s": 0.01,
+        "dependency_retry_max_delay_s": 1.0,
+    }
+    orch, man = _build_cycle_orch(
+        repo, adapters, step_extra=PANEL, config=config
+    )
+
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("cycle")
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.dependency_attempts == 2 and rec.quota_reset_at is not None
+    assert "no `--response`" in rec.notes
+    assert len(reviewer.calls) == 1 and len(gemini.calls) == 3
+    assert len(triage.calls) == 0
+    assert len(list(_members_dir(repo / "runs/demo/run-1").glob("*.json"))) == 1
+
+    assert orch.drive() == M.RUN_DONE  # plain resume; provider/cache recovered
+    assert len(reviewer.calls) == 2  # review artifact reused; only confirm is new
+    assert len(gemini.calls) == 4
+    assert man.record("cycle").dependency_attempts == 0
 
 
 # ===========================================================================

@@ -484,6 +484,126 @@ def _pin_version(pins: PinFile | None, cli: str) -> str | None:
 
 # ---- individual checks ------------------------------------------------------
 
+def _codex_cache_path(env: Mapping[str, str]) -> Path | None:
+    """Resolve the shared codex models cache without consulting global state.
+
+    ``CODEX_HOME`` wins when explicitly configured; otherwise codex and the
+    ChatGPT desktop app conventionally share ``$HOME/.codex``. Reading the path
+    from the injected doctor environment keeps the probe deterministic in tests.
+    """
+    codex_home = env.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "models_cache.json"
+    home = env.get("HOME")
+    if home:
+        return Path(home) / ".codex" / "models_cache.json"
+    return None
+
+
+def _check_codex_cache(probes: DoctorProbes, pins: PinFile | None) -> CheckResult:
+    """Warn on the shared-cache schema/version hazard captured by issue #119.
+
+    The check reads only cache metadata and model-entry KEY NAMES; no cached
+    instruction/message values are surfaced. A missing cache is healthy. An
+    unreadable/partially-written cache and a cache written by a different codex
+    version are warnings because the live CLI probe remains the authoritative
+    pass/fail check — the cache may be atomically refreshed between the two.
+    """
+    path = _codex_cache_path(probes.env)
+    if path is None:
+        return CheckResult(
+            "codex-cache",
+            WARN,
+            "could not locate models_cache.json (HOME and CODEX_HOME are unset)",
+            remedy="set HOME or CODEX_HOME so doctor can inspect the shared codex cache",
+        )
+    try:
+        if not path.exists():
+            return CheckResult("codex-cache", OK, f"not present at {path}")
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        # A concurrent writer may replace/remove the cache between exists/read.
+        return CheckResult("codex-cache", OK, f"not present at {path}")
+    except (OSError, json.JSONDecodeError) as exc:
+        return CheckResult(
+            "codex-cache",
+            WARN,
+            f"{path} is unreadable or mid-rewrite: {type(exc).__name__}: {exc}",
+            remedy=(
+                "retry doctor after the current Codex/Desktop write completes; "
+                "if it persists, isolate Gauntlet with CODEX_HOME or move the "
+                "cache aside so the PATH codex can rebuild it"
+            ),
+        )
+
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        return CheckResult(
+            "codex-cache",
+            WARN,
+            f"{path} has an unrecognized top-level schema",
+            remedy=(
+                "isolate Gauntlet with CODEX_HOME or move the cache aside so the "
+                "PATH codex can rebuild it"
+            ),
+        )
+
+    models = data["models"]
+    entries = [model for model in models if isinstance(model, dict)]
+    invalid_entries = len(models) - len(entries)
+    base_count = sum("base_instructions" in model for model in entries)
+    messages_count = sum("model_messages" in model for model in entries)
+    cache_raw = data.get("client_version")
+    # Unlike CLI/pin output, the cache is mutable external input. Extract only
+    # the bounded semantic-version token so an unexpected metadata value can
+    # never echo arbitrary cache content through doctor output.
+    cache_match = re.search(r"\d+\.\d+(?:\.\d+)?", str(cache_raw or ""))
+    cache_version = cache_match.group(0) if cache_match else None
+    installed_version = _extract_version(probes.cli_version("codex"))
+    pinned_version = _pin_version(pins, "codex")
+
+    version_detail = (
+        f"cache writer {cache_version or 'unknown'}, "
+        f"PATH codex {installed_version or 'unknown'}, "
+        f"pin {pinned_version or 'none'}"
+    )
+    schema_detail = (
+        f"{len(models)} model entries; instruction keys "
+        f"base_instructions={base_count}, model_messages={messages_count}"
+    )
+    hazards: list[str] = []
+    if invalid_entries:
+        hazards.append(f"{invalid_entries} non-object model entries")
+    if cache_version is None:
+        hazards.append("missing/invalid client_version")
+    if (
+        cache_version is not None
+        and installed_version is not None
+        and cache_version != installed_version
+    ):
+        hazards.append(
+            f"cache writer {cache_version} differs from PATH codex {installed_version}"
+        )
+        # This is the precise incompatible key-family shape from issue #119.
+        if entries and messages_count == len(entries) and base_count == 0:
+            hazards.append("model_messages schema omits base_instructions")
+    if entries and base_count == 0 and messages_count == 0:
+        hazards.append("unrecognized model instruction schema")
+
+    detail = f"{path}: {version_detail}; {schema_detail}"
+    if hazards:
+        return CheckResult(
+            "codex-cache",
+            WARN,
+            detail + "; " + "; ".join(hazards),
+            remedy=(
+                "align the PATH codex with .gauntlet/pins.yaml and the cache writer, "
+                "or give Gauntlet a separate CODEX_HOME; retry doctor after any "
+                "concurrent ChatGPT Desktop refresh completes"
+            ),
+        )
+    return CheckResult("codex-cache", OK, detail)
+
+
 def _check_version() -> CheckResult:
     return CheckResult("gauntlet", OK, f"version {__version__}")
 
@@ -1181,6 +1301,7 @@ def run_doctor(
         auth = _check_cli_auth(cli, probes)
         if auth is not None:
             results.append(auth)
+    results.append(_check_codex_cache(probes, pins))
     # Load the run config once up front: its `asset_root` tells the judge /
     # secrets / pipeline checks where assets live (default "." = repo root). A
     # missing/unloadable config is itself surfaced as a FAIL below.

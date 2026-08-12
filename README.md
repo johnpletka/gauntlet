@@ -627,9 +627,20 @@ contract suite, which requires authenticated CLIs and API keys.
 - **`doctor` reports a stale CLI version** — your installed `claude` / `codex`
   differs from `.gauntlet/pins.yaml`. Re-verify with the integration suite, or
   update the pin file if the new version is intended.
+- **`doctor` warns about `codex-cache`** — Codex and ChatGPT Desktop may be
+  sharing `models_cache.json` while running different CLI versions or cache
+  schemas. Align the PATH CLI with `.gauntlet/pins.yaml` and the reported cache
+  writer, or give Gauntlet a separate `CODEX_HOME`. If the cache is reported
+  mid-rewrite, retry after the Desktop/CLI refresh completes; move it aside for
+  the PATH CLI to rebuild only if the warning persists.
 - **A run parks unexpectedly / a step is `failed`** — `gauntlet status <slug>`
   shows where; the step's transcript under `.gauntlet/runs/<slug>/<run>/steps/` has the
   detail. `gauntlet resume <slug>` re-enters safely once the cause is cleared.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
   `gauntlet resume <slug>`.
+- **An ensemble member hits provider capacity or a transient startup fault** —
+  Gauntlet spends the bounded persisted dependency-retry budget without reducing
+  the panel. On exhaustion it parks `provider_unavailable`; a plain
+  `gauntlet resume <slug>` retries only the incomplete member, with no
+  `--response` decision required.

@@ -280,6 +280,39 @@ def test_transport_503_agent_error_event_classified_transient(monkeypatch):
     assert info.marker == "codex_provider_unavailable_message"
 
 
+def test_final_capacity_failure_after_reconnect_classified_transient(monkeypatch):
+    # Issue #119: the final turn.failed verdict, not the first stream diagnostic,
+    # determines retryability.
+    events = [
+        {"type": "thread.started", "thread_id": THREAD_ID},
+        {"type": "turn.started"},
+        {"type": "error", "message": "stream disconnected"},
+        {"type": "error", "message": "Reconnecting... 2/5"},
+        {"type": "turn.failed", "error": {
+            "message": "Selected model is at capacity. Please try a different model."
+        }},
+    ]
+    patch_run(monkeypatch, fake_output(events, exit_code=1))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    info = excinfo.value.failure_info
+    assert info.kind == "transient_overload"
+    assert info.marker == "codex_capacity_message"
+
+
+def test_models_cache_startup_fatal_classified_transient(monkeypatch):
+    stderr = (
+        "ERROR codex_models_manager::cache: failed to load models cache: "
+        "missing field `base_instructions` at line 94 column 5"
+    )
+    patch_run(monkeypatch, fake_output([], exit_code=1, stderr=stderr))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    info = excinfo.value.failure_info
+    assert info.kind == "transient_dependency"
+    assert info.marker == "codex_models_cache_schema_startup"
+
+
 def test_connection_reset_classified_transient(monkeypatch):
     events = _failed_events(
         {"message": "stream disconnected: connection reset by peer"}
