@@ -6,6 +6,13 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-08-12
+
+### Changed
+
+- Promote `pytest>=8.0` to a runtime dependency so it is available in standard
+  Gauntlet installations.
+
 ## [1.1.0] — 2026-08-11
 
 This release hardens long-running agent recovery and closes the remaining

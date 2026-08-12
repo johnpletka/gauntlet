@@ -1,6 +1,6 @@
 [project]
 name = "gauntlet-spec"
-version = "1.1.0"
+version = "1.1.1"
 description = "Adversarial multi-agent development harness: PRD -> plan -> phased implementation, every artifact reviewed adversarially"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ dependencies = [
     "litellm>=1.40,<1.89",
     "jsonschema>=4.21",
     "pyyaml>=6.0",
+    "pytest>=8.0",
     # Console (web/) promotes two already-transitive deps to explicit so a
     # future fastapi/litellm bump cannot silently drop them (FR-11.3): jinja2
     # renders the server-side pages (P1), httpx posts Slack notifications (P6).
