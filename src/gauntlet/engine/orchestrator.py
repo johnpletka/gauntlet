@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -964,6 +964,7 @@ class Orchestrator:
                         notes=f"handler error: {exc}",
                     )
 
+            result = self._assess_shell_failure(step, spec, rec, result)
             result = self._apply_budget_guard(step, rec, result)
             # Clean-handoff invariant (CLAUDE.md §1, review F-001): a conflict park —
             # whether signalled by the textual UPSTREAM CONFLICT marker (first
@@ -1746,6 +1747,59 @@ class Orchestrator:
             usage=partial.usage if partial else None,
             session_id=partial.session_id if partial else None,
             notes=f"agent failed (terminal, FR-3.1): {exc}\n{assessment_note}",
+        )
+
+    def _assess_shell_failure(
+        self, step: Step, spec, rec: StepRecord, result: StepResult
+    ) -> StepResult:
+        """Stamp a provably side-effect-free shell failure plain-resumable (#121).
+
+        A shell step's nonzero exit (a failing test suite, a flaky build) is an
+        execution failure, but unlike an agent failure it holds no session to
+        lose, and when the tree is provably clean against the attempt's
+        ``base_sha`` there is nothing a re-run could re-run over. Assess exactly
+        as ``_agent_failure_result`` does and stamp
+        ``FAILURE_KIND_SIDE_EFFECT_FREE``, so a plain ``gauntlet resume`` may
+        retry it (R7 — retry intent is not a human decision) and a
+        deterministic repeat trips the R5 no-progress guard instead of looping.
+        A side-effecting or unprovable failure stays terminal, exactly as
+        before. Scoped to ``HALT_REASON_ADAPTER_ERROR`` ("the command ran and
+        exited nonzero"): a precondition failure (no ``run:`` command) keeps
+        its own class, and every non-shell step is untouched.
+        """
+        if (
+            step.type != "shell"
+            or result.status != FAILED
+            or result.halt_reason != M.HALT_REASON_ADAPTER_ERROR
+            or result.failure_kind is not None
+        ):
+            return result
+        side_effects = self._attempt_side_effects(step, spec, rec)
+        if side_effects is None:
+            assessment_note = (
+                "side-effect assessment: unprovable (no recorded attempt "
+                "boundary or git unavailable) — fail closed, terminal"
+            )
+            failure_kind = None
+        elif side_effects:
+            assessment_note = (
+                "side-effect assessment: the attempt left Git/worktree "
+                "changes — terminal; recover through the snapshot-backed "
+                "verbs, never a blind re-run (plan §5.2)"
+            )
+            failure_kind = None
+        else:
+            assessment_note = (
+                "side-effect assessment: no Git/worktree side effects — a "
+                "plain `gauntlet resume` may safely retry this shell failure "
+                "(an unchanged repeat raises the R5 no-progress guard instead "
+                "of looping)"
+            )
+            failure_kind = M.FAILURE_KIND_SIDE_EFFECT_FREE
+        return dc_replace(
+            result,
+            failure_kind=failure_kind,
+            notes=f"{result.notes}\n{assessment_note}",
         )
 
     def _attempt_side_effects(
