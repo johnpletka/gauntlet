@@ -1269,6 +1269,16 @@ def commit_message(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%B", sha).rstrip("\n")
 
 
+def commits_from_head(repo: Path, head: str, *, limit: int = 1000) -> list[str]:
+    """Full SHAs of the newest ``limit`` commits reachable from ``head`` (newest
+    first). Used by the phase-commit reconciliation to find a phase's own
+    ``P<N>:`` commit when it sits behind engine bookkeeping commits and outside
+    the step's own ``base..HEAD`` window (the base advanced past it through
+    ``resume`` commit adoption)."""
+    out = _run(repo, "log", f"-n{int(limit)}", "--format=%H", head).strip()
+    return [line for line in out.splitlines() if line]
+
+
 def range_diff(repo: Path, base: str, head: str) -> str:
     """Diff for the confirm pass / review handoff (`base..head`)."""
     return _run(repo, "diff", f"{base}..{head}")

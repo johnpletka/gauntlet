@@ -2155,6 +2155,32 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
                 session_id=draft_session,
                 notes="reconciled pre-existing commit after mid-commit interruption",
             )
+        # The phase's `P<N>:` commit may sit BEHIND engine bookkeeping commits
+        # (`gauntlet: response … consumed`, run-bookkeeping flushes) AND outside
+        # this step's own `base..HEAD` window: when `resume` ADOPTS operator
+        # commits that already carried the phase work — e.g. FR-9.3 clean-handoff
+        # pre-commits made by an operator filling human evidence before the
+        # reviewer handoff — the step's `base_sha` is re-anchored to the adopted
+        # tip, which is PAST the `P<N>:` commit. HEAD is then a bookkeeping commit
+        # and `base` is later still, so neither the HEAD match above nor a
+        # `base..HEAD` scan sees it. Walk back from HEAD instead: the `P<N>`
+        # prefix is unique to this phase, so the most recent commit carrying it is
+        # this phase's own commit. Adopt it rather than failing on an empty tree
+        # (#124).
+        for sha in gitops.commits_from_head(repo, existing):
+            if header_prefix(gitops.commit_message(repo, sha)) == prefix:
+                return StepResult(
+                    status=DONE,
+                    commit_sha=sha,
+                    commit_phase=prefix,
+                    usage=draft_usage,
+                    usage_by_agent=usage_by_agent,
+                    session_id=draft_session,
+                    notes=(
+                        f"reconciled pre-existing {prefix}: commit {sha[:10]} "
+                        "reachable from HEAD; worktree already clean"
+                    ),
+                )
 
     if gitops.is_clean(repo, exclude=exclude):
         if wips:
