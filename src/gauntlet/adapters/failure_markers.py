@@ -240,10 +240,11 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
     # separately installed codex CLI can share ``models_cache.json`` while
     # expecting different schemas; the older reader then exits before emitting
     # any structured failure event. Stderr is consulted ONLY when no
-    # ``turn.failed``/``error`` event exists (see ``classify_codex_failure``), so
-    # a cosmetic cache warning can never override an authoritative terminal
-    # event. The conjunctive regex deliberately does not make arbitrary startup
-    # crashes retryable.
+    # ``turn.failed``/``error`` event exists (see ``classify_codex_failure``), and
+    # the regex matches the complete pinned stderr envelope. The full-string
+    # boundary matters because codex can log the same cache diagnostic without
+    # making it the cause of a later, unrelated startup failure; any additional
+    # diagnostic therefore leaves the invocation unmatched/terminal.
     MarkerRule(
         name="codex_models_cache_schema_startup",
         adapter="codex",
@@ -251,7 +252,10 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
         rule="regex",
         kind=FAILURE_TRANSIENT_DEPENDENCY,
         values=(
-            r"models(?:_|\s+)cache.*missing field\s+[`'\"]?base_instructions",
+            r"\A\s*ERROR\s+codex_models_manager::cache:\s+"
+            r"failed to load models cache:\s+missing field\s+"
+            r"[`'\"]?base_instructions[`'\"]?\s+at line\s+\d+\s+"
+            r"column\s+\d+\s*\Z",
         ),
         fixture="codex/models-cache-schema.json",
         real_capture=True,

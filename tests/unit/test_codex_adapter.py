@@ -313,6 +313,20 @@ def test_models_cache_startup_fatal_classified_transient(monkeypatch):
     assert info.marker == "codex_models_cache_schema_startup"
 
 
+def test_models_cache_warning_with_unrelated_fatal_stays_terminal(monkeypatch):
+    stderr = (
+        "ERROR codex_models_manager::cache: failed to load models cache: "
+        "missing field `base_instructions` at line 94 column 5\n"
+        "fatal: authentication token rejected"
+    )
+    patch_run(monkeypatch, fake_output([], exit_code=1, stderr=stderr))
+    with pytest.raises(AgentFailedError) as excinfo:
+        CodexAdapter().run("hi")
+    info = excinfo.value.failure_info
+    assert info.kind == "terminal"
+    assert info.marker == "unmatched"
+
+
 def test_connection_reset_classified_transient(monkeypatch):
     events = _failed_events(
         {"message": "stream disconnected: connection reset by peer"}

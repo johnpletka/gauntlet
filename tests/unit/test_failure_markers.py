@@ -192,6 +192,20 @@ def test_models_cache_startup_stderr_classifies_dependency_transient():
     assert info.marker == "codex_models_cache_schema_startup"
 
 
+def test_models_cache_warning_cannot_mask_unrelated_startup_fatal():
+    # F-002: codex may log the cache parse failure and recover from it. If the
+    # process then exits for another pre-event reason, the cache diagnostic is
+    # incidental and must not turn the unknown fatal into an automatic retry.
+    stderr = (
+        "ERROR codex_models_manager::cache: failed to load models cache: "
+        "missing field `base_instructions` at line 94 column 5\n"
+        "fatal: authentication token rejected"
+    )
+    info = fm.classify_codex_failure([], 1, stderr=stderr)
+    assert info.kind == FAILURE_TERMINAL
+    assert info.marker == "unmatched"
+
+
 def test_startup_stderr_cannot_override_structured_terminal_failure():
     # The cache warning is cosmetic once a structured failure exists; only a
     # pre-event startup fatal may classify from stderr (issue #119 fail-closed pin).
