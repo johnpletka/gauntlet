@@ -8,11 +8,30 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ### Fixed
 
+- A `phase-commit` step no longer fails terminally when `resume` commit
+  adoption re-anchored its `base_sha` past the phase's own `P<N>:` commit: the
+  step walks back from HEAD — bounded to the run branch's own commits
+  (`HEAD ^base_branch`), in one batched `git log` — adopts the phase commit,
+  and repairs the record's `base_sha` to that commit's parent so review-diff
+  consumers see a forward, non-empty range. A same-prefix commit from the base
+  branch's pre-run history is never adopted, a phase with `P<N> wip:`
+  checkpoints still lands its empty marker commit at the tip, and a genuinely
+  empty phase still fails loud (#124).
+
 - Ensemble-member Codex capacity failures and the pinned shared-model-cache
   startup fatal now consume bounded persisted dependency retries and park
   `provider_unavailable` on exhaustion instead of requiring a human response.
   `doctor` also reports Codex pin drift and incompatible/shared cache metadata
   without exposing cached model content (#119).
+- A failed `shell` step (e.g. a flaky test suite) whose attempt provably left
+  no Git/worktree side effects is no longer terminal-with-abort-as-the-only-exit:
+  the failure gets the plan §5.2 side-effect assessment and records
+  `failure_kind=side_effect_free_unknown`, so a plain `gauntlet resume` retries
+  it and a deterministic repeat trips the R5 no-progress guard. Pre-existing
+  FAILED shell records (stamped before this fix) are assessed at the resume
+  boundary and upgraded with an audited manifest warning when the tree is
+  provably clean against the attempt's `base_sha`; side-effecting or unprovable
+  failures stay terminal exactly as before (#121).
 
 ## [1.1.1] — 2026-08-12
 

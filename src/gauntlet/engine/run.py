@@ -3343,6 +3343,17 @@ class RunManager:
         adoption_notes = RX.reconcile_branch_ahead(man, git_obs, verb="resume")
         if adoption_notes:
             man.write_atomic(run_dir / "manifest.json")
+        # Shell-failure resume-time reclassification (#121): a FAILED shell
+        # step recorded before the failure-time stamping existed carries
+        # `failure_kind=None` even when its attempt provably left no side
+        # effects, so a plain resume would refuse it as terminal. Assess NOW,
+        # at the verb boundary, against the attempt's recorded base_sha on the
+        # run's own tree: provably clean → upgrade the record to the
+        # side-effect-free kind (audited manifest warning) so the ordinary
+        # re-arm path re-runs it; dirty or unprovable → terminal, as before.
+        # Plain resume only (R7: retry intent is not a human decision).
+        if response is None:
+            self._reclassify_clean_shell_failure(layout, run_dir, man)
         # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
         # FR-7.1 idempotent recovery). All validation and operator-identity
         # resolution happen HERE, before driving; the orchestrator only
@@ -3355,6 +3366,65 @@ class RunManager:
             response_action=action,
             interrupted_override="reset_to_base" if reset_interrupted else None,
         )
+
+    def _reclassify_clean_shell_failure(
+        self, layout: "RunLayout", run_dir: Path, man: Manifest
+    ) -> None:
+        """Upgrade a provably clean FAILED shell record to plain-resumable (#121).
+
+        The failure-time assessment (``Orchestrator._assess_shell_failure``)
+        stamps new shell failures; this is its verb-boundary counterpart for
+        records that predate it. Evidence-based and fail-closed: the tree must
+        be provably clean against the attempt's recorded ``base_sha`` (engine
+        bookkeeping tolerated, same rule as the resume disposition) or the
+        record is left terminal exactly as before. The upgrade is persisted
+        with a manifest warning so the reclassification is audited, never
+        silent. Runs against the verb's resolved ``RunPaths`` — inside
+        ``_resume_locked`` the ``_worktree_paths_or_park`` context has already
+        set ``self._paths`` to the run's own tree (the operator's checkout is
+        never assessed for a ``dedicated`` run, #90).
+        """
+        if man.status != M.RUN_FAILED:
+            return
+        failed = self._failed_step(man)
+        if (
+            failed is None
+            or failed.type != "shell"
+            or failed.halt_reason != M.HALT_REASON_ADAPTER_ERROR
+            or failed.failure_kind is not None
+            or failed.base_sha is None
+        ):
+            return
+        paths = self._paths
+        if paths is None:
+            return  # no resolved run tree → fail closed, leave terminal
+        try:
+            work_root = paths.work_root
+            excludes = run_bookkeeping_excludes(
+                work_root, paths.bookkeeping_root, paths.artifact_root_in_work
+            )
+            dirty = gitops.is_dirty_vs(
+                work_root, failed.base_sha, exclude=excludes,
+                bookkeeping=engine_bookkeeping_candidates(
+                    work_root, paths.bookkeeping_root,
+                    state_outside_worktree=paths.state_outside_worktree,
+                ),
+            )
+        except (gitops.GitError, StateDirNotContained, OSError):
+            return  # unprovable → fail closed, leave terminal
+        if dirty:
+            return
+        failed.failure_kind = M.FAILURE_KIND_SIDE_EFFECT_FREE
+        note = (
+            f"resume: reclassified failed shell step '{failed.id}' as "
+            "side-effect-free — the tree is provably clean against the "
+            f"attempt's base {failed.base_sha[:10]}, so re-running cannot "
+            "re-run over partial work (#121); a deterministic repeat trips "
+            "the R5 no-progress guard instead of looping"
+        )
+        if note not in man.warnings:
+            man.warnings.append(note)
+        man.write_atomic(run_dir / "manifest.json")
 
     def _observe_resume_branch(
         self, layout: "RunLayout", run_dir: Path, man: Manifest
