@@ -6,6 +6,8 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-18
+
 ### Fixed
 
 - A `phase-commit` step no longer fails terminally when `resume` commit
