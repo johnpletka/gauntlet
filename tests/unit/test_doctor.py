@@ -112,9 +112,7 @@ def _set_judge_llm(
 
 
 _GOOD_VERSIONS = {"claude": "2.1.172", "codex": "codex-cli 0.139.0"}
-# The scaffolded default config now includes the Gemini ensemble-panel member
-# (pipeline-effectiveness FR-1.1), so a healthy environment carries its key too.
-_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y", "GEMINI_API_KEY": "z"}
+_GOOD_ENV = {"OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "y"}
 
 
 def _by_name(results) -> dict:
@@ -346,10 +344,8 @@ def test_unused_profile_missing_key_warns(tmp_path):
     data = yaml.safe_load(p.read_text())
     data["agents"]["spare"] = {"adapter": "api", "model": "anthropic/claude-x"}
     p.write_text(yaml.safe_dump(data))
-    # GEMINI_API_KEY is present because the default panel references the gemini
-    # profile; the only missing key is the genuinely-unused "spare" profile's.
     results = run_doctor(
-        repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x", "GEMINI_API_KEY": "z"})
+        repo, probes=_probes(_GOOD_VERSIONS, {"OPENAI_API_KEY": "x"})
     )
     keys = _by_name(results)["api-keys"]
     assert keys.status == WARN
@@ -773,18 +769,18 @@ def test_gemini_panel_profile_valid_model_id_probes_ok(monkeypatch):
     assert _real_profile_model_probe("gemini", profile).status == OK
 
 
-def test_shipped_gemini_panel_profile_is_a_covered_api_profile():
-    # The ratified v1 panel's Gemini member is a configured `api` profile, so
-    # doctor's per-profile model probe — which iterates every config.agents entry —
-    # covers it (the coverage P1-A5 requires).
+def test_shipped_gemini_profile_is_an_inactive_opt_in_example():
+    # Fresh installs do not require Gemini, but retain an adjacent example that
+    # users can uncomment before selecting it in the standard panel.
     from gauntlet.engine.config import RunConfig
 
     repo = Path(__file__).resolve().parents[2]
-    cfg = RunConfig.model_validate(
-        yaml.safe_load((repo / ".gauntlet" / "config.yaml").read_text())
-    )
-    assert "gemini" in cfg.agents
-    assert cfg.agents["gemini"].adapter == "api" and cfg.agents["gemini"].model
+    path = repo / "src" / "gauntlet" / "scaffold" / "config.yaml"
+    cfg = RunConfig.model_validate(yaml.safe_load(path.read_text()))
+    assert "gemini" not in cfg.agents
+    text = path.read_text()
+    assert "# gemini:" in text
+    assert "#   model: gemini/gemini-2.5-pro" in text
 
 
 def test_reference_profile_blind_sandbox_fails_read_probe(tmp_path):

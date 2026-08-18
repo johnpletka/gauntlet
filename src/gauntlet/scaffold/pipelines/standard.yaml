@@ -29,7 +29,7 @@ stages:
       - {id: prd-cycle, type: adversarial_cycle, mode: artifact, artifact: prd.md,
          phase: PRD, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
-                     {profile: gemini, lens: spec-coverage}],
+                     {profile: reviewer, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 2,
          review_prompt: prompts/review-document.md}
       - {id: prd-approve, type: human_gate,
@@ -64,14 +64,14 @@ stages:
       # `review_against: prd.md` (issue #80) inlines the approved PRD alongside
       # the plan for round 1, which is what makes review-document.md's mandatory
       # FR-by-FR coverage sweep executable: artifact mode otherwise inlines only
-      # the artifact under review, so the codex reviewer was never told where the
-      # PRD lives and the `api`-adapter panel member could not read it at all.
+      # the artifact under review, so reviewers are not given the approved PRD
+      # as explicit review context.
       # The prd-cycle above deliberately does NOT set it — a PRD has no upstream
       # spec to owe coverage to, and the sweep is inert without the block.
       - {id: plan-cycle, type: adversarial_cycle, mode: artifact, artifact: plan.md,
          phase: PLAN, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
-                     {profile: gemini, lens: spec-coverage}],
+                     {profile: reviewer, lens: spec-coverage}],
          escalation_agent: escalation, max_rounds: 3,
          review_against: prd.md,
          review_prompt: prompts/review-document.md}
@@ -142,7 +142,7 @@ stages:
       - {id: impl-cycle, type: adversarial_cycle, mode: code_review,
          triager: triage, fixer: builder, disposition_agent: mechanic,
          reviewers: [{profile: reviewer, lens: correctness},
-                     {profile: gemini, lens: spec-coverage}],
+                     {profile: reviewer, lens: spec-coverage}],
          verifier: verifier,
          escalation_agent: escalation, max_rounds: 3,
          review_prompt: prompts/review-code.md}

@@ -79,8 +79,11 @@ You need:
 The default agent profiles are: builder = `claude` (model `opus`), reviewer =
 `codex` (model `gpt-5.5`), triage/judge = `gpt-5-mini`, escalation = `gpt-5`.
 You can repoint any tier to a different provider in config (see
-[Configuration](#configuration)); `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` are
-only needed if you switch the API tiers to those providers.
+[Configuration](#configuration)). The default review panel runs the `reviewer`
+profile under both the correctness and spec-coverage lenses. The scaffolded
+config includes a commented Gemini profile for using a distinct provider for
+the latter; enabling it requires `GEMINI_API_KEY`. `ANTHROPIC_API_KEY` is only
+needed if you switch an API-backed tier to Anthropic.
 
 ---
 

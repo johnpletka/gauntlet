@@ -138,17 +138,17 @@ def test_cycle_max_rounds_reflects_p9_carry_budget():
     assert steps["impl-cycle"].get("max_rounds") == 3
 
 
-def test_cycles_use_the_v1_ensemble_panel():
-    # pipeline-effectiveness FR-1.1 / Q2: the shipped cycles run the ratified
-    # two-member panel — the codex reviewer (correctness lens) plus the Gemini
-    # api profile (spec-coverage lens) — instead of a single reviewer.
+def test_cycles_use_the_default_multilens_reviewer_panel():
+    # The shipped cycles retain two independent review lenses without requiring
+    # a third provider credential on a fresh installation. Users can opt into
+    # the commented Gemini profile for the spec-coverage member.
     pipeline, _, _ = _load()
     for cid in ("prd-cycle", "plan-cycle", "impl-cycle"):
         step = next(s for s in pipeline.all_steps() if s.id == cid)
         panel = step.get("reviewers")
         assert panel == [
             {"profile": "reviewer", "lens": "correctness"},
-            {"profile": "gemini", "lens": "spec-coverage"},
+            {"profile": "reviewer", "lens": "spec-coverage"},
         ], cid
         # the singular reviewer role is subsumed by the panel
         assert step.get("reviewer") is None
