@@ -136,7 +136,7 @@ def _verifier_run(run_id: str, legit: int) -> dict:
 
 
 def test_panel_shrink_fires_on_two_below_threshold(tmp_path: Path):
-    _pipeline_repo(tmp_path)
+    _pipeline_repo(tmp_path, gemini_panel=True)
     corpus = [
         _ens_run("run-a", {"reviewer": 9, "gemini": 1}),  # gemini 10%
         _ens_run("run-b", {"reviewer": 8, "gemini": 1}),  # gemini ~11%
@@ -156,7 +156,7 @@ def test_panel_shrink_fires_on_full_overlap(tmp_path: Path):
     # panel whose members fully overlap records 0 unique for everyone while
     # still raising findings — the exact §1.3 failure case. Zero total with
     # raised > 0 is "below any threshold", not "cannot judge".
-    _pipeline_repo(tmp_path)
+    _pipeline_repo(tmp_path, gemini_panel=True)
     corpus = [
         _ens_run("run-a", {"reviewer": 0, "gemini": 0}),
         _ens_run("run-b", {"reviewer": 0, "gemini": 0}),
@@ -167,7 +167,7 @@ def test_panel_shrink_fires_on_full_overlap(tmp_path: Path):
 
 def test_panel_shrink_silent_when_panel_raised_nothing(tmp_path: Path):
     # Zero unique AND zero raised: no signal either way — no proposal.
-    _pipeline_repo(tmp_path)
+    _pipeline_repo(tmp_path, gemini_panel=True)
     corpus = [
         _ens_run("run-a", {"reviewer": 0, "gemini": 0}, raised=0),
         _ens_run("run-b", {"reviewer": 0, "gemini": 0}, raised=0),
@@ -176,7 +176,7 @@ def test_panel_shrink_silent_when_panel_raised_nothing(tmp_path: Path):
 
 
 def test_panel_shrink_silent_when_above_threshold(tmp_path: Path):
-    _pipeline_repo(tmp_path)
+    _pipeline_repo(tmp_path, gemini_panel=True)
     corpus = [
         _ens_run("run-a", {"reviewer": 6, "gemini": 4}),  # gemini 40%
         _ens_run("run-b", {"reviewer": 6, "gemini": 4}),
@@ -185,7 +185,7 @@ def test_panel_shrink_silent_when_above_threshold(tmp_path: Path):
 
 
 def test_panel_shrink_needs_two_below_runs(tmp_path: Path):
-    _pipeline_repo(tmp_path)
+    _pipeline_repo(tmp_path, gemini_panel=True)
     corpus = [
         _ens_run("run-a", {"reviewer": 9, "gemini": 1}),  # below
         _ens_run("run-b", {"reviewer": 5, "gemini": 5}),  # not below
@@ -216,16 +216,26 @@ def test_verifier_revert_needs_three_runs(tmp_path: Path):
 
 
 # --- end-to-end materialization (git apply-checked) --------------------------
-def _pipeline_repo(tmp_path: Path) -> Path:
-    """A git repo carrying the real shipped pipeline + schemas so a governance
-    diff validates against genuine bytes."""
+def _pipeline_repo(tmp_path: Path, *, gemini_panel: bool = False) -> Path:
+    """A git repo carrying the shipped pipeline + schemas.
+
+    ``gemini_panel`` exercises governance after applying the documented opt-in
+    substitution, so the generic Gemini-removal tests do not require Gemini to
+    remain part of the fresh-install default.
+    """
     if not (tmp_path / ".git").exists():
         git(tmp_path, "init", "-q")
         git(tmp_path, "config", "user.name", "Fixture")
         git(tmp_path, "config", "user.email", "fx@gauntlet.local")
         git(tmp_path, "config", "commit.gpgsign", "false")
     (tmp_path / "pipelines").mkdir(exist_ok=True)
-    shutil.copy(REPO / "pipelines" / "standard.yaml", tmp_path / "pipelines" / "standard.yaml")
+    pipeline_text = (REPO / "pipelines" / "standard.yaml").read_text()
+    if gemini_panel:
+        old = "{profile: reviewer, lens: spec-coverage}"
+        new = "{profile: gemini, lens: spec-coverage}"
+        assert old in pipeline_text
+        pipeline_text = pipeline_text.replace(old, new)
+    (tmp_path / "pipelines" / "standard.yaml").write_text(pipeline_text)
     if not (tmp_path / "schemas").exists():
         shutil.copytree(REPO / "schemas", tmp_path / "schemas")
     git(tmp_path, "add", "-A")
@@ -255,7 +265,7 @@ def test_build_governance_proposals_materializes_ratifiable(tmp_path: Path):
     """P6-A5 end to end: a below-yield 2-run corpus + a below-signal 3-verifier
     corpus produce valid (git apply-checked, path-contained) PENDING proposals,
     and the pipeline file is NOT mutated (no config self-mutation)."""
-    repo = _pipeline_repo(tmp_path)
+    repo = _pipeline_repo(tmp_path, gemini_panel=True)
     slug = "fam"
     # Two comparison runs with gemini below 25%.
     _write_corpus_manifest(repo, slug, _ens_run("run-2026-01-01T00-00-00", {"reviewer": 9, "gemini": 1}))

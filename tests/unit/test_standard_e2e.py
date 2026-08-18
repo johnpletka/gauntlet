@@ -84,7 +84,6 @@ agents:
   builder: {adapter: claude-code, permission_mode: acceptEdits}
   reviewer: {adapter: codex, sandbox: read-only}
   verifier: {adapter: claude-code, permission_mode: acceptEdits, allowed_tools: [Bash, Read, Grep, Glob, Edit, Write], base_flags: ["--setting-sources", "project"]}
-  gemini: {adapter: api, model: gemini/gemini-2.5-pro}
   triage: {adapter: api, model: gpt-5-mini}
   escalation: {adapter: api, model: gpt-5}
   mechanic: {adapter: api, model: gpt-5-mini}
@@ -175,7 +174,7 @@ def _factory(adapters):
 def _stub_sandbox(monkeypatch, tmp_path):
     """Stub the P5 verifier sandbox backend for the offline e2e (no claude+judge).
 
-    The whole e2e is fake-driven (faked reviewer/gemini/builder, use_judge=False),
+    The whole e2e is fake-driven (faked reviewer/builder, use_judge=False),
     so the claude-code + judge verifier backend is inherently unavailable here;
     stub it exactly like the other CLIs are faked. The verifier's disposable copy
     and hook confinement are integration-tested (tests/integration); here the fake
@@ -221,15 +220,12 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     repo = _scaffold(tmp_path)
     _stub_sandbox(monkeypatch, tmp_path)
     adapters = {
-        # prd-cycle, plan-cycle, impl-cycle each converge on an empty review;
-        # +1 reviewer self-critique in the now-active retro stage (FR-6.2, P7).
+        # The three cycles each run correctness + spec-coverage through this
+        # profile and converge empty; +1 reviewer self-critique in retro.
         "reviewer": Script(
-            review_empty(), review_empty(), review_empty(),
+            *[review_empty() for _ in range(6)],
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
-        # Ensemble panel member 2 (FR-1.1): the three cycles each run it; it
-        # converges empty like the reviewer so each round finds nothing.
-        "gemini": Script(review_empty(), review_empty(), review_empty()),
         # P5 behavioral verifier: runs once on the impl-cycle (round 1); converges
         # empty (no behavioral findings) so the cycle still converges in round 1.
         "verifier": Script(review_empty()),
@@ -345,15 +341,12 @@ def test_yaml_only_extension_adds_a_third_review_step(tmp_path, monkeypatch):
     repo = _scaffold(tmp_path, pipeline_text=yaml.safe_dump(spec, sort_keys=False))
 
     adapters = {
-        # one extra review call for the added step (4 cycles converge empty) +1
-        # reviewer self-critique in the now-active retro stage (FR-6.2, P7).
+        # Six calls cover both lenses in the three standard cycles, plus one for
+        # the added single-reviewer step and one reviewer self-critique in retro.
         "reviewer": Script(
-            *[review_empty() for _ in range(4)],
+            *[review_empty() for _ in range(7)],
             AgentResult(text="reviewer retrospective", usage=_u(), exit_code=0),
         ),
-        # Panel member 2 runs on the three panel cycles (prd/plan/impl); the added
-        # impl-cycle-2 is a single-reviewer step, so gemini is called 3× not 4×.
-        "gemini": Script(*[review_empty() for _ in range(3)]),
         # P5 verifier runs on impl-cycle only (impl-cycle-2 declares no verifier);
         # converges empty.
         "verifier": Script(review_empty()),
