@@ -2163,12 +2163,37 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         # reviewer handoff — the step's `base_sha` is re-anchored to the adopted
         # tip, which is PAST the `P<N>:` commit. HEAD is then a bookkeeping commit
         # and `base` is later still, so neither the HEAD match above nor a
-        # `base..HEAD` scan sees it. Walk back from HEAD instead: the `P<N>`
-        # prefix is unique to this phase, so the most recent commit carrying it is
-        # this phase's own commit. Adopt it rather than failing on an empty tree
-        # (#124).
-        for sha in gitops.commits_from_head(repo, existing):
-            if header_prefix(gitops.commit_message(repo, sha)) == prefix:
+        # `base..HEAD` scan sees it. Walk back from HEAD instead — but BOUNDED to
+        # the run's own commits (`HEAD ^base_branch`): the `P<N>` prefix is only
+        # unique WITHIN a run, and the base branch's pre-run history can hold a
+        # same-prefix commit from an earlier run/PRD, which must never be adopted
+        # as this phase's deliverable. A genuinely empty phase therefore still
+        # falls through to the loud FAILED below, as does any walk the repo
+        # cannot answer (missing base ref → fail closed, no adoption) (#124).
+        # Adoption is skipped when `P<N> wip:` checkpoints exist: the KEEP branch
+        # below must still land its empty `P<N>:` marker at the tip so the
+        # checkpointed work is covered by the handoff commit.
+        if not wips:
+            try:
+                candidates = gitops.commits_from_head(
+                    repo, existing,
+                    exclude_reachable_from=ctx.manifest.base_branch,
+                )
+            except gitops.GitError:
+                candidates = []
+            for sha, subject in candidates:
+                if header_prefix(subject) != prefix:
+                    continue
+                try:
+                    if gitops.is_ancestor(repo, sha, base):
+                        # Restore `base_sha`'s meaning ("the state this attempt
+                        # started from"): adoption re-anchored it AT or PAST the
+                        # phase commit, which would hand review-diff consumers a
+                        # reversed or empty `base..commit` range. The phase's
+                        # work began at the adopted commit's parent.
+                        ctx.record.base_sha = gitops.commit_parent(repo, sha)
+                except gitops.GitError:
+                    pass  # repair is best-effort; adoption itself stands
                 return StepResult(
                     status=DONE,
                     commit_sha=sha,

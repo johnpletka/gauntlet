@@ -3379,9 +3379,10 @@ class RunManager:
         bookkeeping tolerated, same rule as the resume disposition) or the
         record is left terminal exactly as before. The upgrade is persisted
         with a manifest warning so the reclassification is audited, never
-        silent. Resolves the run's registered worktree read-only — at this
-        boundary ``self.work_root`` is the operator's checkout for a
-        ``dedicated`` run (#90), the wrong tree to assess.
+        silent. Runs against the verb's resolved ``RunPaths`` — inside
+        ``_resume_locked`` the ``_worktree_paths_or_park`` context has already
+        set ``self._paths`` to the run's own tree (the operator's checkout is
+        never assessed for a ``dedicated`` run, #90).
         """
         if man.status != M.RUN_FAILED:
             return
@@ -3396,41 +3397,20 @@ class RunManager:
             return
         paths = self._paths
         if paths is None:
-            try:
-                entry = WT.observe(
-                    self.operator_root, man.branch,
-                    main_root=self._main_worktree_root(),
-                )
-            except gitops.GitError:
-                return  # unprovable tree → fail closed, leave terminal
-            if entry is not None:
-                paths = RunPaths(
-                    repo_root=self.repo_root,
-                    work_root=entry.path,
-                    state_root=run_dir,
-                    artifact_root=layout.slug_dir,
-                )
-        if paths is not None:
+            return  # no resolved run tree → fail closed, leave terminal
+        try:
             work_root = paths.work_root
             excludes = run_bookkeeping_excludes(
                 work_root, paths.bookkeeping_root, paths.artifact_root_in_work
             )
-            bookkeeping_root = paths.bookkeeping_root
-        else:
-            work_root = self.work_root
-            excludes = run_bookkeeping_excludes(
-                work_root, self._bookkeeping_root(run_dir),
-                self._artifact_root_in_work(layout),
-            )
-            bookkeeping_root = self._bookkeeping_root(run_dir)
-        try:
             dirty = gitops.is_dirty_vs(
                 work_root, failed.base_sha, exclude=excludes,
                 bookkeeping=engine_bookkeeping_candidates(
-                    work_root, bookkeeping_root,
+                    work_root, paths.bookkeeping_root,
+                    state_outside_worktree=paths.state_outside_worktree,
                 ),
             )
-        except gitops.GitError:
+        except (gitops.GitError, StateDirNotContained, OSError):
             return  # unprovable → fail closed, leave terminal
         if dirty:
             return

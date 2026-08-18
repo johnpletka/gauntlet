@@ -161,6 +161,7 @@ ROOT_SCOPE: dict[str, str] = {
     "commit_subject": ROOT_SCOPE_REPO,
     "commit_parent": ROOT_SCOPE_REPO,
     "commit_message": ROOT_SCOPE_REPO,
+    "commits_from_head": ROOT_SCOPE_REPO,  # SHA/ref-addressed log read
     "log_range": ROOT_SCOPE_REPO,
     "range_diff": ROOT_SCOPE_REPO,
     "range_diff_path": ROOT_SCOPE_REPO,
@@ -1269,14 +1270,33 @@ def commit_message(repo: Path, sha: str) -> str:
     return _run(repo, "log", "-1", "--format=%B", sha).rstrip("\n")
 
 
-def commits_from_head(repo: Path, head: str, *, limit: int = 1000) -> list[str]:
-    """Full SHAs of the newest ``limit`` commits reachable from ``head`` (newest
-    first). Used by the phase-commit reconciliation to find a phase's own
-    ``P<N>:`` commit when it sits behind engine bookkeeping commits and outside
-    the step's own ``base..HEAD`` window (the base advanced past it through
-    ``resume`` commit adoption)."""
-    out = _run(repo, "log", f"-n{int(limit)}", "--format=%H", head).strip()
-    return [line for line in out.splitlines() if line]
+def commits_from_head(
+    repo: Path,
+    head: str,
+    *,
+    exclude_reachable_from: str | None = None,
+    limit: int = 1000,
+) -> list[tuple[str, str]]:
+    """``(sha, subject)`` of the newest ``limit`` commits reachable from
+    ``head`` (newest first), excluding everything reachable from
+    ``exclude_reachable_from`` when given. Used by the phase-commit
+    reconciliation to find a phase's own ``P<N>:`` commit when it sits behind
+    engine bookkeeping commits and outside the step's own ``base..HEAD`` window
+    (the base advanced past it through ``resume`` commit adoption); the
+    exclusion bounds that walk to the run's own commits, so a same-prefix
+    commit from the base branch's pre-run history can never match. One ``git
+    log`` call — subjects ride along NUL-separated so callers never pay a
+    per-commit ``commit_message`` subprocess."""
+    args = ["log", f"-n{int(limit)}", "--format=%H%x00%s", head]
+    if exclude_reachable_from is not None:
+        args.append(f"^{exclude_reachable_from}")
+    out = _run(repo, *args).strip()
+    return [
+        (sha, subject)
+        for line in out.splitlines()
+        if line and "\x00" in line
+        for sha, subject in [line.split("\x00", 1)]
+    ]
 
 
 def range_diff(repo: Path, base: str, head: str) -> str:

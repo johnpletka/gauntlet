@@ -450,8 +450,10 @@ def test_reconciles_phase_commit_reachable_from_head_behind_base(fixture_repo):
     # layered engine bookkeeping commits on top and re-anchored the commit step's
     # base_sha PAST the P9: commit. HEAD is a bookkeeping commit, base is a later
     # one still, and the worktree is clean — so the HEAD match and a base..HEAD
-    # scan both miss the P9: commit. The step must walk back from HEAD, find the
-    # phase-unique P9: commit, and adopt it rather than failing on an empty tree.
+    # scan both miss the P9: commit. The step must walk back from HEAD (bounded
+    # to the run branch's own commits), find the phase-unique P9: commit, and
+    # adopt it rather than failing on an empty tree.
+    git(fixture_repo, "checkout", "-qb", "b")  # the run branch, off base `main`
     (fixture_repo / "work.py").write_text("phase work\n")
     git(fixture_repo, "add", "-A")
     git(fixture_repo, "commit", "-qm", "P9: the phase\n\nbody")
@@ -464,7 +466,8 @@ def test_reconciles_phase_commit_reachable_from_head_behind_base(fixture_repo):
 
     step = Step.model_validate({"id": "commit", "type": "commit", "phase": "P9",
                                 "message": "P9: the phase\n\nbody"})
-    result = handle_commit(step, _ctx_for_commit(fixture_repo, base_after_phase))
+    ctx = _ctx_for_commit(fixture_repo, base_after_phase)
+    result = handle_commit(step, ctx)
 
     assert result.status == DONE
     assert result.commit_sha == phase_commit  # adopted the existing P9: commit
@@ -472,12 +475,17 @@ def test_reconciles_phase_commit_reachable_from_head_behind_base(fixture_repo):
     assert "reachable from HEAD" in (result.notes or "")
     # No new commit was made — HEAD is unchanged, tree still clean.
     assert gitops.head_sha(fixture_repo) == head
+    # The record's base is repaired to the adopted commit's parent, so review
+    # consumers diff `base..commit` FORWARD over the phase's changes instead of
+    # a reversed/empty range against the re-anchored base.
+    assert ctx.record.base_sha == gitops.commit_parent(fixture_repo, phase_commit)
 
 
 def test_clean_worktree_with_no_phase_commit_still_fails(fixture_repo):
     # The negative control: a genuinely empty phase (no `P9:` commit anywhere)
     # with a clean worktree must STILL fail loud — the #124 reconciliation only
     # adopts a real phase commit, it does not paper over a phase that did nothing.
+    git(fixture_repo, "checkout", "-qb", "b")
     git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: response consumed")
     base = gitops.head_sha(fixture_repo)
     git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: bookkeeping flush")
@@ -486,3 +494,65 @@ def test_clean_worktree_with_no_phase_commit_still_fails(fixture_repo):
     result = handle_commit(step, _ctx_for_commit(fixture_repo, base))
     assert result.status == M.FAILED
     assert "nothing to commit" in (result.notes or "")
+
+
+def test_foreign_phase_commit_in_base_history_is_not_adopted(fixture_repo):
+    # A previous run/PRD left a `P9:` commit in the BASE branch's history. The
+    # current phase produced nothing: the walk must not cross the branch point
+    # and adopt that foreign commit as this phase's deliverable — the loud
+    # FAILED is the correct outcome.
+    (fixture_repo / "old.py").write_text("previous run's work\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P9: an earlier run's phase")
+    git(fixture_repo, "checkout", "-qb", "b")  # run branch forks AFTER old P9:
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: response consumed")
+    base = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: bookkeeping flush")
+    step = Step.model_validate({"id": "commit", "type": "commit", "phase": "P9",
+                                "message": "P9: the phase\n\nbody"})
+    result = handle_commit(step, _ctx_for_commit(fixture_repo, base))
+    assert result.status == M.FAILED
+    assert "nothing to commit" in (result.notes or "")
+
+
+def test_missing_base_branch_fails_closed_not_adopting(fixture_repo):
+    # If the walk cannot be bounded (the base branch ref is gone), adoption is
+    # skipped entirely — an unbounded walk is never an acceptable fallback.
+    git(fixture_repo, "checkout", "-qb", "b")
+    (fixture_repo / "work.py").write_text("phase work\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P9: the phase\n\nbody")
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: response consumed")
+    base = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: bookkeeping flush")
+    git(fixture_repo, "branch", "-qD", "main")
+    step = Step.model_validate({"id": "commit", "type": "commit", "phase": "P9",
+                                "message": "P9: the phase\n\nbody"})
+    result = handle_commit(step, _ctx_for_commit(fixture_repo, base))
+    assert result.status == M.FAILED
+    assert "nothing to commit" in (result.notes or "")
+
+
+def test_keep_mode_checkpoints_win_over_adoption(fixture_repo):
+    # KEEP mode with `P9 wip:` checkpoints at the tip AND an adoptable `P9:`
+    # commit behind base: the empty `P9:` marker carrying the checkpoint trailer
+    # must still be created at the tip — adoption of the older commit would
+    # leave the checkpointed work uncovered by any handoff commit.
+    git(fixture_repo, "checkout", "-qb", "b")
+    (fixture_repo / "work.py").write_text("phase work\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P9: the phase\n\nbody")
+    adopted_candidate = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: response consumed")
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "more.py").write_text("checkpointed work\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P9 wip: checkpointed milestone")
+    step = Step.model_validate({"id": "commit", "type": "commit", "phase": "P9",
+                                "message": "P9: the phase\n\nbody"})
+    result = handle_commit(step, _ctx_for_commit(fixture_repo, base))
+    assert result.status == DONE
+    assert result.commit_sha != adopted_candidate  # NOT the old commit
+    assert result.commit_sha == gitops.head_sha(fixture_repo)  # marker at tip
+    subject = gitops.commit_subject(fixture_repo, result.commit_sha)
+    assert subject.startswith("P9:")
