@@ -291,6 +291,95 @@ def test_version_mismatch_warns_not_fails(tmp_path):
     assert not has_failure(results)
 
 
+def test_codex_version_mismatch_warns_not_fails(tmp_path):
+    # Issue #119 observed PATH codex 0.144.4 against the 0.139.0 behavior pin.
+    # Keep an explicit codex-prefix regression rather than relying on the Claude
+    # mismatch test to prove `codex-cli X.Y.Z` is normalized and surfaced.
+    repo = _healthy_repo(tmp_path)
+    versions = {"claude": "2.1.172", "codex": "codex-cli 0.144.4"}
+    results = run_doctor(repo, probes=_probes(versions, _GOOD_ENV))
+    codex = _by_name(results)["codex"]
+    assert codex.status == WARN
+    assert "0.144.4" in codex.detail and "0.139.0" in codex.detail
+    assert not has_failure(results)
+
+
+def _write_codex_cache(root: Path, payload: object, *, codex_home=False) -> dict[str, str]:
+    cache_dir = root if codex_home else root / ".codex"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "models_cache.json").write_text(json.dumps(payload))
+    key = "CODEX_HOME" if codex_home else "HOME"
+    return {**_GOOD_ENV, key: str(root)}
+
+
+def test_codex_cache_matching_writer_and_schema_is_ok(tmp_path):
+    repo = _healthy_repo(tmp_path / "repo")
+    env = _write_codex_cache(
+        tmp_path / "home",
+        {
+            "client_version": "0.139.0",
+            "models": [{"base_instructions": "not surfaced by doctor"}],
+        },
+    )
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, env))
+    cache = _by_name(results)["codex-cache"]
+    assert cache.status == OK
+    assert "base_instructions=1" in cache.detail
+    assert "not surfaced by doctor" not in cache.detail
+
+
+def test_codex_cache_newer_writer_and_issue_119_schema_warn(tmp_path):
+    repo = _healthy_repo(tmp_path / "repo")
+    env = _write_codex_cache(
+        tmp_path / "codex-home",
+        {
+            "client_version": "0.147.0",
+            "models": [{"model_messages": {"base": "private cache content"}}],
+        },
+        codex_home=True,
+    )
+    versions = {"claude": "2.1.172", "codex": "codex-cli 0.144.4"}
+    results = run_doctor(repo, probes=_probes(versions, env))
+    cache = _by_name(results)["codex-cache"]
+    assert cache.status == WARN
+    assert "cache writer 0.147.0" in cache.detail
+    assert "PATH codex 0.144.4" in cache.detail
+    assert "model_messages schema omits base_instructions" in cache.detail
+    assert "private cache content" not in cache.detail
+    assert cache.remedy and "CODEX_HOME" in cache.remedy
+
+
+def test_codex_cache_partial_json_warns_actionably(tmp_path):
+    repo = _healthy_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    cache_dir = home / ".codex"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "models_cache.json").write_text('{"client_version":')
+    env = {**_GOOD_ENV, "HOME": str(home)}
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, env))
+    cache = _by_name(results)["codex-cache"]
+    assert cache.status == WARN
+    assert "mid-rewrite" in cache.detail
+    assert cache.remedy and "retry doctor" in cache.remedy
+
+
+def test_codex_cache_invalid_utf8_warns_actionably(tmp_path):
+    repo = _healthy_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    cache_dir = home / ".codex"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "models_cache.json").write_bytes(
+        b'{"client_version":"0.139.0","models":["\xe2\x82'
+    )
+    env = {**_GOOD_ENV, "HOME": str(home)}
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, env))
+    cache = _by_name(results)["codex-cache"]
+    assert cache.status == WARN
+    assert "UnicodeDecodeError" in cache.detail
+    assert "mid-rewrite" in cache.detail
+    assert cache.remedy and "retry doctor" in cache.remedy
+
+
 def test_missing_claude_hook_fails(tmp_path):
     repo = _healthy_repo(tmp_path)
     (repo / ".claude/settings.json").unlink()

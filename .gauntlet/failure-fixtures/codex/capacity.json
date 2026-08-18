@@ -1,0 +1,8 @@
+{
+  "events": [
+    {"type": "thread.started", "thread_id": "th_capacity_119"},
+    {"type": "error", "message": "stream disconnected"},
+    {"type": "error", "message": "Reconnecting... 2/5"},
+    {"type": "turn.failed", "error": {"message": "Selected model is at capacity. Please try a different model."}}
+  ]
+}

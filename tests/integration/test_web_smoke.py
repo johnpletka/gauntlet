@@ -134,3 +134,8 @@ def test_launch_gate_approve_done_through_ui(tmp_path):
             "/api/runs/demo/approve", json={}, headers=hdr
         ).status_code == 200
         _poll(lambda: _status(store) == "done")
+        # The manifest reaches ``done`` just before the approve driver exits.
+        # Wait through the supervisor's PID-safe detach/reap boundary so session
+        # teardown does not race the child's normal shutdown and report it as a
+        # leaked judge process (#85).
+        _poll(lambda: not sup.is_attached("demo", man.run_id))

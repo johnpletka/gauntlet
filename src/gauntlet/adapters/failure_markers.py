@@ -178,6 +178,21 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
         fixture="codex/overload.json",
         real_capture=False,  # synthesized: no live overload capture yet
     ),
+    # Issue #119 live capture: after codex's stream reconnect sequence, the
+    # authoritative ``turn.failed`` envelope reported that the selected model
+    # was "at capacity". This is provider overload, not a content decision, so
+    # it consumes the persisted dependency-retry budget and eventually parks
+    # ``provider_unavailable`` rather than forcing a human ``--response``.
+    MarkerRule(
+        name="codex_capacity_message",
+        adapter="codex",
+        field="error.message",
+        rule="regex",
+        kind=FAILURE_TRANSIENT_OVERLOAD,
+        values=(r"\bat capacity\b",),
+        fixture="codex/capacity.json",
+        real_capture=True,
+    ),
     # P5 (plan §5.2): typed transport/dependency phrasings in the pinned
     # ``error.message`` field.
     MarkerRule(
@@ -220,6 +235,30 @@ CODEX_RULES: tuple[MarkerRule, ...] = (
         ),
         fixture="codex/provider-unavailable.json",
         real_capture=True,  # harvested from the issue-#96 run (2026-08-09)
+    ),
+    # Issue #119 live startup-fatal signature. The ChatGPT desktop app and a
+    # separately installed codex CLI can share ``models_cache.json`` while
+    # expecting different schemas; the older reader then exits before emitting
+    # any structured failure event. Stderr is consulted ONLY when no
+    # ``turn.failed``/``error`` event exists (see ``classify_codex_failure``), and
+    # the regex matches the complete pinned stderr envelope. The full-string
+    # boundary matters because codex can log the same cache diagnostic without
+    # making it the cause of a later, unrelated startup failure; any additional
+    # diagnostic therefore leaves the invocation unmatched/terminal.
+    MarkerRule(
+        name="codex_models_cache_schema_startup",
+        adapter="codex",
+        field="stderr",
+        rule="regex",
+        kind=FAILURE_TRANSIENT_DEPENDENCY,
+        values=(
+            r"\A\s*ERROR\s+codex_models_manager::cache:\s+"
+            r"failed to load models cache:\s+missing field\s+"
+            r"[`'\"]?base_instructions[`'\"]?\s+at line\s+\d+\s+"
+            r"column\s+\d+\s*\Z",
+        ),
+        fixture="codex/models-cache-schema.json",
+        real_capture=True,
     ),
 )
 
@@ -318,21 +357,38 @@ def classify_claude_failure(
     return _terminal(excerpt)
 
 
-def _codex_failure_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for event in events:
-        # Fail closed, don't crash: a classifier handed a malformed event list
-        # (non-dict elements) must still classify — skipping the element leaves
-        # the unmatched default (`terminal`) rather than an AttributeError.
-        if isinstance(event, dict) and event.get("type") in ("turn.failed", "error"):
+def codex_failure_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return codex's authoritative structured failure envelope.
+
+    A reconnecting turn may emit one or more intermediate ``error`` events and
+    finish with a ``turn.failed`` carrying the actual provider verdict. Prefer
+    the LAST ``turn.failed`` when present; otherwise use the LAST ``error``.
+    This keeps an early stream-disconnect notice from masking a later capacity
+    verdict, while a final unrecognized failure still fails closed to terminal.
+    Malformed non-dict elements are ignored rather than crashing the classifier.
+    """
+    failures = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") in ("turn.failed", "error")
+    ]
+    for event in reversed(failures):
+        if event.get("type") == "turn.failed":
             return event
-    return None
+    return failures[-1] if failures else None
 
 
 def classify_codex_failure(
-    events: list[dict[str, Any]], exit_code: int
+    events: list[dict[str, Any]], exit_code: int, *, stderr: str = ""
 ) -> FailureInfo:
-    """Classify a codex ``exec`` failure from its ``turn.failed``/``error`` event."""
-    event = _codex_failure_event(events)
+    """Classify a codex ``exec`` failure, preferring its structured envelope.
+
+    Startup stderr is eligible only when codex emitted no structured failure
+    event. That exception is deliberately narrow: it covers pinned pre-event
+    startup fatals without allowing a cosmetic warning to reclassify a real
+    terminal ``turn.failed`` outcome.
+    """
+    event = codex_failure_event(events)
     err = event.get("error") if event else None
     if isinstance(err, str):
         err = {"message": err}
@@ -343,6 +399,8 @@ def classify_codex_failure(
     if "message" not in err and event and isinstance(event.get("message"), str):
         err = {**err, "message": event["message"]}
     for rule in CODEX_RULES:
+        if rule.field == "stderr":
+            continue
         key = rule.field.split(".", 1)[1]  # "error.message" -> "message"
         value = err.get(key)
         if _match(rule, value):
@@ -350,7 +408,16 @@ def classify_codex_failure(
                 kind=rule.kind, marker=rule.name,
                 retry_after_s=None, raw_excerpt=_excerpt(value),
             )
-    excerpt = err.get("message") if err else f"exit code {exit_code}"
+    if event is None:
+        for rule in CODEX_RULES:
+            if rule.field == "stderr" and _match(rule, stderr):
+                return FailureInfo(
+                    kind=rule.kind,
+                    marker=rule.name,
+                    retry_after_s=None,
+                    raw_excerpt=_excerpt(stderr),
+                )
+    excerpt = err.get("message") if err else (stderr or f"exit code {exit_code}")
     return _terminal(excerpt)
 
 
@@ -429,7 +496,11 @@ def classify_captured(adapter: str, data: Any) -> FailureInfo:
     if adapter == "claude-code":
         return classify_claude_failure(data, exit_code=1)
     if adapter == "codex":
-        return classify_codex_failure(list(data.get("events", [])), exit_code=1)
+        return classify_codex_failure(
+            list(data.get("events", [])),
+            exit_code=1,
+            stderr=str(data.get("stderr", "")),
+        )
     if adapter == "api":
         return _classify_api(
             data.get("exception_class", ""),

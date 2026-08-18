@@ -59,7 +59,6 @@ _REQUIRED_ADAPTER_KINDS = frozenset(
 # observed — at which point it is removed from this set (shrinking it is a
 # conscious "we now have a real capture", never automatic).
 _UNCAPTURED_PENDING_LIVE = frozenset({
-    ("codex", FAILURE_TRANSIENT_OVERLOAD),
     ("api", FAILURE_TRANSIENT_USAGE_LIMIT),
     ("api", FAILURE_TRANSIENT_OVERLOAD),
     # P5 dependency pins (plan §5.2): the api pair carries the LIVE issue-#63
@@ -152,6 +151,79 @@ def test_agent_error_event_503_classifies_provider_unavailable():
     info = fm.classify_codex_failure(events, 1)
     assert info.kind == FAILURE_TRANSIENT_DEPENDENCY
     assert info.marker == "codex_provider_unavailable_message"
+
+
+def test_final_capacity_event_wins_over_intermediate_stream_errors():
+    # Issue #119 live sequence: intermediate stream/reconnect diagnostics precede
+    # the authoritative turn.failed capacity verdict. The old first-error selector
+    # stopped at "stream disconnected" (unmatched/terminal), forcing --response.
+    events = [
+        {"type": "thread.started", "thread_id": "th_capacity_119"},
+        {"type": "error", "message": "stream disconnected"},
+        {"type": "error", "message": "Reconnecting... 2/5"},
+        {"type": "turn.failed", "error": {
+            "message": "Selected model is at capacity. Please try a different model."
+        }},
+    ]
+    info = fm.classify_codex_failure(events, 1)
+    assert info.kind == FAILURE_TRANSIENT_OVERLOAD
+    assert info.marker == "codex_capacity_message"
+
+
+def test_final_unlisted_turn_failure_stays_terminal_after_transient_notice():
+    # Fail closed: an earlier recognized reconnect notice must not mask a final,
+    # unrecognized terminal outcome. turn.failed is authoritative when present.
+    events = [
+        {"type": "error", "message": "Reconnecting... 2/5"},
+        {"type": "turn.failed", "error": {
+            "message": "disk full writing scratch file"
+        }},
+    ]
+    assert fm.classify_codex_failure(events, 1).kind == FAILURE_TERMINAL
+
+
+def test_models_cache_startup_stderr_classifies_dependency_transient():
+    stderr = (
+        "ERROR codex_models_manager::cache: failed to load models cache: "
+        "missing field `base_instructions` at line 94 column 5"
+    )
+    info = fm.classify_codex_failure([], 1, stderr=stderr)
+    assert info.kind == FAILURE_TRANSIENT_DEPENDENCY
+    assert info.marker == "codex_models_cache_schema_startup"
+
+
+def test_models_cache_warning_cannot_mask_unrelated_startup_fatal():
+    # F-002: codex may log the cache parse failure and recover from it. If the
+    # process then exits for another pre-event reason, the cache diagnostic is
+    # incidental and must not turn the unknown fatal into an automatic retry.
+    stderr = (
+        "ERROR codex_models_manager::cache: failed to load models cache: "
+        "missing field `base_instructions` at line 94 column 5\n"
+        "fatal: authentication token rejected"
+    )
+    info = fm.classify_codex_failure([], 1, stderr=stderr)
+    assert info.kind == FAILURE_TERMINAL
+    assert info.marker == "unmatched"
+
+
+def test_startup_stderr_cannot_override_structured_terminal_failure():
+    # The cache warning is cosmetic once a structured failure exists; only a
+    # pre-event startup fatal may classify from stderr (issue #119 fail-closed pin).
+    events = [
+        {"type": "turn.failed", "error": {
+            "message": "authentication token rejected"
+        }}
+    ]
+    stderr = "models cache warning: missing field `base_instructions`"
+    assert (
+        fm.classify_codex_failure(events, 1, stderr=stderr).kind
+        == FAILURE_TERMINAL
+    )
+
+
+def test_unlisted_startup_stderr_stays_terminal():
+    info = fm.classify_codex_failure([], 1, stderr="fatal: invalid command flag")
+    assert info.kind == FAILURE_TERMINAL and info.marker == "unmatched"
 
 
 @pytest.mark.parametrize("message", [

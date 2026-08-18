@@ -6,6 +6,14 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Ensemble-member Codex capacity failures and the pinned shared-model-cache
+  startup fatal now consume bounded persisted dependency retries and park
+  `provider_unavailable` on exhaustion instead of requiring a human response.
+  `doctor` also reports Codex pin drift and incompatible/shared cache metadata
+  without exposing cached model content (#119).
+
 ## [1.1.1] — 2026-08-12
 
 ### Changed
