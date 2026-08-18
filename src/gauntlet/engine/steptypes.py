@@ -37,6 +37,7 @@ from gauntlet.engine.execution import (
 )
 from gauntlet.engine import gitops
 from gauntlet.engine.manifest import (
+    FAILURE_KIND_SHELL_EXIT_NONZERO,
     HALT_REASON_ADAPTER_ERROR,
     HALT_REASON_JUDGE_DENY,
     HALT_REASON_PRECONDITION,
@@ -218,6 +219,7 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
         return StepResult(
             status=FAILED,
             halt_reason=HALT_REASON_ADAPTER_ERROR,
+            failure_kind=FAILURE_KIND_SHELL_EXIT_NONZERO,
             notes=f"`{command}` exited {proc.returncode}",
         )
     return StepResult(status=DONE, notes=f"`{command}` exited 0")

@@ -1771,7 +1771,7 @@ class Orchestrator:
             step.type != "shell"
             or result.status != FAILED
             or result.halt_reason != M.HALT_REASON_ADAPTER_ERROR
-            or result.failure_kind is not None
+            or result.failure_kind != M.FAILURE_KIND_SHELL_EXIT_NONZERO
         ):
             return result
         side_effects = self._attempt_side_effects(step, spec, rec)
@@ -1780,14 +1780,14 @@ class Orchestrator:
                 "side-effect assessment: unprovable (no recorded attempt "
                 "boundary or git unavailable) — fail closed, terminal"
             )
-            failure_kind = None
+            failure_kind = M.FAILURE_KIND_SHELL_EXIT_NONZERO
         elif side_effects:
             assessment_note = (
                 "side-effect assessment: the attempt left Git/worktree "
                 "changes — terminal; recover through the snapshot-backed "
                 "verbs, never a blind re-run (plan §5.2)"
             )
-            failure_kind = None
+            failure_kind = M.FAILURE_KIND_SHELL_EXIT_NONZERO
         else:
             assessment_note = (
                 "side-effect assessment: no Git/worktree side effects — a "

@@ -199,6 +199,13 @@ def reason_fields_disjoint(
 # just-finished execution's `failure_kind`, so any non-precondition finalization
 # clears a stale value.
 FAILURE_KIND_CLEAN_HANDOFF = "clean_handoff_precondition"
+# A shell handler's explicit nonzero process result. This marker is terminal by
+# itself: the orchestrator may promote it to ``FAILURE_KIND_SIDE_EFFECT_FREE``
+# only after proving the attempt left no Git/worktree effects. Keeping the
+# pre-assessment fact structured prevents an unrelated handler exception (for
+# example, transcript persistence failing after a successful command) from
+# being mistaken for a retryable command failure.
+FAILURE_KIND_SHELL_EXIT_NONZERO = "shell_exit_nonzero"
 # An UNKNOWN adapter failure whose attempt provably produced no Git/worktree
 # side effects (plan §5.2, P5): the engine assessed the tree against the
 # attempt's ``base_sha`` — not the exception name — and found it unchanged, so
@@ -409,12 +416,10 @@ class StepRecord(BaseModel):
     # predating P3 (which carry ``None``) still load and validate.
     halt_reason: str | None = None
     # Failure-kind discriminator on a FAILED step (current-state, like
-    # ``parked_reason``): ``FAILURE_KIND_CLEAN_HANDOFF`` when this execution failed
-    # a re-runnable PRECONDITION guard (no adapter invoked, no cost) rather than
-    # in execution. ``_is_terminal_failure`` consults it so a plain ``resume``
-    # re-runs such a step once the precondition is fixed instead of treating it as
-    # terminal. ``None`` for every other outcome; cleared on any finalization that
-    # does not re-set it (so a stale value can never mislabel a later failure).
+    # ``parked_reason``). Only kinds in ``RERUNNABLE_FAILURE_KINDS`` permit a
+    # plain resume; terminal kinds may still preserve structured evidence such
+    # as an explicit nonzero shell exit. Cleared on any finalization that does
+    # not re-set it, so stale evidence cannot mislabel a later failure.
     failure_kind: str | None = None
     # Usage-limit park stamps (harness-efficiency FR-3.2). Set only when this step
     # parked with ``parked_reason == PARKED_REASON_USAGE_LIMIT``: ``retry_after_s``

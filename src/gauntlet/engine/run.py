@@ -3390,8 +3390,8 @@ class RunManager:
             failed is None
             or failed.type != "shell"
             or failed.halt_reason != M.HALT_REASON_ADAPTER_ERROR
-            or failed.failure_kind is not None
             or failed.base_sha is None
+            or not self._is_nonzero_shell_exit_record(failed)
         ):
             return
         paths = self._paths
@@ -3445,6 +3445,28 @@ class RunManager:
         if note not in man.warnings:
             man.warnings.append(note)
         man.write_atomic(run_dir / "manifest.json")
+
+    @staticmethod
+    def _is_nonzero_shell_exit_record(failed: StepRecord) -> bool:
+        """Whether a FAILED shell record proves the command exited nonzero.
+
+        New records carry a structured marker. Pre-#121 manifests predate that
+        field, so accept only the exact note shape emitted by ``handle_shell``;
+        an ambiguous ``handler error: ...`` remains terminal. This is purposely
+        evidence-based rather than treating every ``adapter_error`` as proof
+        that the command itself failed.
+        """
+        if failed.failure_kind == M.FAILURE_KIND_SHELL_EXIT_NONZERO:
+            return True
+        if failed.failure_kind is not None:
+            return False
+        text = (failed.notes or "").strip()
+        command, separator, exit_code = text.rpartition("` exited ")
+        return bool(
+            separator
+            and command.startswith("`")
+            and re.fullmatch(r"-?\d+", exit_code)
+        )
 
     def _observe_resume_branch(
         self, layout: "RunLayout", run_dir: Path, man: Manifest

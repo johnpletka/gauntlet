@@ -81,12 +81,12 @@ class StepResult:
     # misroutes a fixer/triager session into the round-1 reviewer. ``None`` for
     # every non-usage-limit outcome (current-state, like ``parked_reason``).
     parked_substep: str | None = None
-    # Failure-kind discriminator (current-state, like ``parked_reason``): set to a
-    # ``manifest.FAILURE_KIND_*`` value ONLY when this step failed a re-runnable
-    # PRECONDITION guard (no adapter invoked, no cost — e.g. the FR-9.3 round-1
-    # clean-handoff guard). ``None`` for every other outcome. ``_finalize`` copies
-    # it onto the record so ``_is_terminal_failure`` can let a plain ``resume``
-    # re-run such a step once the operator fixes the precondition.
+    # Failure-kind discriminator (current-state, like ``parked_reason``): a
+    # structured ``manifest.FAILURE_KIND_*`` fact used to decide whether a
+    # FAILED result is terminal or safely re-runnable. ``_finalize`` copies it
+    # onto the record; only kinds in ``RERUNNABLE_FAILURE_KINDS`` permit a plain
+    # resume. Other kinds may deliberately remain terminal while preserving the
+    # exact failure class (for example an unclean nonzero shell exit).
     failure_kind: str | None = None
     # Content-hash pair for an ``artifact_invalid`` park / its resume-revalidate
     # (harness-efficiency FR-2.2/§6). Set ONLY on an ``artifact_invalid`` park
