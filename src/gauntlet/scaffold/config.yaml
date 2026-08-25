@@ -82,10 +82,12 @@ agents:
     # claude loads the repo's PreToolUse hook only under project setting
     # sources; the engine-managed judge cannot gate the builder without it.
     base_flags: ["--setting-sources", "project"]
+    step_timeout_s: 1800
   reviewer:
     adapter: codex
     model: gpt-5.5
     sandbox: read-only        # pure review steps are read-only (FR-9.6)
+    step_timeout_s: 1800
   # Optional distinct-provider review panel member. To use Gemini for the
   # spec-coverage lens, uncomment this profile and change that panel member in
   # pipelines/standard.yaml from `reviewer` to `gemini`. Its scope is fully
