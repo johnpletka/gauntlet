@@ -3149,10 +3149,37 @@ def _confirm_prompt(
     # Commit list with authors: reviewer-attributed PN.rX mutation commits in
     # the range stay distinguishable from fixer commits (FR-9.6 / F-005).
     commit_list = gitops.log_range(ctx.work_root, handoff, fix_sha)
+    # The confirm pass is subject to the same wholesale `input_too_large`
+    # rejection as review (codex caps turn input at 1 MiB): a fixture-heavy
+    # round's range diff can exceed the panel's declared cap, killing the
+    # cycle terminally — after review itself already went by reference
+    # (issue #126, observed live at 1,279,585 chars). Apply _review_prompt's
+    # by-reference switch here too: full scope through the confirmer's own
+    # git, never truncation. FR-9.5's scope contract is unchanged — only the
+    # transport of the diff; findings and verdicts stay inlined.
+    diff_section = (
+        f"\n\n--- commit-range diff ({handoff[:10]}..{fix_sha[:10]}) ---\n{diff}"
+    )
+    cap, panel_reads_repo = _panel_input_cap(step, ctx)
+    if (
+        cap is not None
+        and panel_reads_repo
+        and len(template) + len(diff_section) > cap - _REVIEW_PROMPT_HEADROOM
+    ):
+        diff_section = (
+            f"\n\n--- commit-range diff ({handoff[:10]}..{fix_sha[:10]}): "
+            f"BY REFERENCE — too large to inline ({len(diff)} chars vs the "
+            f"{cap}-char input limit) ---\n"
+            f"You are running inside the repository worktree. Read the diff "
+            f"yourself with git (read-only), e.g.:\n"
+            f"  git diff --stat {handoff}..{fix_sha}   # the change map — start here\n"
+            f"  git diff {handoff}..{fix_sha} -- <path>  # per-file, as you confirm\n"
+            f"Confirm against the ENTIRE range exactly as if it were inlined here.\n"
+        )
     return (
         template
         + f"\n\n--- commits in range ({handoff[:10]}..{fix_sha[:10]}) ---\n{commit_list}"
-        + f"\n\n--- commit-range diff ({handoff[:10]}..{fix_sha[:10]}) ---\n{diff}"
+        + diff_section
         + "\n\n--- your prior findings, with triage verdicts ---\n"
         + wrap_as_data(json.dumps(
             {"findings": findings, "triage_verdicts": verdicts}, indent=2))
