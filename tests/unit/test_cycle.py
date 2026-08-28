@@ -707,6 +707,39 @@ def test_confirm_prompt_contains_only_the_range_diff(cycle_repo):
     assert "ARTIFACT-BODY-SENTINEL" not in confirm_prompt
 
 
+def test_confirm_oversize_diff_goes_by_reference(cycle_repo, monkeypatch):
+    """The confirm pass inherits _review_prompt's by-reference switch (#126):
+    a round diff too large for the panel's declared input cap is handed by
+    reference — the confirmer reads the repo itself — instead of inlined.
+    Observed live (label-stage P1 impl-cycle r2-confirm): a 1,279,585-char
+    confirm prompt was rejected wholesale by codex (`input_too_large`,
+    max_chars=1048576), failing the cycle terminally after review had already
+    gone by reference successfully. Findings and verdicts stay inlined —
+    only the diff's transport changes, so FR-9.5's scoping holds."""
+    from gauntlet.adapters.codex import CodexAdapter
+
+    monkeypatch.setattr(
+        CodexAdapter, "capabilities",
+        CodexAdapter.capabilities.model_copy(update={"max_input_chars": 80_000}),
+    )
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V("F-001")),
+        "builder": SeqAdapter(writer("src.py", "HUGE-SENTINEL\n" * 8_000, {})),
+    }
+    status, _, _ = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    confirm_prompt = reviewer.calls[1]["prompt"]
+    assert "commit-range diff" in confirm_prompt
+    assert "BY REFERENCE" in confirm_prompt
+    assert "HUGE-SENTINEL" not in confirm_prompt  # the diff body is NOT inlined
+    # the confirmer is told exactly how to read the range with its own git
+    assert "git diff --stat" in confirm_prompt
+    # prior findings + verdicts are still inlined (FR-9.5)
+    assert "F-001" in confirm_prompt and "legitimate" in confirm_prompt
+
+
 def test_review_prompt_embeds_artifact_in_artifact_mode(cycle_repo):
     reviewer = SeqAdapter(REVIEW())
     adapters = {"reviewer": reviewer, "triage": SeqAdapter(), "builder": SeqAdapter()}
