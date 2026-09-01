@@ -3440,10 +3440,27 @@ class RunManager:
         excludes = run_bookkeeping_excludes(
             self.work_root, self._bookkeeping_root(run_dir), layout.slug_dir
         )
+        # #131: a sanctioned recovery reconciliation (fork preservation +
+        # linear commit-tree restore) can orphan the recorded boundary while
+        # carrying its exact tree forward under a new sha. Classifying the
+        # branch against the orphan reports FORKED/BEHIND forever — with no
+        # verb that can repair the recorded sha. Resolve the boundary to its
+        # reachable tree twin first; a genuinely forked branch (no twin) still
+        # classifies exactly as before.
+        boundary = RX.reconciliation_boundary(man)
+        try:
+            tip = gitops.rev_parse(self.work_root, f"refs/heads/{man.branch}")
+            twin = RX.tree_equal_reachable_commit(
+                self.work_root, boundary, tip=tip
+            )
+            if twin is not None:
+                boundary = twin
+        except gitops.GitError:
+            pass  # unreadable branch: let observe_git report it
         return RX.observe_git(
             self.work_root,
             run_branch=man.branch,
-            recorded_sha=RX.reconciliation_boundary(man),
+            recorded_sha=boundary,
             excludes=excludes,
             bookkeeping_candidates=engine_bookkeeping_candidates(
                 self.work_root, self._bookkeeping_root(run_dir)
