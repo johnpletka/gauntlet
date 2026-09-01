@@ -621,6 +621,25 @@ def latest_cycle_round_commit(
             candidates.append(cp.result_sha)
         if cp.handoff_sha:
             candidates.append(cp.handoff_sha)
+    # #131: when a sanctioned recovery reconciliation has re-linearized the
+    # branch, ``rec.base_sha`` can be a commit no longer reachable from the
+    # tip. The predates-the-boundary filter below would then disqualify EVERY
+    # candidate (nothing descends from an orphaned commit), collapsing the
+    # selection to the orphaned base itself — which the rewind executor
+    # rightly refuses, leaving the #95 "no verb can advance" terminal. An
+    # unreachable base cannot bound the attempt, so the filter is skipped.
+    base_bounds_attempt = False
+    if rec.base_sha:
+        try:
+            base_bounds_attempt = gitops.ref_is_valid_commit(
+                repo, rec.base_sha
+            ) and (
+                tip is None
+                or rec.base_sha == tip
+                or gitops.is_ancestor(repo, rec.base_sha, tip)
+            )
+        except gitops.GitError:
+            base_bounds_attempt = False
     best: str | None = None
     for sha in candidates:
         if not sha:
@@ -632,13 +651,48 @@ def latest_cycle_round_commit(
                 repo, sha, tip
             ):
                 continue  # discarded/foreign history: not a reachable round
-            if rec.base_sha and not gitops.is_ancestor(repo, rec.base_sha, sha):
+            if base_bounds_attempt and not gitops.is_ancestor(
+                repo, rec.base_sha, sha
+            ):
                 continue  # predates the attempt boundary: not this cycle's work
             if best is None or gitops.is_ancestor(repo, best, sha):
                 best = sha
         except gitops.GitError:
             continue  # fail closed toward the base_sha fallback
     return best
+
+
+def tree_equal_reachable_commit(
+    repo: Path, sha: str | None, *, tip: str
+) -> str | None:
+    """Newest commit reachable from ``tip`` whose TREE is identical to ``sha``'s (#131).
+
+    A sanctioned recovery reconciliation (fork preservation + a linear
+    ``commit-tree`` restore) carries a commit's exact tree forward under a new
+    sha, orphaning the original. Any recorded rewind target naming the orphan
+    is then semantically satisfiable — the bytes it names exist on the branch —
+    but unreachable by sha. This resolves the orphan to its reachable tree
+    twin. ``sha`` itself is returned when it is already reachable; ``None``
+    when it does not resolve or no twin exists. Read-only and fail-closed.
+    """
+    if not sha:
+        return None
+    try:
+        if not gitops.ref_is_valid_commit(repo, sha):
+            return None
+        if sha == tip or gitops.is_ancestor(repo, sha, tip):
+            return sha
+        want = gitops.rev_parse(repo, f"{sha}^{{tree}}")
+        listing = gitops._run(  # noqa: SLF001 — engine-internal module pair
+            repo, "log", "--format=%H %T", tip
+        )
+        for line in listing.splitlines():
+            commit_sha, _, tree = line.strip().partition(" ")
+            if tree == want:
+                return commit_sha
+    except gitops.GitError:
+        return None
+    return None
 
 
 def build_progress_fingerprint(

@@ -395,6 +395,26 @@ def _apply_cycle_rewind(
 
     repo = ctx.work_root
     rec = ctx.record
+    # #131: a recorded rewind target can be orphaned by a sanctioned recovery
+    # reconciliation (fork preservation + linear commit-tree restore), which
+    # carries the target's exact TREE forward under a new sha. The executor
+    # rightly refuses a rewind onto unreachable history, which used to leave
+    # the cycle terminal ("no verb can advance", the #95 shape). Resolve the
+    # orphan to its reachable tree twin — byte-identical state, reachable sha
+    # — before assessment; an already-reachable target passes through as-is.
+    try:
+        _tip = gitops.head_sha(repo)
+        _twin = RX.tree_equal_reachable_commit(repo, target_sha, tip=_tip)
+        if _twin is not None and _twin != target_sha:
+            reason = (
+                f"{reason} [target {target_sha[:10]} orphaned by recovery "
+                f"reconciliation; rewound to reachable tree twin {_twin[:10]}]"
+            )
+            if recorded_sha == target_sha:
+                recorded_sha = _twin
+            target_sha = _twin
+    except gitops.GitError:
+        pass  # fail closed: the executor's own validation still governs
     # The cycle never switches branches: it observes and mutates the CURRENT
     # checkout (the run branch during a real drive), so the commit inventory
     # — and its governance evidence (F-004) — reflects the range the rewind

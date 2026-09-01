@@ -2320,9 +2320,9 @@ class Orchestrator:
         fallback.
         """
         if rec.type == "adversarial_cycle":
+            head = gitops.head_sha(self.work_root)
             sha = RX.latest_cycle_round_commit(
-                self.work_root, self.manifest, rec,
-                tip=gitops.head_sha(self.work_root),
+                self.work_root, self.manifest, rec, tip=head,
             )
             if sha is not None:
                 try:
@@ -2332,6 +2332,16 @@ class Orchestrator:
                 except gitops.GitError:
                     subject = None
                 return sha, subject
+            # #131: an orphaned base_sha (post-reconciliation linearized
+            # history) would be refused by the rewind executor as "not an
+            # ancestor of the tip". Its reachable tree twin names the same
+            # bytes under a reachable sha, so the rewind stays semantically
+            # identical instead of terminal.
+            twin = RX.tree_equal_reachable_commit(
+                self.work_root, rec.base_sha, tip=head
+            )
+            if twin is not None and twin != rec.base_sha:
+                return twin, None
             return rec.base_sha, None
         wips = gitops.wip_checkpoints(self.work_root, base=rec.base_sha, phase=phase)
         if wips:
