@@ -842,13 +842,19 @@ def test_cycle_routed_proceed_consumes_same_upstream_question(tmp_path):
 
 
 def test_cycle_routed_proceed_reparks_new_upstream_question(tmp_path):
-    """#106 negative control: a new root/target is not covered by the decision."""
+    """#106 negative control: a new root is not covered by the decision.
+
+    The settled fingerprint is (F-001 root, plan.md); the same target under a
+    NEW root must re-park. The target stays `plan.md` — a different artifact
+    than the reviewed `prd.md` — because a target naming the artifact under
+    review is now normalized away as a triager misencoding, not parked.
+    """
     repo, mgr = _drive_disposition_cycle_to_park(tmp_path)
     mechanic = SeqAdapter(_disposition("proceed_in_place"))
     resume = {
         "reviewer": SeqAdapter(REVIEW(F("F-002"))),
         "triage": SeqAdapter(
-            V("F-002", action="defer", target_artifact="prd.md")
+            V("F-002", action="defer", target_artifact="plan.md")
         ),
         "builder": SeqAdapter(),
         "mechanic": mechanic,
@@ -869,7 +875,7 @@ def test_cycle_routed_proceed_reparks_new_upstream_question(tmp_path):
     triage = json.loads(
         (mgr.layout("demo").active_run_dir() / "artifacts" / "triage.json").read_text()
     )
-    assert triage["verdicts"][0]["target_artifact"] == "prd.md"
+    assert triage["verdicts"][0]["target_artifact"] == "plan.md"
 
 
 def test_cycle_routed_malformed_disposition_fails_without_roles(tmp_path):
