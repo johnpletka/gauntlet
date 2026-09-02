@@ -253,6 +253,10 @@ class UsageTotals(BaseModel):
     output_tokens: int = 0
     cached_input_tokens: int = 0
     cost_usd: float | None = None  # None until at least one priced call (§12 Q3)
+    # Raw provider counters (see ``adapters.base.Usage``): prompt-cache writes
+    # and reasoning output. Additive — older manifests load with 0.
+    cache_creation_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
 
     def add(self, usage: Any | None) -> None:
         if usage is None:
@@ -262,6 +266,10 @@ class UsageTotals(BaseModel):
         self.cached_input_tokens += usage.cached_input_tokens or 0
         if usage.cost_usd is not None:
             self.cost_usd = (self.cost_usd or 0.0) + usage.cost_usd
+        self.cache_creation_input_tokens += (
+            getattr(usage, "cache_creation_input_tokens", None) or 0
+        )
+        self.reasoning_output_tokens += getattr(usage, "reasoning_output_tokens", None) or 0
 
 
 class HumanResponse(BaseModel):
@@ -404,6 +412,10 @@ class Invocation(BaseModel):
     member's ``r1-review-<member>``), a single-agent step's ``call`` (with the
     repair/retry suffix of its evidence files), or ``commit-message`` for the
     phase-commit drafter. ``attempt`` is the step attempt the call ran under.
+    ``adapter`` / ``model`` / ``effort`` are FROZEN from the profile (and the
+    built adapter) at call time, so a later config edit can never re-attribute
+    a past call: the report and ledger read the model that ran, not the one
+    configured today.
     Append-only across attempts, resumes and re-drives: a failed or wasted
     call's time is real time, so ``gauntlet report`` can show where a run's
     clock went. Additive — older manifests load with an empty list.
@@ -416,6 +428,9 @@ class Invocation(BaseModel):
     wall_s: float
     outcome: str = "ok"
     attempt: int = 0
+    adapter: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
 
 class StepRecord(BaseModel):

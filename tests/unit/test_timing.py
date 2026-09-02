@@ -476,3 +476,201 @@ stages:
     assert data.parked == by["gate"].parked
     text_out = render_timing(data)
     assert "gate" in text_out and "in progress" in text_out
+
+
+# --- provenance: adapter / model / effort frozen on each call ------------------
+class _CfgCtx:
+    """A context whose config resolves one profile, like a real StepContext."""
+
+    def __init__(self, record, config):
+        self.record = record
+        self.config = config
+
+
+def test_record_invocation_freezes_profile_adapter_model_effort():
+    from gauntlet.engine.config import RunConfig
+
+    cfg = RunConfig.model_validate(
+        {"agents": {"builder": {"adapter": "claude-code", "model": "opus", "effort": "high"}}}
+    )
+    rec = StepRecord(id="implement", type="agent_task", agent="builder")
+    with record_invocation(_CfgCtx(rec, cfg), agent="builder", label="call"):
+        pass
+    inv = rec.invocations[0]
+    assert (inv.adapter, inv.model, inv.effort) == ("claude-code", "opus", "high")
+
+
+def test_record_invocation_built_adapter_model_and_effort_override_win():
+    from types import SimpleNamespace
+
+    from gauntlet.engine.config import RunConfig
+
+    cfg = RunConfig.model_validate(
+        {"agents": {"builder": {"adapter": "codex", "model": "gpt-5.5", "effort": "medium"}}}
+    )
+    rec = StepRecord(id="implement", type="agent_task", agent="builder")
+    with record_invocation(
+        _CfgCtx(rec, cfg), agent="builder", label="call",
+        adapter=SimpleNamespace(model="gpt-5.5-pro"), effort="xhigh",
+    ):
+        pass
+    inv = rec.invocations[0]
+    assert (inv.adapter, inv.model, inv.effort) == ("codex", "gpt-5.5-pro", "xhigh")
+
+
+def test_record_invocation_unknown_profile_or_no_config_records_none():
+    from gauntlet.engine.config import RunConfig
+
+    cfg = RunConfig.model_validate({"agents": {"builder": {"adapter": "claude-code"}}})
+    rec = StepRecord(id="x", type="agent_task", agent="ghost")
+    with record_invocation(_CfgCtx(rec, cfg), agent="ghost", label="call"):
+        pass
+    with record_invocation(_Ctx(rec), agent="builder", label="call"):
+        pass
+    assert [(i.adapter, i.model, i.effort) for i in rec.invocations] == [
+        (None, None, None), (None, None, None),
+    ]
+
+
+def test_driven_cycle_freezes_each_role_provenance(cycle_repo):
+    reviewer = SeqAdapter(REVIEW(), CONFIRM())
+    triage = SeqAdapter()
+    builder = FakeAdapter(text="fixed")
+    status, man, _ = run_cycle(
+        cycle_repo, {"reviewer": reviewer, "triage": triage, "builder": builder}
+    )
+    assert status == M.RUN_DONE
+    # BASE_CONFIG: reviewer=codex (no model), triage=api/h; zero findings → the
+    # cycle converges after review alone.
+    provenance = [(i.agent, i.adapter, i.model) for i in man.record("cycle").invocations]
+    assert provenance == [("reviewer", "codex", None)]
+
+
+def test_build_timing_prefers_frozen_model_over_live_config():
+    man = _manifest()
+    man.steps.append(StepRecord(
+        id="implement", type="agent_task", agent="builder", status=M.DONE,
+        started=_ts(0), ended=_ts(10),
+        invocations=[
+            Invocation(agent="builder", label="call", started=_ts(0), ended=_ts(5),
+                       wall_s=300, adapter="claude-code", model="opus", effort="high"),
+            Invocation(agent="builder", label="call-repair1", started=_ts(5), ended=_ts(9),
+                       wall_s=240, adapter="claude-code", model="opus", effort="high"),
+            Invocation(agent="reviewer", label="r1-review", started=_ts(9), ended=_ts(10),
+                       wall_s=60),  # nothing frozen → falls back to config
+        ],
+    ))
+    data = build_timing(
+        man, model_of={"builder": "claude-code/sonnet", "reviewer": "codex/gpt-5.5"},
+        now=T0 + timedelta(hours=1),
+    )
+    by = {a.agent: a for a in data.agents}
+    assert by["builder"].model == "claude-code/opus@high"  # what ran, not today's config
+    assert by["reviewer"].model == "codex/gpt-5.5"
+    assert "claude-code/opus@high" in render_timing(data)
+
+
+# --- raw token counters flow through every accumulator ------------------------
+def test_usage_totals_accumulate_cache_writes_and_reasoning():
+    from gauntlet.adapters.base import Usage
+
+    t = M.UsageTotals()
+    t.add(Usage(input_tokens=1, output_tokens=2, cache_creation_input_tokens=700,
+                reasoning_output_tokens=50))
+    t.add(Usage(input_tokens=1, output_tokens=2))  # counters absent → unchanged
+    t.add(M.UsageTotals(cache_creation_input_tokens=300, reasoning_output_tokens=5))
+    assert (t.cache_creation_input_tokens, t.reasoning_output_tokens) == (1000, 55)
+    raw = json.loads(t.model_dump_json())
+    del raw["cache_creation_input_tokens"]; del raw["reasoning_output_tokens"]
+    assert M.UsageTotals.model_validate(raw).cache_creation_input_tokens == 0
+
+
+def test_usage_accumulator_carries_raw_counters_per_agent():
+    from gauntlet.adapters.base import Usage
+    from gauntlet.engine.steptypes import _UsageAccumulator
+
+    acc = _UsageAccumulator()
+    acc.add(Usage(input_tokens=5, cache_creation_input_tokens=100), agent="builder")
+    acc.add(Usage(input_tokens=5, reasoning_output_tokens=40), agent="reviewer")
+    other = _UsageAccumulator()
+    other.add(Usage(input_tokens=1, reasoning_output_tokens=2), agent="reviewer")
+    acc.merge(other)
+    total = acc.result()
+    assert (total.cache_creation_input_tokens, total.reasoning_output_tokens) == (100, 42)
+    by = acc.by_agent()
+    assert by["builder"].cache_creation_input_tokens == 100
+    assert by["builder"].reasoning_output_tokens is None  # never reported → None
+    assert by["reviewer"].reasoning_output_tokens == 42
+
+
+def test_cost_report_shows_raw_counters():
+    from gauntlet.engine.report import build_report, render_report
+
+    man = _manifest()
+    man.agent_usage["builder"] = M.UsageTotals(
+        input_tokens=10, output_tokens=5, cache_creation_input_tokens=700,
+        reasoning_output_tokens=0,
+    )
+    man.agent_usage["reviewer"] = M.UsageTotals(
+        input_tokens=10, output_tokens=5, reasoning_output_tokens=44,
+    )
+    man.totals = M.UsageTotals(input_tokens=20, output_tokens=10,
+                               cache_creation_input_tokens=700, reasoning_output_tokens=44)
+    data = build_report(man)
+    by = {a.agent: a for a in data.agents}
+    assert by["builder"].cache_creation_input_tokens == 700
+    assert by["reviewer"].reasoning_output_tokens == 44
+    assert (data.total_cache_creation_input, data.total_reasoning_output) == (700, 44)
+    text = render_report(man)
+    assert "cache-w" in text and "reason" in text
+    assert "700 cache-w / 44 reasoning out" in text
+
+
+# --- effective config snapshot at run start ------------------------------------
+def test_run_start_snapshots_effective_config(tmp_path):
+    from conftest import git
+    from gauntlet.engine.run import RunManager, render_config_snapshot
+
+    import yaml as _yaml
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Fixture")
+    git(repo, "config", "user.email", "fixture@gauntlet.local")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "README.md").write_text("snapshot fixture\n")
+    (repo / ".gauntlet").mkdir()
+    (repo / ".gauntlet" / "config.yaml").write_text(
+        "base_branch: main\nrun_root: runs\n"
+        "agents:\n  builder: {adapter: claude-code, model: opus, effort: high}\n"
+    )
+    (repo / "pipelines").mkdir()
+    (repo / "pipelines" / "one.yaml").write_text(
+        "name: one\nversion: 1\nstages:\n  - id: s\n    steps:\n"
+        "      - {id: implement, type: agent_task, agent: builder, prompt_text: go}\n"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "init")
+    git(repo, "branch", "-M", "main")
+    mgr = RunManager(repo)
+    mgr.new("demo")
+    mgr.layout("demo").prd_path.write_text("# PRD\n\nReal human-authored PRD.\n")
+    status = mgr.start(
+        "demo", repo / "pipelines" / "one.yaml", use_judge=False,
+        adapter_factory=lambda n: FakeAdapter(text="done", writes={"a.txt": "a\n"}),
+    )
+    assert status == M.RUN_DONE
+    run_dir = mgr.layout("demo").active_run_dir()
+    snap = (run_dir / "config.yaml").read_text()
+    assert snap.startswith("# Effective run configuration")
+    data = _yaml.safe_load(snap)
+    assert data["agents"]["builder"]["model"] == "opus"
+    assert data["agents"]["builder"]["effort"] == "high"
+    assert data["run_root"] == "runs"
+    assert "step_timeout_s" in data["agents"]["builder"]  # defaults made explicit
+    assert snap == render_config_snapshot(mgr.config)
+    # The pipeline snapshot beside it is untouched.
+    assert (run_dir / "pipeline.yaml").exists()
+    # Evidence, not state: the manifest and drive are unaffected by its presence.
+    assert mgr.status("demo").record("implement").invocations[0].model == "opus"

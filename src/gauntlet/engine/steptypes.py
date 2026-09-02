@@ -995,7 +995,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             try:
                 # Clock-time evidence (engine-measured, adapter-agnostic): one
                 # Invocation per call, labelled by its evidence-file suffix.
-                with record_invocation(ctx, agent=emit_agent, label=f"call{log_suffix}"):
+                with record_invocation(
+                    ctx, agent=emit_agent, label=f"call{log_suffix}",
+                    adapter=adapter, effort=effort_override,
+                ):
                     return adapter.run(call_prompt, **kwargs)
             except AdapterError as exc:
                 # FR-4.2 is lossless for failures too (P4.r1 F-007): persist
@@ -2321,7 +2324,9 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     for _attempt in range(1 + max_redrafts):
         # The commit-message drafter reads the staged diff of the tree the
         # phase was built in (P7a).
-        with record_invocation(ctx, agent=agent_name, label="commit-message"):
+        with record_invocation(
+            ctx, agent=agent_name, label="commit-message", adapter=adapter
+        ):
             result = adapter.run(prompt, cwd=ctx.work_root)
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
@@ -2356,6 +2361,8 @@ class _UsageAccumulator:
         self._in = 0
         self._out = 0
         self._cached = 0
+        self._cache_w = 0
+        self._reasoning = 0
         self._cost: float | None = None
         self._seen = False
         self._by_agent: dict[str, _UsageAccumulator] = {}
@@ -2367,6 +2374,8 @@ class _UsageAccumulator:
         self._in += usage.input_tokens or 0
         self._out += usage.output_tokens or 0
         self._cached += usage.cached_input_tokens or 0
+        self._cache_w += getattr(usage, "cache_creation_input_tokens", None) or 0
+        self._reasoning += getattr(usage, "reasoning_output_tokens", None) or 0
         if usage.cost_usd is not None:
             self._cost = (self._cost or 0.0) + usage.cost_usd
         if agent is not None:
@@ -2382,6 +2391,8 @@ class _UsageAccumulator:
             output_tokens=self._out,
             cached_input_tokens=self._cached,
             cost_usd=self._cost,
+            cache_creation_input_tokens=self._cache_w or None,
+            reasoning_output_tokens=self._reasoning or None,
         )
 
     def merge(self, other: "_UsageAccumulator") -> None:
@@ -2400,6 +2411,8 @@ class _UsageAccumulator:
         self._in += other._in
         self._out += other._out
         self._cached += other._cached
+        self._cache_w += other._cache_w
+        self._reasoning += other._reasoning
         if other._cost is not None:
             self._cost = (self._cost or 0.0) + other._cost
         for name, acc in other._by_agent.items():

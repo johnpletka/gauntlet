@@ -65,19 +65,54 @@ def outcome_of(exc: BaseException | None) -> str:
     return "error"
 
 
+def _provenance(
+    ctx: Any, agent: str | None, adapter: Any, effort: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """(adapter, model, effort) frozen for one call.
+
+    The profile supplies adapter name, model and default effort; the BUILT
+    adapter's ``model`` wins when it carries one (it is what was actually put on
+    the command line); an explicit ``effort`` override (a cycle-/step-level
+    ``effort:``) wins over the profile's. A context without a config, or a
+    profile the config no longer knows, yields ``None`` — recorded honestly,
+    never guessed.
+    """
+    profile = None
+    config = getattr(ctx, "config", None)
+    if agent and config is not None:
+        try:
+            profile = config.profile(agent)
+        except (KeyError, AttributeError):
+            profile = None
+    adapter_name = getattr(profile, "adapter", None)
+    model = getattr(adapter, "model", None) or getattr(profile, "model", None)
+    return adapter_name, model, effort or getattr(profile, "effort", None)
+
+
 @contextmanager
-def record_invocation(ctx: Any, *, agent: str | None, label: str) -> Iterator[None]:
+def record_invocation(
+    ctx: Any,
+    *,
+    agent: str | None,
+    label: str,
+    adapter: Any = None,
+    effort: str | None = None,
+) -> Iterator[None]:
     """Time one adapter call and append an :class:`Invocation` to ``ctx.record``.
 
     Records on every exit — a returned result or a raised error — and re-raises
     unchanged, so wrapping a call never alters the engine's failure handling.
     The wall-clock width is monotonic (immune to clock steps); the stamps are
     UTC ISO for cross-referencing with the journal and the step's own
-    ``started``/``ended``. A context without a step record (a standalone
-    handler test double) records nothing rather than failing the call.
+    ``started``/``ended``. ``adapter`` (the built adapter instance) and
+    ``effort`` (an explicit override, else the profile's) freeze the
+    adapter/model/effort provenance onto the record — see :func:`_provenance`.
+    A context without a step record (a standalone handler test double) records
+    nothing rather than failing the call.
     """
     record = getattr(ctx, "record", None)
     sink = getattr(record, "invocations", None)
+    adapter_name, model, effort_used = _provenance(ctx, agent, adapter, effort)
     started = _utcnow_iso()
     t0 = time.monotonic()
     exc: BaseException | None = None
@@ -97,6 +132,9 @@ def record_invocation(ctx: Any, *, agent: str | None, label: str) -> Iterator[No
                     wall_s=max(0.0, time.monotonic() - t0),
                     outcome=outcome_of(exc),
                     attempt=int(getattr(record, "attempts", 0) or 0),
+                    adapter=adapter_name,
+                    model=model,
+                    effort=effort_used,
                 )
             )
 
@@ -145,6 +183,17 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
 
 def _leaf(rec: Any) -> str:
     return rec.id if rec.iteration is None else f"{rec.id}.{rec.iteration}"
+
+
+def _frozen_model(inv: Any) -> str | None:
+    """``adapter/model[@effort]`` as frozen on a call; None when nothing was."""
+    adapter = getattr(inv, "adapter", None)
+    model = getattr(inv, "model", None)
+    if not adapter and not model:
+        return None
+    text = f"{adapter}/{model}" if adapter and model else (adapter or model)
+    effort = getattr(inv, "effort", None)
+    return f"{text}@{effort}" if effort else text
 
 
 def parked_seconds_from_events(
@@ -283,6 +332,7 @@ def build_timing(
     steps: list[StepTiming] = []
     by_agent_calls: dict[str, int] = {}
     by_agent_s: dict[str, float] = {}
+    by_agent_models: dict[str, list[str]] = {}  # frozen "adapter/model[@effort]" seen
     by_kind_calls: dict[str, int] = {}
     by_kind_s: dict[str, float] = {}
     total_active: float | None = None
@@ -308,6 +358,9 @@ def build_timing(
                 name = inv.agent or "—"
                 by_agent_calls[name] = by_agent_calls.get(name, 0) + 1
                 by_agent_s[name] = by_agent_s.get(name, 0.0) + inv.wall_s
+                frozen = _frozen_model(inv)
+                if frozen and frozen not in by_agent_models.setdefault(name, []):
+                    by_agent_models[name].append(frozen)
             total_active = (total_active or 0.0) + active
             total_calls += len(invocations)
         elif rec.agent is not None or rec.type == "adversarial_cycle":
@@ -366,7 +419,11 @@ def build_timing(
     agents = [
         AgentTiming(
             agent=name,
-            model=model_of.get(name),
+            # What actually ran (frozen on the calls) beats today's config.
+            model=(
+                " | ".join(by_agent_models[name])
+                if by_agent_models.get(name) else model_of.get(name)
+            ),
             calls=by_agent_calls.get(name, 0),
             active_s=by_agent_s.get(name) if name in by_agent_calls else None,
             pct=(

@@ -24,6 +24,25 @@ All notable changes to Gauntlet are recorded here. The format follows
   before this change show `—` for agent time; runs without a journal show `—`
   for parked time.
 
+- Each invocation also freezes the **adapter, model and effort** that actually
+  ran (from the profile and the built adapter, with any step-/cycle-level
+  `effort:` override), so a later `config.yaml` edit can never re-attribute a
+  past run; the time report shows what ran rather than what is configured
+  today. The raw provider token counters that the dollar figure hides under
+  subscription auth are now carried through every accumulator into the
+  manifest (per step, per profile, run totals) and the cost report:
+  prompt-cache **writes** (Claude Code `cache_creation_input_tokens`) and
+  **reasoning output** (Codex `reasoning_output_tokens`, API
+  `completion_tokens_details.reasoning_tokens`; the API adapter also picks up
+  `prompt_tokens_details.cached_tokens`). All additive; older manifests load
+  with zeros.
+
+- `gauntlet run` snapshots the **effective run configuration** into the run
+  dir as `config.yaml` beside `pipeline.yaml` — every profile's adapter, model,
+  effort, timeouts, tool allowlists and sandbox mode with defaults made
+  explicit, written through the redacting writer. Evidence only: the engine
+  never reads it back.
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed

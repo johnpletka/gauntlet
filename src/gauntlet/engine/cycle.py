@@ -1424,7 +1424,10 @@ def _run_sub(
         try:
             # Clock-time evidence for this call (engine-measured, adapter-
             # agnostic): the step record gets one Invocation per attempt.
-            with record_invocation(ctx, agent=agent_name, label=substep or agent_name):
+            with record_invocation(
+                ctx, agent=agent_name, label=substep or agent_name,
+                adapter=adapter, effort=effort,
+            ):
                 result = adapter.run(attempt_prompt, **run_kwargs)
         except MalformedOutputError as exc:
             _log_partial(logger, exc, usage, attempt, agent_name)

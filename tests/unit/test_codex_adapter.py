@@ -74,6 +74,8 @@ def test_parses_events_and_usage(monkeypatch):
     assert result.usage.input_tokens == 21497
     assert result.usage.cached_input_tokens == 3456
     assert result.usage.output_tokens == 1181
+    assert result.usage.reasoning_output_tokens == 516  # raw reasoning counter
+    assert result.usage.cache_creation_input_tokens is None  # codex reports none
     assert result.usage.cost_usd is None  # codex reports tokens, not cost
     assert result.exit_code == 0
     argv, kwargs = calls[0]

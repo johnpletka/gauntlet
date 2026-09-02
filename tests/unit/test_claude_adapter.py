@@ -37,6 +37,7 @@ RESULT_EVENT = {
         "input_tokens": 14,
         "output_tokens": 5,
         "cache_read_input_tokens": 3000,
+        "cache_creation_input_tokens": 700,
     },
 }
 
@@ -62,6 +63,8 @@ def test_parses_json_result(monkeypatch):
     assert result.usage.input_tokens == 14
     assert result.usage.output_tokens == 5
     assert result.usage.cached_input_tokens == 3000
+    assert result.usage.cache_creation_input_tokens == 700  # raw cache-write counter
+    assert result.usage.reasoning_output_tokens is None  # claude reports none
     assert result.usage.cost_usd == 0.0123
     assert result.exit_code == 0
     assert result.raw_events == [RESULT_EVENT]
