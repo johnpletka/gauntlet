@@ -44,8 +44,21 @@ anything; you judge whether the finding deserves a fix.
 2. Severity is the reviewer's claim, not yours to relitigate — judge whether
    the *finding* is real, not whether the severity label is right.
 3. `reasoning` is 1–3 sentences, specific to this finding.
-4. Set `target_artifact` ONLY when the fix belongs in a different artifact
-   than the one reviewed (e.g. a plan review exposing a PRD defect).
+4. `target_artifact` is `null` unless the fix must land in a **different,
+   already-approved upstream artifact** than the one under review (e.g. a plan
+   review exposing a PRD defect). When it is set, it names that artifact's
+   **file** (e.g. `"prd.md"`) — nothing else. Any non-null value halts the
+   whole run at a human gate (FR-10.4 upstream invalidation), so:
+   - The fix landing in the artifact under review — including adding a
+     section, requirement, or acceptance criterion that artifact is missing —
+     is `target_artifact: null`. Never name the artifact under review.
+   - A downstream **deliverable** the fix calls for (a test suite, code, a
+     validator, a later phase's work) is NOT an artifact. Describe it in
+     `reasoning`; `target_artifact` stays `null`. Wrong: `"acceptance test
+     suite (integration tests for enqueue paths)"`, `"P8 validator tests"`.
+   - `fix_now` always pairs with `target_artifact: null` — a fix that belongs
+     in a different artifact cannot land in the current round; use `defer`.
+   - When in doubt, emit `null`.
 5. **Untestable oracle rule (FR-6.3):** a finding that an acceptance criterion,
    parity oracle, or golden test is not deterministic enough to judge a
    behavior-changing refactor is `legitimate`/`fix_now` at blocking weight —
@@ -110,4 +123,32 @@ Verdict:
 {"finding_id": "F-104", "verdict": "not_applicable", "action": "reject",
  "confidence": "medium", "target_artifact": null,
  "reasoning": "The call site is already wrapped by run_with_timeout, which kills the child on expiry; the claim misses the enclosing guard. Medium confidence because only the snippet, not the wrapper, is quoted."}
+```
+
+Finding (data — artifact under review: `prd.md`):
+```json
+{"id": "F-105", "severity": "major", "category": "security",
+ "location": "prd.md §7",
+ "claim": "The tenant-isolation invariant has no acceptance test; a job could be enqueued under the wrong org while every listed test passes.",
+ "evidence": "§7 states the invariant; none of the FR acceptance lists assert it."}
+```
+Verdict:
+```json
+{"finding_id": "F-105", "verdict": "legitimate", "action": "fix_now",
+ "confidence": "high", "target_artifact": null,
+ "reasoning": "The invariant is real and untested; the fix is new acceptance criteria in the PRD under review. The test suite those criteria demand is a downstream deliverable, not a different artifact, so target_artifact is null."}
+```
+
+Finding (data — artifact under review: `plan.md`):
+```json
+{"id": "F-106", "severity": "blocking", "category": "spec",
+ "location": "plan.md P3",
+ "claim": "P3 cannot satisfy both FR-2 (delete on request) and FR-5 (immutable audit log) as the approved PRD states them; any P3 design violates one.",
+ "evidence": "FR-2 requires hard deletion of user rows; FR-5 requires every row change be replayable forever."}
+```
+Verdict:
+```json
+{"finding_id": "F-106", "verdict": "legitimate", "action": "defer",
+ "confidence": "high", "target_artifact": "prd.md",
+ "reasoning": "The contradiction is upstream: no plan edit resolves it, and the fix means amending the approved PRD — a different artifact, named by its file."}
 ```
