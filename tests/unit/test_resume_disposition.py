@@ -660,9 +660,17 @@ def test_routed_proceed_classifies_on_mechanic_then_implements_on_builder(tmp_pa
         use_judge=False, adapter_factory=factory, clock=_clock(),
     )
     assert status == M.RUN_DONE
-    assert mgr.status("demo").record("implement").status == M.DONE
+    rec = mgr.status("demo").record("implement")
+    assert rec.status == M.DONE
     # mechanic classified first, THEN the builder was re-driven to implement
     assert factory.built == ["mechanic", "builder"]
+    # Timing/provenance follows the adapter switch too: the primary call must
+    # never be frozen under the mechanic profile merely because `_invoke` is a
+    # closure shared by both phases.
+    assert [(i.agent, i.adapter, i.model) for i in rec.invocations[-2:]] == [
+        ("mechanic", "api", "gpt-5-mini"),
+        ("builder", "claude-code", None),
+    ]
     assert (run_work_tree(repo) / "feature.py").read_text() == "implemented\n"  # builder's work
     assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
 

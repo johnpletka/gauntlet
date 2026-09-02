@@ -178,6 +178,16 @@ def _accumulate_usage(total: Usage, response: Any) -> None:
         total.output_tokens = (total.output_tokens or 0) + (
             getattr(usage, "completion_tokens", 0) or 0
         )
+        # OpenAI-style detail blocks (LiteLLM normalizes providers onto them):
+        # cached prompt tokens and reasoning output. Absent → left None.
+        cached = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
+        if isinstance(cached, int):
+            total.cached_input_tokens = (total.cached_input_tokens or 0) + cached
+        reasoning = getattr(
+            getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
+        )
+        if isinstance(reasoning, int):
+            total.reasoning_output_tokens = (total.reasoning_output_tokens or 0) + reasoning
     cost = _completion_cost(response)
     if cost is not None:
         total.cost_usd = (total.cost_usd or 0.0) + cost

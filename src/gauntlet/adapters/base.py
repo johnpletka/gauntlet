@@ -24,6 +24,14 @@ class Usage(BaseModel):
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
     cost_usd: float | None = None
+    # Raw provider counters kept so a configuration can be evaluated in tokens
+    # when the dollar figure is uninformative (subscription auth): prompt-cache
+    # WRITES (claude-code ``cache_creation_input_tokens``; billed above input)
+    # and reasoning/thinking output (codex ``reasoning_output_tokens``, API
+    # ``completion_tokens_details.reasoning_tokens``). ``None`` when the
+    # provider reports no such counter — never synthesized.
+    cache_creation_input_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
 
 
 class AgentResult(BaseModel):

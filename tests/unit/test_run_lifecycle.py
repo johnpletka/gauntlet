@@ -912,19 +912,27 @@ def test_merge_judge_usage_folds_audit_into_manifest(fixture_repo):
     audit.write_text(
         json.dumps({"decision": "allow",
                     "usage": {"input_tokens": 5, "output_tokens": 2,
+                              "cache_creation_input_tokens": 7,
+                              "reasoning_output_tokens": 5,
                               "cost_usd": 0.01}}) + "\n"
         + json.dumps({"decision": "deny", "source": "fast-path",
                       "usage": None}) + "\n"  # fast-path: no usage, skipped
         + json.dumps({"decision": "allow",
                       "usage": {"input_tokens": 3, "output_tokens": 1,
+                                "cache_creation_input_tokens": 4,
+                                "reasoning_output_tokens": 2,
                                 "cost_usd": 0.02}}) + "\n"
     )
     mgr._merge_judge_usage(man, run_dir)
     jl = man.agent_usage["judge_llm"]
     assert jl.input_tokens == 8 and jl.output_tokens == 3
+    assert jl.cache_creation_input_tokens == 11
+    assert jl.reasoning_output_tokens == 7
     assert jl.cost_usd == pytest.approx(0.03)
     # totals now include judge spend so `gauntlet report` can attribute it (FR-3)
     assert man.totals.cost_usd == pytest.approx(1.03)
+    assert man.totals.cache_creation_input_tokens == 11
+    assert man.totals.reasoning_output_tokens == 7
     # persisted to disk, not just in memory (data over inference)
     persisted = M.Manifest.load(run_dir / "manifest.json")
     assert persisted.agent_usage["judge_llm"].cost_usd == pytest.approx(0.03)
@@ -932,6 +940,8 @@ def test_merge_judge_usage_folds_audit_into_manifest(fixture_repo):
     mgr._merge_judge_usage(man, run_dir)
     assert man.agent_usage["judge_llm"].cost_usd == pytest.approx(0.03)
     assert man.totals.cost_usd == pytest.approx(1.03)
+    assert man.totals.cache_creation_input_tokens == 11
+    assert man.totals.reasoning_output_tokens == 7
 
 
 # --- F-005: a failed required PR.md draft is surfaced, not swallowed ----------

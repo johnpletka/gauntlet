@@ -36,6 +36,7 @@ from gauntlet.engine.execution import (
     StepSpec,
 )
 from gauntlet.engine import gitops
+from gauntlet.engine.timing import record_invocation
 from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
     HALT_REASON_JUDGE_DENY,
@@ -992,7 +993,13 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             if stream is not None:
                 kwargs["sink"] = stream.append_line
             try:
-                return adapter.run(call_prompt, **kwargs)
+                # Clock-time evidence (engine-measured, adapter-agnostic): one
+                # Invocation per call, labelled by its evidence-file suffix.
+                with record_invocation(
+                    ctx, agent=emit_agent, label=f"call{log_suffix}",
+                    adapter=adapter, effort=effort_override,
+                ):
+                    return adapter.run(call_prompt, **kwargs)
             except AdapterError as exc:
                 # FR-4.2 is lossless for failures too (P4.r1 F-007): persist
                 # whatever partial evidence the adapter salvaged before it is
@@ -1087,7 +1094,12 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         # cheap.
         spend = _UsageAccumulator()
         spend.add(result.usage, agent=emit_agent)  # the disposition_agent's spend
-        adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
+        # `_invoke` closes over the adapter AND its invocation provenance. Switch
+        # all three together before launching the primary turn; otherwise the
+        # builder's clock record is frozen under the cheap disposition profile.
+        effort_override = step.get("effort")
+        adapter = ctx.build_adapter(agent_name, effort=effort_override)
+        emit_agent = agent_name
         # FR-3.3: re-apply the resolved step timeout to this freshly-built primary
         # adapter. The `timeout` above was applied to the phase-1 disposition
         # adapter (a different, often cheaper profile); this new adapter defaults to
@@ -1106,7 +1118,6 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             result = _invoke(prompt, None, log_suffix="-implement")
         logger.log_result(result, suffix="-implement")
         spend.add(result.usage, agent=agent_name)
-        emit_agent = agent_name
         result = result.model_copy(update={"usage": spend.result()})
         usage_by_agent = spend.by_agent()
 
@@ -2317,7 +2328,10 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     for _attempt in range(1 + max_redrafts):
         # The commit-message drafter reads the staged diff of the tree the
         # phase was built in (P7a).
-        result = adapter.run(prompt, cwd=ctx.work_root)
+        with record_invocation(
+            ctx, agent=agent_name, label="commit-message", adapter=adapter
+        ):
+            result = adapter.run(prompt, cwd=ctx.work_root)
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
@@ -2351,6 +2365,8 @@ class _UsageAccumulator:
         self._in = 0
         self._out = 0
         self._cached = 0
+        self._cache_w = 0
+        self._reasoning = 0
         self._cost: float | None = None
         self._seen = False
         self._by_agent: dict[str, _UsageAccumulator] = {}
@@ -2362,6 +2378,8 @@ class _UsageAccumulator:
         self._in += usage.input_tokens or 0
         self._out += usage.output_tokens or 0
         self._cached += usage.cached_input_tokens or 0
+        self._cache_w += getattr(usage, "cache_creation_input_tokens", None) or 0
+        self._reasoning += getattr(usage, "reasoning_output_tokens", None) or 0
         if usage.cost_usd is not None:
             self._cost = (self._cost or 0.0) + usage.cost_usd
         if agent is not None:
@@ -2377,6 +2395,8 @@ class _UsageAccumulator:
             output_tokens=self._out,
             cached_input_tokens=self._cached,
             cost_usd=self._cost,
+            cache_creation_input_tokens=self._cache_w or None,
+            reasoning_output_tokens=self._reasoning or None,
         )
 
     def merge(self, other: "_UsageAccumulator") -> None:
@@ -2395,6 +2415,8 @@ class _UsageAccumulator:
         self._in += other._in
         self._out += other._out
         self._cached += other._cached
+        self._cache_w += other._cache_w
+        self._reasoning += other._reasoning
         if other._cost is not None:
             self._cost = (self._cost or 0.0) + other._cost
         for name, acc in other._by_agent.items():

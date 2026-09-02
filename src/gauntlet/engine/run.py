@@ -23,6 +23,8 @@ import sys
 import time
 import warnings
 from contextlib import contextmanager
+
+import yaml
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -651,6 +653,23 @@ class RunLayout:
                 f"{run_id!r}"
             ) from exc
         return candidate
+
+
+def render_config_snapshot(config: RunConfig) -> str:
+    """The effective run configuration as YAML, for the run dir's ``config.yaml``.
+
+    Rendered from the validated model (not copied from ``.gauntlet/config.yaml``)
+    so every default is explicit and an injected config (tests, embedding) is
+    captured the same way. Evidence only: nothing reads it back — resume keeps
+    loading the repo's live config, exactly as before.
+    """
+    body = yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False)
+    return (
+        "# Effective run configuration, snapshotted at `gauntlet run` start.\n"
+        "# Evidence for later evaluation (which models/effort/timeouts ran);\n"
+        "# never read back by the engine.\n"
+        + body
+    )
 
 
 class RunManager:
@@ -3079,6 +3098,14 @@ class RunManager:
             # Snapshot the exact pipeline source into the run dir so resume
             # reloads precisely what started the run (FR-5.6 reproducibility).
             (run_dir / "pipeline.yaml").write_text(pipeline_path.read_text())
+            # Snapshot the EFFECTIVE run config beside it (models, effort,
+            # timeouts, tool allowlists, sandbox modes — every profile knob a
+            # later "which configuration ran?" question needs), rendered from
+            # the loaded RunConfig so defaults are explicit, through the
+            # redacting writer so no secret-shaped value lands in evidence.
+            self.writer.write_text(
+                run_dir / "config.yaml", render_config_snapshot(self.config)
+            )
             layout.active_pointer.write_text(run_id)
             if born_dedicated:
                 # P7h: the tree guard covered the MINTING transaction — run id,
@@ -6861,6 +6888,13 @@ class RunManager:
             input_tokens=agg.input_tokens - prior.input_tokens,
             output_tokens=agg.output_tokens - prior.output_tokens,
             cached_input_tokens=agg.cached_input_tokens - prior.cached_input_tokens,
+            cache_creation_input_tokens=(
+                agg.cache_creation_input_tokens
+                - prior.cache_creation_input_tokens
+            ),
+            reasoning_output_tokens=(
+                agg.reasoning_output_tokens - prior.reasoning_output_tokens
+            ),
             cost_usd=(None if agg.cost_usd is None
                       else agg.cost_usd - (prior.cost_usd or 0.0)),
         )
