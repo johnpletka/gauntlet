@@ -1600,10 +1600,11 @@ def report(
     """Print the cost and clock-time breakdown for a run (FR-3.2).
 
     Cost: per step / per agent profile, with cache-read share. Time: the overall
-    wall-clock span split into agent time (inside adapter calls), parked (by
-    reason, replayed from the state journal), host-suspended and other, plus
-    clock time per step, per agent profile (→ model) and per activity (review /
-    triage / fix / confirm / verify pooled across cycles; other steps by id).
+    wall-clock span split into disjoint agent time (the union of adapter-call
+    intervals), parked (by reason, replayed from the state journal),
+    host-suspended and other, plus agent-seconds per step, per agent profile
+    (→ model) and per activity (review / triage / fix / confirm / verify pooled
+    across cycles; other steps by id).
 
     With ``--trend``, also print the cross-run improvement metrics (findings per
     round, %legitimate, fix-survival, test loops, judge ask-rate, cost/phase).

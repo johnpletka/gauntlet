@@ -1094,7 +1094,12 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
         # cheap.
         spend = _UsageAccumulator()
         spend.add(result.usage, agent=emit_agent)  # the disposition_agent's spend
-        adapter = ctx.build_adapter(agent_name, effort=step.get("effort"))
+        # `_invoke` closes over the adapter AND its invocation provenance. Switch
+        # all three together before launching the primary turn; otherwise the
+        # builder's clock record is frozen under the cheap disposition profile.
+        effort_override = step.get("effort")
+        adapter = ctx.build_adapter(agent_name, effort=effort_override)
+        emit_agent = agent_name
         # FR-3.3: re-apply the resolved step timeout to this freshly-built primary
         # adapter. The `timeout` above was applied to the phase-1 disposition
         # adapter (a different, often cheaper profile); this new adapter defaults to
@@ -1113,7 +1118,6 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             result = _invoke(prompt, None, log_suffix="-implement")
         logger.log_result(result, suffix="-implement")
         spend.add(result.usage, agent=agent_name)
-        emit_agent = agent_name
         result = result.model_copy(update={"usage": spend.result()})
         usage_by_agent = spend.by_agent()
 

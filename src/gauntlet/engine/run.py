@@ -6888,6 +6888,13 @@ class RunManager:
             input_tokens=agg.input_tokens - prior.input_tokens,
             output_tokens=agg.output_tokens - prior.output_tokens,
             cached_input_tokens=agg.cached_input_tokens - prior.cached_input_tokens,
+            cache_creation_input_tokens=(
+                agg.cache_creation_input_tokens
+                - prior.cache_creation_input_tokens
+            ),
+            reasoning_output_tokens=(
+                agg.reasoning_output_tokens - prior.reasoning_output_tokens
+            ),
             cost_usd=(None if agg.cost_usd is None
                       else agg.cost_usd - (prior.cost_usd or 0.0)),
         )

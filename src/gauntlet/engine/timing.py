@@ -14,8 +14,9 @@ claude-code does, and the harness must not care: both get the same record.
 per step, per agent profile (mapped to its adapter/model), and per activity
 (``review`` / ``triage`` / ``fix`` / ``confirm`` / ``verify`` across every
 cycle, plus each single-agent step by id) — and splits the overall wall-clock
-span into *agent time* (inside adapter calls), *parked* (by park reason),
-*host-suspended*, and the *other* remainder (engine, git, tests, gaps). Parked
+span into disjoint *agent time* (the union of adapter-call intervals), *parked*
+(by park reason), *host-suspended*, and the *other* remainder (engine, git,
+tests, gaps). Parked
 intervals are derived from the run's append-only state journal (every persist
 carries a timestamp and the full state), so the split is data, never a guess;
 a run without a journal shows ``—`` for parked rather than an estimate.
@@ -181,6 +182,65 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
     return max(0.0, (end - start).total_seconds())
 
 
+_Interval = tuple[datetime, datetime]
+
+
+def _merge_intervals(intervals: Sequence[_Interval]) -> list[_Interval]:
+    """Return the chronological union of valid half-open intervals."""
+    ordered = sorted((start, end) for start, end in intervals if end > start)
+    merged: list[_Interval] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        prior_start, prior_end = merged[-1]
+        merged[-1] = (prior_start, max(prior_end, end))
+    return merged
+
+
+def _clip_intervals(
+    intervals: Sequence[_Interval], bounds: _Interval
+) -> list[_Interval]:
+    start_bound, end_bound = bounds
+    return _merge_intervals(
+        [
+            (max(start, start_bound), min(end, end_bound))
+            for start, end in intervals
+            if end > start_bound and start < end_bound
+        ]
+    )
+
+
+def _subtract_intervals(
+    intervals: Sequence[_Interval], blockers: Sequence[_Interval]
+) -> list[_Interval]:
+    """Subtract the blocker union from the interval union."""
+    blocked = _merge_intervals(blockers)
+    out: list[_Interval] = []
+    for start, end in _merge_intervals(intervals):
+        cursor = start
+        for block_start, block_end in blocked:
+            if block_end <= cursor:
+                continue
+            if block_start >= end:
+                break
+            if block_start > cursor:
+                out.append((cursor, min(block_start, end)))
+            cursor = max(cursor, block_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            out.append((cursor, end))
+    return out
+
+
+def _interval_seconds(intervals: Sequence[_Interval]) -> float:
+    return sum(
+        (end - start).total_seconds()
+        for start, end in _merge_intervals(intervals)
+    )
+
+
 def _leaf(rec: Any) -> str:
     return rec.id if rec.iteration is None else f"{rec.id}.{rec.iteration}"
 
@@ -196,10 +256,10 @@ def _frozen_model(inv: Any) -> str | None:
     return f"{text}@{effort}" if effort else text
 
 
-def parked_seconds_from_events(
+def parked_intervals_from_events(
     events: Sequence[Mapping[str, Any]], *, end: datetime
-) -> dict[tuple[str, str | None], dict[str, float]]:
-    """Per-step parked seconds by park reason, replayed from journal events.
+) -> dict[tuple[str, str | None], dict[str, list[_Interval]]]:
+    """Per-step parked intervals by reason, replayed from journal events.
 
     Walks the journaled states in sequence order; each time a step's status
     leaves ``parked`` the interval since it entered is credited to the reason
@@ -209,11 +269,15 @@ def parked_seconds_from_events(
     or a parseable stamp are skipped, never guessed at.
     """
     last: dict[tuple[str, str | None], tuple[str, str, datetime]] = {}
-    out: dict[tuple[str, str | None], dict[str, float]] = {}
+    out: dict[tuple[str, str | None], dict[str, list[_Interval]]] = {}
 
-    def credit(key: tuple[str, str | None], reason: str, secs: float) -> None:
+    def credit(
+        key: tuple[str, str | None], reason: str, start: datetime, stop: datetime
+    ) -> None:
+        if stop <= start:
+            return
         bucket = out.setdefault(key, {})
-        bucket[reason] = bucket.get(reason, 0.0) + max(0.0, secs)
+        bucket.setdefault(reason, []).append((start, stop))
 
     def seq(ev: Mapping[str, Any]) -> int:
         try:
@@ -242,14 +306,29 @@ def parked_seconds_from_events(
             if prev is None:
                 last[key] = (status, str(reason), ts)
                 continue
-            if prev[0] != status:
+            if prev[0] != status or (
+                status == M.PARKED and prev[1] != str(reason)
+            ):
                 if prev[0] == M.PARKED:
-                    credit(key, prev[1], (ts - prev[2]).total_seconds())
+                    credit(key, prev[1], prev[2], ts)
                 last[key] = (status, str(reason), ts)
     for key, (status, reason, since) in last.items():
         if status == M.PARKED:
-            credit(key, reason, (end - since).total_seconds())
+            credit(key, reason, since, end)
     return out
+
+
+def parked_seconds_from_events(
+    events: Sequence[Mapping[str, Any]], *, end: datetime
+) -> dict[tuple[str, str | None], dict[str, float]]:
+    """Per-step parked seconds by reason, derived from replayed intervals."""
+    return {
+        key: {
+            reason: _interval_seconds(intervals)
+            for reason, intervals in by_reason.items()
+        }
+        for key, by_reason in parked_intervals_from_events(events, end=end).items()
+    }
 
 
 @dataclass
@@ -292,7 +371,13 @@ class TimingData:
     first_started: str | None
     last_ended: str | None
     overall_s: float | None
-    active_s: float | None  # None when no step recorded any call
+    # Disjoint elapsed time covered by at least one adapter call after parked and
+    # host-suspended intervals take precedence. This is the overall partition's
+    # agent-time component, so it can never exceed ``overall_s``.
+    active_s: float | None
+    # Sum of every call's duration. Concurrent work overlaps, so this can exceed
+    # wall time; it is the denominator for per-agent/per-activity shares.
+    agent_seconds_s: float | None
     calls: int
     parked: dict[str, float] | None  # by reason; None = no journal
     suspended_s: float
@@ -325,8 +410,8 @@ def build_timing(
     model_of = model_of or {}
     in_progress = manifest.status in (M.RUN_RUNNING, M.RUN_PARKED)
     has_journal = bool(events)
-    parked_by_step = (
-        parked_seconds_from_events(events, end=now) if has_journal else {}
+    parked_intervals_by_step = (
+        parked_intervals_from_events(events, end=now) if has_journal else {}
     )
 
     steps: list[StepTiming] = []
@@ -335,7 +420,12 @@ def build_timing(
     by_agent_models: dict[str, list[str]] = {}  # frozen "adapter/model[@effort]" seen
     by_kind_calls: dict[str, int] = {}
     by_kind_s: dict[str, float] = {}
-    total_active: float | None = None
+    total_agent_seconds: float | None = None
+    agent_intervals: list[_Interval] = []
+    invocation_interval_missing = False
+    fallback_parked_intervals: dict[
+        tuple[str, str | None], dict[str, list[_Interval]]
+    ] = {}
     total_calls = 0
     without_calls = 0
     for rec in manifest.steps:
@@ -351,6 +441,12 @@ def build_timing(
             active = 0.0
             for inv in invocations:
                 active += inv.wall_s
+                inv_start = _parse_ts(inv.started)
+                inv_end = _parse_ts(inv.ended)
+                if inv_start is None or inv_end is None or inv_end < inv_start:
+                    invocation_interval_missing = True
+                else:
+                    agent_intervals.append((inv_start, inv_end))
                 kind = activity_kind(inv.label, rec.id)
                 kinds[kind] = kinds.get(kind, 0.0) + inv.wall_s
                 by_kind_calls[kind] = by_kind_calls.get(kind, 0) + 1
@@ -361,12 +457,17 @@ def build_timing(
                 frozen = _frozen_model(inv)
                 if frozen and frozen not in by_agent_models.setdefault(name, []):
                     by_agent_models[name].append(frozen)
-            total_active = (total_active or 0.0) + active
+            total_agent_seconds = (total_agent_seconds or 0.0) + active
             total_calls += len(invocations)
         elif rec.agent is not None or rec.type == "adversarial_cycle":
             without_calls += 1
         if has_journal:
-            parked: dict[str, float] | None = parked_by_step.get((rec.id, rec.iteration), {})
+            parked = {
+                reason: _interval_seconds(intervals)
+                for reason, intervals in parked_intervals_by_step.get(
+                    (rec.id, rec.iteration), {}
+                ).items()
+            }
         elif rec.type == "human_gate" and start is not None:
             # No journal to replay, but a gate step's own span IS its park: it
             # starts when it parks and ends when a human decides (or is still
@@ -375,6 +476,10 @@ def build_timing(
             gate_end = now if rec.status == M.PARKED else end
             gate_s = _seconds(start, gate_end)
             parked = {M.PARKED_REASON_GATE: gate_s} if gate_s is not None else None
+            if gate_end is not None and gate_end > start:
+                fallback_parked_intervals[(rec.id, rec.iteration)] = {
+                    M.PARKED_REASON_GATE: [(start, gate_end)]
+                }
         else:
             parked = None
         steps.append(
@@ -398,19 +503,76 @@ def build_timing(
         last = max(ends) if ends else now
     overall = _seconds(first, last)
 
+    interval_source = (
+        parked_intervals_by_step if has_journal else fallback_parked_intervals
+    )
+    parked_raw_by_reason: dict[str, list[_Interval]] = {}
+    for by_reason in interval_source.values():
+        for reason, intervals in by_reason.items():
+            parked_raw_by_reason.setdefault(reason, []).extend(intervals)
+
+    suspension_intervals: list[_Interval] = []
+    suspension_interval_missing = False
+    for suspension in getattr(manifest, "suspensions", []) or []:
+        suspension_start = _parse_ts(suspension.start)
+        suspension_end = _parse_ts(suspension.end)
+        if (
+            suspension_start is None
+            or suspension_end is None
+            or suspension_end < suspension_start
+        ):
+            suspension_interval_missing = True
+        else:
+            suspension_intervals.append((suspension_start, suspension_end))
+
     parked_total: dict[str, float] | None = None
-    if has_journal or any(s.parked for s in steps):
-        parked_total = {}
-        for s in steps:
-            for reason, secs in (s.parked or {}).items():
-                parked_total[reason] = parked_total.get(reason, 0.0) + secs
-    suspended = float(sum(s.gap_s for s in getattr(manifest, "suspensions", []) or []))
+    suspended = 0.0
+    active_wall: float | None = None
     other: float | None = None
-    if overall is not None and total_active is not None:
-        other = max(
-            0.0,
-            overall - total_active - sum((parked_total or {}).values()) - suspended,
-        )
+    if first is not None and last is not None:
+        bounds = (first, last)
+        suspended_intervals = _clip_intervals(suspension_intervals, bounds)
+        suspended = _interval_seconds(suspended_intervals)
+
+        # The overall split is a partition, not a sum of independently
+        # overlapping counters: host suspension wins over parks, parks win over
+        # adapter calls, and the remainder is genuinely "other". Per-agent and
+        # per-activity tables deliberately retain agent-seconds below.
+        parked_occupied: list[_Interval] = []
+        if has_journal or parked_raw_by_reason:
+            parked_total = {}
+            ordered_reasons = sorted(
+                parked_raw_by_reason,
+                key=lambda reason: (
+                    min(start for start, _ in parked_raw_by_reason[reason]), reason
+                ),
+            )
+            for reason in ordered_reasons:
+                raw = _clip_intervals(parked_raw_by_reason[reason], bounds)
+                effective = _subtract_intervals(
+                    raw, [*suspended_intervals, *parked_occupied]
+                )
+                parked_total[reason] = _interval_seconds(effective)
+                parked_occupied = _merge_intervals([*parked_occupied, *effective])
+
+        if total_agent_seconds is not None and not invocation_interval_missing:
+            effective_agent = _subtract_intervals(
+                _clip_intervals(agent_intervals, bounds),
+                [*suspended_intervals, *parked_occupied],
+            )
+            active_wall = _interval_seconds(effective_agent)
+        if (
+            overall is not None
+            and active_wall is not None
+            and not suspension_interval_missing
+        ):
+            other = max(
+                0.0,
+                overall
+                - active_wall
+                - sum((parked_total or {}).values())
+                - suspended,
+            )
 
     # Per agent profile: every profile that made a call, plus any profile the
     # manifest billed usage to without recorded calls (a pre-timing run) so the
@@ -427,8 +589,8 @@ def build_timing(
             calls=by_agent_calls.get(name, 0),
             active_s=by_agent_s.get(name) if name in by_agent_calls else None,
             pct=(
-                100.0 * by_agent_s[name] / total_active
-                if name in by_agent_calls and total_active
+                100.0 * by_agent_s[name] / total_agent_seconds
+                if name in by_agent_calls and total_agent_seconds
                 else None
             ),
         )
@@ -441,7 +603,10 @@ def build_timing(
     kinds_out = [
         KindTiming(
             kind=k, calls=by_kind_calls[k], active_s=by_kind_s[k],
-            pct=(100.0 * by_kind_s[k] / total_active) if total_active else None,
+            pct=(
+                100.0 * by_kind_s[k] / total_agent_seconds
+                if total_agent_seconds else None
+            ),
         )
         for k in ordered
     ]
@@ -450,7 +615,8 @@ def build_timing(
         in_progress=in_progress,
         first_started=first.isoformat(timespec="seconds") if first else None,
         last_ended=last.isoformat(timespec="seconds") if last else None,
-        overall_s=overall, active_s=total_active, calls=total_calls,
+        overall_s=overall, active_s=active_wall,
+        agent_seconds_s=total_agent_seconds, calls=total_calls,
         parked=parked_total, suspended_s=suspended, other_s=other,
         steps=steps, agents=agents, kinds=kinds_out, has_journal=has_journal,
         steps_without_calls=without_calls,
@@ -503,7 +669,9 @@ def render_timing(data: TimingData) -> str:
         f"Time report — run {data.run_id} ({data.slug}) [{data.status}]",
         f"  overall:     {fmt_duration(data.overall_s):>9}{span}",
         f"  agent time:  {fmt_duration(data.active_s):>9}  "
-        f"(inside {data.calls} adapter call(s); concurrent triage calls overlap)",
+        f"(elapsed wall covered by {data.calls} adapter call(s))",
+        f"  agent-secs:  {fmt_duration(data.agent_seconds_s):>9}  "
+        "(sum across calls; concurrent work can exceed overall)",
     ]
     parked_line = f"  parked:      {_parked_cell(data.parked):>9}"
     if data.parked:
@@ -520,7 +688,7 @@ def render_timing(data: TimingData) -> str:
     )
     lines += [
         "",
-        "Per agent profile (clock time inside its calls):",
+        "Per agent profile (agent-seconds inside its calls):",
         f"  {'agent':<16} {'model':<28} {'calls':>6} {'time':>10} {'% time':>8}",
     ]
     for a in data.agents:
@@ -532,7 +700,7 @@ def render_timing(data: TimingData) -> str:
         lines.append("  (no agent calls recorded)")
     lines += [
         "",
-        "Per activity (cycle sub-steps pooled across cycles; other steps by id):",
+        "Per activity (agent-seconds; cycle sub-steps pooled, other steps by id):",
         f"  {'activity':<20} {'calls':>6} {'time':>10} {'% time':>8}",
     ]
     for k in data.kinds:

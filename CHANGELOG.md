@@ -9,13 +9,16 @@ All notable changes to Gauntlet are recorded here. The format follows
 ### Added
 
 - `gauntlet report` now ends with a clock-time section answering "where did
-  the time go?": the run's overall wall-clock span split into agent time
-  (inside adapter calls), parked (by park reason — gate, usage limit, response,
+  the time go?": the run's overall wall-clock span split into disjoint agent
+  time (the union of adapter-call intervals), parked (by park reason — gate,
+  usage limit, response,
   provider unavailable — replayed from the run's state journal, never
   estimated), host-suspended, and the remaining engine/git/test/gap time; plus
   clock time per step (with a review/triage/fix/confirm/verify breakdown for
   each cycle), per agent profile (mapped to its adapter/model) and per
-  activity pooled across cycles. The evidence is a new append-only
+  activity pooled across cycles. Per-profile/activity rows retain
+  **agent-seconds**, so concurrent work stays visible without corrupting the
+  overall remainder. The evidence is a new append-only
   `invocations` list on each manifest step record — one engine-measured
   entry (UTC start/end, wall seconds, agent, label, outcome, attempt) per
   adapter call — so a CLI that exports no timing of its own (Codex) is

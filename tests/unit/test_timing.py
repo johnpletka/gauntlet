@@ -46,9 +46,12 @@ def _ts(minutes: float) -> str:
     return (T0 + timedelta(minutes=minutes)).isoformat()
 
 
-def _inv(label, wall_s, *, agent="builder", outcome="ok", attempt=1):
+def _inv(
+    label, wall_s, *, agent="builder", outcome="ok", attempt=1, start_min=0
+):
     return Invocation(
-        agent=agent, label=label, started=_ts(0), ended=_ts(wall_s / 60),
+        agent=agent, label=label, started=_ts(start_min),
+        ended=_ts(start_min + wall_s / 60),
         wall_s=wall_s, outcome=outcome, attempt=attempt,
     )
 
@@ -214,14 +217,19 @@ def _timed_manifest() -> Manifest:
         id="impl-cycle", type="adversarial_cycle", status=M.DONE, attempts=2,
         started=_ts(60), ended=_ts(120),
         invocations=[
-            _inv("r1-review", 10 * 60, agent="reviewer"),
-            _inv("r1-review-1-gemini", 4 * 60, agent="gemini"),
-            _inv("r1-triage", 60, agent="triage"),
-            _inv("r1-triage", 60, agent="triage"),
-            _inv("r1-fix", 8 * 60, agent="builder", outcome="failed"),
-            _inv("r1-fix", 6 * 60, agent="builder"),
-            _inv("r1-confirm", 3 * 60, agent="reviewer"),
-            _inv("r1-verify", 2 * 60, agent="verifier"),
+            # The ensemble reviews and per-finding triage calls overlap. Their
+            # per-profile rows retain agent-seconds; the overall split uses the
+            # elapsed-time union.
+            _inv("r1-review", 10 * 60, agent="reviewer", start_min=60),
+            _inv("r1-review-1-gemini", 4 * 60, agent="gemini", start_min=60),
+            _inv("r1-triage", 60, agent="triage", start_min=70),
+            _inv("r1-triage", 60, agent="triage", start_min=70),
+            _inv(
+                "r1-fix", 8 * 60, agent="builder", outcome="failed", start_min=71
+            ),
+            _inv("r1-fix", 6 * 60, agent="builder", start_min=79),
+            _inv("r1-confirm", 3 * 60, agent="reviewer", start_min=85),
+            _inv("r1-verify", 2 * 60, agent="verifier", start_min=88),
         ],
     ))
     man.steps.append(StepRecord(
@@ -229,7 +237,7 @@ def _timed_manifest() -> Manifest:
     ))
     man.agent_usage["builder"] = M.UsageTotals(input_tokens=1)
     man.agent_usage["legacy"] = M.UsageTotals(input_tokens=1)  # billed, no calls
-    man.suspensions.append(M.Suspension(start=_ts(70), end=_ts(72), gap_s=120))
+    man.suspensions.append(M.Suspension(start=_ts(55), end=_ts(57), gap_s=120))
     return man
 
 
@@ -253,13 +261,53 @@ def test_build_timing_splits_overall_into_agent_parked_suspended_other():
     )
     assert data.overall_s == pytest.approx(150 * 60)
     assert not data.in_progress
-    # 50m implement + 34m of cycle calls
-    assert data.active_s == pytest.approx((50 + 10 + 4 + 1 + 1 + 8 + 6 + 3 + 2) * 60)
+    # Agent-seconds preserve all nine calls (85m); elapsed agent time unions the
+    # overlapping ensemble/triage calls (80m) for a true overall partition.
+    assert data.agent_seconds_s == pytest.approx(
+        (50 + 10 + 4 + 1 + 1 + 8 + 6 + 3 + 2) * 60
+    )
+    assert data.active_s == pytest.approx(80 * 60)
     assert data.calls == 9
     assert data.parked == {"usage_limit": 10 * 60.0, "gate": 30 * 60.0}
     assert data.suspended_s == 120.0
     assert data.other_s == pytest.approx(150 * 60 - data.active_s - 40 * 60 - 120)
     assert data.has_journal and data.steps_without_calls == 0
+
+
+def test_build_timing_partition_deduplicates_calls_parks_and_suspensions():
+    man = _manifest()
+    man.steps.append(StepRecord(
+        id="cycle", type="adversarial_cycle", status=M.DONE,
+        started=_ts(0), ended=_ts(60),
+        invocations=[
+            _inv("r1-triage", 30 * 60, agent="triage"),
+            _inv("r1-triage", 30 * 60, agent="triage"),
+        ],
+    ))
+    # One suspension overlaps the calls and one overlaps the park. Suspension
+    # takes precedence, then park, then the union of calls.
+    man.suspensions = [
+        M.Suspension(start=_ts(10), end=_ts(20), gap_s=600),
+        M.Suspension(start=_ts(40), end=_ts(50), gap_s=600),
+    ]
+    events = [
+        _event(1, 0, [_row("cycle", "running", type_="adversarial_cycle")]),
+        _event(2, 30, [_row(
+            "cycle", "parked", reason="response", type_="adversarial_cycle"
+        )]),
+        _event(3, 60, [_row("cycle", "done", type_="adversarial_cycle")]),
+    ]
+    data = build_timing(man, events=events, now=T0 + timedelta(hours=2))
+    assert data.overall_s == 60 * 60
+    assert data.agent_seconds_s == 60 * 60  # two concurrent 30m calls
+    assert data.active_s == 20 * 60         # union 0–30 minus suspend 10–20
+    assert data.parked == {"response": 20 * 60.0}  # 30–60 minus suspend 40–50
+    assert data.suspended_s == 20 * 60
+    assert data.other_s == 0
+    assert (
+        data.active_s + sum(data.parked.values())
+        + data.suspended_s + data.other_s
+    ) == data.overall_s
 
 
 def test_build_timing_per_step_rows():
@@ -361,7 +409,8 @@ def test_build_timing_legacy_run_without_calls_reports_unavailable_agent_time():
     man.steps.append(StepRecord(id="gate", type="human_gate", status=M.DONE,
                                 started=_ts(30), ended=_ts(40)))
     data = build_timing(man, now=T0 + timedelta(hours=1))
-    assert data.active_s is None and data.calls == 0 and data.other_s is None
+    assert data.active_s is None and data.agent_seconds_s is None
+    assert data.calls == 0 and data.other_s is None
     assert data.steps_without_calls == 1  # the gate never calls an agent
     assert data.overall_s == pytest.approx(40 * 60)
     assert data.parked == {"gate": 10 * 60.0}  # the gate's own span, no journal needed
@@ -397,7 +446,8 @@ def test_render_timing_has_every_section_and_breakdown():
     )
     text = render_timing(data)
     assert "Time report — run run-x (demo) [done]" in text
-    for heading in ("overall:", "agent time:", "parked:", "suspended:", "other:",
+    for heading in ("overall:", "agent time:", "agent-secs:", "parked:",
+                    "suspended:", "other:",
                     "Per agent profile", "Per activity", "Per step:"):
         assert heading in text
     assert "gate 30m 00s" in text and "usage_limit 10m 00s" in text
@@ -473,7 +523,12 @@ stages:
     assert by["implement"].calls == 1 and by["implement"].parked == {}
     assert set(by["gate"].parked) == {"gate"}
     assert by["gate"].parked["gate"] >= 9 * 60  # parked since the drive, up to `now`
-    assert data.parked == by["gate"].parked
+    # The overall partition is clipped to the manifest's first-start → now
+    # bounds; the per-step evidence is the raw journal interval. Those clocks
+    # can differ by the sub-second write-ahead gap in this real-drive fixture.
+    assert data.parked["gate"] == pytest.approx(
+        by["gate"].parked["gate"], abs=2.0
+    )
     text_out = render_timing(data)
     assert "gate" in text_out and "in progress" in text_out
 
