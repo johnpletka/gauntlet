@@ -336,6 +336,7 @@ class ClaudeCodeAdapter:
             output_tokens=usage.get("output_tokens"),
             cached_input_tokens=cached,
             cost_usd=cost,  # None => tokens-only degraded path (PRD §12 Q3)
+            cache_creation_input_tokens=usage.get("cache_creation_input_tokens"),
         )
 
     def _partial_result(

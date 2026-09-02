@@ -1430,17 +1430,112 @@ def test_blocking_legitimate_defer_parks_instead_of_converging(cycle_repo):
     assert "FR-10.5" in rec.notes and "F-001" in rec.notes
 
 
+def _seed_plan(repo):
+    """Commit a plan.md so a cycle can review it (plan-cycle scenario)."""
+    (repo / "plan.md").write_text("PLAN-BODY-SENTINEL\n")
+    subprocess.run(["git", "-C", str(repo), "add", "plan.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "plan"], check=True)
+
+
 def test_upstream_target_artifact_parks_for_human(cycle_repo):
-    # FR-10.4: a finding whose fix lands in a different (approved) artifact
+    # FR-10.4: a finding whose fix lands in a DIFFERENT (approved) artifact
     # halts at a gate; the cycle never silently amends or silently converges.
+    # Canonical scenario: a plan review implicating the approved PRD.
+    _seed_plan(cycle_repo)
     adapters = {
         "reviewer": SeqAdapter(REVIEW(F("F-001"))),
         "triage": SeqAdapter(V("F-001", action="defer", target_artifact="prd.md")),
         "builder": SeqAdapter(),
     }
-    status, man, _ = run_cycle(cycle_repo, adapters)
+    status, man, _ = run_cycle(cycle_repo, adapters,
+                               step_extra={"artifact": "plan.md"})
     assert status == M.RUN_PARKED
     assert "FR-10.4" in man.record("cycle").notes
+
+
+def test_fixnow_target_naming_other_artifact_still_parks(cycle_repo):
+    # Fail closed: fix_now + a target that NAMES a genuine other artifact file
+    # is contradictory but plausibly a real upstream invalidation — the
+    # normalizer must not clear it; the human gate resolves it (FR-10.4).
+    _seed_plan(cycle_repo)
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001", action="fix_now", target_artifact="prd.md")),
+        "builder": SeqAdapter(),
+    }
+    status, man, _ = run_cycle(cycle_repo, adapters,
+                               step_extra={"artifact": "plan.md"})
+    assert status == M.RUN_PARKED
+    assert "FR-10.4" in man.record("cycle").notes
+
+
+def test_misencoded_deliverable_target_is_cleared_not_parked(cycle_repo):
+    # Recurring triager misencoding (analysis-tools 2026-08/09, 6x): the fix
+    # lands in the artifact under review, but target_artifact carries a
+    # DESCRIPTION of the deliverable the fix adds. The engine clears it, the
+    # round fixes in place, and no FR-10.4 park is raised.
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+    adapters = {
+        "reviewer": reviewer,
+        "triage": SeqAdapter(V(
+            "F-001", action="fix_now",
+            target_artifact="acceptance test suite (integration tests "
+                            "for enqueue paths)",
+        )),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {"done": True})),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)
+    assert status == M.RUN_DONE
+    assert "FR-10.4" not in (man.record("cycle").notes or "")
+    persisted = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    (v,) = persisted["verdicts"]
+    assert v["target_artifact"] is None
+    assert "cleared misencoded target_artifact" in v["reasoning"]
+
+
+def test_target_naming_reviewed_artifact_is_cleared_not_parked(cycle_repo):
+    # A target that names the artifact under review is by definition not a
+    # different artifact: cleared, so the deferral converges instead of
+    # parking as a phantom upstream invalidation.
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-001"))),
+        "triage": SeqAdapter(V("F-001", action="defer", target_artifact="prd.md")),
+        "builder": SeqAdapter(),
+    }
+    status, man, run_dir = run_cycle(cycle_repo, adapters)  # reviews prd.md
+    assert status == M.RUN_DONE
+    assert "FR-10.4" not in (man.record("cycle").notes or "")
+    persisted = json.loads((run_dir / "artifacts" / "triage.json").read_text())
+    (v,) = persisted["verdicts"]
+    assert v["target_artifact"] is None
+
+
+def test_normalize_upstream_targets_matching():
+    # Helper-level matrix: what clears vs. what survives to park.
+    from gauntlet.engine.cycle import _normalize_upstream_targets
+
+    def norm(action, target, reviewed="prd.md"):
+        v = {"finding_id": "F-1", "action": action, "target_artifact": target,
+             "reasoning": "r."}
+        _normalize_upstream_targets([v], reviewed)
+        return v["target_artifact"]
+
+    # reviewed-artifact references clear regardless of casing/article/action
+    assert norm("defer", "prd.md") is None
+    assert norm("defer", "PRD") is None
+    assert norm("fix_now", "the PRD") is None
+    assert norm("defer", "runs/x/prd.md", reviewed="runs/x/prd.md") is None
+    # fix_now + descriptive phrase clears
+    assert norm("fix_now", "P8-A1..A3 validator tests") is None
+    # defer + a different loosely-described target survives (fail closed)
+    assert norm("defer", "the PRD acceptance section") == "the PRD acceptance section"
+    # fix_now + a different artifact FILE survives (fail closed)
+    assert norm("fix_now", "prd.md", reviewed="plan.md") == "prd.md"
+    # rejected verdicts are inert audit data — never touched
+    assert norm("reject", "prd.md") == "prd.md"
+    # code-mode (no reviewed artifact): only the fix_now/phrase rule applies
+    assert norm("fix_now", "acceptance test suite (x)", reviewed=None) is None
+    assert norm("defer", "prd.md", reviewed=None) == "prd.md"
 
 
 # --- convergence policy A (BOOTSTRAP-NOTES #30) -----------------------------------------

@@ -79,6 +79,8 @@ class AgentLine:
     # non-resume profile (the metric targets resume-capable profiles), which is
     # what lets it read differently from total input_tokens.
     cold_start_input_tokens: int | None = None
+    cache_creation_input_tokens: int = 0  # prompt-cache writes (raw counter)
+    reasoning_output_tokens: int = 0  # reasoning/thinking output (raw counter)
 
 
 @dataclass
@@ -101,6 +103,8 @@ class ReportData:
     total_cost: float | None
     total_cache_read_share: float | None  # FR-7.4
     total_cold_start_input: int | None = None  # FR-7.4; None when no resume steps
+    total_cache_creation_input: int = 0
+    total_reasoning_output: int = 0
     agents: list[AgentLine] = field(default_factory=list)
     step_types: list[StepTypeLine] = field(default_factory=list)
     tokens_only: bool = False  # any usage lacked a cost → totals are an estimate
@@ -146,6 +150,8 @@ def build_report(
                 cached_input_tokens=u.cached_input_tokens or 0,
                 cost_usd=u.cost_usd,
                 pct_cost=pct,
+                cache_creation_input_tokens=u.cache_creation_input_tokens or 0,
+                reasoning_output_tokens=u.reasoning_output_tokens or 0,
                 cache_read_share=_cache_read_share(
                     u.input_tokens or 0, u.cached_input_tokens or 0
                 ),
@@ -220,6 +226,8 @@ def build_report(
             totals.input_tokens or 0, totals.cached_input_tokens or 0
         ),
         total_cold_start_input=total_cold,
+        total_cache_creation_input=totals.cache_creation_input_tokens or 0,
+        total_reasoning_output=totals.reasoning_output_tokens or 0,
         agents=agents,
         step_types=step_types,
         tokens_only=any_unpriced,
@@ -260,13 +268,14 @@ def render_report(
         f"Cost report — run {data.run_id} ({data.slug}) [{data.status}]",
         "",
         "Per agent profile:",
-        f"  {'agent':<16} {'in':>10} {'out':>10} {'cached':>10} "
-        f"{'cache%':>8} {'cold-in':>10} {'cost':>16} {'% cost':>8}",
+        f"  {'agent':<16} {'in':>10} {'out':>10} {'cached':>10} {'cache-w':>10} "
+        f"{'reason':>9} {'cache%':>8} {'cold-in':>10} {'cost':>16} {'% cost':>8}",
     ]
     for a in data.agents:
         lines.append(
             f"  {a.agent:<16} {a.input_tokens:>10} {a.output_tokens:>10} "
-            f"{a.cached_input_tokens:>10} {_cache_cell(a.cache_read_share):>8} "
+            f"{a.cached_input_tokens:>10} {a.cache_creation_input_tokens:>10} "
+            f"{a.reasoning_output_tokens:>9} {_cache_cell(a.cache_read_share):>8} "
             f"{_cold_cell(a.cold_start_input_tokens):>10} "
             f"{_cost_cell(a.cost_usd):>16} {_pct_cell(a.pct_cost):>8}"
         )
@@ -304,6 +313,8 @@ def render_report(
         f"Totals: {data.total_input} in / {data.total_output} out / "
         f"{data.total_cached_input} cached "
         f"({_cache_cell(data.total_cache_read_share)} cache read) / "
+        f"{data.total_cache_creation_input} cache-w / "
+        f"{data.total_reasoning_output} reasoning out / "
         f"{_cold_cell(data.total_cold_start_input)} cold-start in / "
         f"{_cost_cell(data.total_cost)}",
     ]
