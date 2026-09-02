@@ -50,6 +50,7 @@ from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine import recovery_exec as RX
 from gauntlet.engine import verify
+from gauntlet.engine.timing import record_invocation
 from gauntlet.engine.commit_format import validate_commit_message
 from gauntlet.engine.execution import (
     DONE,
@@ -1421,7 +1422,10 @@ def _run_sub(
         if stream is not None:
             run_kwargs["sink"] = stream.append_line
         try:
-            result = adapter.run(attempt_prompt, **run_kwargs)
+            # Clock-time evidence for this call (engine-measured, adapter-
+            # agnostic): the step record gets one Invocation per attempt.
+            with record_invocation(ctx, agent=agent_name, label=substep or agent_name):
+                result = adapter.run(attempt_prompt, **run_kwargs)
         except MalformedOutputError as exc:
             _log_partial(logger, exc, usage, attempt, agent_name)
             if after_attempt is not None:

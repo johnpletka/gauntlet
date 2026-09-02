@@ -1597,12 +1597,20 @@ def report(
         False, "--trend", help="Also show cross-run improvement metrics (FR-6.6)."
     ),
 ) -> None:
-    """Print the per-step / per-agent-profile cost breakdown for a run (FR-3.2).
+    """Print the cost and clock-time breakdown for a run (FR-3.2).
+
+    Cost: per step / per agent profile, with cache-read share. Time: the overall
+    wall-clock span split into agent time (inside adapter calls), parked (by
+    reason, replayed from the state journal), host-suspended and other, plus
+    clock time per step, per agent profile (→ model) and per activity (review /
+    triage / fix / confirm / verify pooled across cycles; other steps by id).
 
     With ``--trend``, also print the cross-run improvement metrics (findings per
     round, %legitimate, fix-survival, test loops, judge ask-rate, cost/phase).
     """
+    from gauntlet.engine import journal
     from gauntlet.engine.report import render_report
+    from gauntlet.engine.timing import build_timing, render_timing
     from gauntlet.engine.trend import render_trend
 
     mgr = _manager()
@@ -1619,6 +1627,24 @@ def report(
         except (KeyError, AttributeError):
             continue
     typer.echo(render_report(man, resume_capable=resume_capable), nl=False)
+    # Time section: parked intervals replay from the run's journal (data, never
+    # inferred); a run without one still reports wall/agent time with parked
+    # marked unavailable. Profile → adapter/model comes from config, like the
+    # cold-start set above (an unregistered profile simply shows `—`).
+    events: list[dict] | None = None
+    try:
+        events = journal.read_events(mgr.layout(slug).active_run_dir())
+    except (OSError, ValueError, journal.JournalError):
+        events = None
+    model_of: dict[str, str] = {}
+    for name in mgr.config.agents:
+        try:
+            prof = mgr.config.profile(name)
+        except KeyError:
+            continue
+        model_of[name] = f"{prof.adapter}/{prof.model}" if prof.model else prof.adapter
+    typer.echo("")
+    typer.echo(render_timing(build_timing(man, events=events, model_of=model_of)), nl=False)
     if trend:
         typer.echo("")
         typer.echo(render_trend(mgr.trend(slug)), nl=False)

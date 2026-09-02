@@ -290,7 +290,7 @@ gauntlet approve myfeat          # accept the parked gate; drive to the next one
 gauntlet reject myfeat --notes "…"   # send the phase back for another fix round
 gauntlet resume myfeat           # resume after an interruption (kill -9 safe)
 gauntlet resume myfeat --response "…"   # decide an upstream conflict (see below)
-gauntlet report myfeat           # per-step / per-agent cost + token breakdown
+gauntlet report myfeat           # per-step / per-agent cost, tokens + clock time
 ```
 
 - **Interrupted runs are resumable.** State lives in the run's `manifest.json`;
@@ -454,7 +454,7 @@ Notes:
 | `gauntlet abort <slug>` | Abort a run. |
 | `gauntlet finish <slug>` | Merge a completed run into its base, then delete the branch + pointer. |
 | `gauntlet clean <slug>` | Delete a merged run branch + clear its pointer; keep the run record. |
-| `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown, incl. cache-read share per step type/profile. |
+| `gauntlet report <slug>` | Per-step / per-agent-profile cost breakdown, incl. cache-read share per step type/profile, plus a clock-time section: the run's wall-clock span split into agent time / parked (by reason) / host-suspended / other, and clock time per step, per agent profile (→ model) and per activity (review, triage, fix, confirm, verify pooled across cycles; other steps by id). Measured by the engine around every adapter call, so it is identical for Claude Code and Codex. |
 | `gauntlet ledger backfill` | One-shot, idempotent import of existing run manifests into the machine-global usage ledger (`~/.gauntlet/usage-ledger.jsonl`) so window-admission estimates have history. |
 | `gauntlet feedback <slug>` | Capture human feedback + triage corrections (FR-6.1). |
 | `gauntlet rollback <slug> --phase N` | Reset the branch + manifest to a phase boundary (guarded). |

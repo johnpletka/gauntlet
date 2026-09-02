@@ -36,6 +36,7 @@ from gauntlet.engine.execution import (
     StepSpec,
 )
 from gauntlet.engine import gitops
+from gauntlet.engine.timing import record_invocation
 from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
     HALT_REASON_JUDGE_DENY,
@@ -992,7 +993,10 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
             if stream is not None:
                 kwargs["sink"] = stream.append_line
             try:
-                return adapter.run(call_prompt, **kwargs)
+                # Clock-time evidence (engine-measured, adapter-agnostic): one
+                # Invocation per call, labelled by its evidence-file suffix.
+                with record_invocation(ctx, agent=emit_agent, label=f"call{log_suffix}"):
+                    return adapter.run(call_prompt, **kwargs)
             except AdapterError as exc:
                 # FR-4.2 is lossless for failures too (P4.r1 F-007): persist
                 # whatever partial evidence the adapter salvaged before it is
@@ -2317,7 +2321,8 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     for _attempt in range(1 + max_redrafts):
         # The commit-message drafter reads the staged diff of the tree the
         # phase was built in (P7a).
-        result = adapter.run(prompt, cwd=ctx.work_root)
+        with record_invocation(ctx, agent=agent_name, label="commit-message"):
+            result = adapter.run(prompt, cwd=ctx.work_root)
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
