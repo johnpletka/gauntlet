@@ -263,6 +263,34 @@ _PYTEST_COLLECT_FLAGS: tuple[str, ...] = (
 )
 
 
+#: Shell connector tokens that survive ``shlex.split`` as their own tokens. A
+#: compound ``test_command`` (``pytest … && ruff … && mypy``) is one shell
+#: string, but the enumeration argv is executed WITHOUT a shell — so everything
+#: past the pytest segment must be cut, or pytest receives ``&&`` as a literal
+#: path argument and exits 4 (#129).
+_SHELL_CONNECTORS: frozenset[str] = frozenset({"&&", "||", ";", "|"})
+
+
+def _pytest_segment(parts: list[str]) -> list[str]:
+    """The tokens of the first shell segment that invokes pytest.
+
+    Splits the token stream on connector tokens and returns the first segment
+    containing a ``pytest`` token (matching the ``resolve_command`` gate that
+    routed here). Falls back to the whole stream when no connector is present —
+    the common single-command case — so behavior there is unchanged.
+    """
+    segments: list[list[str]] = [[]]
+    for part in parts:
+        if part in _SHELL_CONNECTORS:
+            segments.append([])
+        else:
+            segments[-1].append(part)
+    for segment in segments:
+        if any(re.search(r"\bpytest\b", token) for token in segment):
+            return segment
+    return parts
+
+
 def _pytest_enumeration_command(test_command: str) -> tuple[str, ...]:
     """Turn a pytest test command into one deterministic collection command.
 
@@ -270,9 +298,11 @@ def _pytest_enumeration_command(test_command: str) -> tuple[str, ...]:
     quiet flag changes pytest's output format (``-qq``), which suppresses node
     ids and makes a successful collection look unparseable.  Normalize only
     the flags owned by the collector, preserving every project-specific
-    launcher, selection, and configuration argument.
+    launcher, selection, and configuration argument. A compound command is
+    reduced to its pytest segment first (#129) — the connectors and the other
+    segments belong to the shell-run ``tests`` step, never to this argv.
     """
-    parts = shlex.split(test_command)
+    parts = _pytest_segment(shlex.split(test_command))
     normalized: list[str] = []
     index = 0
     while index < len(parts):
