@@ -3467,7 +3467,7 @@ class RunManager:
         excludes = run_bookkeeping_excludes(
             self.work_root, self._bookkeeping_root(run_dir), layout.slug_dir
         )
-        # #131: a sanctioned recovery reconciliation (fork preservation +
+        # #132: a sanctioned recovery reconciliation (fork preservation +
         # linear commit-tree restore) can orphan the recorded boundary while
         # carrying its exact tree forward under a new sha. Classifying the
         # branch against the orphan reports FORKED/BEHIND forever — with no
@@ -3480,7 +3480,19 @@ class RunManager:
             twin = RX.tree_equal_reachable_commit(
                 self.work_root, boundary, tip=tip
             )
-            if twin is not None:
+            if twin is not None and twin != boundary:
+                # Audit trail: the reconciliation classified the branch
+                # against a substitute sha, not the recorded one. Recorded in
+                # the manifest warnings like the #121 reclassification note.
+                note = (
+                    f"resume: recorded boundary {boundary[:10]} is orphaned "
+                    "by a preserved recovery reconciliation; reconciled the "
+                    f"run branch against its reachable tree twin {twin[:10]} "
+                    "(identical tree) instead (#132)"
+                )
+                if note not in man.warnings:
+                    man.warnings.append(note)
+                    man.write_atomic(run_dir / "manifest.json")
                 boundary = twin
         except gitops.GitError:
             pass  # unreadable branch: let observe_git report it

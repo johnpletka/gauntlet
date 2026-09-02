@@ -150,6 +150,8 @@ ROOT_SCOPE: dict[str, str] = {
     "ref_is_valid_commit": ROOT_SCOPE_REPO,
     "is_ancestor": ROOT_SCOPE_REPO,
     "merge_base": ROOT_SCOPE_REPO,
+    "refs_containing": ROOT_SCOPE_REPO,        # ref-store read (#132)
+    "first_commit_with_tree": ROOT_SCOPE_REPO, # SHA-addressed log walk (#132)
     "create_ref": ROOT_SCOPE_REPO,
     "create_ref_exclusive": ROOT_SCOPE_REPO,
     "delete_ref": ROOT_SCOPE_REPO,
@@ -1532,6 +1534,54 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
         return True
     except subprocess.CalledProcessError:
         return False
+
+
+def refs_containing(repo: Path, sha: str) -> list[str]:
+    """Every ref (``refs/...``) whose history contains ``sha``. Read-only.
+
+    Empty for a dangling commit. Used as the preservation evidence a
+    sanctioned recovery reconciliation leaves behind (#132): the
+    fork-preservation ref (``<run-branch>-fork-<tip>``) — or any other ref —
+    still reaching the orphaned commit.
+    """
+    out = _run(repo, "for-each-ref", "--format=%(refname)", "--contains", sha)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def first_commit_with_tree(repo: Path, tip: str, tree: str) -> str | None:
+    """Newest commit reachable from ``tip`` whose tree object is ``tree``.
+
+    Streams ``git log`` and stops at the first hit, so the walk is bounded by
+    the distance to the match rather than the length of the history (#132).
+    ``None`` when no reachable commit carries that tree.
+    """
+    proc = subprocess.Popen(
+        ["git", "-C", str(repo), "log", "--format=%H %T", tip],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    found: str | None = None
+    try:
+        for line in proc.stdout:
+            commit_sha, _, commit_tree = line.strip().partition(" ")
+            if commit_tree == tree:
+                found = commit_sha
+                break
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr is not None else ""
+        if proc.stderr is not None:
+            proc.stderr.close()
+        rc = proc.wait()
+    # A walk we cut short exits non-zero on our own kill; only an
+    # uninterrupted failed walk (bad tip, corrupt object) is a git error.
+    if found is None and rc != 0:
+        raise GitError(["log", "--format=%H %T", tip], rc, stderr)
+    return found
 
 
 def create_ref(repo: Path, ref: str, sha: str) -> None:

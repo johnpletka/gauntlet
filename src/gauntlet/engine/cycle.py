@@ -396,7 +396,7 @@ def _apply_cycle_rewind(
 
     repo = ctx.work_root
     rec = ctx.record
-    # #131: a recorded rewind target can be orphaned by a sanctioned recovery
+    # #132: a recorded rewind target can be orphaned by a sanctioned recovery
     # reconciliation (fork preservation + linear commit-tree restore), which
     # carries the target's exact TREE forward under a new sha. The executor
     # rightly refuses a rewind onto unreachable history, which used to leave

@@ -1,4 +1,4 @@
-"""#131 — orphaned rewind targets resolve to their reachable tree twin.
+"""#132 — orphaned rewind targets resolve to their reachable tree twin.
 
 A sanctioned recovery reconciliation (fork preservation + a linear
 ``commit-tree`` restore) carries a commit's exact tree forward under a new
@@ -61,7 +61,43 @@ def test_an_orphaned_commit_resolves_to_its_reachable_tree_twin(repo: Path) -> N
     tip = twin
 
     assert not gitops.is_ancestor(repo, orphaned, tip)
+    # The orphan is preserved: `main` still reaches it (the shape the
+    # fork-preservation ref leaves behind), so it may resolve.
+    assert gitops.refs_containing(repo, orphaned)
     assert tree_equal_reachable_commit(repo, orphaned, tip=tip) == twin
+
+
+def test_an_unpreserved_orphan_never_resolves_even_with_a_twin(repo: Path) -> None:
+    # Fail closed: tree equality alone must not launder a dangling commit
+    # past the fork guard. Same twin shape as above, but no ref keeps the
+    # orphan alive — no sanctioned reconciliation produced it.
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "work.txt").write_text("completion\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "completion")
+    orphaned = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "-q", "--hard", base)  # main no longer reaches it
+    assert not gitops.refs_containing(repo, orphaned)
+    twin = _git(repo, "commit-tree", f"{orphaned}^{{tree}}",
+                "-p", "HEAD", "-m", "linear restore")
+    _git(repo, "update-ref", "refs/heads/main", twin)
+
+    assert gitops.first_commit_with_tree(repo, twin, _git(repo, "rev-parse", f"{orphaned}^{{tree}}")) == twin
+    assert tree_equal_reachable_commit(repo, orphaned, tip=twin) is None
+
+
+def test_the_twin_walk_stops_at_the_newest_match(repo: Path) -> None:
+    # Two reachable commits share the tree; the NEWEST one is the answer, and
+    # the streaming walk returns it without needing the older one.
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "b.txt").write_text("x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add b")
+    _git(repo, "rm", "-q", "b.txt")
+    _git(repo, "commit", "-qm", "remove b again")  # tree == base's tree
+    newest = _git(repo, "rev-parse", "HEAD")
+    tree = _git(repo, "rev-parse", f"{base}^{{tree}}")
+    assert gitops.first_commit_with_tree(repo, newest, tree) == newest
 
 
 def test_a_reachable_target_passes_through_unchanged(repo: Path) -> None:
