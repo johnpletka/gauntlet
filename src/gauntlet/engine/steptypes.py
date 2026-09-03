@@ -2085,23 +2085,56 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         wips = gitops.wip_checkpoints(repo, phase=wip_scope)
     except gitops.WrongPhaseCheckpointError as exc:
         return StepResult(status=FAILED, notes=f"checkpoint discovery failed closed: {exc}")
+    # #134: the trailing run is EMPTY when a non-checkpoint commit sits above
+    # the builder's checkpoints — an operator pre-commit that `resume` adopted
+    # (re-anchoring this step's `base_sha` at/past the checkpoints), an adopted
+    # fix round — because that commit reads as the "gap" ending the run. With a
+    # clean tree the step then failed "nothing to commit" and the operator hand-
+    # made the empty `P<N>:` marker + `resume --response`. Take that path here:
+    # look for THIS phase's scoped checkpoints in the run's own history (bounded
+    # to `HEAD ^base_branch`, stopping at the previous phase's `P<N-1>:`
+    # commit). Only a clean tree qualifies — a residual is committed as the
+    # phase commit exactly as before. `buried` is never squashed: the adopted
+    # commits above the checkpoints are not this step's to rewrite, so it lands
+    # the same empty marker the KEEP branch does. Fail closed (no fallback) when
+    # the walk cannot be bounded (missing base ref) or a wrong-phase checkpoint
+    # sits in the range; a range with no scoped checkpoint falls through to
+    # today's loud FAILED.
+    buried: list[tuple[str, str]] = []
+    adopted_above = 0
+    if not wips and wip_scope and gitops.is_clean(repo, exclude=exclude):
+        try:
+            buried, adopted_above = gitops.phase_checkpoints_in_run(
+                repo, phase=wip_scope, base_branch=ctx.manifest.base_branch,
+            )
+        except gitops.WrongPhaseCheckpointError as exc:
+            return StepResult(
+                status=FAILED, notes=f"checkpoint discovery failed closed: {exc}"
+            )
+        except gitops.GitError:
+            buried, adopted_above = [], 0  # unbounded walk is never a fallback
+    milestones = wips or buried
     squash = (
         ctx.config.checkpoint_commits == CHECKPOINT_COMMITS_SQUASH and bool(wips)
     )
     # The squash base is the parent of the OLDEST checkpoint: where the collapsed
     # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
-    squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
+    # For buried checkpoints the same base covers the adopted commits above them
+    # — the cumulative phase diff the review range will show.
+    squash_base = (
+        gitops.commit_parent(repo, milestones[-1][0]) if milestones else None
+    )
     message, draft_usage, draft_session, drafter = _commit_message(
-        step, ctx, consumed, diff_base=(squash_base if wips else None)
+        step, ctx, consumed, diff_base=(squash_base if milestones else None)
     )
     if consumed:
         message = _append_response_trailer(message, [r.response_id for r in consumed])
-    if wips:
+    if milestones:
         # Chronological (oldest first) milestone list in the body — engine-
         # appended (data over inference) so the milestones are always recorded,
         # whether the drafter mentioned them or not.
-        subjects = [subject for _sha, subject in reversed(wips)]
+        subjects = [subject for _sha, subject in reversed(milestones)]
         message = _append_checkpoint_trailer(message, subjects, squashed=squash)
     usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
@@ -2131,6 +2164,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # is a single non-empty `P<N>:` commit; the reviewed range diff base..<PN:>
     # is unchanged from the keep case (same base, same final tree).
     if squash:
+        ctx.record.base_sha = squash_base
         gitops.reset_soft(repo, squash_base)
         # The soft reset re-stages every commit in squash_base..old-HEAD, which
         # can include an engine bookkeeping commit swept in by a checkpoint-
@@ -2146,6 +2180,13 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             session_id=draft_session,
             notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
         )
+
+    # Persist the cumulative phase base for review consumers, including the
+    # first recorded phase and residual commits above checkpoints.
+    if milestones and squash_base:
+        previous_base = ctx.record.base_sha
+        if previous_base is None or gitops.is_ancestor(repo, squash_base, previous_base):
+            ctx.record.base_sha = squash_base
 
     # Mid-commit resume reconciliation (review F-003): if a prior attempt
     # already created the commit (HEAD moved off the recorded base) but died
@@ -2181,10 +2222,11 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         # as this phase's deliverable. A genuinely empty phase therefore still
         # falls through to the loud FAILED below, as does any walk the repo
         # cannot answer (missing base ref → fail closed, no adoption) (#124).
-        # Adoption is skipped when `P<N> wip:` checkpoints exist: the KEEP branch
-        # below must still land its empty `P<N>:` marker at the tip so the
-        # checkpointed work is covered by the handoff commit.
-        if not wips:
+        # Adoption is skipped when `P<N> wip:` checkpoints exist (trailing or
+        # buried, #134): the KEEP branch below must still land its empty `P<N>:`
+        # marker at the tip so the checkpointed work is covered by the handoff
+        # commit.
+        if not milestones:
             try:
                 candidates = gitops.commits_from_head(
                     repo, existing,
@@ -2219,7 +2261,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
                 )
 
     if gitops.is_clean(repo, exclude=exclude):
-        if wips:
+        if milestones:
             # KEEP, no residual: the `wip:` commits already carry all of the
             # phase's work. The reviewer handoff must STILL land on a `P<N>:`
             # commit (git-history contract, CLAUDE.md §1), so record an explicit
@@ -2228,14 +2270,29 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             sha = gitops.commit_all(
                 repo, message, identity=identity, allow_empty=True, exclude=exclude
             )
+            if buried:
+                # #134: adoption re-anchored `base_sha` AT or PAST the buried
+                # checkpoints, which would hand review-diff consumers an empty
+                # or partial `base..marker` range. The phase's work began at the
+                # oldest checkpoint's parent (`squash_base`); restore that so
+                # the range is the cumulative phase diff — checkpoints AND the
+                # adopted commits above them. A base already beneath them is
+                # left alone.
+                try:
+                    if base is None or gitops.is_ancestor(repo, buried[-1][0], base):
+                        ctx.record.base_sha = squash_base
+                except gitops.GitError:
+                    pass  # repair is best-effort; the marker itself stands
+                note = (
+                    f"empty P<N>: marker over {len(buried)} checkpoint(s) "
+                    f"beneath {adopted_above} adopted commit(s): {sha[:10]}"
+                )
+            else:
+                note = f"empty P<N>: marker over {len(wips)} checkpoint(s): {sha[:10]}"
             return StepResult(
                 status=DONE, commit_sha=sha, commit_phase=prefix,
                 usage=draft_usage, usage_by_agent=usage_by_agent,
-                session_id=draft_session,
-                notes=(
-                    f"empty P<N>: marker over {len(wips)} checkpoint(s): "
-                    f"{sha[:10]}"
-                ),
+                session_id=draft_session, notes=note,
             )
         return StepResult(
             status=FAILED,

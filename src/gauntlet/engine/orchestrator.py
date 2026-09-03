@@ -2053,6 +2053,7 @@ class Orchestrator:
                     step_id=rec.id,
                     phase=result.commit_phase or "",
                     sha=result.commit_sha,
+                    base_sha=rec.base_sha,
                 )
             )
         for phase, sha in result.commits:  # multi-commit steps (adversarial_cycle)

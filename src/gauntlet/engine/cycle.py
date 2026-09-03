@@ -2168,27 +2168,29 @@ def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
 
 
 def _code_review_base(ctx: StepContext, handoff: str) -> str:
-    """Round-1 code_review base: the phase's starting tip, so the review diff
-    spans the WHOLE phase.
-
-    ``manifest.commits`` records only phase-marker and fix commits (never the
-    intra-phase ``P<N> wip:`` checkpoint commits, FR-11.2), so the entry recorded
-    *before* ``handoff`` is exactly this phase's starting tip — the previous
-    phase's marker/last-fix. Diffing from there spans every checkpoint commit of
-    this phase plus its final marker, so a phase whose work landed entirely in
-    checkpoints (leaving an EMPTY marker commit) still presents its full diff for
-    review instead of an empty range.
-
-    Falls back to ``<handoff>^`` when ``handoff`` is the first recorded commit or
-    is not a recorded commit at all (an empty manifest / a lightweight first
-    review). This is identical to the previous ``handoff^`` behaviour whenever a
-    phase was a single commit (the pre-checkpoint invariant: ``handoff^`` then WAS
-    the previous marker), so it is a strict generalisation, not a behaviour change
-    for the single-commit case."""
+    """Use the persisted phase base; old journals skip same-phase fixes."""
     commits = ctx.manifest.commits
     for i in range(len(commits) - 1, -1, -1):
-        if commits[i].sha == handoff:
-            return commits[i - 1].sha if i > 0 else f"{handoff}^"
+        commit = commits[i]
+        if commit.sha != handoff:
+            continue
+        phase = commit.phase.split(".")[0]
+        first = i
+        while first > 0 and phase[1:].isdigit() and commits[first - 1].phase.split(".")[0] == phase:
+            first -= 1
+        previous = commits[first - 1].sha if first else None
+        base = commit.base_sha
+        if base and (previous is None or gitops.is_ancestor(ctx.work_root, base, previous)):
+            return base
+        if previous:
+            return previous
+        # Legacy manifests have no CommitRecord.base_sha. The matching
+        # foreach commit record may still carry a repaired base after adoption.
+        record = (ctx.manifest.record(commit.step_id, ctx.record.iteration)
+                  if isinstance(ctx.manifest, M.Manifest) else None)
+        if record is not None and record.base_sha:
+            return record.base_sha
+        return f"{commits[first].sha}^"
     return f"{handoff}^"
 
 

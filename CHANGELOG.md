@@ -112,6 +112,23 @@ All notable changes to Gauntlet are recorded here. The format follows
   run; exit 0 whether or not anything was resumed. `gauntlet serve` runs the
   same sweep on `web.sweep_interval_s` (default 120 s; 0 disables),
   launching console-owned drivers. README documents the cron/launchd recipe.
+### Fixed
+
+- `phase-commit` no longer fails "clean worktree, nothing to commit" when the
+  builder's `P<N> wip:` checkpoints sit beneath an adopted commit (#134,
+  rec. 4). The trailing-run checkpoint discovery stops at the first
+  non-checkpoint commit, so an operator pre-commit that `resume` adopted (or
+  an adopted fix round) hid every checkpoint beneath it; adoption had also
+  re-anchored `base_sha` at or past them. The operator's ritual was a
+  hand-made empty `P<N>:` marker plus `resume --response`. The step now takes
+  that path itself: with a clean tree and no trailing checkpoints it walks the
+  run's own history (`HEAD ^base_branch`, stopping at the previous phase's
+  handoff commit) for this phase's scoped checkpoints, lands the same empty
+  `P<N>:` marker listing them, notes how many adopted commits it sits over,
+  and restores `base_sha` to the oldest checkpoint's parent so the review range
+  is the cumulative phase diff. Fail closed as before on a wrong-phase
+  checkpoint, an unbounded walk (missing base ref), or a range with no
+  checkpoints at all; adopted commits are never squashed.
 
 ## [1.2.0] — 2026-08-18
 

@@ -137,6 +137,7 @@ ROOT_SCOPE: dict[str, str] = {
     "path_is_ignored": ROOT_SCOPE_WORK,
     "path_is_untracked": ROOT_SCOPE_WORK,
     "wip_checkpoints": ROOT_SCOPE_WORK,   # walks from the tree's own HEAD
+    "phase_checkpoints_in_run": ROOT_SCOPE_WORK,  # #134: same walk, bounded to the run
     "run_with_temp_index": ROOT_SCOPE_WORK,
     "validate_temp_index_path": ROOT_SCOPE_WORK,
     "show_toplevel": ROOT_SCOPE_WORK,
@@ -1267,6 +1268,62 @@ def wip_checkpoints(
                 continue
             break
     return result
+
+
+# A bare phase / stage commit (`P8: …`, `PLAN: …`) — never a `.x` fix round or a
+# `wip:` checkpoint. The boundary the buried-checkpoint walk stops at: it is the
+# previous phase's handoff commit, i.e. this phase's true start.
+_PHASE_BOUNDARY_RE = re.compile(r"^(?:P\d+|PRD|PLAN|REVIEW): ")
+
+
+def phase_checkpoints_in_run(
+    repo: Path,
+    *,
+    phase: str,
+    base_branch: str,
+    tip: str = "HEAD",
+    limit: int = 1000,
+) -> tuple[list[tuple[str, str]], int]:
+    """This phase's ``<phase> wip:`` checkpoints buried in the run's own history.
+
+    The commit step's trailing-run discovery (:func:`wip_checkpoints` without a
+    base) stops at the first non-checkpoint commit — so a plain commit adopted
+    ABOVE the builder's checkpoints (an operator pre-commit `resume` adopted,
+    an adopted fix round) hides every checkpoint beneath it and the step saw a
+    clean tree with "nothing to commit" (#134). This walks back from ``tip``
+    over the run's OWN commits only (``tip ^base_branch``, one batched ``git
+    log``) and returns ``(checkpoints newest first, adopted_count)`` where
+    ``adopted_count`` is the number of non-checkpoint, non-bookkeeping commits
+    seen in the walked range (the adopted commits the marker lands over).
+
+    The walk stops at the phase's true start: the first bare phase / stage
+    commit (``P<M>:`` / ``PRD:`` …) — the previous phase's handoff, or this
+    phase's own already-landed commit, beneath which nothing is this phase's
+    open work. Engine bookkeeping (``gauntlet:``) commits are walked through
+    and not counted. Fail closed (:class:`WrongPhaseCheckpointError`) on a
+    ``P<N> wip:`` for ANOTHER phase anywhere in the walked range, mirroring the
+    trailing-run rule (review F-001). Bounding to ``^base_branch`` means a
+    same-prefix checkpoint from an earlier run/PRD in the base branch's history
+    can never be counted; a missing base ref raises :class:`GitError` so the
+    caller declines the fallback rather than walking unbounded.
+    """
+    matcher = _wip_subject_re(phase)
+    result: list[tuple[str, str]] = []
+    adopted = 0
+    for sha, subject in commits_from_head(
+        repo, tip, exclude_reachable_from=base_branch, limit=limit
+    ):
+        if matcher.match(subject):
+            result.append((sha, subject))
+        elif _WIP_SUBJECT_RE.match(subject):
+            raise WrongPhaseCheckpointError(phase, subject)
+        elif _ENGINE_SUBJECT_RE.match(subject):
+            continue
+        elif _PHASE_BOUNDARY_RE.match(subject):
+            break
+        else:
+            adopted += 1
+    return result, adopted
 
 
 def commit_message(repo: Path, sha: str) -> str:
