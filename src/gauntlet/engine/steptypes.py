@@ -22,6 +22,7 @@ from pathlib import Path
 from gauntlet.adapters.base import (
     AdapterError,
     AgentFailedError,
+    AgentResult,
     SessionNotFoundError,
 )
 from gauntlet.engine.commit_format import header_prefix, validate_commit_message
@@ -1045,25 +1046,44 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                     stream.close()
 
     fallback_note = ""
-    try:
-        result = _invoke(prompt, emit_session)
-    except SessionNotFoundError as exc:
-        # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
-        # to a full re-run with no session (recoverable, not a run-halting fault)
-        # and record the fallback. Off the quota-resume path a SessionNotFoundError
-        # is unexpected, so re-raise it to fail closed like any other adapter error.
-        if not is_quota_resume:
-            raise
-        logger.log_text("session-expired.txt", str(exc))
-        fallback_note = (
-            "usage-limit resume: stored session was unknown/expired; fell back "
-            "to a full re-run with no session (FR-3.3)"
+    ratified = (
+        consuming_response
+        and emit_agent != agent_name
+        and pending_response_kind(ctx) == "accept_artifacts"
+    )
+    if ratified:
+        # #134: a structured ratification needs no classification — the cheap
+        # disposition emitter is never invoked (zero model calls); the
+        # engine-authored proceed_in_place goes through the SAME fail-closed
+        # oracle below, then the primary agent re-drives as on any proceed.
+        structured = ratified_disposition(ctx)
+        logger.log_text(
+            "disposition-ratified.json", json.dumps(structured, indent=2)
         )
+        result = AgentResult(
+            text="engine: --accept-artifacts ratification → proceed_in_place",
+            structured=structured, exit_code=0,
+        )
+    else:
         try:
-            prompt = _render_prompt(step, ctx)
-        except DeferralCollectionError as exc:
-            return _deferral_collection_halt(exc)
-        result = _invoke(prompt, None)
+            result = _invoke(prompt, emit_session)
+        except SessionNotFoundError as exc:
+            # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
+            # to a full re-run with no session (recoverable, not a run-halting fault)
+            # and record the fallback. Off the quota-resume path a SessionNotFoundError
+            # is unexpected, so re-raise it to fail closed like any other adapter error.
+            if not is_quota_resume:
+                raise
+            logger.log_text("session-expired.txt", str(exc))
+            fallback_note = (
+                "usage-limit resume: stored session was unknown/expired; fell back "
+                "to a full re-run with no session (FR-3.3)"
+            )
+            try:
+                prompt = _render_prompt(step, ctx)
+            except DeferralCollectionError as exc:
+                return _deferral_collection_halt(exc)
+            result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     # Attribute usage to the agent that actually ran (the disposition emitter on a
     # routed `--response` resume, else the step's agent) so `agent_usage` reflects
@@ -1827,12 +1847,24 @@ def render_human_responses(responses) -> str:
     """
     parts = ["# Human decisions (chronological)\n"]
     for r in responses:
-        parts.append(
+        block = (
             f"## Response {r.response_id} — attempt {r.response_attempt}\n"
             f"Response: {r.response_text}\n"
             f"Timestamp: {r.timestamp}\n"
             f"User: {r.user}\n"
         )
+        if getattr(r, "kind", "text") == "accept_artifacts":
+            # #134: a structured ratification is not prose to interpret. The
+            # artifacts named by digest ARE the approved artifacts; the only
+            # valid classification is proceed_in_place.
+            block += (
+                "Kind: structured artifact ratification (--accept-artifacts). "
+                "The governed artifacts as they stand in the run dir, at the "
+                "digests above, ARE the approved PRD/plan. Classify this as "
+                "proceed_in_place and implement against them; do not treat it "
+                "as an amendment request.\n"
+            )
+        parts.append(block)
     return "\n".join(parts)
 
 
@@ -1863,6 +1895,33 @@ def _load_schema(step: Step, ctx: StepContext) -> dict | None:
     if not ref:
         return None
     return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
+
+
+def pending_response_kind(ctx: StepContext) -> str | None:
+    """The ``kind`` of the pending `--response` entry this invocation consumes,
+    or ``None`` when no response is pending (#134). ``text`` for a prose
+    decision; ``accept_artifacts`` for a structured ratification."""
+    responses = getattr(ctx.record, "human_responses", None) or []
+    if not responses or responses[-1].state != RESPONSE_PENDING:
+        return None
+    return getattr(responses[-1], "kind", None) or "text"
+
+
+def ratified_disposition(ctx: StepContext) -> dict:
+    """The engine-authored ``proceed_in_place`` disposition for a pending
+    ``accept_artifacts`` response (#134): the same shape the oracle validates
+    (conflict null, responses_considered naming the consumed entry), with no
+    model call. Both disposition gates return this instead of classifying."""
+    pending = ctx.record.human_responses[-1]
+    return {
+        "disposition": "proceed_in_place",
+        "responses_considered": [pending.response_id],
+        "action_summary": (
+            "operator ratified the authoring-surface artifacts as approved "
+            "(structured --accept-artifacts); proceeding against them"
+        ),
+        "conflict": None,
+    }
 
 
 def _consuming_response(ctx: StepContext) -> bool:

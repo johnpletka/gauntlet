@@ -121,6 +121,13 @@ class ResponseAction:
     iteration: str | None = None
     text: str | None = None
     user: str | None = None
+    # #134: what KIND of response an ``append`` records — ``text`` (a prose
+    # decision, the default) or ``accept_artifacts`` (a structured artifact
+    # ratification whose ``text`` is engine-generated). ``ratified`` carries the
+    # authoring-surface digests for the latter; the orchestrator persists them
+    # on the manifest beside the response entry, in the same checkpoint.
+    response_kind: str = "text"
+    ratified: tuple = ()
 
 
 class _LazyPlanPhases:
@@ -2406,7 +2413,10 @@ class Orchestrator:
             rec = self.manifest.record(action.step_id, action.iteration)
             if rec is None:  # defensive: validated in RunManager before we drive
                 return
-            self._append_response(rec, action.text, action.user)
+            self._append_response(
+                rec, action.text, action.user,
+                kind=action.response_kind, ratified=action.ratified,
+            )
 
     def _reconcile_response_checkpoint(self) -> None:
         """Idempotently flush the latest response step's current-state commit."""
@@ -2441,7 +2451,10 @@ class Orchestrator:
                 target = rec
         return target
 
-    def _append_response(self, rec: StepRecord, text: str, user: str) -> M.HumanResponse:
+    def _append_response(
+        self, rec: StepRecord, text: str, user: str, *,
+        kind: str = M.RESPONSE_KIND_TEXT, ratified=(),
+    ) -> M.HumanResponse:
         """Append one `pending` response entry, persist, and commit it (FR-2).
 
         `response_id` (`<step_id>-resp-<ordinal>`) and `response_attempt` are
@@ -2449,7 +2462,16 @@ class Orchestrator:
         the stable handle the builder references (FR-5/FR-10) and recovery
         deduplicates on (FR-7.1). The `pending` write is atomic and committed
         BEFORE the agent launches.
+
+        An ``accept_artifacts`` entry (#134) additionally appends one
+        :class:`M.RatifiedArtifact` per ratified digest and — for a digest that
+        differs from the run's last-known approved one — a durable manifest
+        warning, all in the SAME atomic write and checkpoint commit as the
+        entry itself, so the audit trail can never carry the ratification
+        without its digests (or the reverse).
         """
+        from gauntlet.engine import ratification as RT
+
         ordinal = len(rec.human_responses) + 1
         entry = M.HumanResponse(
             response_id=f"{rec.id}-resp-{ordinal}",
@@ -2459,8 +2481,21 @@ class Orchestrator:
             response_attempt=ordinal,
             state=M.RESPONSE_PENDING,
             artifact_fingerprint=self._governed_artifact_fingerprint(rec),
+            kind=kind,
         )
         rec.human_responses.append(entry)
+        if kind == M.RESPONSE_KIND_ACCEPT_ARTIFACTS:
+            for digest in ratified:
+                self.manifest.ratified_artifacts.append(
+                    M.RatifiedArtifact(
+                        name=digest.name, sha256=digest.sha256,
+                        response_id=entry.response_id, at=entry.timestamp,
+                    )
+                )
+                if digest.drifted:
+                    note = RT.drift_note(digest, entry.response_id)
+                    if note not in self.manifest.warnings:
+                        self.manifest.warnings.append(note)
         self._persist()  # atomic write-ahead of the pending entry (FR-2.2)
         self._commit_manifest_checkpoint(
             f"gauntlet: response {entry.response_id} pending"

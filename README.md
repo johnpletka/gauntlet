@@ -421,6 +421,25 @@ builder then emits one of three outcomes:
 - **Re-parks for clarification** — the decision was ambiguous; the builder names
   what it still needs. Supply another `--response`.
 
+**Ratifying the artifacts as they stand.** When your decision is simply "the
+PRD/plan as written (including any sanctioned hand-edit) are the approved
+artifacts — proceed", use the structured form instead of prose (#134):
+
+```sh
+gauntlet resume <slug> --accept-artifacts
+```
+
+It records the sha256 of each governed artifact on the authoring surface
+(`<run_root>/<slug>/prd.md`, `plan.md`) as ratified, appends an engine-generated
+response naming those digests, and re-drives with `proceed_in_place` — no prose
+is classified and no disposition model runs, so acceptance wording that happens
+to contain imperative verbs can never be re-parked as an amendment request. A
+digest that differs from the run's last-known approved one (a prior
+ratification, else the bytes committed on the run branch) is recorded and
+printed **loudly**, never refused: manual governed-artifact edits are a
+sanctioned recovery workflow. Mutually exclusive with `--response`; only valid
+for a `parked_for_response` park.
+
 Notes:
 
 - `--response` is **required** to resume a step parked on an upstream conflict.
