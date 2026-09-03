@@ -2386,11 +2386,9 @@ def _draft_commit_message(
 
     #134: an oversize diff is handed BY REFERENCE (status + ``diff --stat``
     inline, the drafter reads per-file diffs with its own git) instead of
-    inlined past the adapter's cap; and when the redrafts are spent with ONLY
-    the header still wrong, the header is synthesized from the plan phase's
-    title rather than parking the run for a 73-char subject line. Both are
-    recorded in ``notes`` (the caller's list) and, for the synthesis, as a
-    manifest warning.
+    inlined past the adapter's cap, recorded in ``notes`` (the caller's list);
+    and the redraft feedback echoes the offending header with its exact count
+    (the enforced ceiling is ``HEADER_MAX``, #142; the prompt asks for under 72).
     """
     agent_name = step.get("message_agent")
     if not agent_name:
@@ -2459,64 +2457,7 @@ def _draft_commit_message(
             f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix. "
             f"Return only the corrected commit message.\n{change}\n"
         )
-    synthesized = _synthesize_header(step, ctx, message)
-    if synthesized is not None and err is not None:
-        offending = message.split("\n", 1)[0]
-        note = (
-            f"header synthesized from plan phase title after {max_redrafts} "
-            f"redrafts (drafted header {offending!r}: {err.reason})"
-        )
-        notes.append(note)
-        step_id = getattr(getattr(ctx, "record", None), "id", None) or step.id
-        _manifest_warning(ctx, f"{step_id}: {note}")
-        return synthesized, usage.result(), session_id, agent_name
     return message, usage.result(), session_id, agent_name
-
-
-def _synthesize_header(step: Step, ctx: StepContext, message: str) -> str | None:
-    """The drafted body under a deterministic ``P<N>: <plan phase title>``
-    header, or ``None`` when the fallback does not apply (#134).
-
-    Applies ONLY when the body already validates and the drafted header is the
-    sole defect: the header is engine-synthesized from the plan the human
-    approved (the phase's own title, truncated at a word boundary to fit), so
-    the message stays a legal, plan-anchored subject line and the reasoning
-    the drafter wrote is kept intact. Requires a numeric ``P<N>`` prefix (an
-    explicit ``phase:`` or the foreach iteration's id) AND that phase's title
-    from the iteration item — anything else fails as before (never guess a
-    title, never relabel a stage-label commit).
-    """
-    prefix = step.get("phase") or _iteration_phase(ctx)
-    if not prefix or not re.fullmatch(r"P\d+", prefix):
-        return None
-    item = ctx.iteration_item
-    if not isinstance(item, dict) or item.get("id") != prefix:
-        return None
-    title = " ".join(str(item.get("title") or "").split())
-    if not title:
-        return None
-    header = f"{prefix}: {title}"
-    if len(header) > HEADER_MAX:
-        cut = header[:HEADER_MAX]
-        space = cut.rfind(" ")
-        # Word boundary, keeping at least one word of the title after the prefix.
-        if space > len(prefix) + 2:
-            cut = cut[:space]
-        header = cut.rstrip(" ,;:-—–")
-    lines = (message or "").rstrip("\n").split("\n")
-    candidate = "\n".join([header, *lines[1:]])
-    if validate_commit_message(candidate) is not None:
-        return None  # the body was wrong too: not a header-only defect
-    return candidate
-
-
-def _manifest_warning(ctx, text: str) -> None:
-    """Append a de-duplicated FR-10.3 advisory to ``manifest.warnings`` (the
-    `gauntlet status` warnings block), tolerating a context without one."""
-    manifest = getattr(ctx, "manifest", None)
-    warnings = getattr(manifest, "warnings", None)
-    if warnings is not None and text not in warnings:
-        warnings.append(text)
 
 
 def _iteration_phase(ctx: StepContext) -> str:

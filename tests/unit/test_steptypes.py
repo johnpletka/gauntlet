@@ -781,7 +781,9 @@ def test_redraft_feedback_echoes_header_and_exact_count(fixture_repo):
     """The rejection feedback quotes the offending header line with its exact
     character count and the prefix-inclusive rule (#134) — a bare "78 chars"
     left models re-submitting 74."""
-    long_header = "P1: " + "x" * 76  # 80 chars
+    from gauntlet.engine.commit_format import HEADER_MAX
+
+    long_header = "P1: " + "x" * 106  # 110 chars: past the enforced ceiling (#142)
 
     class Drafter:
         capabilities = FakeAdapter.capabilities
@@ -801,9 +803,9 @@ def test_redraft_feedback_echoes_header_and_exact_count(fixture_repo):
     assert orch.drive() == M.RUN_DONE
     feedback = drafter.prompts[1]
     assert repr(long_header) in feedback
-    assert "80 characters" in feedback
-    assert "the limit is 72 counting the 'P<N>: ' prefix" in feedback
-    assert "header is 80 chars" in feedback  # the validator's own reason, too
+    assert "110 characters" in feedback
+    assert f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix" in feedback
+    assert "header is 110 chars" in feedback  # the validator's own reason, too
 
 
 def _phase_ctx(repo, *, iteration_item, adapter, step_id="commit"):
@@ -828,124 +830,6 @@ def _phase_ctx(repo, *, iteration_item, adapter, step_id="commit"):
         iteration_item=iteration_item, iteration_index=2,
         adapter_factory=lambda _n: adapter,
     )
-
-
-class StubbornDrafter:
-    """Always returns the same (bad-header) text — the redrafts are wasted."""
-
-    capabilities = FakeAdapter.capabilities
-
-    def __init__(self, text):
-        self.text = text
-        self.n = 0
-
-    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
-        self.n += 1
-        return AgentResult(text=self.text, exit_code=0)
-
-
-_P3 = {
-    "id": "P3",
-    # 81 chars with the prefix: forces the word-boundary truncation to 68.
-    "title": "Judge policy engine with a per-run allow cache and fast-path allow/deny rules",
-    "goal": "g",
-}
-
-
-def test_commit_header_fallback_synthesizes_from_phase_title(fixture_repo):
-    """Redrafts spent, body valid, ONLY the header wrong: the engine synthesizes
-    `P<N>: <plan phase title>` (word-boundary truncated to ≤72), keeps the
-    drafted body, and records a step note + manifest warning (#134)."""
-    from gauntlet.engine.steptypes import handle_commit
-
-    (fixture_repo / "work.py").write_text("code\n")
-    drafter = StubbornDrafter("P3: " + "w" * 90 + "\n\nThe reasoning the drafter wrote.\n")
-    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
-    step = Step.model_validate(
-        {"id": "commit", "type": "commit", "message_agent": "triage", "max_redrafts": 2}
-    )
-    result = handle_commit(step, ctx)
-    assert result.status == "done", result.notes
-    assert drafter.n == 3  # initial + 2 redrafts, all rejected
-    subject = gitops.commit_subject(fixture_repo, "HEAD")
-    assert subject == "P3: Judge policy engine with a per-run allow cache and fast-path"
-    assert len(subject) <= 72
-    body = gitops._run(fixture_repo, "log", "-1", "--format=%b", "HEAD")
-    assert "The reasoning the drafter wrote." in body
-    note = "header synthesized from plan phase title after 2 redrafts"
-    assert note in result.notes
-    assert any(note in w for w in ctx.manifest.warnings)
-    assert any("header is 94 chars" in w for w in ctx.manifest.warnings)
-
-
-def test_commit_header_fallback_handles_off_shape_header(fixture_repo):
-    """A header that is short but off-shape (no `P<N>: ` prefix) is the same
-    header-only defect; a short title is used whole."""
-    from gauntlet.engine.steptypes import handle_commit
-
-    (fixture_repo / "work.py").write_text("code\n")
-    drafter = StubbornDrafter("Add the thing\n\nbody.\n")
-    item = {"id": "P3", "title": "Short  title", "goal": "g"}
-    ctx = _phase_ctx(fixture_repo, iteration_item=item, adapter=drafter)
-    step = Step.model_validate({"id": "commit", "type": "commit", "message_agent": "triage"})
-    result = handle_commit(step, ctx)
-    assert result.status == "done", result.notes
-    assert gitops.commit_subject(fixture_repo, "HEAD") == "P3: Short title"
-
-
-def test_commit_header_fallback_not_used_when_body_invalid(fixture_repo):
-    """The fallback is header-ONLY: a draft whose body also fails (missing
-    blank line / empty body) fails as before — never a synthesized message
-    around an unusable body. The terminal failure names the override."""
-    from gauntlet.engine.steptypes import handle_commit
-
-    (fixture_repo / "work.py").write_text("code\n")
-    drafter = StubbornDrafter("P3: " + "w" * 90)  # over-long header, no body
-    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
-    step = Step.model_validate(
-        {"id": "commit", "type": "commit", "message_agent": "triage", "max_redrafts": 1}
-    )
-    result = handle_commit(step, ctx)
-    assert result.status == "failed"
-    assert drafter.n == 2
-    assert "commit message invalid: header is 94 chars" in result.notes
-    assert "synthesized" not in result.notes
-    assert ctx.manifest.warnings == []
-    assert gitops.commit_subject(fixture_repo, "HEAD") == "init"  # nothing landed
-    # (c): the failure names the verbatim override, spelled out.
-    assert "gauntlet resume demo --response '<full message>'" in result.notes
-    assert "uses your text verbatim when it is itself a valid commit message" in result.notes
-    assert "P<N>: header ≤72 chars, blank line, body" in result.notes
-
-
-def test_commit_header_fallback_requires_phase_title(fixture_repo):
-    """No foreach phase (or a phase without a matching title): no synthesis —
-    the engine never guesses a subject line. Fails exactly as before."""
-    from gauntlet.engine.steptypes import handle_commit
-
-    (fixture_repo / "work.py").write_text("code\n")
-    drafter = StubbornDrafter("P3: " + "w" * 90 + "\n\nbody.\n")
-    ctx = _phase_ctx(fixture_repo, iteration_item=None, adapter=drafter)
-    step = Step.model_validate(
-        {"id": "commit", "type": "commit", "message_agent": "triage", "phase": "P3"}
-    )
-    result = handle_commit(step, ctx)
-    assert result.status == "failed"
-    assert "commit message invalid" in result.notes and "--response" in result.notes
-    assert ctx.manifest.warnings == []
-
-
-def test_commit_header_fallback_skips_stage_label_phases(fixture_repo):
-    """Stage labels (PRD/PLAN/REVIEW) are never relabelled from a plan phase."""
-    from gauntlet.engine.steptypes import handle_commit
-
-    (fixture_repo / "work.py").write_text("code\n")
-    drafter = StubbornDrafter("PLAN.1: " + "w" * 90 + "\n\nbody.\n")
-    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
-    step = Step.model_validate(
-        {"id": "commit", "type": "commit", "message_agent": "triage", "phase": "PLAN"}
-    )
-    assert handle_commit(step, ctx).status == "failed"
 
 
 def test_commit_bad_literal_message_names_override(fixture_repo):

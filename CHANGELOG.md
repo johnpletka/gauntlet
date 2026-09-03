@@ -56,13 +56,9 @@ All notable changes to Gauntlet are recorded here. The format follows
   diff BY REFERENCE: `git status` and `git diff --stat` stay inline, and the
   drafter reads per-file diffs with its own git. Never a truncation. A phase
   that minted a multi-megabyte diff previously failed `phase-commit`
-  terminally on every model. When the redrafts are spent and ONLY the header
-  is still wrong (over 72 chars or off-shape) while the body validates, the
-  header is synthesized as `P<N>: <plan phase title>` (word-boundary
-  truncated to fit) from the plan the human approved, the drafted body is
-  kept, and a manifest warning plus step note record the substitution — a
-  73-char subject line no longer parks a run. Redraft feedback now echoes the
-  offending header line with its exact character count, and the terminal
+  terminally on every model. Redraft feedback now echoes the offending
+  header line with its exact character count against the enforced ceiling
+  (100 since #142; the prompt asks for under 72), and the terminal
   format failure names the verbatim override (`gauntlet resume <slug>
   --response '<full message>'` uses the text as the message when it is itself
   a valid one). The step notes record when a draft went by reference (#134).
