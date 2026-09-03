@@ -23,9 +23,23 @@ def test_accepts_review_flow_stage_label():
 
 
 def test_rejects_overlong_header():
-    long = "P3: " + "x" * 80
+    long = "P3: " + "x" * 120
     err = validate_commit_message(long + "\n\nbody")
-    assert err and "72" in err.reason
+    assert err and "100" in err.reason
+
+
+def test_accepts_a_header_between_the_prompted_and_enforced_limits():
+    # The prompt asks for < 72; the gate allows up to HEADER_MAX (100), so a
+    # drafter that lands a few characters over the convention does not park a
+    # run over a cosmetic rule (#142).
+    from gauntlet.engine.commit_format import HEADER_MAX
+
+    for length in (73, 80, HEADER_MAX):
+        header = "P3: " + "x" * (length - len("P3: "))
+        assert len(header) == length
+        assert validate_commit_message(header + "\n\nbody") is None, length
+    over = "P3: " + "x" * (HEADER_MAX + 1 - len("P3: "))
+    assert validate_commit_message(over + "\n\nbody") is not None
 
 
 def test_rejects_missing_phase_prefix():
