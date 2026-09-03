@@ -2097,7 +2097,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
     squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
     # Drafting side-notes (#134): "diff handed by reference", "header
-    # synthesized from the plan phase title" — surfaced on the step record so
+    # bounded inline for tool-less drafting" — surfaced on the step record so
     # an operator reading `gauntlet status` sees WHY a commit message looks the
     # way it does (data over inference), never inferred from the message.
     draft_notes: list[str] = []
@@ -2384,13 +2384,9 @@ def _draft_commit_message(
     Returns ``(message, usage, session_id, drafter)`` so the commit step records
     the drafter's cost (FR-3.2/§7).
 
-    #134: an oversize diff is handed BY REFERENCE (status + ``diff --stat``
-    inline, the drafter reads per-file diffs with its own git) instead of
-    inlined past the adapter's cap; and when the redrafts are spent with ONLY
-    the header still wrong, the header is synthesized from the plan phase's
-    title rather than parking the run for a 73-char subject line. Both are
-    recorded in ``notes`` (the caller's list) and, for the synthesis, as a
-    manifest warning.
+    Oversize changes use git references only for adapters that can read the
+    repository. Tool-less adapters receive bounded, explicitly partial diff
+    excerpts. Invalid drafts exhaust the ordinary redraft loop and fail closed.
     """
     agent_name = step.get("message_agent")
     if not agent_name:
@@ -2414,7 +2410,7 @@ def _draft_commit_message(
         f"{plan_section}{_response_section(consumed)}"
     )
     change, diff_len = _change_context(ctx, diff_base=diff_base)
-    cap, _reads_repo = profile_input_cap(ctx, agent_name)
+    cap, reads_repo = profile_input_cap(ctx, agent_name)
     if cap is not None:
         # Same rule as the review/confirm prompts: an over-cap prompt is
         # rejected WHOLESALE by the adapter, so never build one.
@@ -2428,8 +2424,15 @@ def _draft_commit_message(
             f"{DRAFT_INLINE_DIFF_MAX} chars"
         )
     if oversize:
-        change = _change_context_by_reference(ctx, diff_base=diff_base, why=why)
-        notes.append(f"diff handed to the drafter by reference ({why})")
+        if reads_repo:
+            change = _change_context_by_reference(ctx, diff_base=diff_base, why=why)
+            notes.append(f"diff handed to the drafter by reference ({why})")
+        else:
+            budget = min(40_000, cap - PROMPT_INPUT_HEADROOM - len(header) - 2048) if cap else 40_000
+            if budget < 1024:
+                raise ValueError("commit drafting instructions leave no room for change evidence")
+            change = _bounded_draft_evidence(change, budget=budget)
+            notes.append(f"drafter received bounded inline diff excerpts ({why})")
     prompt = f"{header}\n{change}\n"
     max_redrafts = max(0, int(step.get("max_redrafts", 2)))
     message = ""
@@ -2459,64 +2462,33 @@ def _draft_commit_message(
             f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix. "
             f"Return only the corrected commit message.\n{change}\n"
         )
-    synthesized = _synthesize_header(step, ctx, message)
-    if synthesized is not None and err is not None:
-        offending = message.split("\n", 1)[0]
-        note = (
-            f"header synthesized from plan phase title after {max_redrafts} "
-            f"redrafts (drafted header {offending!r}: {err.reason})"
-        )
-        notes.append(note)
-        step_id = getattr(getattr(ctx, "record", None), "id", None) or step.id
-        _manifest_warning(ctx, f"{step_id}: {note}")
-        return synthesized, usage.result(), session_id, agent_name
     return message, usage.result(), session_id, agent_name
 
 
-def _synthesize_header(step: Step, ctx: StepContext, message: str) -> str | None:
-    """The drafted body under a deterministic ``P<N>: <plan phase title>``
-    header, or ``None`` when the fallback does not apply (#134).
+def _bounded_draft_evidence(change: str, *, budget: int) -> str:
+    """Distribute a fixed evidence budget across files for tool-less drafting.
 
-    Applies ONLY when the body already validates and the drafted header is the
-    sole defect: the header is engine-synthesized from the plan the human
-    approved (the phase's own title, truncated at a word boundary to fit), so
-    the message stays a legal, plan-anchored subject line and the reasoning
-    the drafter wrote is kept intact. Requires a numeric ``P<N>`` prefix (an
-    explicit ``phase:`` or the foreach iteration's id) AND that phase's title
-    from the iteration item — anything else fails as before (never guess a
-    title, never relabel a stage-label commit).
+    This is message drafting, not code review: omitted evidence is explicit,
+    and the model must limit its claims to the visible excerpts and phase plan.
     """
-    prefix = step.get("phase") or _iteration_phase(ctx)
-    if not prefix or not re.fullmatch(r"P\d+", prefix):
-        return None
-    item = ctx.iteration_item
-    if not isinstance(item, dict) or item.get("id") != prefix:
-        return None
-    title = " ".join(str(item.get("title") or "").split())
-    if not title:
-        return None
-    header = f"{prefix}: {title}"
-    if len(header) > HEADER_MAX:
-        cut = header[:HEADER_MAX]
-        space = cut.rfind(" ")
-        # Word boundary, keeping at least one word of the title after the prefix.
-        if space > len(prefix) + 2:
-            cut = cut[:space]
-        header = cut.rstrip(" ,;:-—–")
-    lines = (message or "").rstrip("\n").split("\n")
-    candidate = "\n".join([header, *lines[1:]])
-    if validate_commit_message(candidate) is not None:
-        return None  # the body was wrong too: not a header-only defect
-    return candidate
-
-
-def _manifest_warning(ctx, text: str) -> None:
-    """Append a de-duplicated FR-10.3 advisory to ``manifest.warnings`` (the
-    `gauntlet status` warnings block), tolerating a context without one."""
-    manifest = getattr(ctx, "manifest", None)
-    warnings = getattr(manifest, "warnings", None)
-    if warnings is not None and text not in warnings:
-        warnings.append(text)
+    parts = re.split(r"(?=^diff --git )", change, flags=re.MULTILINE)
+    header = (
+        "--- PARTIAL DIFF EXCERPTS (bounded inline evidence) ---\n"
+        "You have no repository tools. These excerpts omit content. Use only "
+        "the visible evidence and phase plan; do not claim to have inspected "
+        "omitted changes.\n"
+    )
+    allowance = max(1, (budget - len(header) - 128) // len(parts))
+    excerpts = []
+    omitted = 0
+    for part in parts:
+        if len(part) > allowance:
+            omitted += len(part) - allowance
+            part = part[:allowance]
+        excerpts.append(part)
+    result = header + "\n".join(excerpts)
+    suffix = f"\n[omitted {omitted} source characters across {len(parts)} sections]\n"
+    return result[:budget - len(suffix)] + suffix
 
 
 def _iteration_phase(ctx: StepContext) -> str:
