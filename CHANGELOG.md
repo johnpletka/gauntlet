@@ -46,6 +46,28 @@ All notable changes to Gauntlet are recorded here. The format follows
   explicit, written through the redacting writer. Evidence only: the engine
   never reads it back.
 
+- **Notifications are pushed by the driver itself** (#134, recs 6 and 10).
+  Every run transition that needs a human — gate reached, escalation, decision
+  park, usage-limit / provider-unavailable / usage-window / invalid-artifact
+  park, halt, failure, completion — is emitted the instant the driver persists
+  it, on every driving verb (`run`, `resume`, the in-process auto-resume,
+  `approve`, `reject`), to macOS desktop, a Slack incoming webhook and/or a new
+  generic JSON webhook (`notify.webhook_url` / `GAUNTLET_NOTIFY_WEBHOOK`).
+  Detection latency no longer depends on a resident `gauntlet serve`. The
+  channel primitives, kind table and classifier moved to
+  `gauntlet.engine.notify` (the console re-exports them); the classifier now
+  maps every park class by its persisted `parked_reason` and a halt to its own
+  `run-halted` kind. A gate-reached notification carries a pre-built review
+  bundle — `git diff --stat` of the reviewed range, finding/triage counts,
+  spend and elapsed time, and the exact next command — assembled read-only by
+  the new `gauntlet.engine.gate_evidence`. Each emission is appended to the
+  run's `notifications.jsonl` ledger; the console notifier consults the same
+  ledger, so driver and console never double-fire and a restarted emitter never
+  re-announces. New engine `notify:` config block (`desktop`, `slack`,
+  `webhook`, `slack_webhook`, `webhook_url`, optional `kinds` allowlist;
+  defaults are safe no-ops); an absent `web.notify` inherits it.
+  `GAUNTLET_NOTIFY_DISABLED=1` is the driver-side kill switch.
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed

@@ -55,6 +55,17 @@ reviewer_mutation: commit
 #     enforce: false          # false = advisory warning; true = pre-step park
 #     # fallback_estimate: 50000  # used while the ledger has no history
 
+# Driver-side notifications (#134): every park / halt / failure / completion is
+# pushed by the run's own driver — no console needed. Defaults are safe no-ops:
+# Slack and the generic webhook only fire when a URL resolves (here or via the
+# GAUNTLET_SLACK_WEBHOOK / GAUNTLET_NOTIFY_WEBHOOK env vars). Keep webhook
+# secrets in the ENVIRONMENT, not in this file.
+# notify:
+#   desktop: true             # terminal-notifier / osascript on macOS
+#   slack: true               # slack_webhook: <url>  (or the env var)
+#   webhook: true             # webhook_url: <url>    (or the env var)
+#   # kinds: [gate-reached, escalation-parked, run-failed]  # allowlist; absent = all
+
 # Lightweight `gauntlet review` issue tracker (FR-6, optional). Uncomment to let
 # `gauntlet review --issue ENG-1234` (and `--pr`'s linked-ticket auto-derive)
 # fetch the originating problem statement. v1 supports only `linear`; the token

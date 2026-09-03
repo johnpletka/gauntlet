@@ -202,7 +202,8 @@ def create_app(
     # *after* the watcher exists.
     if notifier is None and notifications:
         notifier = build_notifier(
-            web_config_from(store.config).notify, watcher=watcher, base_url=base_url
+            web_config_from(store.config).notify, watcher=watcher, base_url=base_url,
+            store=store,  # #134: de-dup through each run's notifications.jsonl
         )
     watcher.notifier = notifier
     # The supervisor (P3) owns console-launched runs and surfaces the worktree
