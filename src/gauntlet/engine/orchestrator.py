@@ -2134,7 +2134,6 @@ class Orchestrator:
         log_dir = step_log_dir(ctx) / "preflight"
         unmet = PC.resolve_preconditions(
             items, cwd=self.work_root, env=os.environ,
-            run_command=PC.command_runner(log_dir, self.writer),
         )
         try:
             self.writer.write_text(log_dir / "preflight.txt", PC.render_checklist(items, unmet))

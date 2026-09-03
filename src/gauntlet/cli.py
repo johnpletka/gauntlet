@@ -395,17 +395,11 @@ def _plan_preflight_advisory(mgr, man, rstate, pipeline) -> list[str]:
         cwd = _status_work_root(mgr, man)
     except Exception:  # fail-soft: advisory only
         cwd = mgr.repo_root
-    unmet = PC.resolve_preconditions(items, cwd=cwd, env=os.environ, run_command=None)
-    commands = PC.command_items(items)
+    unmet = PC.resolve_preconditions(items, cwd=cwd, env=os.environ)
     out = []
     if unmet:
         out.append(f"plan preflight: {len(unmet)} unmet precondition(s) — `gauntlet approve` will refuse:")
         out.extend(f"  - {u.render()}" for u in unmet)
-    if commands:
-        out.append(
-            f"plan preflight: {len(commands)} command precondition(s) are run at "
-            "approve time (status is read-only)"
-        )
     return out
 
 

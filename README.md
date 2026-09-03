@@ -362,8 +362,8 @@ in the foreground; pass `--no-browser` (on either command) to skip the launch.
 ### Plan preconditions
 
 A plan's `gauntlet-phases` block may declare the environmental things its phases
-depend on and no agent can create — staged data files, environment variables,
-provisioning commands (#134). Per phase or for the whole plan (mapping form):
+depend on and no agent can create — staged data files and environment variables
+(#134). Provision separately before approval; command items are rejected. Per phase or for the whole plan (mapping form):
 
 ```markdown
 ```gauntlet-phases
@@ -377,20 +377,18 @@ phases:
     acceptance: [{id: P1-A1, clause: "…"}]
     preconditions:                   # this phase's own items
       - {path: data/restricted/bundle.parquet, description: "staged by ops"}
-      - {command: "uv run python scripts/provision.py --check", timeout_s: 120}
 ```
 ```
 
 `plan-lint` fails closed on a malformed item. `gauntlet approve` on the plan
-gate (`preflight: plan_preconditions`) resolves every item — commands run in
-the run worktree with their output persisted under `<run_dir>/preflight/` — and
+gate (`preflight: plan_preconditions`) checks every item without executing plan
+text, records the checklist under `<run_dir>/preflight/`, and
 **refuses while any is unmet**, listing each; `--skip-preflight` approves anyway
 with an audited manifest warning. Each implement phase (`preconditions_from:
 plan`) re-resolves the plan-level items plus its own before the builder
 launches; an unmet item fails the step as a re-runnable precondition (nothing
 invoked, no tokens spent) and a plain `gauntlet resume` re-checks. `gauntlet
-status` on a parked plan gate lists unmet `path`/`env` items read-only (commands
-run only at approve time). An `env` value is only ever tested for presence and
+status` on a parked plan gate lists unmet `path`/`env` items read-only. An `env` value is only ever tested for presence and
 never written anywhere.
 
 ### CLI observability

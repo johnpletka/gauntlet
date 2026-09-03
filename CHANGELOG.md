@@ -49,11 +49,11 @@ All notable changes to Gauntlet are recorded here. The format follows
 - **Plan preconditions** (#134, rec. 7). A plan's `gauntlet-phases` block may
   declare, per phase and (mapping form) for the whole plan, the environmental
   preconditions the phases depend on: `{path}` must exist, `{env}` must be set
-  and non-empty (the value is never recorded), `{command, timeout_s}` must exit
-  0. `plan-lint` and the `plan_phases` validator fail closed on a malformed
+  and non-empty (the value is never recorded). Provision separately; command
+  items are rejected. `plan-lint` and the `plan_phases` validator fail closed on a malformed
   item. `gauntlet approve` on a gate declaring `preflight: plan_preconditions`
-  (the standard pipeline's `plan-approve`) resolves every item first — commands
-  run in the run worktree, output persisted under `<run_dir>/preflight/` — and
+  (the standard pipeline's `plan-approve`) checks every item without executing
+  plan text, records the checklist under `<run_dir>/preflight/`, and
   refuses while any is unmet, naming each; `--skip-preflight` approves anyway
   with an audited manifest warning. A step declaring `preconditions_from: plan`
   (the standard pipeline's `implement`) re-resolves the plan-level items plus
@@ -64,7 +64,7 @@ All notable changes to Gauntlet are recorded here. The format follows
   gate lists unmet `path`/`env` items read-only. In the field a phase parked
   mid-run because a data bundle was never staged — discoverable before the
   run started; the mechanism is generic so an adopter's own notion of "staged"
-  is a path or a command, never a Gauntlet concept.
+  is a required path or environment variable.
 
 ## [1.2.0] — 2026-08-18
 

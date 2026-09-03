@@ -33,3 +33,6 @@ apply, so the file reads oldest-first.
   terminal reject (no upstream cycle to iterate) is refused unless the explicit
   `--terminal` flag is given — a flag-less reject can no longer end a run by
   surprise.
+
+- **plan-author.md** (#146 review): limit preconditions to read-only path and
+  environment checks; require provisioning separately before approval.
