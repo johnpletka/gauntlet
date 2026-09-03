@@ -56,6 +56,16 @@ def _no_caffeinate(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_driver_notifications(monkeypatch):
+    """The driver pushes every park/fail/gate by default (#134); the unit suite
+    must never fire a real desktop/Slack/webhook send. Tests that exercise the
+    driver path unset this switch themselves."""
+    from gauntlet.engine.notify import GAUNTLET_NOTIFY_DISABLED_ENV
+
+    monkeypatch.setenv(GAUNTLET_NOTIFY_DISABLED_ENV, "1")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_usage_ledger(tmp_path, monkeypatch):
     """Redirect the machine-global usage ledger (FR-10) to a per-test temp path.
 

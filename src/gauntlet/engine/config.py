@@ -568,6 +568,48 @@ class CollectorConfig(BaseModel):
     command: str | list[str] | None = None
 
 
+class NotifyConfig(BaseModel):
+    """Driver-side notifications (#134, rec. 6): the run's own driver pushes
+    every park / halt / fail / gate / completion transition the instant it
+    persists one, so detection latency no longer depends on a resident
+    ``gauntlet serve`` console.
+
+    Per-channel on/off plus the endpoints. Defaults are safe no-ops: Slack and
+    the generic webhook only fire when a URL resolves (here, or from the
+    ``GAUNTLET_SLACK_WEBHOOK`` / ``GAUNTLET_NOTIFY_WEBHOOK`` env fallbacks), and
+    desktop needs ``terminal-notifier``/``osascript`` on PATH. The console's
+    ``web.notify`` block inherits these values when absent, so one block drives
+    both emitters; the per-run ``notifications.jsonl`` ledger keeps them from
+    double-firing. ``GAUNTLET_NOTIFY_DISABLED=1`` is the driver-side kill switch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    desktop: bool = True
+    slack: bool = True
+    webhook: bool = True
+    slack_webhook: str | None = None  # falls back to GAUNTLET_SLACK_WEBHOOK
+    webhook_url: str | None = None  # falls back to GAUNTLET_NOTIFY_WEBHOOK
+    # Optional allowlist of notification kinds (e.g. only gate-reached and
+    # run-failed). Absent = every kind. Validated against the closed kind table.
+    kinds: list[str] | None = None
+
+    @field_validator("kinds")
+    @classmethod
+    def _validate_kinds(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        from gauntlet.engine.notify import ALL_KINDS  # lazy: no import cycle
+
+        unknown = sorted(set(v) - set(ALL_KINDS))
+        if unknown:
+            raise ValueError(
+                f"notify.kinds names unknown kind(s) {unknown}; "
+                f"valid: {list(ALL_KINDS)}"
+            )
+        return list(dict.fromkeys(v))
+
+
 class RunConfig(BaseModel):
     """Top-level `.gauntlet/config.yaml` (FR-2.1, FR-9.1/9.7, F-003 policy)."""
 
@@ -735,6 +777,10 @@ class RunConfig(BaseModel):
     # Optional `review:` block controlling the `gauntlet review` state location
     # (§6, FR-8.3). Absent => the out-of-repo XDG default (zero repo footprint).
     review: ReviewConfig = Field(default_factory=ReviewConfig)
+
+    # Driver-side notifications (#134): every park/halt/fail/gate/completion
+    # transition is pushed by the driver itself. Defaults are safe no-ops.
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
 
     # NOTE: the optional console `web:` block (FR-9.4) is intentionally NOT a
     # field here — console settings stay above the orchestrator (plan ground

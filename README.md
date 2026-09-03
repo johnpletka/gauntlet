@@ -351,9 +351,36 @@ all slugs with live status / current step / cost, drills into each step's
 running steps), assembles the evidence behind a parked gate and offers
 **Approve / Reject** in one place, and classifies a failed/parked run into the
 action that actually applies. It can also launch and abort runs as supervised
-children and survive its own restart by re-attaching to live PIDs, and fire
-desktop / Slack / in-tab notifications on the four moments that need a human
-(gate reached, escalation parked, run failed, run completed).
+children and survive its own restart by re-attaching to live PIDs, and adds an
+in-tab notification channel on top of the driver's own push (below).
+
+**Notifications come from the driver itself.** Every park (gate, escalation,
+decision, usage limit, provider outage, usage window, invalid artifact), halt,
+failure and completion is pushed the instant the driver persists it — to macOS
+desktop, a Slack incoming webhook, and/or a generic JSON webhook — whether or
+not a console is running, so detection latency no longer depends on someone
+being resident (#134). A gate notification carries a pre-built review bundle:
+`git diff --stat` of the reviewed range, finding/triage counts, spend and
+elapsed time, and the exact next command. Emissions are recorded in the run's
+`notifications.jsonl` ledger, which the console consults so the two never
+double-fire. Configure it once in `.gauntlet/config.yaml`:
+
+```yaml
+notify:                      # driver-side push (defaults shown; all opt-out)
+  desktop: true              # terminal-notifier / osascript on macOS
+  slack: true                # fires only when a webhook resolves
+  slack_webhook: null        # or the GAUNTLET_SLACK_WEBHOOK env var
+  webhook: true              # generic JSON POST; fires only when a URL resolves
+  webhook_url: null          # or the GAUNTLET_NOTIFY_WEBHOOK env var
+  # kinds: [gate-reached, escalation-parked, run-failed]   # allowlist; absent = all
+```
+
+Kinds: `gate-reached`, `escalation-parked`, `parked-for-response`,
+`parked-usage-limit`, `parked-provider-unavailable`, `parked-usage-window`,
+`parked-artifact-invalid`, `run-halted`, `run-failed`, `run-completed` (plus the
+console-only advisories `usage-window-warning`, `gate-auto-approved`, and
+`run-orphaned`). `GAUNTLET_NOTIFY_DISABLED=1` silences the driver for one
+invocation. An absent `web.notify` block inherits `notify:`.
 
 `gauntlet run --watch` ensures the console is up (booting or reusing it), prints
 its URL, and **opens the authenticated console in your browser** before running

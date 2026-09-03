@@ -36,6 +36,7 @@ from gauntlet.web.notify import (
     KIND_ESCALATION,
     KIND_FAILED,
     KIND_GATE,
+    KIND_HALTED,
     KIND_WARNING,
     Notification,
     Notifier,
@@ -146,8 +147,10 @@ def test_classify_kind_table():
     assert classify_kind(_event(run_status="done")) == KIND_COMPLETED
 
 
-def test_classify_kind_halt_is_not_a_kind():
-    """FR-9.1: a gate is 'distinct from a halt' — a halted/parked step is no kind."""
+def test_classify_kind_halt_is_its_own_kind_not_a_gate():
+    """FR-9.1: a gate is 'distinct from a halt' — a halt is never gate-reached.
+    Since #134 a halt is pushed under its own kind (`run-halted`) so a
+    budget/timeout/judge halt no longer waits for someone to open the console."""
     halt = _event(
         run_status="parked",
         current_step="impl",
@@ -155,7 +158,8 @@ def test_classify_kind_halt_is_not_a_kind():
         current_step_type="agent_task",
         current_step_notes="timeout halt (FR-3.3): step exceeded 600s",
     )
-    assert classify_kind(halt) is None
+    assert classify_kind(halt) == KIND_HALTED
+    assert classify_kind(halt) != KIND_GATE
 
 
 def test_classify_kind_running_is_not_a_kind():

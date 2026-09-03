@@ -13,6 +13,7 @@ import contextlib
 import getpass
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -4147,7 +4148,7 @@ class RunManager:
                 orch = self._orchestrator(layout, run_dir, pipeline, man,
                                           judge_env={}, adapter_factory=adapter_factory)
                 status = orch.approve_gate(gate, notes)
-                self._maybe_draft_pr(layout, run_dir, man, status)
+                self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
@@ -4193,7 +4194,7 @@ class RunManager:
                                           adapter_factory=adapter_factory)
                 status = orch.reject_gate(gate, notes, user,
                                           allow_terminal=allow_terminal)
-                self._maybe_draft_pr(layout, run_dir, man, status)
+                self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
@@ -4203,7 +4204,7 @@ class RunManager:
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
         status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     # ---- abort --------------------------------------------------------------
@@ -6856,7 +6857,7 @@ class RunManager:
                 # orchestrator is the sole in-drive manifest writer, so this drains
                 # only after driving stops — no concurrent write). Best-effort.
                 self._drain_suspensions(writer, man, run_dir)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     def _drain_suspensions(self, writer, man: Manifest, run_dir: Path) -> None:
@@ -6868,6 +6869,71 @@ class RunManager:
             M.Suspension(start=s.start, end=s.end, gap_s=s.gap_s) for s in intervals
         )
         man.write_atomic(run_dir / "manifest.json")
+
+    def _finish_drive(self, layout, run_dir, man, status: str) -> None:
+        """Everything that follows a drive stopping — on EVERY driving verb
+        (start / resume / auto-resume / approve / reject): draft PR.md at the
+        final-gate pass (FR-9.8), then push the persisted transition to the
+        operator (#134). The notification runs in ``finally`` so a PR-draft
+        failure (which re-raises by design) still announces the state the run
+        actually landed in; a notification can never affect run state.
+        """
+        try:
+            self._maybe_draft_pr(layout, run_dir, man, status)
+        finally:
+            self._notify_transition(layout, run_dir)
+
+    def _driver_notifier(self, layout, run_dir):
+        """The driver-side notifier for this run, or ``None`` when no channel is
+        configured / resolvable or ``GAUNTLET_NOTIFY_DISABLED`` is set (#134).
+
+        De-dups through the run's ``notifications.jsonl`` ledger (shared with a
+        watching console), honors the ``notify.kinds`` allowlist, and attaches
+        the rich gate evidence (diff stat, finding counts, spend, elapsed) to
+        a gate-reached notification. Read-only over the run's persisted state.
+        """
+        from gauntlet.engine import notify as N
+
+        if N.driver_notifications_disabled():
+            return None
+        cfg = self.config.notify
+        channels = N.build_channels(cfg)
+        if not channels:
+            return None
+
+        def summary_for(event, kind):
+            if kind != N.KIND_GATE:
+                return None
+            from gauntlet.engine.gate_evidence import gate_summary
+
+            man = Manifest.load(run_dir / "manifest.json")
+            return gate_summary(
+                man, run_dir=run_dir, slug_dir=layout.slug_dir, repo=self.repo_root,
+            )
+
+        return N.Notifier(
+            channels,
+            ledger_dir_for=lambda _event: run_dir,
+            by=N.EMITTER_DRIVER,
+            kinds=cfg.kinds,
+            summary_for=summary_for,
+        )
+
+    def _notify_transition(self, layout, run_dir) -> None:
+        """Classify the manifest as persisted on disk and emit (fail-soft)."""
+        from gauntlet.engine import notify as N
+
+        try:
+            notifier = self._driver_notifier(layout, run_dir)
+            if notifier is None:
+                return
+            man = Manifest.load(run_dir / "manifest.json")
+            N.emit_driver_notification(man, notifier=notifier)
+        except Exception:  # FR-9.3: never reach run state
+            logging.getLogger(__name__).warning(
+                "driver notification skipped for %s; run state unaffected",
+                run_dir, exc_info=True,
+            )
 
     def _maybe_draft_pr(self, layout, run_dir, man, status: str) -> None:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.
@@ -6985,7 +7051,7 @@ class RunManager:
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
         status = orch.approve_gate(gate, notes)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     def _orchestrator(self, layout, run_dir, pipeline, man, *, judge_env,

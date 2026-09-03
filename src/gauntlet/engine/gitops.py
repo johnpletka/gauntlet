@@ -166,6 +166,7 @@ ROOT_SCOPE: dict[str, str] = {
     "commits_from_head": ROOT_SCOPE_REPO,  # SHA/ref-addressed log read
     "log_range": ROOT_SCOPE_REPO,
     "range_diff": ROOT_SCOPE_REPO,
+    "diff_stat_range": ROOT_SCOPE_REPO,
     "range_diff_path": ROOT_SCOPE_REPO,
     "diff_range_empty": ROOT_SCOPE_REPO,
     "any_tracked_at": ROOT_SCOPE_REPO,
@@ -1304,6 +1305,13 @@ def commits_from_head(
 def range_diff(repo: Path, base: str, head: str) -> str:
     """Diff for the confirm pass / review handoff (`base..head`)."""
     return _run(repo, "diff", f"{base}..{head}")
+
+
+def diff_stat_range(repo: Path, base: str, head: str) -> str:
+    """``git diff --stat base..head`` — the reviewed range's shape for a gate
+    notification (#134). Read-only over the object database; any tree of the
+    repository answers identically."""
+    return _run(repo, "diff", "--stat", f"{base}..{head}")
 
 
 def any_tracked_at(repo: Path, sha: str, paths: list[str]) -> bool:
