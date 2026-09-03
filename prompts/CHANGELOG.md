@@ -33,3 +33,7 @@ apply, so the file reads oldest-first.
   terminal reject (no upstream cycle to iterate) is refused unless the explicit
   `--terminal` flag is given — a flag-less reject can no longer end a run by
   surprise.
+
+- **operator.md** (#147 review): require completed-work evidence and a valid
+  body for manual phase markers; document capability-aware drafting, the
+  100-character validator limit, and read-only preconditions.

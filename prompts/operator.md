@@ -255,7 +255,7 @@ first and only then triages:
    (or the console's timer) reclaims an orphaned driver and fires a due
    schedule. None of these takes a decision a human owns.
 3. **Preflight what a phase will need.** The plan gate refuses approval while a
-   declared `preconditions:` item (data file, env var, provisioning command) is
+   declared `preconditions:` item (data file or env var) is
    unmet, so a phase never parks mid-run on something discoverable up front.
 
 **Pre-authorized decision matrix.** When you operate as an agent, this is the
@@ -438,24 +438,33 @@ left for you.
   for decisions that change something.
 - **`phase-commit` fails "clean worktree, nothing to commit".** The builder's
   `P<N> wip:` checkpoints sit beneath an adopted commit. The engine now lands
-  the empty `P<N>:` marker itself and repairs `base_sha`. If it still fails,
-  the phase has no checkpoints anywhere: the ritual is an empty
-  `git commit --allow-empty -m "P<N>: <title>"` on the run branch in the
-  run worktree, then a plain `resume`.
-- **Commit-message drafter fails on every model.** An oversize phase diff is
-  now handed to the drafter by reference; a header over 72 chars falls back to
-  the plan phase title. If drafting still fails, `gauntlet resume <slug>
-  --response '<full commit message>'` uses your text **verbatim** (no model
-  call) when it is itself a valid message: `P<N>: <≤72-char header>`, blank
-  line, body.
+  the empty `P<N>:` marker itself and preserves the full phase review range.
+  If it still fails, inspect the failure and commit history: missing checkpoints,
+  a wrong phase prefix, or an unprovable run boundary are distinct causes.
+  Do not manufacture a marker for work that has not been completed. Only after
+  verifying the completed phase work in committed history and obtaining human
+  authorization for a manual marker, run in the run worktree on the run branch:
+  `git commit --allow-empty -m "P<N>: <title>" -m "<what changed, why, and relevant FR references>"`,
+  then plain `resume`. Include a substantive body; the empty marker itself is
+  not evidence that the phase is complete.
+- **Commit-message drafter fails on every model.** Oversize changes use git
+  references for repository-capable drafters and bounded inline diff excerpts
+  for tool-less API drafters. Draft headers should stay within 72 characters;
+  the validator allows up to 100, including the phase prefix. Invalid drafts
+  fail after bounded retries; the engine does not substitute a plan title.
+  `gauntlet resume <slug> --response '<full commit message>'` uses your text
+  **verbatim** (no model call) when valid: `P<N>: <header>`, blank line, and a
+  substantive body. Check the actual changes before writing the message.
 - **Failed `tests` step, budget spent, resume refuses "no progress".** A plain
   `resume` now re-arms exactly one more `on_fail` route per human action
   (audited warning `operator resume re-armed on_fail …`). Never cherry-pick
   fixes around the pipeline; if the route fails twice, the cause is real —
   read `logs`.
 - **A phase parks mid-run on a missing data file / env var / provisioning.**
-  Declare it in the plan's `preconditions:`; the plan gate refuses approval
-  until it resolves, and `status` on that gate lists what is unmet.
+  Before plan approval, declare required paths and environment variable names
+  in `preconditions:` and provision them separately. Command items are rejected.
+  The gate refuses while checks are unmet; `status` lists them. If the plan is
+  already approved, surface missing requirements through the plan loop.
 - **Provider outage or usage limit parks, hours of latency.** Set the auto
   knobs (§2a); until then, the deadline `status` prints is the moment to
   `resume` — never `--response`. An `orphaned` run after a host sleep or a
