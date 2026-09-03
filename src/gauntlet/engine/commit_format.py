@@ -25,7 +25,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-HEADER_MAX = 72
+# Enforced ceiling, deliberately looser than the ~72 the drafter prompt asks
+# for (#142): an LLM told a limit is approximately compliant, and a run parking
+# terminally over a header a few characters past a cosmetic convention benefits
+# nobody. The prompt keeps headers conventional; this gate only catches a
+# drafter that ignored the format outright.
+HEADER_MAX = 100
 
 # P<n> | PRD | PLAN | REVIEW, optionally .<round> or .r<round>, then ": " + summary.
 _PREFIX = r"(?:P\d+|PRD|PLAN|REVIEW)"
@@ -41,7 +46,8 @@ def validate_commit_message(message: str) -> FormatError | None:
     """Return ``None`` if the message is well-formed, else a :class:`FormatError`.
 
     Rules (single source of truth for the engine's reject + redraft loop):
-    1. A header line matching the ``PN[.x|.rx]: summary`` shape, ≤ 72 chars.
+    1. A header line matching the ``PN[.x|.rx]: summary`` shape, ≤ ``HEADER_MAX``
+       chars (the prompt asks for ~72; the gate allows 100 — #142).
     2. A blank second line.
     3. A non-empty body (the reasoning — what/why, refs, deferrals).
     """

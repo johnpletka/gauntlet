@@ -2755,10 +2755,14 @@ def _plan_section(step: Step, ctx: StepContext) -> str:
 
 _DEFAULT_COMMIT_PROMPT = (
     "Draft a git commit message for the staged changes. Line 1: an imperative "
-    "header prefixed with the phase, e.g. 'P3: <summary>', at most 72 chars. "
+    "header prefixed with the phase, e.g. 'P3: <summary>', under 72 characters. "
     "Then a blank line, then a body explaining what changed and why, the plan "
     "assumption validated, and relevant FR references."
 )
+# The prompt asks for < 72 (the git convention) while the engine enforces
+# HEADER_MAX (100) — the gap is deliberate (#142): a drafter told the exact
+# enforced limit aims at it and lands a few characters over, burning every
+# redraft and parking the run over a cosmetic rule.
 
 
 # --- helpers -----------------------------------------------------------------
