@@ -121,6 +121,9 @@ def test_llm_decision_carries_usage_into_audit(tmp_path):
     assert d.usage == {
         "input_tokens": 12, "output_tokens": 3,
         "cached_input_tokens": None, "cost_usd": 0.002,
+        # Raw provider counters (cost-metrics): carried on every Usage, None
+        # when the provider reports none — so they ride into the audit too.
+        "cache_creation_input_tokens": None, "reasoning_output_tokens": None,
     }
     line = json.loads(audit.read_text().splitlines()[0])
     assert line["usage"]["cost_usd"] == 0.002

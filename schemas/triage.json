@@ -43,7 +43,7 @@
         },
         "target_artifact": {
           "type": ["string", "null"],
-          "description": "null unless the fix lands in a different artifact than the one reviewed (e.g. a plan finding implicating the PRD); set, FR-10.4 upstream-invalidation routing becomes explicit instead of inferred from reasoning text. Required-but-nullable for native structured-output strict mode (see findings.json note)."
+          "description": "null unless the fix lands in a different, already-approved artifact than the one reviewed (e.g. a plan finding implicating the PRD); set, FR-10.4 upstream-invalidation routing becomes explicit instead of inferred from reasoning text. When set it is that artifact's file name (e.g. \"prd.md\") — never the artifact under review, and never a description of a downstream deliverable such as a test suite; when in doubt, null. Required-but-nullable for native structured-output strict mode (see findings.json note)."
         },
         "escalated": {
           "type": "boolean",

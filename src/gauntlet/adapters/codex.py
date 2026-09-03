@@ -354,6 +354,7 @@ class CodexAdapter:
             output_tokens=totals.get("output_tokens"),
             cached_input_tokens=totals.get("cached_input_tokens"),
             cost_usd=None,
+            reasoning_output_tokens=totals.get("reasoning_output_tokens"),
         )
 
     def _partial_result(self, out: ProcessOutput) -> AgentResult:

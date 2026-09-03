@@ -3,7 +3,7 @@
 - model: `gpt-5-mini`
 - corpus: `prompts/triage-corpus.jsonl` (37 hand-labeled findings)
 - verdict agreement: **94.6%** (35/37; exit ≥ 85%)
-- action agreement (secondary): 91.9%
+- action agreement (secondary): 89.2%
 - blocking→reject misses without escalation: **0** (exit: zero)
 - blocking→reject misses caught by escalation: 0
 - exit criteria: **PASS**
@@ -32,8 +32,8 @@
 
 ## Disagreements
 
-- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence high) — Unrestricted plugin/entry-point loading creates an unbounded code-execution surface; for a fail-closed safety harness this is a material security risk that can lead to unauthorized code execution or supply-chain attacks. The plan must define trust boundaries (allowlisting, version pinning, signing/audit requirements and warnings) before exposing dynamic extension loading.
-- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence medium) — Committing raw events.jsonl by default can leak large or sensitive payloads and pollute repositories; this is a real spec/design gap around data-handling defaults. The plan should be updated to make raw-stream commits opt-in or document filtering/consent, but it is a plan-level decision rather than an immediate code fix so it can be deferred to a plan revision.
+- `plan-F-008` (major): labeled **premature_optimization**, model said **legitimate** (confidence medium) — Allowing third-party adapters and step entry points without defined trust boundaries, allowlisting, version pinning, or explicit warnings creates an unbounded code-execution surface for a safety-critical harness. The plan should address these controls now (auditability, allowlist/pinning, and fail-closed behavior) before exposing runtime plugin loading.
+- `plan-OQ-2` (minor): labeled **bikeshedding**, model said **legitimate** (confidence medium) — Committing raw events.jsonl by default can leak sensitive content and bloat repositories; that is a real operational/privacy risk. The plan should explicitly change the default to ignore raw streams or make inclusion opt-in to align with a fail-closed safety posture.
 
 ## Corpus caveat (recorded honestly)
 

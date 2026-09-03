@@ -621,7 +621,7 @@ def latest_cycle_round_commit(
             candidates.append(cp.result_sha)
         if cp.handoff_sha:
             candidates.append(cp.handoff_sha)
-    # #131: when a sanctioned recovery reconciliation has re-linearized the
+    # #132: when a sanctioned recovery reconciliation has re-linearized the
     # branch, ``rec.base_sha`` can be a commit no longer reachable from the
     # tip. The predates-the-boundary filter below would then disqualify EVERY
     # candidate (nothing descends from an orphaned commit), collapsing the
@@ -665,7 +665,7 @@ def latest_cycle_round_commit(
 def tree_equal_reachable_commit(
     repo: Path, sha: str | None, *, tip: str
 ) -> str | None:
-    """Newest commit reachable from ``tip`` whose TREE is identical to ``sha``'s (#131).
+    """Newest commit reachable from ``tip`` whose TREE is identical to ``sha``'s (#132).
 
     A sanctioned recovery reconciliation (fork preservation + a linear
     ``commit-tree`` restore) carries a commit's exact tree forward under a new
@@ -674,6 +674,13 @@ def tree_equal_reachable_commit(
     but unreachable by sha. This resolves the orphan to its reachable tree
     twin. ``sha`` itself is returned when it is already reachable; ``None``
     when it does not resolve or no twin exists. Read-only and fail-closed.
+
+    Preservation gate: an orphan resolves ONLY when some ref still contains
+    it — the evidence a sanctioned reconciliation leaves behind (the
+    ``<run-branch>-fork-<tip>`` preservation ref, or any other ref). A
+    dangling sha is unpreserved history that no sanctioned verb produced, so
+    tree equality alone must not launder it past the fork guard; it stays
+    unresolved and the caller's own refusal governs.
     """
     if not sha:
         return None
@@ -682,17 +689,12 @@ def tree_equal_reachable_commit(
             return None
         if sha == tip or gitops.is_ancestor(repo, sha, tip):
             return sha
+        if not gitops.refs_containing(repo, sha):
+            return None  # unpreserved orphan: fail closed
         want = gitops.rev_parse(repo, f"{sha}^{{tree}}")
-        listing = gitops._run(  # noqa: SLF001 — engine-internal module pair
-            repo, "log", "--format=%H %T", tip
-        )
-        for line in listing.splitlines():
-            commit_sha, _, tree = line.strip().partition(" ")
-            if tree == want:
-                return commit_sha
+        return gitops.first_commit_with_tree(repo, tip, want)
     except gitops.GitError:
         return None
-    return None
 
 
 def build_progress_fingerprint(

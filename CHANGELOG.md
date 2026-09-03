@@ -6,6 +6,46 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `gauntlet report` now ends with a clock-time section answering "where did
+  the time go?": the run's overall wall-clock span split into disjoint agent
+  time (the union of adapter-call intervals), parked (by park reason — gate,
+  usage limit, response,
+  provider unavailable — replayed from the run's state journal, never
+  estimated), host-suspended, and the remaining engine/git/test/gap time; plus
+  clock time per step (with a review/triage/fix/confirm/verify breakdown for
+  each cycle), per agent profile (mapped to its adapter/model) and per
+  activity pooled across cycles. Per-profile/activity rows retain
+  **agent-seconds**, so concurrent work stays visible without corrupting the
+  overall remainder. The evidence is a new append-only
+  `invocations` list on each manifest step record — one engine-measured
+  entry (UTC start/end, wall seconds, agent, label, outcome, attempt) per
+  adapter call — so a CLI that exports no timing of its own (Codex) is
+  measured exactly like one that does (Claude Code). Failed, malformed and
+  retried calls are recorded too: their time is real time. Runs recorded
+  before this change show `—` for agent time; runs without a journal show `—`
+  for parked time.
+
+- Each invocation also freezes the **adapter, model and effort** that actually
+  ran (from the profile and the built adapter, with any step-/cycle-level
+  `effort:` override), so a later `config.yaml` edit can never re-attribute a
+  past run; the time report shows what ran rather than what is configured
+  today. The raw provider token counters that the dollar figure hides under
+  subscription auth are now carried through every accumulator into the
+  manifest (per step, per profile, run totals) and the cost report:
+  prompt-cache **writes** (Claude Code `cache_creation_input_tokens`) and
+  **reasoning output** (Codex `reasoning_output_tokens`, API
+  `completion_tokens_details.reasoning_tokens`; the API adapter also picks up
+  `prompt_tokens_details.cached_tokens`). All additive; older manifests load
+  with zeros.
+
+- `gauntlet run` snapshots the **effective run configuration** into the run
+  dir as `config.yaml` beside `pipeline.yaml` — every profile's adapter, model,
+  effort, timeouts, tool allowlists and sandbox mode with defaults made
+  explicit, written through the redacting writer. Evidence only: the engine
+  never reads it back.
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed

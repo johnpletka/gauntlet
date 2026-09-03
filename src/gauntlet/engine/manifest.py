@@ -253,6 +253,10 @@ class UsageTotals(BaseModel):
     output_tokens: int = 0
     cached_input_tokens: int = 0
     cost_usd: float | None = None  # None until at least one priced call (§12 Q3)
+    # Raw provider counters (see ``adapters.base.Usage``): prompt-cache writes
+    # and reasoning output. Additive — older manifests load with 0.
+    cache_creation_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
 
     def add(self, usage: Any | None) -> None:
         if usage is None:
@@ -262,6 +266,10 @@ class UsageTotals(BaseModel):
         self.cached_input_tokens += usage.cached_input_tokens or 0
         if usage.cost_usd is not None:
             self.cost_usd = (self.cost_usd or 0.0) + usage.cost_usd
+        self.cache_creation_input_tokens += (
+            getattr(usage, "cache_creation_input_tokens", None) or 0
+        )
+        self.reasoning_output_tokens += getattr(usage, "reasoning_output_tokens", None) or 0
 
 
 class HumanResponse(BaseModel):
@@ -379,6 +387,50 @@ class Checkpoint(BaseModel):
     handoff_sha: str
     artifact: str | None = None
     result_sha: str | None = None
+
+
+# --- per-invocation clock-time evidence (cost-metrics: timing) ---------------
+# Outcome vocabulary for one adapter call, as the engine observed it. ``ok`` is
+# a returned result (the caller may still reject its structured output later);
+# the rest map the adapter error the call raised. Written by
+# :func:`gauntlet.engine.timing.record_invocation`, never inferred afterwards.
+INVOCATION_OUTCOMES = (
+    "ok", "malformed", "failed", "timeout", "vanished", "session_not_found",
+    "error",
+)
+
+
+class Invocation(BaseModel):
+    """One adapter call the engine made on behalf of a step — clock-time evidence.
+
+    ``started``/``ended`` are the engine's own UTC stamps around the call and
+    ``wall_s`` its monotonic wall-clock width, so the record is identical in
+    shape and trustworthiness for every adapter: a CLI that exports no timing
+    of its own (codex) is measured exactly like one that does (claude-code).
+    ``label`` names the work the call did — a cycle sub-step (``r1-review``,
+    ``r1-triage``, ``r1-fix``, ``r1-confirm``, ``r1-verify``, an ensemble
+    member's ``r1-review-<member>``), a single-agent step's ``call`` (with the
+    repair/retry suffix of its evidence files), or ``commit-message`` for the
+    phase-commit drafter. ``attempt`` is the step attempt the call ran under.
+    ``adapter`` / ``model`` / ``effort`` are FROZEN from the profile (and the
+    built adapter) at call time, so a later config edit can never re-attribute
+    a past call: the report and ledger read the model that ran, not the one
+    configured today.
+    Append-only across attempts, resumes and re-drives: a failed or wasted
+    call's time is real time, so ``gauntlet report`` can show where a run's
+    clock went. Additive — older manifests load with an empty list.
+    """
+
+    agent: str | None = None
+    label: str
+    started: str
+    ended: str
+    wall_s: float
+    outcome: str = "ok"
+    attempt: int = 0
+    adapter: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
 
 class StepRecord(BaseModel):
@@ -511,6 +563,12 @@ class StepRecord(BaseModel):
     # was never checkpoint-recovered. Additive/nullable — older manifests load
     # unchanged.
     resumed_from_checkpoint: str | None = None
+    # Per-adapter-call clock-time evidence (see :class:`Invocation`): every
+    # call the engine made for this step, in the order it finished, across
+    # every attempt. ``gauntlet report`` aggregates these into per-step,
+    # per-profile and per-activity clock time. Additive/append-only — older
+    # manifests load with an empty list.
+    invocations: list[Invocation] = Field(default_factory=list)
 
 
 class CommitRecord(BaseModel):

@@ -2332,7 +2332,7 @@ class Orchestrator:
                 except gitops.GitError:
                     subject = None
                 return sha, subject
-            # #131: an orphaned base_sha (post-reconciliation linearized
+            # #132: an orphaned base_sha (post-reconciliation linearized
             # history) would be refused by the rewind executor as "not an
             # ancestor of the tip". Its reachable tree twin names the same
             # bytes under a reachable sha, so the rewind stays semantically
