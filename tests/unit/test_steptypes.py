@@ -780,7 +780,9 @@ def test_redraft_feedback_echoes_header_and_exact_count(fixture_repo):
     """The rejection feedback quotes the offending header line with its exact
     character count and the prefix-inclusive rule (#134) — a bare "78 chars"
     left models re-submitting 74."""
-    long_header = "P1: " + "x" * 106  # 80 chars
+    from gauntlet.engine.commit_format import HEADER_MAX
+
+    long_header = "P1: " + "x" * 106  # 110 chars: past the enforced ceiling (#142)
 
     class Drafter:
         capabilities = FakeAdapter.capabilities
@@ -801,7 +803,7 @@ def test_redraft_feedback_echoes_header_and_exact_count(fixture_repo):
     feedback = drafter.prompts[1]
     assert repr(long_header) in feedback
     assert "110 characters" in feedback
-    assert "the limit is 100 counting the 'P<N>: ' prefix" in feedback
+    assert f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix" in feedback
     assert "header is 110 chars" in feedback  # the validator's own reason, too
 
 

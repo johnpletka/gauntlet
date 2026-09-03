@@ -40,3 +40,6 @@ apply, so the file reads oldest-first.
   body must stay free of the diff, and how to draft when the engine hands an
   oversize diff BY REFERENCE (`diff --stat` inline, per-file diffs read with
   git) instead of inlining it.
+
+- **commit-message.md** (#141 review): retain the updated guidance to aim under
+  72 characters while making the enforced 100-character ceiling explicit.

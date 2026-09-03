@@ -2096,8 +2096,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
     squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
-    # Drafting side-notes (#134): "diff handed by reference", "header
-    # bounded inline for tool-less drafting" — surfaced on the step record so
+    # Drafting side-notes (#134): by-reference or bounded inline evidence — surfaced on the step record so
     # an operator reading `gauntlet status` sees WHY a commit message looks the
     # way it does (data over inference), never inferred from the message.
     draft_notes: list[str] = []
