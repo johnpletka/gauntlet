@@ -74,6 +74,23 @@ All notable changes to Gauntlet are recorded here. The format follows
   boundary and upgraded with an audited manifest warning when the tree is
   provably clean against the attempt's `base_sha`; side-effecting or unprovable
   failures stay terminal exactly as before (#121).
+- A failed `shell` step that declares an `on_fail` route (the standard
+  pipeline's `tests`) no longer strands the run once its retry budget is spent.
+  A plain `gauntlet resume` used to re-execute the same failing command, fail
+  identically, and trip the R5 no-progress guard naming only `abort` — so
+  operators reached for git surgery instead of the route the pipeline already
+  declares. A plain resume is a human action: it now re-arms exactly one more
+  route through the same reset the in-budget path uses (the route target and
+  everything after it go pending, `base_sha` and stale cycle checkpoints are
+  cleared), records an audited manifest warning (`operator resume re-armed
+  on_fail for <step> (route_to=<target>, re-arm #k)`), and drives; each later
+  plain resume after another exhaustion re-arms again and increments `k`. Shell
+  steps without `on_fail` keep today's refusals (including the #121 dirty-tree
+  case), and the no-progress refusal now names each safe action's executable
+  form, including the re-arm when a route exists. `tests-recheck` in the
+  standard pipeline gains `on_fail: {route_to: impl-cycle, max_retries: 1}`, so
+  a post-cycle test failure routes back to the cycle that changed the tree
+  instead of terminating the run (#134).
 
 ## [1.1.1] — 2026-08-12
 

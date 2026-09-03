@@ -883,7 +883,12 @@ class NoProgressError(RuntimeError):
         self.after = after
         self.safe_actions = safe_actions
         self.unchanged_fields = tuple(type(before).model_fields)
-        actions = ", ".join(action.kind.value for action in safe_actions)
+        # Name each action's executable form, not only its kind (#134): the
+        # kind alone ("retry, abort") sent operators to git surgery when the
+        # description already said which verb re-arms the step.
+        actions = "; ".join(
+            f"{action.kind.value} — {action.description}" for action in safe_actions
+        )
         super().__init__(
             "recovery made no progress: run/step, branch, index, worktree, "
             f"artifact, response, and cycle state are unchanged ({before.digest}); "
