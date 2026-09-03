@@ -142,6 +142,26 @@ All notable changes to Gauntlet are recorded here. The format follows
   validator allows 100 characters (the prompt targets 72); invalid drafts
   fail after bounded retries without synthesizing a replacement title.
   The failure names the verbatim `resume --response` override (#134).
+- **`gauntlet resume --accept-artifacts`** — first-class artifact ratification
+  (#134, rec. 3). An FR-10.4 escalation (`parked_for_response`) could only be
+  resolved with `--response "<prose>"`, which a disposition model classifies;
+  acceptance prose carrying imperative verbs was routinely classified
+  `amendment_required` and re-parked, costing a full park round-trip for a
+  decision that was never a prose question. The structured form records the
+  sha256 of each governed artifact on the authoring surface (`prd.md`,
+  `plan.md`) as ratified — an additive `ratified_artifacts` list on the
+  manifest plus a `kind: accept_artifacts` response entry whose text is
+  engine-generated from the digests — and both disposition gates (cycle and
+  agent_task) short-circuit that entry to `proceed_in_place` with zero model
+  calls (the engine-authored disposition still passes the same fail-closed
+  oracle), settling the prior round's upstream question exactly as a routed
+  proceed does (#106). A digest that differs from the run's last-known
+  approved one (a prior ratification, else the bytes committed on the run
+  branch) is recorded loudly — a manifest warning and a CLI `AUDIT:` line —
+  never refused (manual governed-artifact edits are sanctioned in recovery).
+  Mutually exclusive with `--response`; refused unless the run is
+  `parked_for_response` on a respondable step. `status` and the operator
+  playbook name it beside `--response`.
 
 ## [1.2.0] — 2026-08-18
 

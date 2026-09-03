@@ -743,7 +743,22 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # cycle re-drives with the decision injected, unchanged).
     disposition_agent = step.get("disposition_agent")
     settled_upstream: set[tuple[str, str]] = set()
-    if is_response_redrive and disposition_agent:
+    from gauntlet.engine.steptypes import pending_response_kind
+
+    if is_response_redrive and pending_response_kind(ctx) == "accept_artifacts":
+        # #134: a structured ratification (`resume --accept-artifacts`) is
+        # proceed_in_place by construction — no prose to classify, so the
+        # disposition emitter is never invoked (zero model calls). The prior
+        # round's upstream question is settled exactly as a routed proceed
+        # settles it (#106), and the roles re-drive against the ratified
+        # artifacts with the decision block injected as usual.
+        settled_upstream = _prior_upstream_fingerprints(ctx)
+        step_logger(ctx, "response-disposition").log_text(
+            "disposition-ratified.txt",
+            "engine: --accept-artifacts ratification → proceed_in_place; "
+            "disposition agent not invoked",
+        )
+    elif is_response_redrive and disposition_agent:
         # Snapshot the exact upstream question BEFORE fresh review invalidates
         # the prior round's findings/triage artifacts.  A proceeding disposition
         # settles only this (finding-root, target-artifact) pair; a genuinely new

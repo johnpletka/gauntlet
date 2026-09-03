@@ -3165,7 +3165,7 @@ class RunManager:
                use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None,
                auto_sleep=None, reset_interrupted: bool = False,
-               same_tree: bool = False) -> str:
+               same_tree: bool = False, accept_artifacts: bool = False) -> str:
         """One resume, then in-process auto-resume of a usage-limit or
         provider-unavailable park (FR-3.4 / #134).
 
@@ -3186,6 +3186,7 @@ class RunManager:
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
             reset_interrupted=reset_interrupted, same_tree=same_tree,
+            accept_artifacts=accept_artifacts,
         )
         # NOTE: reset_interrupted is deliberately NOT forwarded to the
         # auto-resume continuation — it is a one-shot operator decision for
@@ -3212,7 +3213,8 @@ class RunManager:
                      use_judge: bool = True, adapter_factory=None,
                      extra_context: dict | None = None, clock=None,
                      reset_interrupted: bool = False,
-                     same_tree: bool = False) -> str:
+                     same_tree: bool = False,
+                     accept_artifacts: bool = False) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
@@ -3269,6 +3271,7 @@ class RunManager:
                     response=response, use_judge=use_judge,
                     adapter_factory=adapter_factory, extra_context=extra_context,
                     clock=clock, reset_interrupted=reset_interrupted,
+                    accept_artifacts=accept_artifacts,
                 )
         finally:
             self._release_worktree_lock(handle)
@@ -3317,6 +3320,7 @@ class RunManager:
         self, layout: "RunLayout", run_dir: Path, man: Manifest, paths: RunPaths,
         *, response: str | None, use_judge: bool, adapter_factory,
         extra_context: dict | None, clock, reset_interrupted: bool,
+        accept_artifacts: bool = False,
     ) -> str:
         """The body of one resume, with the drive lock held and roots resolved."""
         # P3 (plan §4.3): a recovery transaction killed between its intent
@@ -3400,7 +3404,10 @@ class RunManager:
         # FR-7.1 idempotent recovery). All validation and operator-identity
         # resolution happen HERE, before driving; the orchestrator only
         # applies an already-validated, fail-closed decision.
-        action = self._plan_response_action(man, response, pipeline)
+        action = self._plan_response_action(
+            man, response, pipeline, accept_artifacts=accept_artifacts,
+            layout=layout,
+        )
         return self._drive(
             layout, run_dir, pipeline, man,
             use_judge=use_judge, adapter_factory=adapter_factory,
@@ -4002,7 +4009,8 @@ class RunManager:
         return datetime.now(timezone.utc)
 
     def _plan_response_action(
-        self, man: Manifest, response: str | None, pipeline=None
+        self, man: Manifest, response: str | None, pipeline=None, *,
+        accept_artifacts: bool = False, layout=None,
     ) -> ResponseAction:
         """Validate `gauntlet resume [--response]` and decide the transition.
 
@@ -4028,6 +4036,12 @@ class RunManager:
             )
 
         # No pending entry.
+        if accept_artifacts:
+            if response is not None:
+                raise ValueError(
+                    "--accept-artifacts and --response are mutually exclusive"
+                )
+            return self._plan_accept_artifacts(man, layout)
         if response is None:
             # FR-1.1 / FR-10.4: a response-resolvable park REQUIRES --response —
             # the builder's UPSTREAM CONFLICT (agent_task) AND a reviewer-surfaced
@@ -4135,6 +4149,66 @@ class RunManager:
         return ResponseAction(
             kind="append", step_id=stuck.id, iteration=stuck.iteration,
             text=response, user=user,
+        )
+
+    def _plan_accept_artifacts(self, man: Manifest, layout) -> ResponseAction:
+        """Plan a `resume --accept-artifacts` ratification (#134, rec. 3).
+
+        Valid ONLY for a run parked awaiting a decision (``parked_for_response``
+        on a respondable step): the operator states that the governed
+        artifacts as they stand on the authoring surface (the slug dir in the
+        operator's checkout) ARE the approved artifacts. The digests are
+        computed here; the orchestrator persists them beside the response
+        entry. The drift audit compares against the run's last-known approved
+        digest — a prior ratification, else the bytes committed on the run
+        branch — and a difference is recorded loudly (manifest warning), never
+        refused: manual governed-artifact edits are a sanctioned recovery
+        workflow (R9).
+        """
+        from gauntlet.engine import ratification as RT
+
+        parked = self._parked_step(man)
+        reason = (
+            M.normalize_parked_reason(parked.parked_reason, parked.type, parked.status)
+            if parked is not None else None
+        )
+        if (
+            man.status != M.RUN_PARKED
+            or parked is None
+            or reason not in M.RESPONSE_RESOLVABLE_PARK_REASONS
+            or parked.type not in M.RESPONDABLE_STEP_TYPES
+        ):
+            raise ValueError(
+                "--accept-artifacts applies only to a run parked awaiting a "
+                "decision (parked_for_response on an agent_task / "
+                "adversarial_cycle step); this run is "
+                f"{man.status}" + (
+                    f" at step '{parked.id}' ({parked.type}, "
+                    f"{reason or 'no park reason'})" if parked is not None else ""
+                ) + ". Use --response, approve/reject, or a plain resume as "
+                "the state requires."
+            )
+        layout = layout or self.layout(man.slug)
+        known: dict[str, str] = {}
+        for entry in man.ratified_artifacts:  # latest per name wins
+            known[entry.name] = entry.sha256
+        for name in RT.GOVERNED_ARTIFACT_NAMES:
+            if name in known:
+                continue
+            relpath = str(Path(self.config.run_root) / man.slug / name)
+            try:
+                committed = gitops.file_bytes_at_commit(self.repo_root, man.branch, relpath)
+            except gitops.GitError:
+                committed = None
+            if committed is not None:
+                known[name] = RT.digest_bytes(committed)
+        plan = RT.plan_ratification(layout.slug_dir, known=known)
+        user = resolve_operator_identity(self.repo_root)
+        return ResponseAction(
+            kind="append", step_id=parked.id, iteration=parked.iteration,
+            text=plan.text, user=user,
+            response_kind=M.RESPONSE_KIND_ACCEPT_ARTIFACTS,
+            ratified=tuple(plan.digests),
         )
 
     @staticmethod

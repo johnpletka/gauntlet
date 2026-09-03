@@ -117,7 +117,7 @@ _MEANING: dict[str, str] = {
     STATE_ORPHANED: "manifest says running but the driver is gone; the lock is reclaimable",
     STATE_INDETERMINATE: "cannot prove the driver is alive or dead — inspect read-only before acting",
     STATE_PARKED_GATE: "awaiting a human decision at a gate",
-    STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision",
+    STATE_PARKED_FOR_RESPONSE: "awaiting a `resume --response` decision (or `resume --accept-artifacts` to ratify the artifacts as they stand)",
     STATE_PARKED_USAGE_LIMIT: "paused by a provider usage limit — `resume` continues the session",
     STATE_PARKED_USAGE_WINDOW: "parked before a step to stay within the provider usage window — `resume` retries once it replenishes",
     STATE_PARKED_ARTIFACT_INVALID: "a validated artifact is malformed — hand-edit it, then `resume` re-runs the validator",
@@ -499,7 +499,12 @@ def _decide_reject(slug: str, *, gate_cycle_id: str | None = None) -> Action:
 def _decide_resume_response(slug: str) -> Action:
     return Action("resume --response", "decide",
                   ["gauntlet", "resume", slug, "--response"], ["response"], False,
-                  f'gauntlet resume {slug} --response "<your decision>"')
+                  f'gauntlet resume {slug} --response "<your decision>"',
+                  consequence=(
+                      "records and classifies your prose decision; to ratify "
+                      "the artifacts exactly as they stand instead, "
+                      f"`gauntlet resume {slug} --accept-artifacts` (#134)"
+                  ))
 
 
 def _control_reset_interrupted(slug: str) -> Action:

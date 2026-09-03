@@ -367,6 +367,30 @@ def _refuse_inside_run_worktree(cwd: Path) -> None:
     raise typer.Exit(1)
 
 
+def _echo_ratification_audit(mgr, slug: str) -> None:
+    """Print what `--accept-artifacts` recorded, from the manifest (#134).
+
+    Data over inference: the digests and any drift warning are read back from
+    the persisted manifest — the same record `status`/`report` show — so the
+    CLI never narrates something the run did not record. Loud on drift.
+    """
+    from gauntlet.engine.manifest import Manifest
+
+    try:
+        man = Manifest.load(mgr.layout(slug).active_run_dir() / "manifest.json")
+    except (OSError, ValueError):
+        return
+    if not man.ratified_artifacts:
+        return
+    last_id = man.ratified_artifacts[-1].response_id
+    for entry in man.ratified_artifacts:
+        if entry.response_id == last_id:
+            typer.echo(f"ratified {entry.name} sha256={entry.sha256} ({entry.response_id})")
+    for warning in man.warnings:
+        if warning.startswith(f"artifact ratification {last_id}:"):
+            typer.echo(f"AUDIT: {warning}", err=True)
+
+
 def _manager() -> "object":
     from gauntlet.engine.run import RunManager
 
@@ -1451,6 +1475,17 @@ def resume(
              "persisted, and never applied automatically. A no-op for a run "
              "already in same_tree mode.",
     ),
+    accept_artifacts: bool = typer.Option(
+        False, "--accept-artifacts",
+        help="Structured ratification for a parked_for_response park (#134): "
+             "record that the governed artifacts (prd.md / plan.md) as they "
+             "stand in the run dir ARE the approved artifacts, by sha256 "
+             "digest, and re-drive with proceed_in_place — no prose is "
+             "classified, no disposition model runs. Mutually exclusive with "
+             "--response. A digest that differs from the run's last-known "
+             "approved one is recorded LOUDLY (audit line + manifest warning), "
+             "never refused.",
+    ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
@@ -1465,6 +1500,12 @@ def resume(
     `gauntlet resume --response` (FR-3.2), not only `gauntlet review --response`.
     """
     mgr = _manager()
+    if accept_artifacts and response is not None:
+        typer.echo(
+            "error: --accept-artifacts and --response are mutually exclusive",
+            err=True,
+        )
+        raise typer.Exit(2)
     review_dir = _locate_review_run(mgr, slug)
     if review_dir is not None:
         _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
@@ -1473,7 +1514,10 @@ def resume(
         status = mgr.resume(
             slug, response=response, use_judge=not no_judge,
             reset_interrupted=reset_interrupted, same_tree=same_tree,
+            accept_artifacts=accept_artifacts,
         )
+        if accept_artifacts:
+            _echo_ratification_audit(mgr, slug)
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and

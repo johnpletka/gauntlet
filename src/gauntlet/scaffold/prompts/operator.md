@@ -45,7 +45,11 @@ behind that output. Drive every decision off the reported state class:
   (reject feeds the note back into the upstream review cycle as a new round — see §3).
 - **`parked_for_response`** — the run is awaiting `resume --response`: a builder
   `UPSTREAM CONFLICT` or a review-cycle escalation its own loop could not settle.
-  Action: `gauntlet resume <slug> --response "<decision>"`.
+  Action: `gauntlet resume <slug> --response "<decision>"` for a genuine
+  decision, or `gauntlet resume <slug> --accept-artifacts` when the decision is
+  "the PRD/plan as they stand are approved — proceed" (#134): the structured
+  form records the artifact digests and re-drives as proceed_in_place with no
+  prose classification, so it can never be re-parked as an amendment request.
 - **`parked_usage_limit`** — a provider usage limit interrupted an agent (or a
   cycle sub-agent) mid-step. This is a pause, not a failure: the worktree is
   untouched and the agent's session id is preserved. Action: plain `gauntlet
@@ -274,7 +278,12 @@ own worktree off the branch's tip — never adopt or edit the run's.
   the judge like `approve`.
 - **Respond** to a `parked_for_response` park with the human's decision:
   `gauntlet resume <slug> --response "<decision>"`. The text is passed verbatim
-  to the agent that re-evaluates the conflict; be specific.
+  to the agent that re-evaluates the conflict; be specific. **Phrasing trap:**
+  a response that *states* acceptance but contains imperative verbs ("record
+  these digests…", "implement it as written") is routinely classified
+  `amendment_required` and re-parked. For pure acceptance use
+  `--accept-artifacts` instead; keep `--response` for decisions that change
+  something.
 
 ## 4. Recovery (the wedged live driver)
 
