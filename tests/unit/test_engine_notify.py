@@ -518,3 +518,22 @@ def test_malformed_delivery_identity_and_channels_are_ignored(tmp_path):
     ledger = N.NotificationLedger(path)
     assert ledger.keys() == {tuple(key)}
     assert not ledger.delivered(tuple(key), "webhook")
+
+
+@pytest.mark.parametrize("unavailable", ["module", "filesystem"])
+def test_delivery_survives_unavailable_advisory_lock(tmp_path, monkeypatch, unavailable):
+    if unavailable == "module":
+        monkeypatch.setattr(N, "fcntl", None)
+    else:
+        from types import SimpleNamespace
+        def unsupported(*args):
+            raise OSError("advisory locking unavailable")
+        monkeypatch.setattr(N, "fcntl", SimpleNamespace(
+            flock=unsupported, LOCK_EX=1, LOCK_NB=2))
+    channel = _Capture()
+    notifier = N.Notifier([channel], ledger_dir_for=lambda event: tmp_path)
+    event = _event(_parked(M.PARKED_REASON_GATE, step_type="human_gate"))
+    notifier.notify_transition(event)
+    notifier.notify_transition(event)
+    assert len(channel.sent) == 1
+    assert N.NotificationLedger.for_run_dir(tmp_path).entries()[0]["status"] == "delivered"

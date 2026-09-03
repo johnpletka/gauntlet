@@ -36,7 +36,6 @@ can never affect a run — the notifier owns no run state.
 from __future__ import annotations
 
 import json
-import fcntl
 import hashlib
 import time
 from contextlib import contextmanager
@@ -49,6 +48,11 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: notifications still work; ledger de-dup is best-effort
+    fcntl = None
 
 import httpx
 from pydantic import BaseModel, Field
@@ -733,6 +737,9 @@ class NotificationLedger:
     @contextmanager
     def delivery_lock(self, channel: str):
         """Serialize check/send/ack across driver and console, with a bound."""
+        if fcntl is None:
+            yield
+            return
         suffix = hashlib.sha256(channel.encode()).hexdigest()[:12]
         path = self.path.with_name(f"{self.path.name}.{suffix}.lock")
         try:
@@ -752,6 +759,11 @@ class NotificationLedger:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("notification delivery lock timed out")
                     time.sleep(0.02)
+                except OSError:
+                    # A filesystem without advisory locking must not silence
+                    # notifications. Successful deliveries still get recorded.
+                    yield
+                    return
             yield
         finally:
             handle.close()
