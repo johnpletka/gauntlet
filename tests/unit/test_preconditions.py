@@ -1,7 +1,7 @@
 """Plan-declared environmental preconditions (#134, rec. 7).
 
 The parser fails closed on a malformed item, the resolver is pure over an
-injected environment and command runner, the plan gate refuses approval while
+injected environment, the plan gate refuses approval while
 any item is unmet (`--skip-preflight` audits instead), and a step declaring
 `preconditions_from: plan` fails as a re-runnable precondition before its
 handler runs — nothing invoked — until the operator satisfies the item.
@@ -28,12 +28,10 @@ def test_parse_each_kind_and_labels():
     items = PC.parse_preconditions([
         {"path": "data/bundle.parquet", "description": "staged by ops"},
         {"env": "OPENAI_API_KEY"},
-        {"command": "true", "timeout_s": 5},
     ], scope="P2")
-    assert [i.kind for i in items] == ["path", "env", "command"]
+    assert [i.kind for i in items] == ["path", "env"]
     assert items[0].label() == "path data/bundle.parquet [P2] — staged by ops"
-    assert items[2].effective_timeout_s == 5
-    assert items[1].effective_timeout_s == PC.DEFAULT_COMMAND_TIMEOUT_S
+    assert items[1].label() == "env OPENAI_API_KEY [P2]"
 
 
 @pytest.mark.parametrize("raw, needle", [
@@ -44,7 +42,7 @@ def test_parse_each_kind_and_labels():
     ([{"path": "a", "bogus": 1}], "unknown key"),
     ([{"env": "not a name"}], "environment variable NAME"),
     ([{"path": "a", "timeout_s": 3}], "unknown key"),
-    ([{"command": "true", "timeout_s": 0}], "positive integer"),
+    ([{"command": "true", "timeout_s": 0}], "command preconditions are unsupported"),
     ([{"path": ""}], "non-empty string"),
 ])
 def test_parse_fails_closed(raw, needle):
@@ -53,54 +51,32 @@ def test_parse_fails_closed(raw, needle):
 
 
 # --- resolution ----------------------------------------------------------------------
-def test_resolve_path_env_and_injected_command(tmp_path):
+def test_resolve_path_env_without_exposing_values(tmp_path):
     (tmp_path / "present.txt").write_text("x")
     items = PC.parse_preconditions([
         {"path": "present.txt"}, {"path": "missing.txt"},
         {"env": "PC_SET"}, {"env": "PC_EMPTY"}, {"env": "PC_UNSET"},
-        {"command": "ok"}, {"command": "bad"}, {"command": "slow", "timeout_s": 1},
     ], scope="P1")
-    env = {"PC_SET": "s3cr3t-value", "PC_EMPTY": "  "}
-    ran = []
-
-    def runner(item, cwd, env_):
-        ran.append(item.target)
-        if item.target == "ok":
-            return PC.CommandOutcome(0)
-        if item.target == "bad":
-            return PC.CommandOutcome(2, "boom | line two", evidence="/log/cmd-2.txt")
-        return PC.CommandOutcome(None, "", timed_out=True)
-
-    unmet = PC.resolve_preconditions(items, cwd=tmp_path, env=env, run_command=runner)
-    rendered = [u.render() for u in unmet]
-    assert len(unmet) == 5 and ran == ["ok", "bad", "slow"]  # every item checked
-    assert any("missing.txt" in r and "missing:" in r for r in rendered)
-    assert any("PC_EMPTY is set but empty" in r for r in rendered)
-    assert any("PC_UNSET is not set" in r for r in rendered)
-    assert any("exited 2; output tail: boom | line two (full output: /log/cmd-2.txt)" in r
-               for r in rendered)
-    assert any("timed out after 1s" in r for r in rendered)
-    assert not any("s3cr3t-value" in r for r in rendered)  # values never leak
-    # read-only mode: commands are neither run nor reported
-    ran.clear()
-    ro = PC.resolve_preconditions(items, cwd=tmp_path, env=env, run_command=None)
-    assert ran == [] and len(ro) == 3
-    assert [i.target for i in PC.command_items(items)] == ["ok", "bad", "slow"]
+    unmet = PC.resolve_preconditions(items, cwd=tmp_path,
+                                    env={"PC_SET": "s3cr3t-value", "PC_EMPTY": " "})
+    rendered = "\n".join(u.render() for u in unmet)
+    assert len(unmet) == 3
+    assert "missing.txt" in rendered and "PC_EMPTY is set but empty" in rendered
+    assert "PC_UNSET is not set" in rendered
+    assert "s3cr3t-value" not in rendered
+    assert PC.render_checklist(items, unmet).count("[UNMET]") == 3
 
 
-def test_real_command_runner_persists_output(tmp_path):
-    class W:
-        def write_text(self, path, text):
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_text(text)
-
-    runner = PC.command_runner(tmp_path / "pre", W())
-    item = PC.parse_preconditions([{"command": "echo hello; echo oops >&2; exit 3"}], scope="P1")[0]
-    out = runner(item, tmp_path, dict(os.environ))
-    assert out.returncode == 3 and "hello" in out.output_tail and "oops" in out.output_tail
-    assert out.evidence and Path(out.evidence).read_text().startswith("$ echo hello")
-    checklist = PC.render_checklist([item], [PC.Unmet(item, "exited 3")])
-    assert checklist.startswith("[UNMET] command")
+def test_command_rejected_without_execution_or_output_leak(tmp_path, monkeypatch):
+    import subprocess
+    def forbidden(*args, **kwargs):
+        pytest.fail("preflight must not execute commands")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    command = "echo dummy-secret; touch should-not-exist; exit 1"
+    with pytest.raises(PC.PreconditionSpecError, match="provision separately") as exc:
+        PC.parse_preconditions([{"command": command}], scope="P1")
+    assert "dummy-secret" not in str(exc.value)
+    assert not (tmp_path / "should-not-exist").exists()
 
 
 # --- the plan block ----------------------------------------------------------------------
@@ -202,19 +178,18 @@ def test_approve_refuses_until_preconditions_are_met(fixture_repo, tmp_path, mon
     (mgr.layout("demo").slug_dir / "plan.md").write_text(_plan_with(
         f"    - {{path: {bundle}, description: staged by ops}}\n"
         "    - {env: DEMO_PRE_TOKEN}\n"
-        "    - {command: 'test -f " + str(bundle) + "'}\n"
     ))
     path = _write_pipeline(fixture_repo, GATED)
     monkeypatch.delenv("DEMO_PRE_TOKEN", raising=False)
     assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
-    with pytest.raises(ValueError, match="3 unmet precondition") as ei:
+    with pytest.raises(ValueError, match="2 unmet precondition") as ei:
         mgr.approve("demo", use_judge=False)
     msg = str(ei.value)
-    assert "staged by ops" in msg and "DEMO_PRE_TOKEN is not set" in msg and "exited 1" in msg
+    assert "staged by ops" in msg and "DEMO_PRE_TOKEN is not set" in msg
     assert "--skip-preflight" in msg
     assert mgr.status("demo").record("gate").status == M.PARKED  # nothing stamped
     run_dir = mgr.layout("demo").active_run_dir()
-    assert (run_dir / "preflight" / "preflight.txt").read_text().count("[UNMET]") == 3
+    assert (run_dir / "preflight" / "preflight.txt").read_text().count("[UNMET]") == 2
     # Satisfy everything → approval lands and the run completes.
     bundle.write_text("data")
     monkeypatch.setenv("DEMO_PRE_TOKEN", "t")
@@ -304,7 +279,6 @@ def test_status_lists_unmet_preconditions_read_only(fixture_repo, tmp_path, monk
     (mgr.layout("demo").slug_dir / "plan.md").write_text(_plan_with(
         f"    - {{path: {bundle}}}\n"
         "    - {env: DEMO_PRE_TOKEN}\n"
-        "    - {command: 'exit 1'}\n"
     ))
     path = _write_pipeline(fixture_repo, GATED)
     monkeypatch.delenv("DEMO_PRE_TOKEN", raising=False)
@@ -314,6 +288,22 @@ def test_status_lists_unmet_preconditions_read_only(fixture_repo, tmp_path, monk
     assert r.exit_code == 0, r.output
     assert "plan preflight: 2 unmet precondition(s)" in r.output
     assert "DEMO_PRE_TOKEN is not set" in r.output and str(bundle) in r.output
-    assert "1 command precondition(s) are run at approve time" in r.output
+    assert "command precondition" not in r.output
     # read-only: the command was NOT executed by status (no preflight dir yet)
     assert not (mgr.layout("demo").active_run_dir() / "preflight").exists()
+
+
+def test_approve_rejects_command_plan_without_mutation(fixture_repo, tmp_path):
+    target = tmp_path / "unapproved-output"
+    mgr = _prepare(fixture_repo)
+    _author_prd(mgr, "demo")
+    (mgr.layout("demo").slug_dir / "plan.md").write_text(
+        _plan_with(f"    - {{command: 'touch {target}; echo dummy-secret; exit 1'}}\n"))
+    path = _write_pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", path, use_judge=False) == M.RUN_PARKED
+    with pytest.raises(ValueError, match="command preconditions are unsupported") as exc:
+        mgr.approve("demo", use_judge=False)
+    assert not target.exists()
+    assert "dummy-secret" not in str(exc.value)
+    assert mgr.status("demo").record("gate").status == M.PARKED
+    assert "dummy-secret" not in (mgr.layout("demo").active_run_dir() / "manifest.json").read_text()
