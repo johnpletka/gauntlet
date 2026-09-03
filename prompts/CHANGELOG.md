@@ -33,3 +33,10 @@ apply, so the file reads oldest-first.
   terminal reject (no upstream cycle to iterate) is refused unless the explicit
   `--terminal` flag is given — a flag-less reject can no longer end a run by
   surprise.
+
+- **commit-message.md** (#134): add the hard rules that the 72-char header
+  limit is counted INCLUDING the `PN: ` prefix (models violated the limit
+  roughly every phase, each violation costing a redraft or a park), that the
+  body must stay free of the diff, and how to draft when the engine hands an
+  oversize diff BY REFERENCE (`diff --stat` inline, per-file diffs read with
+  git) instead of inlining it.
