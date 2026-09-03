@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -606,6 +607,31 @@ def _check_codex_cache(probes: DoctorProbes, pins: PinFile | None) -> CheckResul
 
 def _check_version() -> CheckResult:
     return CheckResult("gauntlet", OK, f"version {__version__}")
+
+
+def _check_keep_awake(config, *, platform: str = sys.platform) -> CheckResult:
+    """FR-5.4 / #134: host sleep was measured as a leading source of park
+    latency, so `keep_awake` defaults on. Warn (never fail) when an operator has
+    opted out on darwin, or when the `caffeinate` binary is missing so the
+    assertion silently cannot be taken."""
+    if platform != "darwin":
+        return CheckResult("keep-awake", OK, f"n/a off darwin ({platform})")
+    if not config.keep_awake:
+        return CheckResult(
+            "keep-awake", WARN,
+            "keep_awake: false — the host may sleep mid-run; every suspension "
+            "is park latency (#134)",
+            remedy="remove `keep_awake: false` from .gauntlet/config.yaml (the "
+                   "default wraps the driver in `caffeinate -i -w <pid>`)",
+        )
+    if shutil.which("caffeinate") is None:
+        return CheckResult(
+            "keep-awake", WARN,
+            "keep_awake is on but `caffeinate` is not on PATH; the run proceeds "
+            "without the sleep assertion",
+            remedy="restore /usr/bin/caffeinate to PATH",
+        )
+    return CheckResult("keep-awake", OK, "caffeinate -i -w <driver pid> for the run's life")
 
 
 def _check_cli(cli: str, probes: DoctorProbes, pins: PinFile | None) -> CheckResult:
@@ -1348,6 +1374,7 @@ def run_doctor(
             _check_profiles(config, probes, repo_root, reference_profiles)
         )
         results.append(_check_test_command(config))
+        results.append(_check_keep_awake(config))
         tracker_check = _check_tracker(config, probes)
         if tracker_check is not None:
             results.append(tracker_check)

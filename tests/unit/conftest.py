@@ -42,6 +42,20 @@ def git(repo: Path, *args: str, message: str | None = None) -> str:
 
 
 @pytest.fixture(autouse=True)
+def _no_caffeinate(monkeypatch):
+    """Never spawn `caffeinate` from the unit suite.
+
+    ``keep_awake`` defaults to true (#134), so every test that drives a run
+    would otherwise fork a real `caffeinate -i -w <pid>` on darwin. The pure
+    command builder (`keep_awake_command`) keeps its own tests; only the
+    spawning context manager is neutralised here.
+    """
+    from gauntlet.engine import heartbeat
+
+    monkeypatch.setattr(heartbeat.KeepAwake, "__enter__", lambda self: self)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_usage_ledger(tmp_path, monkeypatch):
     """Redirect the machine-global usage ledger (FR-10) to a per-test temp path.
 
