@@ -46,6 +46,17 @@ All notable changes to Gauntlet are recorded here. The format follows
   explicit, written through the redacting writer. Evidence only: the engine
   never reads it back.
 
+### Changed
+
+- `keep_awake` now defaults to **true** (#134). Host sleep was measured as a
+  leading source of park latency (58 minutes of one run, and a driver wedge on
+  another), and the `caffeinate -i -w <pid>` assertion is scoped to the
+  driver's lifetime so nothing lingers. Set `keep_awake: false` to opt out.
+  Off darwin the knob is a no-op; the "ignored on this platform" warning now
+  fires only when it was set explicitly. `gauntlet doctor` gains a
+  `keep-awake` check that warns (never fails) when the knob is off on darwin
+  or `caffeinate` is not on PATH.
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed

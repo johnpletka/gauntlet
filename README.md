@@ -308,8 +308,9 @@ gauntlet report myfeat           # per-step / per-agent cost, tokens + clock tim
 - **Laptop sleep is survivable.** A driver heartbeat detects host suspension and
   credits the slept time back to the running step's deadline (capped), so
   closing the lid neither silently stalls the run nor spuriously kills a healthy
-  step; `status` reports detected suspensions. Opt-in `keep_awake: true` wraps
-  the driver in `caffeinate -i` on macOS.
+  step; `status` reports detected suspensions. `keep_awake` (default `true`)
+  wraps the driver in `caffeinate -i` on macOS so the host does not sleep
+  mid-run; set it to `false` to opt out.
 - **Malformed structured artifacts self-repair.** Agent-authored artifacts (like
   the plan's `gauntlet-phases` block) are validated in-step; the agent gets its
   own parse error back for a bounded repair loop, and if that fails the run
@@ -527,7 +528,8 @@ resume_on_quota: notify      # notify (default) | auto — self-resume a
                              #   usage-limit park at the provider's hinted reset
                              #   time (in-process; wants keep_awake or an
                              #   external scheduler re-invoking `resume`)
-keep_awake: false            # true wraps the driver in `caffeinate -i` (darwin)
+keep_awake: true             # default; wraps the driver in `caffeinate -i`
+                             #   (darwin) — false lets the host sleep mid-run
 heartbeat_interval_s: 15     # driver heartbeat cadence (suspend detection)
 suspend_credit_cap_s: 43200  # max slept time credited back to a step deadline
 checkpoint_commits: keep     # keep | squash — builders' intra-phase `PN wip:`

@@ -36,7 +36,8 @@ reviewer_mutation: commit
 #                             #   usage-limit park at the provider's hinted
 #                             #   reset time (wants keep_awake or an external
 #                             #   scheduler re-invoking `gauntlet resume`)
-# keep_awake: false           # true wraps the driver in `caffeinate -i` (darwin)
+# keep_awake: true            # default; wraps the driver in `caffeinate -i`
+#                             #   (darwin) — set false to allow host sleep
 # heartbeat_interval_s: 15    # driver heartbeat cadence (suspend detection)
 # suspend_credit_cap_s: 43200 # max host-sleep time credited to a step deadline
 # checkpoint_commits: keep    # keep | squash — builder `PN wip:` milestone

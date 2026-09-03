@@ -6775,7 +6775,11 @@ class RunManager:
         # with the defaults behaves exactly as before.
         from gauntlet.engine.heartbeat import HeartbeatWriter, KeepAwake
 
-        if self.config.keep_awake and sys.platform != "darwin":
+        if (
+            self.config.keep_awake
+            and sys.platform != "darwin"
+            and "keep_awake" in self.config.model_fields_set
+        ):
             warnings.warn(
                 "keep_awake: true is ignored on this non-darwin platform "
                 f"({sys.platform}); `caffeinate` is a macOS tool (FR-5.4).",
