@@ -28,7 +28,8 @@ unreadable ledger lines are ignored (fail open on the *ledger*: an unreadable
 record must not silence a real park).
 
 **Fail-soft (FR-9.3).** Every channel send is wrapped so an error is logged and
-swallowed, and the I/O channels run on a daemon thread. A notification failure
+swallowed, and the I/O channels run on a daemon thread. The CLI waits up to 12 seconds
+for pending sends before exit. A notification failure
 can never affect a run — the notifier owns no run state.
 """
 
@@ -165,7 +166,7 @@ LEDGER_NAME = "notifications.jsonl"
 EMITTER_DRIVER = "driver"
 EMITTER_CONSOLE = "console"
 
-# De-dup key: (run_id, kind, current_step) — FR-9.1.
+# Delivery identity includes foreach iteration and the persisted step-end stamp.
 Key = tuple[str | None, ...]
 
 
@@ -668,9 +669,9 @@ def driver_notifications_disabled() -> bool:
 
 # --- the de-dup ledger ----------------------------------------------------------
 class NotificationLedger:
-    """``<run_dir>/notifications.jsonl`` — append-only, one line per emitted
-    notification: ``{key: [run_id, kind, current_step], kind, emitted_at,
-    channels: [names], by: "driver"|"console"}``.
+    """``<run_dir>/notifications.jsonl`` — append-only, one line per successful
+    channel delivery: ``{key: [run_id, kind, current_step, iteration, episode], kind, emitted_at,
+    channels: [name], status: "delivered", by: "driver"|"console"}``.
 
     Read fail-open: an unreadable file or a malformed line is ignored (the
     notification is emitted anyway — an unreadable record must not silence a
@@ -894,8 +895,8 @@ class Notifier:
 
     def emit(self, event: Transition, kind: str, *, note: str | None = None) -> str | None:
         """Send one explicit kind for this event unless its key already fired
-        (memory or ledger). Records the send in the ledger. Returns the kind on
-        a send, else ``None``."""
+        (memory or ledger) for each channel. Successful sends are acknowledged
+        in the ledger. Returns the kind when dispatching, else ``None``."""
         if not self._allowed(kind):
             return None
         key = self._key(event, kind)
