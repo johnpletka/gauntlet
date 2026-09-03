@@ -354,3 +354,44 @@ def test_cli_sweep_json_reports_skip(fixture_repo, monkeypatch):
     r = CliRunner().invoke(cli.app, ["sweep", "demo"])
     assert r.exit_code == 0
     assert "skipped" in r.output and "human" in r.output
+
+
+@pytest.mark.parametrize("projection", ["stale", "missing", "corrupt"])
+def test_sweep_preserves_authoritative_journal(tmp_path, projection):
+    h = _Harness(tmp_path, AUTO)
+    man = _parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due())
+    h.save(man)
+    path = h.run_dir / "manifest.json"
+    old = path.read_text()
+    man.steps[0].scheduled_resume.attempts = 2
+    man.warnings.append("newest durable evidence")
+    h.save(man)
+    if projection == "missing":
+        path.unlink()
+    else:
+        path.write_text(old if projection == "stale" else "{broken")
+    out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
+    assert out.action == SW.ACTION_RESUMED, out
+    assert h.load().steps[0].scheduled_resume.attempts == 3
+    assert "newest durable evidence" in h.load().warnings
+
+
+@pytest.mark.parametrize("change", ["deadline", "iteration", "config", "reason"])
+def test_stamp_rechecks_decision_under_lock(tmp_path, change):
+    h = _Harness(tmp_path, AUTO.model_copy(deep=True))
+    man = _parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due())
+    h.save(man)
+    decision = SW.decide(man, op.LIVENESS_NONE, lock=SW.LOCK_ABSENT,
+                         config=h.mgr.config, now=T0)
+    if change == "deadline":
+        man.steps[0].scheduled_resume.attempt_at = (T0 + timedelta(hours=1)).isoformat()
+    elif change == "iteration":
+        man.steps[0].iteration = "P2"
+    elif change == "reason":
+        man.steps[0].parked_reason = M.PARKED_REASON_GATE
+    else:
+        h.mgr.config.resume_on_quota = "notify"
+    h.save(man)
+    reason = SW._stamp_under_lock(h.mgr, "demo", h.run_dir, "run-1", decision, T0)
+    assert reason and "state changed" in reason
+    assert h.load().steps[0].scheduled_resume.attempts == 0

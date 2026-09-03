@@ -110,6 +110,8 @@ class SweepDecision:
     reason: str  # REASON_* when acting; a one-line skip reason otherwise
     step_id: str | None = None  # the parked step a schedule action targets
     park_reason: str | None = None  # normalized park reason for the audit line
+    iteration: str | None = None
+    schedule: tuple | None = None  # identity of the episode observed before locking
 
     @property
     def audit_reason(self) -> str:
@@ -233,6 +235,9 @@ def decide(
         return SweepDecision(
             False, f"{state}: no scheduled_resume armed — a human resumes"
         )
+    stamped = getattr(sched, "reason", None)
+    if stamped is not None and stamped != reason:
+        return SweepDecision(False, f"{state}: stale schedule reason")
     knob, is_auto = auto_resume_knob(config, reason)
     if knob is None:
         return SweepDecision(
@@ -267,7 +272,9 @@ def decide(
         )
     assert action == AUTO_RESUME_RESUME
     return SweepDecision(
-        True, REASON_SCHEDULE, step_id=parked_rec.id, park_reason=reason
+        True, REASON_SCHEDULE, step_id=parked_rec.id, park_reason=reason,
+        iteration=parked_rec.iteration,
+        schedule=(sched.attempt_at, sched.attempts, sched.max_attempts, stamped),
     )
 
 
@@ -361,14 +368,29 @@ def _stamp_under_lock(
     """
     handle = mgr._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
     try:
+        mgr._reconcile_projection_locked(run_dir, slug)
         man = Manifest.load(run_dir / "manifest.json")
+        if man.run_id != run_id or _resolve_run_dir(mgr, slug) != run_dir:
+            return "state changed under the sweep (active run changed)"
+        # The acquired lock is ours, so reuse only the dead-holder proof for
+        # an orphan; re-evaluate all manifest/config/schedule predicates.
+        current = decide(
+            man, operator.LIVENESS_NONE,
+            lock=LOCK_DEAD if decision.reason == REASON_ORPHAN else LOCK_ABSENT,
+            config=mgr.config, now=now,
+        )
+        if not current.act:
+            return f"state changed under the sweep ({current.reason})"
+        if current != decision:
+            return "state changed under the sweep (park or schedule changed)"
         if decision.reason == REASON_ORPHAN:
             if man.status != M.RUN_RUNNING:
                 return f"state changed under the sweep (run is {man.status})"
         else:
             step = next(
                 (s for s in man.steps
-                 if s.id == decision.step_id and s.status == M.PARKED), None,
+                 if s.id == decision.step_id and s.iteration == decision.iteration
+                 and s.status == M.PARKED), None,
             )
             if step is None or step.scheduled_resume is None:
                 return "state changed under the sweep (schedule gone)"
