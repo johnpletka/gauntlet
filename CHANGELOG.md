@@ -46,6 +46,27 @@ All notable changes to Gauntlet are recorded here. The format follows
   explicit, written through the redacting writer. Evidence only: the engine
   never reads it back.
 
+### Fixed
+
+- The commit-message drafter no longer inlines an unbounded phase diff. It
+  resolves the `message_agent` adapter's declared input cap through the same
+  capability path the review and confirm prompts use and, when the assembled
+  prompt would exceed it (or, with no declared cap, when the diff alone exceeds
+  a fixed 400,000-char ceiling — fail closed against the unknown), hands the
+  diff BY REFERENCE: `git status` and `git diff --stat` stay inline, and the
+  drafter reads per-file diffs with its own git. Never a truncation. A phase
+  that minted a multi-megabyte diff previously failed `phase-commit`
+  terminally on every model. When the redrafts are spent and ONLY the header
+  is still wrong (over 72 chars or off-shape) while the body validates, the
+  header is synthesized as `P<N>: <plan phase title>` (word-boundary
+  truncated to fit) from the plan the human approved, the drafted body is
+  kept, and a manifest warning plus step note record the substitution — a
+  73-char subject line no longer parks a run. Redraft feedback now echoes the
+  offending header line with its exact character count, and the terminal
+  format failure names the verbatim override (`gauntlet resume <slug>
+  --response '<full message>'` uses the text as the message when it is itself
+  a valid one). The step notes record when a draft went by reference (#134).
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed
