@@ -46,6 +46,20 @@ All notable changes to Gauntlet are recorded here. The format follows
   explicit, written through the redacting writer. Evidence only: the engine
   never reads it back.
 
+- **Operator playbook v2** (#134, recs 8, 9, 11). `prompts/operator.md` gains
+  §2a *Standing-operator mode* — arm detection first (driver-side `notify:`
+  push, the auto-resume knobs, `keep_awake`, `gauntlet sweep` on a cadence,
+  plan preconditions) and a **pre-authorized decision matrix** stating which
+  park classes an agent operator resolves autonomously and which page the
+  human — and §6a *Trap catalog*: the recurring parks that each cost a full
+  round-trip on a real run (target_artifact misencoding, acceptance phrasing,
+  the phase-commit marker, the commit-message override, the exhausted
+  `tests` route, missing preconditions, provider/usage parks, the run-worktree
+  cwd traps, `git clean -xdff`, stale drivers) with the exact response and
+  what the engine now handles. The operator skill template is bumped to
+  version 2 (v1 retired append-only under `_versions/`), so `gauntlet init`
+  refreshes an unmodified adopter copy and never clobbers a customized one.
+
 ## [1.2.0] — 2026-08-18
 
 ### Fixed
