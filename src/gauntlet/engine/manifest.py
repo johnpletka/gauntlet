@@ -575,6 +575,7 @@ class CommitRecord(BaseModel):
     step_id: str
     phase: str  # the PN[.x] prefix
     sha: str
+    base_sha: str | None = None  # full phase range; absent in older journals
 
 
 # --- evidence-tiered gates (pipeline-effectiveness FR-4, P8) ------------------

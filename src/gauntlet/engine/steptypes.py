@@ -2164,6 +2164,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # is a single non-empty `P<N>:` commit; the reviewed range diff base..<PN:>
     # is unchanged from the keep case (same base, same final tree).
     if squash:
+        ctx.record.base_sha = squash_base
         gitops.reset_soft(repo, squash_base)
         # The soft reset re-stages every commit in squash_base..old-HEAD, which
         # can include an engine bookkeeping commit swept in by a checkpoint-
@@ -2179,6 +2180,13 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             session_id=draft_session,
             notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
         )
+
+    # Persist the cumulative phase base for review consumers, including the
+    # first recorded phase and residual commits above checkpoints.
+    if milestones and squash_base:
+        previous_base = ctx.record.base_sha
+        if previous_base is None or gitops.is_ancestor(repo, squash_base, previous_base):
+            ctx.record.base_sha = squash_base
 
     # Mid-commit resume reconciliation (review F-003): if a prior attempt
     # already created the commit (HEAD moved off the recorded base) but died

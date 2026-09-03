@@ -720,3 +720,40 @@ def test_marker_fallback_never_squashes_adopted_commits(fixture_repo):
     assert gitops.commit_parent(fixture_repo, result.commit_sha) == adopted
     assert gitops.diff_range_empty(fixture_repo, adopted, result.commit_sha)
     assert "empty P<N>: marker" in (result.notes or "")
+
+
+@pytest.mark.parametrize("previous_phase", [False, True])
+def test_review_range_includes_adopted_fix_before_empty_marker(fixture_repo, previous_phase):
+    from gauntlet.engine.cycle import _code_review_base
+    base = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    _wip(fixture_repo, "P9 wip: implementation", "implementation.py", "implementation\n")
+    fix = _wip(fixture_repo, "P9.1: Adopt correction", "correction.py", "correction\n")
+    ctx = _ctx_for_commit(fixture_repo, fix)
+    if previous_phase:
+        ctx.manifest.commits.append(M.CommitRecord(step_id="old", phase="P8", sha=base))
+    ctx.manifest.commits.append(M.CommitRecord(step_id="implement", phase="P9.1", sha=fix))
+    result = handle_commit(Step.model_validate({"id": "commit", "type": "commit",
+        "phase": "P9", "message": "P9: Complete phase\n\nImplement and correct the phase."}), ctx)
+    assert result.status == DONE, result.notes
+    ctx.manifest.commits.append(M.CommitRecord(step_id="commit", phase="P9",
+        sha=result.commit_sha, base_sha=ctx.record.base_sha))
+    review_base = _code_review_base(ctx, result.commit_sha)
+    assert review_base == base
+    diff = gitops.range_diff(fixture_repo, review_base, result.commit_sha)
+    assert "implementation.py" in diff and "correction.py" in diff
+
+
+@pytest.mark.parametrize("mode", ["keep", "squash"])
+def test_first_checkpoint_phase_persists_review_base(fixture_repo, mode):
+    from gauntlet.engine.cycle import _code_review_base
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P9 wip: first implementation", "first.py", "first\n")
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config={
+        "checkpoint_commits": mode, "agents": {"builder": {"adapter": "claude-code"}}})
+    assert orch.drive() == M.RUN_DONE
+    commit = orch.manifest.commits[-1]
+    assert commit.base_sha == base
+    ctx = _ctx_for_commit(fixture_repo, base)
+    ctx.manifest.commits = orch.manifest.commits
+    assert _code_review_base(ctx, commit.sha) == base
