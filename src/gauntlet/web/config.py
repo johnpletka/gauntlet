@@ -12,7 +12,7 @@ validates it here, when it builds the notifier.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class WebNotifyConfig(BaseModel):
@@ -62,6 +62,17 @@ class WebConfig(BaseModel):
     # no model call (D8). Enabled here in the `web:` block or via `serve
     # --enable-handoff`.
     handoff: bool = False
+    # #134: the console runs the unattended sweep (`gauntlet sweep --all`
+    # semantics: orphan reclaim + due scheduled parks, nothing else) on this
+    # cadence, launching each resume as an owned detached driver. 0 disables.
+    sweep_interval_s: float = 120.0
+
+    @field_validator("sweep_interval_s")
+    @classmethod
+    def _non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"web.sweep_interval_s must be >= 0; got {v!r}")
+        return float(v)
 
 
 def web_config_from(config: object) -> WebConfig:

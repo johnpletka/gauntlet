@@ -44,6 +44,9 @@ reviewer_mutation: commit
 #                             #   exhausted) at its recorded backoff/Retry-After
 #                             #   deadline; same survival needs and shared
 #                             #   max_auto_resume_attempts as resume_on_quota
+# external_scheduler: false   # true = you run `gauntlet sweep --all` from
+#                             #   cron/launchd, so a dead driver's due schedule
+#                             #   and an orphaned run are reclaimed unattended
 # heartbeat_interval_s: 15    # driver heartbeat cadence (suspend detection)
 # suspend_credit_cap_s: 43200 # max host-sleep time credited to a step deadline
 # checkpoint_commits: keep    # keep | squash — builder `PN wip:` milestone

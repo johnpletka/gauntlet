@@ -809,6 +809,59 @@ def _ensure_watch_console(mgr, *, host: str, port: int, no_browser: bool = False
     open_authenticated(handle, no_browser=no_browser, echo=typer.echo)
 
 
+@app.command()
+@_friendly_errors
+def sweep(
+    slug: str = typer.Argument(None, help="One run to sweep (omit with --all)."),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Sweep every run under the configured run_root.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit one JSON object per run instead of lines.",
+    ),
+    detach: bool = typer.Option(
+        None, "--detach/--foreground",
+        help="Launch each resume as a detached `gauntlet resume <slug>` child "
+             "(default with --all) or drive it in this process until its next "
+             "park (default for a single slug).",
+    ),
+) -> None:
+    """Unattended, judgment-free resume sweep (#134).
+
+    Takes ONLY the two actions the operator playbook classes as no-decision:
+    reclaim a run whose driver is PROVEN dead (orphaned), and fire a parked
+    step's armed, due `scheduled_resume` under the config knob that armed it
+    (`resume_on_quota: auto` / `resume_on_provider_unavailable: auto`). Gates,
+    response parks, failures, indeterminate liveness, malformed locks and live
+    drivers are skipped with a one-line reason. Idempotent: exit 0 whether or
+    not anything was resumed; non-zero only on an internal error. Every action
+    stamps `unattended sweep resumed (<reason>) at <iso>` into the manifest.
+    Run it from cron/launchd (`external_scheduler: true`) or let `gauntlet
+    serve` run it on its timer.
+    """
+    import json
+
+    from gauntlet.engine import sweep as SW
+
+    if bool(slug) == bool(all_runs):
+        typer.echo("error: give exactly one of <slug> or --all", err=True)
+        raise typer.Exit(2)
+    _refuse_inside_run_worktree(Path.cwd())
+    mgr = _manager()
+    run_root = mgr.repo_root / mgr.config.run_root
+    slugs = SW.enumerate_slugs(run_root) if all_runs else [slug]
+    use_detach = all_runs if detach is None else detach
+    launcher = SW.detached_launcher if use_detach else None
+    outcomes = SW.sweep_slugs(mgr, slugs, launcher=launcher)
+    if json_output:
+        typer.echo(json.dumps([o.to_dict() for o in outcomes], indent=2))
+        return
+    if not outcomes:
+        typer.echo(f"no runs under {run_root}")
+    for o in outcomes:
+        typer.echo(o.render())
+
+
 @app.command(cls=_InteractiveCommand)
 @_friendly_errors
 def status(

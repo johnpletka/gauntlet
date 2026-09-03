@@ -14,6 +14,9 @@ updates yet (P2), no control verbs (P3+), no gate resolution (P5).
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import contextlib
 from pathlib import Path
 from urllib.parse import quote
@@ -46,6 +49,8 @@ from gauntlet.web.store import RunNotFound, RunStore, UnsafePath
 from gauntlet.web.supervisor import ControlFailed, ControlRefused
 from gauntlet.web.views import register_views
 from gauntlet.web.watcher import Watcher
+
+logger = logging.getLogger(__name__)
 
 TOKEN_ENV_VAR = "GAUNTLET_WEB_TOKEN"
 
@@ -175,6 +180,43 @@ class AbortBody(BaseModel):
     confirm: bool = False
 
 
+async def _sweep_loop(store, supervisor, interval: float) -> None:
+    """Run :func:`console_sweep` every ``interval`` seconds, fail-soft."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(console_sweep, store, supervisor)
+        except Exception:  # never let a sweep failure take the console down
+            logger.warning("console sweep failed; next tick continues", exc_info=True)
+
+
+def console_sweep(store, supervisor) -> list:
+    """One console sweep over every run under the store's run root (#134).
+
+    Same decision table as `gauntlet sweep --all`; each action is launched as
+    a console-owned detached driver via ``supervisor.resume`` so the run shows
+    as owned and its child is supervised. Mutual exclusion with a cron sweep
+    or a human's own resume rides on the drive lock inside the engine.
+    """
+    from gauntlet.engine import sweep as SW
+    from gauntlet.engine.run import RunManager
+
+    mgr = RunManager(store.repo_root)
+
+    def _launch(_mgr, slug: str, run_dir, run_id):
+        rp = supervisor.resume(slug)
+        return f"console-owned `gauntlet resume {slug}` (pid {getattr(rp, 'pid', None)})"
+
+    outcomes = SW.sweep_slugs(mgr, SW.enumerate_slugs(mgr.repo_root / mgr.config.run_root),
+                              launcher=_launch)
+    for o in outcomes:
+        if o.action == SW.ACTION_SKIPPED:
+            logger.debug("sweep: %s", o.render())
+        else:
+            logger.info("sweep: %s", o.render())
+    return outcomes
+
+
 def create_app(
     store: RunStore,
     *,
@@ -230,9 +272,24 @@ def create_app(
         if callable(reattach):
             reattach()
         watcher.start()
+        # #134: the unattended sweep timer — orphan reclaim + due scheduled
+        # parks, launched as owned detached drivers through the supervisor.
+        # Only with a real supervisor (read-only deployments and the minimal
+        # test stubs have none) and a positive cadence; it sleeps first, so a
+        # short-lived test app never sweeps.
+        sweep_task = None
+        interval = web_config_from(store.config).sweep_interval_s
+        if interval > 0 and callable(getattr(supervisor, "resume", None)):
+            sweep_task = asyncio.create_task(
+                _sweep_loop(store, supervisor, interval)
+            )
         try:
             yield
         finally:
+            if sweep_task is not None:
+                sweep_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await sweep_task
             await watcher.stop()
 
     app = FastAPI(

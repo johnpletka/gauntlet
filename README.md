@@ -387,6 +387,55 @@ its URL, and **opens the authenticated console in your browser** before running
 in the foreground; pass `--no-browser` (on either command) to skip the launch.
 `--console-host` / `--console-port` override the bind (default `127.0.0.1:8765`). `gauntlet serve --resume` does the same boot-or-reuse-and-open without holding the foreground.
 
+### Unattended recovery: `gauntlet sweep`
+
+A dead driver cannot self-resume, and a stale drive lock is only ever reclaimed
+by the next driving verb someone types. `gauntlet sweep` is the idempotent,
+judgment-free sweep a resident process runs instead of a human (#134):
+
+```sh
+gauntlet sweep myfeat          # one run: act only on a no-decision rule
+gauntlet sweep --all           # every run under run_root, each resume detached
+gauntlet sweep --all --json    # the same, one object per run
+```
+
+It takes exactly two actions: **reclaim an orphaned run** whose drive lock
+proves the driver dead or PID-reused, and **fire a due `scheduled_resume`** on a
+usage-limit / provider-unavailable park under the knob that armed it
+(`resume_on_quota: auto` / `resume_on_provider_unavailable: auto`). Everything
+else — gates, response parks, failures, indeterminate liveness, malformed
+locks, live drivers, terminal runs — is skipped with a one-line reason. Exit 0
+whether or not anything was resumed. Every action stamps
+`unattended sweep resumed (<reason>) at <iso>` into the manifest, and a
+`--all` resume appends its output to `<run_dir>/sweep-resume.log`.
+
+`gauntlet serve` runs the same sweep on a timer (`web.sweep_interval_s`,
+default 120; 0 disables), launching each resume as a console-owned driver.
+Without a console, schedule it yourself and set `external_scheduler: true` so
+the config lint knows the wait is covered:
+
+```sh
+# cron: every 5 minutes
+*/5 * * * * cd /path/to/repo && /path/to/gauntlet sweep --all >> ~/.gauntlet/sweep.log 2>&1
+```
+
+```xml
+<!-- ~/Library/LaunchAgents/com.gauntlet.sweep.plist (macOS) -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gauntlet.sweep</string>
+  <key>ProgramArguments</key>
+  <array><string>/path/to/gauntlet</string><string>sweep</string><string>--all</string></array>
+  <key>WorkingDirectory</key><string>/path/to/repo</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/Users/you/.gauntlet/sweep.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.gauntlet/sweep.log</string>
+</dict></plist>
+```
+
+Mutual exclusion between a cron sweep, the console's sweep and your own
+`resume` rides on the drive lock: a resume that loses the race fails closed
+inside the engine and the sweep reports it as `refused`, never retried.
+
 ### CLI observability
 
 ```sh

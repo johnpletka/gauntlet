@@ -33,6 +33,9 @@ behind that output. Drive every decision off the reported state class:
   only (`status`, `logs`). Do **not** resume or recover a healthy run.
 - **`orphaned`** — the manifest says running but the driver is dead or its PID was
   recycled; the drive lock is reclaimable. Action: `gauntlet resume <slug>`.
+  No decision is at stake, so this is one of the two actions `gauntlet sweep`
+  takes unattended (the other: firing a due `scheduled_resume`); a console or
+  a cron/launchd sweep may already have reclaimed it — check `status` first.
 - **`indeterminate`** — liveness cannot be proven either way (an unparseable,
   unverifiable, or foreign-host lock; an unsupported platform). Action:
   **read-only inspection only** (`logs`, `status --json`) — never a mutating verb.

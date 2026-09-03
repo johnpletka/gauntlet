@@ -93,6 +93,25 @@ All notable changes to Gauntlet are recorded here. The format follows
   `webhook`, `slack_webhook`, `webhook_url`, optional `kinds` allowlist;
   defaults are safe no-ops); an absent `web.notify` inherits it.
   `GAUNTLET_NOTIFY_DISABLED=1` is the driver-side kill switch.
+- **`gauntlet sweep`** — the unattended, judgment-free resume sweep (#134,
+  rec. 1b). A dead driver cannot self-resume, so a resident process (the
+  console's timer, or cron/launchd with `external_scheduler: true`) runs a
+  sweep that takes only the two actions the operator playbook already classes
+  as no-decision: reclaim an **orphaned** run whose drive lock proves the
+  driver dead or PID-reused, and fire a parked step's armed, **due**
+  `scheduled_resume` under the config knob that armed it. The decision is a
+  pure function of the same composite state `status` renders plus the lock
+  proof, the schedule and the config (table-tested, reason-agnostic); gates,
+  response parks, failures, indeterminate liveness, malformed locks, live
+  drivers and terminal runs are skipped with a one-line reason. Each action
+  re-verifies and stamps `unattended sweep resumed (<reason>) at <iso>` under
+  the drive lock (a schedule attempt is counted write-ahead), then goes
+  through the real `RunManager.resume` — in the foreground for one slug, or
+  as a detached `gauntlet resume <slug>` child (log in
+  `<run_dir>/sweep-resume.log`) with `--all`. `--json` emits one object per
+  run; exit 0 whether or not anything was resumed. `gauntlet serve` runs the
+  same sweep on `web.sweep_interval_s` (default 120 s; 0 disables),
+  launching console-owned drivers. README documents the cron/launchd recipe.
 
 ## [1.2.0] — 2026-08-18
 

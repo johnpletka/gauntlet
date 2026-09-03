@@ -4895,45 +4895,49 @@ class RunManager:
             # A live driver owns the projection; its own write lands next.
             return
         try:
-            outcome = J.reconcile_projection(
-                run_dir, validate=M.validate_projection_text
-            )
-            if outcome.rebuild_required:
-                planned = RX.projection_rebuild_assessment(
-                    self.repo_root, run_dir, slug=slug
-                )
-                if planned is None:
-                    raise J.JournalError(
-                        f"manifest projection under {run_dir} is "
-                        "missing/corrupt and no rebuild action could be "
-                        "planned; inspect the journal dir before retrying"
-                    )
-                assessment, action = planned
-                # The executor's own guard verifies (never reclaims) the
-                # lock — reclaim policy with its identity verification
-                # belongs here; the guard sees the lock as this process's.
-                RX.RecoveryExecutor(
-                    self.repo_root,
-                    run_dir,
-                    run_id=outcome.run_id or "unknown",
-                    run_root=self.config.run_root,
-                ).apply_rebuild(assessment, action)
-                return
-            if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_RESTORED):
-                # Loud, durable audit: the reconciliation notes land as
-                # manifest warnings through the normal journaled persist (a
-                # fresh transition — so the R5 fingerprint provably moves).
-                man = Manifest.load(run_dir / "manifest.json")
-                changed = False
-                for note in outcome.notes:
-                    warn = f"[projection] {note}"
-                    if warn not in man.warnings:
-                        man.warnings.append(warn)
-                        changed = True
-                if changed:
-                    man.write_atomic(run_dir / "manifest.json")
+            self._reconcile_projection_locked(run_dir, slug)
         finally:
             self._release_worktree_lock(handle)
+
+    def _reconcile_projection_locked(self, run_dir: Path, slug: str) -> None:
+        """Restore journal authority while the caller holds the drive lock."""
+        outcome = J.reconcile_projection(
+            run_dir, validate=M.validate_projection_text
+        )
+        if outcome.rebuild_required:
+            planned = RX.projection_rebuild_assessment(
+                self.repo_root, run_dir, slug=slug
+            )
+            if planned is None:
+                raise J.JournalError(
+                    f"manifest projection under {run_dir} is "
+                    "missing/corrupt and no rebuild action could be "
+                    "planned; inspect the journal dir before retrying"
+                )
+            assessment, action = planned
+            # The executor's own guard verifies (never reclaims) the
+            # lock — reclaim policy with its identity verification
+            # belongs here; the guard sees the lock as this process's.
+            RX.RecoveryExecutor(
+                self.repo_root,
+                run_dir,
+                run_id=outcome.run_id or "unknown",
+                run_root=self.config.run_root,
+            ).apply_rebuild(assessment, action)
+            return
+        if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_RESTORED):
+            # Loud, durable audit: the reconciliation notes land as
+            # manifest warnings through the normal journaled persist (a
+            # fresh transition — so the R5 fingerprint provably moves).
+            man = Manifest.load(run_dir / "manifest.json")
+            changed = False
+            for note in outcome.notes:
+                warn = f"[projection] {note}"
+                if warn not in man.warnings:
+                    man.warnings.append(warn)
+                    changed = True
+            if changed:
+                man.write_atomic(run_dir / "manifest.json")
 
     def _reconcile_projection_safe(self, layout: "RunLayout") -> None:
         """Reconcile the projection when a run dir resolves; else skip (P6).
