@@ -412,3 +412,99 @@ def test_driver_honors_kinds_allowlist(fixture_repo, monkeypatch):
     assert ch.sent == []
     assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
     assert [n.kind for n in ch.sent] == [N.KIND_COMPLETED]
+
+
+def test_each_iteration_and_repark_notifies_once(tmp_path):
+    channel = _Capture()
+    notifier = N.Notifier([channel], ledger_dir_for=lambda e: tmp_path)
+    for phase, ended in [("P1", "first"), ("P2", "first"), ("P2", "second")]:
+        event = _event(_parked(M.PARKED_REASON_GATE, step_type="human_gate",
+                               iteration=phase, ended=ended))
+        notifier.notify_transition(event)
+        notifier.notify_transition(event)
+    assert len(channel.sent) == 3
+
+
+def test_console_channel_is_not_suppressed_by_driver_delivery(tmp_path):
+    event = _event(_parked(M.PARKED_REASON_GATE, step_type="human_gate"))
+    driver, console = _Capture(), _Capture()
+    driver.name, console.name = "webhook", "in_tab"
+    for channel in (driver, console):
+        N.Notifier([channel], ledger_dir_for=lambda e: tmp_path).notify_transition(event)
+    assert len(driver.sent) == len(console.sent) == 1
+
+
+def test_failed_channel_retries_without_resending_success(tmp_path):
+    event = _event(_parked(M.PARKED_REASON_USAGE_LIMIT))
+    good, bad = _Capture(), _Capture()
+    good.name, bad.name = "good", "bad"
+    original = bad.send
+    bad.send = lambda note: (_ for _ in ()).throw(RuntimeError("failed"))
+    notifier = N.Notifier([good, bad], ledger_dir_for=lambda e: tmp_path)
+    notifier.notify_transition(event)
+    assert len(N.NotificationLedger.for_run_dir(tmp_path).entries()) == 1
+    bad.send = original
+    notifier.notify_transition(event)
+    assert len(good.sent) == len(bad.sent) == 1
+    assert len(N.NotificationLedger.for_run_dir(tmp_path).entries()) == 2
+
+
+def test_driver_flushes_background_delivery_before_process_exit(tmp_path):
+    import subprocess
+    import sys
+    script = """
+import sys, time
+from pathlib import Path
+from gauntlet.engine import notify as N
+from gauntlet.engine.manifest import Manifest, PipelineRef
+class Channel:
+    name = 'test'
+    background = True
+    def send(self, note):
+        time.sleep(0.15)
+        Path(sys.argv[1]).write_text('delivered')
+man = Manifest(run_id='r', slug='s', branch='b', base_branch='main', status='done',
+               pipeline=PipelineRef(name='p', version=1, hash='h'))
+N.emit_driver_notification(man, notifier=N.Notifier([Channel()],
+    ledger_dir_for=lambda e: Path(sys.argv[1]).parent))
+"""
+    target = tmp_path / "delivery"
+    subprocess.run([sys.executable, "-B", "-c", script, str(target)], check=True)
+    assert target.read_text() == "delivered"
+    assert N.NotificationLedger.for_run_dir(tmp_path).entries()[0]["status"] == "delivered"
+
+
+def test_concurrent_emitters_serialize_one_channel(tmp_path):
+    import threading
+    import time
+    event = _event(_parked(M.PARKED_REASON_USAGE_LIMIT))
+    channel = _Capture()
+    original = channel.send
+    def slow(note):
+        time.sleep(0.05)
+        original(note)
+    channel.send = slow
+    notifiers = [N.Notifier([channel], ledger_dir_for=lambda e: tmp_path) for _ in range(2)]
+    threads = [threading.Thread(target=n.notify_transition, args=(event,)) for n in notifiers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(channel.sent) == 1
+
+
+def test_gate_summary_includes_implementation_before_review(fixture_repo):
+    from conftest import git
+    from gauntlet.engine import gitops
+    base = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    (fixture_repo / "implementation.py").write_text("implementation\n")
+    git(fixture_repo, "add", "implementation.py")
+    git(fixture_repo, "commit", "-qm", "P1: Implement phase")
+    handoff = gitops.head_sha(fixture_repo)
+    cycle = StepRecord(id="review", type="adversarial_cycle", status=M.DONE, base_sha=handoff)
+    gate = StepRecord(id="gate", type="human_gate", status=M.PARKED)
+    man = _man(steps=[cycle, gate], current_step="gate", commits=[
+        M.CommitRecord(step_id="commit", phase="P1", sha=handoff)])
+    assert GE.reviewed_range(fixture_repo, man, gate) == (f"{handoff}^", handoff)
+    assert "implementation.py" in gitops.range_diff(fixture_repo, *GE.reviewed_range(fixture_repo, man, gate))

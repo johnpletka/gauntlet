@@ -19,8 +19,8 @@ streams (``usage-window-warning``, ``gate-auto-approved``) ride
 ``manifest.warnings`` and are console-only.
 
 **De-dup ledger.** ``<run_dir>/notifications.jsonl`` is an append-only record of
-every notification emitted for the run — one JSON line per send, keyed
-``[run_id, kind, current_step]`` and stamped with the emitter (``driver`` /
+every successful channel delivery for the run — one JSON line per acknowledgment, keyed
+``[run_id, kind, current_step, iteration, episode]`` and stamped with the emitter (``driver`` /
 ``console``). Both emitters consult it before sending and append what they
 sent, so a driver running under a watching console never double-fires, and a
 restarted driver never re-announces a park it already announced. Malformed or
@@ -35,6 +35,10 @@ can never affect a run — the notifier owns no run state.
 from __future__ import annotations
 
 import json
+import fcntl
+import hashlib
+import time
+from contextlib import contextmanager
 import logging
 import os
 import shutil
@@ -162,7 +166,7 @@ EMITTER_DRIVER = "driver"
 EMITTER_CONSOLE = "console"
 
 # De-dup key: (run_id, kind, current_step) — FR-9.1.
-Key = tuple[str, str, str | None]
+Key = tuple[str | None, ...]
 
 
 def _utc_now() -> str:
@@ -207,6 +211,8 @@ class Transition(BaseModel):
     current_step_status: str | None = None
     current_step_type: str | None = None
     current_step_notes: str | None = None
+    iteration: str | None = None
+    episode: str | None = None
     parked_reason: str | None = None
     halt_reason: str | None = None
     # The persisted park deadline (usage-limit reset / provider backoff /
@@ -229,6 +235,8 @@ class Transition(BaseModel):
             current_step_status=cur.status if cur else None,
             current_step_type=cur.type if cur else None,
             current_step_notes=cur.notes if cur else None,
+            iteration=cur.iteration if cur else None,
+            episode=cur.ended if cur else None,
             parked_reason=(
                 M.normalize_parked_reason(cur.parked_reason, cur.type, cur.status)
                 if cur
@@ -522,7 +530,7 @@ class DesktopChannel:
         subprocess.run(  # noqa: S603 - fixed argv, no shell
             self._command(note),
             timeout=self.timeout,
-            check=False,
+            check=True,
             capture_output=True,
         )
 
@@ -692,12 +700,12 @@ class NotificationLedger:
             key = rec.get("key") if isinstance(rec, dict) else None
             if (
                 isinstance(key, list)
-                and len(key) == 3
+                and len(key) in (3, 5)
                 and isinstance(key[0], str)
                 and isinstance(key[1], str)
                 and (key[2] is None or isinstance(key[2], str))
             ):
-                out.add((key[0], key[1], key[2]))
+                out.add(tuple(key))
         return out
 
     def entries(self) -> list[dict]:
@@ -716,12 +724,43 @@ class NotificationLedger:
                 out.append(rec)
         return out
 
+    def delivered(self, key: Key, channel: str) -> bool:
+        return any(rec.get("key") == list(key) and rec.get("status") == "delivered"
+                   and channel in rec.get("channels", []) for rec in self.entries())
+
+    @contextmanager
+    def delivery_lock(self, channel: str):
+        """Serialize check/send/ack across driver and console, with a bound."""
+        suffix = hashlib.sha256(channel.encode()).hexdigest()[:12]
+        path = self.path.with_name(f"{self.path.name}.{suffix}.lock")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a")
+        except OSError:
+            # Broken ledger storage must not suppress the notification.
+            yield
+            return
+        try:
+            deadline = time.monotonic() + 6
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("notification delivery lock timed out")
+                    time.sleep(0.02)
+            yield
+        finally:
+            handle.close()
+
     def append(self, key: Key, *, kind: str, channels: list[str], by: str) -> None:
         rec = {
             "key": list(key),
             "kind": kind,
             "emitted_at": _utc_now(),
             "channels": list(channels),
+            "status": "delivered",
             "by": by,
         }
         try:
@@ -744,7 +783,7 @@ LedgerDirFn = Callable[[Transition], "Path | None"]
 class Notifier:
     """Edge-triggered, de-duplicated fan-out over a set of channels (FR-9.1/9.3).
 
-    De-dup key is ``(run_id, kind, current_step)`` so each distinct decision
+    De-dup key is ``(run_id, kind, current_step, iteration, episode)`` so each distinct decision
     point notifies once — in memory for this process AND, when ``ledger_dir_for``
     resolves the run's dir, through the run's persisted ledger (#134), so the
     driver and a watching console never both fire for one transition and a
@@ -771,11 +810,15 @@ class Notifier:
         self.by = by
         self.kinds = set(kinds) if kinds is not None else None
         self.summary_for = summary_for
-        self._fired: set[Key] = set()
+        self._fired: set[Key] = set()  # explicit startup suppression / advisories
+        self._delivered: set[tuple[Key, str]] = set()
+        self._inflight: set[tuple[Key, str]] = set()
+        self._threads: list[threading.Thread] = []
+        self._mutex = threading.Lock()
 
     @staticmethod
     def _key(event: Transition, kind: str) -> Key:
-        return (event.run_id, kind, event.current_step)
+        return (event.run_id, kind, event.current_step, event.iteration, event.episode)
 
     @staticmethod
     def _warning_key(event: Transition, kind: str, warning: str) -> Key:
@@ -805,11 +848,6 @@ class Notifier:
             )
             return None
         return NotificationLedger.for_run_dir(run_dir) if run_dir is not None else None
-
-    def _seen(self, key: Key, ledger: NotificationLedger | None) -> bool:
-        if key in self._fired:
-            return True
-        return ledger is not None and key in ledger.keys()
 
     def prime(self, event: Transition) -> None:
         """Record the current state's de-dup keys without notifying (FR-9.1).
@@ -862,10 +900,14 @@ class Notifier:
             return None
         key = self._key(event, kind)
         ledger = self._ledger(event)
-        if self._seen(key, ledger):
-            self._fired.add(key)
+        if key in self._fired:
             return None
-        self._fired.add(key)
+        channels = [ch for ch in self.channels
+                    if (key, ch.name) not in self._delivered
+                    and (key, ch.name) not in self._inflight
+                    and not (ledger and ledger.delivered(key, ch.name))]
+        if not channels:
+            return None
         summary = None
         if self.summary_for is not None:
             try:
@@ -878,14 +920,8 @@ class Notifier:
         note_obj = Notification.build(
             event, kind, base_url=self.base_url, note=note, summary=summary
         )
-        self._fanout(note_obj)
-        if ledger is not None:
-            ledger.append(
-                key,
-                kind=kind,
-                channels=[getattr(ch, "name", str(ch)) for ch in self.channels],
-                by=self.by,
-            )
+        for channel in channels:
+            self._dispatch(channel, note_obj, key=key, ledger=ledger)
         return kind
 
     def _allowed(self, kind: str) -> bool:
@@ -896,24 +932,52 @@ class Notifier:
         for channel in self.channels:
             self._dispatch(channel, note)
 
-    def _dispatch(self, channel, note: Notification) -> None:
-        """Send on one channel, fail-soft; off-thread when the channel does I/O."""
+    def _dispatch(self, channel, note: Notification, *, key=None, ledger=None) -> None:
+        """Acknowledge only successful sends; failures remain retryable."""
+        delivery = (key, channel.name)
+        with self._mutex:
+            if key is not None and (delivery in self._inflight or delivery in self._delivered):
+                return
+            self._inflight.add(delivery)
 
-        def _run() -> None:
+        def send_and_ack():
+            if ledger and ledger.delivered(key, channel.name):
+                return
+            channel.send(note)
+            if ledger:
+                ledger.append(key, kind=note.kind, channels=[channel.name], by=self.by)
+            with self._mutex:
+                self._delivered.add(delivery)
+
+        def run():
             try:
-                channel.send(note)
-            except Exception:  # FR-9.3: log and swallow — never reach a run
-                logger.exception(
-                    "notify channel %r raised on %s/%s; swallowed (FR-9.3)",
-                    getattr(channel, "name", channel),
-                    note.slug,
-                    note.run_id,
-                )
+                if ledger:
+                    with ledger.delivery_lock(channel.name):
+                        send_and_ack()
+                else:
+                    send_and_ack()
+            except Exception:
+                logger.exception("notify channel %r failed; delivery remains retryable", channel.name)
+            finally:
+                with self._mutex:
+                    self._inflight.discard(delivery)
 
         if getattr(channel, "background", False):
-            threading.Thread(target=_run, daemon=True).start()
+            thread = threading.Thread(target=run, daemon=True)
+            with self._mutex:
+                self._threads = [t for t in self._threads if t.is_alive()]
+                self._threads.append(thread)
+                thread.start()
         else:
-            _run()
+            run()
+
+    def flush(self, timeout: float = 12.0) -> None:
+        """Give pending channels a bounded chance to finish before CLI exit."""
+        deadline = time.monotonic() + timeout
+        with self._mutex:
+            pending = list(self._threads)
+        for thread in pending:
+            thread.join(max(0, deadline - time.monotonic()))
 
 
 def emit_driver_notification(
@@ -926,7 +990,9 @@ def emit_driver_notification(
         return None
     try:
         event = Transition.from_manifest(man, slug=slug)
-        return notifier.notify_transition(event)
+        kind = notifier.notify_transition(event)
+        notifier.flush()
+        return kind
     except Exception:
         logger.warning(
             "driver notification failed for %s/%s; run state unaffected (FR-9.3)",

@@ -148,8 +148,8 @@ def reviewed_range(
 ) -> tuple[str, str] | None:
     """``(base_sha, head_sha)`` of the range the gate ratifies, or ``None``.
 
-    ``base`` is the upstream cycle's persisted ``StepRecord.base_sha`` (the
-    transaction boundary stamped when the cycle entered), falling back to the
+    ``base`` includes the implementation handoff for code review gates.
+    Artifact gates use the upstream cycle's persisted boundary, falling back to the
     nearest earlier step that recorded one, then to ``merge-base(base_branch,
     run branch)``. ``head`` is the run branch's tip — resolved from the shared
     refs, so the operator's checkout is never consulted or moved.
@@ -173,7 +173,20 @@ def reviewed_range(
         cycle_rec = operator._resolve_upstream_cycle(man, gate_rec, pipeline)
     except Exception:  # fail-soft: an odd pipeline shape must not sink the summary
         cycle_rec = None
-    if cycle_rec is not None and cycle_rec.base_sha:
+    cycle_step = next((s for s in pipeline.all_steps() if cycle_rec and s.id == cycle_rec.id), None) if pipeline else None
+    code_cycle = cycle_step is None or cycle_step.get("mode", "artifact") == "code_review"
+    if code_cycle and cycle_rec is not None and man.commits:
+        # Find the implementation handoff at/before this cycle's entry. Fix
+        # commits made within review may follow it in the manifest.
+        candidates = [c for c in man.commits
+                      if cycle_rec.base_sha and gitops.is_ancestor(repo, c.sha, cycle_rec.base_sha)]
+        if candidates:
+            handoff = candidates[-1]
+            from types import SimpleNamespace
+            from gauntlet.engine.cycle import _code_review_base
+            base = _code_review_base(SimpleNamespace(
+                manifest=man, record=cycle_rec, work_root=repo), handoff.sha)
+    if base is None and cycle_rec is not None and cycle_rec.base_sha:
         base = cycle_rec.base_sha
     if base is None:
         # Nearest earlier step (manifest order) that stamped a boundary.
