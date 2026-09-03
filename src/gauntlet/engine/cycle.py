@@ -63,6 +63,7 @@ from gauntlet.engine.execution import (
     run_bookkeeping_paths,
 )
 from gauntlet.engine.pipeline import Step
+from gauntlet.engine.steptypes import PROMPT_INPUT_HEADROOM, profile_input_cap
 
 DEFAULT_FINDINGS_SCHEMA = "schemas/findings.json"
 DEFAULT_TRIAGE_SCHEMA = "schemas/triage.json"
@@ -2648,10 +2649,10 @@ def _spec_reference_block(step: Step, ctx: StepContext, rnd: int) -> str:
 
 # Headroom under the adapter's declared input cap for everything appended
 # around the diff (lens fragments, carried findings, the human-decision block)
-# plus CLI envelope overhead. 64 KiB is deliberately generous: the cost of
-# switching to by-reference a little early is a few reviewer git reads; the
-# cost of switching late is the whole invocation rejected (`input_too_large`).
-_REVIEW_PROMPT_HEADROOM = 65_536
+# plus CLI envelope overhead. One constant shared with the commit-message
+# drafter's by-reference switch (steptypes, #134) so every prompt builder
+# switches at the same margin; see PROMPT_INPUT_HEADROOM for the sizing note.
+_REVIEW_PROMPT_HEADROOM = PROMPT_INPUT_HEADROOM
 
 
 def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
@@ -2666,13 +2667,14 @@ def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
     for member in _panel(step):
         if not member.profile:
             continue
-        try:
-            capabilities = ctx.config.profile(member.profile).adapter_class().capabilities
-        except Exception:
+        cap, member_reads_repo = profile_input_cap(ctx, member.profile)
+        if cap is None and not member_reads_repo:
+            # `profile_input_cap` could not resolve the profile at all (a
+            # test double / no config profile): unknown, inline as today.
             return None, False
-        if capabilities.max_input_chars is not None:
-            caps.append(capabilities.max_input_chars)
-        reads_repo = reads_repo and capabilities.reads_repo
+        if cap is not None:
+            caps.append(cap)
+        reads_repo = reads_repo and member_reads_repo
     return (min(caps) if caps else None), reads_repo
 
 

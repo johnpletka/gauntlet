@@ -129,6 +129,19 @@ All notable changes to Gauntlet are recorded here. The format follows
   is the cumulative phase diff. Fail closed as before on a wrong-phase
   checkpoint, an unbounded walk (missing base ref), or a range with no
   checkpoints at all; adopted commits are never squashed.
+### Fixed
+
+- The commit-message drafter no longer inlines an unbounded phase diff. It
+  resolves the `message_agent` adapter's declared input cap through the same
+  capability path the review and confirm prompts use and, when the assembled
+  prompt would exceed it (or, with no declared cap, when the diff alone exceeds
+  a fixed 400,000-char ceiling — fail closed against the unknown), hands the
+  change by reference for repository-capable drafters. Tool-less API drafters
+  receive bounded inline excerpts with explicit omission notices. Redraft
+  feedback echoes the offending header and its exact character count. The
+  validator allows 100 characters (the prompt targets 72); invalid drafts
+  fail after bounded retries without synthesizing a replacement title.
+  The failure names the verbatim `resume --response` override (#134).
 
 ## [1.2.0] — 2026-08-18
 

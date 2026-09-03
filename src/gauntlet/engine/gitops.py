@@ -115,6 +115,7 @@ ROOT_SCOPE: dict[str, str] = {
     "worktree_tree_hash": ROOT_SCOPE_WORK,
     "diff_head": ROOT_SCOPE_WORK,
     "diff_worktree_vs": ROOT_SCOPE_WORK,
+    "diff_stat": ROOT_SCOPE_WORK,  # #134: the drafter's change map, vs the working tree
     "commit_all": ROOT_SCOPE_WORK,
     "commit_paths": ROOT_SCOPE_WORK,
     "commit_run_bookkeeping": ROOT_SCOPE_WORK,
@@ -1463,6 +1464,17 @@ def diff_worktree_vs(repo: Path, base: str, *, exclude: list[str] | None = None)
     this range so its body reflects the whole phase, not an empty residual tree.
     """
     return _run(repo, "diff", base, *_exclude_pathspec(exclude))
+
+
+def diff_stat(repo: Path, base: str = "HEAD", *, exclude: list[str] | None = None) -> str:
+    """``git diff --stat`` of the working tree vs ``base`` (#134).
+
+    The change MAP the commit-message drafter is handed when the full diff is
+    too large to inline: one line per touched path with its churn, no hunks.
+    Untracked files never appear here (git's diff sees only tracked paths) —
+    the status the drafter also receives lists them.
+    """
+    return _run(repo, "diff", "--stat", base, *_exclude_pathspec(exclude))
 
 
 def merge_base(repo: Path, a: str, b: str) -> str | None:

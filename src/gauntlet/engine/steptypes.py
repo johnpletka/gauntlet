@@ -24,7 +24,11 @@ from gauntlet.adapters.base import (
     AgentFailedError,
     SessionNotFoundError,
 )
-from gauntlet.engine.commit_format import header_prefix, validate_commit_message
+from gauntlet.engine.commit_format import (
+    HEADER_MAX,
+    header_prefix,
+    validate_commit_message,
+)
 from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
     DONE,
@@ -2120,13 +2124,10 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # The squash base is the parent of the OLDEST checkpoint: where the collapsed
     # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
-    # For buried checkpoints the same base covers the adopted commits above them
-    # — the cumulative phase diff the review range will show.
-    squash_base = (
-        gitops.commit_parent(repo, milestones[-1][0]) if milestones else None
-    )
+    squash_base = gitops.commit_parent(repo, milestones[-1][0]) if milestones else None
+    draft_notes: list[str] = []
     message, draft_usage, draft_session, drafter = _commit_message(
-        step, ctx, consumed, diff_base=(squash_base if milestones else None)
+        step, ctx, consumed, diff_base=squash_base, notes=draft_notes,
     )
     if consumed:
         message = _append_response_trailer(message, [r.response_id for r in consumed])
@@ -2140,13 +2141,20 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     err = validate_commit_message(message)
     if err is not None:
         # message_agent drafting includes a bounded redraft loop in _draft;
-        # a literal/exhausted message that still fails is a hard error.
+        # a literal/exhausted message that still fails is a hard error. The
+        # failure names the operator's verbatim override (#134): every park
+        # here used to cost a guess at what `--response` would do with the
+        # text — it is used AS the message when it is itself a valid one.
         return StepResult(
             status=FAILED,
             usage=draft_usage,
             usage_by_agent=usage_by_agent,
             session_id=draft_session,
-            notes=f"commit message invalid: {err.reason}",
+            notes=_join_notes(
+                f"commit message invalid: {err.reason}. "
+                f"Override: {commit_override_hint(ctx)}",
+                draft_notes,
+            ),
         )
     prefix = header_prefix(message)
 
@@ -2178,7 +2186,9 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             status=DONE, commit_sha=sha, commit_phase=prefix,
             usage=draft_usage, usage_by_agent=usage_by_agent,
             session_id=draft_session,
-            notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
+            notes=_join_notes(
+                f"squashed {len(wips)} checkpoint(s) into {sha[:10]}", draft_notes
+            ),
         )
 
     # Persist the cumulative phase base for review consumers, including the
@@ -2292,7 +2302,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             return StepResult(
                 status=DONE, commit_sha=sha, commit_phase=prefix,
                 usage=draft_usage, usage_by_agent=usage_by_agent,
-                session_id=draft_session, notes=note,
+                session_id=draft_session, notes=_join_notes(note, draft_notes),
             )
         return StepResult(
             status=FAILED,
@@ -2308,13 +2318,37 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     return StepResult(
         status=DONE, commit_sha=sha, commit_phase=prefix,
         usage=draft_usage, usage_by_agent=usage_by_agent,
-        session_id=draft_session, notes=f"committed {sha[:10]}",
+        session_id=draft_session,
+        notes=_join_notes(f"committed {sha[:10]}", draft_notes),
     )
 
 
-def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
+def _join_notes(primary: str, extra: list[str] | None) -> str:
+    """One step-notes string: the outcome first, drafting side-notes after."""
+    return "; ".join([primary, *(extra or [])])
+
+
+def commit_override_hint(ctx) -> str:
+    """The operator's verbatim commit-message override, spelled out (#134).
+
+    Named in every terminal commit-format failure so the recovery is a
+    copy-paste, not a guess: a `--response` that is itself a valid commit
+    message is used AS the message (:func:`_commit_message`), with no redraft.
+    """
+    slug = getattr(getattr(ctx, "manifest", None), "slug", None) or "<slug>"
+    return (
+        f"`gauntlet resume {slug} --response '<full message>'` uses your text "
+        f"verbatim when it is itself a valid commit message (P<N>: header "
+        f"≤{HEADER_MAX} chars, blank line, body)"
+    )
+
+
+def _commit_message(
+    step: Step, ctx: StepContext, consumed=(), *, diff_base=None, notes=None
+):
     """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
-    are None for a literal message (no model call)."""
+    are None for a literal message (no model call). ``notes`` (a list the
+    caller owns) collects drafting side-notes for the step record (#134)."""
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
@@ -2330,7 +2364,12 @@ def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None
         if text and validate_commit_message(text) is None:
             return text, None, None, None
         consumed = list(consumed) + [pending]
-    return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
+    if notes is None:
+        # Pre-#134 call shape (also what test doubles of the drafter accept).
+        return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
+    return _draft_commit_message(
+        step, ctx, consumed, diff_base=diff_base, notes=notes
+    )
 
 
 def _pending_response(ctx: StepContext):
@@ -2346,7 +2385,42 @@ def _pending_response(ctx: StepContext):
     return None
 
 
-def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
+# Headroom under an adapter's declared input cap for everything a prompt
+# carries besides its main payload (template, plan section, response section)
+# plus CLI envelope overhead. 64 KiB is deliberately generous: switching to
+# by-reference a little early costs the agent a few git reads; switching late
+# costs the whole invocation (`input_too_large`). Shared by the review /
+# confirm prompt builders (cycle.py) and the commit-message drafter (#134).
+PROMPT_INPUT_HEADROOM = 65_536
+
+# The commit-message drafter's inline-diff ceiling when the drafter's adapter
+# declares NO input cap (#134). Fail closed against the unknown: a claude-code
+# drafter has no declared cap, yet a phase that minted a few MB of model files
+# (a ~2.5M-token diff, observed live) fails `phase-commit` terminally on every
+# model when the whole diff is inlined. Above this many chars the diff goes by
+# reference regardless of what the adapter would accept.
+DRAFT_INLINE_DIFF_MAX = 400_000
+
+
+def profile_input_cap(ctx: StepContext, profile: str) -> tuple[int | None, bool]:
+    """``(max_input_chars, reads_repo)`` declared by ``profile``'s adapter class.
+
+    THE capability path every by-reference switch resolves through (review and
+    confirm panels via ``cycle._panel_input_cap``; the commit-message drafter,
+    #134): the profile's configured adapter CLASS, not a built instance — a
+    test double injected via ``adapter_factory`` has no config profile, and an
+    unresolvable profile means ``(None, False)``: unknown cap, no repo access.
+    """
+    try:
+        capabilities = ctx.config.profile(profile).adapter_class().capabilities
+    except Exception:
+        return None, False
+    return capabilities.max_input_chars, bool(capabilities.reads_repo)
+
+
+def _draft_commit_message(
+    step: Step, ctx: StepContext, consumed=(), *, diff_base=None, notes=None
+):
     """Draft a commit message via the message_agent with bounded redraft.
 
     The agent sees the change as data — both the tracked diff AND the untracked
@@ -2356,12 +2430,17 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     engine validates the format and asks for a redraft on violation (FR-9.2).
     Returns ``(message, usage, session_id, drafter)`` so the commit step records
     the drafter's cost (FR-3.2/§7).
+
+    Oversize changes use git references only for adapters that can read the
+    repository. Tool-less adapters receive bounded, explicitly partial diff
+    excerpts. Invalid drafts exhaust the ordinary redraft loop and fail closed.
     """
     agent_name = step.get("message_agent")
     if not agent_name:
         raise ValueError("commit step needs either `message:` or `message_agent:`")
+    if notes is None:
+        notes = []
     adapter = ctx.build_adapter(agent_name)
-    change = _change_context(ctx, diff_base=diff_base)
     base_prompt = (
         (ctx.repo_root / ctx.config.asset_root / step.get("prompt")).read_text()
         if step.get("prompt")
@@ -2377,9 +2456,34 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
         f"{base_prompt}\n\nRequired header phase prefix: {phase_hint or '(infer PN)'}\n"
         f"{plan_section}{_response_section(consumed)}"
     )
+    change, diff_len = _change_context(ctx, diff_base=diff_base)
+    cap, reads_repo = profile_input_cap(ctx, agent_name)
+    if cap is not None:
+        # Same rule as the review/confirm prompts: an over-cap prompt is
+        # rejected WHOLESALE by the adapter, so never build one.
+        oversize = len(header) + len(change) > cap - PROMPT_INPUT_HEADROOM
+        why = f"{diff_len} chars vs the {cap}-char input limit"
+    else:
+        # Unknown cap: fail closed on the diff alone (see DRAFT_INLINE_DIFF_MAX).
+        oversize = diff_len > DRAFT_INLINE_DIFF_MAX
+        why = (
+            f"{diff_len} chars with no declared input limit; inline ceiling "
+            f"{DRAFT_INLINE_DIFF_MAX} chars"
+        )
+    if oversize:
+        if reads_repo:
+            change = _change_context_by_reference(ctx, diff_base=diff_base, why=why)
+            notes.append(f"diff handed to the drafter by reference ({why})")
+        else:
+            budget = min(40_000, cap - PROMPT_INPUT_HEADROOM - len(header) - 2048) if cap else 40_000
+            if budget < 1024:
+                raise ValueError("commit drafting instructions leave no room for change evidence")
+            change = _bounded_draft_evidence(change, budget=budget)
+            notes.append(f"drafter received bounded inline diff excerpts ({why})")
     prompt = f"{header}\n{change}\n"
-    max_redrafts = int(step.get("max_redrafts", 2))
+    max_redrafts = max(0, int(step.get("max_redrafts", 2)))
     message = ""
+    err = None
     usage = _UsageAccumulator()  # sum across ALL draft attempts, incl. rejected
     session_id = None
     for _attempt in range(1 + max_redrafts):
@@ -2392,14 +2496,46 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
-        if validate_commit_message(message) is None:
+        err = validate_commit_message(message)
+        if err is None:
             return message, usage.result(), session_id, agent_name
+        # Echo the offending header WITH its exact count (#134): "header is 78
+        # chars" alone left models re-submitting 74; the line they wrote and
+        # the prefix-inclusive rule make the fix arithmetic, not a guess.
+        offending = message.split("\n", 1)[0]
         prompt = (
-            f"{header}\n\nYour previous draft was rejected: "
-            f"{validate_commit_message(message).reason}. "
+            f"{header}\n\nYour previous draft was rejected: {err.reason}. "
+            f"Its header line was {offending!r} — {len(offending)} characters; "
+            f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix. "
             f"Return only the corrected commit message.\n{change}\n"
         )
     return message, usage.result(), session_id, agent_name
+
+
+def _bounded_draft_evidence(change: str, *, budget: int) -> str:
+    """Distribute a fixed evidence budget across files for tool-less drafting.
+
+    This is message drafting, not code review: omitted evidence is explicit,
+    and the model must limit its claims to the visible excerpts and phase plan.
+    """
+    parts = re.split(r"(?=^diff --git )", change, flags=re.MULTILINE)
+    header = (
+        "--- PARTIAL DIFF EXCERPTS (bounded inline evidence) ---\n"
+        "You have no repository tools. These excerpts omit content. Use only "
+        "the visible evidence and phase plan; do not claim to have inspected "
+        "omitted changes.\n"
+    )
+    allowance = max(1, (budget - len(header) - 128) // len(parts))
+    excerpts = []
+    omitted = 0
+    for part in parts:
+        if len(part) > allowance:
+            omitted += len(part) - allowance
+            part = part[:allowance]
+        excerpts.append(part)
+    result = header + "\n".join(excerpts)
+    suffix = f"\n[omitted {omitted} source characters across {len(parts)} sections]\n"
+    return result[:budget - len(suffix)] + suffix
 
 
 def _iteration_phase(ctx: StepContext) -> str:
@@ -2489,8 +2625,9 @@ class _UsageAccumulator:
         return out
 
 
-def _change_context(ctx: StepContext, *, diff_base=None) -> str:
-    """The change a commit is about to record, as data for the drafter (F-008).
+def _change_context(ctx: StepContext, *, diff_base=None) -> tuple[str, int]:
+    """The change a commit is about to record, as data for the drafter (F-008),
+    and the raw diff's length (the by-reference switch's input, #134).
 
     Normally the tracked diff vs HEAD plus the untracked files staging will add.
     When the phase already landed `P<N> wip:` checkpoint commits (FR-11.1), the
@@ -2509,6 +2646,39 @@ def _change_context(ctx: StepContext, *, diff_base=None) -> str:
     return (
         f"--- git status (incl. untracked) ---\n{status}\n"
         f"\n--- {label} ---\n{diff}"
+    ), len(diff)
+
+
+def _change_context_by_reference(ctx: StepContext, *, diff_base=None, why: str) -> str:
+    """:func:`_change_context` with the diff BY REFERENCE (#134).
+
+    The status (incl. untracked files) and the ``diff --stat`` change map stay
+    inline; the hunks do not. The drafter runs inside the worktree and reads
+    the per-file diffs it needs with its own git — the same transport the
+    review and confirm prompts use for an oversize range (cycle.py), and like
+    them never a truncation: a clipped diff would silently narrow what the
+    message claims to describe.
+    """
+    repo = ctx.work_root
+    base = diff_base or "HEAD"
+    label = (
+        f"vs phase base {diff_base[:10]}" if diff_base else "vs HEAD"
+    )
+    status = gitops.status_porcelain(repo, exclude=ctx.excludes)
+    stat = gitops.diff_stat(repo, base, exclude=ctx.excludes)
+    return (
+        f"--- git status (incl. untracked) ---\n{status}\n"
+        f"\n--- diff --stat (tracked, {label}) ---\n{stat}\n"
+        f"\n--- diff (tracked, {label}): BY REFERENCE — too large to inline "
+        f"({why}) ---\n"
+        f"You are running inside the repository worktree. Read the change "
+        f"yourself with git (read-only), e.g.:\n"
+        f"  git diff --stat {base}      # the change map — shown above\n"
+        f"  git diff {base} -- <path>   # per-file, for the files the message "
+        f"must explain\n"
+        f"Untracked files (`??` in the status) are not in the diff; read them "
+        f"directly. Draft for the ENTIRE change exactly as if the diff were "
+        f"inlined here, and keep the body free of the diff itself.\n"
     )
 
 

@@ -650,3 +650,330 @@ def test_phase_lint_halts_when_phase_has_no_prose_section(fixture_repo):
     assert rec.status == M.PARKED
     assert rec.parked_reason == M.PARKED_REASON_ARTIFACT_INVALID
     assert "no locatable prose section" in rec.notes and "P2" in rec.notes
+
+
+# --- #134: by-reference drafting, header fallback, override naming ---------
+_COMMIT_PIPELINE = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message_agent: triage, max_redrafts: 2}
+"""
+
+
+def _cap_codex(monkeypatch, cap):
+    from gauntlet.adapters.codex import CodexAdapter
+
+    monkeypatch.setattr(
+        CodexAdapter, "capabilities",
+        CodexAdapter.capabilities.model_copy(update={"max_input_chars": cap}),
+    )
+
+
+def test_profile_input_cap_resolves_through_adapter_class():
+    """The drafter resolves its cap the way the review panel does: the
+    profile's adapter CLASS declaration. Unknown profile → (None, False)."""
+    from types import SimpleNamespace
+
+    from gauntlet.engine.steptypes import profile_input_cap
+
+    cfg = RunConfig.model_validate({"agents": {
+        "cx": {"adapter": "codex"}, "api": {"adapter": "api", "model": "h"},
+    }})
+    ctx = SimpleNamespace(config=cfg)
+    assert profile_input_cap(ctx, "cx") == (1_048_576, True)
+    assert profile_input_cap(ctx, "api") == (None, False)
+    assert profile_input_cap(ctx, "nope") == (None, False)
+
+
+def test_commit_draft_goes_by_reference_above_cap(fixture_repo, monkeypatch):
+    """A phase diff that would push the draft prompt over the drafter adapter's
+    declared input cap is handed BY REFERENCE (status + `diff --stat` inline,
+    per-file diffs read with git), never inlined and never truncated (#134).
+    Observed live: a ~2.5M-token diff of minted model files failed
+    `phase-commit` terminally on every model."""
+    _cap_codex(monkeypatch, 80_000)
+    (fixture_repo / "README.md").write_text("HUGE-SENTINEL\n" * 8_000)  # tracked, ≫ cap
+    drafter = RecordingDrafter()
+    cfg = {"agents": {"triage": {"adapter": "codex"}}}
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    prompt = drafter.prompts[0]
+    assert "BY REFERENCE" in prompt
+    assert "HUGE-SENTINEL" not in prompt  # the hunks are NOT inlined
+    assert "--- git status (incl. untracked) ---" in prompt  # status stays inline
+    assert "--- diff --stat (tracked, vs HEAD) ---" in prompt
+    assert "README.md |" in prompt  # the change map names the file
+    assert "git diff HEAD -- <path>" in prompt
+    assert "80000-char input limit" in prompt
+    assert "keep the body free of the diff" in prompt
+    notes = orch.manifest.record("commit").notes
+    assert "diff handed to the drafter by reference" in notes
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "P1: add new file"
+
+
+def test_commit_draft_stays_inline_below_cap(fixture_repo, monkeypatch):
+    _cap_codex(monkeypatch, 80_000)
+    (fixture_repo / "README.md").write_text("SMALL-SENTINEL\n")
+    drafter = RecordingDrafter()
+    cfg = {"agents": {"triage": {"adapter": "codex"}}}
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    prompt = drafter.prompts[0]
+    assert "+SMALL-SENTINEL" in prompt  # the diff body IS inlined
+    assert "BY REFERENCE" not in prompt
+    assert "diff --stat" not in prompt
+    assert "by reference" not in orch.manifest.record("commit").notes
+
+
+def test_commit_draft_unknown_cap_huge_diff_uses_inline_evidence(fixture_repo):
+    """The default API drafter has no tools; retain substantive inline evidence."""
+    from gauntlet.engine.steptypes import DRAFT_INLINE_DIFF_MAX
+
+    assert DRAFT_INLINE_DIFF_MAX == 400_000
+    (fixture_repo / "README.md").write_text("UNKNOWN-CAP-SENTINEL\n" * 25_000)  # ~525k
+    drafter = RecordingDrafter()
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}  # cap: None
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    prompt = drafter.prompts[0]
+    assert "BY REFERENCE" not in prompt
+    assert "+UNKNOWN-CAP-SENTINEL" in prompt
+    assert "PARTIAL DIFF EXCERPTS" in prompt and "omitted" in prompt
+    assert len(prompt) < 45_000
+    assert "bounded inline" in orch.manifest.record("commit").notes
+
+
+def test_commit_draft_unknown_cap_moderate_diff_stays_inline(fixture_repo):
+    (fixture_repo / "README.md").write_text("MODERATE-SENTINEL\n" * 2_000)  # ~36k
+    drafter = RecordingDrafter()
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    assert "+MODERATE-SENTINEL" in drafter.prompts[0]
+    assert "BY REFERENCE" not in drafter.prompts[0]
+
+
+def test_change_context_by_reference_uses_phase_base(fixture_repo):
+    """With `P<N> wip:` checkpoints the drafting diff base is the squash base;
+    the by-reference block must point the drafter at THAT range, not HEAD."""
+    from types import SimpleNamespace
+
+    from gauntlet.engine.steptypes import _change_context_by_reference
+
+    base = gitops.head_sha(fixture_repo)
+    (fixture_repo / "a.py").write_text("a\n")
+    git(fixture_repo, "add", "-A")
+    git(fixture_repo, "commit", "-qm", "P1 wip: a")
+    (fixture_repo / "README.md").write_text("changed\n")
+    ctx = SimpleNamespace(work_root=fixture_repo, excludes=[])
+    text = _change_context_by_reference(ctx, diff_base=base, why="test")
+    assert f"vs phase base {base[:10]}" in text
+    assert f"git diff {base} -- <path>" in text
+    assert "a.py" in text and "README.md" in text  # the stat spans the phase
+    assert "+changed" not in text
+
+
+def test_redraft_feedback_echoes_header_and_exact_count(fixture_repo):
+    """The rejection feedback quotes the offending header line with its exact
+    character count and the prefix-inclusive rule (#134) — a bare "78 chars"
+    left models re-submitting 74."""
+    long_header = "P1: " + "x" * 106  # 80 chars
+
+    class Drafter:
+        capabilities = FakeAdapter.capabilities
+
+        def __init__(self):
+            self.prompts = []
+
+        def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+            self.prompts.append(prompt)
+            text = f"{long_header}\n\nbody." if len(self.prompts) == 1 else "P1: ok\n\nbody."
+            return AgentResult(text=text, exit_code=0)
+
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = Drafter()
+    cfg = {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config=cfg, adapters={"triage": drafter})
+    assert orch.drive() == M.RUN_DONE
+    feedback = drafter.prompts[1]
+    assert repr(long_header) in feedback
+    assert "110 characters" in feedback
+    assert "the limit is 100 counting the 'P<N>: ' prefix" in feedback
+    assert "header is 110 chars" in feedback  # the validator's own reason, too
+
+
+def _phase_ctx(repo, *, iteration_item, adapter, step_id="commit"):
+    """A StepContext driving handle_commit directly inside a foreach phase."""
+    from gauntlet.engine.execution import StepContext
+    from gauntlet.engine.manifest import StepRecord
+    from gauntlet.logging.redact import RedactingWriter
+
+    ar = repo / "runs" / "demo"
+    (ar / "run-1").mkdir(parents=True, exist_ok=True)
+    man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
+                   pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    return StepContext(
+        repo_root=repo, run_dir=ar / "run-1", artifact_root=ar,
+        config=RunConfig.model_validate(
+            {"agents": {"triage": {"adapter": "api", "model": "h"}}}
+        ),
+        pipeline=Pipeline.model_validate({"name": "demo", "version": 1, "stages": []}),
+        manifest=man,
+        record=StepRecord(id=step_id, type="commit", base_sha=gitops.head_sha(repo)),
+        writer=RedactingWriter(),
+        iteration_item=iteration_item, iteration_index=2,
+        adapter_factory=lambda _n: adapter,
+    )
+
+
+class StubbornDrafter:
+    """Always returns the same (bad-header) text — the redrafts are wasted."""
+
+    capabilities = FakeAdapter.capabilities
+
+    def __init__(self, text):
+        self.text = text
+        self.n = 0
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None, extra_flags=None):
+        self.n += 1
+        return AgentResult(text=self.text, exit_code=0)
+
+
+_P3 = {
+    "id": "P3",
+    # 81 chars with the prefix: forces the word-boundary truncation to 68.
+    "title": "Judge policy engine with a per-run allow cache and fast-path allow/deny rules",
+    "goal": "g",
+}
+
+
+def test_commit_header_within_enforced_limit_preserves_draft(fixture_repo):
+    from gauntlet.engine.steptypes import handle_commit
+    (fixture_repo / "work.py").write_text("code\n")
+    header = "P3: " + "w" * 90
+    drafter = StubbornDrafter(header + "\n\nThe reasoning the drafter wrote.\n")
+    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
+    step = Step.model_validate({"id": "commit", "type": "commit", "message_agent": "triage"})
+    result = handle_commit(step, ctx)
+    assert result.status == "done", result.notes
+    assert drafter.n == 1
+    assert gitops.commit_subject(fixture_repo, "HEAD") == header
+    assert "The reasoning the drafter wrote." in gitops.commit_message(fixture_repo, "HEAD")
+    assert ctx.manifest.warnings == []
+
+
+def test_commit_header_rejects_off_shape_header(fixture_repo):
+    """An approved plan title must not hide an invalid drafted header."""
+    from gauntlet.engine.steptypes import handle_commit
+
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = StubbornDrafter("Add the thing\n\nbody.\n")
+    item = {"id": "P3", "title": "Short  title", "goal": "g"}
+    ctx = _phase_ctx(fixture_repo, iteration_item=item, adapter=drafter)
+    step = Step.model_validate({"id": "commit", "type": "commit", "message_agent": "triage"})
+    result = handle_commit(step, ctx)
+    assert result.status == "failed", result.notes
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "init"
+    assert drafter.n == 3 and ctx.manifest.warnings == []
+
+
+def test_commit_header_fallback_not_used_when_body_invalid(fixture_repo):
+    """The fallback is header-ONLY: a draft whose body also fails (missing
+    blank line / empty body) fails as before — never a synthesized message
+    around an unusable body. The terminal failure names the override."""
+    from gauntlet.engine.steptypes import handle_commit
+
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = StubbornDrafter("P3: " + "w" * 110)  # over-long header, no body
+    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
+    step = Step.model_validate(
+        {"id": "commit", "type": "commit", "message_agent": "triage", "max_redrafts": 1}
+    )
+    result = handle_commit(step, ctx)
+    assert result.status == "failed"
+    assert drafter.n == 2
+    assert "commit message invalid: header is 114 chars" in result.notes
+    assert "synthesized" not in result.notes
+    assert ctx.manifest.warnings == []
+    assert gitops.commit_subject(fixture_repo, "HEAD") == "init"  # nothing landed
+    # (c): the failure names the verbatim override, spelled out.
+    assert "gauntlet resume demo --response '<full message>'" in result.notes
+    assert "uses your text verbatim when it is itself a valid commit message" in result.notes
+    assert "P<N>: header ≤100 chars, blank line, body" in result.notes
+
+
+def test_commit_header_fallback_requires_phase_title(fixture_repo):
+    """No foreach phase (or a phase without a matching title): no synthesis —
+    the engine never guesses a subject line. Fails exactly as before."""
+    from gauntlet.engine.steptypes import handle_commit
+
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = StubbornDrafter("P3: " + "w" * 110 + "\n\nbody.\n")
+    ctx = _phase_ctx(fixture_repo, iteration_item=None, adapter=drafter)
+    step = Step.model_validate(
+        {"id": "commit", "type": "commit", "message_agent": "triage", "phase": "P3"}
+    )
+    result = handle_commit(step, ctx)
+    assert result.status == "failed"
+    assert "commit message invalid" in result.notes and "--response" in result.notes
+    assert ctx.manifest.warnings == []
+
+
+def test_commit_header_fallback_skips_stage_label_phases(fixture_repo):
+    """Stage labels (PRD/PLAN/REVIEW) are never relabelled from a plan phase."""
+    from gauntlet.engine.steptypes import handle_commit
+
+    (fixture_repo / "work.py").write_text("code\n")
+    drafter = StubbornDrafter("PLAN.1: " + "w" * 110 + "\n\nbody.\n")
+    ctx = _phase_ctx(fixture_repo, iteration_item=_P3, adapter=drafter)
+    step = Step.model_validate(
+        {"id": "commit", "type": "commit", "message_agent": "triage", "phase": "PLAN"}
+    )
+    assert handle_commit(step, ctx).status == "failed"
+
+
+def test_commit_bad_literal_message_names_override(fixture_repo):
+    (fixture_repo / "work.py").write_text("code\n")
+    text = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: commit, type: commit, message: "not a valid header"}
+"""
+    orch = _orch(fixture_repo, text)
+    assert orch.drive() == M.RUN_FAILED
+    notes = orch.manifest.record("commit").notes
+    assert "gauntlet resume demo --response '<full message>'" in notes
+    assert "verbatim" in notes
+
+
+def test_commit_prompt_counts_prefix_and_bans_diff_in_body():
+    """(d) the drafter's template states the prefix-inclusive count rule and
+    the diff-free body rule; the scaffold copy is byte-identical."""
+    from pathlib import Path
+
+    import gauntlet
+
+    root = Path(__file__).resolve().parents[2]
+    prompt = (root / "prompts" / "commit-message.md").read_text()
+    assert "INCLUDING the `PN: ` prefix" in prompt
+    assert "Keep the body free of the diff" in prompt
+    assert "BY REFERENCE" in prompt
+    scaffold = Path(gauntlet.__file__).parent / "scaffold" / "prompts" / "commit-message.md"
+    assert scaffold.read_text() == prompt
+
+
+def test_toolless_evidence_includes_small_file_after_large_file():
+    from gauntlet.engine.steptypes import _bounded_draft_evidence
+    change = "status\ndiff --git a/large b/large\n+" + "x" * 100000
+    change += "\ndiff --git a/logic.py b/logic.py\n+fix_actual_bug()\n"
+    evidence = _bounded_draft_evidence(change, budget=40000)
+    assert len(evidence) <= 40000
+    assert "+fix_actual_bug()" in evidence
+    assert "no repository tools" in evidence and "omitted" in evidence
