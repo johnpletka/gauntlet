@@ -801,10 +801,22 @@ class Orchestrator:
         to a completed implement); it must be reset too, otherwise the loop skips
         it and only the failing step re-runs forever.
         """
+        self.reset_records_for_retry(self.manifest, stage, route_to, iteration)
+
+    @staticmethod
+    def reset_records_for_retry(
+        manifest: Manifest, stage: Stage, route_to: str, iteration: str | None
+    ) -> None:
+        """The one ``on_fail`` reset, shared with the verb boundary (#134).
+
+        ``RunManager`` re-arms an exhausted shell step's route on a plain
+        resume through exactly this reset, so the operator-driven route and
+        the orchestrator's in-budget route can never drift apart.
+        """
         ids = [s.id for s in stage.steps]
         start = ids.index(route_to)
         for sid in ids[start:]:
-            rec = self.manifest.record(sid, iteration)
+            rec = manifest.record(sid, iteration)
             if rec is not None:
                 rec.status = M.PENDING
                 rec.ended = None
@@ -814,6 +826,18 @@ class Orchestrator:
                 # a later interrupt's dirty check diff against — and a
                 # reset_to_base rewind past — everything the run landed since.
                 rec.base_sha = None
+                # Cycle sub-step checkpoints belong to the attempt too (#134):
+                # a route that resets a COMPLETED adversarial_cycle (e.g.
+                # tests-recheck → impl-cycle) must re-run it as a fresh round.
+                # The cycle's FR-4.1 reuse keys on "checkpoints present"; with
+                # the stale ones kept, HEAD still sits on the cycle's own last
+                # fix tip and the tree is clean, so the SHA/dirty guards would
+                # NOT invalidate reuse and the cycle would replay its completed
+                # sub-steps into an immediate no-op DONE — the route would
+                # never repair anything. A reject re-drive already clears them
+                # (its pending response disables reuse); this makes the
+                # response-less route behave the same.
+                rec.checkpoints = []
 
     # ---- single-step execution ----------------------------------------------
     def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:

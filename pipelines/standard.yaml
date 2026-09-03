@@ -166,8 +166,17 @@ stages:
       # this re-proves the tests signal, against the tree the phase actually ships.
       # Without it the gate below could never auto-approve any phase that fixed
       # anything, which is nearly every phase.
+      # A failing recheck routes back to `impl-cycle` (#134), not to a fresh
+      # `implement`: the tree it failed on is the cycle's own fix rounds, so the
+      # cycle owns the repair — its verifier executes the suite in the disposable
+      # copy and surfaces the failure as a finding the fixer acts on. The route
+      # resets impl-cycle, acceptance-recheck and this step for a fresh attempt
+      # (stale cycle checkpoints cleared, base_sha re-stamped at re-entry). One
+      # retry: a second recheck failure surfaces FAILED, and every later plain
+      # `gauntlet resume` re-arms exactly one more route per human action — the
+      # exit is the pipeline's own routing, never git surgery.
       - {id: tests-recheck, type: shell, run: "{{config.test_command}}",
-         timeout_s: 1800}
+         timeout_s: 1800, on_fail: {route_to: impl-cycle, max_retries: 1}}
       # Evidence-tiered phase gate (FR-4.1). Policy `auto_when_clean`: the strict
       # §4.2 conjunction auto-approves and records an evidence snapshot; ANY miss
       # parks for a human exactly as a plain gate would. Note what this changes on

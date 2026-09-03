@@ -727,6 +727,10 @@ contract suite, which requires authenticated CLIs and API keys.
 - **A run parks unexpectedly / a step is `failed`** — `gauntlet status <slug>`
   shows where; the step's transcript under `.gauntlet/runs/<slug>/<run>/steps/` has the
   detail. `gauntlet resume <slug>` re-enters safely once the cause is cleared.
+  A failed `shell` step with an `on_fail` route (the standard pipeline's
+  `tests` / `tests-recheck`) whose retry budget is spent needs no git surgery:
+  each plain `gauntlet resume <slug>` re-arms exactly one more route, audited
+  as a manifest warning.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
   `gauntlet resume <slug>`.

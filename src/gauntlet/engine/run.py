@@ -3181,6 +3181,7 @@ class RunManager:
         # whole verb — an unchanged repeat that is not a legitimate live wait
         # raises NoProgressError (nonzero) instead of exiting 0 re-parked.
         before = self._capture_progress(slug)
+        self._rearmed_route = False
         status = self._resume_once(
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
@@ -3198,7 +3199,13 @@ class RunManager:
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock, sleep=auto_sleep,
         )
-        self._require_progress_after(slug, before, verb="resume")
+        # #134: a resume that re-armed an exhausted on_fail route re-ran the
+        # route target (real work, a human action) even when the step then
+        # failed identically — the fingerprint ignores the attempts counter by
+        # design, so without this the re-arm would read as a no-op repeat. The
+        # audited re-arm warning is the evidence; the FAILED status is loud.
+        if not getattr(self, "_rearmed_route", False):
+            self._require_progress_after(slug, before, verb="resume")
         return status
 
     def _resume_once(self, slug: str, *, response: str | None = None,
@@ -3385,6 +3392,10 @@ class RunManager:
         # Plain resume only (R7: retry intent is not a human decision).
         if response is None:
             self._reclassify_clean_shell_failure(layout, run_dir, man)
+            # #134: a shell step whose `on_fail` budget is spent re-arms ONE
+            # more route per plain resume (a human action), instead of
+            # re-running the same failing command into the R5 refusal.
+            self._rearm_exhausted_shell_route(run_dir, man, pipeline)
         # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
         # FR-7.1 idempotent recovery). All validation and operator-identity
         # resolution happen HERE, before driving; the orchestrator only
@@ -3397,6 +3408,67 @@ class RunManager:
             response_action=action,
             interrupted_override="reset_to_base" if reset_interrupted else None,
         )
+
+    REARM_WARNING_PREFIX = "operator resume re-armed on_fail for"
+
+    def _rearm_exhausted_shell_route(
+        self, run_dir: Path, man: Manifest, pipeline
+    ) -> None:
+        """Re-arm one more ``on_fail`` route on an exhausted shell step (#134).
+
+        The orchestrator routes a failed shell step (``tests`` → ``implement``)
+        while ``attempts <= max_retries``; once the budget is spent the step
+        surfaces FAILED, a plain resume re-runs the SAME command, it fails
+        identically, and the R5 guard refuses "no progress" — so operators
+        reached for git surgery instead of the route the pipeline declares.
+
+        A plain ``gauntlet resume`` is an explicit human action, so it re-arms
+        exactly one more route: the same reset the in-budget path uses
+        (:meth:`Orchestrator.reset_records_for_retry` — route target and
+        everything after it pending, ``base_sha`` and stale cycle checkpoints
+        cleared), an audited manifest warning counting the re-arm, and the
+        drive proceeds from the route target. The persisted ``attempts``
+        counter is NOT reset, so the next failure exhausts again and the next
+        plain resume re-arms again (``re-arm #k``) — one route per human
+        action, never an unbounded loop. Steps without ``on_fail``, a step
+        still inside its budget (the orchestrator routes it itself), and a
+        step with a pending ``--response`` are left alone.
+        """
+        from gauntlet.engine.orchestrator import Orchestrator
+
+        if man.status != M.RUN_FAILED:
+            return
+        failed = self._failed_step(man)
+        if failed is None or failed.type != "shell":
+            return
+        if failed.human_responses and (
+            failed.human_responses[-1].state == M.RESPONSE_PENDING
+        ):
+            return
+        stage = step = None
+        for st in pipeline.stages:
+            for s in st.steps:
+                if s.id == failed.id:
+                    stage, step = st, s
+                    break
+            if step is not None:
+                break
+        if step is None or step.on_fail is None:
+            return
+        if failed.attempts <= step.on_fail.max_retries:
+            return  # budget not spent: the orchestrator's own routing applies
+        route_to = step.on_fail.route_to
+        self._rearmed_route = True  # R5: this verb did real work (see resume())
+        prefix = f"{self.REARM_WARNING_PREFIX} '{failed.id}'"
+        k = 1 + sum(1 for w in man.warnings if w.startswith(prefix))
+        Orchestrator.reset_records_for_retry(man, stage, route_to, failed.iteration)
+        man.warnings.append(
+            f"{prefix} (route_to={route_to}, re-arm #{k}): the retry budget "
+            f"(max_retries={step.on_fail.max_retries}) was spent after "
+            f"{failed.attempts} failure(s); this plain resume routes once more "
+            "(#134)"
+        )
+        man.write_atomic(run_dir / "manifest.json")
 
     def _reclassify_clean_shell_failure(
         self, layout: "RunLayout", run_dir: Path, man: Manifest
