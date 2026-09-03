@@ -299,19 +299,26 @@ class HumanResponse(BaseModel):
 
 
 class ScheduledResume(BaseModel):
-    """An armed auto-resume schedule on a usage-limit park (FR-3.4).
+    """An armed auto-resume schedule on a usage-limit or provider-unavailable
+    park (FR-3.4; generalized by #134).
 
     Persisted on the parked step BEFORE the run parks, so a process death
     between scheduling and ``attempt_at`` loses nothing — the next driver start
     or ``gauntlet resume`` reconciles from disk. ``attempt_at`` is the absolute
-    UTC time to resume (``now + retry_after_s``, else the quota reset time);
-    ``attempts`` counts spaced attempts made; once ``attempts >= max_attempts``
-    the step re-parks plain (no schedule) with an exhaustion note.
+    UTC time to resume (``now + retry_after_s``, else the quota reset time; for
+    a ``provider_unavailable`` park the recorded backoff / Retry-After
+    deadline); ``attempts`` counts spaced attempts made; once ``attempts >=
+    max_attempts`` the step re-parks plain (no schedule) with an exhaustion
+    note. ``reason`` records which park reason armed the schedule
+    (``usage_limit`` / ``provider_unavailable``) so the wait loop can consult
+    the matching config knob; ``None`` on manifests written before #134 (an
+    unstamped schedule is read as the step's own park reason). Additive/nullable.
     """
 
     attempt_at: str
     attempts: int = 0
     max_attempts: int = 3
+    reason: str | None = None
 
 
 class RevalidationRecord(BaseModel):
@@ -493,9 +500,11 @@ class StepRecord(BaseModel):
     # misrouted into the round-1 reviewer. Additive/nullable: older manifests load
     # unchanged.
     parked_substep: str | None = None
-    # Armed auto-resume schedule on a usage-limit park (FR-3.4). Set only when
-    # ``resume_on_quota: auto`` parked this step; ``None`` otherwise and after a
-    # successful resume. Additive/nullable — older manifests load unchanged.
+    # Armed auto-resume schedule on a usage-limit or provider-unavailable park
+    # (FR-3.4 / #134). Set only when ``resume_on_quota: auto`` (usage_limit) or
+    # ``resume_on_provider_unavailable: auto`` (provider_unavailable) parked
+    # this step; ``None`` otherwise and after a successful resume.
+    # Additive/nullable — older manifests load unchanged.
     scheduled_resume: ScheduledResume | None = None
     # Content-hash pair recorded on an ``artifact_invalid`` park (FR-7.2/§6). P3
     # defines the shape here; P4 populates it on the validator-repair park path.

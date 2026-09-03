@@ -36,6 +36,12 @@ reviewer_mutation: commit
 #                             #   usage-limit park at the provider's hinted
 #                             #   reset time (wants keep_awake or an external
 #                             #   scheduler re-invoking `gauntlet resume`)
+# resume_on_provider_unavailable: notify
+#                             # notify (default) | auto — auto self-resumes a
+#                             #   provider_unavailable park (dependency retries
+#                             #   exhausted) at its recorded backoff/Retry-After
+#                             #   deadline; same survival needs and shared
+#                             #   max_auto_resume_attempts as resume_on_quota
 # keep_awake: false           # true wraps the driver in `caffeinate -i` (darwin)
 # heartbeat_interval_s: 15    # driver heartbeat cadence (suspend detection)
 # suspend_credit_cap_s: 43200 # max host-sleep time credited to a step deadline

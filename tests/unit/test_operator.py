@@ -815,3 +815,57 @@ def test_intent_resolution_error_yields_anomaly(tmp_path, monkeypatch):
     recon, anomaly = op.read_recovery_intent(tmp_path, run_dir, "demo")
     assert recon is None
     assert anomaly is not None and "recovery-intent" in anomaly
+
+
+# --- #134: the human footer names the armed auto-resume schedule --------------
+def test_footer_provider_park_names_armed_auto_resume(host):
+    driver = op.DriverInfo(op.LIVENESS_ALIVE, 4242, None, None)
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED,
+               reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
+    sched = M.ScheduledResume(
+        attempt_at="2026-07-02T09:00:00+00:00", attempts=1, max_attempts=3,
+        reason="provider_unavailable",
+    )
+    lines = op.render_footer(
+        driver, rstate, quota_reset_at="2026-07-02T09:00:00+00:00",
+        scheduled_resume=sched,
+    )
+    assert any("retry deadline: 2026-07-02T09:00:00+00:00" in ln for ln in lines)
+    assert any(
+        ln == "auto-resume scheduled at 2026-07-02T09:00:00+00:00 "
+              "(attempt 2/3, provider_unavailable)"
+        for ln in lines
+    )
+
+
+def test_footer_usage_limit_park_names_armed_auto_resume_with_fallback_reason(host):
+    # A pre-#134 schedule (no reason stamp) names the state's own park reason.
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    sched = M.ScheduledResume(attempt_at="2026-07-02T09:00:00+00:00")
+    lines = op.render_footer(driver, rstate, scheduled_resume=sched)
+    assert any(
+        ln == "auto-resume scheduled at 2026-07-02T09:00:00+00:00 "
+              "(attempt 1/3, usage_limit)"
+        for ln in lines
+    )
+
+
+def test_footer_no_auto_resume_line_when_unarmed(host):
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED,
+               reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)],
+    )
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    lines = op.render_footer(driver, rstate, quota_reset_at="2026-07-02T09:00:00+00:00")
+    assert not any("auto-resume scheduled" in ln for ln in lines)

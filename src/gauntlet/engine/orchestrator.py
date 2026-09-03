@@ -1876,6 +1876,19 @@ class Orchestrator:
             return result
         return result
 
+    def _auto_resume_armed_for(self, parked_reason: str | None) -> bool:
+        """Whether the configured auto-resume knob for *parked_reason* is ``auto``.
+
+        ``usage_limit`` → ``resume_on_quota``; ``provider_unavailable`` →
+        ``resume_on_provider_unavailable`` (#134). Every other park reason (gate,
+        response, artifact_invalid, usage_window, …) never arms a schedule.
+        """
+        if parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+            return self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
+        if parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE:
+            return self.config.resume_on_provider_unavailable == RESUME_ON_QUOTA_AUTO
+        return False
+
     def _finalize(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
         rec.status = {
             DONE: M.DONE,
@@ -1973,21 +1986,25 @@ class Orchestrator:
         # never carries a stale hand-edit record.
         rec.revalidation = result.revalidation
         # Auto-resume schedule (FR-3.4) is current-state and armed at park time so
-        # a usage-limit park under `resume_on_quota: auto` carries its schedule the
-        # instant `_drive` returns (before any wait), and a process death loses
-        # nothing. Preserve the prior attempts count across re-parks (the
-        # RunManager increments it around each in-process resume). Cleared on any
-        # non-usage-limit-park finalization so a step resumed to DONE never carries
-        # a stale schedule. `notify` mode never arms one.
+        # a usage-limit park under `resume_on_quota: auto` — or (#134) a
+        # provider_unavailable park under `resume_on_provider_unavailable: auto`
+        # — carries its schedule the instant `_drive` returns (before any wait),
+        # and a process death loses nothing. Preserve the prior attempts count
+        # across re-parks (the RunManager increments it around each in-process
+        # resume; the ceiling is shared across both park reasons so an outage
+        # that turns into a quota wall still stops at `max_auto_resume_attempts`).
+        # Cleared on any other finalization so a step resumed to DONE never
+        # carries a stale schedule. `notify` mode never arms one.
         if (
             result.status == PARKED
-            and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-            and self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
-            # Arm ONLY with a structured reset time (FR-3.4): a park with no
-            # reported reset has ``quota_reset_at is None``; falling back to
+            and self._auto_resume_armed_for(result.parked_reason)
+            # Arm ONLY with a concrete deadline (FR-3.4): a usage-limit park with
+            # no reported reset has ``quota_reset_at is None``; falling back to
             # ``self.clock()`` would make the schedule due immediately, and the
             # auto-resume loop would burn every attempt in an unspaced hot loop.
-            # With no reset time, leave a plain usage-limit park for a human.
+            # With no deadline, leave a plain park for a human. (A
+            # provider_unavailable park always carries its backoff deadline —
+            # depretry.park_deadline_s — so it always arms under `auto`.)
             and rec.quota_reset_at is not None
         ):
             prior_attempts = (
@@ -1997,6 +2014,7 @@ class Orchestrator:
                 attempt_at=rec.quota_reset_at,
                 attempts=prior_attempts,
                 max_attempts=self.config.max_auto_resume_attempts,
+                reason=result.parked_reason,
             )
         else:
             rec.scheduled_resume = None
