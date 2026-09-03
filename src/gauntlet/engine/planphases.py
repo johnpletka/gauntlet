@@ -15,10 +15,18 @@ loader fails closed rather than guessing phases.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from gauntlet.engine.preconditions import (
+    PLAN_SCOPE,
+    Precondition,
+    PreconditionSpecError,
+    parse_preconditions,
+)
 
 # A fenced ```gauntlet-phases ... ``` block. The info string must be exactly
 # `gauntlet-phases` so an ordinary ```yaml example in the plan is never mistaken
@@ -59,12 +67,65 @@ class PlanPhasesError(ValueError):
     """The plan's ``gauntlet-phases`` block is present but malformed."""
 
 
+# The keys a MAPPING-form block admits (issue #134). The classic form is a bare
+# YAML list of phases; a plan that needs plan-wide preconditions wraps it:
+# ``{preconditions: [...], phases: [...]}``. Any other top-level key is rejected
+# so a typo (``precondition:``) can never silently declare nothing.
+_BLOCK_KEYS = frozenset({"phases", "preconditions"})
+
+
+@dataclass(frozen=True)
+class PlanSpec:
+    """Everything the ``gauntlet-phases`` block declares (issue #134).
+
+    ``phases`` is the ordered phase list the foreach fans out over (unchanged
+    shape — each entry is the phase's own mapping). ``preconditions`` are the
+    block's top-level (whole-plan) items; ``phase_preconditions`` maps each
+    phase id to its own, in declaration order. Both are shape-validated
+    :class:`~gauntlet.engine.preconditions.Precondition` items.
+    """
+
+    phases: list[dict[str, Any]]
+    preconditions: list[Precondition] = field(default_factory=list)
+    phase_preconditions: dict[str, list[Precondition]] = field(default_factory=dict)
+
+    def all_preconditions(self) -> list[Precondition]:
+        """Plan-level items, then every phase's, in plan order (the gate check)."""
+        items = list(self.preconditions)
+        for phase in self.phases:
+            items.extend(self.phase_preconditions.get(phase["id"], []))
+        return items
+
+    def preconditions_for(self, phase_id: str) -> list[Precondition]:
+        """Plan-level items plus ``phase_id``'s own (the pre-phase check)."""
+        if phase_id not in self.phase_preconditions:
+            raise PlanPhasesError(
+                f"phase {phase_id!r} is not declared in the plan's "
+                "gauntlet-phases block"
+            )
+        return list(self.preconditions) + list(self.phase_preconditions[phase_id])
+
+
 def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
     """Return the structured phase list from a plan's text, or ``None``.
 
     ``None`` means no ``gauntlet-phases`` block at all (the plan stage has not
     produced one yet). A present-but-malformed block raises :class:`PlanPhasesError`
     — fail closed, never silently fan out over a guess.
+    """
+    spec = extract_plan(plan_text)
+    return spec.phases if spec is not None else None
+
+
+def extract_plan(plan_text: str) -> PlanSpec | None:
+    """Parse the whole ``gauntlet-phases`` block: phases + preconditions.
+
+    Accepts both block forms — the bare phase list, and the mapping form
+    ``{preconditions: [...], phases: [...]}`` (issue #134) — and validates every
+    declared ``preconditions:`` list (top-level and per phase) for shape, so a
+    malformed item fails the plan at ``plan-lint`` / the ``plan_phases``
+    validator rather than at the first preflight. Same ``None`` / raise
+    contract as :func:`extract_phases`.
     """
     matches = _BLOCK_RE.findall(plan_text)
     if not matches:
@@ -78,11 +139,34 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
         data = yaml.safe_load(matches[0])
     except yaml.YAMLError as exc:
         raise PlanPhasesError(f"gauntlet-phases block is not valid YAML: {exc}") from None
+    plan_items: list[Precondition] = []
+    if isinstance(data, dict):
+        unknown = sorted(set(data) - _BLOCK_KEYS)
+        if unknown:
+            raise PlanPhasesError(
+                "gauntlet-phases block must be a non-empty YAML list of phases, "
+                "or a mapping whose only keys are 'phases' and 'preconditions'; "
+                f"got unknown top-level key(s) {unknown}"
+            )
+        if "phases" not in data:
+            raise PlanPhasesError(
+                "gauntlet-phases mapping-form block is missing 'phases' (the "
+                "non-empty phase list)"
+            )
+        if "preconditions" in data:
+            plan_items = _parse_preconditions_or_raise(
+                data["preconditions"], scope=PLAN_SCOPE
+            )
+        data = data["phases"]
     if not isinstance(data, list) or not data:
-        raise PlanPhasesError("gauntlet-phases block must be a non-empty YAML list")
+        raise PlanPhasesError(
+            "gauntlet-phases block must be a non-empty YAML list of phases (or "
+            "a mapping with a non-empty 'phases' list)"
+        )
 
     seen: set[str] = set()
     phases: list[dict[str, Any]] = []
+    phase_items: dict[str, list[Precondition]] = {}
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise PlanPhasesError(f"phase #{i + 1} is not a mapping: {item!r}")
@@ -121,8 +205,23 @@ def extract_phases(plan_text: str) -> list[dict[str, Any]] | None:
         shape_err = _frs_body_error(pid, item["frs"]) if "frs" in item else None
         if shape_err:
             raise PlanPhasesError(shape_err)
+        # #134: a per-phase `preconditions:` list is shape-validated here so an
+        # unknown key or shape fails the plan at lint time, never at preflight.
+        phase_items[pid] = (
+            _parse_preconditions_or_raise(item["preconditions"], scope=pid)
+            if "preconditions" in item else []
+        )
         phases.append(item)
-    return phases
+    return PlanSpec(
+        phases=phases, preconditions=plan_items, phase_preconditions=phase_items
+    )
+
+
+def _parse_preconditions_or_raise(raw: Any, *, scope: str) -> list[Precondition]:
+    try:
+        return parse_preconditions(raw, scope=scope)
+    except PreconditionSpecError as exc:
+        raise PlanPhasesError(str(exc)) from None
 
 
 def _acceptance_body_error(pid: str, acc: Any) -> str | None:
@@ -325,3 +424,15 @@ def load_plan_phases(plan_path: Path) -> list[dict[str, Any]] | None:
     if not plan_path.exists():
         return None
     return extract_phases(plan_path.read_text())
+
+
+def load_plan_spec(plan_path: Path) -> PlanSpec | None:
+    """Read ``plan.md`` and return its full :class:`PlanSpec`, or ``None``.
+
+    The preconditions counterpart of :func:`load_plan_phases` (issue #134):
+    ``None`` when the plan file or its block is absent; raises
+    :class:`PlanPhasesError` on a malformed block.
+    """
+    if not plan_path.exists():
+        return None
+    return extract_plan(plan_path.read_text())
