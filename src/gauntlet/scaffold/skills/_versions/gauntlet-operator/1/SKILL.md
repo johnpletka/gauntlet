@@ -8,25 +8,20 @@ description: >-
   operator playbook: the run-state triage tree, the gate decisions, and the
   guarded recovery and evidence commands.
 x-gauntlet-generated: true
-x-gauntlet-template-version: 2
+x-gauntlet-template-version: 1
 ---
 
 # Operating a Gauntlet run in this repository
 
 This repo runs on Gauntlet, so a live run moves through a state machine that
 pauses for human decisions and can wedge in ways that need a careful, guarded
-response. Before you touch anything, open the playbook at `prompts/operator.md` and
+response. Before you touch anything, open the playbook at `{{PLAYBOOK_PATH}}` and
 follow it — that file holds this project's triage tree, the meaning of each
 run-state, and which command resolves which one. Treat it as the source; this
 skill only sends you there.
 
 The reflex it teaches, worth internalizing up front:
 
-- **Arm detection first, then triage.** Park latency — not compute — is where
-  a run's wall-clock goes. Configure the driver's `notify:` push and the
-  auto-resume knobs, run `gauntlet sweep --all` on a cadence, and carry the
-  playbook's pre-authorized decision matrix (§2a): the no-decision parks are
-  yours to resume; gates, responses, and invalid artifacts page the human.
 - **Ask the tool, do not infer.** Begin with `gauntlet status <slug>`; it
   computes the real state — including whether the driver is actually alive — and
   prints the next command. `gauntlet status <slug> --json` is the same answer for

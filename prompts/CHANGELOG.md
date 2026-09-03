@@ -42,3 +42,6 @@ apply, so the file reads oldest-first.
   git) instead of inlining it.
 - **plan-author.md** (#146 review): limit preconditions to read-only path and
   environment checks; require provisioning separately before approval.
+- **operator.md** (#147 review): require completed-work evidence and a valid
+  body for manual phase markers; document capability-aware drafting, the
+  100-character validator limit, and read-only preconditions.

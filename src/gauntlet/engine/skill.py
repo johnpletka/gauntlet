@@ -406,7 +406,7 @@ class SkillSpec:
 # contract: the SKILL.md description enumerates them verbatim and in this order.
 OPERATOR_SKILL_NAME = "gauntlet-operator"
 OPERATOR_PLAYBOOK_REL = "prompts/operator.md"
-OPERATOR_TEMPLATE_VERSION = 1
+OPERATOR_TEMPLATE_VERSION = 2
 OPERATOR_TRIGGER_PHRASES = (
     "check the gauntlet run",
     "is the run stuck",
