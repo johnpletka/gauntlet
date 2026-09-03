@@ -1255,7 +1255,9 @@ def test_manifest_is_human_readable_json(tmp_path):
     entry = data["steps"][0]["human_responses"][0]
     # artifact_fingerprint joined the durable shape with #79 (the
     # vacuous-convergence guard's comparison anchor); additive/nullable.
+    # `kind` joined with #134 (text | accept_artifacts); additive, default text.
     assert set(entry) == {
         "response_id", "response_text", "timestamp", "user",
-        "response_attempt", "state", "artifact_fingerprint",
+        "response_attempt", "state", "artifact_fingerprint", "kind",
     }
+    assert entry["kind"] == "text"
