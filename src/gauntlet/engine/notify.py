@@ -704,7 +704,7 @@ class NotificationLedger:
                 and len(key) in (3, 5)
                 and isinstance(key[0], str)
                 and isinstance(key[1], str)
-                and (key[2] is None or isinstance(key[2], str))
+                and all(value is None or isinstance(value, str) for value in key[2:])
             ):
                 out.add(tuple(key))
         return out
@@ -727,7 +727,8 @@ class NotificationLedger:
 
     def delivered(self, key: Key, channel: str) -> bool:
         return any(rec.get("key") == list(key) and rec.get("status") == "delivered"
-                   and channel in rec.get("channels", []) for rec in self.entries())
+                   and isinstance(rec.get("channels"), list)
+                   and channel in rec["channels"] for rec in self.entries())
 
     @contextmanager
     def delivery_lock(self, channel: str):

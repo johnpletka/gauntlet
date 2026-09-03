@@ -508,3 +508,13 @@ def test_gate_summary_includes_implementation_before_review(fixture_repo):
         M.CommitRecord(step_id="commit", phase="P1", sha=handoff)])
     assert GE.reviewed_range(fixture_repo, man, gate) == (f"{handoff}^", handoff)
     assert "implementation.py" in gitops.range_diff(fixture_repo, *GE.reviewed_range(fixture_repo, man, gate))
+
+
+def test_malformed_delivery_identity_and_channels_are_ignored(tmp_path):
+    key = ["r1", N.KIND_GATE, "gate", "P1", "ended"]
+    path = tmp_path / N.LEDGER_NAME
+    path.write_text(json.dumps({"key": key[:4] + [{}]}) + "\n" +
+                    json.dumps({"key": key, "status": "delivered", "channels": "webhook"}))
+    ledger = N.NotificationLedger(path)
+    assert ledger.keys() == {tuple(key)}
+    assert not ledger.delivered(tuple(key), "webhook")
