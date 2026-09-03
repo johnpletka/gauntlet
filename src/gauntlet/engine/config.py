@@ -38,9 +38,26 @@ from gauntlet.logging.redact import RedactionSettings
 # Auto-resume modes (FR-3.4). ``notify`` (default) parks + notifies with the
 # reset time and never self-resumes; ``auto`` arms an in-process wait that
 # performs the FR-3.3 continuation resume when the quota window replenishes.
+# The same two modes govern ``resume_on_provider_unavailable`` (#134): a
+# dependency park's backoff / Retry-After deadline is waited out the same way.
 RESUME_ON_QUOTA_NOTIFY = "notify"
 RESUME_ON_QUOTA_AUTO = "auto"
 _RESUME_ON_QUOTA_MODES = frozenset({RESUME_ON_QUOTA_NOTIFY, RESUME_ON_QUOTA_AUTO})
+# Aliases naming the shared mode set for the second knob.
+AUTO_RESUME_NOTIFY = RESUME_ON_QUOTA_NOTIFY
+AUTO_RESUME_AUTO = RESUME_ON_QUOTA_AUTO
+_AUTO_RESUME_MODES = _RESUME_ON_QUOTA_MODES
+
+
+def _validate_auto_resume_mode(field: str, v: str) -> str:
+    """Shared validator for the two auto-resume knobs: ``notify``/``auto`` only,
+    anything else fails closed (FR-3.4 / #134)."""
+    name = (v or "").strip().lower()
+    if name not in _AUTO_RESUME_MODES:
+        raise ValueError(
+            f"{field} must be one of {sorted(_AUTO_RESUME_MODES)}; got {v!r}"
+        )
+    return name
 
 # Intra-phase checkpoint-commit disposition (harness-efficiency FR-11.1).
 # ``keep`` (default) leaves ``PN wip:`` milestone commits in history; ``squash``
@@ -642,9 +659,19 @@ class RunConfig(BaseModel):
     # (`external_scheduler: true` declares the operator re-invokes `gauntlet
     # resume` via cron/launchd); enabling `auto` with neither is a load warning.
     resume_on_quota: str = RESUME_ON_QUOTA_NOTIFY
+    # The same policy for a `provider_unavailable` park (#134, rec. 1a): the
+    # bounded in-process dependency retries (below) exhausted and the step
+    # parked with a concrete backoff / Retry-After deadline. `notify` (default)
+    # leaves it for the operator; `auto` has the live driver wait out that
+    # deadline and perform the plain retry resume itself — the same wait loop,
+    # survival requirement (keep_awake / external_scheduler) and shared attempt
+    # ceiling as `resume_on_quota`. No provider health probe is attempted: the
+    # only signal is the recorded deadline (fail-closed).
+    resume_on_provider_unavailable: str = AUTO_RESUME_NOTIFY
     external_scheduler: bool = False
-    # Spaced auto-resume attempts before falling back to a plain usage_limit park
-    # with an exhaustion note (FR-3.4) — a persistent limit is not a hot loop.
+    # Spaced auto-resume attempts before falling back to a plain usage_limit /
+    # provider_unavailable park with an exhaustion note (FR-3.4) — a persistent
+    # limit or outage is not a hot loop. Shared by both `auto` knobs.
     max_auto_resume_attempts: int = 3
 
     # --- dependency retry policy (recovery-redesign plan §5.2, P5) -----------
@@ -734,13 +761,21 @@ class RunConfig(BaseModel):
     @classmethod
     def _validate_resume_on_quota(cls, v: str) -> str:
         """Only ``notify``/``auto`` are valid; anything else fails closed (FR-3.4)."""
-        name = (v or "").strip().lower()
-        if name not in _RESUME_ON_QUOTA_MODES:
-            raise ValueError(
-                f"resume_on_quota must be one of {sorted(_RESUME_ON_QUOTA_MODES)}; "
-                f"got {v!r}"
-            )
-        return name
+        return _validate_auto_resume_mode("resume_on_quota", v)
+
+    @field_validator("resume_on_provider_unavailable")
+    @classmethod
+    def _validate_resume_on_provider_unavailable(cls, v: str) -> str:
+        """Same closed mode set as ``resume_on_quota`` (#134)."""
+        return _validate_auto_resume_mode("resume_on_provider_unavailable", v)
+
+    @property
+    def any_auto_resume(self) -> bool:
+        """True when either auto-resume knob is ``auto`` (#134)."""
+        return (
+            self.resume_on_quota == AUTO_RESUME_AUTO
+            or self.resume_on_provider_unavailable == AUTO_RESUME_AUTO
+        )
 
     @field_validator("interrupted_step")
     @classmethod
@@ -801,16 +836,16 @@ class RunConfig(BaseModel):
         still reconcile a due schedule on the next manual resume, but its
         promise (self-resume without operator action) does not hold — surface
         that at load rather than silently."""
-        if (
-            self.resume_on_quota == RESUME_ON_QUOTA_AUTO
-            and not self.keep_awake
-            and not self.external_scheduler
-        ):
+        if self.any_auto_resume and not self.keep_awake and not self.external_scheduler:
+            knobs = [
+                name for name in ("resume_on_quota", "resume_on_provider_unavailable")
+                if getattr(self, name) == AUTO_RESUME_AUTO
+            ]
             warnings.warn(
-                "resume_on_quota: auto without keep_awake or an external "
-                "scheduler — the driver may not survive the quota wait, so "
+                f"{' / '.join(knobs)}: auto without keep_awake or an external "
+                "scheduler — the driver may not survive the wait, so "
                 "auto-resume falls back to reconciliation on the next manual "
-                "`gauntlet resume` (FR-3.4).",
+                "`gauntlet resume` (FR-3.4 / #134).",
                 stacklevel=2,
             )
         return self

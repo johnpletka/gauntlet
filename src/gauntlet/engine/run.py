@@ -3152,7 +3152,8 @@ class RunManager:
         # Auto-resume runs OUTSIDE the lock (each attempt re-acquires it via
         # `_resume_once`) so the wait between attempts holds no worktree lock —
         # matching the reconciliation model (FR-3.4). A no-op unless the run
-        # parked on a usage limit under `resume_on_quota: auto`.
+        # parked on a usage limit under `resume_on_quota: auto` or on a
+        # dependency failure under `resume_on_provider_unavailable: auto` (#134).
         return self._auto_resume_if_scheduled(
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock,
@@ -3164,13 +3165,15 @@ class RunManager:
                extra_context: dict | None = None, clock=None,
                auto_sleep=None, reset_interrupted: bool = False,
                same_tree: bool = False) -> str:
-        """One resume, then in-process auto-resume of a usage-limit park (FR-3.4).
+        """One resume, then in-process auto-resume of a usage-limit or
+        provider-unavailable park (FR-3.4 / #134).
 
         A manual resume always continues the session once immediately (the
         "manual override resumes now" branch): that is ``_resume_once``. If the
-        run re-parks on the usage limit under ``resume_on_quota: auto``, the live
-        driver waits until the projected reset and resumes again, bounded by
-        ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
+        run re-parks on the usage limit under ``resume_on_quota: auto`` (or on a
+        dependency failure under ``resume_on_provider_unavailable: auto``), the
+        live driver waits until the recorded deadline and resumes again, bounded
+        by ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
         ``notify`` mode the wrapper is a no-op.
         """
         # R5 (plan §4.5): fingerprint the persisted state before and after the
@@ -3712,18 +3715,47 @@ class RunManager:
             return ""
         return " Safe actions: " + "; ".join(f"`{c}`" for c in commands)
 
-    @staticmethod
-    def _parked_usage_limit_step(man: Manifest) -> "M.StepRecord | None":
-        """The scheduled-resume-armed usage-limit park, or ``None`` (shared find)."""
-        return next(
-            (
-                s for s in man.steps
-                if s.status == M.PARKED
-                and s.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-                and s.scheduled_resume is not None
-            ),
-            None,
-        )
+    # Park reasons whose armed schedule the in-process wait loop honors, mapped
+    # to the RunConfig knob that must read ``auto`` for the loop to act (#134).
+    _AUTO_RESUME_KNOB_BY_REASON = {
+        M.PARKED_REASON_USAGE_LIMIT: "resume_on_quota",
+        M.PARKED_REASON_PROVIDER_UNAVAILABLE: "resume_on_provider_unavailable",
+    }
+
+    def _auto_resume_enabled_for(self, reason: str | None) -> bool:
+        """Whether the knob governing *reason* currently reads ``auto``.
+
+        Consulted on EVERY pass of the wait loop (not once at entry) so a knob
+        flipped back to ``notify`` on the live ``RunManager`` config stops the
+        loop at its next decision instead of driving one more resume.
+        """
+        knob = self._AUTO_RESUME_KNOB_BY_REASON.get(reason or "")
+        return knob is not None and getattr(self.config, knob) == RESUME_ON_QUOTA_AUTO
+
+    def _parked_auto_resume_step(self, man: Manifest) -> "M.StepRecord | None":
+        """The scheduled-resume-armed usage-limit / provider-unavailable park whose
+        governing knob is ``auto``, or ``None`` (shared find, FR-3.4 / #134).
+
+        A schedule stamped with a ``reason`` is matched against the step's own
+        park reason (a stale stamp from a different episode never routes the
+        wrong knob); an unstamped schedule (pre-#134 manifest) is read as the
+        step's park reason. A parked step whose knob is now ``notify`` is not
+        returned — its schedule stays on disk (a manual resume reconciles it)
+        but the live loop leaves it alone.
+        """
+        for s in man.steps:
+            if s.status != M.PARKED or s.scheduled_resume is None:
+                continue
+            reason = M.normalize_parked_reason(s.parked_reason, s.type, s.status)
+            if reason not in self._AUTO_RESUME_KNOB_BY_REASON:
+                continue
+            stamped = s.scheduled_resume.reason
+            if stamped is not None and stamped != reason:
+                continue
+            if not self._auto_resume_enabled_for(reason):
+                continue
+            return s
+        return None
 
     @contextlib.contextmanager
     def _auto_resume_wait_context(self, run_dir: Path):
@@ -3759,7 +3791,7 @@ class RunManager:
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
-            step = self._parked_usage_limit_step(man)
+            step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return False
             if step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts:
@@ -3779,14 +3811,20 @@ class RunManager:
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
-            step = self._parked_usage_limit_step(man)
+            step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return
+            reason = M.normalize_parked_reason(step.parked_reason, step.type, step.status)
             step.scheduled_resume = None
+            clears = (
+                "the provider recovers"
+                if reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+                else "the window clears"
+            )
             note = (
                 f"auto-resume exhausted after {self.config.max_auto_resume_attempts} "
-                "attempts (FR-3.4); left as a plain usage_limit park — resume "
-                "manually once the window clears, or abort"
+                f"attempts (FR-3.4); left as a plain {reason} park — resume "
+                f"manually once {clears}, or abort"
             )
             step.notes = f"{step.notes}\n{note}" if step.notes else note
             man.write_atomic(run_dir / "manifest.json")
@@ -3797,9 +3835,16 @@ class RunManager:
         self, slug: str, status: str, *, use_judge: bool, adapter_factory,
         extra_context: dict | None, clock, sleep=None, wait_context=None,
     ) -> str:
-        """Drive the in-process auto-resume wait loop for a usage-limit park (FR-3.4).
+        """Drive the in-process auto-resume wait loop for a usage-limit or
+        provider-unavailable park (FR-3.4; generalized by #134).
 
-        A no-op unless ``resume_on_quota: auto``. Reads the parked step's
+        A no-op unless ``resume_on_quota: auto`` or
+        ``resume_on_provider_unavailable: auto`` — each governs only its own park
+        reason, re-read every pass (:meth:`_parked_auto_resume_step`). A
+        provider_unavailable continuation is the same plain ``_resume_once`` an
+        operator would run: the orchestrator starts a fresh dependency-retry
+        episode (``dependency_attempts`` reset, plan §5.2) and re-parks with a
+        new backoff deadline if the provider is still down. Reads the parked step's
         ``scheduled_resume`` (armed by the orchestrator at park time), and on each
         pass either waits for the projected reset (suspend-aware: sleeps in bounded
         polls and re-checks the wall clock), performs one continuation resume
@@ -3815,7 +3860,7 @@ class RunManager:
         manifest mutations (attempt increment, exhaustion note) happen under the
         worktree lock (F-005) so they never clobber a concurrent manual resume.
         """
-        if self.config.resume_on_quota != RESUME_ON_QUOTA_AUTO:
+        if not self.config.any_auto_resume:
             return status
         _sleep = sleep or time.sleep
         _wait_ctx = wait_context or self._auto_resume_wait_context
@@ -3830,7 +3875,7 @@ class RunManager:
                     return status
                 if man.status != M.RUN_PARKED:
                     return status
-                step = self._parked_usage_limit_step(man)
+                step = self._parked_auto_resume_step(man)
                 if step is None:
                     return status
                 now = self._auto_resume_now(clock)

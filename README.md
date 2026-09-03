@@ -530,6 +530,16 @@ resume_on_quota: notify      # notify (default) | auto — self-resume a
                              #   external scheduler re-invoking `resume`)
 keep_awake: true             # default; wraps the driver in `caffeinate -i`
                              #   (darwin) — false lets the host sleep mid-run
+resume_on_provider_unavailable: notify
+                             # notify (default) | auto — self-resume a
+                             #   provider_unavailable park (bounded dependency
+                             #   retries exhausted) at its recorded backoff /
+                             #   Retry-After deadline; the same in-process wait,
+                             #   survival requirement and attempt ceiling as
+                             #   resume_on_quota (no provider health probe —
+                             #   the deadline is the only signal)
+max_auto_resume_attempts: 3  # spaced auto-resume attempts shared by both
+                             #   `auto` knobs before the park is left plain
 heartbeat_interval_s: 15     # driver heartbeat cadence (suspend detection)
 suspend_credit_cap_s: 43200  # max slept time credited back to a step deadline
 checkpoint_commits: keep     # keep | squash — builders' intra-phase `PN wip:`

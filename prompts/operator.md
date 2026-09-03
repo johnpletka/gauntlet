@@ -61,7 +61,10 @@ behind that output. Drive every decision off the reported state class:
   never reset it). This is infrastructure, not content: no decision is at
   stake. Action: plain `gauntlet resume <slug>` after the retry deadline
   `status` prints — **never** `--response` (retry intent is not a human
-  decision). For a cycle fan-out, completed sub-steps and per-finding leaves
+  decision). With `resume_on_provider_unavailable: auto` configured, the live
+  driver self-resumes at that deadline (bounded attempts; `status` prints the
+  armed schedule) — check `status` before assuming you must act.
+  For a cycle fan-out, completed sub-steps and per-finding leaves
   are checkpointed; the resume retries only the incomplete work, and
   `gauntlet logs <slug>` points at the failing leaf's own evidence.
 - **`parked_artifact_invalid`** — an agent-authored structured artifact (e.g.

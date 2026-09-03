@@ -1445,7 +1445,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1; #134 adds the always-present nullable top-level `scheduled_resume` object (the armed auto-resume schedule on a usage_limit / provider_unavailable park) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -1476,6 +1476,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "agent_usage",
     "warnings",
     "quota",
+    "scheduled_resume",
     "driver",
     "parked",
     "failure",
@@ -1567,6 +1568,31 @@ _STATUS_SCHEMA_JSON = r'''{
         "reset_at": {
           "type": ["string", "null"],
           "description": "Absolute UTC reset time (ISO-8601): a usage_limit park's provider reset (null when no structured retry hint), or a usage_window park's projected window-replenishment time."
+        }
+      }
+    },
+    "scheduled_resume": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["attempt_at", "attempts", "max_attempts", "reason"],
+      "description": "The armed in-process auto-resume schedule on the parked step (harness-efficiency FR-3.4; generalized to provider_unavailable parks by #134), non-null only when parked on a usage_limit or provider_unavailable park whose step carries a schedule (armed by `resume_on_quota: auto` / `resume_on_provider_unavailable: auto`); null otherwise, including after the schedule is exhausted. Additive; keeps schema_version=1.",
+      "properties": {
+        "attempt_at": {
+          "type": "string",
+          "description": "Absolute UTC time (ISO-8601) of the next scheduled resume attempt: the park's recorded reset / backoff / Retry-After deadline."
+        },
+        "attempts": {
+          "type": "integer",
+          "description": "Spaced auto-resume attempts already made in this park episode (incremented write-ahead before each continuation resume)."
+        },
+        "max_attempts": {
+          "type": "integer",
+          "description": "The attempt ceiling (`max_auto_resume_attempts`); at attempts >= max_attempts the schedule is cleared with an exhaustion note and the park is left plain."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": ["usage_limit", "provider_unavailable", null],
+          "description": "Which park reason armed the schedule. null on a schedule persisted before #134 (read as the step's own park reason)."
         }
       }
     },
@@ -2481,6 +2507,19 @@ def status_payload(
     ):
         parked_rec = by_rendered.get(rstate.parked.step_id)
         quota = {"reset_at": parked_rec.quota_reset_at if parked_rec else None}
+    # FR-3.4 / #134: the armed auto-resume schedule on the parked step, so an
+    # operator can see WHEN the live driver will retry (and how many attempts
+    # remain) without opening the manifest. Null on every other state and once
+    # the schedule is exhausted.
+    scheduled_resume = None
+    if (
+        rstate.state in (STATE_PARKED_USAGE_LIMIT, STATE_PARKED_PROVIDER_UNAVAILABLE)
+        and rstate.parked is not None
+    ):
+        parked_rec = by_rendered.get(rstate.parked.step_id)
+        scheduled_resume = scheduled_resume_dict(
+            parked_rec.scheduled_resume if parked_rec else None
+        )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "slug": man.slug,
@@ -2501,6 +2540,7 @@ def status_payload(
         # warn-don't-park default). Always present; an empty array when none.
         "warnings": list(man.warnings),
         "quota": quota,
+        "scheduled_resume": scheduled_resume,
         "worktree": worktree,
         "driver": {
             "state": driver.state,
@@ -3275,6 +3315,22 @@ def _fmt_age(age_s: float) -> str:
     return f"{age_s / 60:.0f}m"
 
 
+def scheduled_resume_dict(sched: "M.ScheduledResume | None") -> dict | None:
+    """The §6.1 ``scheduled_resume`` object for an armed schedule, else ``None``.
+
+    Shared by ``status --json`` and the human footer so the two surfaces render
+    the same datum (FR-3.4 / #134).
+    """
+    if sched is None:
+        return None
+    return {
+        "attempt_at": sched.attempt_at,
+        "attempts": sched.attempts,
+        "max_attempts": sched.max_attempts,
+        "reason": sched.reason,
+    }
+
+
 def render_footer(
     driver: DriverInfo,
     rstate: RunState,
@@ -3287,6 +3343,7 @@ def render_footer(
     cost_usd: float | None = None,
     quota_reset_at: str | None = None,
     slug: str | None = None,
+    scheduled_resume: "M.ScheduledResume | None" = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -3348,6 +3405,22 @@ def render_footer(
         lines.append(
             f"retry deadline: {quota_reset_at}" if quota_reset_at
             else "retry deadline: unrecorded (a repeated resume will refuse as no-progress)"
+        )
+    # An armed auto-resume schedule (FR-3.4 / #134) names the next attempt time
+    # and the attempt budget, so the operator knows the live driver will retry
+    # on its own — the same datum `--json` carries as `scheduled_resume`.
+    if scheduled_resume is not None and rstate.state in (
+        STATE_PARKED_USAGE_LIMIT, STATE_PARKED_PROVIDER_UNAVAILABLE
+    ):
+        reason = scheduled_resume.reason or (
+            M.PARKED_REASON_USAGE_LIMIT
+            if rstate.state == STATE_PARKED_USAGE_LIMIT
+            else M.PARKED_REASON_PROVIDER_UNAVAILABLE
+        )
+        nxt = min(scheduled_resume.attempts + 1, scheduled_resume.max_attempts)
+        lines.append(
+            f"auto-resume scheduled at {scheduled_resume.attempt_at} "
+            f"(attempt {nxt}/{scheduled_resume.max_attempts}, {reason})"
         )
 
     if current_step_freshness is not None:

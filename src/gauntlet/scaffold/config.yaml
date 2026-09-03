@@ -38,6 +38,12 @@ reviewer_mutation: commit
 #                             #   scheduler re-invoking `gauntlet resume`)
 # keep_awake: true            # default; wraps the driver in `caffeinate -i`
 #                             #   (darwin) — set false to allow host sleep
+# resume_on_provider_unavailable: notify
+#                             # notify (default) | auto — auto self-resumes a
+#                             #   provider_unavailable park (dependency retries
+#                             #   exhausted) at its recorded backoff/Retry-After
+#                             #   deadline; same survival needs and shared
+#                             #   max_auto_resume_attempts as resume_on_quota
 # heartbeat_interval_s: 15    # driver heartbeat cadence (suspend detection)
 # suspend_credit_cap_s: 43200 # max host-sleep time credited to a step deadline
 # checkpoint_commits: keep    # keep | squash — builder `PN wip:` milestone

@@ -1094,6 +1094,7 @@ def status(
     # usage limit — the reset time, all sourced from the manifest so no parked
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
+    scheduled_resume = None
     if rstate.state in (
         operator.STATE_PARKED_USAGE_LIMIT,
         operator.STATE_PARKED_USAGE_WINDOW,
@@ -1105,6 +1106,8 @@ def status(
             None,
         )
         quota_reset_at = pr.quota_reset_at if pr is not None else None
+        # FR-3.4 / #134: the armed auto-resume schedule, same datum as --json.
+        scheduled_resume = pr.scheduled_resume if pr is not None else None
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
@@ -1112,6 +1115,7 @@ def status(
         cost_usd=man.totals.cost_usd,
         quota_reset_at=quota_reset_at,
         slug=slug,  # names the §4 recover verb in the agent-silent line (#103)
+        scheduled_resume=scheduled_resume,
     ):
         typer.echo(line)
 

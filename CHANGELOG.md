@@ -56,6 +56,22 @@ All notable changes to Gauntlet are recorded here. The format follows
   fires only when it was set explicitly. `gauntlet doctor` gains a
   `keep-awake` check that warns (never fails) when the knob is off on darwin
   or `caffeinate` is not on PATH.
+- Scheduled auto-resume now covers **provider-unavailable parks**, not only
+  usage-limit ones (#134, rec. 1a). A new `resume_on_provider_unavailable`
+  knob (`notify` default | `auto`, validated exactly like `resume_on_quota`)
+  arms the same in-process wait loop on a `provider_unavailable` park, using
+  the backoff / Retry-After deadline the park already records; the two knobs
+  share `max_auto_resume_attempts` and the keep-awake / external-scheduler
+  survival warning, and each governs only its own park reason (a knob flipped
+  back to `notify` stops the loop at its next decision). Exhaustion leaves a
+  plain `provider_unavailable` park with the usual note. The manifest's
+  `scheduled_resume` gains an additive `reason` field recording which park
+  armed it, `status --json` exposes the armed schedule as a new always-present
+  nullable `scheduled_resume` object (`attempt_at`, `attempts`,
+  `max_attempts`, `reason`; schema_version stays 1), and the human `status`
+  footer prints `auto-resume scheduled at <iso> (attempt n/m, <reason>)`. No
+  provider health probe is attempted — the recorded deadline is the only
+  signal (fail-closed).
 
 ## [1.2.0] — 2026-08-18
 
