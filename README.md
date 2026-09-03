@@ -435,6 +435,37 @@ the config lint knows the wait is covered:
 Mutual exclusion between a cron sweep, the console's sweep and your own
 `resume` rides on the drive lock: a resume that loses the race fails closed
 inside the engine and the sweep reports it as `refused`, never retried.
+### Plan preconditions
+
+A plan's `gauntlet-phases` block may declare the environmental things its phases
+depend on and no agent can create — staged data files and environment variables
+(#134). Provision separately before approval; command items are rejected. Per phase or for the whole plan (mapping form):
+
+```markdown
+```gauntlet-phases
+preconditions:                       # whole-plan items
+  - {env: OPENAI_API_KEY, description: "scoring calls"}
+phases:
+  - id: P1
+    title: Build the feature table
+    goal: …
+    frs: [FR-1.1]
+    acceptance: [{id: P1-A1, clause: "…"}]
+    preconditions:                   # this phase's own items
+      - {path: data/restricted/bundle.parquet, description: "staged by ops"}
+```
+```
+
+`plan-lint` fails closed on a malformed item. `gauntlet approve` on the plan
+gate (`preflight: plan_preconditions`) checks every item without executing plan
+text, records the checklist under `<run_dir>/preflight/`, and
+**refuses while any is unmet**, listing each; `--skip-preflight` approves anyway
+with an audited manifest warning. Each implement phase (`preconditions_from:
+plan`) re-resolves the plan-level items plus its own before the builder
+launches; an unmet item fails the step as a re-runnable precondition (nothing
+invoked, no tokens spent) and a plain `gauntlet resume` re-checks. `gauntlet
+status` on a parked plan gate lists unmet `path`/`env` items read-only. An `env` value is only ever tested for presence and
+never written anywhere.
 
 ### CLI observability
 

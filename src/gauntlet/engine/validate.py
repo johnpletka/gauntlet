@@ -177,6 +177,30 @@ def _validate_step(
             "(FR-4 / review F-002); choose another name"
         )
 
+    # 1c2. #134 plan-precondition options: `preflight:` only on a human_gate and
+    # only the one known preflight; `preconditions_from:` only the one source.
+    # An unknown value would silently check nothing — fail closed at load.
+    from gauntlet.engine import preconditions as PC
+
+    preflight = step.get("preflight")
+    if preflight is not None:
+        if step.type != "human_gate":
+            report.errors.append(
+                f"step {step.id!r} declares `preflight:` but is a {step.type}; "
+                "preflight applies to human_gate steps only (#134)"
+            )
+        elif preflight != PC.PREFLIGHT_PLAN_PRECONDITIONS:
+            report.errors.append(
+                f"step {step.id!r} declares unknown preflight {preflight!r}; the "
+                f"only preflight is {PC.PREFLIGHT_PLAN_PRECONDITIONS!r} (#134)"
+            )
+    pre_from = step.get("preconditions_from")
+    if pre_from is not None and pre_from != PC.PRECONDITIONS_FROM_PLAN:
+        report.errors.append(
+            f"step {step.id!r} declares unknown preconditions_from {pre_from!r}; "
+            f"the only source is {PC.PRECONDITIONS_FROM_PLAN!r} (#134)"
+        )
+
     # 1d. `validate:` shape + capability (FR-2.1 / review F-003, F-004). The
     # named validator runs against the step's `output:` artifact and, on failure,
     # re-invokes the SAME agent session with the error (the bounded in-session

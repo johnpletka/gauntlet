@@ -81,7 +81,12 @@ stages:
       # stage fans out. plan-lint runs the same parser the foreach uses, so a
       # structurally unrunnable plan halts here instead of reaching approval.
       - {id: plan-lint, type: phase_lint, artifact: plan.md}
-      - {id: plan-approve, type: human_gate,
+      # #134: `preflight: plan_preconditions` — `gauntlet approve` first
+      # resolves every precondition the plan's gauntlet-phases block declares
+      # (data files, env vars, provisioning commands) and refuses while any is
+      # unmet, so a phase never parks mid-run on something discoverable before
+      # the first agent launched. `--skip-preflight` approves anyway (audited).
+      - {id: plan-approve, type: human_gate, preflight: plan_preconditions,
          show: [plan.md, findings.json, triage.json, confirm.json]}
 
   # --- phase loop (one iteration per plan.phases entry) ---------------------
@@ -100,7 +105,11 @@ stages:
       # decision on this step's UPSTREAM CONFLICT park) to the cheap profile
       # instead of the builder. A re-park/amend classification costs zero builder
       # window; only a `proceed` re-drives the builder to actually implement.
+      # #134: `preconditions_from: plan` re-resolves the plan-level items plus
+      # THIS phase's own before the builder launches; an unmet item fails the
+      # step as a re-runnable precondition (no agent invoked, no tokens spent).
       - {id: implement, type: agent_task, agent: builder,
+         preconditions_from: plan,
          disposition_agent: mechanic,
          prompt: prompts/implement-phase.md,
          inputs: [{name: prd.md, mode: reference}, {name: plan.md, mode: phase}],

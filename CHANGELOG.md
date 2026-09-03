@@ -162,6 +162,25 @@ All notable changes to Gauntlet are recorded here. The format follows
   Mutually exclusive with `--response`; refused unless the run is
   `parked_for_response` on a respondable step. `status` and the operator
   playbook name it beside `--response`.
+- **Plan preconditions** (#134, rec. 7). A plan's `gauntlet-phases` block may
+  declare, per phase and (mapping form) for the whole plan, the environmental
+  preconditions the phases depend on: `{path}` must exist, `{env}` must be set
+  and non-empty (the value is never recorded). Provision separately; command
+  items are rejected. `plan-lint` and the `plan_phases` validator fail closed on a malformed
+  item. `gauntlet approve` on a gate declaring `preflight: plan_preconditions`
+  (the standard pipeline's `plan-approve`) checks every item without executing
+  plan text, records the checklist under `<run_dir>/preflight/`, and
+  refuses while any is unmet, naming each; `--skip-preflight` approves anyway
+  with an audited manifest warning. A step declaring `preconditions_from: plan`
+  (the standard pipeline's `implement`) re-resolves the plan-level items plus
+  the current phase's own before its handler runs; an unmet item finishes the
+  step FAILED with `halt_reason=precondition` and the re-runnable
+  `clean_handoff_precondition` kind (nothing invoked, no tokens spent), and a
+  plain `gauntlet resume` re-checks. `gauntlet status` on a parked preflight
+  gate lists unmet `path`/`env` items read-only. In the field a phase parked
+  mid-run because a data bundle was never staged — discoverable before the
+  run started; the mechanism is generic so an adopter's own notion of "staged"
+  is a required path or environment variable.
 
 ## [1.2.0] — 2026-08-18
 

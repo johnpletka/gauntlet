@@ -4258,7 +4258,8 @@ class RunManager:
 
     # ---- gates --------------------------------------------------------------
     def approve(self, slug: str, gate: str | None = None, notes: str | None = None,
-                *, use_judge: bool = True, adapter_factory=None) -> str:
+                *, use_judge: bool = True, adapter_factory=None,
+                skip_preflight: bool = False) -> str:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -4287,6 +4288,13 @@ class RunManager:
                 if gate is None:
                     raise ValueError("no gate to approve; run is not parked")
                 pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+                # #134: a gate declaring `preflight: plan_preconditions` checks
+                # every precondition the plan declares BEFORE approval lands.
+                gate_step = self._pipeline_step(pipeline, gate)
+                if gate_step is not None and gate_step.get("preflight") is not None:
+                    self._plan_gate_preflight(
+                        layout, run_dir, man, gate_step, skip=skip_preflight
+                    )
                 # Approving a gate drives the rest of the run, so honor use_judge.
                 if use_judge:
                     return self._with_judge(man, run_dir, lambda env: self._approve_drive(
@@ -4298,6 +4306,65 @@ class RunManager:
                 return status
         finally:
             self._release_worktree_lock(handle)
+
+    def _plan_gate_preflight(
+        self, layout, run_dir: Path, man: Manifest, gate_step, *, skip: bool
+    ) -> None:
+        """Resolve the plan's declared preconditions at the plan gate (#134).
+
+        Walks plan-level and every phase's items against the run worktree and
+        the live environment (commands run, output persisted under
+        ``<run_dir>/preflight/``). Any unmet item refuses the approval — the
+        gate stays parked, nothing is stamped — naming each item and the
+        ``--skip-preflight`` escape, which approves anyway with an audited
+        manifest warning listing what was skipped.
+        """
+        import os
+
+        from gauntlet.engine import preconditions as PC
+        from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+
+        if gate_step.get("preflight") != PC.PREFLIGHT_PLAN_PRECONDITIONS:
+            raise ValueError(
+                f"gate {gate_step.id!r} declares unknown preflight "
+                f"{gate_step.get('preflight')!r}"
+            )
+        plan_path = layout.slug_dir / "plan.md"
+        try:
+            spec = load_plan_spec(plan_path)
+        except PlanPhasesError as exc:
+            raise ValueError(f"plan preflight: {plan_path} is not readable: {exc}")
+        if spec is None:
+            return
+        items = spec.all_preconditions()
+        if not items:
+            return
+        log_dir = run_dir / "preflight"
+        unmet = PC.resolve_preconditions(
+            items, cwd=self.work_root, env=os.environ,
+        )
+        try:
+            self.writer.write_text(log_dir / "preflight.txt", PC.render_checklist(items, unmet))
+        except OSError:
+            pass
+        if not unmet:
+            return
+        listed = "\n".join(f"  - {u.render()}" for u in unmet)
+        if skip:
+            note = (
+                f"plan gate {gate_step.id!r} approved with --skip-preflight; "
+                f"{len(unmet)} unmet precondition(s) (#134):\n{listed}"
+            )
+            if note not in man.warnings:
+                man.warnings.append(note)
+            man.write_atomic(run_dir / "manifest.json")
+            return
+        raise ValueError(
+            f"plan preflight: {len(unmet)} unmet precondition(s) — the gate stays "
+            f"parked, nothing approved (#134):\n{listed}\nSatisfy them and "
+            f"approve again, or `gauntlet approve {man.slug} --skip-preflight` "
+            "to approve anyway (recorded as a manifest warning)."
+        )
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
                *, use_judge: bool = True, allow_terminal: bool = False,

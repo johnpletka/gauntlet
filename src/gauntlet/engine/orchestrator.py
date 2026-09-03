@@ -947,7 +947,7 @@ class Orchestrator:
                 # skip this entirely.
                 auto = self._maybe_auto_approve(step, iteration, item)
                 try:
-                    result = auto if auto is not None else spec.handler(step, ctx)
+                    result = self._dispatch_handler(step, ctx, item, auto, spec)
                 except AgentVanishedError as exc:
                     # Agent-liveness watchdog (FR-5.3, #103): the adapter child
                     # was PROVABLY gone while its stream stayed open — an
@@ -2124,6 +2124,80 @@ class Orchestrator:
         return consumed
 
     # ---- helpers -------------------------------------------------------------
+    def _dispatch_handler(self, step: Step, ctx: StepContext, item: Any, auto, spec):
+        """Run the step's handler, unless an auto-approval or an unmet plan
+        precondition (#134, `preconditions_from: plan`) settles it first."""
+        if auto is not None:
+            return auto
+        from gauntlet.engine import preconditions as PC
+
+        if step.get("preconditions_from") == PC.PRECONDITIONS_FROM_PLAN:
+            blocked = self._check_plan_preconditions(step, ctx, item)
+            if blocked is not None:
+                return blocked
+        return spec.handler(step, ctx)
+
+    def _check_plan_preconditions(
+        self, step: Step, ctx: StepContext, item: Any
+    ) -> StepResult | None:
+        """Re-resolve the plan's declared preconditions before a step runs (#134).
+
+        Plan-level items plus the current foreach phase's own (the item's
+        ``id``) are checked against the run worktree and the live environment;
+        ``command`` items run through the shell-step path with their output
+        persisted under the step dir. An unmet item finishes the step FAILED
+        with ``halt_reason=precondition`` and the re-runnable
+        ``clean_handoff_precondition`` kind — nothing was invoked, no tokens
+        were spent, and a plain ``gauntlet resume`` re-checks and proceeds
+        once the operator satisfies it. Fail closed on an unreadable plan.
+        """
+        import os
+
+        from gauntlet.engine import preconditions as PC
+        from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+        from gauntlet.engine.steptypes import step_log_dir
+
+        def _blocked(note: str) -> StepResult:
+            return StepResult(
+                status=FAILED,
+                halt_reason=M.HALT_REASON_PRECONDITION,
+                failure_kind=M.FAILURE_KIND_CLEAN_HANDOFF,
+                notes=note,
+            )
+
+        try:
+            spec = load_plan_spec(self.artifact_root / "plan.md")
+        except PlanPhasesError as exc:
+            return _blocked(f"plan preconditions unreadable (nothing invoked): {exc}")
+        if spec is None:
+            return None
+        phase_id = item.get("id") if isinstance(item, dict) else None
+        try:
+            items = (
+                spec.preconditions_for(phase_id) if phase_id
+                else list(spec.preconditions)
+            )
+        except PlanPhasesError as exc:
+            return _blocked(f"plan preconditions unresolvable (nothing invoked): {exc}")
+        if not items:
+            return None
+        log_dir = step_log_dir(ctx) / "preflight"
+        unmet = PC.resolve_preconditions(
+            items, cwd=self.work_root, env=os.environ,
+        )
+        try:
+            self.writer.write_text(log_dir / "preflight.txt", PC.render_checklist(items, unmet))
+        except OSError:
+            pass  # evidence is best-effort; the verdict is not
+        if not unmet:
+            return None
+        listed = "; ".join(u.render() for u in unmet)
+        return _blocked(
+            f"plan preconditions unmet — nothing invoked, no tokens spent "
+            f"(#134): {listed}. Satisfy them, then a plain `gauntlet resume` "
+            "re-checks and proceeds."
+        )
+
     def _make_context(
         self, step: Step, rec: StepRecord, iteration: str | None, item: Any
     ) -> StepContext:

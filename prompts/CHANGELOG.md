@@ -40,3 +40,5 @@ apply, so the file reads oldest-first.
   body must stay free of the diff, and how to draft when the engine hands an
   oversize diff BY REFERENCE (`diff --stat` inline, per-file diffs read with
   git) instead of inlining it.
+- **plan-author.md** (#146 review): limit preconditions to read-only path and
+  environment checks; require provisioning separately before approval.

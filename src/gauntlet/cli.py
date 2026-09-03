@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import sys
+import os
 from pathlib import Path
 
 import typer
@@ -389,6 +390,41 @@ def _echo_ratification_audit(mgr, slug: str) -> None:
     for warning in man.warnings:
         if warning.startswith(f"artifact ratification {last_id}:"):
             typer.echo(f"AUDIT: {warning}", err=True)
+
+
+def _plan_preflight_advisory(mgr, man, rstate, pipeline) -> list[str]:
+    """Read-only plan-precondition advisory for a parked `preflight` gate (#134).
+
+    Resolves `path` / `env` items only (never runs a `command` — status is
+    read-only) and lists what `gauntlet approve` will refuse on. Fail-soft: an
+    unreadable plan or pipeline renders nothing.
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine import preconditions as PC
+    from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+
+    if rstate.state != operator.STATE_PARKED_GATE or rstate.parked is None or pipeline is None:
+        return []
+    gate = next((s for s in pipeline.all_steps() if s.id == rstate.parked.step_id), None)
+    if gate is None or gate.get("preflight") != PC.PREFLIGHT_PLAN_PRECONDITIONS:
+        return []
+    try:
+        spec = load_plan_spec(mgr.layout(man.slug).slug_dir / "plan.md")
+    except (PlanPhasesError, OSError):
+        return ["plan preflight: plan.md unreadable — `gauntlet approve` will refuse"]
+    if spec is None or not spec.all_preconditions():
+        return []
+    items = spec.all_preconditions()
+    try:
+        cwd = _status_work_root(mgr, man)
+    except Exception:  # fail-soft: advisory only
+        cwd = mgr.repo_root
+    unmet = PC.resolve_preconditions(items, cwd=cwd, env=os.environ)
+    out = []
+    if unmet:
+        out.append(f"plan preflight: {len(unmet)} unmet precondition(s) — `gauntlet approve` will refuse:")
+        out.extend(f"  - {u.render()}" for u in unmet)
+    return out
 
 
 def _manager() -> "object":
@@ -1195,6 +1231,8 @@ def status(
         scheduled_resume=scheduled_resume,
     ):
         typer.echo(line)
+    for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):
+        typer.echo(line)
 
 
 def _status_interactive(mgr, slug: str, *, agent: str) -> None:
@@ -1350,9 +1388,27 @@ def approve(
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
     notes: str = typer.Option(None, help="Approval notes."),
     no_judge: bool = typer.Option(False, "--no-judge"),
+    skip_preflight: bool = typer.Option(
+        False, "--skip-preflight",
+        help="Approve a `preflight: plan_preconditions` gate even though the "
+             "plan's declared preconditions are unmet (#134). The unmet items "
+             "are recorded as a manifest warning.",
+    ),
 ) -> None:
-    """Approve a parked human_gate and continue the run (FR-8.1)."""
-    typer.echo(f"run status: {_manager().approve(slug, gate, notes, use_judge=not no_judge)}")
+    """Approve a parked human_gate and continue the run (FR-8.1).
+
+    A gate declaring `preflight: plan_preconditions` (the standard pipeline's
+    `plan-approve`) first resolves every precondition the plan's
+    `gauntlet-phases` block declares — data files, env vars, provisioning
+    commands — and refuses while any is unmet, so a phase never parks mid-run on
+    something discoverable before the first agent launched (#134).
+    """
+    typer.echo(
+        "run status: "
+        + str(_manager().approve(
+            slug, gate, notes, use_judge=not no_judge, skip_preflight=skip_preflight,
+        ))
+    )
 
 
 @app.command()
