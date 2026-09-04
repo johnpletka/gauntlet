@@ -615,7 +615,7 @@ def test_resume_on_provider_unavailable_normalizes_case():
 
 def test_provider_auto_without_keep_awake_or_scheduler_warns():
     with pytest.warns(UserWarning, match="resume_on_provider_unavailable: auto"):
-        RunConfig.model_validate({"resume_on_provider_unavailable": "auto"})
+        RunConfig.model_validate({"resume_on_provider_unavailable": "auto", "keep_awake": False})
 
 
 def test_provider_auto_with_keep_awake_does_not_warn():
@@ -637,7 +637,7 @@ def test_provider_auto_with_external_scheduler_does_not_warn():
 def test_both_knobs_auto_warn_once_naming_both():
     with pytest.warns(UserWarning) as rec:
         RunConfig.model_validate(
-            {"resume_on_quota": "auto", "resume_on_provider_unavailable": "auto"}
+            {"resume_on_quota": "auto", "resume_on_provider_unavailable": "auto", "keep_awake": False}
         )
     msgs = [str(w.message) for w in rec if "auto-resume" in str(w.message)]
     assert len(msgs) == 1
