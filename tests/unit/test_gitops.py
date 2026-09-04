@@ -307,6 +307,27 @@ def test_wip_checkpoints_prior_phase_gate_commit_with_no_current_wips(fixture_re
     assert gitops.wip_checkpoints(fixture_repo, phase="P4") == []
 
 
+def test_wip_checkpoints_prior_run_same_phase_history_is_not_interleaving(fixture_repo):
+    """A previous RUN's `P<N> wip:` commits for the same phase number, sitting
+    in pre-run history beneath the prior phase's `P<N>:` commit, must not make
+    the boundary case look interleaved: the lookahead is bounded to the
+    contiguous trailing run and stops at the first real gap (#148, observed
+    live — the label-stage run's P4 checkpoints beneath entities-stage P4)."""
+    _wip(fixture_repo, "P4 wip: an earlier run's checkpoint", "old.py", "old\n")
+    gitops.commit_all(
+        fixture_repo, "P4: an earlier run's phase commit\n\nbody",
+        identity=Identity("B", "b@g.local"), allow_empty=True,
+    )
+    gitops.commit_all(
+        fixture_repo, "P3: prior phase\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    _wip(fixture_repo, "P3 wip: operator proving run", "r.json", "{}\n")
+    m1 = _wip(fixture_repo, "P4 wip: this run's work", "a.py", "a\n")
+    wips = gitops.wip_checkpoints(fixture_repo, phase="P4")
+    assert [sha for sha, _s in wips] == [m1]
+
+
 def test_wip_checkpoints_interleaved_wrong_phase_still_fails_closed(fixture_repo):
     """A wrong-phase wip with a genuine current-phase checkpoint BENEATH it is
     interleaved — the truncation hazard the fail-closed protects against — and
