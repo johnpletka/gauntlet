@@ -139,7 +139,16 @@ def test_resume_on_quota_rejects_unknown_value():
 
 
 def test_auto_without_keep_awake_or_scheduler_warns():
+    # keep_awake defaults on (#134), so the no-survival case must opt out.
     with pytest.warns(UserWarning, match="auto"):
+        RunConfig.model_validate({"resume_on_quota": "auto", "keep_awake": False})
+
+
+def test_keep_awake_defaults_on_and_survives_auto():
+    cfg = RunConfig.model_validate({})
+    assert cfg.keep_awake is True
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         RunConfig.model_validate({"resume_on_quota": "auto"})
 
 

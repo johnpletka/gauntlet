@@ -381,8 +381,8 @@ class SuspendAwareDeadline:
 
 
 # --- keep-awake (caffeinate) -------------------------------------------------
-# Opt-in: altering host sleep behavior is an explicit human choice (CLAUDE.md
-# machine-state rule / §7), so the default is off. On darwin `caffeinate -i`
+# Default ON since #134 (host sleep dominated park latency in the field); the
+# operator opts out with `keep_awake: false`. On darwin `caffeinate -i`
 # asserts an idle-sleep prevention; `-w <pid>` scopes the assertion to the
 # driver's lifetime so it is released automatically when the driver exits — no
 # lingering system-wide assertion.

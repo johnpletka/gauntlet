@@ -1092,3 +1092,26 @@ def test_writability_check_refuses_a_symlinked_worktrees_root(fixture_repo, tmp_
     assert [r.status for r in results] == [FAIL]
     assert "symlink" in results[0].detail
     assert list(outside.iterdir()) == []
+
+
+# --- #134: keep_awake defaults on; doctor warns when opted out ---------------
+def test_keep_awake_check_warns_when_opted_out_on_darwin():
+    from gauntlet.engine.config import RunConfig
+    from gauntlet.engine.doctor import WARN, _check_keep_awake
+
+    cfg = RunConfig.model_validate({"keep_awake": False})
+    res = _check_keep_awake(cfg, platform="darwin")
+    assert res.status == WARN
+    assert "keep_awake: false" in res.detail
+    assert res.remedy
+
+
+def test_keep_awake_check_ok_by_default_and_na_off_darwin(monkeypatch):
+    from gauntlet.engine.config import RunConfig
+    from gauntlet.engine.doctor import OK, _check_keep_awake
+
+    cfg = RunConfig.model_validate({})
+    assert cfg.keep_awake is True
+    assert _check_keep_awake(cfg, platform="linux").status == OK
+    monkeypatch.setattr("gauntlet.engine.doctor.shutil.which", lambda _n: "/usr/bin/caffeinate")
+    assert _check_keep_awake(cfg, platform="darwin").status == OK

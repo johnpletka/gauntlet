@@ -627,9 +627,12 @@ class RunConfig(BaseModel):
     # produced no output for longer than this is classified hung, not asleep.
     agent_silence_s: float = DEFAULT_AGENT_SILENCE_S
     # Keep the host awake for the driver's lifetime via `caffeinate -i` on darwin
-    # (FR-5.4). Default false — changing host power behavior is an explicit human
-    # choice (CLAUDE.md machine-state rule). Ignored (with a warning) off darwin.
-    keep_awake: bool = False
+    # (FR-5.4). Default TRUE since #134: host sleep was measured as a leading
+    # source of park latency (58 min on one run, plus a driver wedge on another),
+    # and the assertion is scoped to the driver's pid so nothing lingers. Set
+    # `keep_awake: false` to opt out. Off darwin the knob is a no-op; a warning
+    # is only raised when it was set explicitly.
+    keep_awake: bool = True
 
     # --- usage-limit auto-resume (harness-efficiency FR-3.4) -----------------
     # `notify` (default): park on a usage limit + notify with the reset time; the
