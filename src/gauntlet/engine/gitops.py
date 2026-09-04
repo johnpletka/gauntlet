@@ -1235,9 +1235,13 @@ def wip_checkpoints(
       (``gauntlet:`` subjects) are walked THROUGH, not treated as a gap, so a
       checkpoint preserved beneath a recovery rewind is still found (review
       F-002). When ``phase`` is scoped, a ``P<N> wip:`` commit for a DIFFERENT
-      phase in the trailing run raises :class:`WrongPhaseCheckpointError` (fail
-      closed, review F-001) rather than being squashed into the wrong phase. This
-      is the set the phase-end commit collapses (squash) or lists (keep marker).
+      phase INTERLEAVED with this phase's run (a current-phase checkpoint sits
+      beneath it) raises :class:`WrongPhaseCheckpointError` (fail closed,
+      review F-001) rather than being squashed into — or silently truncating
+      the run at — the wrong phase; one at the BOTTOM of the run (a prior
+      phase's gate-time operator commit, #148) is the phase boundary and stops
+      the walk losslessly. This is the set the phase-end commit collapses
+      (squash) or lists (keep marker).
     """
     matcher = _wip_subject_re(phase)
     if base is not None:
@@ -1246,17 +1250,35 @@ def wip_checkpoints(
     else:
         out = _run(repo, "log", f"-{limit}", "--format=%H%x00%s", tip)
         stop_at_gap = True
+    lines = out.splitlines()
     result: list[tuple[str, str]] = []
-    for line in out.splitlines():
+    for i, line in enumerate(lines):
         sha, _, subject = line.partition("\x00")
         if matcher.match(subject):
             result.append((sha, subject))
         elif stop_at_gap:
             if phase is not None and _WIP_SUBJECT_RE.match(subject):
-                # A `P<N> wip:` for another phase inside this phase's trailing run
-                # (e.g. a mistyped `P8 wip:` during P9). Fail closed rather than
-                # squash it into — or truncate the run at — the wrong phase.
-                raise WrongPhaseCheckpointError(phase, subject)
+                # A `P<N> wip:` for another phase in this phase's trailing run.
+                # Two distinct situations share this shape (#148):
+                #
+                #   * a mistyped checkpoint INTERLEAVED with this phase's run
+                #     (e.g. `P8 wip:` landed during P9) — stopping here would
+                #     silently truncate the run and leave the genuine wips
+                #     beneath it out of the squash, so fail closed;
+                #   * a prior phase's sanctioned gate-time operator commit at
+                #     the BOTTOM of the run (committed while parked at that
+                #     phase's gate, so it necessarily follows its `P<N>:`
+                #     commit) — no current-phase wip lies beneath it, stopping
+                #     is provably lossless, and it is the phase boundary.
+                #
+                # Only the interleaved case has anything to protect: fail
+                # closed iff a current-phase checkpoint exists further down.
+                if any(
+                    matcher.match(rest.partition("\x00")[2])
+                    for rest in lines[i + 1 :]
+                ):
+                    raise WrongPhaseCheckpointError(phase, subject)
+                break
             if _ENGINE_SUBJECT_RE.match(subject):
                 # Engine bookkeeping commit (a response/rewind checkpoint) can sit
                 # between this phase's wip commits after a checkpoint-preserving
