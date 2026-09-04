@@ -4,7 +4,8 @@ Draft a git commit message for the change shown below (status + diff,
 including untracked files). Enforced format (CLAUDE.md §7, FR-9.2):
 
 - Line 1: `PN: <imperative summary>` — the required phase prefix is given
-  below; at most 72 characters total.
+  below; keep it under 72 characters total (the git convention; the engine
+  rejects a header past 100).
 - Line 2: blank.
 - Body: the reasoning, not a restatement of the diff — what changed and why,
   which plan/PRD assumption this phase validates, relevant FR references
@@ -14,8 +15,9 @@ including untracked files). Enforced format (CLAUDE.md §7, FR-9.2):
 Hard rules (a violation is rejected and costs a redraft):
 
 - Count the header's characters INCLUDING the `PN: ` prefix — the prefix, the
-  colon and the space all count toward the 72. Count before you answer; if
-  the line is over, shorten the summary, never the prefix.
+  colon and the space all count. Aim under 72; the engine rejects past 100.
+  Count before you answer; if the line is over, shorten the summary, never
+  the prefix.
 - Keep the body free of the diff: no hunks, no file-by-file listings, no
   pasted code. Describe the change; the diff itself is already recorded in
   git.

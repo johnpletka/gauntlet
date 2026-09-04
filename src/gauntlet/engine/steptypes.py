@@ -2184,6 +2184,8 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
     squash_base = gitops.commit_parent(repo, milestones[-1][0]) if milestones else None
+    # Record the evidence mode so operators can see whether drafting used
+    # repository references or bounded inline evidence.
     draft_notes: list[str] = []
     message, draft_usage, draft_session, drafter = _commit_message(
         step, ctx, consumed, diff_base=squash_base, notes=draft_notes,

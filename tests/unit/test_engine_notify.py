@@ -508,3 +508,32 @@ def test_gate_summary_includes_implementation_before_review(fixture_repo):
         M.CommitRecord(step_id="commit", phase="P1", sha=handoff)])
     assert GE.reviewed_range(fixture_repo, man, gate) == (f"{handoff}^", handoff)
     assert "implementation.py" in gitops.range_diff(fixture_repo, *GE.reviewed_range(fixture_repo, man, gate))
+
+
+def test_malformed_delivery_identity_and_channels_are_ignored(tmp_path):
+    key = ["r1", N.KIND_GATE, "gate", "P1", "ended"]
+    path = tmp_path / N.LEDGER_NAME
+    path.write_text(json.dumps({"key": key[:4] + [{}]}) + "\n" +
+                    json.dumps({"key": key, "status": "delivered", "channels": "webhook"}))
+    ledger = N.NotificationLedger(path)
+    assert ledger.keys() == {tuple(key)}
+    assert not ledger.delivered(tuple(key), "webhook")
+
+
+@pytest.mark.parametrize("unavailable", ["module", "filesystem"])
+def test_delivery_survives_unavailable_advisory_lock(tmp_path, monkeypatch, unavailable):
+    if unavailable == "module":
+        monkeypatch.setattr(N, "fcntl", None)
+    else:
+        from types import SimpleNamespace
+        def unsupported(*args):
+            raise OSError("advisory locking unavailable")
+        monkeypatch.setattr(N, "fcntl", SimpleNamespace(
+            flock=unsupported, LOCK_EX=1, LOCK_NB=2))
+    channel = _Capture()
+    notifier = N.Notifier([channel], ledger_dir_for=lambda event: tmp_path)
+    event = _event(_parked(M.PARKED_REASON_GATE, step_type="human_gate"))
+    notifier.notify_transition(event)
+    notifier.notify_transition(event)
+    assert len(channel.sent) == 1
+    assert N.NotificationLedger.for_run_dir(tmp_path).entries()[0]["status"] == "delivered"

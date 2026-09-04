@@ -45,3 +45,6 @@ apply, so the file reads oldest-first.
 - **operator.md** (#147 review): require completed-work evidence and a valid
   body for manual phase markers; document capability-aware drafting, the
   100-character validator limit, and read-only preconditions.
+
+- **commit-message.md** (#141 review): retain the updated guidance to aim under
+  72 characters while making the enforced 100-character ceiling explicit.

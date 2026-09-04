@@ -86,10 +86,11 @@ All notable changes to Gauntlet are recorded here. The format follows
   `run-halted` kind. A gate-reached notification carries a pre-built review
   bundle — `git diff --stat` of the reviewed range, finding/triage counts,
   spend and elapsed time, and the exact next command — assembled read-only by
-  the new `gauntlet.engine.gate_evidence`. Each emission is appended to the
-  run's `notifications.jsonl` ledger; the console notifier consults the same
-  ledger, so driver and console never double-fire and a restarted emitter never
-  re-announces. New engine `notify:` config block (`desktop`, `slack`,
+  the new `gauntlet.engine.gate_evidence`. Successful channel deliveries are
+  acknowledged in `notifications.jsonl`, keyed by transition, phase iteration,
+  and park episode. Driver and console serialize sends per channel; a delivery
+  on one channel does not suppress another. Failed sends remain retryable. The
+  CLI waits up to 12 seconds for pending sends before exit. New engine `notify:` config block (`desktop`, `slack`,
   `webhook`, `slack_webhook`, `webhook_url`, optional `kinds` allowlist;
   defaults are safe no-ops); an absent `web.notify` inherits it.
   `GAUNTLET_NOTIFY_DISABLED=1` is the driver-side kill switch.

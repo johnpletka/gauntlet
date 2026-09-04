@@ -28,14 +28,14 @@ unreadable ledger lines are ignored (fail open on the *ledger*: an unreadable
 record must not silence a real park).
 
 **Fail-soft (FR-9.3).** Every channel send is wrapped so an error is logged and
-swallowed, and the I/O channels run on a daemon thread. A notification failure
+swallowed, and the I/O channels run on a daemon thread. The CLI waits up to 12 seconds
+for pending sends before exit. A notification failure
 can never affect a run — the notifier owns no run state.
 """
 
 from __future__ import annotations
 
 import json
-import fcntl
 import hashlib
 import time
 from contextlib import contextmanager
@@ -48,6 +48,11 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: notifications still work; ledger de-dup is best-effort
+    fcntl = None
 
 import httpx
 from pydantic import BaseModel, Field
@@ -165,7 +170,7 @@ LEDGER_NAME = "notifications.jsonl"
 EMITTER_DRIVER = "driver"
 EMITTER_CONSOLE = "console"
 
-# De-dup key: (run_id, kind, current_step) — FR-9.1.
+# Delivery identity includes foreach iteration and the persisted step-end stamp.
 Key = tuple[str | None, ...]
 
 
@@ -668,9 +673,9 @@ def driver_notifications_disabled() -> bool:
 
 # --- the de-dup ledger ----------------------------------------------------------
 class NotificationLedger:
-    """``<run_dir>/notifications.jsonl`` — append-only, one line per emitted
-    notification: ``{key: [run_id, kind, current_step], kind, emitted_at,
-    channels: [names], by: "driver"|"console"}``.
+    """``<run_dir>/notifications.jsonl`` — append-only, one line per successful
+    channel delivery: ``{key: [run_id, kind, current_step, iteration, episode], kind, emitted_at,
+    channels: [name], status: "delivered", by: "driver"|"console"}``.
 
     Read fail-open: an unreadable file or a malformed line is ignored (the
     notification is emitted anyway — an unreadable record must not silence a
@@ -703,7 +708,7 @@ class NotificationLedger:
                 and len(key) in (3, 5)
                 and isinstance(key[0], str)
                 and isinstance(key[1], str)
-                and (key[2] is None or isinstance(key[2], str))
+                and all(value is None or isinstance(value, str) for value in key[2:])
             ):
                 out.add(tuple(key))
         return out
@@ -726,11 +731,15 @@ class NotificationLedger:
 
     def delivered(self, key: Key, channel: str) -> bool:
         return any(rec.get("key") == list(key) and rec.get("status") == "delivered"
-                   and channel in rec.get("channels", []) for rec in self.entries())
+                   and isinstance(rec.get("channels"), list)
+                   and channel in rec["channels"] for rec in self.entries())
 
     @contextmanager
     def delivery_lock(self, channel: str):
         """Serialize check/send/ack across driver and console, with a bound."""
+        if fcntl is None:
+            yield
+            return
         suffix = hashlib.sha256(channel.encode()).hexdigest()[:12]
         path = self.path.with_name(f"{self.path.name}.{suffix}.lock")
         try:
@@ -750,6 +759,11 @@ class NotificationLedger:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("notification delivery lock timed out")
                     time.sleep(0.02)
+                except OSError:
+                    # A filesystem without advisory locking must not silence
+                    # notifications. Successful deliveries still get recorded.
+                    yield
+                    return
             yield
         finally:
             handle.close()
@@ -894,8 +908,8 @@ class Notifier:
 
     def emit(self, event: Transition, kind: str, *, note: str | None = None) -> str | None:
         """Send one explicit kind for this event unless its key already fired
-        (memory or ledger). Records the send in the ledger. Returns the kind on
-        a send, else ``None``."""
+        (memory or ledger) for each channel. Successful sends are acknowledged
+        in the ledger. Returns the kind when dispatching, else ``None``."""
         if not self._allowed(kind):
             return None
         key = self._key(event, kind)
