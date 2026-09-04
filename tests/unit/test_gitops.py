@@ -324,6 +324,60 @@ def test_wip_checkpoints_trailing_run_fails_closed_on_wrong_phase(fixture_repo):
     assert exc.value.found_subject == "P8 wip: mistyped"
 
 
+def test_wip_checkpoints_prior_phase_gate_commit_is_the_boundary(fixture_repo):
+    """A prior phase's gate-time operator commit at the BOTTOM of the trailing
+    run is the phase boundary, not a mistype: no current-phase checkpoint lies
+    beneath it, so stopping there is lossless and the walk must not fail
+    closed (#148)."""
+    gitops.commit_all(
+        fixture_repo, "P3: prior phase\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    # Operator commits the proving-run record while parked at P3's gate —
+    # necessarily after the P3: phase commit, correctly labeled P3.
+    _wip(fixture_repo, "P3 wip: operator proving run — record VERIFIED", "r.json", "{}\n")
+    gitops.commit_all(
+        fixture_repo, "gauntlet: response impl-cycle-resp-6 consumed\n\nbody",
+        identity=Identity("Gauntlet Engine", "engine@gauntlet.local"),
+        allow_empty=True,
+    )
+    m1 = _wip(fixture_repo, "P4 wip: one", "a.py", "a\n")
+    m2 = _wip(fixture_repo, "P4 wip: two", "b.py", "b\n")
+    wips = gitops.wip_checkpoints(fixture_repo, phase="P4")
+    assert [sha for sha, _s in wips] == [m2, m1]
+    # Squash base = parent of the oldest P4 checkpoint (the engine bookkeeping
+    # commit) — ABOVE the P3 wip commit, which stays untouched at the boundary.
+    assert gitops.commit_parent(fixture_repo, m1) == gitops.rev_parse(
+        fixture_repo, "HEAD~2"
+    )
+
+
+def test_wip_checkpoints_prior_phase_gate_commit_with_no_current_wips(fixture_repo):
+    """The boundary rule also holds when the current phase made no checkpoints
+    at all: the walk returns empty instead of failing closed (#148)."""
+    gitops.commit_all(
+        fixture_repo, "P3: prior phase\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    _wip(fixture_repo, "P3 wip: operator proving run", "r.json", "{}\n")
+    assert gitops.wip_checkpoints(fixture_repo, phase="P4") == []
+
+
+def test_wip_checkpoints_interleaved_wrong_phase_still_fails_closed(fixture_repo):
+    """A wrong-phase wip with a genuine current-phase checkpoint BENEATH it is
+    interleaved — the truncation hazard the fail-closed protects against — and
+    still raises, even when another current-phase wip sits above it (#148)."""
+    gitops.commit_all(
+        fixture_repo, "P8: prior\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    _wip(fixture_repo, "P9 wip: beneath", "a.py", "a\n")
+    _wip(fixture_repo, "P8 wip: mistyped", "b.py", "b\n")
+    _wip(fixture_repo, "P9 wip: above", "c.py", "c\n")
+    with pytest.raises(gitops.WrongPhaseCheckpointError):
+        gitops.wip_checkpoints(fixture_repo, phase="P9")
+
+
 def test_wip_checkpoints_trailing_run_walks_through_engine_commits(fixture_repo):
     """An engine bookkeeping (`gauntlet:`) commit between this phase's wip commits
     is transparent — the walk finds the checkpoints beneath it (review F-002)."""
