@@ -1277,12 +1277,22 @@ def wip_checkpoints(
                 #     is provably lossless, and it is the phase boundary.
                 #
                 # Only the interleaved case has anything to protect: fail
-                # closed iff a current-phase checkpoint exists further down.
-                if any(
-                    matcher.match(rest.partition("\x00")[2])
-                    for rest in lines[i + 1 :]
-                ):
-                    raise WrongPhaseCheckpointError(phase, subject)
+                # closed iff a current-phase checkpoint exists further down
+                # WITHIN the contiguous trailing run. The lookahead walks
+                # through wip and bookkeeping subjects only and stops at the
+                # first real gap (a `P<N>:` phase commit / the branch base):
+                # beyond that gap lies pre-phase history, where an earlier
+                # run's same-numbered `P<N> wip:` commits (merged to the base
+                # branch) are ordinary history, not this phase's checkpoints.
+                for rest in lines[i + 1 :]:
+                    rest_subject = rest.partition("\x00")[2]
+                    if matcher.match(rest_subject):
+                        raise WrongPhaseCheckpointError(phase, subject)
+                    if not (
+                        _WIP_SUBJECT_RE.match(rest_subject)
+                        or _ENGINE_SUBJECT_RE.match(rest_subject)
+                    ):
+                        break
                 break
             if _ENGINE_SUBJECT_RE.match(subject):
                 # Engine bookkeeping commit (a response/rewind checkpoint) can sit
