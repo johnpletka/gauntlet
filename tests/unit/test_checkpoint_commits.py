@@ -426,7 +426,7 @@ def test_implement_prompt_instructs_wip_checkpoints():
 
 
 # --- #124: reconcile a phase commit reachable from HEAD but behind base_sha ---
-def _ctx_for_commit(repo, base_sha):
+def _ctx_for_commit(repo, base_sha, *, config=None):
     """A minimal StepContext for driving handle_commit directly, with an
     explicit record.base_sha (the orchestrator normally sets it to HEAD-at-start;
     here we simulate a base re-anchored past the phase commit by resume adoption)."""
@@ -434,9 +434,10 @@ def _ctx_for_commit(repo, base_sha):
     (ar / "run-1").mkdir(parents=True, exist_ok=True)
     man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
                    pipeline=PipelineRef(name="demo", version=1, hash="h"))
+    cfg = config or {"agents": {"builder": {"adapter": "claude-code"}}}
     return StepContext(
         repo_root=repo, run_dir=ar / "run-1", artifact_root=ar,
-        config=RunConfig.model_validate({"agents": {"builder": {"adapter": "claude-code"}}}),
+        config=RunConfig.model_validate(cfg),
         pipeline=Pipeline.model_validate({"name": "demo", "version": 1, "stages": []}),
         manifest=man,
         record=StepRecord(id="commit", type="commit", base_sha=base_sha),
@@ -556,3 +557,203 @@ def test_keep_mode_checkpoints_win_over_adoption(fixture_repo):
     assert result.commit_sha == gitops.head_sha(fixture_repo)  # marker at tip
     subject = gitops.commit_subject(fixture_repo, result.commit_sha)
     assert subject.startswith("P9:")
+
+
+# --- #134: marker commit over checkpoints buried beneath adopted commits -----
+_P9_STEP = {"id": "commit", "type": "commit", "phase": "P9",
+            "message": "P9: the phase\n\nbody"}
+
+
+def _adopted(repo, subject: str, rel: str, content: str) -> str:
+    """A plain (non-wip, non-bookkeeping) commit at the tip, as left by an
+    operator pre-commit that `resume` adopted (re-anchoring base_sha to it)."""
+    return _wip(repo, subject, rel, content)
+
+
+def test_marker_lands_over_checkpoints_beneath_adopted_commit(fixture_repo):
+    # #134 reproduction: the builder checkpointed the phase as `P9 wip:` commits,
+    # an operator commit landed above them and `resume` adopted it, re-anchoring
+    # the commit step's base_sha AT the adopted tip. Trailing-run discovery from
+    # HEAD stops at the adopted commit (a "gap") and finds nothing; the tree is
+    # clean; before this fix the step failed "nothing to commit" and the
+    # operator hand-made the empty `P9:` marker. The engine now takes that path.
+    git(fixture_repo, "checkout", "-qb", "b")
+    first_wip = _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    _wip(fixture_repo, "P9 wip: cli wiring", "b.py", "b\n")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    assert gitops.wip_checkpoints(fixture_repo, phase="P9") == []  # the trap
+    ctx = _ctx_for_commit(fixture_repo, adopted)  # base re-anchored at the tip
+    result = handle_commit(Step.model_validate(_P9_STEP), ctx)
+
+    assert result.status == DONE
+    head = gitops.head_sha(fixture_repo)
+    assert result.commit_sha == head and result.commit_phase == "P9"
+    assert gitops.commit_subject(fixture_repo, head) == "P9: the phase"
+    # An empty marker directly on the adopted commit — nothing rewritten.
+    assert gitops.commit_parent(fixture_repo, head) == adopted
+    assert gitops.diff_range_empty(fixture_repo, adopted, head)
+    msg = gitops.commit_message(fixture_repo, head)
+    assert "P9 wip: model layer" in msg and "P9 wip: cli wiring" in msg
+    assert "2 checkpoint(s) beneath 1 adopted commit(s)" in (result.notes or "")
+    # base_sha is repaired to the parent of the OLDEST checkpoint so the review
+    # range diff is the cumulative phase diff (checkpoints + adopted commit).
+    assert ctx.record.base_sha == gitops.commit_parent(fixture_repo, first_wip)
+    diff = gitops.range_diff(fixture_repo, ctx.record.base_sha, head)
+    assert "a.py" in diff and "b.py" in diff and "evidence.md" in diff
+
+
+def test_marker_lands_beneath_adopted_fix_round_commit(fixture_repo):
+    # The adopted commit above the checkpoints carries a phase-shaped header
+    # (`P9.1:`) — not this phase's `P9:` commit, so the #124 adoption must not
+    # take it, and the checkpoints beneath it still get their marker. base_sha
+    # sits ABOVE the checkpoints but below HEAD (bookkeeping on top).
+    git(fixture_repo, "checkout", "-qb", "b")
+    first_wip = _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    fix = _adopted(fixture_repo, "P9.1: Address review — tweak", "a.py", "a2\n")
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: bookkeeping flush")
+    ctx = _ctx_for_commit(fixture_repo, fix)
+    result = handle_commit(Step.model_validate(_P9_STEP), ctx)
+    assert result.status == DONE
+    assert result.commit_sha == gitops.head_sha(fixture_repo)
+    assert result.commit_sha != fix
+    assert gitops.commit_subject(fixture_repo, result.commit_sha) == "P9: the phase"
+    assert "1 checkpoint(s) beneath 1 adopted commit(s)" in (result.notes or "")
+    assert ctx.record.base_sha == gitops.commit_parent(fixture_repo, first_wip)
+
+
+def test_marker_keeps_base_when_it_is_already_below_checkpoints(fixture_repo):
+    # base_sha was NOT re-anchored (it still sits below the checkpoints); an
+    # adopted commit above them alone hides the trailing run. The marker lands
+    # and the already-correct base is left alone.
+    git(fixture_repo, "checkout", "-qb", "b")
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    ctx = _ctx_for_commit(fixture_repo, base)
+    result = handle_commit(Step.model_validate(_P9_STEP), ctx)
+    assert result.status == DONE
+    assert gitops.commit_subject(fixture_repo, result.commit_sha) == "P9: the phase"
+    assert ctx.record.base_sha == base
+
+
+def test_marker_walk_stops_at_previous_phase_commit(fixture_repo):
+    # The walk back to the phase's true start stops at the previous phase's
+    # `P8:` commit: P8's own kept checkpoints beneath it are never counted, and
+    # base_sha is re-anchored exactly at that boundary.
+    git(fixture_repo, "checkout", "-qb", "b")
+    _wip(fixture_repo, "P8 wip: earlier", "z.py", "z\n")
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "P8: prior phase\n\nbody")
+    boundary = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    ctx = _ctx_for_commit(fixture_repo, adopted)
+    result = handle_commit(Step.model_validate(_P9_STEP), ctx)
+    assert result.status == DONE
+    assert "1 checkpoint(s) beneath 1 adopted commit(s)" in (result.notes or "")
+    msg = gitops.commit_message(fixture_repo, result.commit_sha)
+    assert "P9 wip: model layer" in msg and "P8 wip" not in msg
+    assert ctx.record.base_sha == boundary
+
+
+def test_marker_fallback_fails_closed_on_wrong_phase_checkpoint(fixture_repo):
+    # A wrong-phase `P8 wip:` inside the walked range (no `P8:` boundary shields
+    # it) fails closed exactly like the trailing-run discovery does.
+    git(fixture_repo, "checkout", "-qb", "b")
+    _wip(fixture_repo, "P8 wip: mistyped", "z.py", "z\n")
+    _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    result = handle_commit(Step.model_validate(_P9_STEP), _ctx_for_commit(fixture_repo, adopted))
+    assert result.status == M.FAILED
+    assert "failed closed" in (result.notes or "")
+    assert gitops.head_sha(fixture_repo) == adopted  # nothing committed
+
+
+def test_clean_tree_with_adopted_commit_but_no_checkpoints_still_fails(fixture_repo):
+    # Negative control: adopted commits above the base but no `P9 wip:`
+    # checkpoint anywhere in the run's history — still the loud FAILED. The
+    # fallback lands a marker over checkpoints, never over nothing.
+    git(fixture_repo, "checkout", "-qb", "b")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    result = handle_commit(Step.model_validate(_P9_STEP), _ctx_for_commit(fixture_repo, adopted))
+    assert result.status == M.FAILED
+    assert "nothing to commit" in (result.notes or "")
+    assert gitops.head_sha(fixture_repo) == adopted
+
+
+def test_foreign_run_checkpoints_in_base_history_are_not_counted(fixture_repo):
+    # An earlier run/PRD left `P9 wip:` checkpoints in the BASE branch's
+    # history. The walk is bounded to the run's own commits (`HEAD ^main`), so
+    # those are never counted as this phase's checkpoints — FAILED is correct.
+    _wip(fixture_repo, "P9 wip: an earlier run's milestone", "old.py", "o\n")
+    git(fixture_repo, "checkout", "-qb", "b")  # run branch forks AFTER them
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    result = handle_commit(Step.model_validate(_P9_STEP), _ctx_for_commit(fixture_repo, adopted))
+    assert result.status == M.FAILED
+    assert "nothing to commit" in (result.notes or "")
+    assert gitops.head_sha(fixture_repo) == adopted
+
+
+def test_marker_fallback_skipped_when_base_branch_missing(fixture_repo):
+    # Without the base branch ref the walk cannot be bounded — no fallback, the
+    # step fails closed as before rather than counting an unbounded history.
+    git(fixture_repo, "checkout", "-qb", "b")
+    _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    git(fixture_repo, "branch", "-qD", "main")
+    result = handle_commit(Step.model_validate(_P9_STEP), _ctx_for_commit(fixture_repo, adopted))
+    assert result.status == M.FAILED
+    assert "nothing to commit" in (result.notes or "")
+
+
+def test_marker_fallback_never_squashes_adopted_commits(fixture_repo):
+    # SQUASH mode collapses only the TRAILING run it owns. Checkpoints found
+    # beneath adopted commits get the empty marker: the adopted commits are not
+    # this step's to rewrite.
+    git(fixture_repo, "checkout", "-qb", "b")
+    _wip(fixture_repo, "P9 wip: model layer", "a.py", "a\n")
+    adopted = _adopted(fixture_repo, "stage human evidence", "evidence.md", "e\n")
+    cfg = {"agents": {"builder": {"adapter": "claude-code"}},
+           "checkpoint_commits": "squash"}
+    ctx = _ctx_for_commit(fixture_repo, adopted, config=cfg)
+    result = handle_commit(Step.model_validate(_P9_STEP), ctx)
+    assert result.status == DONE
+    assert gitops.commit_parent(fixture_repo, result.commit_sha) == adopted
+    assert gitops.diff_range_empty(fixture_repo, adopted, result.commit_sha)
+    assert "empty P<N>: marker" in (result.notes or "")
+
+
+@pytest.mark.parametrize("previous_phase", [False, True])
+def test_review_range_includes_adopted_fix_before_empty_marker(fixture_repo, previous_phase):
+    from gauntlet.engine.cycle import _code_review_base
+    base = gitops.head_sha(fixture_repo)
+    git(fixture_repo, "checkout", "-qb", "gauntlet/demo")
+    _wip(fixture_repo, "P9 wip: implementation", "implementation.py", "implementation\n")
+    fix = _wip(fixture_repo, "P9.1: Adopt correction", "correction.py", "correction\n")
+    ctx = _ctx_for_commit(fixture_repo, fix)
+    if previous_phase:
+        ctx.manifest.commits.append(M.CommitRecord(step_id="old", phase="P8", sha=base))
+    ctx.manifest.commits.append(M.CommitRecord(step_id="implement", phase="P9.1", sha=fix))
+    result = handle_commit(Step.model_validate({"id": "commit", "type": "commit",
+        "phase": "P9", "message": "P9: Complete phase\n\nImplement and correct the phase."}), ctx)
+    assert result.status == DONE, result.notes
+    ctx.manifest.commits.append(M.CommitRecord(step_id="commit", phase="P9",
+        sha=result.commit_sha, base_sha=ctx.record.base_sha))
+    review_base = _code_review_base(ctx, result.commit_sha)
+    assert review_base == base
+    diff = gitops.range_diff(fixture_repo, review_base, result.commit_sha)
+    assert "implementation.py" in diff and "correction.py" in diff
+
+
+@pytest.mark.parametrize("mode", ["keep", "squash"])
+def test_first_checkpoint_phase_persists_review_base(fixture_repo, mode):
+    from gauntlet.engine.cycle import _code_review_base
+    base = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P9 wip: first implementation", "first.py", "first\n")
+    orch = _orch(fixture_repo, _COMMIT_PIPELINE, config={
+        "checkpoint_commits": mode, "agents": {"builder": {"adapter": "claude-code"}}})
+    assert orch.drive() == M.RUN_DONE
+    commit = orch.manifest.commits[-1]
+    assert commit.base_sha == base
+    ctx = _ctx_for_commit(fixture_repo, base)
+    ctx.manifest.commits = orch.manifest.commits
+    assert _code_review_base(ctx, commit.sha) == base

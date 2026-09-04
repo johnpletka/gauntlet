@@ -57,6 +57,16 @@ the phase loop over (`foreach: plan.phases`). Each entry has:
   sentence. The plan gate rejects any phase without this list (FR-3.1): the
   acceptance gate later proves each clause maps to a real test.
 
+- `preconditions` (optional): the ENVIRONMENTAL things this phase depends on
+  that no agent can create — staged data files and environment variables. Each item is exactly one of `{path: <file or dir>}`
+  (must exist; relative to the repository root), `{env: NAME}` (must be set
+  and non-empty; the value is never read into any record), plus an optional
+  `description`. Provision separately before approval; command items are rejected. The engine checks every item at the plan gate — approval is
+  refused while any is unmet — and again just before the phase launches, so a
+  missing bundle parks the run BEFORE the first agent turn, not mid-phase.
+  Whole-plan items go in a top-level `preconditions:` list by writing the block
+  as a mapping: `{preconditions: [...], phases: [...]}`.
+
 It must agree with the prose phases — the human ratifies the prose, the engine
 executes the list, and they must not drift. Concretely: **every phase id in the
 block must have a matching prose heading** of the form `## <id> — <title>` (e.g.

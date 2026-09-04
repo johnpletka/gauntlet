@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import sys
+import os
 from pathlib import Path
 
 import typer
@@ -365,6 +366,65 @@ def _refuse_inside_run_worktree(cwd: Path) -> None:
         err=True,
     )
     raise typer.Exit(1)
+
+
+def _echo_ratification_audit(mgr, slug: str) -> None:
+    """Print what `--accept-artifacts` recorded, from the manifest (#134).
+
+    Data over inference: the digests and any drift warning are read back from
+    the persisted manifest — the same record `status`/`report` show — so the
+    CLI never narrates something the run did not record. Loud on drift.
+    """
+    from gauntlet.engine.manifest import Manifest
+
+    try:
+        man = Manifest.load(mgr.layout(slug).active_run_dir() / "manifest.json")
+    except (OSError, ValueError):
+        return
+    if not man.ratified_artifacts:
+        return
+    last_id = man.ratified_artifacts[-1].response_id
+    for entry in man.ratified_artifacts:
+        if entry.response_id == last_id:
+            typer.echo(f"ratified {entry.name} sha256={entry.sha256} ({entry.response_id})")
+    for warning in man.warnings:
+        if warning.startswith(f"artifact ratification {last_id}:"):
+            typer.echo(f"AUDIT: {warning}", err=True)
+
+
+def _plan_preflight_advisory(mgr, man, rstate, pipeline) -> list[str]:
+    """Read-only plan-precondition advisory for a parked `preflight` gate (#134).
+
+    Resolves `path` / `env` items only (never runs a `command` — status is
+    read-only) and lists what `gauntlet approve` will refuse on. Fail-soft: an
+    unreadable plan or pipeline renders nothing.
+    """
+    from gauntlet.engine import operator
+    from gauntlet.engine import preconditions as PC
+    from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+
+    if rstate.state != operator.STATE_PARKED_GATE or rstate.parked is None or pipeline is None:
+        return []
+    gate = next((s for s in pipeline.all_steps() if s.id == rstate.parked.step_id), None)
+    if gate is None or gate.get("preflight") != PC.PREFLIGHT_PLAN_PRECONDITIONS:
+        return []
+    try:
+        spec = load_plan_spec(mgr.layout(man.slug).slug_dir / "plan.md")
+    except (PlanPhasesError, OSError):
+        return ["plan preflight: plan.md unreadable — `gauntlet approve` will refuse"]
+    if spec is None or not spec.all_preconditions():
+        return []
+    items = spec.all_preconditions()
+    try:
+        cwd = _status_work_root(mgr, man)
+    except Exception:  # fail-soft: advisory only
+        cwd = mgr.repo_root
+    unmet = PC.resolve_preconditions(items, cwd=cwd, env=os.environ)
+    out = []
+    if unmet:
+        out.append(f"plan preflight: {len(unmet)} unmet precondition(s) — `gauntlet approve` will refuse:")
+        out.extend(f"  - {u.render()}" for u in unmet)
+    return out
 
 
 def _manager() -> "object":
@@ -809,6 +869,59 @@ def _ensure_watch_console(mgr, *, host: str, port: int, no_browser: bool = False
     open_authenticated(handle, no_browser=no_browser, echo=typer.echo)
 
 
+@app.command()
+@_friendly_errors
+def sweep(
+    slug: str = typer.Argument(None, help="One run to sweep (omit with --all)."),
+    all_runs: bool = typer.Option(
+        False, "--all", help="Sweep every run under the configured run_root.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit one JSON object per run instead of lines.",
+    ),
+    detach: bool = typer.Option(
+        None, "--detach/--foreground",
+        help="Launch each resume as a detached `gauntlet resume <slug>` child "
+             "(default with --all) or drive it in this process until its next "
+             "park (default for a single slug).",
+    ),
+) -> None:
+    """Unattended, judgment-free resume sweep (#134).
+
+    Takes ONLY the two actions the operator playbook classes as no-decision:
+    reclaim a run whose driver is PROVEN dead (orphaned), and fire a parked
+    step's armed, due `scheduled_resume` under the config knob that armed it
+    (`resume_on_quota: auto` / `resume_on_provider_unavailable: auto`). Gates,
+    response parks, failures, indeterminate liveness, malformed locks and live
+    drivers are skipped with a one-line reason. Idempotent: exit 0 whether or
+    not anything was resumed; non-zero only on an internal error. Every action
+    stamps `unattended sweep resumed (<reason>) at <iso>` into the manifest.
+    Run it from cron/launchd (`external_scheduler: true`) or let `gauntlet
+    serve` run it on its timer.
+    """
+    import json
+
+    from gauntlet.engine import sweep as SW
+
+    if bool(slug) == bool(all_runs):
+        typer.echo("error: give exactly one of <slug> or --all", err=True)
+        raise typer.Exit(2)
+    _refuse_inside_run_worktree(Path.cwd())
+    mgr = _manager()
+    run_root = mgr.repo_root / mgr.config.run_root
+    slugs = SW.enumerate_slugs(run_root) if all_runs else [slug]
+    use_detach = all_runs if detach is None else detach
+    launcher = SW.detached_launcher if use_detach else None
+    outcomes = SW.sweep_slugs(mgr, slugs, launcher=launcher)
+    if json_output:
+        typer.echo(json.dumps([o.to_dict() for o in outcomes], indent=2))
+        return
+    if not outcomes:
+        typer.echo(f"no runs under {run_root}")
+    for o in outcomes:
+        typer.echo(o.render())
+
+
 @app.command(cls=_InteractiveCommand)
 @_friendly_errors
 def status(
@@ -1094,6 +1207,7 @@ def status(
     # usage limit — the reset time, all sourced from the manifest so no parked
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
+    scheduled_resume = None
     if rstate.state in (
         operator.STATE_PARKED_USAGE_LIMIT,
         operator.STATE_PARKED_USAGE_WINDOW,
@@ -1105,6 +1219,8 @@ def status(
             None,
         )
         quota_reset_at = pr.quota_reset_at if pr is not None else None
+        # FR-3.4 / #134: the armed auto-resume schedule, same datum as --json.
+        scheduled_resume = pr.scheduled_resume if pr is not None else None
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
@@ -1112,7 +1228,10 @@ def status(
         cost_usd=man.totals.cost_usd,
         quota_reset_at=quota_reset_at,
         slug=slug,  # names the §4 recover verb in the agent-silent line (#103)
+        scheduled_resume=scheduled_resume,
     ):
+        typer.echo(line)
+    for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):
         typer.echo(line)
 
 
@@ -1269,9 +1388,27 @@ def approve(
     gate: str = typer.Option(None, "--gate", help="Gate step id (default: current)."),
     notes: str = typer.Option(None, help="Approval notes."),
     no_judge: bool = typer.Option(False, "--no-judge"),
+    skip_preflight: bool = typer.Option(
+        False, "--skip-preflight",
+        help="Approve a `preflight: plan_preconditions` gate even though the "
+             "plan's declared preconditions are unmet (#134). The unmet items "
+             "are recorded as a manifest warning.",
+    ),
 ) -> None:
-    """Approve a parked human_gate and continue the run (FR-8.1)."""
-    typer.echo(f"run status: {_manager().approve(slug, gate, notes, use_judge=not no_judge)}")
+    """Approve a parked human_gate and continue the run (FR-8.1).
+
+    A gate declaring `preflight: plan_preconditions` (the standard pipeline's
+    `plan-approve`) first resolves every precondition the plan's
+    `gauntlet-phases` block declares — data files, env vars, provisioning
+    commands — and refuses while any is unmet, so a phase never parks mid-run on
+    something discoverable before the first agent launched (#134).
+    """
+    typer.echo(
+        "run status: "
+        + str(_manager().approve(
+            slug, gate, notes, use_judge=not no_judge, skip_preflight=skip_preflight,
+        ))
+    )
 
 
 @app.command()
@@ -1394,6 +1531,17 @@ def resume(
              "persisted, and never applied automatically. A no-op for a run "
              "already in same_tree mode.",
     ),
+    accept_artifacts: bool = typer.Option(
+        False, "--accept-artifacts",
+        help="Structured ratification for a parked_for_response park (#134): "
+             "record that the governed artifacts (prd.md / plan.md) as they "
+             "stand in the run dir ARE the approved artifacts, by sha256 "
+             "digest, and re-drive with proceed_in_place — no prose is "
+             "classified, no disposition model runs. Mutually exclusive with "
+             "--response. A digest that differs from the run's last-known "
+             "approved one is recorded LOUDLY (audit line + manifest warning), "
+             "never refused.",
+    ),
 ) -> None:
     """Resume an interrupted run at its last incomplete step (FR-8.2).
 
@@ -1408,6 +1556,12 @@ def resume(
     `gauntlet resume --response` (FR-3.2), not only `gauntlet review --response`.
     """
     mgr = _manager()
+    if accept_artifacts and response is not None:
+        typer.echo(
+            "error: --accept-artifacts and --response are mutually exclusive",
+            err=True,
+        )
+        raise typer.Exit(2)
     review_dir = _locate_review_run(mgr, slug)
     if review_dir is not None:
         _resume_review_cli(mgr, review_dir, response=response, no_judge=no_judge)
@@ -1416,7 +1570,10 @@ def resume(
         status = mgr.resume(
             slug, response=response, use_judge=not no_judge,
             reset_interrupted=reset_interrupted, same_tree=same_tree,
+            accept_artifacts=accept_artifacts,
         )
+        if accept_artifacts:
+            _echo_ratification_audit(mgr, slug)
     except ValueError as exc:
         # A terminal/parked run resume cannot proceed: surface WHY + the next
         # verb on stderr and exit non-zero — never silently print a status and

@@ -33,3 +33,18 @@ apply, so the file reads oldest-first.
   terminal reject (no upstream cycle to iterate) is refused unless the explicit
   `--terminal` flag is given — a flag-less reject can no longer end a run by
   surprise.
+
+- **commit-message.md** (#134): add the hard rules that the 72-char header
+  limit is counted INCLUDING the `PN: ` prefix (models violated the limit
+  roughly every phase, each violation costing a redraft or a park), that the
+  body must stay free of the diff, and how to draft when the engine hands an
+  oversize diff BY REFERENCE (`diff --stat` inline, per-file diffs read with
+  git) instead of inlining it.
+- **plan-author.md** (#146 review): limit preconditions to read-only path and
+  environment checks; require provisioning separately before approval.
+- **operator.md** (#147 review): require completed-work evidence and a valid
+  body for manual phase markers; document capability-aware drafting, the
+  100-character validator limit, and read-only preconditions.
+
+- **commit-message.md** (#141 review): retain the updated guidance to aim under
+  72 characters while making the enforced 100-character ceiling explicit.

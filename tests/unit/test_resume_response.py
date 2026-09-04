@@ -526,20 +526,22 @@ def test_retry_budget_does_not_reset_across_resume(tmp_path):
     )
     assert mgr.status("demo").record("tests").attempts == 3
 
-    # Resume the failed run: the exhausted budget stays exhausted, so the step
-    # fails exactly ONE more time (no fresh reroutes) — attempts advances by 1,
-    # not by another full budget of 3. Since P5.1 (review F-002) the identical
-    # re-failure then raises NoProgressError (the failure counter is
-    # bookkeeping, not progress — R5), instead of returning RUN_FAILED with a
-    # clean exit while nothing changed.
-    from gauntlet.engine.recovery import NoProgressError
-
-    with pytest.raises(NoProgressError):
-        mgr.resume(
-            "demo", use_judge=False,
-            adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
-        )
-    assert mgr.status("demo").record("tests").attempts == 4
+    # Resume the failed run: the exhausted budget stays exhausted — the step
+    # is NOT handed a fresh budget of 3. Since #134 a plain resume is a human
+    # action that re-arms exactly ONE more on_fail route (audited as a manifest
+    # warning), so the step fails exactly one more time: attempts advances by
+    # 1, the run surfaces FAILED again (the re-arm is real work, so the R5
+    # no-progress guard does not fire), and the persisted counter still
+    # governs — a second plain resume re-arms one more, never three.
+    status = mgr.resume(
+        "demo", use_judge=False,
+        adapter_factory=lambda n: ScriptedAdapter("proceed"), clock=_clock(),
+    )
+    assert status == M.RUN_FAILED
+    man = mgr.status("demo")
+    assert man.record("tests").attempts == 4
+    rearms = [w for w in man.warnings if w.startswith(mgr.REARM_WARNING_PREFIX)]
+    assert len(rearms) == 1 and "re-arm #1" in rearms[0]
 
 
 def test_consumed_failure_is_not_reexecuted_on_resume(tmp_path):
@@ -1255,7 +1257,9 @@ def test_manifest_is_human_readable_json(tmp_path):
     entry = data["steps"][0]["human_responses"][0]
     # artifact_fingerprint joined the durable shape with #79 (the
     # vacuous-convergence guard's comparison anchor); additive/nullable.
+    # `kind` joined with #134 (text | accept_artifacts); additive, default text.
     assert set(entry) == {
         "response_id", "response_text", "timestamp", "user",
-        "response_attempt", "state", "artifact_fingerprint",
+        "response_attempt", "state", "artifact_fingerprint", "kind",
     }
+    assert entry["kind"] == "text"

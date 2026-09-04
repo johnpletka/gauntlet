@@ -351,14 +351,121 @@ all slugs with live status / current step / cost, drills into each step's
 running steps), assembles the evidence behind a parked gate and offers
 **Approve / Reject** in one place, and classifies a failed/parked run into the
 action that actually applies. It can also launch and abort runs as supervised
-children and survive its own restart by re-attaching to live PIDs, and fire
-desktop / Slack / in-tab notifications on the four moments that need a human
-(gate reached, escalation parked, run failed, run completed).
+children and survive its own restart by re-attaching to live PIDs, and adds an
+in-tab notification channel on top of the driver's own push (below).
+
+**Notifications come from the driver itself.** Every park (gate, escalation,
+decision, usage limit, provider outage, usage window, invalid artifact), halt,
+failure and completion is pushed the instant the driver persists it — to macOS
+desktop, a Slack incoming webhook, and/or a generic JSON webhook — whether or
+not a console is running, so detection latency no longer depends on someone
+being resident (#134). A gate notification carries a pre-built review bundle:
+`git diff --stat` of the reviewed range, finding/triage counts, spend and
+elapsed time, and the exact next command. Emissions are recorded in the run's
+`notifications.jsonl` ledger, which the console consults so the two never
+double-fire. Configure it once in `.gauntlet/config.yaml`:
+
+```yaml
+notify:                      # driver-side push (defaults shown; all opt-out)
+  desktop: true              # terminal-notifier / osascript on macOS
+  slack: true                # fires only when a webhook resolves
+  slack_webhook: null        # or the GAUNTLET_SLACK_WEBHOOK env var
+  webhook: true              # generic JSON POST; fires only when a URL resolves
+  webhook_url: null          # or the GAUNTLET_NOTIFY_WEBHOOK env var
+  # kinds: [gate-reached, escalation-parked, run-failed]   # allowlist; absent = all
+```
+
+Kinds: `gate-reached`, `escalation-parked`, `parked-for-response`,
+`parked-usage-limit`, `parked-provider-unavailable`, `parked-usage-window`,
+`parked-artifact-invalid`, `run-halted`, `run-failed`, `run-completed` (plus the
+console-only advisories `usage-window-warning`, `gate-auto-approved`, and
+`run-orphaned`). `GAUNTLET_NOTIFY_DISABLED=1` silences the driver for one
+invocation. An absent `web.notify` block inherits `notify:`.
 
 `gauntlet run --watch` ensures the console is up (booting or reusing it), prints
 its URL, and **opens the authenticated console in your browser** before running
 in the foreground; pass `--no-browser` (on either command) to skip the launch.
 `--console-host` / `--console-port` override the bind (default `127.0.0.1:8765`). `gauntlet serve --resume` does the same boot-or-reuse-and-open without holding the foreground.
+
+### Unattended recovery: `gauntlet sweep`
+
+A dead driver cannot self-resume, and a stale drive lock is only ever reclaimed
+by the next driving verb someone types. `gauntlet sweep` is the idempotent,
+judgment-free sweep a resident process runs instead of a human (#134):
+
+```sh
+gauntlet sweep myfeat          # one run: act only on a no-decision rule
+gauntlet sweep --all           # every run under run_root, each resume detached
+gauntlet sweep --all --json    # the same, one object per run
+```
+
+It takes exactly two actions: **reclaim an orphaned run** whose drive lock
+proves the driver dead or PID-reused, and **fire a due `scheduled_resume`** on a
+usage-limit / provider-unavailable park under the knob that armed it
+(`resume_on_quota: auto` / `resume_on_provider_unavailable: auto`). Everything
+else — gates, response parks, failures, indeterminate liveness, malformed
+locks, live drivers, terminal runs — is skipped with a one-line reason. Exit 0
+whether or not anything was resumed. Every action stamps
+`unattended sweep resumed (<reason>) at <iso>` into the manifest, and a
+`--all` resume appends its output to `<run_dir>/sweep-resume.log`.
+
+`gauntlet serve` runs the same sweep on a timer (`web.sweep_interval_s`,
+default 120; 0 disables), launching each resume as a console-owned driver.
+Without a console, schedule it yourself and set `external_scheduler: true` so
+the config lint knows the wait is covered:
+
+```sh
+# cron: every 5 minutes
+*/5 * * * * cd /path/to/repo && /path/to/gauntlet sweep --all >> ~/.gauntlet/sweep.log 2>&1
+```
+
+```xml
+<!-- ~/Library/LaunchAgents/com.gauntlet.sweep.plist (macOS) -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gauntlet.sweep</string>
+  <key>ProgramArguments</key>
+  <array><string>/path/to/gauntlet</string><string>sweep</string><string>--all</string></array>
+  <key>WorkingDirectory</key><string>/path/to/repo</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>/Users/you/.gauntlet/sweep.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.gauntlet/sweep.log</string>
+</dict></plist>
+```
+
+Mutual exclusion between a cron sweep, the console's sweep and your own
+`resume` rides on the drive lock: a resume that loses the race fails closed
+inside the engine and the sweep reports it as `refused`, never retried.
+### Plan preconditions
+
+A plan's `gauntlet-phases` block may declare the environmental things its phases
+depend on and no agent can create — staged data files and environment variables
+(#134). Provision separately before approval; command items are rejected. Per phase or for the whole plan (mapping form):
+
+```markdown
+```gauntlet-phases
+preconditions:                       # whole-plan items
+  - {env: OPENAI_API_KEY, description: "scoring calls"}
+phases:
+  - id: P1
+    title: Build the feature table
+    goal: …
+    frs: [FR-1.1]
+    acceptance: [{id: P1-A1, clause: "…"}]
+    preconditions:                   # this phase's own items
+      - {path: data/restricted/bundle.parquet, description: "staged by ops"}
+```
+```
+
+`plan-lint` fails closed on a malformed item. `gauntlet approve` on the plan
+gate (`preflight: plan_preconditions`) checks every item without executing plan
+text, records the checklist under `<run_dir>/preflight/`, and
+**refuses while any is unmet**, listing each; `--skip-preflight` approves anyway
+with an audited manifest warning. Each implement phase (`preconditions_from:
+plan`) re-resolves the plan-level items plus its own before the builder
+launches; an unmet item fails the step as a re-runnable precondition (nothing
+invoked, no tokens spent) and a plain `gauntlet resume` re-checks. `gauntlet
+status` on a parked plan gate lists unmet `path`/`env` items read-only. An `env` value is only ever tested for presence and
+never written anywhere.
 
 ### CLI observability
 
@@ -421,6 +528,25 @@ builder then emits one of three outcomes:
   (FR-10.4), then resume again with a decision that no longer contradicts it.
 - **Re-parks for clarification** — the decision was ambiguous; the builder names
   what it still needs. Supply another `--response`.
+
+**Ratifying the artifacts as they stand.** When your decision is simply "the
+PRD/plan as written (including any sanctioned hand-edit) are the approved
+artifacts — proceed", use the structured form instead of prose (#134):
+
+```sh
+gauntlet resume <slug> --accept-artifacts
+```
+
+It records the sha256 of each governed artifact on the authoring surface
+(`<run_root>/<slug>/prd.md`, `plan.md`) as ratified, appends an engine-generated
+response naming those digests, and re-drives with `proceed_in_place` — no prose
+is classified and no disposition model runs, so acceptance wording that happens
+to contain imperative verbs can never be re-parked as an amendment request. A
+digest that differs from the run's last-known approved one (a prior
+ratification, else the bytes committed on the run branch) is recorded and
+printed **loudly**, never refused: manual governed-artifact edits are a
+sanctioned recovery workflow. Mutually exclusive with `--response`; only valid
+for a `parked_for_response` park.
 
 Notes:
 
@@ -530,6 +656,16 @@ resume_on_quota: notify      # notify (default) | auto — self-resume a
                              #   external scheduler re-invoking `resume`)
 keep_awake: true             # default; wraps the driver in `caffeinate -i`
                              #   (darwin) — false lets the host sleep mid-run
+resume_on_provider_unavailable: notify
+                             # notify (default) | auto — self-resume a
+                             #   provider_unavailable park (bounded dependency
+                             #   retries exhausted) at its recorded backoff /
+                             #   Retry-After deadline; the same in-process wait,
+                             #   survival requirement and attempt ceiling as
+                             #   resume_on_quota (no provider health probe —
+                             #   the deadline is the only signal)
+max_auto_resume_attempts: 3  # spaced auto-resume attempts shared by both
+                             #   `auto` knobs before the park is left plain
 heartbeat_interval_s: 15     # driver heartbeat cadence (suspend detection)
 suspend_credit_cap_s: 43200  # max slept time credited back to a step deadline
 checkpoint_commits: keep     # keep | squash — builders' intra-phase `PN wip:`
@@ -641,6 +777,10 @@ contract suite, which requires authenticated CLIs and API keys.
 - **A run parks unexpectedly / a step is `failed`** — `gauntlet status <slug>`
   shows where; the step's transcript under `.gauntlet/runs/<slug>/<run>/steps/` has the
   detail. `gauntlet resume <slug>` re-enters safely once the cause is cleared.
+  A failed `shell` step with an `on_fail` route (the standard pipeline's
+  `tests` / `tests-recheck`) whose retry budget is spent needs no git surgery:
+  each plain `gauntlet resume <slug>` re-arms exactly one more route, audited
+  as a manifest warning.
 - **An agent hits a provider session/usage limit mid-step** — the engine fails
   the step closed (it does not fake success). Wait for the limit to reset, then
   `gauntlet resume <slug>`.

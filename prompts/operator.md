@@ -33,6 +33,9 @@ behind that output. Drive every decision off the reported state class:
   only (`status`, `logs`). Do **not** resume or recover a healthy run.
 - **`orphaned`** — the manifest says running but the driver is dead or its PID was
   recycled; the drive lock is reclaimable. Action: `gauntlet resume <slug>`.
+  No decision is at stake, so this is one of the two actions `gauntlet sweep`
+  takes unattended (the other: firing a due `scheduled_resume`); a console or
+  a cron/launchd sweep may already have reclaimed it — check `status` first.
 - **`indeterminate`** — liveness cannot be proven either way (an unparseable,
   unverifiable, or foreign-host lock; an unsupported platform). Action:
   **read-only inspection only** (`logs`, `status --json`) — never a mutating verb.
@@ -42,7 +45,11 @@ behind that output. Drive every decision off the reported state class:
   (reject feeds the note back into the upstream review cycle as a new round — see §3).
 - **`parked_for_response`** — the run is awaiting `resume --response`: a builder
   `UPSTREAM CONFLICT` or a review-cycle escalation its own loop could not settle.
-  Action: `gauntlet resume <slug> --response "<decision>"`.
+  Action: `gauntlet resume <slug> --response "<decision>"` for a genuine
+  decision, or `gauntlet resume <slug> --accept-artifacts` when the decision is
+  "the PRD/plan as they stand are approved — proceed" (#134): the structured
+  form records the artifact digests and re-drives as proceed_in_place with no
+  prose classification, so it can never be re-parked as an amendment request.
 - **`parked_usage_limit`** — a provider usage limit interrupted an agent (or a
   cycle sub-agent) mid-step. This is a pause, not a failure: the worktree is
   untouched and the agent's session id is preserved. Action: plain `gauntlet
@@ -61,7 +68,10 @@ behind that output. Drive every decision off the reported state class:
   never reset it). This is infrastructure, not content: no decision is at
   stake. Action: plain `gauntlet resume <slug>` after the retry deadline
   `status` prints — **never** `--response` (retry intent is not a human
-  decision). For a cycle fan-out, completed sub-steps and per-finding leaves
+  decision). With `resume_on_provider_unavailable: auto` configured, the live
+  driver self-resumes at that deadline (bounded attempts; `status` prints the
+  armed schedule) — check `status` before assuming you must act.
+  For a cycle fan-out, completed sub-steps and per-finding leaves
   are checkpointed; the resume retries only the incomplete work, and
   `gauntlet logs <slug>` points at the failing leaf's own evidence.
 - **`parked_artifact_invalid`** — an agent-authored structured artifact (e.g.
@@ -205,6 +215,8 @@ Work top-down; stop at the first branch that matches.
 
 1. **Run `gauntlet status <slug>`** (or `--json` if you are scripting). Read the
    `state` line and the driver-liveness line. Everything below keys off them.
+   (Before the first triage of a session, arm detection per §2a; when you act
+   as an agent, the §2a decision matrix is the authority you carry.)
 2. **Is it parked?** `parked_gate` → decide the gate (§3). `parked_for_response`
    → supply the response (§3). A gate decision is the only routine pause; make it
    deliberately, never reflexively.
@@ -233,6 +245,48 @@ Work top-down; stop at the first branch that matches.
 5. **Terminal?** `done` / `aborted` → nothing to do. `unknown` → inspect
    read-only and escalate; never apply a mutating verb to a state the tool itself
    could not classify.
+
+## 2a. Standing-operator mode (arm this before you triage anything)
+
+Issue #134 measured where a run's wall-clock goes: not into agent compute but
+into **park latency** — a run sitting parked or failed until someone notices.
+The single largest lever is detection, so a standing operator arms detection
+first and only then triages:
+
+1. **Let the driver page you.** The driver pushes every park / halt / failure /
+   gate / completion itself (desktop, Slack, generic webhook) — configure the
+   `notify:` block once in `.gauntlet/config.yaml`; no console needs to be
+   running. `gauntlet run --watch` / `gauntlet serve` add the in-tab channel and
+   the gate evidence page on top.
+2. **Let the engine take the no-decision actions.** `resume_on_quota: auto` and
+   `resume_on_provider_unavailable: auto` self-resume a usage-limit or provider
+   outage park at its recorded deadline; `keep_awake` (default on) stops host
+   sleep from parking a run; `gauntlet sweep --all` on a cron/launchd cadence
+   (or the console's timer) reclaims an orphaned driver and fires a due
+   schedule. None of these takes a decision a human owns.
+3. **Preflight what a phase will need.** The plan gate refuses approval while a
+   declared `preconditions:` item (data file or env var) is
+   unmet, so a phase never parks mid-run on something discoverable up front.
+
+**Pre-authorized decision matrix.** When you operate as an agent, this is the
+authority you carry by default — stated here so no session has to be granted it
+in ad-hoc prose, and so you never exceed it:
+
+| Park / state | Resolve autonomously | Page the human |
+|---|---|---|
+| `orphaned` (driver proven dead) | plain `resume` (or the sweep does it) | — |
+| `parked_usage_limit`, `parked_provider_unavailable`, `parked_usage_window` | plain `resume` after the deadline `status` prints | if the same park repeats past the auto-resume ceiling |
+| `failed` shell step with an `on_fail` route, budget spent | plain `resume` re-arms one route (audited) | after the second identical re-failure — the cause is not transient |
+| `failed` / `halted` for any other reason, `interrupted` | read `logs`; a plain `resume` when the cause is clearly fixed | anything that needs judgment, or `--reset-interrupted` |
+| `parked_gate` | never | always — a human ratifies |
+| `parked_for_response` | never | always; offer the exact `--response` or `--accept-artifacts` line |
+| `parked_artifact_invalid` | never edit the artifact yourself | always, with the validator's diagnostic |
+| `indeterminate`, `unknown` | read-only inspection only | always |
+| `done`, `aborted` | nothing | report |
+
+The rule behind the table: the engine already prints the exact command for
+every no-decision park; typing it is not a decision. Everything that changes an
+approved artifact, ratifies a gate, or interprets a conflict is.
 
 ## 3. Gates and responses (the routine pauses)
 
@@ -268,7 +322,12 @@ own worktree off the branch's tip — never adopt or edit the run's.
   the judge like `approve`.
 - **Respond** to a `parked_for_response` park with the human's decision:
   `gauntlet resume <slug> --response "<decision>"`. The text is passed verbatim
-  to the agent that re-evaluates the conflict; be specific.
+  to the agent that re-evaluates the conflict; be specific. **Phrasing trap:**
+  a response that *states* acceptance but contains imperative verbs ("record
+  these digests…", "implement it as written") is routinely classified
+  `amendment_required` and re-parked. For pure acceptance use
+  `--accept-artifacts` instead; keep `--response` for decisions that change
+  something.
 
 ## 4. Recovery (the wedged live driver)
 
@@ -372,6 +431,70 @@ defeats the safety the pipeline is built on.
   resume <slug>` rebuilds the tree and verifies its HEAD against the state the
   run recorded. Uncommitted work in the tree at that instant is the one thing
   that does not survive.
+
+## 6a. Trap catalog — recurring parks and their exact response
+
+Each of these cost at least one full park round-trip on a real run before it
+was catalogued (#134). Most now have an engine fix; the entry says what is
+left for you.
+
+- **Triage `target_artifact` misencoding → spurious FR-10.4 escalation.** A
+  triager names the artifact under review (or a descriptive phrase) as the
+  upstream target. The engine now clears those two shapes with an audit note
+  in `reasoning`. What still parks, correctly: a verdict that names a genuinely
+  *other* artifact file. If that is itself a misencoding, respond with
+  `--response "F-00N targets no upstream artifact; re-triage with
+  target_artifact null"`.
+- **Acceptance phrasing re-parked as an amendment.** A `--response` that
+  *states* acceptance but contains imperative verbs ("record these digests…",
+  "implement it as written") is classified `amendment_required`. For pure
+  acceptance use `gauntlet resume <slug> --accept-artifacts` (records the
+  artifact digests, proceeds with no prose classification). Keep `--response`
+  for decisions that change something.
+- **`phase-commit` fails "clean worktree, nothing to commit".** The builder's
+  `P<N> wip:` checkpoints sit beneath an adopted commit. The engine now lands
+  the empty `P<N>:` marker itself and preserves the full phase review range.
+  If it still fails, inspect the failure and commit history: missing checkpoints,
+  a wrong phase prefix, or an unprovable run boundary are distinct causes.
+  Do not manufacture a marker for work that has not been completed. Only after
+  verifying the completed phase work in committed history and obtaining human
+  authorization for a manual marker, run in the run worktree on the run branch:
+  `git commit --allow-empty -m "P<N>: <title>" -m "<what changed, why, and relevant FR references>"`,
+  then plain `resume`. Include a substantive body; the empty marker itself is
+  not evidence that the phase is complete.
+- **Commit-message drafter fails on every model.** Oversize changes use git
+  references for repository-capable drafters and bounded inline diff excerpts
+  for tool-less API drafters. Draft headers should stay within 72 characters;
+  the validator allows up to 100, including the phase prefix. Invalid drafts
+  fail after bounded retries; the engine does not substitute a plan title.
+  `gauntlet resume <slug> --response '<full commit message>'` uses your text
+  **verbatim** (no model call) when valid: `P<N>: <header>`, blank line, and a
+  substantive body. Check the actual changes before writing the message.
+- **Failed `tests` step, budget spent, resume refuses "no progress".** A plain
+  `resume` now re-arms exactly one more `on_fail` route per human action
+  (audited warning `operator resume re-armed on_fail …`). Never cherry-pick
+  fixes around the pipeline; if the route fails twice, the cause is real —
+  read `logs`.
+- **A phase parks mid-run on a missing data file / env var / provisioning.**
+  Before plan approval, declare required paths and environment variable names
+  in `preconditions:` and provision them separately. Command items are rejected.
+  The gate refuses while checks are unmet; `status` lists them. If the plan is
+  already approved, surface missing requirements through the plan loop.
+- **Provider outage or usage limit parks, hours of latency.** Set the auto
+  knobs (§2a); until then, the deadline `status` prints is the moment to
+  `resume` — never `--response`. An `orphaned` run after a host sleep or a
+  wedge is reclaimed by a plain `resume` or the sweep.
+- **A verb run from inside the run worktree.** The CLI refuses and names
+  where to stand: every verb runs from the operator's checkout; the run
+  worktree is `.gauntlet/worktrees/<slug>/<run-id>` (`status --json` →
+  `worktree.path`). Never `git checkout gauntlet/<slug>` (git refuses while the
+  run holds it); read the branch with `git log`/`git diff`/`git show`.
+- **`git clean -xdff` deleted the run worktree.** Recoverable: the branch and
+  the journal survive; `gauntlet resume <slug>` rebuilds the tree. Uncommitted
+  work in the tree at that instant is lost.
+- **Stale driver after an engine/schema self-modification.** A long-lived
+  driver runs in-memory code against on-disk artifacts its own phases changed.
+  Resume with a fresh driver process; never hand-edit artifacts to compensate.
 
 ## 7. Operating a `gauntlet review` run (the lightweight surface)
 

@@ -13,6 +13,7 @@ import contextlib
 import getpass
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -3152,7 +3153,8 @@ class RunManager:
         # Auto-resume runs OUTSIDE the lock (each attempt re-acquires it via
         # `_resume_once`) so the wait between attempts holds no worktree lock —
         # matching the reconciliation model (FR-3.4). A no-op unless the run
-        # parked on a usage limit under `resume_on_quota: auto`.
+        # parked on a usage limit under `resume_on_quota: auto` or on a
+        # dependency failure under `resume_on_provider_unavailable: auto` (#134).
         return self._auto_resume_if_scheduled(
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock,
@@ -3163,24 +3165,28 @@ class RunManager:
                use_judge: bool = True, adapter_factory=None,
                extra_context: dict | None = None, clock=None,
                auto_sleep=None, reset_interrupted: bool = False,
-               same_tree: bool = False) -> str:
-        """One resume, then in-process auto-resume of a usage-limit park (FR-3.4).
+               same_tree: bool = False, accept_artifacts: bool = False) -> str:
+        """One resume, then in-process auto-resume of a usage-limit or
+        provider-unavailable park (FR-3.4 / #134).
 
         A manual resume always continues the session once immediately (the
         "manual override resumes now" branch): that is ``_resume_once``. If the
-        run re-parks on the usage limit under ``resume_on_quota: auto``, the live
-        driver waits until the projected reset and resumes again, bounded by
-        ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
+        run re-parks on the usage limit under ``resume_on_quota: auto`` (or on a
+        dependency failure under ``resume_on_provider_unavailable: auto``), the
+        live driver waits until the recorded deadline and resumes again, bounded
+        by ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
         ``notify`` mode the wrapper is a no-op.
         """
         # R5 (plan §4.5): fingerprint the persisted state before and after the
         # whole verb — an unchanged repeat that is not a legitimate live wait
         # raises NoProgressError (nonzero) instead of exiting 0 re-parked.
         before = self._capture_progress(slug)
+        self._rearmed_route = False
         status = self._resume_once(
             slug, response=response, use_judge=use_judge,
             adapter_factory=adapter_factory, extra_context=extra_context, clock=clock,
             reset_interrupted=reset_interrupted, same_tree=same_tree,
+            accept_artifacts=accept_artifacts,
         )
         # NOTE: reset_interrupted is deliberately NOT forwarded to the
         # auto-resume continuation — it is a one-shot operator decision for
@@ -3194,14 +3200,21 @@ class RunManager:
             slug, status, use_judge=use_judge, adapter_factory=adapter_factory,
             extra_context=extra_context, clock=clock, sleep=auto_sleep,
         )
-        self._require_progress_after(slug, before, verb="resume")
+        # #134: a resume that re-armed an exhausted on_fail route re-ran the
+        # route target (real work, a human action) even when the step then
+        # failed identically — the fingerprint ignores the attempts counter by
+        # design, so without this the re-arm would read as a no-op repeat. The
+        # audited re-arm warning is the evidence; the FAILED status is loud.
+        if not getattr(self, "_rearmed_route", False):
+            self._require_progress_after(slug, before, verb="resume")
         return status
 
     def _resume_once(self, slug: str, *, response: str | None = None,
                      use_judge: bool = True, adapter_factory=None,
                      extra_context: dict | None = None, clock=None,
                      reset_interrupted: bool = False,
-                     same_tree: bool = False) -> str:
+                     same_tree: bool = False,
+                     accept_artifacts: bool = False) -> str:
         layout = self.layout(slug)
         self._ensure_slug_gitignore(layout)  # idempotent (#33; old runs too)
         run_dir = layout.active_run_dir()
@@ -3258,6 +3271,7 @@ class RunManager:
                     response=response, use_judge=use_judge,
                     adapter_factory=adapter_factory, extra_context=extra_context,
                     clock=clock, reset_interrupted=reset_interrupted,
+                    accept_artifacts=accept_artifacts,
                 )
         finally:
             self._release_worktree_lock(handle)
@@ -3306,6 +3320,7 @@ class RunManager:
         self, layout: "RunLayout", run_dir: Path, man: Manifest, paths: RunPaths,
         *, response: str | None, use_judge: bool, adapter_factory,
         extra_context: dict | None, clock, reset_interrupted: bool,
+        accept_artifacts: bool = False,
     ) -> str:
         """The body of one resume, with the drive lock held and roots resolved."""
         # P3 (plan §4.3): a recovery transaction killed between its intent
@@ -3381,11 +3396,18 @@ class RunManager:
         # Plain resume only (R7: retry intent is not a human decision).
         if response is None:
             self._reclassify_clean_shell_failure(layout, run_dir, man)
+            # #134: a shell step whose `on_fail` budget is spent re-arms ONE
+            # more route per plain resume (a human action), instead of
+            # re-running the same failing command into the R5 refusal.
+            self._rearm_exhausted_shell_route(run_dir, man, pipeline)
         # Plan the --response transition (FR-1/FR-1.1/FR-8/FR-9 guards +
         # FR-7.1 idempotent recovery). All validation and operator-identity
         # resolution happen HERE, before driving; the orchestrator only
         # applies an already-validated, fail-closed decision.
-        action = self._plan_response_action(man, response, pipeline)
+        action = self._plan_response_action(
+            man, response, pipeline, accept_artifacts=accept_artifacts,
+            layout=layout,
+        )
         return self._drive(
             layout, run_dir, pipeline, man,
             use_judge=use_judge, adapter_factory=adapter_factory,
@@ -3393,6 +3415,67 @@ class RunManager:
             response_action=action,
             interrupted_override="reset_to_base" if reset_interrupted else None,
         )
+
+    REARM_WARNING_PREFIX = "operator resume re-armed on_fail for"
+
+    def _rearm_exhausted_shell_route(
+        self, run_dir: Path, man: Manifest, pipeline
+    ) -> None:
+        """Re-arm one more ``on_fail`` route on an exhausted shell step (#134).
+
+        The orchestrator routes a failed shell step (``tests`` → ``implement``)
+        while ``attempts <= max_retries``; once the budget is spent the step
+        surfaces FAILED, a plain resume re-runs the SAME command, it fails
+        identically, and the R5 guard refuses "no progress" — so operators
+        reached for git surgery instead of the route the pipeline declares.
+
+        A plain ``gauntlet resume`` is an explicit human action, so it re-arms
+        exactly one more route: the same reset the in-budget path uses
+        (:meth:`Orchestrator.reset_records_for_retry` — route target and
+        everything after it pending, ``base_sha`` and stale cycle checkpoints
+        cleared), an audited manifest warning counting the re-arm, and the
+        drive proceeds from the route target. The persisted ``attempts``
+        counter is NOT reset, so the next failure exhausts again and the next
+        plain resume re-arms again (``re-arm #k``) — one route per human
+        action, never an unbounded loop. Steps without ``on_fail``, a step
+        still inside its budget (the orchestrator routes it itself), and a
+        step with a pending ``--response`` are left alone.
+        """
+        from gauntlet.engine.orchestrator import Orchestrator
+
+        if man.status != M.RUN_FAILED:
+            return
+        failed = self._failed_step(man)
+        if failed is None or failed.type != "shell":
+            return
+        if failed.human_responses and (
+            failed.human_responses[-1].state == M.RESPONSE_PENDING
+        ):
+            return
+        stage = step = None
+        for st in pipeline.stages:
+            for s in st.steps:
+                if s.id == failed.id:
+                    stage, step = st, s
+                    break
+            if step is not None:
+                break
+        if step is None or step.on_fail is None:
+            return
+        if failed.attempts <= step.on_fail.max_retries:
+            return  # budget not spent: the orchestrator's own routing applies
+        route_to = step.on_fail.route_to
+        self._rearmed_route = True  # R5: this verb did real work (see resume())
+        prefix = f"{self.REARM_WARNING_PREFIX} '{failed.id}'"
+        k = 1 + sum(1 for w in man.warnings if w.startswith(prefix))
+        Orchestrator.reset_records_for_retry(man, stage, route_to, failed.iteration)
+        man.warnings.append(
+            f"{prefix} (route_to={route_to}, re-arm #{k}): the retry budget "
+            f"(max_retries={step.on_fail.max_retries}) was spent after "
+            f"{failed.attempts} failure(s); this plain resume routes once more "
+            "(#134)"
+        )
+        man.write_atomic(run_dir / "manifest.json")
 
     def _reclassify_clean_shell_failure(
         self, layout: "RunLayout", run_dir: Path, man: Manifest
@@ -3712,18 +3795,47 @@ class RunManager:
             return ""
         return " Safe actions: " + "; ".join(f"`{c}`" for c in commands)
 
-    @staticmethod
-    def _parked_usage_limit_step(man: Manifest) -> "M.StepRecord | None":
-        """The scheduled-resume-armed usage-limit park, or ``None`` (shared find)."""
-        return next(
-            (
-                s for s in man.steps
-                if s.status == M.PARKED
-                and s.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-                and s.scheduled_resume is not None
-            ),
-            None,
-        )
+    # Park reasons whose armed schedule the in-process wait loop honors, mapped
+    # to the RunConfig knob that must read ``auto`` for the loop to act (#134).
+    _AUTO_RESUME_KNOB_BY_REASON = {
+        M.PARKED_REASON_USAGE_LIMIT: "resume_on_quota",
+        M.PARKED_REASON_PROVIDER_UNAVAILABLE: "resume_on_provider_unavailable",
+    }
+
+    def _auto_resume_enabled_for(self, reason: str | None) -> bool:
+        """Whether the knob governing *reason* currently reads ``auto``.
+
+        Consulted on EVERY pass of the wait loop (not once at entry) so a knob
+        flipped back to ``notify`` on the live ``RunManager`` config stops the
+        loop at its next decision instead of driving one more resume.
+        """
+        knob = self._AUTO_RESUME_KNOB_BY_REASON.get(reason or "")
+        return knob is not None and getattr(self.config, knob) == RESUME_ON_QUOTA_AUTO
+
+    def _parked_auto_resume_step(self, man: Manifest) -> "M.StepRecord | None":
+        """The scheduled-resume-armed usage-limit / provider-unavailable park whose
+        governing knob is ``auto``, or ``None`` (shared find, FR-3.4 / #134).
+
+        A schedule stamped with a ``reason`` is matched against the step's own
+        park reason (a stale stamp from a different episode never routes the
+        wrong knob); an unstamped schedule (pre-#134 manifest) is read as the
+        step's park reason. A parked step whose knob is now ``notify`` is not
+        returned — its schedule stays on disk (a manual resume reconciles it)
+        but the live loop leaves it alone.
+        """
+        for s in man.steps:
+            if s.status != M.PARKED or s.scheduled_resume is None:
+                continue
+            reason = M.normalize_parked_reason(s.parked_reason, s.type, s.status)
+            if reason not in self._AUTO_RESUME_KNOB_BY_REASON:
+                continue
+            stamped = s.scheduled_resume.reason
+            if stamped is not None and stamped != reason:
+                continue
+            if not self._auto_resume_enabled_for(reason):
+                continue
+            return s
+        return None
 
     @contextlib.contextmanager
     def _auto_resume_wait_context(self, run_dir: Path):
@@ -3759,7 +3871,7 @@ class RunManager:
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
-            step = self._parked_usage_limit_step(man)
+            step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return False
             if step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts:
@@ -3779,14 +3891,20 @@ class RunManager:
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
             man = Manifest.load(run_dir / "manifest.json")
-            step = self._parked_usage_limit_step(man)
+            step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return
+            reason = M.normalize_parked_reason(step.parked_reason, step.type, step.status)
             step.scheduled_resume = None
+            clears = (
+                "the provider recovers"
+                if reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+                else "the window clears"
+            )
             note = (
                 f"auto-resume exhausted after {self.config.max_auto_resume_attempts} "
-                "attempts (FR-3.4); left as a plain usage_limit park — resume "
-                "manually once the window clears, or abort"
+                f"attempts (FR-3.4); left as a plain {reason} park — resume "
+                f"manually once {clears}, or abort"
             )
             step.notes = f"{step.notes}\n{note}" if step.notes else note
             man.write_atomic(run_dir / "manifest.json")
@@ -3797,9 +3915,16 @@ class RunManager:
         self, slug: str, status: str, *, use_judge: bool, adapter_factory,
         extra_context: dict | None, clock, sleep=None, wait_context=None,
     ) -> str:
-        """Drive the in-process auto-resume wait loop for a usage-limit park (FR-3.4).
+        """Drive the in-process auto-resume wait loop for a usage-limit or
+        provider-unavailable park (FR-3.4; generalized by #134).
 
-        A no-op unless ``resume_on_quota: auto``. Reads the parked step's
+        A no-op unless ``resume_on_quota: auto`` or
+        ``resume_on_provider_unavailable: auto`` — each governs only its own park
+        reason, re-read every pass (:meth:`_parked_auto_resume_step`). A
+        provider_unavailable continuation is the same plain ``_resume_once`` an
+        operator would run: the orchestrator starts a fresh dependency-retry
+        episode (``dependency_attempts`` reset, plan §5.2) and re-parks with a
+        new backoff deadline if the provider is still down. Reads the parked step's
         ``scheduled_resume`` (armed by the orchestrator at park time), and on each
         pass either waits for the projected reset (suspend-aware: sleeps in bounded
         polls and re-checks the wall clock), performs one continuation resume
@@ -3815,7 +3940,7 @@ class RunManager:
         manifest mutations (attempt increment, exhaustion note) happen under the
         worktree lock (F-005) so they never clobber a concurrent manual resume.
         """
-        if self.config.resume_on_quota != RESUME_ON_QUOTA_AUTO:
+        if not self.config.any_auto_resume:
             return status
         _sleep = sleep or time.sleep
         _wait_ctx = wait_context or self._auto_resume_wait_context
@@ -3830,7 +3955,7 @@ class RunManager:
                     return status
                 if man.status != M.RUN_PARKED:
                     return status
-                step = self._parked_usage_limit_step(man)
+                step = self._parked_auto_resume_step(man)
                 if step is None:
                     return status
                 now = self._auto_resume_now(clock)
@@ -3884,7 +4009,8 @@ class RunManager:
         return datetime.now(timezone.utc)
 
     def _plan_response_action(
-        self, man: Manifest, response: str | None, pipeline=None
+        self, man: Manifest, response: str | None, pipeline=None, *,
+        accept_artifacts: bool = False, layout=None,
     ) -> ResponseAction:
         """Validate `gauntlet resume [--response]` and decide the transition.
 
@@ -3910,6 +4036,12 @@ class RunManager:
             )
 
         # No pending entry.
+        if accept_artifacts:
+            if response is not None:
+                raise ValueError(
+                    "--accept-artifacts and --response are mutually exclusive"
+                )
+            return self._plan_accept_artifacts(man, layout)
         if response is None:
             # FR-1.1 / FR-10.4: a response-resolvable park REQUIRES --response —
             # the builder's UPSTREAM CONFLICT (agent_task) AND a reviewer-surfaced
@@ -4019,6 +4151,66 @@ class RunManager:
             text=response, user=user,
         )
 
+    def _plan_accept_artifacts(self, man: Manifest, layout) -> ResponseAction:
+        """Plan a `resume --accept-artifacts` ratification (#134, rec. 3).
+
+        Valid ONLY for a run parked awaiting a decision (``parked_for_response``
+        on a respondable step): the operator states that the governed
+        artifacts as they stand on the authoring surface (the slug dir in the
+        operator's checkout) ARE the approved artifacts. The digests are
+        computed here; the orchestrator persists them beside the response
+        entry. The drift audit compares against the run's last-known approved
+        digest — a prior ratification, else the bytes committed on the run
+        branch — and a difference is recorded loudly (manifest warning), never
+        refused: manual governed-artifact edits are a sanctioned recovery
+        workflow (R9).
+        """
+        from gauntlet.engine import ratification as RT
+
+        parked = self._parked_step(man)
+        reason = (
+            M.normalize_parked_reason(parked.parked_reason, parked.type, parked.status)
+            if parked is not None else None
+        )
+        if (
+            man.status != M.RUN_PARKED
+            or parked is None
+            or reason not in M.RESPONSE_RESOLVABLE_PARK_REASONS
+            or parked.type not in M.RESPONDABLE_STEP_TYPES
+        ):
+            raise ValueError(
+                "--accept-artifacts applies only to a run parked awaiting a "
+                "decision (parked_for_response on an agent_task / "
+                "adversarial_cycle step); this run is "
+                f"{man.status}" + (
+                    f" at step '{parked.id}' ({parked.type}, "
+                    f"{reason or 'no park reason'})" if parked is not None else ""
+                ) + ". Use --response, approve/reject, or a plain resume as "
+                "the state requires."
+            )
+        layout = layout or self.layout(man.slug)
+        known: dict[str, str] = {}
+        for entry in man.ratified_artifacts:  # latest per name wins
+            known[entry.name] = entry.sha256
+        for name in RT.GOVERNED_ARTIFACT_NAMES:
+            if name in known:
+                continue
+            relpath = str(Path(self.config.run_root) / man.slug / name)
+            try:
+                committed = gitops.file_bytes_at_commit(self.repo_root, man.branch, relpath)
+            except gitops.GitError:
+                committed = None
+            if committed is not None:
+                known[name] = RT.digest_bytes(committed)
+        plan = RT.plan_ratification(layout.slug_dir, known=known)
+        user = resolve_operator_identity(self.repo_root)
+        return ResponseAction(
+            kind="append", step_id=parked.id, iteration=parked.iteration,
+            text=plan.text, user=user,
+            response_kind=M.RESPONSE_KIND_ACCEPT_ARTIFACTS,
+            ratified=tuple(plan.digests),
+        )
+
     @staticmethod
     def _step_with_pending_response(man: Manifest):
         """The step whose latest `--response` entry is still `pending`, if any.
@@ -4066,7 +4258,8 @@ class RunManager:
 
     # ---- gates --------------------------------------------------------------
     def approve(self, slug: str, gate: str | None = None, notes: str | None = None,
-                *, use_judge: bool = True, adapter_factory=None) -> str:
+                *, use_judge: bool = True, adapter_factory=None,
+                skip_preflight: bool = False) -> str:
         explicit_gate = gate
         layout = self.layout(slug)
         run_dir = layout.active_run_dir()
@@ -4095,6 +4288,13 @@ class RunManager:
                 if gate is None:
                     raise ValueError("no gate to approve; run is not parked")
                 pipeline, _ = load_pipeline(run_dir / "pipeline.yaml")
+                # #134: a gate declaring `preflight: plan_preconditions` checks
+                # every precondition the plan declares BEFORE approval lands.
+                gate_step = self._pipeline_step(pipeline, gate)
+                if gate_step is not None and gate_step.get("preflight") is not None:
+                    self._plan_gate_preflight(
+                        layout, run_dir, man, gate_step, skip=skip_preflight
+                    )
                 # Approving a gate drives the rest of the run, so honor use_judge.
                 if use_judge:
                     return self._with_judge(man, run_dir, lambda env: self._approve_drive(
@@ -4102,10 +4302,69 @@ class RunManager:
                 orch = self._orchestrator(layout, run_dir, pipeline, man,
                                           judge_env={}, adapter_factory=adapter_factory)
                 status = orch.approve_gate(gate, notes)
-                self._maybe_draft_pr(layout, run_dir, man, status)
+                self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
+
+    def _plan_gate_preflight(
+        self, layout, run_dir: Path, man: Manifest, gate_step, *, skip: bool
+    ) -> None:
+        """Resolve the plan's declared preconditions at the plan gate (#134).
+
+        Walks plan-level and every phase's items against the run worktree and
+        the live environment (commands run, output persisted under
+        ``<run_dir>/preflight/``). Any unmet item refuses the approval — the
+        gate stays parked, nothing is stamped — naming each item and the
+        ``--skip-preflight`` escape, which approves anyway with an audited
+        manifest warning listing what was skipped.
+        """
+        import os
+
+        from gauntlet.engine import preconditions as PC
+        from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+
+        if gate_step.get("preflight") != PC.PREFLIGHT_PLAN_PRECONDITIONS:
+            raise ValueError(
+                f"gate {gate_step.id!r} declares unknown preflight "
+                f"{gate_step.get('preflight')!r}"
+            )
+        plan_path = layout.slug_dir / "plan.md"
+        try:
+            spec = load_plan_spec(plan_path)
+        except PlanPhasesError as exc:
+            raise ValueError(f"plan preflight: {plan_path} is not readable: {exc}")
+        if spec is None:
+            return
+        items = spec.all_preconditions()
+        if not items:
+            return
+        log_dir = run_dir / "preflight"
+        unmet = PC.resolve_preconditions(
+            items, cwd=self.work_root, env=os.environ,
+        )
+        try:
+            self.writer.write_text(log_dir / "preflight.txt", PC.render_checklist(items, unmet))
+        except OSError:
+            pass
+        if not unmet:
+            return
+        listed = "\n".join(f"  - {u.render()}" for u in unmet)
+        if skip:
+            note = (
+                f"plan gate {gate_step.id!r} approved with --skip-preflight; "
+                f"{len(unmet)} unmet precondition(s) (#134):\n{listed}"
+            )
+            if note not in man.warnings:
+                man.warnings.append(note)
+            man.write_atomic(run_dir / "manifest.json")
+            return
+        raise ValueError(
+            f"plan preflight: {len(unmet)} unmet precondition(s) — the gate stays "
+            f"parked, nothing approved (#134):\n{listed}\nSatisfy them and "
+            f"approve again, or `gauntlet approve {man.slug} --skip-preflight` "
+            "to approve anyway (recorded as a manifest warning)."
+        )
 
     def reject(self, slug: str, notes: str, gate: str | None = None,
                *, use_judge: bool = True, allow_terminal: bool = False,
@@ -4148,7 +4407,7 @@ class RunManager:
                                           adapter_factory=adapter_factory)
                 status = orch.reject_gate(gate, notes, user,
                                           allow_terminal=allow_terminal)
-                self._maybe_draft_pr(layout, run_dir, man, status)
+                self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
             self._release_worktree_lock(handle)
@@ -4158,7 +4417,7 @@ class RunManager:
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
         status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     # ---- abort --------------------------------------------------------------
@@ -4849,45 +5108,49 @@ class RunManager:
             # A live driver owns the projection; its own write lands next.
             return
         try:
-            outcome = J.reconcile_projection(
-                run_dir, validate=M.validate_projection_text
-            )
-            if outcome.rebuild_required:
-                planned = RX.projection_rebuild_assessment(
-                    self.repo_root, run_dir, slug=slug
-                )
-                if planned is None:
-                    raise J.JournalError(
-                        f"manifest projection under {run_dir} is "
-                        "missing/corrupt and no rebuild action could be "
-                        "planned; inspect the journal dir before retrying"
-                    )
-                assessment, action = planned
-                # The executor's own guard verifies (never reclaims) the
-                # lock — reclaim policy with its identity verification
-                # belongs here; the guard sees the lock as this process's.
-                RX.RecoveryExecutor(
-                    self.repo_root,
-                    run_dir,
-                    run_id=outcome.run_id or "unknown",
-                    run_root=self.config.run_root,
-                ).apply_rebuild(assessment, action)
-                return
-            if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_RESTORED):
-                # Loud, durable audit: the reconciliation notes land as
-                # manifest warnings through the normal journaled persist (a
-                # fresh transition — so the R5 fingerprint provably moves).
-                man = Manifest.load(run_dir / "manifest.json")
-                changed = False
-                for note in outcome.notes:
-                    warn = f"[projection] {note}"
-                    if warn not in man.warnings:
-                        man.warnings.append(warn)
-                        changed = True
-                if changed:
-                    man.write_atomic(run_dir / "manifest.json")
+            self._reconcile_projection_locked(run_dir, slug)
         finally:
             self._release_worktree_lock(handle)
+
+    def _reconcile_projection_locked(self, run_dir: Path, slug: str) -> None:
+        """Restore journal authority while the caller holds the drive lock."""
+        outcome = J.reconcile_projection(
+            run_dir, validate=M.validate_projection_text
+        )
+        if outcome.rebuild_required:
+            planned = RX.projection_rebuild_assessment(
+                self.repo_root, run_dir, slug=slug
+            )
+            if planned is None:
+                raise J.JournalError(
+                    f"manifest projection under {run_dir} is "
+                    "missing/corrupt and no rebuild action could be "
+                    "planned; inspect the journal dir before retrying"
+                )
+            assessment, action = planned
+            # The executor's own guard verifies (never reclaims) the
+            # lock — reclaim policy with its identity verification
+            # belongs here; the guard sees the lock as this process's.
+            RX.RecoveryExecutor(
+                self.repo_root,
+                run_dir,
+                run_id=outcome.run_id or "unknown",
+                run_root=self.config.run_root,
+            ).apply_rebuild(assessment, action)
+            return
+        if outcome.health in (J.HEALTH_CAUGHT_UP, J.HEALTH_RESTORED):
+            # Loud, durable audit: the reconciliation notes land as
+            # manifest warnings through the normal journaled persist (a
+            # fresh transition — so the R5 fingerprint provably moves).
+            man = Manifest.load(run_dir / "manifest.json")
+            changed = False
+            for note in outcome.notes:
+                warn = f"[projection] {note}"
+                if warn not in man.warnings:
+                    man.warnings.append(warn)
+                    changed = True
+            if changed:
+                man.write_atomic(run_dir / "manifest.json")
 
     def _reconcile_projection_safe(self, layout: "RunLayout") -> None:
         """Reconcile the projection when a run dir resolves; else skip (P6).
@@ -6811,7 +7074,7 @@ class RunManager:
                 # orchestrator is the sole in-drive manifest writer, so this drains
                 # only after driving stops — no concurrent write). Best-effort.
                 self._drain_suspensions(writer, man, run_dir)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     def _drain_suspensions(self, writer, man: Manifest, run_dir: Path) -> None:
@@ -6823,6 +7086,71 @@ class RunManager:
             M.Suspension(start=s.start, end=s.end, gap_s=s.gap_s) for s in intervals
         )
         man.write_atomic(run_dir / "manifest.json")
+
+    def _finish_drive(self, layout, run_dir, man, status: str) -> None:
+        """Everything that follows a drive stopping — on EVERY driving verb
+        (start / resume / auto-resume / approve / reject): draft PR.md at the
+        final-gate pass (FR-9.8), then push the persisted transition to the
+        operator (#134). The notification runs in ``finally`` so a PR-draft
+        failure (which re-raises by design) still announces the state the run
+        actually landed in; a notification can never affect run state.
+        """
+        try:
+            self._maybe_draft_pr(layout, run_dir, man, status)
+        finally:
+            self._notify_transition(layout, run_dir)
+
+    def _driver_notifier(self, layout, run_dir):
+        """The driver-side notifier for this run, or ``None`` when no channel is
+        configured / resolvable or ``GAUNTLET_NOTIFY_DISABLED`` is set (#134).
+
+        De-dups through the run's ``notifications.jsonl`` ledger (shared with a
+        watching console), honors the ``notify.kinds`` allowlist, and attaches
+        the rich gate evidence (diff stat, finding counts, spend, elapsed) to
+        a gate-reached notification. Read-only over the run's persisted state.
+        """
+        from gauntlet.engine import notify as N
+
+        if N.driver_notifications_disabled():
+            return None
+        cfg = self.config.notify
+        channels = N.build_channels(cfg)
+        if not channels:
+            return None
+
+        def summary_for(event, kind):
+            if kind != N.KIND_GATE:
+                return None
+            from gauntlet.engine.gate_evidence import gate_summary
+
+            man = Manifest.load(run_dir / "manifest.json")
+            return gate_summary(
+                man, run_dir=run_dir, slug_dir=layout.slug_dir, repo=self.repo_root,
+            )
+
+        return N.Notifier(
+            channels,
+            ledger_dir_for=lambda _event: run_dir,
+            by=N.EMITTER_DRIVER,
+            kinds=cfg.kinds,
+            summary_for=summary_for,
+        )
+
+    def _notify_transition(self, layout, run_dir) -> None:
+        """Classify the manifest as persisted on disk and emit (fail-soft)."""
+        from gauntlet.engine import notify as N
+
+        try:
+            notifier = self._driver_notifier(layout, run_dir)
+            if notifier is None:
+                return
+            man = Manifest.load(run_dir / "manifest.json")
+            N.emit_driver_notification(man, notifier=notifier)
+        except Exception:  # FR-9.3: never reach run state
+            logging.getLogger(__name__).warning(
+                "driver notification skipped for %s; run state unaffected",
+                run_dir, exc_info=True,
+            )
 
     def _maybe_draft_pr(self, layout, run_dir, man, status: str) -> None:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.
@@ -6940,7 +7268,7 @@ class RunManager:
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
         status = orch.approve_gate(gate, notes)
-        self._maybe_draft_pr(layout, run_dir, man, status)
+        self._finish_drive(layout, run_dir, man, status)
         return status
 
     def _orchestrator(self, layout, run_dir, pipeline, man, *, judge_env,

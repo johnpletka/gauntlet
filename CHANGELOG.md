@@ -56,6 +56,145 @@ All notable changes to Gauntlet are recorded here. The format follows
   fires only when it was set explicitly. `gauntlet doctor` gains a
   `keep-awake` check that warns (never fails) when the knob is off on darwin
   or `caffeinate` is not on PATH.
+- Scheduled auto-resume now covers **provider-unavailable parks**, not only
+  usage-limit ones (#134, rec. 1a). A new `resume_on_provider_unavailable`
+  knob (`notify` default | `auto`, validated exactly like `resume_on_quota`)
+  arms the same in-process wait loop on a `provider_unavailable` park, using
+  the backoff / Retry-After deadline the park already records; the two knobs
+  share `max_auto_resume_attempts` and the keep-awake / external-scheduler
+  survival warning, and each governs only its own park reason (a knob flipped
+  back to `notify` stops the loop at its next decision). Exhaustion leaves a
+  plain `provider_unavailable` park with the usual note. The manifest's
+  `scheduled_resume` gains an additive `reason` field recording which park
+  armed it, `status --json` exposes the armed schedule as a new always-present
+  nullable `scheduled_resume` object (`attempt_at`, `attempts`,
+  `max_attempts`, `reason`; schema_version stays 1), and the human `status`
+  footer prints `auto-resume scheduled at <iso> (attempt n/m, <reason>)`. No
+  provider health probe is attempted — the recorded deadline is the only
+  signal (fail-closed).
+- **Notifications are pushed by the driver itself** (#134, recs 6 and 10).
+  Every run transition that needs a human — gate reached, escalation, decision
+  park, usage-limit / provider-unavailable / usage-window / invalid-artifact
+  park, halt, failure, completion — is emitted the instant the driver persists
+  it, on every driving verb (`run`, `resume`, the in-process auto-resume,
+  `approve`, `reject`), to macOS desktop, a Slack incoming webhook and/or a new
+  generic JSON webhook (`notify.webhook_url` / `GAUNTLET_NOTIFY_WEBHOOK`).
+  Detection latency no longer depends on a resident `gauntlet serve`. The
+  channel primitives, kind table and classifier moved to
+  `gauntlet.engine.notify` (the console re-exports them); the classifier now
+  maps every park class by its persisted `parked_reason` and a halt to its own
+  `run-halted` kind. A gate-reached notification carries a pre-built review
+  bundle — `git diff --stat` of the reviewed range, finding/triage counts,
+  spend and elapsed time, and the exact next command — assembled read-only by
+  the new `gauntlet.engine.gate_evidence`. Successful channel deliveries are
+  acknowledged in `notifications.jsonl`, keyed by transition, phase iteration,
+  and park episode. Driver and console serialize sends per channel; a delivery
+  on one channel does not suppress another. Failed sends remain retryable. The
+  CLI waits up to 12 seconds for pending sends before exit. New engine `notify:` config block (`desktop`, `slack`,
+  `webhook`, `slack_webhook`, `webhook_url`, optional `kinds` allowlist;
+  defaults are safe no-ops); an absent `web.notify` inherits it.
+  `GAUNTLET_NOTIFY_DISABLED=1` is the driver-side kill switch.
+- **`gauntlet sweep`** — the unattended, judgment-free resume sweep (#134,
+  rec. 1b). A dead driver cannot self-resume, so a resident process (the
+  console's timer, or cron/launchd with `external_scheduler: true`) runs a
+  sweep that takes only the two actions the operator playbook already classes
+  as no-decision: reclaim an **orphaned** run whose drive lock proves the
+  driver dead or PID-reused, and fire a parked step's armed, **due**
+  `scheduled_resume` under the config knob that armed it. The decision is a
+  pure function of the same composite state `status` renders plus the lock
+  proof, the schedule and the config (table-tested, reason-agnostic); gates,
+  response parks, failures, indeterminate liveness, malformed locks, live
+  drivers and terminal runs are skipped with a one-line reason. Each action
+  re-verifies and stamps `unattended sweep resumed (<reason>) at <iso>` under
+  the drive lock (a schedule attempt is counted write-ahead), then goes
+  through the real `RunManager.resume` — in the foreground for one slug, or
+  as a detached `gauntlet resume <slug>` child (log in
+  `<run_dir>/sweep-resume.log`) with `--all`. `--json` emits one object per
+  run; exit 0 whether or not anything was resumed. `gauntlet serve` runs the
+  same sweep on `web.sweep_interval_s` (default 120 s; 0 disables),
+  launching console-owned drivers. README documents the cron/launchd recipe.
+### Fixed
+
+- `phase-commit` no longer fails "clean worktree, nothing to commit" when the
+  builder's `P<N> wip:` checkpoints sit beneath an adopted commit (#134,
+  rec. 4). The trailing-run checkpoint discovery stops at the first
+  non-checkpoint commit, so an operator pre-commit that `resume` adopted (or
+  an adopted fix round) hid every checkpoint beneath it; adoption had also
+  re-anchored `base_sha` at or past them. The operator's ritual was a
+  hand-made empty `P<N>:` marker plus `resume --response`. The step now takes
+  that path itself: with a clean tree and no trailing checkpoints it walks the
+  run's own history (`HEAD ^base_branch`, stopping at the previous phase's
+  handoff commit) for this phase's scoped checkpoints, lands the same empty
+  `P<N>:` marker listing them, notes how many adopted commits it sits over,
+  and restores `base_sha` to the oldest checkpoint's parent so the review range
+  is the cumulative phase diff. Fail closed as before on a wrong-phase
+  checkpoint, an unbounded walk (missing base ref), or a range with no
+  checkpoints at all; adopted commits are never squashed.
+### Fixed
+
+- The commit-message drafter no longer inlines an unbounded phase diff. It
+  resolves the `message_agent` adapter's declared input cap through the same
+  capability path the review and confirm prompts use and, when the assembled
+  prompt would exceed it (or, with no declared cap, when the diff alone exceeds
+  a fixed 400,000-char ceiling — fail closed against the unknown), hands the
+  change by reference for repository-capable drafters. Tool-less API drafters
+  receive bounded inline excerpts with explicit omission notices. Redraft
+  feedback echoes the offending header and its exact character count. The
+  validator allows 100 characters (the prompt targets 72); invalid drafts
+  fail after bounded retries without synthesizing a replacement title.
+  The failure names the verbatim `resume --response` override (#134).
+- **`gauntlet resume --accept-artifacts`** — first-class artifact ratification
+  (#134, rec. 3). An FR-10.4 escalation (`parked_for_response`) could only be
+  resolved with `--response "<prose>"`, which a disposition model classifies;
+  acceptance prose carrying imperative verbs was routinely classified
+  `amendment_required` and re-parked, costing a full park round-trip for a
+  decision that was never a prose question. The structured form records the
+  sha256 of each governed artifact on the authoring surface (`prd.md`,
+  `plan.md`) as ratified — an additive `ratified_artifacts` list on the
+  manifest plus a `kind: accept_artifacts` response entry whose text is
+  engine-generated from the digests — and both disposition gates (cycle and
+  agent_task) short-circuit that entry to `proceed_in_place` with zero model
+  calls (the engine-authored disposition still passes the same fail-closed
+  oracle), settling the prior round's upstream question exactly as a routed
+  proceed does (#106). A digest that differs from the run's last-known
+  approved one (a prior ratification, else the bytes committed on the run
+  branch) is recorded loudly — a manifest warning and a CLI `AUDIT:` line —
+  never refused (manual governed-artifact edits are sanctioned in recovery).
+  Mutually exclusive with `--response`; refused unless the run is
+  `parked_for_response` on a respondable step. `status` and the operator
+  playbook name it beside `--response`.
+- **Plan preconditions** (#134, rec. 7). A plan's `gauntlet-phases` block may
+  declare, per phase and (mapping form) for the whole plan, the environmental
+  preconditions the phases depend on: `{path}` must exist, `{env}` must be set
+  and non-empty (the value is never recorded). Provision separately; command
+  items are rejected. `plan-lint` and the `plan_phases` validator fail closed on a malformed
+  item. `gauntlet approve` on a gate declaring `preflight: plan_preconditions`
+  (the standard pipeline's `plan-approve`) checks every item without executing
+  plan text, records the checklist under `<run_dir>/preflight/`, and
+  refuses while any is unmet, naming each; `--skip-preflight` approves anyway
+  with an audited manifest warning. A step declaring `preconditions_from: plan`
+  (the standard pipeline's `implement`) re-resolves the plan-level items plus
+  the current phase's own before its handler runs; an unmet item finishes the
+  step FAILED with `halt_reason=precondition` and the re-runnable
+  `clean_handoff_precondition` kind (nothing invoked, no tokens spent), and a
+  plain `gauntlet resume` re-checks. `gauntlet status` on a parked preflight
+  gate lists unmet `path`/`env` items read-only. In the field a phase parked
+  mid-run because a data bundle was never staged — discoverable before the
+  run started; the mechanism is generic so an adopter's own notion of "staged"
+  is a required path or environment variable.
+- **Operator playbook v2** (#134, recs 8, 9, 11). `prompts/operator.md` gains
+  §2a *Standing-operator mode* — arm detection first (driver-side `notify:`
+  push, the auto-resume knobs, `keep_awake`, `gauntlet sweep` on a cadence,
+  plan preconditions) and a **pre-authorized decision matrix** stating which
+  park classes an agent operator resolves autonomously and which page the
+  human — and §6a *Trap catalog*: the recurring parks that each cost a full
+  round-trip on a real run (target_artifact misencoding, acceptance phrasing,
+  the phase-commit marker, the commit-message override, the exhausted
+  `tests` route, missing preconditions, provider/usage parks, the run-worktree
+  cwd traps, `git clean -xdff`, stale drivers) with the exact response and
+  what the engine now handles. The operator skill template is bumped to
+  version 2 (v1 retired append-only under `_versions/`), so `gauntlet init`
+  refreshes an unmodified adopter copy and never clobbers a customized one.
 
 ## [1.2.0] — 2026-08-18
 
@@ -85,6 +224,23 @@ All notable changes to Gauntlet are recorded here. The format follows
   boundary and upgraded with an audited manifest warning when the tree is
   provably clean against the attempt's `base_sha`; side-effecting or unprovable
   failures stay terminal exactly as before (#121).
+- A failed `shell` step that declares an `on_fail` route (the standard
+  pipeline's `tests`) no longer strands the run once its retry budget is spent.
+  A plain `gauntlet resume` used to re-execute the same failing command, fail
+  identically, and trip the R5 no-progress guard naming only `abort` — so
+  operators reached for git surgery instead of the route the pipeline already
+  declares. A plain resume is a human action: it now re-arms exactly one more
+  route through the same reset the in-budget path uses (the route target and
+  everything after it go pending, `base_sha` and stale cycle checkpoints are
+  cleared), records an audited manifest warning (`operator resume re-armed
+  on_fail for <step> (route_to=<target>, re-arm #k)`), and drives; each later
+  plain resume after another exhaustion re-arms again and increments `k`. Shell
+  steps without `on_fail` keep today's refusals (including the #121 dirty-tree
+  case), and the no-progress refusal now names each safe action's executable
+  form, including the re-arm when a route exists. `tests-recheck` in the
+  standard pipeline gains `on_fail: {route_to: impl-cycle, max_retries: 1}`, so
+  a post-cycle test failure routes back to the cycle that changed the tree
+  instead of terminating the run (#134).
 
 ## [1.1.1] — 2026-08-12
 

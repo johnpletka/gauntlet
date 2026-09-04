@@ -39,6 +39,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from gauntlet.engine.notify import Transition
+
 from gauntlet.engine.manifest import Manifest
 from gauntlet.web.store import RunStore, _current_record, _mtime_iso
 
@@ -53,20 +55,16 @@ DEFAULT_INTERVAL_S = 1.0
 Identity = tuple[str, str | None, str | None, str, int | None]
 
 
-class WatchEvent(BaseModel):
-    """One observed run transition (the SSE/notify payload, FR-8.2/FR-9.2)."""
+class WatchEvent(Transition):
+    """One observed run transition (the SSE/notify payload, FR-8.2/FR-9.2).
 
-    slug: str
-    run_id: str
-    run_status: str
-    current_step: str | None = None
-    current_step_status: str | None = None
-    current_step_type: str | None = None  # step `type` (gate vs cycle) for FR-9.1
-    current_step_notes: str | None = None
-    # Run-level non-fatal anomalies (manifest.warnings). Carried so the notifier
-    # can push a newly-recorded advisory usage-window shortfall (FR-10.3); NOT part
-    # of `identity` (a manifest rewrite already re-fires via its revision/mtime).
-    warnings: list[str] = []
+    Extends the engine's :class:`~gauntlet.engine.notify.Transition` (the typed
+    run/step state plus the persisted park/halt reasons, #134) with the FR-8.1
+    identity fields. ``warnings`` is carried so the notifier can push a
+    newly-recorded advisory (FR-10.3); it is NOT part of ``identity`` (a
+    manifest rewrite already re-fires via its revision/mtime).
+    """
+
     updated: str | None = None  # manifest mtime as ISO (display)
     revision: int | None = None  # manifest mtime in ns: the FR-8.1 manifest_revision
 
@@ -180,16 +178,12 @@ class Watcher:
     def _event_for(
         self, slug: str, man: Manifest, manifest_path: Path, mtime_ns: int
     ) -> WatchEvent:
-        cur = _current_record(man)
+        # The typed state (incl. persisted park/halt reasons) comes from the
+        # engine's own transition builder so the console classifies exactly
+        # what the driver classifies (#134).
+        base = Transition.from_manifest(man, slug=slug)
         return WatchEvent(
-            slug=slug,
-            run_id=man.run_id,
-            run_status=man.status,
-            current_step=man.current_step,
-            current_step_status=cur.status if cur else None,
-            current_step_type=cur.type if cur else None,
-            current_step_notes=cur.notes if cur else None,
-            warnings=list(man.warnings),
+            **base.model_dump(),
             updated=_mtime_iso(manifest_path),
             revision=mtime_ns,
         )

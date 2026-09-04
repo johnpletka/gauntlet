@@ -121,6 +121,13 @@ class ResponseAction:
     iteration: str | None = None
     text: str | None = None
     user: str | None = None
+    # #134: what KIND of response an ``append`` records — ``text`` (a prose
+    # decision, the default) or ``accept_artifacts`` (a structured artifact
+    # ratification whose ``text`` is engine-generated). ``ratified`` carries the
+    # authoring-surface digests for the latter; the orchestrator persists them
+    # on the manifest beside the response entry, in the same checkpoint.
+    response_kind: str = "text"
+    ratified: tuple = ()
 
 
 class _LazyPlanPhases:
@@ -801,10 +808,22 @@ class Orchestrator:
         to a completed implement); it must be reset too, otherwise the loop skips
         it and only the failing step re-runs forever.
         """
+        self.reset_records_for_retry(self.manifest, stage, route_to, iteration)
+
+    @staticmethod
+    def reset_records_for_retry(
+        manifest: Manifest, stage: Stage, route_to: str, iteration: str | None
+    ) -> None:
+        """The one ``on_fail`` reset, shared with the verb boundary (#134).
+
+        ``RunManager`` re-arms an exhausted shell step's route on a plain
+        resume through exactly this reset, so the operator-driven route and
+        the orchestrator's in-budget route can never drift apart.
+        """
         ids = [s.id for s in stage.steps]
         start = ids.index(route_to)
         for sid in ids[start:]:
-            rec = self.manifest.record(sid, iteration)
+            rec = manifest.record(sid, iteration)
             if rec is not None:
                 rec.status = M.PENDING
                 rec.ended = None
@@ -814,6 +833,18 @@ class Orchestrator:
                 # a later interrupt's dirty check diff against — and a
                 # reset_to_base rewind past — everything the run landed since.
                 rec.base_sha = None
+                # Cycle sub-step checkpoints belong to the attempt too (#134):
+                # a route that resets a COMPLETED adversarial_cycle (e.g.
+                # tests-recheck → impl-cycle) must re-run it as a fresh round.
+                # The cycle's FR-4.1 reuse keys on "checkpoints present"; with
+                # the stale ones kept, HEAD still sits on the cycle's own last
+                # fix tip and the tree is clean, so the SHA/dirty guards would
+                # NOT invalidate reuse and the cycle would replay its completed
+                # sub-steps into an immediate no-op DONE — the route would
+                # never repair anything. A reject re-drive already clears them
+                # (its pending response disables reuse); this makes the
+                # response-less route behave the same.
+                rec.checkpoints = []
 
     # ---- single-step execution ----------------------------------------------
     def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:
@@ -916,7 +947,7 @@ class Orchestrator:
                 # skip this entirely.
                 auto = self._maybe_auto_approve(step, iteration, item)
                 try:
-                    result = auto if auto is not None else spec.handler(step, ctx)
+                    result = self._dispatch_handler(step, ctx, item, auto, spec)
                 except AgentVanishedError as exc:
                     # Agent-liveness watchdog (FR-5.3, #103): the adapter child
                     # was PROVABLY gone while its stream stayed open — an
@@ -1876,6 +1907,19 @@ class Orchestrator:
             return result
         return result
 
+    def _auto_resume_armed_for(self, parked_reason: str | None) -> bool:
+        """Whether the configured auto-resume knob for *parked_reason* is ``auto``.
+
+        ``usage_limit`` → ``resume_on_quota``; ``provider_unavailable`` →
+        ``resume_on_provider_unavailable`` (#134). Every other park reason (gate,
+        response, artifact_invalid, usage_window, …) never arms a schedule.
+        """
+        if parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+            return self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
+        if parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE:
+            return self.config.resume_on_provider_unavailable == RESUME_ON_QUOTA_AUTO
+        return False
+
     def _finalize(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
         rec.status = {
             DONE: M.DONE,
@@ -1973,21 +2017,25 @@ class Orchestrator:
         # never carries a stale hand-edit record.
         rec.revalidation = result.revalidation
         # Auto-resume schedule (FR-3.4) is current-state and armed at park time so
-        # a usage-limit park under `resume_on_quota: auto` carries its schedule the
-        # instant `_drive` returns (before any wait), and a process death loses
-        # nothing. Preserve the prior attempts count across re-parks (the
-        # RunManager increments it around each in-process resume). Cleared on any
-        # non-usage-limit-park finalization so a step resumed to DONE never carries
-        # a stale schedule. `notify` mode never arms one.
+        # a usage-limit park under `resume_on_quota: auto` — or (#134) a
+        # provider_unavailable park under `resume_on_provider_unavailable: auto`
+        # — carries its schedule the instant `_drive` returns (before any wait),
+        # and a process death loses nothing. Preserve the prior attempts count
+        # across re-parks (the RunManager increments it around each in-process
+        # resume; the ceiling is shared across both park reasons so an outage
+        # that turns into a quota wall still stops at `max_auto_resume_attempts`).
+        # Cleared on any other finalization so a step resumed to DONE never
+        # carries a stale schedule. `notify` mode never arms one.
         if (
             result.status == PARKED
-            and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
-            and self.config.resume_on_quota == RESUME_ON_QUOTA_AUTO
-            # Arm ONLY with a structured reset time (FR-3.4): a park with no
-            # reported reset has ``quota_reset_at is None``; falling back to
+            and self._auto_resume_armed_for(result.parked_reason)
+            # Arm ONLY with a concrete deadline (FR-3.4): a usage-limit park with
+            # no reported reset has ``quota_reset_at is None``; falling back to
             # ``self.clock()`` would make the schedule due immediately, and the
             # auto-resume loop would burn every attempt in an unspaced hot loop.
-            # With no reset time, leave a plain usage-limit park for a human.
+            # With no deadline, leave a plain park for a human. (A
+            # provider_unavailable park always carries its backoff deadline —
+            # depretry.park_deadline_s — so it always arms under `auto`.)
             and rec.quota_reset_at is not None
         ):
             prior_attempts = (
@@ -1997,6 +2045,7 @@ class Orchestrator:
                 attempt_at=rec.quota_reset_at,
                 attempts=prior_attempts,
                 max_attempts=self.config.max_auto_resume_attempts,
+                reason=result.parked_reason,
             )
         else:
             rec.scheduled_resume = None
@@ -2035,6 +2084,7 @@ class Orchestrator:
                     step_id=rec.id,
                     phase=result.commit_phase or "",
                     sha=result.commit_sha,
+                    base_sha=rec.base_sha,
                 )
             )
         for phase, sha in result.commits:  # multi-commit steps (adversarial_cycle)
@@ -2074,6 +2124,80 @@ class Orchestrator:
         return consumed
 
     # ---- helpers -------------------------------------------------------------
+    def _dispatch_handler(self, step: Step, ctx: StepContext, item: Any, auto, spec):
+        """Run the step's handler, unless an auto-approval or an unmet plan
+        precondition (#134, `preconditions_from: plan`) settles it first."""
+        if auto is not None:
+            return auto
+        from gauntlet.engine import preconditions as PC
+
+        if step.get("preconditions_from") == PC.PRECONDITIONS_FROM_PLAN:
+            blocked = self._check_plan_preconditions(step, ctx, item)
+            if blocked is not None:
+                return blocked
+        return spec.handler(step, ctx)
+
+    def _check_plan_preconditions(
+        self, step: Step, ctx: StepContext, item: Any
+    ) -> StepResult | None:
+        """Re-resolve the plan's declared preconditions before a step runs (#134).
+
+        Plan-level items plus the current foreach phase's own (the item's
+        ``id``) are checked against the run worktree and the live environment;
+        ``command`` items run through the shell-step path with their output
+        persisted under the step dir. An unmet item finishes the step FAILED
+        with ``halt_reason=precondition`` and the re-runnable
+        ``clean_handoff_precondition`` kind — nothing was invoked, no tokens
+        were spent, and a plain ``gauntlet resume`` re-checks and proceeds
+        once the operator satisfies it. Fail closed on an unreadable plan.
+        """
+        import os
+
+        from gauntlet.engine import preconditions as PC
+        from gauntlet.engine.planphases import PlanPhasesError, load_plan_spec
+        from gauntlet.engine.steptypes import step_log_dir
+
+        def _blocked(note: str) -> StepResult:
+            return StepResult(
+                status=FAILED,
+                halt_reason=M.HALT_REASON_PRECONDITION,
+                failure_kind=M.FAILURE_KIND_CLEAN_HANDOFF,
+                notes=note,
+            )
+
+        try:
+            spec = load_plan_spec(self.artifact_root / "plan.md")
+        except PlanPhasesError as exc:
+            return _blocked(f"plan preconditions unreadable (nothing invoked): {exc}")
+        if spec is None:
+            return None
+        phase_id = item.get("id") if isinstance(item, dict) else None
+        try:
+            items = (
+                spec.preconditions_for(phase_id) if phase_id
+                else list(spec.preconditions)
+            )
+        except PlanPhasesError as exc:
+            return _blocked(f"plan preconditions unresolvable (nothing invoked): {exc}")
+        if not items:
+            return None
+        log_dir = step_log_dir(ctx) / "preflight"
+        unmet = PC.resolve_preconditions(
+            items, cwd=self.work_root, env=os.environ,
+        )
+        try:
+            self.writer.write_text(log_dir / "preflight.txt", PC.render_checklist(items, unmet))
+        except OSError:
+            pass  # evidence is best-effort; the verdict is not
+        if not unmet:
+            return None
+        listed = "; ".join(u.render() for u in unmet)
+        return _blocked(
+            f"plan preconditions unmet — nothing invoked, no tokens spent "
+            f"(#134): {listed}. Satisfy them, then a plain `gauntlet resume` "
+            "re-checks and proceeds."
+        )
+
     def _make_context(
         self, step: Step, rec: StepRecord, iteration: str | None, item: Any
     ) -> StepContext:
@@ -2406,7 +2530,10 @@ class Orchestrator:
             rec = self.manifest.record(action.step_id, action.iteration)
             if rec is None:  # defensive: validated in RunManager before we drive
                 return
-            self._append_response(rec, action.text, action.user)
+            self._append_response(
+                rec, action.text, action.user,
+                kind=action.response_kind, ratified=action.ratified,
+            )
 
     def _reconcile_response_checkpoint(self) -> None:
         """Idempotently flush the latest response step's current-state commit."""
@@ -2441,7 +2568,10 @@ class Orchestrator:
                 target = rec
         return target
 
-    def _append_response(self, rec: StepRecord, text: str, user: str) -> M.HumanResponse:
+    def _append_response(
+        self, rec: StepRecord, text: str, user: str, *,
+        kind: str = M.RESPONSE_KIND_TEXT, ratified=(),
+    ) -> M.HumanResponse:
         """Append one `pending` response entry, persist, and commit it (FR-2).
 
         `response_id` (`<step_id>-resp-<ordinal>`) and `response_attempt` are
@@ -2449,7 +2579,16 @@ class Orchestrator:
         the stable handle the builder references (FR-5/FR-10) and recovery
         deduplicates on (FR-7.1). The `pending` write is atomic and committed
         BEFORE the agent launches.
+
+        An ``accept_artifacts`` entry (#134) additionally appends one
+        :class:`M.RatifiedArtifact` per ratified digest and — for a digest that
+        differs from the run's last-known approved one — a durable manifest
+        warning, all in the SAME atomic write and checkpoint commit as the
+        entry itself, so the audit trail can never carry the ratification
+        without its digests (or the reverse).
         """
+        from gauntlet.engine import ratification as RT
+
         ordinal = len(rec.human_responses) + 1
         entry = M.HumanResponse(
             response_id=f"{rec.id}-resp-{ordinal}",
@@ -2459,8 +2598,21 @@ class Orchestrator:
             response_attempt=ordinal,
             state=M.RESPONSE_PENDING,
             artifact_fingerprint=self._governed_artifact_fingerprint(rec),
+            kind=kind,
         )
         rec.human_responses.append(entry)
+        if kind == M.RESPONSE_KIND_ACCEPT_ARTIFACTS:
+            for digest in ratified:
+                self.manifest.ratified_artifacts.append(
+                    M.RatifiedArtifact(
+                        name=digest.name, sha256=digest.sha256,
+                        response_id=entry.response_id, at=entry.timestamp,
+                    )
+                )
+                if digest.drifted:
+                    note = RT.drift_note(digest, entry.response_id)
+                    if note not in self.manifest.warnings:
+                        self.manifest.warnings.append(note)
         self._persist()  # atomic write-ahead of the pending entry (FR-2.2)
         self._commit_manifest_checkpoint(
             f"gauntlet: response {entry.response_id} pending"

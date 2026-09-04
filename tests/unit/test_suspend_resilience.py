@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from gauntlet.adapters.base import (
+    FAILURE_TRANSIENT_DEPENDENCY,
     FAILURE_TRANSIENT_USAGE_LIMIT,
     AdapterCapabilities,
     AgentFailedError,
@@ -355,11 +356,11 @@ class _AutoResumeHarness:
     can be exercised deterministically without a real adapter or drive.
     """
 
-    def __init__(self, tmp_path: Path, *, outcomes):
+    def __init__(self, tmp_path: Path, *, outcomes, config: dict | None = None):
         self.repo = tmp_path
         cfg = RunConfig.model_validate({
             "resume_on_quota": "auto", "keep_awake": True, "run_root": "runs",
-            "max_auto_resume_attempts": 3,
+            "max_auto_resume_attempts": 3, **(config or {}),
         })
         self.mgr = RunManager(tmp_path, config=cfg)
         self.run_dir = tmp_path / "runs" / "demo" / "run-1"
@@ -390,14 +391,22 @@ class _AutoResumeHarness:
     def _save(self, man: Manifest) -> None:
         man.write_atomic(self.run_dir / "manifest.json")
 
-    def park(self, *, attempt_at: datetime, attempts: int = 0) -> None:
+    def park(self, *, attempt_at: datetime, attempts: int = 0,
+             reason: str = M.PARKED_REASON_USAGE_LIMIT,
+             schedule_reason: str | None = "same") -> None:
+        # ``schedule_reason``: "same" stamps the schedule with ``reason`` (what
+        # the orchestrator does since #134); None leaves it unstamped (a
+        # pre-#134 manifest); any other value simulates a stale stamp.
+        stamp = reason if schedule_reason == "same" else schedule_reason
         m = _manifest()
         m.status = M.RUN_PARKED
         m.steps.append(StepRecord(
             id="implement", type="agent_task", status=M.PARKED,
-            parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+            parked_reason=reason,
+            quota_reset_at=attempt_at.isoformat(),
             scheduled_resume=ScheduledResume(
-                attempt_at=attempt_at.isoformat(), attempts=attempts, max_attempts=3),
+                attempt_at=attempt_at.isoformat(), attempts=attempts, max_attempts=3,
+                reason=stamp),
         ))
         self._save(m)
 
@@ -490,3 +499,387 @@ def test_auto_resume_defers_to_a_concurrent_lock_holder(tmp_path):
         h.mgr._release_worktree_lock(handle)
     assert h.resume_calls == 0
     assert h._load().record("implement").scheduled_resume.attempts == 0
+
+
+# --- #134: scheduled auto-resume generalized to provider_unavailable parks ----
+def _dependency(retry_after_s=None):
+    return AgentFailedError(
+        "api call failed: simulated timeout",
+        partial=AgentResult(text="", session_id="sess-1",
+                            usage=Usage(input_tokens=1, output_tokens=0), exit_code=1),
+        failure_info=FailureInfo(
+            kind=FAILURE_TRANSIENT_DEPENDENCY, marker="api_timeout",
+            retry_after_s=retry_after_s,
+        ),
+    )
+
+
+def _cfg(**over):
+    # dependency_retry_attempts: 0 → the first dependency failure parks at once
+    # (no in-process retry sleeps), with the backoff deadline still recorded.
+    base = {"agents": {"builder": {"adapter": "claude-code"}},
+            "keep_awake": True, "dependency_retry_attempts": 0}
+    base.update(over)
+    return base
+
+
+def test_provider_auto_arms_schedule_on_provider_unavailable_park(fixture_repo):
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(resume_on_provider_unavailable="auto"),
+                  adapters={"builder": _RaiseOnce(_dependency())}, manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.quota_reset_at is not None  # the backoff deadline (plan §5.2)
+    assert rec.scheduled_resume is not None
+    assert rec.scheduled_resume.attempt_at == rec.quota_reset_at
+    assert rec.scheduled_resume.attempts == 0
+    assert rec.scheduled_resume.max_attempts == 3
+    assert rec.scheduled_resume.reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+
+
+def test_provider_auto_arms_with_retry_after_deadline(fixture_repo):
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(resume_on_provider_unavailable="auto"),
+                  adapters={"builder": _RaiseOnce(_dependency(retry_after_s=120))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.retry_after_s == 120
+    assert rec.scheduled_resume is not None
+    assert rec.scheduled_resume.attempt_at == rec.quota_reset_at
+
+
+def test_provider_notify_default_never_arms_a_schedule(fixture_repo):
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(),
+                  adapters={"builder": _RaiseOnce(_dependency())}, manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.quota_reset_at is not None  # deadline recorded, but no schedule
+    assert rec.scheduled_resume is None
+
+
+def test_quota_auto_alone_does_not_arm_a_provider_park(fixture_repo):
+    # Each knob governs only its own park reason.
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(resume_on_quota="auto"),
+                  adapters={"builder": _RaiseOnce(_dependency())}, manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.scheduled_resume is None
+
+
+def test_provider_auto_alone_does_not_arm_a_usage_limit_park(fixture_repo):
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(resume_on_provider_unavailable="auto"),
+                  adapters={"builder": _RaiseOnce(_transient(retry_after_s=300))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+    assert rec.scheduled_resume is None
+
+
+def test_usage_limit_schedule_is_stamped_with_its_reason(fixture_repo):
+    man = _manifest()
+    orch = _build(fixture_repo, PIPE, config=_cfg(resume_on_quota="auto"),
+                  adapters={"builder": _RaiseOnce(_transient(retry_after_s=300))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    assert man.record("implement").scheduled_resume.reason == M.PARKED_REASON_USAGE_LIMIT
+
+
+def test_scheduled_resume_loads_without_reason_field():
+    # Additive: a schedule persisted before #134 has no `reason` and still loads.
+    sched = ScheduledResume.model_validate({"attempt_at": T0.isoformat(), "attempts": 1})
+    assert sched.reason is None
+    assert sched.max_attempts == 3
+
+
+# --- #134: config validation + survival warning for the new knob -------------
+def test_resume_on_provider_unavailable_rejects_unknown_value():
+    with pytest.raises(ValueError, match="resume_on_provider_unavailable"):
+        RunConfig.model_validate({"resume_on_provider_unavailable": "sometimes"})
+
+
+def test_resume_on_provider_unavailable_normalizes_case():
+    cfg = RunConfig.model_validate(
+        {"resume_on_provider_unavailable": " Auto ", "keep_awake": True}
+    )
+    assert cfg.resume_on_provider_unavailable == "auto"
+    assert cfg.any_auto_resume
+
+
+def test_provider_auto_without_keep_awake_or_scheduler_warns():
+    with pytest.warns(UserWarning, match="resume_on_provider_unavailable: auto"):
+        RunConfig.model_validate({"resume_on_provider_unavailable": "auto", "keep_awake": False})
+
+
+def test_provider_auto_with_keep_awake_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        RunConfig.model_validate(
+            {"resume_on_provider_unavailable": "auto", "keep_awake": True}
+        )
+
+
+def test_provider_auto_with_external_scheduler_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        RunConfig.model_validate(
+            {"resume_on_provider_unavailable": "auto", "external_scheduler": True}
+        )
+
+
+def test_both_knobs_auto_warn_once_naming_both():
+    with pytest.warns(UserWarning) as rec:
+        RunConfig.model_validate(
+            {"resume_on_quota": "auto", "resume_on_provider_unavailable": "auto", "keep_awake": False}
+        )
+    msgs = [str(w.message) for w in rec if "auto-resume" in str(w.message)]
+    assert len(msgs) == 1
+    assert "resume_on_quota" in msgs[0]
+    assert "resume_on_provider_unavailable" in msgs[0]
+
+
+def test_default_config_has_no_auto_resume():
+    assert not RunConfig.model_validate({}).any_auto_resume
+
+
+# --- #134: the wait loop on a provider_unavailable park ----------------------
+_PROVIDER_AUTO = {"resume_on_quota": "notify", "resume_on_provider_unavailable": "auto"}
+
+
+def test_auto_resume_provider_park_resumes_when_due(tmp_path):
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"], config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 - timedelta(seconds=1),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    assert h.run() == M.RUN_DONE
+    assert h.resume_calls == 1
+
+
+def test_auto_resume_provider_park_waits_out_the_backoff_deadline(tmp_path):
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"], config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 + timedelta(seconds=90),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    h.run()
+    assert h.resume_calls == 1
+    assert h.now >= T0 + timedelta(seconds=90)
+    assert h.wait_entries >= 1  # heartbeat/keep-awake context spans the wait
+
+
+def test_auto_resume_provider_park_exhausts_to_a_plain_provider_park(tmp_path):
+    h = _AutoResumeHarness(tmp_path, outcomes=["reparks"] * 4, config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 - timedelta(seconds=1),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 3  # exactly max_auto_resume_attempts
+    step = h._load().record("implement")
+    assert step.status == M.PARKED
+    assert step.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert step.scheduled_resume is None  # left as a plain park
+    assert step.quota_reset_at is not None  # deadline kept: still a legitimate wait
+    assert "auto-resume exhausted" in (step.notes or "")
+    assert "plain provider_unavailable park" in (step.notes or "")
+
+
+def test_provider_park_ignored_when_only_quota_knob_is_auto(tmp_path):
+    # `resume_on_quota: auto` (the harness default) must not drive a
+    # provider_unavailable park; its schedule stays untouched for a manual resume.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 - timedelta(seconds=1),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+    sched = h._load().record("implement").scheduled_resume
+    assert sched is not None and sched.attempts == 0
+
+
+def test_usage_limit_park_ignored_when_only_provider_knob_is_auto(tmp_path):
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"], config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 - timedelta(seconds=1))  # usage_limit
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+
+
+def test_unstamped_schedule_is_read_as_the_step_park_reason(tmp_path):
+    # A pre-#134 manifest has no `reason` stamp: route by the step's own reason.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"], config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 - timedelta(seconds=1),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE, schedule_reason=None)
+    assert h.run() == M.RUN_DONE
+    assert h.resume_calls == 1
+
+
+def test_stale_schedule_stamp_never_routes_the_wrong_knob(tmp_path):
+    # A usage_limit step carrying a schedule stamped provider_unavailable must
+    # not be driven by the provider knob (nor by the quota knob: harness default
+    # `resume_on_quota: auto` still requires the stamp to match).
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"],
+                           config={"resume_on_provider_unavailable": "auto"})
+    h.park(attempt_at=T0 - timedelta(seconds=1),
+           reason=M.PARKED_REASON_USAGE_LIMIT,
+           schedule_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+
+
+def test_knob_flipped_to_notify_mid_wait_stops_the_loop(tmp_path):
+    # The governing knob is re-read every pass: flipping it to notify during
+    # the wait stops the loop before it drives another resume.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"], config=_PROVIDER_AUTO)
+    h.park(attempt_at=T0 + timedelta(seconds=30),
+           reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE)
+    real_sleep = h._sleep
+
+    def flip_then_sleep(seconds):
+        h.mgr.config.resume_on_provider_unavailable = "notify"
+        real_sleep(seconds)
+
+    h._sleep = flip_then_sleep
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+    assert h._load().record("implement").scheduled_resume is not None
+
+
+def test_both_knobs_auto_drive_either_park_reason(tmp_path):
+    both = {"resume_on_quota": "auto", "resume_on_provider_unavailable": "auto"}
+    for reason in (M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_PROVIDER_UNAVAILABLE):
+        sub = tmp_path / reason
+        sub.mkdir()
+        h = _AutoResumeHarness(sub, outcomes=["done"], config=both)
+        h.park(attempt_at=T0 - timedelta(seconds=1), reason=reason)
+        assert h.run() == M.RUN_DONE, reason
+        assert h.resume_calls == 1, reason
+
+
+# --- #134: end-to-end through the real resume path ---------------------------
+_E2E_CONFIG = """
+base_branch: main
+run_root: runs
+interrupted_step: park
+dependency_retry_attempts: 0
+dependency_retry_base_s: 2.0
+dependency_retry_max_delay_s: 5.0
+resume_on_provider_unavailable: auto
+external_scheduler: true
+agents:
+  builder: {adapter: claude-code}
+"""
+
+_E2E_PIPE = """
+name: demo
+version: 1
+stages:
+  - id: s
+    steps:
+      - {id: implement, type: agent_task, agent: builder, prompt_text: go}
+"""
+
+
+class _FlakyDependencyAdapter:
+    """Raises a classified dependency failure ``fail_times`` times, then succeeds."""
+
+    name = "fake"
+    timeout_s = 600.0
+
+    def __init__(self, fail_times: int):
+        self.capabilities = AdapterCapabilities(
+            repo_write=True, structured_output="native", resume=True
+        )
+        self.fail_times = fail_times
+        self.calls: list[dict] = []
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None,
+            extra_flags=None, sink=None):
+        self.calls.append({"prompt": prompt, "session": session})
+        if len(self.calls) <= self.fail_times:
+            raise _dependency()
+        return AgentResult(text="done", session_id="s1", exit_code=0)
+
+
+def _seed_e2e(repo: Path):
+    from conftest import git
+    from gauntlet.engine.manifest import PipelineRef
+    from gauntlet.engine.pipeline import load_pipeline
+
+    (repo / ".gauntlet").mkdir(exist_ok=True)
+    (repo / ".gauntlet" / "config.yaml").write_text(_E2E_CONFIG)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "seed config")
+    git(repo, "checkout", "-qb", "gauntlet/demo")
+    slug_dir = repo / "runs" / "demo"
+    run_dir = slug_dir / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".gitignore").write_text("*\n")
+    (run_dir / "pipeline.yaml").write_text(_E2E_PIPE)
+    (slug_dir / ".gitignore").write_text(".gitignore\nactive-run.txt\n")
+    (slug_dir / "active-run.txt").write_text("run-1")
+    _, phash = load_pipeline(run_dir / "pipeline.yaml")
+    man = Manifest(
+        run_id="run-1", slug="demo", branch="gauntlet/demo", base_branch="main",
+        pipeline=PipelineRef(name="demo", version=1, hash=phash),
+        status=M.RUN_RUNNING,
+    )
+    man.write_atomic(run_dir / "manifest.json")
+    return RunManager(repo), run_dir
+
+
+class _FakeTime:
+    """A fake orchestrator clock whose `sleep` advances it (no real waiting)."""
+
+    def __init__(self):
+        self.now = T0
+
+    def clock(self) -> str:
+        return self.now.isoformat()
+
+    def sleep(self, seconds: float) -> None:
+        self.now = self.now + timedelta(seconds=seconds)
+
+
+def test_e2e_provider_park_auto_resumes_through_the_plain_retry_path(fixture_repo):
+    """A dependency failure parks provider_unavailable with a backoff deadline;
+    under `resume_on_provider_unavailable: auto` the SAME `resume` verb waits
+    out the deadline and performs the plain retry resume (a fresh dependency
+    episode, plan §5.2) — the recovered provider completes the run with no
+    operator action and no `--response`."""
+    mgr, run_dir = _seed_e2e(fixture_repo)
+    assert mgr.config.resume_on_provider_unavailable == "auto"
+    mgr._auto_resume_wait_context = lambda run_dir: contextlib.nullcontext()
+    adapter = _FlakyDependencyAdapter(fail_times=1)
+    ft = _FakeTime()
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter,
+        clock=ft.clock, auto_sleep=ft.sleep,
+    )
+    assert status == M.RUN_DONE
+    assert len(adapter.calls) == 2  # the park, then the one auto-resume retry
+    assert ft.now > T0  # the loop actually waited out the backoff deadline
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.DONE
+    assert rec.parked_reason is None
+    assert rec.scheduled_resume is None  # cleared on the DONE finalization
+    assert rec.dependency_attempts == 0  # episode ended; budget reset
+
+
+def test_e2e_provider_park_exhausts_then_leaves_plain_park(fixture_repo):
+    mgr, run_dir = _seed_e2e(fixture_repo)
+    mgr._auto_resume_wait_context = lambda run_dir: contextlib.nullcontext()
+    adapter = _FlakyDependencyAdapter(fail_times=99)
+    ft = _FakeTime()
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter,
+        clock=ft.clock, auto_sleep=ft.sleep,
+    )
+    assert status == M.RUN_PARKED
+    assert len(adapter.calls) == 1 + 3  # the park + max_auto_resume_attempts retries
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.PARKED
+    assert rec.parked_reason == M.PARKED_REASON_PROVIDER_UNAVAILABLE
+    assert rec.scheduled_resume is None
+    assert rec.quota_reset_at is not None
+    assert "auto-resume exhausted" in (rec.notes or "")

@@ -22,9 +22,14 @@ from pathlib import Path
 from gauntlet.adapters.base import (
     AdapterError,
     AgentFailedError,
+    AgentResult,
     SessionNotFoundError,
 )
-from gauntlet.engine.commit_format import header_prefix, validate_commit_message
+from gauntlet.engine.commit_format import (
+    HEADER_MAX,
+    header_prefix,
+    validate_commit_message,
+)
 from gauntlet.engine.config import CHECKPOINT_COMMITS_SQUASH
 from gauntlet.engine.execution import (
     DONE,
@@ -1045,25 +1050,44 @@ def handle_agent_task(step: Step, ctx: StepContext) -> StepResult:
                     stream.close()
 
     fallback_note = ""
-    try:
-        result = _invoke(prompt, emit_session)
-    except SessionNotFoundError as exc:
-        # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
-        # to a full re-run with no session (recoverable, not a run-halting fault)
-        # and record the fallback. Off the quota-resume path a SessionNotFoundError
-        # is unexpected, so re-raise it to fail closed like any other adapter error.
-        if not is_quota_resume:
-            raise
-        logger.log_text("session-expired.txt", str(exc))
-        fallback_note = (
-            "usage-limit resume: stored session was unknown/expired; fell back "
-            "to a full re-run with no session (FR-3.3)"
+    ratified = (
+        consuming_response
+        and emit_agent != agent_name
+        and pending_response_kind(ctx) == "accept_artifacts"
+    )
+    if ratified:
+        # #134: a structured ratification needs no classification — the cheap
+        # disposition emitter is never invoked (zero model calls); the
+        # engine-authored proceed_in_place goes through the SAME fail-closed
+        # oracle below, then the primary agent re-drives as on any proceed.
+        structured = ratified_disposition(ctx)
+        logger.log_text(
+            "disposition-ratified.json", json.dumps(structured, indent=2)
         )
+        result = AgentResult(
+            text="engine: --accept-artifacts ratification → proceed_in_place",
+            structured=structured, exit_code=0,
+        )
+    else:
         try:
-            prompt = _render_prompt(step, ctx)
-        except DeferralCollectionError as exc:
-            return _deferral_collection_halt(exc)
-        result = _invoke(prompt, None)
+            result = _invoke(prompt, emit_session)
+        except SessionNotFoundError as exc:
+            # FR-3.3: the stored session is gone — on a usage-limit resume, fall back
+            # to a full re-run with no session (recoverable, not a run-halting fault)
+            # and record the fallback. Off the quota-resume path a SessionNotFoundError
+            # is unexpected, so re-raise it to fail closed like any other adapter error.
+            if not is_quota_resume:
+                raise
+            logger.log_text("session-expired.txt", str(exc))
+            fallback_note = (
+                "usage-limit resume: stored session was unknown/expired; fell back "
+                "to a full re-run with no session (FR-3.3)"
+            )
+            try:
+                prompt = _render_prompt(step, ctx)
+            except DeferralCollectionError as exc:
+                return _deferral_collection_halt(exc)
+            result = _invoke(prompt, None)
     logger.log_result(result)  # transcript.md + events.jsonl (+ structured)
     # Attribute usage to the agent that actually ran (the disposition emitter on a
     # routed `--response` resume, else the step's agent) so `agent_usage` reflects
@@ -1827,12 +1851,24 @@ def render_human_responses(responses) -> str:
     """
     parts = ["# Human decisions (chronological)\n"]
     for r in responses:
-        parts.append(
+        block = (
             f"## Response {r.response_id} — attempt {r.response_attempt}\n"
             f"Response: {r.response_text}\n"
             f"Timestamp: {r.timestamp}\n"
             f"User: {r.user}\n"
         )
+        if getattr(r, "kind", "text") == "accept_artifacts":
+            # #134: a structured ratification is not prose to interpret. The
+            # artifacts named by digest ARE the approved artifacts; the only
+            # valid classification is proceed_in_place.
+            block += (
+                "Kind: structured artifact ratification (--accept-artifacts). "
+                "The governed artifacts as they stand in the run dir, at the "
+                "digests above, ARE the approved PRD/plan. Classify this as "
+                "proceed_in_place and implement against them; do not treat it "
+                "as an amendment request.\n"
+            )
+        parts.append(block)
     return "\n".join(parts)
 
 
@@ -1863,6 +1899,33 @@ def _load_schema(step: Step, ctx: StepContext) -> dict | None:
     if not ref:
         return None
     return json.loads((ctx.repo_root / ctx.config.asset_root / ref).read_text())
+
+
+def pending_response_kind(ctx: StepContext) -> str | None:
+    """The ``kind`` of the pending `--response` entry this invocation consumes,
+    or ``None`` when no response is pending (#134). ``text`` for a prose
+    decision; ``accept_artifacts`` for a structured ratification."""
+    responses = getattr(ctx.record, "human_responses", None) or []
+    if not responses or responses[-1].state != RESPONSE_PENDING:
+        return None
+    return getattr(responses[-1], "kind", None) or "text"
+
+
+def ratified_disposition(ctx: StepContext) -> dict:
+    """The engine-authored ``proceed_in_place`` disposition for a pending
+    ``accept_artifacts`` response (#134): the same shape the oracle validates
+    (conflict null, responses_considered naming the consumed entry), with no
+    model call. Both disposition gates return this instead of classifying."""
+    pending = ctx.record.human_responses[-1]
+    return {
+        "disposition": "proceed_in_place",
+        "responses_considered": [pending.response_id],
+        "action_summary": (
+            "operator ratified the authoring-surface artifacts as approved "
+            "(structured --accept-artifacts); proceeding against them"
+        ),
+        "conflict": None,
+    }
 
 
 def _consuming_response(ctx: StepContext) -> bool:
@@ -2085,35 +2148,74 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         wips = gitops.wip_checkpoints(repo, phase=wip_scope)
     except gitops.WrongPhaseCheckpointError as exc:
         return StepResult(status=FAILED, notes=f"checkpoint discovery failed closed: {exc}")
+    # #134: the trailing run is EMPTY when a non-checkpoint commit sits above
+    # the builder's checkpoints — an operator pre-commit that `resume` adopted
+    # (re-anchoring this step's `base_sha` at/past the checkpoints), an adopted
+    # fix round — because that commit reads as the "gap" ending the run. With a
+    # clean tree the step then failed "nothing to commit" and the operator hand-
+    # made the empty `P<N>:` marker + `resume --response`. Take that path here:
+    # look for THIS phase's scoped checkpoints in the run's own history (bounded
+    # to `HEAD ^base_branch`, stopping at the previous phase's `P<N-1>:`
+    # commit). Only a clean tree qualifies — a residual is committed as the
+    # phase commit exactly as before. `buried` is never squashed: the adopted
+    # commits above the checkpoints are not this step's to rewrite, so it lands
+    # the same empty marker the KEEP branch does. Fail closed (no fallback) when
+    # the walk cannot be bounded (missing base ref) or a wrong-phase checkpoint
+    # sits in the range; a range with no scoped checkpoint falls through to
+    # today's loud FAILED.
+    buried: list[tuple[str, str]] = []
+    adopted_above = 0
+    if not wips and wip_scope and gitops.is_clean(repo, exclude=exclude):
+        try:
+            buried, adopted_above = gitops.phase_checkpoints_in_run(
+                repo, phase=wip_scope, base_branch=ctx.manifest.base_branch,
+            )
+        except gitops.WrongPhaseCheckpointError as exc:
+            return StepResult(
+                status=FAILED, notes=f"checkpoint discovery failed closed: {exc}"
+            )
+        except gitops.GitError:
+            buried, adopted_above = [], 0  # unbounded walk is never a fallback
+    milestones = wips or buried
     squash = (
         ctx.config.checkpoint_commits == CHECKPOINT_COMMITS_SQUASH and bool(wips)
     )
     # The squash base is the parent of the OLDEST checkpoint: where the collapsed
     # `P<N>:` commit lands. Also the drafting diff base when checkpoints exist —
     # so the drafter sees the cumulative phase diff, not an empty residual tree.
-    squash_base = gitops.commit_parent(repo, wips[-1][0]) if wips else None
+    squash_base = gitops.commit_parent(repo, milestones[-1][0]) if milestones else None
+    # Record the evidence mode so operators can see whether drafting used
+    # repository references or bounded inline evidence.
+    draft_notes: list[str] = []
     message, draft_usage, draft_session, drafter = _commit_message(
-        step, ctx, consumed, diff_base=(squash_base if wips else None)
+        step, ctx, consumed, diff_base=squash_base, notes=draft_notes,
     )
     if consumed:
         message = _append_response_trailer(message, [r.response_id for r in consumed])
-    if wips:
+    if milestones:
         # Chronological (oldest first) milestone list in the body — engine-
         # appended (data over inference) so the milestones are always recorded,
         # whether the drafter mentioned them or not.
-        subjects = [subject for _sha, subject in reversed(wips)]
+        subjects = [subject for _sha, subject in reversed(milestones)]
         message = _append_checkpoint_trailer(message, subjects, squashed=squash)
     usage_by_agent = {drafter: draft_usage} if draft_usage and drafter else {}
     err = validate_commit_message(message)
     if err is not None:
         # message_agent drafting includes a bounded redraft loop in _draft;
-        # a literal/exhausted message that still fails is a hard error.
+        # a literal/exhausted message that still fails is a hard error. The
+        # failure names the operator's verbatim override (#134): every park
+        # here used to cost a guess at what `--response` would do with the
+        # text — it is used AS the message when it is itself a valid one.
         return StepResult(
             status=FAILED,
             usage=draft_usage,
             usage_by_agent=usage_by_agent,
             session_id=draft_session,
-            notes=f"commit message invalid: {err.reason}",
+            notes=_join_notes(
+                f"commit message invalid: {err.reason}. "
+                f"Override: {commit_override_hint(ctx)}",
+                draft_notes,
+            ),
         )
     prefix = header_prefix(message)
 
@@ -2131,6 +2233,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     # is a single non-empty `P<N>:` commit; the reviewed range diff base..<PN:>
     # is unchanged from the keep case (same base, same final tree).
     if squash:
+        ctx.record.base_sha = squash_base
         gitops.reset_soft(repo, squash_base)
         # The soft reset re-stages every commit in squash_base..old-HEAD, which
         # can include an engine bookkeeping commit swept in by a checkpoint-
@@ -2144,8 +2247,17 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             status=DONE, commit_sha=sha, commit_phase=prefix,
             usage=draft_usage, usage_by_agent=usage_by_agent,
             session_id=draft_session,
-            notes=f"squashed {len(wips)} checkpoint(s) into {sha[:10]}",
+            notes=_join_notes(
+                f"squashed {len(wips)} checkpoint(s) into {sha[:10]}", draft_notes
+            ),
         )
+
+    # Persist the cumulative phase base for review consumers, including the
+    # first recorded phase and residual commits above checkpoints.
+    if milestones and squash_base:
+        previous_base = ctx.record.base_sha
+        if previous_base is None or gitops.is_ancestor(repo, squash_base, previous_base):
+            ctx.record.base_sha = squash_base
 
     # Mid-commit resume reconciliation (review F-003): if a prior attempt
     # already created the commit (HEAD moved off the recorded base) but died
@@ -2181,10 +2293,11 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
         # as this phase's deliverable. A genuinely empty phase therefore still
         # falls through to the loud FAILED below, as does any walk the repo
         # cannot answer (missing base ref → fail closed, no adoption) (#124).
-        # Adoption is skipped when `P<N> wip:` checkpoints exist: the KEEP branch
-        # below must still land its empty `P<N>:` marker at the tip so the
-        # checkpointed work is covered by the handoff commit.
-        if not wips:
+        # Adoption is skipped when `P<N> wip:` checkpoints exist (trailing or
+        # buried, #134): the KEEP branch below must still land its empty `P<N>:`
+        # marker at the tip so the checkpointed work is covered by the handoff
+        # commit.
+        if not milestones:
             try:
                 candidates = gitops.commits_from_head(
                     repo, existing,
@@ -2219,7 +2332,7 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
                 )
 
     if gitops.is_clean(repo, exclude=exclude):
-        if wips:
+        if milestones:
             # KEEP, no residual: the `wip:` commits already carry all of the
             # phase's work. The reviewer handoff must STILL land on a `P<N>:`
             # commit (git-history contract, CLAUDE.md §1), so record an explicit
@@ -2228,14 +2341,29 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
             sha = gitops.commit_all(
                 repo, message, identity=identity, allow_empty=True, exclude=exclude
             )
+            if buried:
+                # #134: adoption re-anchored `base_sha` AT or PAST the buried
+                # checkpoints, which would hand review-diff consumers an empty
+                # or partial `base..marker` range. The phase's work began at the
+                # oldest checkpoint's parent (`squash_base`); restore that so
+                # the range is the cumulative phase diff — checkpoints AND the
+                # adopted commits above them. A base already beneath them is
+                # left alone.
+                try:
+                    if base is None or gitops.is_ancestor(repo, buried[-1][0], base):
+                        ctx.record.base_sha = squash_base
+                except gitops.GitError:
+                    pass  # repair is best-effort; the marker itself stands
+                note = (
+                    f"empty P<N>: marker over {len(buried)} checkpoint(s) "
+                    f"beneath {adopted_above} adopted commit(s): {sha[:10]}"
+                )
+            else:
+                note = f"empty P<N>: marker over {len(wips)} checkpoint(s): {sha[:10]}"
             return StepResult(
                 status=DONE, commit_sha=sha, commit_phase=prefix,
                 usage=draft_usage, usage_by_agent=usage_by_agent,
-                session_id=draft_session,
-                notes=(
-                    f"empty P<N>: marker over {len(wips)} checkpoint(s): "
-                    f"{sha[:10]}"
-                ),
+                session_id=draft_session, notes=_join_notes(note, draft_notes),
             )
         return StepResult(
             status=FAILED,
@@ -2251,13 +2379,37 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     return StepResult(
         status=DONE, commit_sha=sha, commit_phase=prefix,
         usage=draft_usage, usage_by_agent=usage_by_agent,
-        session_id=draft_session, notes=f"committed {sha[:10]}",
+        session_id=draft_session,
+        notes=_join_notes(f"committed {sha[:10]}", draft_notes),
     )
 
 
-def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
+def _join_notes(primary: str, extra: list[str] | None) -> str:
+    """One step-notes string: the outcome first, drafting side-notes after."""
+    return "; ".join([primary, *(extra or [])])
+
+
+def commit_override_hint(ctx) -> str:
+    """The operator's verbatim commit-message override, spelled out (#134).
+
+    Named in every terminal commit-format failure so the recovery is a
+    copy-paste, not a guess: a `--response` that is itself a valid commit
+    message is used AS the message (:func:`_commit_message`), with no redraft.
+    """
+    slug = getattr(getattr(ctx, "manifest", None), "slug", None) or "<slug>"
+    return (
+        f"`gauntlet resume {slug} --response '<full message>'` uses your text "
+        f"verbatim when it is itself a valid commit message (P<N>: header "
+        f"≤{HEADER_MAX} chars, blank line, body)"
+    )
+
+
+def _commit_message(
+    step: Step, ctx: StepContext, consumed=(), *, diff_base=None, notes=None
+):
     """Return ``(message, usage, session_id, drafter)``; usage/session/drafter
-    are None for a literal message (no model call)."""
+    are None for a literal message (no model call). ``notes`` (a list the
+    caller owns) collects drafting side-notes for the step record (#134)."""
     literal = step.get("message")
     if literal:
         return literal, None, None, None  # human-authored YAML; still validated
@@ -2273,7 +2425,12 @@ def _commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None
         if text and validate_commit_message(text) is None:
             return text, None, None, None
         consumed = list(consumed) + [pending]
-    return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
+    if notes is None:
+        # Pre-#134 call shape (also what test doubles of the drafter accept).
+        return _draft_commit_message(step, ctx, consumed, diff_base=diff_base)
+    return _draft_commit_message(
+        step, ctx, consumed, diff_base=diff_base, notes=notes
+    )
 
 
 def _pending_response(ctx: StepContext):
@@ -2289,7 +2446,42 @@ def _pending_response(ctx: StepContext):
     return None
 
 
-def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_base=None):
+# Headroom under an adapter's declared input cap for everything a prompt
+# carries besides its main payload (template, plan section, response section)
+# plus CLI envelope overhead. 64 KiB is deliberately generous: switching to
+# by-reference a little early costs the agent a few git reads; switching late
+# costs the whole invocation (`input_too_large`). Shared by the review /
+# confirm prompt builders (cycle.py) and the commit-message drafter (#134).
+PROMPT_INPUT_HEADROOM = 65_536
+
+# The commit-message drafter's inline-diff ceiling when the drafter's adapter
+# declares NO input cap (#134). Fail closed against the unknown: a claude-code
+# drafter has no declared cap, yet a phase that minted a few MB of model files
+# (a ~2.5M-token diff, observed live) fails `phase-commit` terminally on every
+# model when the whole diff is inlined. Above this many chars the diff goes by
+# reference regardless of what the adapter would accept.
+DRAFT_INLINE_DIFF_MAX = 400_000
+
+
+def profile_input_cap(ctx: StepContext, profile: str) -> tuple[int | None, bool]:
+    """``(max_input_chars, reads_repo)`` declared by ``profile``'s adapter class.
+
+    THE capability path every by-reference switch resolves through (review and
+    confirm panels via ``cycle._panel_input_cap``; the commit-message drafter,
+    #134): the profile's configured adapter CLASS, not a built instance — a
+    test double injected via ``adapter_factory`` has no config profile, and an
+    unresolvable profile means ``(None, False)``: unknown cap, no repo access.
+    """
+    try:
+        capabilities = ctx.config.profile(profile).adapter_class().capabilities
+    except Exception:
+        return None, False
+    return capabilities.max_input_chars, bool(capabilities.reads_repo)
+
+
+def _draft_commit_message(
+    step: Step, ctx: StepContext, consumed=(), *, diff_base=None, notes=None
+):
     """Draft a commit message via the message_agent with bounded redraft.
 
     The agent sees the change as data — both the tracked diff AND the untracked
@@ -2299,12 +2491,17 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
     engine validates the format and asks for a redraft on violation (FR-9.2).
     Returns ``(message, usage, session_id, drafter)`` so the commit step records
     the drafter's cost (FR-3.2/§7).
+
+    Oversize changes use git references only for adapters that can read the
+    repository. Tool-less adapters receive bounded, explicitly partial diff
+    excerpts. Invalid drafts exhaust the ordinary redraft loop and fail closed.
     """
     agent_name = step.get("message_agent")
     if not agent_name:
         raise ValueError("commit step needs either `message:` or `message_agent:`")
+    if notes is None:
+        notes = []
     adapter = ctx.build_adapter(agent_name)
-    change = _change_context(ctx, diff_base=diff_base)
     base_prompt = (
         (ctx.repo_root / ctx.config.asset_root / step.get("prompt")).read_text()
         if step.get("prompt")
@@ -2320,9 +2517,34 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
         f"{base_prompt}\n\nRequired header phase prefix: {phase_hint or '(infer PN)'}\n"
         f"{plan_section}{_response_section(consumed)}"
     )
+    change, diff_len = _change_context(ctx, diff_base=diff_base)
+    cap, reads_repo = profile_input_cap(ctx, agent_name)
+    if cap is not None:
+        # Same rule as the review/confirm prompts: an over-cap prompt is
+        # rejected WHOLESALE by the adapter, so never build one.
+        oversize = len(header) + len(change) > cap - PROMPT_INPUT_HEADROOM
+        why = f"{diff_len} chars vs the {cap}-char input limit"
+    else:
+        # Unknown cap: fail closed on the diff alone (see DRAFT_INLINE_DIFF_MAX).
+        oversize = diff_len > DRAFT_INLINE_DIFF_MAX
+        why = (
+            f"{diff_len} chars with no declared input limit; inline ceiling "
+            f"{DRAFT_INLINE_DIFF_MAX} chars"
+        )
+    if oversize:
+        if reads_repo:
+            change = _change_context_by_reference(ctx, diff_base=diff_base, why=why)
+            notes.append(f"diff handed to the drafter by reference ({why})")
+        else:
+            budget = min(40_000, cap - PROMPT_INPUT_HEADROOM - len(header) - 2048) if cap else 40_000
+            if budget < 1024:
+                raise ValueError("commit drafting instructions leave no room for change evidence")
+            change = _bounded_draft_evidence(change, budget=budget)
+            notes.append(f"drafter received bounded inline diff excerpts ({why})")
     prompt = f"{header}\n{change}\n"
-    max_redrafts = int(step.get("max_redrafts", 2))
+    max_redrafts = max(0, int(step.get("max_redrafts", 2)))
     message = ""
+    err = None
     usage = _UsageAccumulator()  # sum across ALL draft attempts, incl. rejected
     session_id = None
     for _attempt in range(1 + max_redrafts):
@@ -2335,14 +2557,46 @@ def _draft_commit_message(step: Step, ctx: StepContext, consumed=(), *, diff_bas
         usage.add(result.usage)  # a redraft's cost is real spend (F-008 round 2)
         session_id = result.session_id
         message = result.text.strip()
-        if validate_commit_message(message) is None:
+        err = validate_commit_message(message)
+        if err is None:
             return message, usage.result(), session_id, agent_name
+        # Echo the offending header WITH its exact count (#134): "header is 78
+        # chars" alone left models re-submitting 74; the line they wrote and
+        # the prefix-inclusive rule make the fix arithmetic, not a guess.
+        offending = message.split("\n", 1)[0]
         prompt = (
-            f"{header}\n\nYour previous draft was rejected: "
-            f"{validate_commit_message(message).reason}. "
+            f"{header}\n\nYour previous draft was rejected: {err.reason}. "
+            f"Its header line was {offending!r} — {len(offending)} characters; "
+            f"the limit is {HEADER_MAX} counting the 'P<N>: ' prefix. "
             f"Return only the corrected commit message.\n{change}\n"
         )
     return message, usage.result(), session_id, agent_name
+
+
+def _bounded_draft_evidence(change: str, *, budget: int) -> str:
+    """Distribute a fixed evidence budget across files for tool-less drafting.
+
+    This is message drafting, not code review: omitted evidence is explicit,
+    and the model must limit its claims to the visible excerpts and phase plan.
+    """
+    parts = re.split(r"(?=^diff --git )", change, flags=re.MULTILINE)
+    header = (
+        "--- PARTIAL DIFF EXCERPTS (bounded inline evidence) ---\n"
+        "You have no repository tools. These excerpts omit content. Use only "
+        "the visible evidence and phase plan; do not claim to have inspected "
+        "omitted changes.\n"
+    )
+    allowance = max(1, (budget - len(header) - 128) // len(parts))
+    excerpts = []
+    omitted = 0
+    for part in parts:
+        if len(part) > allowance:
+            omitted += len(part) - allowance
+            part = part[:allowance]
+        excerpts.append(part)
+    result = header + "\n".join(excerpts)
+    suffix = f"\n[omitted {omitted} source characters across {len(parts)} sections]\n"
+    return result[:budget - len(suffix)] + suffix
 
 
 def _iteration_phase(ctx: StepContext) -> str:
@@ -2432,8 +2686,9 @@ class _UsageAccumulator:
         return out
 
 
-def _change_context(ctx: StepContext, *, diff_base=None) -> str:
-    """The change a commit is about to record, as data for the drafter (F-008).
+def _change_context(ctx: StepContext, *, diff_base=None) -> tuple[str, int]:
+    """The change a commit is about to record, as data for the drafter (F-008),
+    and the raw diff's length (the by-reference switch's input, #134).
 
     Normally the tracked diff vs HEAD plus the untracked files staging will add.
     When the phase already landed `P<N> wip:` checkpoint commits (FR-11.1), the
@@ -2452,6 +2707,39 @@ def _change_context(ctx: StepContext, *, diff_base=None) -> str:
     return (
         f"--- git status (incl. untracked) ---\n{status}\n"
         f"\n--- {label} ---\n{diff}"
+    ), len(diff)
+
+
+def _change_context_by_reference(ctx: StepContext, *, diff_base=None, why: str) -> str:
+    """:func:`_change_context` with the diff BY REFERENCE (#134).
+
+    The status (incl. untracked files) and the ``diff --stat`` change map stay
+    inline; the hunks do not. The drafter runs inside the worktree and reads
+    the per-file diffs it needs with its own git — the same transport the
+    review and confirm prompts use for an oversize range (cycle.py), and like
+    them never a truncation: a clipped diff would silently narrow what the
+    message claims to describe.
+    """
+    repo = ctx.work_root
+    base = diff_base or "HEAD"
+    label = (
+        f"vs phase base {diff_base[:10]}" if diff_base else "vs HEAD"
+    )
+    status = gitops.status_porcelain(repo, exclude=ctx.excludes)
+    stat = gitops.diff_stat(repo, base, exclude=ctx.excludes)
+    return (
+        f"--- git status (incl. untracked) ---\n{status}\n"
+        f"\n--- diff --stat (tracked, {label}) ---\n{stat}\n"
+        f"\n--- diff (tracked, {label}): BY REFERENCE — too large to inline "
+        f"({why}) ---\n"
+        f"You are running inside the repository worktree. Read the change "
+        f"yourself with git (read-only), e.g.:\n"
+        f"  git diff --stat {base}      # the change map — shown above\n"
+        f"  git diff {base} -- <path>   # per-file, for the files the message "
+        f"must explain\n"
+        f"Untracked files (`??` in the status) are not in the diff; read them "
+        f"directly. Draft for the ENTIRE change exactly as if the diff were "
+        f"inlined here, and keep the body free of the diff itself.\n"
     )
 
 

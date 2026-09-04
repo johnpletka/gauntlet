@@ -224,6 +224,20 @@ RERUNNABLE_FAILURE_KINDS = frozenset(
 RESPONSE_PENDING = "pending"
 RESPONSE_CONSUMED = "consumed"
 
+# --- human-response kinds (#134, rec. 3) --------------------------------------
+# ``text`` is an operator-authored prose decision (``resume --response``): the
+# re-drive classifies it (a cheap disposition model or the builder itself)
+# into the FR-3 disposition enum before anything proceeds. ``accept_artifacts``
+# is a STRUCTURED ratification (``resume --accept-artifacts``): the operator
+# states that the current authoring-surface bytes of the governed artifacts
+# ARE the approved artifacts. Its text is engine-generated (the artifact
+# digests), so no prose is ever interpreted: both disposition gates
+# short-circuit it to ``proceed_in_place`` with zero model calls. Additive —
+# entries predating the field load as ``text``.
+RESPONSE_KIND_TEXT = "text"
+RESPONSE_KIND_ACCEPT_ARTIFACTS = "accept_artifacts"
+RESPONSE_KINDS = frozenset({RESPONSE_KIND_TEXT, RESPONSE_KIND_ACCEPT_ARTIFACTS})
+
 # --- step lifecycle states ---------------------------------------------------
 PENDING = "pending"
 RUNNING = "running"
@@ -296,22 +310,52 @@ class HumanResponse(BaseModel):
     # step has no governed artifact (code_review mode) or on entries predating
     # the field — the guard skips rather than guesses. Additive/nullable.
     artifact_fingerprint: str | None = None
+    # How this entry was recorded (#134): ``text`` for an operator-authored
+    # prose decision (the default, so every entry written before the field
+    # existed loads unchanged); ``accept_artifacts`` for a structured artifact
+    # ratification whose ``response_text`` is engine-generated. The disposition
+    # gates key on this — never on the text — to bypass prose classification.
+    kind: Literal["text", "accept_artifacts"] = RESPONSE_KIND_TEXT
+
+
+class RatifiedArtifact(BaseModel):
+    """One governed artifact ratified as approved by ``resume --accept-artifacts``.
+
+    Append-only audit (#134): ``sha256`` is the digest of the AUTHORING-SURFACE
+    bytes (the operator's ``<run_root>/<slug>/<name>``) at the moment of the
+    ratification; ``response_id`` names the ``accept_artifacts`` response entry
+    that carried it; ``at`` is that entry's timestamp. Later ratifications
+    append — the latest entry per ``name`` is the run's last-known approved
+    digest, which the next ratification's drift audit compares against.
+    """
+
+    name: str
+    sha256: str
+    response_id: str
+    at: str
 
 
 class ScheduledResume(BaseModel):
-    """An armed auto-resume schedule on a usage-limit park (FR-3.4).
+    """An armed auto-resume schedule on a usage-limit or provider-unavailable
+    park (FR-3.4; generalized by #134).
 
     Persisted on the parked step BEFORE the run parks, so a process death
     between scheduling and ``attempt_at`` loses nothing — the next driver start
     or ``gauntlet resume`` reconciles from disk. ``attempt_at`` is the absolute
-    UTC time to resume (``now + retry_after_s``, else the quota reset time);
-    ``attempts`` counts spaced attempts made; once ``attempts >= max_attempts``
-    the step re-parks plain (no schedule) with an exhaustion note.
+    UTC time to resume (``now + retry_after_s``, else the quota reset time; for
+    a ``provider_unavailable`` park the recorded backoff / Retry-After
+    deadline); ``attempts`` counts spaced attempts made; once ``attempts >=
+    max_attempts`` the step re-parks plain (no schedule) with an exhaustion
+    note. ``reason`` records which park reason armed the schedule
+    (``usage_limit`` / ``provider_unavailable``) so the wait loop can consult
+    the matching config knob; ``None`` on manifests written before #134 (an
+    unstamped schedule is read as the step's own park reason). Additive/nullable.
     """
 
     attempt_at: str
     attempts: int = 0
     max_attempts: int = 3
+    reason: str | None = None
 
 
 class RevalidationRecord(BaseModel):
@@ -493,9 +537,11 @@ class StepRecord(BaseModel):
     # misrouted into the round-1 reviewer. Additive/nullable: older manifests load
     # unchanged.
     parked_substep: str | None = None
-    # Armed auto-resume schedule on a usage-limit park (FR-3.4). Set only when
-    # ``resume_on_quota: auto`` parked this step; ``None`` otherwise and after a
-    # successful resume. Additive/nullable — older manifests load unchanged.
+    # Armed auto-resume schedule on a usage-limit or provider-unavailable park
+    # (FR-3.4 / #134). Set only when ``resume_on_quota: auto`` (usage_limit) or
+    # ``resume_on_provider_unavailable: auto`` (provider_unavailable) parked
+    # this step; ``None`` otherwise and after a successful resume.
+    # Additive/nullable — older manifests load unchanged.
     scheduled_resume: ScheduledResume | None = None
     # Content-hash pair recorded on an ``artifact_invalid`` park (FR-7.2/§6). P3
     # defines the shape here; P4 populates it on the validator-repair park path.
@@ -575,6 +621,7 @@ class CommitRecord(BaseModel):
     step_id: str
     phase: str  # the PN[.x] prefix
     sha: str
+    base_sha: str | None = None  # full phase range; absent in older journals
 
 
 # --- evidence-tiered gates (pipeline-effectiveness FR-4, P8) ------------------
@@ -817,6 +864,10 @@ class Manifest(BaseModel):
     # the fork manual-push note. Absent (``None``) for branch mode / heavyweight
     # runs; additive, so older manifests load unchanged.
     pr: ReviewPrRecord | None = None
+    # Structured artifact ratifications (#134): one entry per governed artifact
+    # per `resume --accept-artifacts`, in record order. Additive — older
+    # manifests load with an empty list.
+    ratified_artifacts: list[RatifiedArtifact] = Field(default_factory=list)
     # Which tree layout this run was BORN into (P7c, spike §13). Set once by
     # `start()` from `config.worktree.mode` and never rewritten by a later
     # verb. Additive and optional, so every pre-P7c manifest loads unchanged

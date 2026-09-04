@@ -2,6 +2,8 @@
 
 import pytest
 
+from conftest import git
+
 from gauntlet.engine import gitops
 from gauntlet.engine.gitops import Identity
 
@@ -251,6 +253,60 @@ def test_wip_checkpoints_scoped_to_phase_ignores_other_phases_in_range(fixture_r
     # Unscoped still sees both (legacy behaviour) — and would pick the stray.
     unscoped = gitops.wip_checkpoints(fixture_repo, base=base)
     assert [s for _sha, s in unscoped] == ["P4 wip: stray", "P3 wip: one"]
+
+
+def test_phase_checkpoints_in_run_finds_checkpoints_beneath_adopted_commits(fixture_repo):
+    """#134: checkpoints buried beneath a plain (adopted) commit are invisible
+    to the trailing-run walk but found by the bounded run-history walk, which
+    also counts the adopted commits above/among them, walks through engine
+    bookkeeping, and stops at the previous phase's bare `P8:` commit."""
+    _wip(fixture_repo, "P8 wip: earlier", "z.py", "z\n")
+    gitops.commit_all(
+        fixture_repo, "P8: prior\n\nbody", identity=Identity("B", "b@g.local"),
+        allow_empty=True,
+    )
+    m1 = _wip(fixture_repo, "P9 wip: one", "a.py", "a\n")
+    _wip(fixture_repo, "operator: staged evidence", "e.md", "e\n")
+    m2 = _wip(fixture_repo, "P9 wip: two", "b.py", "b\n")
+    gitops.commit_all(
+        fixture_repo, "gauntlet: response consumed",
+        identity=Identity("E", "e@g.local"), allow_empty=True,
+    )
+    _wip(fixture_repo, "P9.1: Address review — tweak", "b.py", "b2\n")
+    git(fixture_repo, "branch", "base")  # a base ref with none of this history
+    git(fixture_repo, "update-ref", "refs/heads/base", "HEAD~7")
+    assert gitops.wip_checkpoints(fixture_repo, phase="P9") == []
+    wips, adopted = gitops.phase_checkpoints_in_run(
+        fixture_repo, phase="P9", base_branch="base"
+    )
+    assert [sha for sha, _s in wips] == [m2, m1]  # newest first
+    assert adopted == 2  # the operator commit and the fix round; not bookkeeping
+
+
+def test_phase_checkpoints_in_run_is_bounded_to_the_run_branch(fixture_repo):
+    """Same-prefix checkpoints in the base branch's pre-run history are never
+    counted, and a missing base ref raises rather than walking unbounded."""
+    _wip(fixture_repo, "P9 wip: earlier run", "old.py", "o\n")
+    git(fixture_repo, "checkout", "-qb", "run")
+    _wip(fixture_repo, "operator: staged evidence", "e.md", "e\n")
+    wips, adopted = gitops.phase_checkpoints_in_run(
+        fixture_repo, phase="P9", base_branch="main"
+    )
+    assert wips == [] and adopted == 1
+    with pytest.raises(gitops.GitError):
+        gitops.phase_checkpoints_in_run(
+            fixture_repo, phase="P9", base_branch="no-such-branch"
+        )
+
+
+def test_phase_checkpoints_in_run_fails_closed_on_wrong_phase(fixture_repo):
+    git(fixture_repo, "checkout", "-qb", "run")
+    _wip(fixture_repo, "P8 wip: mistyped", "z.py", "z\n")
+    _wip(fixture_repo, "P9 wip: real", "a.py", "a\n")
+    _wip(fixture_repo, "operator: staged evidence", "e.md", "e\n")
+    with pytest.raises(gitops.WrongPhaseCheckpointError) as exc:
+        gitops.phase_checkpoints_in_run(fixture_repo, phase="P9", base_branch="main")
+    assert exc.value.found_subject == "P8 wip: mistyped"
 
 
 def test_wip_checkpoints_trailing_run_fails_closed_on_wrong_phase(fixture_repo):

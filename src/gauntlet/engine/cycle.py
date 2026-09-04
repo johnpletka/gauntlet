@@ -63,6 +63,7 @@ from gauntlet.engine.execution import (
     run_bookkeeping_paths,
 )
 from gauntlet.engine.pipeline import Step
+from gauntlet.engine.steptypes import PROMPT_INPUT_HEADROOM, profile_input_cap
 
 DEFAULT_FINDINGS_SCHEMA = "schemas/findings.json"
 DEFAULT_TRIAGE_SCHEMA = "schemas/triage.json"
@@ -742,7 +743,22 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # cycle re-drives with the decision injected, unchanged).
     disposition_agent = step.get("disposition_agent")
     settled_upstream: set[tuple[str, str]] = set()
-    if is_response_redrive and disposition_agent:
+    from gauntlet.engine.steptypes import pending_response_kind
+
+    if is_response_redrive and pending_response_kind(ctx) == "accept_artifacts":
+        # #134: a structured ratification (`resume --accept-artifacts`) is
+        # proceed_in_place by construction — no prose to classify, so the
+        # disposition emitter is never invoked (zero model calls). The prior
+        # round's upstream question is settled exactly as a routed proceed
+        # settles it (#106), and the roles re-drive against the ratified
+        # artifacts with the decision block injected as usual.
+        settled_upstream = _prior_upstream_fingerprints(ctx)
+        step_logger(ctx, "response-disposition").log_text(
+            "disposition-ratified.txt",
+            "engine: --accept-artifacts ratification → proceed_in_place; "
+            "disposition agent not invoked",
+        )
+    elif is_response_redrive and disposition_agent:
         # Snapshot the exact upstream question BEFORE fresh review invalidates
         # the prior round's findings/triage artifacts.  A proceeding disposition
         # settles only this (finding-root, target-artifact) pair; a genuinely new
@@ -2168,27 +2184,29 @@ def _phase_and_handoff(step: Step, ctx: StepContext) -> tuple[str | None, str]:
 
 
 def _code_review_base(ctx: StepContext, handoff: str) -> str:
-    """Round-1 code_review base: the phase's starting tip, so the review diff
-    spans the WHOLE phase.
-
-    ``manifest.commits`` records only phase-marker and fix commits (never the
-    intra-phase ``P<N> wip:`` checkpoint commits, FR-11.2), so the entry recorded
-    *before* ``handoff`` is exactly this phase's starting tip — the previous
-    phase's marker/last-fix. Diffing from there spans every checkpoint commit of
-    this phase plus its final marker, so a phase whose work landed entirely in
-    checkpoints (leaving an EMPTY marker commit) still presents its full diff for
-    review instead of an empty range.
-
-    Falls back to ``<handoff>^`` when ``handoff`` is the first recorded commit or
-    is not a recorded commit at all (an empty manifest / a lightweight first
-    review). This is identical to the previous ``handoff^`` behaviour whenever a
-    phase was a single commit (the pre-checkpoint invariant: ``handoff^`` then WAS
-    the previous marker), so it is a strict generalisation, not a behaviour change
-    for the single-commit case."""
+    """Use the persisted phase base; old journals skip same-phase fixes."""
     commits = ctx.manifest.commits
     for i in range(len(commits) - 1, -1, -1):
-        if commits[i].sha == handoff:
-            return commits[i - 1].sha if i > 0 else f"{handoff}^"
+        commit = commits[i]
+        if commit.sha != handoff:
+            continue
+        phase = commit.phase.split(".")[0]
+        first = i
+        while first > 0 and phase[1:].isdigit() and commits[first - 1].phase.split(".")[0] == phase:
+            first -= 1
+        previous = commits[first - 1].sha if first else None
+        base = commit.base_sha
+        if base and (previous is None or gitops.is_ancestor(ctx.work_root, base, previous)):
+            return base
+        if previous:
+            return previous
+        # Legacy manifests have no CommitRecord.base_sha. The matching
+        # foreach commit record may still carry a repaired base after adoption.
+        record = (ctx.manifest.record(commit.step_id, ctx.record.iteration)
+                  if isinstance(ctx.manifest, M.Manifest) else None)
+        if record is not None and record.base_sha:
+            return record.base_sha
+        return f"{commits[first].sha}^"
     return f"{handoff}^"
 
 
@@ -2646,10 +2664,10 @@ def _spec_reference_block(step: Step, ctx: StepContext, rnd: int) -> str:
 
 # Headroom under the adapter's declared input cap for everything appended
 # around the diff (lens fragments, carried findings, the human-decision block)
-# plus CLI envelope overhead. 64 KiB is deliberately generous: the cost of
-# switching to by-reference a little early is a few reviewer git reads; the
-# cost of switching late is the whole invocation rejected (`input_too_large`).
-_REVIEW_PROMPT_HEADROOM = 65_536
+# plus CLI envelope overhead. One constant shared with the commit-message
+# drafter's by-reference switch (steptypes, #134) so every prompt builder
+# switches at the same margin; see PROMPT_INPUT_HEADROOM for the sizing note.
+_REVIEW_PROMPT_HEADROOM = PROMPT_INPUT_HEADROOM
 
 
 def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
@@ -2664,13 +2682,14 @@ def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
     for member in _panel(step):
         if not member.profile:
             continue
-        try:
-            capabilities = ctx.config.profile(member.profile).adapter_class().capabilities
-        except Exception:
+        cap, member_reads_repo = profile_input_cap(ctx, member.profile)
+        if cap is None and not member_reads_repo:
+            # `profile_input_cap` could not resolve the profile at all (a
+            # test double / no config profile): unknown, inline as today.
             return None, False
-        if capabilities.max_input_chars is not None:
-            caps.append(capabilities.max_input_chars)
-        reads_repo = reads_repo and capabilities.reads_repo
+        if cap is not None:
+            caps.append(cap)
+        reads_repo = reads_repo and member_reads_repo
     return (min(caps) if caps else None), reads_repo
 
 

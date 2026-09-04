@@ -214,6 +214,8 @@ def test_section_6_2_example_validates():
         # Additive FR-10.3 advisory channel: always present, empty when none.
         "warnings": [],
         "quota": None,
+        # Additive #134: the armed auto-resume schedule; null when unarmed.
+        "scheduled_resume": None,
         "driver": {"state": "none", "pid": None, "since": None, "host": None},
         # FR-7.2: a human_gate park now stamps/emits the normalized `gate` reason.
         "parked": {"step_id": "impl-cycle.0", "type": "human_gate", "reason": "gate"},
@@ -673,3 +675,60 @@ def test_cli_json_contract_violation_exits_nonzero_empty_stdout(
     assert result.exit_code != 0
     assert result.stdout.strip() == ""  # no half-formed object on stdout
     assert "error:" in result.stderr
+
+
+# --- #134: the armed auto-resume schedule is exposed additively ---------------
+def test_scheduled_resume_block_on_provider_unavailable_park():
+    man = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                   quota_reset_at="2026-07-02T09:00:00+00:00",
+                   scheduled_resume=M.ScheduledResume(
+                       attempt_at="2026-07-02T09:00:00+00:00", attempts=1,
+                       max_attempts=3, reason="provider_unavailable")),
+    ])
+    payload = _payload(man, op.LIVENESS_ALIVE)
+    assert payload["state"] == "parked_provider_unavailable"
+    assert payload["scheduled_resume"] == {
+        "attempt_at": "2026-07-02T09:00:00+00:00",
+        "attempts": 1,
+        "max_attempts": 3,
+        "reason": "provider_unavailable",
+    }
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_scheduled_resume_block_on_usage_limit_park_with_null_reason():
+    # A pre-#134 schedule (no reason stamp) still renders, with reason null.
+    man = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                   scheduled_resume=M.ScheduledResume(
+                       attempt_at="2026-07-02T09:00:00+00:00")),
+    ])
+    payload = _payload(man, op.LIVENESS_NONE)
+    assert payload["scheduled_resume"] == {
+        "attempt_at": "2026-07-02T09:00:00+00:00",
+        "attempts": 0,
+        "max_attempts": 3,
+        "reason": None,
+    }
+    validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_scheduled_resume_always_present_null_when_unarmed():
+    assert "scheduled_resume" in STATUS_SCHEMA["required"]
+    # A provider park with no schedule (notify mode / exhausted) → null.
+    plain = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+                   quota_reset_at="2026-07-02T09:00:00+00:00"),
+    ])
+    payload = _payload(plain, op.LIVENESS_NONE)
+    assert payload["scheduled_resume"] is None
+    validate_schema(payload, STATUS_SCHEMA)
+    # Non-park states → null.
+    gate = _manifest(M.RUN_PARKED, [_step("gate", "human_gate", M.PARKED)])
+    assert _payload(gate, op.LIVENESS_NONE)["scheduled_resume"] is None
+    running = _manifest(M.RUN_RUNNING, [_step("s", "agent_task", M.RUNNING)])
+    assert _payload(running, op.LIVENESS_ALIVE)["scheduled_resume"] is None
