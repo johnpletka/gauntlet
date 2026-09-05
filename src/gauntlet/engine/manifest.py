@@ -488,6 +488,14 @@ class StepRecord(BaseModel):
     attempts: int = 0
     # Transaction boundary (F-003): HEAD before the step touched the worktree.
     base_sha: str | None = None
+    # Immutable start of the numeric foreach phase this step belongs to (#148).
+    # Unlike ``base_sha`` (an attempt boundary that retries/recovery legitimately
+    # re-anchor), this is stamped before the phase's first step and shared by every
+    # record in that phase iteration. Checkpoint discovery uses it to exclude a
+    # prior phase's sanctioned gate-time commits without inferring provenance from
+    # ambiguous ``P<N> wip:`` subject ordering. Cleared only when rollback resets
+    # the phase. Additive/nullable so pre-1.3 manifests load fail-closed.
+    phase_start_sha: str | None = None
     # Park discriminator (FR-7.2), one of ``PARKED_REASONS``. CURRENT-STATE, not a
     # latch: ``_finalize`` copies the just-finished execution's value and clears it
     # (back to None) on any non-park finalization, so a stale value can never cause

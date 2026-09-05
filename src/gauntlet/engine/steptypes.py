@@ -2144,9 +2144,20 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     wip_scope = (
         phase_prefix if phase_prefix and re.fullmatch(r"P\d+", phase_prefix) else None
     )
+    # #148: this immutable foreach boundary is stamped before the phase's first
+    # step. It excludes prior-phase gate-time operator checkpoints without trying
+    # to infer their provenance from commit subjects; any wrong-phase checkpoint
+    # after the boundary is therefore unambiguously current-phase work and fails
+    # closed. Older/custom contexts carry None and retain the conservative walk.
+    phase_start = ctx.record.phase_start_sha if wip_scope else None
     try:
-        wips = gitops.wip_checkpoints(repo, phase=wip_scope)
-    except gitops.WrongPhaseCheckpointError as exc:
+        wips = gitops.wip_checkpoints(
+            repo, phase=wip_scope, phase_start=phase_start
+        )
+    except (
+        gitops.WrongPhaseCheckpointError,
+        gitops.PhaseStartBoundaryError,
+    ) as exc:
         return StepResult(status=FAILED, notes=f"checkpoint discovery failed closed: {exc}")
     # #134: the trailing run is EMPTY when a non-checkpoint commit sits above
     # the builder's checkpoints — an operator pre-commit that `resume` adopted
@@ -2168,9 +2179,15 @@ def handle_commit(step: Step, ctx: StepContext) -> StepResult:
     if not wips and wip_scope and gitops.is_clean(repo, exclude=exclude):
         try:
             buried, adopted_above = gitops.phase_checkpoints_in_run(
-                repo, phase=wip_scope, base_branch=ctx.manifest.base_branch,
+                repo,
+                phase=wip_scope,
+                base_branch=ctx.manifest.base_branch,
+                phase_start=phase_start,
             )
-        except gitops.WrongPhaseCheckpointError as exc:
+        except (
+            gitops.WrongPhaseCheckpointError,
+            gitops.PhaseStartBoundaryError,
+        ) as exc:
             return StepResult(
                 status=FAILED, notes=f"checkpoint discovery failed closed: {exc}"
             )

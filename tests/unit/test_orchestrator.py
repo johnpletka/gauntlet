@@ -840,6 +840,29 @@ stages:
     assert orch.approve_gate("gate") in (M.RUN_PARKED, M.RUN_DONE)
 
 
+def test_numeric_phase_start_is_persisted_across_gate_resume(fixture_repo):
+    """Every record in a numeric foreach phase shares its immutable start SHA."""
+    text = """
+name: demo
+version: 1
+stages:
+  - id: phases
+    foreach: vars.items
+    steps:
+      - {id: gate, type: human_gate}
+      - {id: after, type: shell, run: "true"}
+"""
+    start = gitops.head_sha(fixture_repo)
+    orch = _build(
+        fixture_repo, text, extra_context={"items": [{"id": "P1"}]}
+    )
+
+    assert orch.drive() == M.RUN_PARKED
+    assert orch.manifest.record("gate", "0").phase_start_sha == start
+    assert orch.approve_gate("gate") == M.RUN_DONE
+    assert orch.manifest.record("after", "0").phase_start_sha == start
+
+
 def test_shell_timeout_halts(fixture_repo):
     # Review F-006: a shell step exceeding its timeout halts at a checkpoint.
     text = """

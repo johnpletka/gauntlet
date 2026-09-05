@@ -66,6 +66,18 @@ class WrongPhaseCheckpointError(RuntimeError):
         self.found_subject = found_subject
 
 
+class PhaseStartBoundaryError(RuntimeError):
+    """The recorded phase start cannot safely bound checkpoint discovery."""
+
+    def __init__(self, phase_start: str, tip: str) -> None:
+        super().__init__(
+            f"recorded phase start {phase_start!r} is not an ancestor of "
+            f"checkpoint tip {tip!r}; refusing an unbounded checkpoint walk"
+        )
+        self.phase_start = phase_start
+        self.tip = tip
+
+
 class GitError(RuntimeError):
     """A git invocation failed. Carries argv + stderr for the manifest/log."""
 
@@ -1216,6 +1228,7 @@ def wip_checkpoints(
     repo: Path,
     *,
     base: str | None = None,
+    phase_start: str | None = None,
     tip: str = "HEAD",
     limit: int = 1000,
     phase: str | None = None,
@@ -1235,65 +1248,54 @@ def wip_checkpoints(
       checkpoint the recovery rewind targets. Non-matching commits in the range
       are skipped, not a stop.
     * ``base`` absent (commit step, FR-11.1): the TRAILING run of (scoped)
-      checkpoint commits at ``tip`` — walk back to the first real gap (the prior
-      phase's ``P<N>:`` commit / the branch base). Engine bookkeeping commits
+      checkpoint commits at ``tip`` — walk back to the first real gap. When the
+      orchestrator supplies its persisted ``phase_start``, the log is bounded to
+      ``phase_start..tip``: prior-phase gate-time operator commits are outside the
+      range by construction, while ANY wrong-phase ``P<N> wip:`` inside it fails
+      closed. That independent boundary is required because a prior-phase gate
+      commit and a mistyped FIRST checkpoint of this phase have the same subject
+      ordering (#148 review). Without it the legacy walk remains conservative and
+      fails on every ambiguous wrong-phase checkpoint. Engine bookkeeping commits
       (``gauntlet:`` subjects) are walked THROUGH, not treated as a gap, so a
       checkpoint preserved beneath a recovery rewind is still found (review
-      F-002). When ``phase`` is scoped, a ``P<N> wip:`` commit for a DIFFERENT
-      phase INTERLEAVED with this phase's run (a current-phase checkpoint sits
-      beneath it) raises :class:`WrongPhaseCheckpointError` (fail closed,
-      review F-001) rather than being squashed into — or silently truncating
-      the run at — the wrong phase; one at the BOTTOM of the run (a prior
-      phase's gate-time operator commit, #148) is the phase boundary and stops
-      the walk losslessly. This is the set the phase-end commit collapses
-      (squash) or lists (keep marker).
+      F-002). This is the set the phase-end commit collapses (squash) or lists
+      (keep marker).
     """
     matcher = _wip_subject_re(phase)
     if base is not None:
         out = _run(repo, "log", "--format=%H%x00%s", f"{base}..{tip}")
         stop_at_gap = False
+    elif phase_start is not None:
+        if not is_ancestor(repo, phase_start, tip):
+            raise PhaseStartBoundaryError(phase_start, tip)
+        out = _run(repo, "log", "--format=%H%x00%s", f"{phase_start}..{tip}")
+        stop_at_gap = True
     else:
         out = _run(repo, "log", f"-{limit}", "--format=%H%x00%s", tip)
         stop_at_gap = True
     lines = out.splitlines()
+    if phase_start is not None and phase is not None:
+        # The persisted boundary proves every checkpoint in this range belongs
+        # to the current phase, even one hidden beneath a plain adopted commit
+        # that ends the trailing-run result. Audit the WHOLE bounded range before
+        # collecting that trailing subset so a gap cannot conceal a mistype.
+        for line in lines:
+            subject = line.partition("\x00")[2]
+            if _WIP_SUBJECT_RE.match(subject) and not matcher.match(subject):
+                raise WrongPhaseCheckpointError(phase, subject)
     result: list[tuple[str, str]] = []
-    for i, line in enumerate(lines):
+    for line in lines:
         sha, _, subject = line.partition("\x00")
         if matcher.match(subject):
             result.append((sha, subject))
         elif stop_at_gap:
             if phase is not None and _WIP_SUBJECT_RE.match(subject):
-                # A `P<N> wip:` for another phase in this phase's trailing run.
-                # Two distinct situations share this shape (#148):
-                #
-                #   * a mistyped checkpoint INTERLEAVED with this phase's run
-                #     (e.g. `P8 wip:` landed during P9) — stopping here would
-                #     silently truncate the run and leave the genuine wips
-                #     beneath it out of the squash, so fail closed;
-                #   * a prior phase's sanctioned gate-time operator commit at
-                #     the BOTTOM of the run (committed while parked at that
-                #     phase's gate, so it necessarily follows its `P<N>:`
-                #     commit) — no current-phase wip lies beneath it, stopping
-                #     is provably lossless, and it is the phase boundary.
-                #
-                # Only the interleaved case has anything to protect: fail
-                # closed iff a current-phase checkpoint exists further down
-                # WITHIN the contiguous trailing run. The lookahead walks
-                # through wip and bookkeeping subjects only and stops at the
-                # first real gap (a `P<N>:` phase commit / the branch base):
-                # beyond that gap lies pre-phase history, where an earlier
-                # run's same-numbered `P<N> wip:` commits (merged to the base
-                # branch) are ordinary history, not this phase's checkpoints.
-                for rest in lines[i + 1 :]:
-                    rest_subject = rest.partition("\x00")[2]
-                    if matcher.match(rest_subject):
-                        raise WrongPhaseCheckpointError(phase, subject)
-                    if not (
-                        _WIP_SUBJECT_RE.match(rest_subject)
-                        or _ENGINE_SUBJECT_RE.match(rest_subject)
-                    ):
-                        break
-                break
+                # With an explicit phase_start, everything in the range was
+                # committed after this phase began. Without one the commit's
+                # provenance is ambiguous. Both cases must fail closed: subject
+                # ordering alone cannot prove this is a prior gate commit rather
+                # than the first checkpoint of the current phase (#148 review).
+                raise WrongPhaseCheckpointError(phase, subject)
             if _ENGINE_SUBJECT_RE.match(subject):
                 # Engine bookkeeping commit (a response/rewind checkpoint) can sit
                 # between this phase's wip commits after a checkpoint-preserving
@@ -1314,6 +1316,7 @@ def phase_checkpoints_in_run(
     *,
     phase: str,
     base_branch: str,
+    phase_start: str | None = None,
     tip: str = "HEAD",
     limit: int = 1000,
 ) -> tuple[list[tuple[str, str]], int]:
@@ -1337,14 +1340,20 @@ def phase_checkpoints_in_run(
     ``P<N> wip:`` for ANOTHER phase anywhere in the walked range, mirroring the
     trailing-run rule (review F-001). Bounding to ``^base_branch`` means a
     same-prefix checkpoint from an earlier run/PRD in the base branch's history
-    can never be counted; a missing base ref raises :class:`GitError` so the
-    caller declines the fallback rather than walking unbounded.
+    can never be counted. When the orchestrator supplies its persisted
+    ``phase_start``, that tighter boundary also excludes a prior phase's valid
+    gate-time ``wip:`` commits while leaving every current-phase mistype inside
+    the fail-closed range (#148 review). A missing/unreachable boundary raises so
+    the caller declines the fallback rather than walking unbounded.
     """
     matcher = _wip_subject_re(phase)
     result: list[tuple[str, str]] = []
     adopted = 0
+    boundary = phase_start or base_branch
+    if phase_start is not None and not is_ancestor(repo, phase_start, tip):
+        raise PhaseStartBoundaryError(phase_start, tip)
     for sha, subject in commits_from_head(
-        repo, tip, exclude_reachable_from=base_branch, limit=limit
+        repo, tip, exclude_reachable_from=boundary, limit=limit
     ):
         if matcher.match(subject):
             result.append((sha, subject))
