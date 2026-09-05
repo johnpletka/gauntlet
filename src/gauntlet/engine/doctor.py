@@ -1296,11 +1296,6 @@ def _check_repo_secrets(repo_root: Path, asset_root: str = ".") -> CheckResult:
     return CheckResult("repo-secrets", OK, "no credential literals in repo config")
 
 
-# How many drifted asset names to name in the detail line before eliding the
-# rest. Enough to act on; short enough to stay one readable terminal line.
-_DRIFT_NAMES_SHOWN = 6
-
-
 def _check_asset_drift(repo_root: Path, asset_root: str = ".") -> CheckResult:
     """Warn when a scaffolded asset no longer matches the running version's.
 
@@ -1380,10 +1375,11 @@ def _check_asset_drift(repo_root: Path, asset_root: str = ".") -> CheckResult:
         parts.append(f"{len(missing)} missing")
     if unreadable:
         parts.append(f"{len(unreadable)} unreadable")
-    shown = ", ".join(problems[:_DRIFT_NAMES_SHOWN])
-    elided = len(problems) - _DRIFT_NAMES_SHOWN
-    if elided > 0:
-        shown += f", +{elided} more"
+    # The set is bounded by the packaged scaffold (29 assets today), and every
+    # path is needed to act on the warning. Do not elide results: doing so sends
+    # an operator back to manually comparing the full tree to discover the
+    # hidden files — the exact work this check exists to remove (#154).
+    shown = ", ".join(problems)
     return CheckResult(
         name, WARN,
         f"{' / '.join(parts)} of {total} scaffolded assets vs gauntlet "

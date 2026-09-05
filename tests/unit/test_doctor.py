@@ -1148,6 +1148,32 @@ def test_asset_drift_warns_when_a_prompt_falls_behind(tmp_path):
     assert not has_failure(results)
 
 
+def test_asset_drift_names_every_drifted_asset(tmp_path):
+    # The motivating repo had 14 drifted assets. Every path must be visible by
+    # default so the warning is actionable without a second full-tree audit.
+    repo = _healthy_repo(tmp_path)
+    changed = [
+        ".gauntlet/policy.yaml",
+        ".gauntlet/pipelines/review.yaml",
+        ".gauntlet/pipelines/standard.yaml",
+        ".gauntlet/prompts/commit-message.md",
+        ".gauntlet/prompts/cycle-confirm.md",
+        ".gauntlet/prompts/cycle-fix.md",
+        ".gauntlet/prompts/cycle-rereview.md",
+    ]
+    for rel in changed:
+        path = repo / rel
+        path.write_text(path.read_text() + "\n# local drift\n")
+
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    drift = _by_name(results)["asset-drift"]
+    assert drift.status == WARN
+    assert "7 differ" in drift.detail
+    for rel in changed:
+        assert rel in drift.detail
+    assert "+1 more" not in drift.detail
+
+
 def test_asset_drift_reports_a_deleted_asset_as_missing(tmp_path):
     repo = _healthy_repo(tmp_path)
     (repo / ".gauntlet/schemas/confirm.json").unlink()
