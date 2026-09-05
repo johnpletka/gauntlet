@@ -1115,3 +1115,115 @@ def test_keep_awake_check_ok_by_default_and_na_off_darwin(monkeypatch):
     assert _check_keep_awake(cfg, platform="linux").status == OK
     monkeypatch.setattr("gauntlet.engine.doctor.shutil.which", lambda _n: "/usr/bin/caffeinate")
     assert _check_keep_awake(cfg, platform="darwin").status == OK
+
+
+# ---- scaffold asset drift (#19: init never updates an existing asset) -------
+# The gap these cover: `init` writes prompts/schemas/pipelines/policy once and
+# then skips them by existence forever, so a project's assets silently fall
+# behind the engine that reads them. Nothing warned. Now something does.
+
+def test_asset_drift_ok_on_freshly_scaffolded_repo(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    drift = _by_name(results)["asset-drift"]
+    assert drift.status == OK
+    assert "match" in drift.detail
+
+
+def test_asset_drift_warns_when_a_prompt_falls_behind(tmp_path):
+    # The regression under test: a prompt scaffolded by an older Gauntlet and
+    # never updated. Stand in for "older" with any content difference — the
+    # check compares against the RUNNING version's scaffold, which is exactly
+    # what an old copy fails to match.
+    repo = _healthy_repo(tmp_path)
+    stale = repo / ".gauntlet/prompts/cycle-confirm.md"
+    stale.write_text("# an older version of this prompt\n")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    drift = _by_name(results)["asset-drift"]
+    assert drift.status == WARN
+    assert drift.status != FAIL  # drift gates no run — never a blocker
+    assert ".gauntlet/prompts/cycle-confirm.md" in drift.detail
+    assert drift.remedy
+    # doctor as a whole must still exit zero: warn-only, like the skill checks.
+    assert not has_failure(results)
+
+
+def test_asset_drift_reports_a_deleted_asset_as_missing(tmp_path):
+    repo = _healthy_repo(tmp_path)
+    (repo / ".gauntlet/schemas/confirm.json").unlink()
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    drift = _by_name(results)["asset-drift"]
+    assert drift.status == WARN
+    assert "missing" in drift.detail
+    assert ".gauntlet/schemas/confirm.json" in drift.detail
+
+
+def test_asset_drift_ignores_per_project_config_and_pins(tmp_path):
+    # config.yaml and pins.yaml differ from the scaffold on every healthy repo
+    # by design (test-command detection, machine-verified CLI versions). If they
+    # were compared, this check would warn on everyone and be ignored by
+    # everyone — so the taxonomy excludes them and this pins that.
+    repo = _healthy_repo(tmp_path)
+    (repo / ".gauntlet/config.yaml").write_text(
+        (repo / ".gauntlet/config.yaml").read_text() + "\n# local note\n"
+    )
+    (repo / ".gauntlet/pins.yaml").write_text("verified_date: \"2026-01-01\"\nclis: {}\n")
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    assert _by_name(results)["asset-drift"].status == OK
+
+
+def test_asset_drift_does_not_dereference_a_symlinked_asset(tmp_path):
+    # Same hazard `_check_skill` refuses (F-003): reading through a symlink
+    # would pull content from outside the repo into diagnostics.
+    repo = _healthy_repo(tmp_path)
+    outside = tmp_path.parent / "outside-secret.md"
+    outside.write_text("content from outside the repo\n")
+    target = repo / ".gauntlet/prompts/triage.md"
+    target.unlink()
+    target.symlink_to(outside)
+    results = run_doctor(repo, probes=_probes(_GOOD_VERSIONS, _GOOD_ENV))
+    drift = _by_name(results)["asset-drift"]
+    assert drift.status == WARN
+    assert "symlink" in drift.detail
+    assert "content from outside" not in drift.detail
+
+
+def test_asset_drift_resolves_targets_through_asset_root(tmp_path):
+    # Gauntlet's own repo keeps assets at the root (`asset_root: "."`) while an
+    # adopter consolidates under `.gauntlet/`. A check hardcoding `.gauntlet/`
+    # would report every asset missing for the former.
+    from gauntlet.engine.doctor import _check_asset_drift
+    from gauntlet.engine.init import SCAFFOLD_DIR, content_contract_assets
+    import shutil
+
+    root_style = tmp_path / "root-style"
+    for src, asset_rel in content_contract_assets():
+        dst = root_style / asset_rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    assert _check_asset_drift(root_style, ".").status == OK
+    # …and the same tree read as if assets lived under .gauntlet/ is all-missing.
+    assert _check_asset_drift(root_style, ".gauntlet").status == WARN
+    assert SCAFFOLD_DIR.is_dir()
+
+
+def test_content_contract_assets_covers_every_scaffold_prompt_and_schema():
+    # The coverage guarantee that keeps this fix honest as the scaffold grows:
+    # the asset set is DERIVED from init's own maps, so a prompt or schema added
+    # tomorrow is drift-checked without anyone editing a second list. A
+    # hand-maintained list is exactly how this class of gap reappears.
+    from gauntlet.engine.init import SCAFFOLD_DIR, content_contract_assets
+
+    covered = {rel for _src, rel in content_contract_assets()}
+    for sub in ("prompts", "schemas", "pipelines"):
+        on_disk = {
+            p.relative_to(SCAFFOLD_DIR).as_posix()
+            for p in (SCAFFOLD_DIR / sub).rglob("*")
+            if p.is_file()
+        }
+        assert on_disk, f"scaffold/{sub} unexpectedly empty"
+        assert on_disk <= covered, f"uncovered in scaffold/{sub}: {on_disk - covered}"
+    assert "policy.yaml" in covered
+    # Per-project assets stay out (see the noise test above).
+    assert "config.yaml" not in covered
+    assert "pins.yaml" not in covered
