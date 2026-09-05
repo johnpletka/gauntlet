@@ -99,6 +99,42 @@ _ASSET_DIRS = {
     "schemas": ".gauntlet/schemas",
 }
 
+# Assets that are per-project BY DESIGN, so a byte difference from the scaffold
+# carries no signal: the config gets test-command detection on create (#18) plus
+# every profile and knob a project tunes, and the pin file records the CLI
+# versions THIS machine verified (FR-1.5). Both are excluded from the drift
+# check below — reporting them would be pure noise on every healthy repo.
+_PER_PROJECT_ASSETS = frozenset({CONFIG_TARGET, ".gauntlet/pins.yaml"})
+
+
+def content_contract_assets() -> list[tuple[Path, str]]:
+    """(scaffold source, asset-root-relative target) for every asset whose
+    CONTENT the engine has a runtime contract with: the prompts it renders, the
+    schemas it validates agent output against, the pipelines it executes, and
+    the policy the judge enforces.
+
+    Derived from the same maps ``_asset_pairs`` uses, so an asset added to the
+    scaffold is covered by ``doctor._check_asset_drift`` automatically instead
+    of needing a second list kept in sync by hand.
+
+    Targets are relative to the project's ``asset_root`` rather than repo-root,
+    because Gauntlet's own repo keeps these assets at the root (``asset_root:
+    "."``) while an adopter consolidates them under ``.gauntlet/``. The scaffold
+    source layout mirrors the asset-root layout, so the source-relative path is
+    the target.
+    """
+    pairs: list[tuple[Path, str]] = []
+    for src_rel, dst_rel in _ASSET_FILES.items():
+        if dst_rel in _PER_PROJECT_ASSETS:
+            continue
+        pairs.append((SCAFFOLD_DIR / src_rel, src_rel))
+    for src_dir in _ASSET_DIRS:
+        base = SCAFFOLD_DIR / src_dir
+        for src in sorted(base.rglob("*")):
+            if src.is_file():
+                pairs.append((src, src.relative_to(SCAFFOLD_DIR).as_posix()))
+    return pairs
+
 # Action verbs recorded per touched path.
 CREATED = "created"
 SKIPPED = "skipped"      # asset already present; left untouched (idempotent)
