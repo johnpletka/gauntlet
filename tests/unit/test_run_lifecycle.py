@@ -1025,8 +1025,24 @@ def test_rollback_rewind_resets_later_foreach_iterations(tmp_path):
     for it in ("0", "1"):
         for sid in ("implement", "phase-commit", "impl-cycle"):
             man.upsert(M.StepRecord(id=sid, type="", status=M.DONE, iteration=it))
-    man.upsert(M.StepRecord(id="implement", type="", status=M.DONE, iteration="2"))
-    man.upsert(M.StepRecord(id="phase-commit", type="", status=M.FAILED, iteration="2"))
+    man.upsert(
+        M.StepRecord(
+            id="implement",
+            type="",
+            status=M.DONE,
+            iteration="2",
+            phase_start_sha="phase-3-start",
+        )
+    )
+    man.upsert(
+        M.StepRecord(
+            id="phase-commit",
+            type="",
+            status=M.FAILED,
+            iteration="2",
+            phase_start_sha="phase-3-start",
+        )
+    )
 
     _rewind_manifest_state(man, run_dir, target="ddd")
 
@@ -1035,6 +1051,8 @@ def test_rollback_rewind_resets_later_foreach_iterations(tmp_path):
     # its step ids sit inside the static keep-set.
     assert man.record("implement", "2").status == M.PENDING
     assert man.record("phase-commit", "2").status == M.PENDING
+    assert man.record("implement", "2").phase_start_sha is None
+    assert man.record("phase-commit", "2").phase_start_sha is None
     # Iterations at or before the boundary are untouched.
     for it in ("0", "1"):
         for sid in ("implement", "phase-commit", "impl-cycle"):

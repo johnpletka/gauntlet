@@ -7435,6 +7435,7 @@ def _rewind_manifest_state(man: Manifest, run_dir: Path, target: str) -> None:
         if past or rec.status not in (M.DONE, M.SKIPPED, M.PENDING):
             rec.status = M.PENDING
             rec.base_sha = None
+            rec.phase_start_sha = None
             rec.session_id = None
             rec.ended = None
             # Current-state discriminators (FR-2.1/FR-7.2): a pending record

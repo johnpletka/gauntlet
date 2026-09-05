@@ -426,7 +426,7 @@ def test_implement_prompt_instructs_wip_checkpoints():
 
 
 # --- #124: reconcile a phase commit reachable from HEAD but behind base_sha ---
-def _ctx_for_commit(repo, base_sha, *, config=None):
+def _ctx_for_commit(repo, base_sha, *, config=None, phase_start_sha=None):
     """A minimal StepContext for driving handle_commit directly, with an
     explicit record.base_sha (the orchestrator normally sets it to HEAD-at-start;
     here we simulate a base re-anchored past the phase commit by resume adoption)."""
@@ -440,7 +440,12 @@ def _ctx_for_commit(repo, base_sha, *, config=None):
         config=RunConfig.model_validate(cfg),
         pipeline=Pipeline.model_validate({"name": "demo", "version": 1, "stages": []}),
         manifest=man,
-        record=StepRecord(id="commit", type="commit", base_sha=base_sha),
+        record=StepRecord(
+            id="commit",
+            type="commit",
+            base_sha=base_sha,
+            phase_start_sha=phase_start_sha,
+        ),
         writer=RedactingWriter(),
     )
 
@@ -666,6 +671,56 @@ def test_marker_fallback_fails_closed_on_wrong_phase_checkpoint(fixture_repo):
     assert result.status == M.FAILED
     assert "failed closed" in (result.notes or "")
     assert gitops.head_sha(fixture_repo) == adopted  # nothing committed
+
+
+def test_commit_step_fails_closed_on_mistyped_first_checkpoint(fixture_repo):
+    """The immutable phase start keeps a bottom mistype inside the P9 range."""
+    git(fixture_repo, "checkout", "-qb", "b")
+    phase_start = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P8 wip: mistyped first P9 milestone", "z.py", "z\n")
+    tip = _wip(fixture_repo, "P9 wip: later milestone", "a.py", "a\n")
+    step = Step.model_validate(
+        {"id": "commit", "type": "commit", "phase": "P9", "message": "P9: phase\n\nbody"}
+    )
+
+    result = handle_commit(
+        step,
+        _ctx_for_commit(
+            fixture_repo, tip, phase_start_sha=phase_start
+        ),
+    )
+
+    assert result.status == M.FAILED
+    assert "failed closed" in (result.notes or "")
+    assert gitops.head_sha(fixture_repo) == tip
+
+
+def test_marker_fallback_excludes_prior_phase_gate_commit(fixture_repo):
+    """An adopted commit can bury P4 wips without exposing P3's gate record."""
+    git(fixture_repo, "checkout", "-qb", "b")
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "P3: prior phase")
+    _wip(fixture_repo, "P3 wip: operator proving run", "r.json", "{}\n")
+    git(fixture_repo, "commit", "-q", "--allow-empty", "-m", "gauntlet: response consumed")
+    phase_start = gitops.head_sha(fixture_repo)
+    _wip(fixture_repo, "P4 wip: implementation", "a.py", "a\n")
+    adopted = _adopted(
+        fixture_repo, "operator: adopted evidence", "evidence.md", "e\n"
+    )
+    step = Step.model_validate(
+        {"id": "commit", "type": "commit", "phase": "P4", "message": "P4: phase\n\nbody"}
+    )
+
+    ctx = _ctx_for_commit(
+        fixture_repo, adopted, phase_start_sha=phase_start
+    )
+    result = handle_commit(step, ctx)
+
+    assert result.status == DONE
+    assert gitops.commit_subject(fixture_repo, result.commit_sha) == "P4: phase"
+    message = gitops.commit_message(fixture_repo, result.commit_sha)
+    assert "P4 wip: implementation" in message
+    assert "P3 wip: operator proving run" not in message
+    assert "1 checkpoint(s) beneath 1 adopted commit(s)" in (result.notes or "")
 
 
 def test_clean_tree_with_adopted_commit_but_no_checkpoints_still_fails(fixture_repo):

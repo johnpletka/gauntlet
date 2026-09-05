@@ -695,6 +695,7 @@ class Orchestrator:
         return DONE
 
     def _run_steps(self, stage: Stage, *, iteration: str | None, item: Any) -> str:
+        phase_start_sha = self._phase_start_for(stage, iteration, item)
         index = {step.id: i for i, step in enumerate(stage.steps)}
         ptr = 0
         while ptr < len(stage.steps):
@@ -714,14 +715,18 @@ class Orchestrator:
             if self._is_terminal_failure(step, rec):
                 return FAILED
             if not eval_when(step.when, self._context(item, iteration)):
-                self._mark_skipped(step.id, iteration)
+                self._mark_skipped(
+                    step.id, iteration, phase_start_sha=phase_start_sha
+                )
                 self._persist()
                 ptr += 1
                 continue
             if step.foreach is not None and iteration is None:
                 status = self._run_step_foreach(step)
             else:
-                result = self._execute(step, iteration, item)
+                result = self._execute(
+                    step, iteration, item, phase_start_sha=phase_start_sha
+                )
                 status = result.status
             if status == DONE:
                 ptr += 1
@@ -847,7 +852,14 @@ class Orchestrator:
                 rec.checkpoints = []
 
     # ---- single-step execution ----------------------------------------------
-    def _execute(self, step: Step, iteration: str | None, item: Any) -> StepResult:
+    def _execute(
+        self,
+        step: Step,
+        iteration: str | None,
+        item: Any,
+        *,
+        phase_start_sha: str | None = None,
+    ) -> StepResult:
         spec = get_spec(step.type)
         rec = self.manifest.record(step.id, iteration)
         # A TIMEOUT-halted step re-enters through the same disposition as an
@@ -868,9 +880,15 @@ class Orchestrator:
         )
         if rec is None:
             rec = StepRecord(
-                id=step.id, type=step.type, agent=step.agent, iteration=iteration
+                id=step.id,
+                type=step.type,
+                agent=step.agent,
+                iteration=iteration,
+                phase_start_sha=phase_start_sha,
             )
             self.manifest.upsert(rec)
+        elif rec.phase_start_sha is None and phase_start_sha is not None:
+            rec.phase_start_sha = phase_start_sha
 
         if resuming:
             short = self._resume_disposition(step, spec, rec, item)
@@ -2258,11 +2276,24 @@ class Orchestrator:
                 names.add(name)
         return names
 
-    def _mark_skipped(self, step_id: str, iteration: str | None) -> None:
+    def _mark_skipped(
+        self,
+        step_id: str,
+        iteration: str | None,
+        *,
+        phase_start_sha: str | None = None,
+    ) -> None:
         rec = self.manifest.record(step_id, iteration)
         if rec is None:
-            rec = StepRecord(id=step_id, type="", iteration=iteration)
+            rec = StepRecord(
+                id=step_id,
+                type="",
+                iteration=iteration,
+                phase_start_sha=phase_start_sha,
+            )
             self.manifest.upsert(rec)
+        elif rec.phase_start_sha is None and phase_start_sha is not None:
+            rec.phase_start_sha = phase_start_sha
         rec.status = M.SKIPPED
         rec.ended = self.clock()
         rec.parked_reason = None  # never carry a stale conflict reason (FR-2.1, F-001)
@@ -2416,6 +2447,46 @@ class Orchestrator:
             candidate = item.get("id")
         candidate = str(candidate or "")
         return candidate if _NUMERIC_PHASE_RE.fullmatch(candidate) else None
+
+    def _phase_start_for(
+        self, stage: Stage, iteration: str | None, item: Any
+    ) -> str | None:
+        """Return the persisted start of one numeric phase iteration (#148).
+
+        The first drive stamps HEAD before any step in the foreach body executes;
+        every record in that iteration carries the same immutable SHA. Retries may
+        re-anchor their mutable ``base_sha`` but never this boundary. A pre-upgrade
+        iteration with records but no stamp returns ``None`` rather than guessing
+        from those mutable attempt bases — its checkpoint walk stays conservatively
+        fail-closed.
+        """
+        if iteration is None or not isinstance(item, dict):
+            return None
+        phase = str(item.get("id", "") or "")
+        if not _NUMERIC_PHASE_RE.fullmatch(phase):
+            return None
+
+        records = [
+            rec
+            for step in stage.steps
+            if (rec := self.manifest.record(step.id, iteration)) is not None
+        ]
+        starts = {rec.phase_start_sha for rec in records if rec.phase_start_sha}
+        if len(starts) > 1:
+            raise RuntimeError(
+                f"phase {phase} iteration {iteration} has inconsistent recorded "
+                f"start SHAs: {sorted(starts)}"
+            )
+        if starts:
+            return next(iter(starts))
+        if records:
+            # Rollback retains later-phase records as pristine PENDING shells
+            # while clearing both boundaries. They have not begun in the rewound
+            # history, so the current HEAD is their new, provable phase start.
+            if all(rec.status == M.PENDING and rec.base_sha is None for rec in records):
+                return self._head_sha()
+            return None  # pre-upgrade/in-flight state cannot be reconstructed
+        return self._head_sha()
 
     def _checkpoint_rewind_target(
         self, rec: StepRecord, phase: str | None = None
