@@ -6,6 +6,38 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-05
+
+Gauntlet 1.3.1 fixes two problems found in real runs: a phase could become
+impossible to finish after an operator committed work at the previous phase's
+gate, and project scaffolds could quietly fall behind the installed Gauntlet
+version.
+
+### More reliable phase completion
+
+- **Phase commits no longer get stuck behind a prior phase's operator
+  checkpoint.** Gauntlet now recognizes a different-phase `P<N> wip:` commit
+  at the bottom of the current checkpoint run as the previous phase boundary.
+  It still fails closed when a different-phase checkpoint is actually
+  interleaved with the current phase, so work cannot be silently omitted from
+  the squash (#148).
+- The checkpoint search stops at the first real phase boundary. Similar
+  checkpoint names in older, pre-run history can no longer make a safe
+  boundary look like an interleaved mistake.
+
+### Visible scaffold drift
+
+- **`gauntlet doctor` now warns when scaffolded prompts, schemas, pipelines,
+  or `policy.yaml` differ from the running Gauntlet version.** These files can
+  be intentionally customized, so drift is a warning rather than a failure.
+  The warning identifies every file that differs, is missing, or cannot be
+  read, and points to the packaged scaffold for comparison (#154).
+- Project-specific `config.yaml` and `pins.yaml` files are excluded from the
+  comparison. Symlinked assets are reported without being followed.
+- `gauntlet init` still leaves existing assets unchanged. When `doctor` reports
+  drift, compare the listed files with the current scaffold and reapply any
+  local customizations onto the new versions.
+
 ## [1.3.0] — 2026-09-04
 
 Gauntlet 1.3.0 helps long runs keep moving with less supervision. It adds
