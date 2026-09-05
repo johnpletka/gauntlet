@@ -1296,6 +1296,98 @@ def _check_repo_secrets(repo_root: Path, asset_root: str = ".") -> CheckResult:
     return CheckResult("repo-secrets", OK, "no credential literals in repo config")
 
 
+def _check_asset_drift(repo_root: Path, asset_root: str = ".") -> CheckResult:
+    """Warn when a scaffolded asset no longer matches the running version's.
+
+    ``gauntlet init`` writes ``prompts/``, ``schemas/``, ``pipelines/`` and
+    ``policy.yaml`` once and then skips them forever ("exists; left unchanged")
+    — only skills are refreshed (§4.5). So a project scaffolded on an older
+    Gauntlet keeps those assets verbatim while the engine that reads them moves
+    on, and nothing anywhere says so. That gap is silent and consequential: the
+    engine and its prompts form one contract, and half of it can be years old.
+    The FR-6.1 carried-remainder path is the worked example — ``cycle.py`` hands
+    the confirmer a strict output schema requiring ``carried_from`` while a
+    pre-FR-6.1 ``cycle-confirm.md`` never explains the field, so the model emits
+    ``null``, ``_carry_remainders`` skips every entry, and the mechanism no-ops
+    with no error, no warning, and a green doctor.
+
+    Warn-only, never a FAIL, for the same reason ``_check_skill`` is: a project
+    may legitimately customize any of these, and drift gates no run. Because
+    provenance is not recorded for assets (unlike skills' ``x-gauntlet-*``
+    frontmatter), this check cannot tell a deliberate customization from a stale
+    copy — so it reports the difference and points at the scaffold to diff
+    against, and never claims the file is wrong. Reporting the ambiguous truth
+    beats today's silence.
+
+    Per-project-by-design assets (``config.yaml``, ``pins.yaml``) are excluded at
+    the taxonomy level (``init._PER_PROJECT_ASSETS``); including them would warn
+    on every healthy repo.
+    """
+    from gauntlet.engine.init import SCAFFOLD_DIR, content_contract_assets
+
+    name = "asset-drift"
+    remedy = (
+        f"diff each against {SCAFFOLD_DIR}/<asset> and re-apply your local "
+        "changes onto the current version; `gauntlet init` will not update an "
+        "existing asset for you (#19)"
+    )
+    drifted: list[str] = []
+    missing: list[str] = []
+    unreadable: list[str] = []
+    total = 0
+
+    for src, asset_rel in content_contract_assets():
+        rel = (Path(asset_root) / asset_rel).as_posix()
+        total += 1
+        # Never dereference a symlinked asset (or a symlinked parent): reading
+        # through it would pull content from outside the repo into diagnostics,
+        # the same hazard `_check_skill` refuses (F-003). Report, do not read.
+        if _has_symlinked_component(repo_root, rel):
+            unreadable.append(f"{rel} (symlink; not dereferenced)")
+            continue
+        path = repo_root / rel
+        if not path.exists():
+            missing.append(rel)
+            continue
+        if not path.is_file():
+            unreadable.append(f"{rel} (not a regular file)")
+            continue
+        # Bytes, not text: a scaffold asset is compared for identity, and an
+        # unreadable/undecodable file must warn rather than crash a warn-only
+        # check (the `_check_skill` F-002 posture).
+        try:
+            if path.read_bytes() != src.read_bytes():
+                drifted.append(rel)
+        except OSError as exc:
+            unreadable.append(f"{rel} ({exc.strerror or exc})")
+
+    problems = drifted + missing + unreadable
+    if not problems:
+        return CheckResult(
+            name, OK,
+            f"all {total} scaffolded assets match gauntlet {__version__}",
+        )
+
+    parts = []
+    if drifted:
+        parts.append(f"{len(drifted)} differ")
+    if missing:
+        parts.append(f"{len(missing)} missing")
+    if unreadable:
+        parts.append(f"{len(unreadable)} unreadable")
+    # The set is bounded by the packaged scaffold (29 assets today), and every
+    # path is needed to act on the warning. Do not elide results: doing so sends
+    # an operator back to manually comparing the full tree to discover the
+    # hidden files — the exact work this check exists to remove (#154).
+    shown = ", ".join(problems)
+    return CheckResult(
+        name, WARN,
+        f"{' / '.join(parts)} of {total} scaffolded assets vs gauntlet "
+        f"{__version__} (customized or stale — init never updates one): {shown}",
+        remedy=remedy,
+    )
+
+
 def _check_pin_file(repo_root: Path, pins: PinFile | None) -> CheckResult:
     if pins is None:
         return CheckResult(
@@ -1352,6 +1444,7 @@ def run_doctor(
         results.append(_check_playbook(repo_root, spec, asset_root))
     results.append(_check_judge(repo_root, asset_root))
     results.append(_check_repo_secrets(repo_root, asset_root))
+    results.append(_check_asset_drift(repo_root, asset_root))
 
     if config is None:
         results.append(CheckResult(
