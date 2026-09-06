@@ -19,6 +19,9 @@ branch_prefix: "gauntlet/"
 asset_root: .gauntlet
 run_root: .gauntlet/runs
 test_command: "uv run pytest"
+# Optional repository-owned selector; see README: Phase-scoped test commands.
+# Always retain full typechecking and explicit data/file-read guards in this command.
+# phase_test_command: "python scripts/test_changed.py"
 
 # On resume of a step killed mid-edit with a dirty worktree (FR-8.2):
 #   park          -> stop for a human (default; nothing re-run over partial work)

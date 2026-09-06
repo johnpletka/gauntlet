@@ -114,7 +114,7 @@ stages:
          prompt: prompts/implement-phase.md,
          inputs: [{name: prd.md, mode: reference}, {name: plan.md, mode: phase}],
          halt_on: "UPSTREAM CONFLICT"}
-      - {id: tests, type: shell, run: "{{config.test_command}}",
+      - {id: tests, type: shell, test_scope: phase, run: "{{config.test_command}}",
          timeout_s: 1800, on_fail: {route_to: implement, max_retries: 2}}
       # clean worktree + commit BEFORE the reviewer handoff (FR-9.3); the phase
       # prefix (P1, P2, …) comes from the foreach item's id. FR-6.3: the commit
@@ -184,7 +184,7 @@ stages:
       # retry: a second recheck failure surfaces FAILED, and every later plain
       # `gauntlet resume` re-arms exactly one more route per human action — the
       # exit is the pipeline's own routing, never git surgery.
-      - {id: tests-recheck, type: shell, run: "{{config.test_command}}",
+      - {id: tests-recheck, type: shell, test_scope: phase, run: "{{config.test_command}}",
          timeout_s: 1800, on_fail: {route_to: impl-cycle, max_retries: 1}}
       # Evidence-tiered phase gate (FR-4.1). Policy `auto_when_clean`: the strict
       # §4.2 conjunction auto-approves and records an evidence snapshot; ANY miss
@@ -206,6 +206,12 @@ stages:
   # automatically — `gauntlet proposals review` is the human ratification gate
   # (FR-6.4). `gauntlet feedback <run>` captures human feedback at run end or
   # later; `gauntlet report --trend` reads the cross-run metrics (FR-6.6).
+  - id: final-validation
+    when: config.phase_test_command
+    steps:
+      - {id: full-tests, type: shell, test_scope: full, run: "{{config.test_command}}",
+         timeout_s: 1800}
+
   - id: retro
     steps:
       - {id: retrospective, type: retrospective,

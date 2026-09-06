@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -40,7 +41,7 @@ from gauntlet.engine.execution import (
     StepResult,
     StepSpec,
 )
-from gauntlet.engine import gitops
+from gauntlet.engine import gitops, test_scope
 from gauntlet.engine.timing import record_invocation
 from gauntlet.engine.manifest import (
     HALT_REASON_ADAPTER_ERROR,
@@ -197,6 +198,17 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
             notes="shell step has no `run:` command",
         )
     command = render_shell_command(template, ctx.config)
+    selection = None
+    scope = step.get("test_scope")
+    if scope is not None:
+        if scope not in ("phase", "full") or template.strip() != "{{config.test_command}}":
+            return StepResult(status=FAILED, halt_reason=HALT_REASON_PRECONDITION,
+                              notes="test_scope requires phase/full and run: '{{config.test_command}}'")
+        selection = test_scope.prepare(ctx.work_root, ctx.config, ctx.record.phase_start_sha,
+                                       full=scope == "full")
+        command = render_shell_command(selection["command"], ctx.config)
+        selection["command"] = command
+        _write_step_log(ctx, "test-selection.json", json.dumps(selection, indent=2) + "\n")
     timeout = step.timeout_s  # per-step guard (FR-3.3); None => unbounded
     try:
         proc = subprocess.run(
@@ -208,8 +220,12 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=test_scope.environment(selection, dict(os.environ)) if selection else None,
         )
     except subprocess.TimeoutExpired as exc:
+        if selection is not None:
+            selection["outcome"] = "timeout"
+            _write_step_log(ctx, "test-selection.json", json.dumps(selection, indent=2) + "\n")
         _write_step_log(ctx, "output.txt", f"$ {command}\n--- TIMEOUT after {timeout}s ---\n")
         # Halt at a checkpoint rather than letting a stuck command burn on.
         return StepResult(
@@ -217,6 +233,9 @@ def handle_shell(step: Step, ctx: StepContext) -> StepResult:
             halt_reason=HALT_REASON_TIMEOUT,
             notes=f"shell timeout halt (FR-3.3): `{command}` exceeded {timeout}s",
         )
+    if selection is not None:
+        selection["exit_code"] = proc.returncode
+        _write_step_log(ctx, "test-selection.json", json.dumps(selection, indent=2) + "\n")
     _write_step_log(ctx, "output.txt", _proc_log(command, proc))
     if proc.returncode != 0:
         # The command ran and reported failure (e.g. a failing test suite): a
