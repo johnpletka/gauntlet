@@ -118,11 +118,29 @@ def phantom_deferrals(
     defers to a non-phase like ``post-v1`` / ``FUTURE.md`` (the CLAUDE.md §7
     out-of-run deferral convention) is intentional, not a phantom phase, so it is
     never flagged (this is FR-3.3's "'Deferred to P<N>'-style" scope).
+
+    **Supersession (#158).** A phase-shaped phantom whose exact text also appears
+    as an out-of-run deferral (a non-phase target) is RE-TARGETED, not dangling:
+    the obligation has a real home, and the prose spelling — which the commit
+    convention cannot express as out-of-run, and which is immutable once the
+    phase commit lands — is treated as corrected by the structured entry. The
+    match is on identical non-empty stripped text, the same identity the
+    ``(to_phase, text)`` dedup uses; a phantom with no matching structured entry
+    still parks, so genuinely dropped work stays fail-closed. Observed live: the
+    terminal phase's commit deferred operator-handoff work to ``P<N+1>``, which
+    can never exist, with no lawful correction path.
     """
+    retargeted = {
+        d.text.strip()
+        for d in deferrals
+        if not _PHASE_ID_RE.match(d.to_phase) and d.text.strip()
+    }
     return [
         d
         for d in deferrals
-        if _PHASE_ID_RE.match(d.to_phase) and d.to_phase not in known_phase_ids
+        if _PHASE_ID_RE.match(d.to_phase)
+        and d.to_phase not in known_phase_ids
+        and (not d.text.strip() or d.text.strip() not in retargeted)
     ]
 
 

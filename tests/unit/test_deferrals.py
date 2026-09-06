@@ -171,6 +171,41 @@ def test_phantom_deferrals_exempts_out_of_run_targets():
     assert phantom_deferrals(ds, {"P1", "P2"}) == []
 
 
+def test_phantom_deferral_superseded_by_out_of_run_entry_with_identical_text():
+    """#158: a commit-prose deferral to a nonexistent phase is RE-TARGETED — not
+    dangling — when the exact text also appears as a structured out-of-run
+    deferral. The commit is immutable and its convention cannot spell an
+    out-of-run target, so the structured entry is the correction path; the
+    obligation has a real home and the park would protect nothing."""
+    text = "per-layer scan, operator status confirmation, and record closure"
+    ds = [
+        Deferral("P14", text, "commit:8212eb171d"),
+        Deferral("operator", text, "acceptance-map:P13"),
+    ]
+    assert phantom_deferrals(ds, {"P12", "P13"}) == []
+
+
+def test_phantom_deferral_without_matching_retarget_still_parks():
+    """The supersession is text-exact: a structured entry with different text
+    leaves the phantom dangling and fail-closed (FR-3.3)."""
+    ds = [
+        Deferral("P14", "the real obligation", "commit:a"),
+        Deferral("operator", "a different obligation", "acceptance-map:P13"),
+    ]
+    assert [d.to_phase for d in phantom_deferrals(ds, {"P13"})] == ["P14"]
+
+
+def test_phantom_deferral_with_empty_text_is_never_superseded():
+    """An empty-text phantom carries no identity to match on; a blanket
+    supersession by an empty-text out-of-run entry would silently drop
+    unnameable work, so it stays fail-closed."""
+    ds = [
+        Deferral("P14", "", "commit:a"),
+        Deferral("operator", "", "acceptance-map:P13"),
+    ]
+    assert [d.to_phase for d in phantom_deferrals(ds, {"P13"})] == ["P14"]
+
+
 def test_open_deferrals_for_filters_and_dedups():
     ds = [
         Deferral("P3", "retry logic", "commit:a"),
