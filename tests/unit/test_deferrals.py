@@ -185,6 +185,27 @@ def test_phantom_deferral_superseded_by_out_of_run_entry_with_identical_text():
     assert phantom_deferrals(ds, {"P12", "P13"}) == []
 
 
+def test_structured_phantom_is_not_superseded_by_out_of_run_entry():
+    """Only immutable commit prose needs the #158 correction path. A mutable
+    structured phantom must be removed or corrected rather than hidden by a
+    second acceptance-map entry with identical text."""
+    text = "operator handoff"
+    phantom = Deferral("P14", text, "acceptance-map:P13")
+    ds = [phantom, Deferral("operator", text, "acceptance-map:P13")]
+    assert phantom_deferrals(ds, {"P13"}) == [phantom]
+
+
+@pytest.mark.parametrize("target", ["", "   ", " P14 "])
+def test_commit_phantom_not_superseded_by_empty_or_phase_shaped_target(target):
+    """A correction needs a real out-of-run destination after normalization;
+    empty targets and whitespace-disguised phase targets cannot suppress the
+    immutable commit-prose phantom."""
+    text = "operator handoff"
+    phantom = Deferral("P14", text, "commit:a")
+    ds = [phantom, Deferral(target, text, "acceptance-map:P13")]
+    assert phantom in phantom_deferrals(ds, {"P13"})
+
+
 def test_phantom_deferral_without_matching_retarget_still_parks():
     """The supersession is text-exact: a structured entry with different text
     leaves the phantom dangling and fail-closed (FR-3.3)."""

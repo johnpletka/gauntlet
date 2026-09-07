@@ -119,29 +119,41 @@ def phantom_deferrals(
     out-of-run deferral convention) is intentional, not a phantom phase, so it is
     never flagged (this is FR-3.3's "'Deferred to P<N>'-style" scope).
 
-    **Supersession (#158).** A phase-shaped phantom whose exact text also appears
-    as an out-of-run deferral (a non-phase target) is RE-TARGETED, not dangling:
-    the obligation has a real home, and the prose spelling — which the commit
-    convention cannot express as out-of-run, and which is immutable once the
-    phase commit lands — is treated as corrected by the structured entry. The
-    match is on identical non-empty stripped text, the same identity the
-    ``(to_phase, text)`` dedup uses; a phantom with no matching structured entry
-    still parks, so genuinely dropped work stays fail-closed. Observed live: the
-    terminal phase's commit deferred operator-handoff work to ``P<N+1>``, which
-    can never exist, with no lawful correction path.
+    **Supersession (#158).** A commit-prose phase-shaped phantom whose exact text
+    also appears in a structured acceptance-map deferral with a non-empty,
+    out-of-run target is RE-TARGETED, not dangling: the obligation has a real
+    home, and the prose spelling — which the commit convention cannot express as
+    out-of-run, and which is immutable once the phase commit lands — is treated as
+    corrected by the structured entry. The match is on identical non-empty
+    stripped text, the same identity the ``(to_phase, text)`` dedup uses. Mutable
+    structured phantoms are never superseded; their author must remove or correct
+    them. A phantom with no matching structured entry still parks, so genuinely
+    dropped work stays fail-closed. Observed live: the terminal phase's commit
+    deferred operator-handoff work to ``P<N+1>``, which can never exist, with no
+    lawful correction path.
     """
-    retargeted = {
-        d.text.strip()
-        for d in deferrals
-        if not _PHASE_ID_RE.match(d.to_phase) and d.text.strip()
-    }
-    return [
-        d
-        for d in deferrals
-        if _PHASE_ID_RE.match(d.to_phase)
-        and d.to_phase not in known_phase_ids
-        and (not d.text.strip() or d.text.strip() not in retargeted)
-    ]
+    retargeted: set[str] = set()
+    for d in deferrals:
+        target = d.to_phase.strip()
+        text = d.text.strip()
+        if (
+            d.source.startswith(("acceptance-map:", "acceptance-map@"))
+            and target
+            and not _PHASE_ID_RE.fullmatch(target)
+            and text
+        ):
+            retargeted.add(text)
+
+    phantoms: list[Deferral] = []
+    for d in deferrals:
+        target = d.to_phase.strip()
+        if not _PHASE_ID_RE.fullmatch(target) or target in known_phase_ids:
+            continue
+        text = d.text.strip()
+        if d.source.startswith("commit:") and text and text in retargeted:
+            continue
+        phantoms.append(d)
+    return phantoms
 
 
 def open_deferrals_for(phase_id: str, deferrals: list[Deferral]) -> list[Deferral]:
