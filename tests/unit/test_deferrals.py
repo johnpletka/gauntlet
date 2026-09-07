@@ -171,6 +171,62 @@ def test_phantom_deferrals_exempts_out_of_run_targets():
     assert phantom_deferrals(ds, {"P1", "P2"}) == []
 
 
+def test_phantom_deferral_superseded_by_out_of_run_entry_with_identical_text():
+    """#158: a commit-prose deferral to a nonexistent phase is RE-TARGETED — not
+    dangling — when the exact text also appears as a structured out-of-run
+    deferral. The commit is immutable and its convention cannot spell an
+    out-of-run target, so the structured entry is the correction path; the
+    obligation has a real home and the park would protect nothing."""
+    text = "per-layer scan, operator status confirmation, and record closure"
+    ds = [
+        Deferral("P14", text, "commit:8212eb171d"),
+        Deferral("operator", text, "acceptance-map:P13"),
+    ]
+    assert phantom_deferrals(ds, {"P12", "P13"}) == []
+
+
+def test_structured_phantom_is_not_superseded_by_out_of_run_entry():
+    """Only immutable commit prose needs the #158 correction path. A mutable
+    structured phantom must be removed or corrected rather than hidden by a
+    second acceptance-map entry with identical text."""
+    text = "operator handoff"
+    phantom = Deferral("P14", text, "acceptance-map:P13")
+    ds = [phantom, Deferral("operator", text, "acceptance-map:P13")]
+    assert phantom_deferrals(ds, {"P13"}) == [phantom]
+
+
+@pytest.mark.parametrize("target", ["", "   ", " P14 "])
+def test_commit_phantom_not_superseded_by_empty_or_phase_shaped_target(target):
+    """A correction needs a real out-of-run destination after normalization;
+    empty targets and whitespace-disguised phase targets cannot suppress the
+    immutable commit-prose phantom."""
+    text = "operator handoff"
+    phantom = Deferral("P14", text, "commit:a")
+    ds = [phantom, Deferral(target, text, "acceptance-map:P13")]
+    assert phantom in phantom_deferrals(ds, {"P13"})
+
+
+def test_phantom_deferral_without_matching_retarget_still_parks():
+    """The supersession is text-exact: a structured entry with different text
+    leaves the phantom dangling and fail-closed (FR-3.3)."""
+    ds = [
+        Deferral("P14", "the real obligation", "commit:a"),
+        Deferral("operator", "a different obligation", "acceptance-map:P13"),
+    ]
+    assert [d.to_phase for d in phantom_deferrals(ds, {"P13"})] == ["P14"]
+
+
+def test_phantom_deferral_with_empty_text_is_never_superseded():
+    """An empty-text phantom carries no identity to match on; a blanket
+    supersession by an empty-text out-of-run entry would silently drop
+    unnameable work, so it stays fail-closed."""
+    ds = [
+        Deferral("P14", "", "commit:a"),
+        Deferral("operator", "", "acceptance-map:P13"),
+    ]
+    assert [d.to_phase for d in phantom_deferrals(ds, {"P13"})] == ["P14"]
+
+
 def test_open_deferrals_for_filters_and_dedups():
     ds = [
         Deferral("P3", "retry logic", "commit:a"),
