@@ -6,6 +6,47 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.3] — 2026-09-06
+
+Gauntlet 1.3.3 speeds up feedback in large repositories without giving up a
+full validation pass, and fixes an edge case that could leave an otherwise
+recoverable run permanently parked.
+
+### Faster phase testing
+
+- **Projects can provide their own phase-aware test command.** Set
+  `phase_test_command` alongside the existing full `test_command` to run a
+  repository-specific test selector during each implementation phase and its
+  review recheck (#160).
+- Gauntlet gives the selector a validated inventory of everything changed since
+  the phase began, including committed review fixes and uncommitted files. It
+  records the selection details with the step so operators can see what ran and
+  why.
+- Safety fallbacks remain conservative: if Gauntlet cannot prove the phase
+  boundary or build a trustworthy change inventory, it runs the full test
+  command. A later full-suite validation is also required before the run moves
+  on to its retrospective.
+- The independent verifier receives the same phase context, so its checks stay
+  aligned with the main test step. Projects that do not configure
+  `phase_test_command` keep the previous full-suite behavior.
+
+**Upgrade note:** `gauntlet init` does not overwrite customized project files.
+Existing projects that want phase-scoped testing must add `phase_test_command`
+to their config, mark their phase test steps with `test_scope: phase`, and add a
+later `test_scope: full` step. See “Phase-scoped test commands” in the README for
+the complete setup and selector requirements.
+
+### Deferral recovery
+
+- **A corrected final-phase deferral no longer leaves a run stuck.** If an
+  immutable phase commit mistakenly points work at a nonexistent later phase,
+  Gauntlet now recognizes an exact matching structured deferral that moves the
+  work to a real out-of-run destination such as `post-v1` or `FUTURE.md`
+  (#158).
+- The check remains fail-closed: missing, mismatched, empty, or still
+  phase-shaped corrections continue to park the run instead of silently
+  dropping deferred work.
+
 ## [1.3.1] — 2026-09-05
 
 Gauntlet 1.3.1 fixes two problems found in real runs: a phase could become
