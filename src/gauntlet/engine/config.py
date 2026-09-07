@@ -643,6 +643,16 @@ class RunConfig(BaseModel):
     # WorktreeConfig — the worktree PATH is derived and has no knob (§6.4).
     worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
     test_command: str = "uv run pytest"
+    # Opt-in adopter-owned selector. The full command remains the fallback (#160).
+    phase_test_command: str | None = Field(default=None, min_length=1)
+
+    @field_validator("phase_test_command")
+    @classmethod
+    def _nonblank_phase_tests(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("phase_test_command must not be blank")
+        return value
+
     # Per-collector enumeration command overrides (FR-3.2, PR #59 review F4):
     # `collectors: {pytest: {command: "hatch run pytest"}}`. Absent, the pytest
     # collector derives its command from `test_command` so enumeration runs in

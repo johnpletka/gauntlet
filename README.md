@@ -789,3 +789,63 @@ contract suite, which requires authenticated CLIs and API keys.
   the panel. On exhaustion it parks `provider_unavailable`; a plain
   `gauntlet resume <slug>` retries only the incomplete member, with no
   `--response` decision required.
+
+### Phase-scoped test commands
+
+For large adopter suites, opt in to testing the changes in each implementation phase (#160):
+
+```yaml
+# .gauntlet/config.yaml: retain the authoritative FULL validation command.
+test_command: "pnpm run typecheck && pnpm exec vitest run"
+# Supply this repository-owned script before enabling the option.
+phase_test_command: "pnpm run typecheck && node scripts/test-changed.cjs"
+```
+
+Gauntlet does not infer a repository's test graph. The phase command owns dependency selection,
+explicit file-read/data guards, and full-suite fallback for unmapped inputs or test/toolchain
+configuration changes. For example, Vitest's import graph alone cannot discover tests that read
+YAML, SQL or JSON with `readFileSync`. Always union those guards with affected tests. Keep full
+static typechecking; require an explicit, justified empty-selection outcome, and exit nonzero on
+selection or test failures. Log the selected test IDs and reasons to stdout so the step transcript
+records what ran. A failing phase command is a failed step, never silently replaced by a green full run.
+
+The shipped standard pipeline marks `tests` and `tests-recheck` with `test_scope: phase`, and runs
+`full-tests` once after all phases when this option is configured. Existing installations must update
+their copied pipeline to include these annotations **and** the final full step. Configuration alone
+never rewrites a pinned pipeline or a live run's config snapshot. In custom pipelines, use:
+
+```yaml
+- {id: tests, type: shell, test_scope: phase, run: "{{config.test_command}}"}
+# At the final validation boundary (and whenever full validation is required):
+- {id: full-tests, type: shell, test_scope: full, run: "{{config.test_command}}"}
+```
+
+`test_scope` accepts only `phase` or `full` on a shell step whose entire `run` is the trusted
+`{{config.test_command}}` token. Other shell commands retain their existing behavior. No new
+artifact-to-shell interpolation is permitted.
+
+For an opted-in phase, the engine validates the immutable `phase_start_sha`, rather than the current
+step's retry boundary or `HEAD~1`. Its inventory includes committed phase changes and review fixes,
+staged/unstaged paths and nonignored untracked files. Renames include both old and new names.
+A missing/invalid/non-ancestor baseline, Git failure, deleted path, unsupported changed entry, empty
+change set or oversized context falls back to the full command. Project-specific uncertainty must
+also fall back in the repository's selector. Recovery/rechecks reuse the persisted phase start;
+rollback that resets the phase follows the existing phase-start reset contract.
+
+The child receives engine-owned variables (ambient `GAUNTLET_TEST_*` values are removed):
+
+- `GAUNTLET_TEST_MODE`: `phase` or `full`.
+- `GAUNTLET_TEST_BASE_SHA`: validated phase-start commit, only in phase mode.
+- `GAUNTLET_TEST_CONTEXT`: JSON, only in phase mode, with `version: 1`, `base_sha`, `head_sha`,
+  `head_tree`, `changed_paths`, `deleted_paths`, `worktree_fingerprint`, `mode`, `reason` and `command`.
+  Parse JSON instead of splitting filenames on whitespace. Paths are relative to the subprocess cwd.
+
+The engine records `test-selection.json` next to each scoped shell step's output, including the
+chosen command and fallback reason, plus exit status or timeout after execution. The fingerprint
+identifies HEAD plus the current bytes/modes of changed files; it is evidence, not a test-result cache.
+The verifier independently prepares the same contract inside its disposable Git worktree, adds only
+these generated variables after secret stripping, and receives the chosen command in its prompt.
+Its transcript remains the evidence of commands actually executed; the context file alone does not
+claim that a verifier ran or passed tests. Existing verifier behavior remains unchanged when the
+option is absent. A selector started outside Gauntlet must default to full validation when context
+is absent. Keep normal CI validation as well as the final full-suite boundary.

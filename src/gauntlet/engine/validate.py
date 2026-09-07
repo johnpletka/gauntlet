@@ -88,6 +88,16 @@ def validate_pipeline(
         )
         stage_is_foreach = stage.foreach is not None
         for step in stage.steps:
+            scope = step.get("test_scope")
+            if scope is not None and (
+                step.type != "shell" or scope not in ("phase", "full")
+                or not isinstance(step.get("run"), str)
+                or step.get("run", "").strip() != "{{config.test_command}}"
+            ):
+                report.errors.append(
+                    f"step {step.id!r}: test_scope requires a shell step, phase/full, "
+                    "and run: '{{config.test_command}}'"
+                )
             _validate_step(
                 step, config, available, produced, report,
                 repo_root=repo_root, artifact_root=artifact_root,
@@ -113,6 +123,20 @@ def validate_pipeline(
                 cyc = {"findings.json", "triage.json", "confirm.json"}
                 available.update(cyc)
                 produced.update(cyc)
+    if config.phase_test_command:
+        phase_stages = [i for i, stage in enumerate(pipeline.stages)
+                        if any(s.get("test_scope") == "phase" for s in stage.steps)]
+        if phase_stages and not any(
+            i > max(phase_stages) and stage.foreach is None
+            and stage.when in (None, "config.phase_test_command")
+            and any(s.type == "shell" and s.get("test_scope") == "full"
+                    and s.when is None and s.foreach is None for s in stage.steps)
+            for i, stage in enumerate(pipeline.stages)
+        ):
+            report.errors.append(
+                "phase_test_command requires a final test_scope: full shell step in a later "
+                "non-foreach stage, unconditionally or when: config.phase_test_command"
+            )
     if report.errors:
         raise PipelineValidationError(report.errors)
     return report

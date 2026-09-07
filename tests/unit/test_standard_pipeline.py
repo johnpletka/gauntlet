@@ -40,7 +40,7 @@ def test_standard_validates_with_real_config():
 
 def test_standard_stage_and_step_shape():
     pipeline, _, _ = _load()
-    assert [s.id for s in pipeline.stages] == ["prd", "plan", "phases", "retro"]
+    assert [s.id for s in pipeline.stages] == ["prd", "plan", "phases", "final-validation", "retro"]
     by_id = {s.id: s for s in pipeline.stages}
 
     prd = [st.id for st in by_id["prd"].steps]
@@ -90,6 +90,12 @@ def test_standard_stage_and_step_shape():
     assert gate.get("policy") == "auto_when_clean"
     assert by_id["phases"].steps[4].get("verifier")
     assert by_id["phases"].foreach == "plan.phases"
+    final = by_id["final-validation"]
+    assert final.when == "config.phase_test_command"
+    assert final.steps[0].get("test_scope") == "full"
+    assert final.steps[0].get("run") == "{{config.test_command}}"
+    assert by_id["phases"].steps[1].get("test_scope") == "phase"
+    assert tests_recheck.get("test_scope") == "phase"
     assert [st.id for st in by_id["retro"].steps] == ["retrospective"]
 
 

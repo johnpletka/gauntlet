@@ -516,7 +516,7 @@ def _stub_sandbox(monkeypatch, tmp_path):
     return copy_dir
 
 
-def _drive_single(repo, phase_sha, adapters, *, iteration_item=_PHASE_ITEM):
+def _drive_single(repo, phase_sha, adapters, *, iteration_item=_PHASE_ITEM, config=None, phase_start_sha=None):
     """Drive one code_review cycle step directly through the handler with a
     StepContext carrying ``iteration_item`` (the foreach phase)."""
     from gauntlet.engine.cycle import handle_adversarial_cycle
@@ -529,7 +529,7 @@ def _drive_single(repo, phase_sha, adapters, *, iteration_item=_PHASE_ITEM):
             "reviewer": "reviewer", "triager": "triage", "fixer": "builder",
             "verifier": "verifier", "max_rounds": 2,
             "review_prompt": "prompts/review-code.md"}
-    cfg = RunConfig.model_validate(_VCONFIG)
+    cfg = RunConfig.model_validate(config or _VCONFIG)
     man = Manifest(run_id="r", slug="demo", branch="b", base_branch="main",
                    pipeline=PipelineRef(name="demo", version=1, hash="h"))
     man.commits.append(CommitRecord(step_id="commit", phase="P5", sha=phase_sha))
@@ -539,7 +539,7 @@ def _drive_single(repo, phase_sha, adapters, *, iteration_item=_PHASE_ITEM):
         repo_root=repo, run_dir=run_dir, artifact_root=repo,
         config=cfg, pipeline=Pipeline.model_validate(
             {"name": "demo", "version": 1, "stages": []}),
-        manifest=man, record=StepRecord(id="cycle", type="adversarial_cycle"),
+        manifest=man, record=StepRecord(id="cycle", type="adversarial_cycle", phase_start_sha=phase_start_sha),
         writer=RedactingWriter(), excludes=["runs"],
         judge_env=dict(_JUDGE_ENV),
         iteration_item=iteration_item,

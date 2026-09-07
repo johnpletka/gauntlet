@@ -2117,9 +2117,23 @@ def _run_verifier(
             ctx.judge_env, copy.path,
             step_id=verifier_step_id, scratch_home=scratch_home,
         )
+        test_instruction = ""
+        if ctx.config.phase_test_command:
+            from gauntlet.engine import test_scope
+            from gauntlet.engine.steptypes import render_shell_command
+            selection = test_scope.prepare(copy.path, ctx.config, ctx.record.phase_start_sha)
+            selection["command"] = render_shell_command(selection["command"], ctx.config)
+            env = test_scope.environment(selection, env)
+            logger.log_text("test-selection.json", json.dumps(selection, indent=2) + "\n")
+            test_instruction = (
+                "\nEngine-selected validation command (" + selection["mode"] + ", "
+                + selection["reason"] + "): " + selection["command"]
+                + "\nRun this command for repository test validation; report its exit status and output. "
+                "Phase mode covers affected tests only. Also execute the phase's acceptance checks."
+            )
         extra_flags = verify.configure_claude_verifier(adapter, env=env)
         review = _run_sub(
-            ctx, profile, _verifier_prompt(step, ctx, phase), schema=verifier_schema,
+            ctx, profile, _verifier_prompt(step, ctx, phase) + test_instruction, schema=verifier_schema,
             usage=usage, logger=logger, structured_name="findings.json",
             substep=f"r{rnd}-verify", effort=effort,
             cwd=copy.path, extra_flags=extra_flags,
