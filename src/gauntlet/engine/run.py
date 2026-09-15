@@ -1404,16 +1404,22 @@ class RunManager:
     ) -> str | None:
         """The branch SHA this run's authoritative state last recorded (A3).
 
-        Preference order, most authoritative first: the journal's own
-        ``WorktreeAdopted`` ``branch_sha`` (written when the tree was last
-        healthy), then the manifest's last recorded commit. ``None`` when
+        Preference order, most authoritative first: the latest journaled
+        worktree adoption or (while done) completion export's ``branch_sha``,
+        then the manifest's last recorded commit. A rollback invalidates the
+        completion export as a reconstruction boundary. ``None`` when
         neither is available — an unverifiable recreate is still better than
         refusing to recreate at all, and the caller simply skips the check
         rather than inventing an expectation.
         """
         try:
             for evt in reversed(J.read_events(run_dir)):
-                if evt.get("kind") == "WorktreeAdopted":
+                completion = (
+                    evt.get("kind") == "CompletionExported"
+                    and man is not None and man.status == M.RUN_DONE
+                    and (evt.get("payload") or {}).get("branch") == branch
+                )
+                if completion or evt.get("kind") == "WorktreeAdopted":
                     sha = (evt.get("payload") or {}).get("branch_sha")
                     if sha:
                         return str(sha)
@@ -5096,7 +5102,9 @@ class RunManager:
         )
         genesis_pending = (
             pre.health == J.HEALTH_NO_JOURNAL
-            and (run_dir / "manifest.json").exists()
+            and any(
+                (run_dir / name).exists() for name in ("manifest.json", "completion.json")
+            )
         )
         if pre.health == J.HEALTH_OK or (
             pre.health == J.HEALTH_NO_JOURNAL and not genesis_pending
@@ -7097,6 +7105,32 @@ class RunManager:
         """
         try:
             self._maybe_draft_pr(layout, run_dir, man, status)
+            if status == M.RUN_DONE:
+                # Journals are local. Commit a separate terminal snapshot so
+                # another checkout can read completion without tracking the
+                # mutable operator-side projection (#164).
+                from gauntlet.engine.completion import commit_completion
+
+                if self._paths is None:
+                    raise RuntimeError("completion export requires resolved run paths")
+                sha = commit_completion(self._paths, man, self.writer)
+                if self._paths.dedicated_worktree:
+                    # A3 recreates against recorded history, so the final
+                    # engine commit must be recorded too. Retrying after a
+                    # commit-to-journal crash fills this audit gap without
+                    # creating an empty commit or replaying agents.
+                    head = sha or gitops.head_sha(self.work_root)
+                    key = f"completion-exported:{man.run_id}:{head}"
+                    J.append_audit(
+                        run_dir, "CompletionExported",
+                        {"branch": man.branch, "branch_sha": head},
+                        run_id=man.run_id, idempotency_key=key,
+                    )
+                    if not self._journal_has_key(run_dir, key):
+                        raise J.JournalError(
+                            "completion was committed but its recovery record "
+                            "could not be saved; resume the completed run to retry"
+                        )
         finally:
             self._notify_transition(layout, run_dir)
 

@@ -693,7 +693,7 @@ def engine_bookkeeping_candidates(
     """
     root = repo_root.resolve()
     paths: list[str] = []
-    for name in ("manifest.json", "RUN.md"):
+    for name in ("manifest.json", "RUN.md", "completion.json"):
         rel = _tree_rel(
             run_dir / name, root, field="bookkeeping path",
             state_outside_worktree=state_outside_worktree,
@@ -758,15 +758,18 @@ def run_bookkeeping_paths(
 
     The manifest is authoritative; RUN.md is its derived index. Returns only
     the files that currently exist, repo-root-relative and POSIX-formatted —
-    the exact set every engine bookkeeping commit (and the bookkeeping-
-    preserving rewinds) force-stages. Shared by the orchestrator's checkpoint
-    commits and the cycle's fix-rerun rewind so the two can never disagree on
-    what counts as bookkeeping.
+    the live set checkpoint commits and bookkeeping-preserving rewinds
+    force-stage. Completion exports are classified as engine metadata by the
+    broader historical allowlist, but only the terminal writer publishes them:
+    a mid-run checkpoint must not re-publish completion preserved by recovery.
     """
     return [
         rel
         for rel in engine_bookkeeping_candidates(
             repo_root, run_dir, state_outside_worktree=state_outside_worktree
         )
-        if (repo_root.resolve() / rel).exists()
+        # completion.json is a terminal export, not mutable bookkeeping.
+        # Recovery can preserve it on disk; a mid-run checkpoint must never
+        # re-publish that old terminal state after a rollback.
+        if Path(rel).name != "completion.json" and (repo_root.resolve() / rel).exists()
     ]

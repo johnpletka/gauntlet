@@ -1,10 +1,9 @@
 """RunStore — the console's read model (P1, FR-1/FR-2).
 
 Read-only. Discovers every slug under the configured run root and parses each
-``manifest.json`` via the existing pydantic :class:`Manifest`. It never imports
-the orchestrator drive path and never writes — the load-bearing P1 premise is
-that the on-disk manifest + artifact layout is a *sufficient* read model with
-**zero** engine changes (D2, FR-11.2).
+run state through the same journal-aware projection view as the CLI. It never
+drives the orchestrator or writes run state: stale, corrupt or missing
+projections are resolved in memory, never repaired by a GET request.
 
 Containment (FR-10.1 / §7): every user-controlled path segment (``slug``,
 ``run_id``, ``step``) is validated as a single safe filename and the resolved
@@ -278,6 +277,45 @@ class RunStore:
         _safe_segment(slug, kind="slug")
         return self._assert_contained(self.run_root_dir / slug)
 
+    def _has_run_state(self, run_dir: Path) -> bool:
+        run_dir = self._assert_contained(run_dir)
+        return any(
+            (run_dir / name).exists()
+            for name in ("manifest.json", "journal", "completion.json")
+        )
+
+    def _load_manifest(self, manifest_path: Path) -> Manifest:
+        """Read authoritative state without repairing the projection (#164)."""
+        from gauntlet.engine.operator import load_projection_view
+
+        manifest_path = self._assert_contained(manifest_path)
+        run_dir = manifest_path.parent
+        self._assert_contained(run_dir / "completion.json")
+        journal = self._assert_contained(run_dir / "journal")
+        # Journals are local files, but their symlinks must obey the same
+        # containment boundary as request-selected artifacts.
+        for event in journal.glob("*.json"):
+            self._assert_contained(event)
+        view = load_projection_view(self.repo_root, run_dir, slug=run_dir.parent.name)
+        if view.manifest is None:
+            raise ValueError(f"no readable manifest or journal state at {run_dir}")
+        return view.manifest
+
+    def state_revision(self, manifest_path: Path) -> tuple[int | None, ...]:
+        """Detect projection writes, journal appends and completion imports."""
+        manifest_path = self._assert_contained(manifest_path)
+        journal = self._assert_contained(manifest_path.parent / "journal")
+        completion = self._assert_contained(manifest_path.parent / "completion.json")
+        revisions = []
+        for path in (manifest_path, journal, completion):
+            try:
+                revisions.append(path.stat().st_mtime_ns)
+            except FileNotFoundError:
+                revisions.append(None)
+        if all(value is None for value in revisions):
+            raise FileNotFoundError(manifest_path)
+        return tuple(revisions)
+
     def _run_dirs(self, slug_dir: Path) -> list[str]:
         """Sorted run-dir names (lexical == chronological for ``run-<ts>``)."""
         if not slug_dir.exists():
@@ -285,7 +323,7 @@ class RunStore:
         return sorted(
             d.name
             for d in slug_dir.glob("run-*")
-            if d.is_dir() and (d / "manifest.json").exists()
+            if d.is_dir() and self._has_run_state(d)
         )
 
     def _resolve_run_id(self, slug: str, run_id: str | None) -> str:
@@ -299,7 +337,7 @@ class RunStore:
         if run_id is not None:
             _safe_segment(run_id, kind="run_id")
             run_dir = self._assert_contained(slug_dir / run_id)
-            if not (run_dir / "manifest.json").exists():
+            if not self._has_run_state(run_dir):
                 raise RunNotFound(f"no run {run_id!r} for slug {slug!r}")
             return run_id
 
@@ -308,7 +346,7 @@ class RunStore:
             active = pointer.read_text().strip()
             if active:
                 _safe_segment(active, kind="run_id")
-                if (self._assert_contained(slug_dir / active) / "manifest.json").exists():
+                if self._has_run_state(slug_dir / active):
                     return active
 
         names = self._run_dirs(slug_dir)
@@ -463,7 +501,7 @@ class RunStore:
         run_dir = self._slug_dir(slug) / rid
         manifest_path = run_dir / "manifest.json"
         try:
-            man = Manifest.load(manifest_path)
+            man = self._load_manifest(manifest_path)
         except (OSError, ValueError):
             return None
         cur = _current_record(man)
@@ -540,7 +578,7 @@ class RunStore:
         for rid in self._run_dirs(slug_dir):
             manifest_path = slug_dir / rid / "manifest.json"
             try:
-                man = Manifest.load(manifest_path)
+                man = self._load_manifest(manifest_path)
             except (OSError, ValueError):
                 continue
             started, ended = _started_ended(man)
@@ -576,7 +614,7 @@ class RunStore:
     def manifest(self, slug: str, run_id: str | None = None) -> Manifest:
         run_dir = self.run_dir(slug, run_id)
         try:
-            return Manifest.load(run_dir / "manifest.json")
+            return self._load_manifest(run_dir / "manifest.json")
         except (OSError, ValueError) as exc:
             raise RunNotFound(f"unreadable manifest for {slug!r}: {exc}") from exc
 
@@ -711,7 +749,7 @@ class RunStore:
         """Which artifacts a step has on disk, and (for cycles) its round dirs."""
         run_dir = self.run_dir(slug, run_id)
         rid = run_dir.name
-        man = Manifest.load(run_dir / "manifest.json")
+        man = self._load_manifest(run_dir / "manifest.json")
         _safe_segment(step, kind="step")
         steps_root = self._assert_contained(run_dir / "steps")
         step_dir = self._assert_contained(steps_root / step)

@@ -53,10 +53,10 @@ def trees(tmp_path):
     return work, slug_dir, run_dir, external
 
 
-# --- the contained case is unchanged -----------------------------------------
+# --- contained live paths and the terminal-history allowlist -----------------------------------------
 
 
-def test_contained_run_dir_yields_the_same_paths_as_before(trees):
+def test_contained_run_dir_separates_live_paths_from_terminal_history(trees):
     work, slug_dir, run_dir, _ = trees
     assert run_bookkeeping_excludes(work, run_dir, slug_dir) == [
         "runs/demo/run-1",
@@ -65,6 +65,7 @@ def test_contained_run_dir_yields_the_same_paths_as_before(trees):
     assert engine_bookkeeping_candidates(work, run_dir) == [
         "runs/demo/run-1/manifest.json",
         "runs/demo/run-1/RUN.md",
+        "runs/demo/run-1/completion.json",
     ]
     assert run_bookkeeping_paths(work, run_dir) == [
         "runs/demo/run-1/manifest.json",
@@ -87,6 +88,7 @@ def test_run_bookkeeping_paths_still_filters_to_files_that_exist(trees):
     assert engine_bookkeeping_candidates(work, run_dir) == [
         "runs/demo/run-1/manifest.json",
         "runs/demo/run-1/RUN.md",
+        "runs/demo/run-1/completion.json",
     ]
 
 
@@ -176,6 +178,7 @@ def test_the_flag_does_not_suppress_a_contained_result(trees):
     ) == [
         "runs/demo/run-1/manifest.json",
         "runs/demo/run-1/RUN.md",
+        "runs/demo/run-1/completion.json",
     ]
     assert governed_artifact_paths(
         work, slug_dir, artifacts_outside_worktree=True
@@ -225,3 +228,12 @@ def test_state_and_artifact_declarations_are_independent(trees):
         governed_artifact_paths(work, external, state_outside_worktree=True)
     with pytest.raises(TypeError):
         run_bookkeeping_paths(work, external, artifacts_outside_worktree=True)
+
+
+def test_mid_run_checkpoint_does_not_republish_preserved_completion(trees):
+    work, _, run_dir, _ = trees
+    (run_dir / "completion.json").write_text('{"status": "done"}')
+    assert "runs/demo/run-1/completion.json" in engine_bookkeeping_candidates(work, run_dir)
+    assert run_bookkeeping_paths(work, run_dir) == [
+        "runs/demo/run-1/manifest.json", "runs/demo/run-1/RUN.md",
+    ]

@@ -1,18 +1,20 @@
 """Watcher — poll manifests, emit edge-triggered transitions (P2, FR-8).
 
-A single async task stats each known ``manifest.json`` ~once per second and
-publishes a transition to an in-process async event bus, which feeds the SSE
+A single async task stats each known projection, journal directory and completion
+export once per second and publishes transitions to an event bus feeding the SSE
 streams (P2) and, later, the notifier (P6). The watcher owns **no** run state —
-it only observes on-disk manifests — so a watcher error can never affect a run.
+it only observes journal-authoritative state. A watcher error cannot affect a run.
 
 **Two uses of the manifest mtime (review F-001/F-002):**
 
-- *File-change detection* uses the manifest's ``st_mtime_ns`` as a cheap gate:
+- *File-change detection* uses projection/journal-directory/completion-export ``st_mtime_ns``
+  as a cheap gate:
   a changed mtime means "re-parse this file", an unchanged mtime means "skip the
   read" without even parsing.
 - *Event identity* is the FR-8.1 tuple ``(run_id, current_step,
   current_step_status, run_status, manifest_revision)``, where
-  ``manifest_revision`` is that same ``st_mtime_ns`` — the PRD's v1 revision
+  ``manifest_revision`` is the projection mtime, or journal-directory mtime for
+  a journal-only update (or completion-export mtime on import) — the PRD's v1 revision
   marker (``prd.md`` FR-8.1, "``mtime`` suffices"). Including the revision means
   any manifest write is a new identity even when the four semantic fields are
   unchanged, so a run that re-enters the *same* semantic state (e.g. parks at
@@ -42,7 +44,7 @@ from pydantic import BaseModel
 from gauntlet.engine.notify import Transition
 
 from gauntlet.engine.manifest import Manifest
-from gauntlet.web.store import RunStore, _current_record, _mtime_iso
+from gauntlet.web.store import RunNotFound, RunStore, _mtime_iso
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +108,8 @@ class Watcher:
         # watcher). Set here or assigned later (create_app wires it). When None,
         # the watcher is a pure transition observer, exactly as in P2.
         self.notifier = notifier
-        # manifest path → (last mtime_ns, last semantic identity-or-None)
-        self._seen: dict[Path, tuple[int, Identity | None]] = {}
+        # manifest path → (state-source mtimes, last semantic identity)
+        self._seen: dict[Path, tuple[tuple[int | None, ...], Identity | None]] = {}
         # Whether the watcher's *initial* scan has completed. Startup priming
         # (suppress notifications for runs that predate the server) must apply
         # only to that first scan — a run first *discovered* after the watcher is
@@ -176,7 +178,7 @@ class Watcher:
 
     # ---- polling core --------------------------------------------------------
     def _event_for(
-        self, slug: str, man: Manifest, manifest_path: Path, mtime_ns: int
+        self, slug: str, man: Manifest, manifest_path: Path, mtime_ns: int | None
     ) -> WatchEvent:
         # The typed state (incl. persisted park/halt reasons) comes from the
         # engine's own transition builder so the console classifies exactly
@@ -202,20 +204,28 @@ class Watcher:
         for slug, _rid, manifest_path in self.store.iter_manifests():
             live.add(manifest_path)
             try:
-                mtime_ns = manifest_path.stat().st_mtime_ns
-            except OSError:
+                revision = self.store.state_revision(manifest_path)
+            except (OSError, ValueError):
                 continue
             prev = self._seen.get(manifest_path)
-            if prev is not None and prev[0] == mtime_ns:
+            if prev is not None and prev[0] == revision:
                 continue  # cheap gate: file untouched since last tick
             try:
-                man = Manifest.load(manifest_path)
-            except (OSError, ValueError):
+                man = self.store.manifest(slug, _rid)
+            except (OSError, ValueError, RunNotFound):
                 # Fail closed: record the mtime so we don't spin re-parsing a
                 # torn/broken file, but keep the prior identity so a later valid
                 # rewrite still reads as a transition.
-                self._seen[manifest_path] = (mtime_ns, prev[1] if prev else None)
+                self._seen[manifest_path] = (revision, prev[1] if prev else None)
                 continue
+            # Preserve the projection-mtime contract when it changes. A
+            # journal-only append has its own directory revision, including
+            # when the projection is missing or was never updated.
+            mtime_ns = revision[0]
+            if mtime_ns is None or (prev is not None and prev[0][0] == mtime_ns):
+                mtime_ns = max(
+                    (value for value in revision[1:] if value is not None), default=None,
+                )
             event = self._event_for(slug, man, manifest_path, mtime_ns)
             identity = event.identity
             if prev is None or prev[1] != identity:
@@ -231,7 +241,7 @@ class Watcher:
                 startup = not self._primed
                 first = startup and (prev is None or prev[1] is None)
                 self._dispatch_notify(event, first=first)
-            self._seen[manifest_path] = (mtime_ns, identity)
+            self._seen[manifest_path] = (revision, identity)
         # Forget runs whose dir vanished (rare), so memory tracks live runs only.
         for gone in set(self._seen) - live:
             del self._seen[gone]

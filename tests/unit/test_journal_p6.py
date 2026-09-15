@@ -101,7 +101,9 @@ def test_event_vocabulary_is_the_plan_4_6_set_plus_genesis():
     load-bearing part: the authoritative answer to "does this run have a
     worktree?" is ``git worktree list --porcelain`` (spike §10 makes that the
     detection rule precisely so it never depends on an event having landed), so
-    these record the transition without joining the state chain.
+    these record the transition without joining the state chain. #164 adds
+    CompletionExported on the same extension seam: it records the terminal
+    branch revision for reconstruction, without redefining run status.
     """
     assert set(J.EVENT_KINDS) == {
         "JournalGenesis",
@@ -119,6 +121,7 @@ def test_event_vocabulary_is_the_plan_4_6_set_plus_genesis():
         "RunStatusChanged",
         "WorktreeAdopted",
         "WorktreeReleased",
+        "CompletionExported",
     }
 
 

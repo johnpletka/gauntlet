@@ -86,6 +86,8 @@ EVENT_KINDS = (
     # transition record — who adopted what, when, and at which SHA.
     "WorktreeAdopted",
     "WorktreeReleased",
+    # Terminal export records the branch revision used by A3 reconstruction.
+    "CompletionExported",
 )
 
 # Lifecycle literals, pinned 1:1 to manifest.py's constants by
@@ -768,6 +770,39 @@ def derive_kind(prev: dict | None, cur: dict) -> tuple[str, list[str]]:
 # --- migration genesis (deliverable 4, plan §8) -------------------------------
 
 
+def bootstrap_state(run_dir: Path, *, validate: "Validator | None" = None) -> tuple[str, str]:
+    """No-journal source for both read-only views and first mutating contact.
+
+    Git carries completion.json, a terminal snapshot separate from the mutable
+    manifest. Accept it only for this run instance and (when present) the same
+    manifest identity/pipeline. A local journal ALWAYS takes precedence, even
+    after rollback. This helper must only be called when no state event exists.
+    """
+    legacy = run_dir / "manifest.json"
+    try:
+        text = legacy.read_text()
+    except (FileNotFoundError, NotADirectoryError):
+        text = None
+    try:
+        completed = (run_dir / "completion.json").read_text()
+        if not _valid_state(completed, validate):
+            raise ValueError("invalid completion snapshot")
+        state = json.loads(completed)
+        if (state.get("status") != "done" or state.get("current_step") is not None
+                or state.get("run_id") != run_dir.name
+                or state.get("slug") != run_dir.parent.name):
+            raise ValueError("completion does not identify this completed run")
+        if text is not None:
+            old = json.loads(text)
+            if any(old.get(key) != state.get(key) for key in ("run_id", "slug", "pipeline")):
+                raise ValueError("completion differs from manifest identity")
+        return completed, "completion.json"
+    except (OSError, ValueError, AttributeError):
+        if text is None:
+            raise FileNotFoundError(legacy) from None
+        return text, "manifest.json"
+
+
 def ensure_genesis(
     run_dir: Path,
     *,
@@ -776,8 +811,9 @@ def ensure_genesis(
 ) -> dict | None:
     """Migrate a pre-P6 run: one deterministic genesis event on first contact.
 
-    When the journal holds NO state event and ``manifest.json`` holds a state
-    this engine can actually LOAD, its bytes are embedded verbatim as a
+    When the journal holds NO state event, select a loadable local manifest or
+    portable completion snapshot via :func:`bootstrap_state`. Its bytes are
+    embedded verbatim as a
     ``JournalGenesis`` state event — same input bytes ⇒ same event bytes,
     modulo the injected clock and the observed HEAD. Nothing is rewritten:
     approved artifacts, run history, and the manifest itself are untouched
@@ -791,12 +827,11 @@ def ensure_genesis(
     raises, as it did before), and the first contact after a repair seeds the
     genesis from the repaired bytes.
     """
-    manifest_path = run_dir / "manifest.json"
     jdir = journal_dir(run_dir)
     if _head_state(jdir, mutate=False).event is not None:
         return None
     try:
-        text = manifest_path.read_text()
+        text, source = bootstrap_state(run_dir, validate=validate)
     except (FileNotFoundError, NotADirectoryError):
         return None
     if not _valid_state(text, validate):
@@ -810,10 +845,10 @@ def ensure_genesis(
         run_id=run_id,
         idempotency_key=_sha256_text(f"genesis:{run_id}:{_sha256_text(text)}"),
         payload={
-            "migrated_from": "manifest.json",
+            "migrated_from": source,
             "note": (
                 "pre-P6 run migrated on first mutating contact (plan §8): the "
-                "on-disk manifest bytes are embedded verbatim; legacy attempt "
+                f"{source} bytes are embedded verbatim; legacy attempt "
                 "identity stays derived as <step_id>#<attempts>"
             ),
         },
@@ -1013,6 +1048,10 @@ def reconcile_projection(
     if status.health == HEALTH_NO_JOURNAL:
         genesis = ensure_genesis(run_dir, clock=clock, validate=validate)
         if genesis is not None:
+            if genesis["payload"]["migrated_from"] != "manifest.json":
+                # Use the ordinary preserve/rebuild path after importing the
+                # portable snapshot, so stale bytes are never discarded.
+                return reconcile_projection(run_dir, clock=clock, validate=validate)
             notes.append(
                 f"journal genesis appended from the existing manifest "
                 f"(seq {genesis['seq']}; pre-P6 migration, plan §8)"

@@ -293,9 +293,19 @@ gauntlet resume myfeat --response "…"   # decide an upstream conflict (see bel
 gauntlet report myfeat           # per-step / per-agent cost, tokens + clock time
 ```
 
-- **Interrupted runs are resumable.** State lives in the run's `manifest.json`;
+- **Interrupted runs are resumable.** The local journal is authoritative;
+  `manifest.json` is its rebuildable projection. Both CLI status and the console
+  read the journal when that projection is stale, missing, or corrupt.
   `gauntlet resume` re-enters at the last incomplete step. A step that wrote a
   dirty tree before dying is parked or reset rather than re-run blindly.
+- **Completion travels through Git.** After a run finishes, the engine commits
+  `runs/<slug>/<run-id>/completion.json` on the run branch. A checkout without
+  the local journal reads this validated terminal snapshot; its first mutating
+  command imports the same state into a journal. An existing journal always
+  wins, including after rollback. The completion commit stages only this file.
+  If publication fails, resume the completed run to retry without rerunning
+  its agents. Older runs without this snapshot retain their legacy behavior;
+  reconcile their manifests once before sharing them through Git.
 - **Provider usage limits pause, they don't destroy.** A quota/429/usage-limit
   hit mid-step — including inside a review cycle's sub-agents — **parks** the run
   (`parked_usage_limit`) with the worktree untouched and the agent session

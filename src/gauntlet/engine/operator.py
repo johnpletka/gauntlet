@@ -980,10 +980,15 @@ def load_projection_view(
             return None
 
     if status.health in (JR.HEALTH_OK, JR.HEALTH_NO_JOURNAL):
-        # Healthy, or a pre-P6 run with no journal: classify from the on-disk
-        # projection, exactly as before P6.
+        # A healthy projection agrees with the journal. Without a journal,
+        # use the same bootstrap source as the first mutating command: a
+        # validated completion export if present, otherwise the legacy manifest.
         try:
-            man: "Manifest | None" = Manifest.load(manifest_path)
+            if status.health == JR.HEALTH_NO_JOURNAL:
+                text, _ = JR.bootstrap_state(run_instance_dir, validate=M.validate_projection_text)
+                man: "Manifest | None" = Manifest.model_validate_json(text)
+            else:
+                man = Manifest.load(manifest_path)
         except (OSError, ValueError):
             man = _head_manifest()
         return ProjectionView(
