@@ -294,7 +294,7 @@ def test_start_discards_spent_merged_branch_and_recreates(fixture_repo):
     # The claim itself — the spent branch was discarded and recreated with this
     # run's work on it — is unchanged and is what these two lines now say.
     assert gitops.current_branch(run_work_tree(fixture_repo)) == "gauntlet/demo"
-    assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P1: implement"
+    assert gitops.commit_subject(fixture_repo, mgr.status("demo").commits[-1].sha) == "P1: implement"
 
 
 # --- clean -------------------------------------------------------------------
@@ -415,8 +415,9 @@ def test_resume_refuses_reset_branch_without_rewinding_worktree(fixture_repo):
     # run; that half is asserted by the companion test below.
     mgr = _prepare(fixture_repo, CONFIG_SAME_TREE)
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
+    recorded_phase = mgr.status("demo").commits[-1].sha
     git(fixture_repo, "checkout", "-q", "main")
-    git(fixture_repo, "branch", "-f", "gauntlet/demo", "gauntlet/demo~1")  # drop P1
+    git(fixture_repo, "branch", "-f", "gauntlet/demo", recorded_phase + "^")  # drop P1
     with pytest.raises(RunBranchStateError, match="missing the manifest"):
         mgr.resume("demo", use_judge=False)
     # the worktree was NOT switched onto the bad branch
@@ -436,7 +437,7 @@ def test_dedicated_resume_refuses_a_reset_run_branch(fixture_repo):
     assert _run_linear(mgr, fixture_repo, "demo") == M.RUN_DONE
     work = run_work_tree(fixture_repo)
     assert work != fixture_repo, "the P7g default must give this run its own tree"
-    git(work, "reset", "--hard", "-q", "HEAD~1")  # drop the recorded P1 commit
+    git(work, "reset", "--hard", "-q", mgr.status("demo").commits[-1].sha + "^")  # drop the recorded P1 commit
     with pytest.raises(RunBranchStateError, match="missing the manifest"):
         mgr.resume("demo", use_judge=False)
 

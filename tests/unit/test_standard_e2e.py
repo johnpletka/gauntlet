@@ -283,7 +283,7 @@ def test_standard_runs_end_to_end_with_fakes(tmp_path, monkeypatch):
     # (acceptance A1), so naming the branch is both the same claim and the one
     # that is vantage-independent (refs are shared across worktrees, spike E1).
     assert man.branch == "gauntlet/toy"
-    assert gitops.commit_subject(repo, man.branch) in (
+    assert gitops.commit_subject(repo, man.commits[-1].sha) in (
         "P1: build the widget", "PLAN: Author plan.md for adversarial review",
     )
     # every cycle converged; the phase implemented the widget — in the tree the

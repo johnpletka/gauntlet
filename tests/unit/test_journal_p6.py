@@ -548,20 +548,21 @@ def test_branch_reset_materializing_old_manifest_does_not_reset_state(
     the completed step is not re-run and the reconciliation is loud."""
     mgr, man, base, run_dir = _seed(fixture_repo)
     # Bookkeeping commit carries the RUNNING-state manifest (S1) on the branch.
-    gitops.commit_run_bookkeeping(
+    stale_checkpoint = gitops.commit_run_bookkeeping(
         fixture_repo, "gauntlet: manifest checkpoint",
         ["runs/demo/run-1/manifest.json"], identity=gitops.ENGINE_IDENTITY,
     )
-    # The run completes: state advances to S2 (journaled), uncommitted.
+    # The run completes: state advances to S2 (journaled and exported at completion).
     status, first_adapter = _resume(mgr)
     assert status == M.RUN_DONE
     assert len(first_adapter.calls) == 1
     s2 = (run_dir / "manifest.json").read_bytes()
 
-    # The reset (the file effect every sanctioned rewind's reset_hard has):
+    # Restore the old snapshot (the projection effect of a branch rewind):
     # the tracked manifest.json snaps back to the committed S1 — a RUNNING
     # step under a running run. Pre-P6 this WAS the state machine rewinding.
-    git(fixture_repo, "reset", "-q", "--hard", "HEAD")
+    git(fixture_repo, "restore", "--source", stale_checkpoint, "--worktree",
+        "--", "runs/demo/run-1/manifest.json")
     stale = Manifest.load(run_dir / "manifest.json")
     assert stale.record("implement").status == M.RUNNING  # the pre-P6 trap
 
@@ -792,7 +793,7 @@ def test_migrated_run_reset_to_pre_genesis_manifest_keeps_authority(
     # Commit state S0, then advance the manifest to S1 and drop the journal:
     # a genuine pre-P6 run whose git history holds a state (S0) that the
     # migration genesis (which embeds S1) will never have recorded.
-    gitops.commit_run_bookkeeping(
+    stale_checkpoint = gitops.commit_run_bookkeeping(
         fixture_repo, "gauntlet: pre-P6 checkpoint",
         ["runs/demo/run-1/manifest.json"], identity=gitops.ENGINE_IDENTITY,
     )
@@ -810,8 +811,9 @@ def test_migrated_run_reset_to_pre_genesis_manifest_keeps_authority(
     genesis = _state_events(run_dir)[0]
     assert genesis["kind"] == "JournalGenesis"
 
-    # The reset materializes the PRE-genesis committed manifest.
-    git(fixture_repo, "reset", "-q", "--hard", "HEAD")
+    # Restore the PRE-genesis snapshot, not HEAD: completion now exports S2.
+    git(fixture_repo, "restore", "--source", stale_checkpoint, "--worktree",
+        "--", "runs/demo/run-1/manifest.json")
     reset_bytes = (run_dir / "manifest.json").read_text()
     assert Manifest.load(run_dir / "manifest.json").record(
         "implement"

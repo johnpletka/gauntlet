@@ -108,13 +108,13 @@ def test_e2e_conflict_resume_proceeds_unsticks_run(tmp_path):
     ]
     # The phase commit itself landed (the proceed path committed real work).
     # P7g: the phase commit lands on the run BRANCH, in the run's tree.
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
     assert (run_work_tree(repo) / "feature.py").exists()
     # PRD §8 / appendix: the implementation phase commit BODY references the
     # consumed response_id, linking the committed code to the human decision that
     # ratified it — the audit linkage the bookkeeping checkpoint alone cannot
     # stand in for (F-001).
-    phase_body = gitops.commit_message(repo, "gauntlet/demo")
+    phase_body = gitops.commit_message(repo, mgr.status("demo").commits[-1].sha)
     assert "Gauntlet-Response: implement-resp-1" in phase_body
 
 
@@ -196,9 +196,9 @@ def test_e2e_multi_cycle_repark_then_resolve(tmp_path):
         "Gauntlet Engine|gauntlet: response implement-resp-2 consumed",
     ]
     # P7g: the phase commit lands on the run BRANCH, in the run's tree.
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
     # PRD §8 / appendix: the phase commit body references BOTH consumed responses
     # — the full audit linkage from the committed code to every human decision in
     # the cycle that produced it (F-001).
-    phase_body = gitops.commit_message(repo, "gauntlet/demo")
+    phase_body = gitops.commit_message(repo, mgr.status("demo").commits[-1].sha)
     assert "Gauntlet-Response: implement-resp-1, implement-resp-2" in phase_body

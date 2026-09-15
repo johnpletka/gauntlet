@@ -109,14 +109,14 @@ def test_kill9_resume_recovers_in_a_loop(tmp_path, iteration):
     status = mgr.resume("demo", use_judge=False, adapter_factory=lambda n: RecoverAdapter())
     assert status == M.RUN_DONE
 
-    # Exactly one commit, containing the recovered file; clean tree; no dupes.
+    # Exactly one phase commit, containing the recovered file; clean tree; no dupes.
     final = mgr.status("demo")
     assert [c.phase for c in final.commits] == ["P1"]
     # P7g: the recovered effects are on the run BRANCH and in the RUN's tree —
     # the recovery property is unchanged, only the vantage point is. Naming the
     # branch reads the same from either tree (refs are shared, spike E1).
     work = run_work_tree(repo)
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: crash phase"
     assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
     # work tree is clean; only the engine's own run bookkeeping is untracked
     assert gitops.is_clean(work, exclude=["runs"])
