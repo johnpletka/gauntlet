@@ -96,7 +96,7 @@ def test_engine_manages_judge_lifecycle_around_a_run(tmp_path):
     # The operator's own HEAD is asserted UNMOVED for the same reason (A1).
     work = run_work_tree(repo, "demo")
     assert work != repo, "the run must not have driven the operator's checkout"
-    assert gitops.commit_subject(work, "HEAD") == "P1: engine-managed judge run"
+    assert gitops.commit_subject(work, mgr.status("demo").commits[-1].sha) == "P1: engine-managed judge run"
     assert (work / "artifact.txt").read_text().strip() == "work"
     assert gitops.commit_subject(repo, "HEAD") == "init"
 
@@ -174,7 +174,7 @@ def test_real_pipeline_agent_shell_commit_with_live_judge(tmp_path):
     assert work != repo, "the run must not have driven the operator's checkout"
     assert (work / "hello.txt").exists()
     assert not (repo / "hello.txt").exists()
-    assert gitops.commit_subject(work, "HEAD") == "P1: pipeline writes hello"
+    assert gitops.commit_subject(work, mgr.status("demo").commits[-1].sha) == "P1: pipeline writes hello"
     # the judge gated the agent's tool call live and allowed the benign echo
     audit = mgr.layout("demo").active_run_dir() / "judge-audit.jsonl"
     assert audit.exists()

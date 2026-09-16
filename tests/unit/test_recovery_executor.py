@@ -1002,7 +1002,7 @@ def test_killed_rollback_replays_via_resume_and_converges(fixture_repo, monkeypa
     assert RX.load_intent(run_dir) is None
     assert any("replayed after a process death" in w for w in man.warnings)
     assert [c.phase for c in man.commits] == ["P1", "P2"]
-    assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P2: phase two"
+    assert gitops.commit_subject(fixture_repo, man.commits[-1].sha) == "P2: phase two"
     # A second resume finds nothing to replay and nothing to do.
     assert RX.replay_pending_intent(fixture_repo, run_dir) is None
 

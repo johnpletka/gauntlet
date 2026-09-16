@@ -168,6 +168,16 @@ class GateResolver:
     def __init__(self, store: RunStore) -> None:
         self.store = store
 
+    def _manifest(self, slug: str, run_dir: Path) -> Manifest:
+        """The run's AUTHORITATIVE state (journal head / completion export),
+        the same view the list and detail pages render (#164) — never the raw
+        projection, which can be stale, missing in a fresh checkout that only
+        carries ``completion.json``, or one transition behind a kill window."""
+        try:
+            return self.store.load_manifest(run_dir)
+        except (OSError, ValueError) as exc:
+            raise RunNotFound(f"unreadable manifest for {slug!r}: {exc}") from exc
+
     # ---- artifact path resolution (FR-4.2 / review F-006) -------------------
     def _resolve_artifact(
         self, run_dir: Path, slug_dir: Path, name: str
@@ -207,7 +217,7 @@ class GateResolver:
     def gate(self, slug: str, run_id: str | None = None) -> GateView:
         run_dir = self.store.run_dir(slug, run_id)
         rid = run_dir.name
-        man = Manifest.load(run_dir / "manifest.json")
+        man = self._manifest(slug, run_dir)
         rec = self._gate_step(man)
         slug_dir = self.store._slug_dir(slug)
 
@@ -385,7 +395,7 @@ class GateResolver:
     ) -> DiffView:
         run_dir = self.store.run_dir(slug, run_id)
         rid = run_dir.name
-        man = Manifest.load(run_dir / "manifest.json")
+        man = self._manifest(slug, run_dir)
         repo = self.store.repo_root
 
         # Explicit SHAs override the automatic selection (§6). Validate them as

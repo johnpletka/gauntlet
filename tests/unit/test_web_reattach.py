@@ -378,7 +378,7 @@ def test_orphaned_owned_run_resumes_to_done(tmp_path, kill_delay):
     assert [c.phase for c in final.commits] == ["P1"]
     # P7g: recovered effects land on the run BRANCH and in the RUN's tree.
     work = run_work_tree(repo)
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: crash phase"
     assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
     assert gitops.is_clean(work, exclude=["runs"])
     assert gitops._run(
@@ -466,7 +466,7 @@ def test_orphaned_between_steps_resumes_to_done(tmp_path, kill_delay):
     assert [c.phase for c in final.commits] == ["P1"]
     # P7g: recovered effects land on the run BRANCH and in the RUN's tree.
     work = run_work_tree(repo)
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: crash phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: crash phase"
     assert (work / "feature.py").read_text() == "RECOVERED — final content\n"
     assert gitops.is_clean(work, exclude=["runs"])
     assert gitops._run(

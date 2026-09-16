@@ -253,7 +253,7 @@ def test_response_proceeds_records_pending_then_consumed(tmp_path):
     # proceed resolved the conflict in place: discriminator cleared (FR-2.1).
     assert rec.parked_reason is None
     # A real phase commit landed (no re-park).
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
 
 
 def test_response_checkpoints_reach_git_history_in_order(tmp_path):

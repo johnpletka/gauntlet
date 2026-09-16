@@ -248,7 +248,7 @@ def test_proceed_in_place_completes_and_commits(tmp_path):
     assert rec.status == M.DONE
     assert rec.parked_reason is None  # proceed clears the discriminator
     assert rec.attempts == 0  # not a failure
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
 
 
 def test_proceed_with_deviation_completes(tmp_path):
@@ -672,7 +672,7 @@ def test_routed_proceed_classifies_on_mechanic_then_implements_on_builder(tmp_pa
         ("builder", "claude-code", None),
     ]
     assert (run_work_tree(repo) / "feature.py").read_text() == "implemented\n"  # builder's work
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
 
 
 TIMEOUT_CONFIG = """
@@ -903,7 +903,7 @@ def test_dirty_repark_then_proceed_commits_no_stale_edits(tmp_path):
         "demo", response="now resolved", use_judge=False,
         adapter_factory=lambda n: proceed, clock=_clock(),
     ) == M.RUN_DONE
-    assert gitops.commit_subject(repo, "gauntlet/demo") == "P1: implement phase"
+    assert gitops.commit_subject(repo, mgr.status("demo").commits[-1].sha) == "P1: implement phase"
     assert (run_work_tree(repo) / "feature.py").read_text() == "implemented\n"
 
 

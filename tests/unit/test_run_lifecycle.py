@@ -398,7 +398,7 @@ def test_run_end_to_end_creates_branch_and_commit(fixture_repo):
     # than `HEAD` says the same thing from either vantage — refs are shared
     # across worktrees (spike E1).
     assert gitops.current_branch(run_work_tree(fixture_repo)) == "gauntlet/demo"
-    assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P1: implement"
+    assert gitops.commit_subject(fixture_repo, mgr.status("demo").commits[-1].sha) == "P1: implement"
     man = mgr.status("demo")
     assert man.status == M.RUN_DONE
     assert man.commits[-1].phase == "P1"
@@ -454,7 +454,8 @@ def test_rollback_to_phase_one_rewinds_branch_and_manifest(fixture_repo):
     # P7g: the phase commits are on the run branch, in the RUN's tree; the
     # operator's HEAD never moved (acceptance A1).
     work = run_work_tree(fixture_repo)
-    p2_sha = gitops.head_sha(work)
+    run_tip = gitops.head_sha(work)
+    p2_sha = mgr.status("demo").commits[-1].sha
     assert gitops.commit_subject(fixture_repo, p2_sha) == "P2: phase two"
 
     target = mgr.rollback("demo", phase=1)
@@ -475,7 +476,7 @@ def test_rollback_to_phase_one_rewinds_branch_and_manifest(fixture_repo):
     ).splitlines()
     assert refs
     snapshot = git_snapshot.load_snapshot(fixture_repo, refs[-1])
-    assert snapshot.run_branch_sha == p2_sha
+    assert snapshot.run_branch_sha == run_tip
     assert gitops.is_ancestor(fixture_repo, p2_sha, snapshot.snapshot_commit)
 
 
@@ -584,11 +585,14 @@ def test_rollback_engine_shaped_pr_md_commit_is_not_bookkeeping(fixture_repo):
     )
     ahead = gitops.head_sha(fixture_repo)
 
+    unmanifested_count = len(gitops.log_range(
+        fixture_repo, mgr.status("demo").commits[-1].sha, ahead,
+    ).splitlines())
     mgr.rollback("demo", phase=1)
     man = mgr.status("demo")
     # The absorb audit trail proves the commit was NOT classified bookkeeping
     # (the bookkeeping fast path records no warning and needs no absorption).
-    assert any("absorbed 1 unmanifested commit" in w for w in man.warnings)
+    assert any(f"absorbed {unmanifested_count} unmanifested commit" in w and ahead[:7] in w for w in man.warnings)
     refs = gitops._run(
         fixture_repo, "for-each-ref", "--format=%(refname)",
         "refs/gauntlet/recovery/",
@@ -622,12 +626,15 @@ def test_rollback_absorbs_strictly_ahead_commits_with_backup(fixture_repo):
         "commit", "-qm", "P2 wip: arm the thing")
     ahead = gitops.head_sha(work)
 
+    unmanifested_count = len(gitops.log_range(
+        fixture_repo, mgr.status("demo").commits[-1].sha, ahead,
+    ).splitlines())
     target = mgr.rollback("demo", phase=1)
     assert gitops.head_sha(work) == target
     assert gitops.commit_subject(fixture_repo, "gauntlet/demo") == "P1: phase one"
     man = mgr.status("demo")
     assert any(
-        "absorbed 1 unmanifested commit" in w and "P2 wip: arm the thing" in w
+        f"absorbed {unmanifested_count} unmanifested commit" in w and "P2 wip: arm the thing" in w
         for w in man.warnings
     )
     refs = gitops._run(
@@ -814,7 +821,7 @@ def test_rollback_refuses_branch_forked_from_manifest(fixture_repo):
     # (spike E2-E), and the guard under test reads the RUN branch, so forking
     # the operator's `main` would prove nothing about it.
     work = run_work_tree(fixture_repo)
-    last_recorded = gitops.head_sha(work)
+    last_recorded = mgr.status("demo").commits[-1].sha
     gitops.reset_hard(work, f"{last_recorded}~1")
     (work / "extra.py").write_text("forked line of history\n")
     git(work, "add", "-A")

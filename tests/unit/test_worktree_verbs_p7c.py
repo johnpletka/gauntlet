@@ -25,6 +25,7 @@ from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine import worktree as WT
 from gauntlet.engine.run import RunManager
+from gauntlet.engine.execution import engine_bookkeeping_candidates
 
 from conftest import FakeAdapter, git
 
@@ -116,7 +117,7 @@ def test_start_drives_the_run_worktree_not_the_operator_checkout(fixture_repo):
 
     # 2. the engine's phase commit landed on the run branch, reachable from the
     #    run tree's HEAD — and the operator's HEAD never moved
-    assert gitops.commit_subject(fixture_repo, "refs/heads/gauntlet/demo") == (
+    assert gitops.commit_subject(fixture_repo, mgr.status("demo").commits[-1].sha) == (
         "P1: implement"
     )
     assert gitops.current_branch(fixture_repo) == before_branch
@@ -194,7 +195,15 @@ def test_resume_recreates_a_missing_worktree_and_verifies_head(fixture_repo):
     assert mgr.approve("demo", notes="ok", use_judge=False) == M.RUN_DONE
     again = _run_worktree(mgr, "gauntlet/demo")
     assert again is not None and again.path.is_dir()
-    assert gitops.head_sha(again.path) == recorded
+    # Reconstruction must retain the original history; completion may append
+    # engine metadata after the recreated tree has been verified.
+    assert gitops.is_ancestor(fixture_repo, recorded, gitops.head_sha(again.path))
+    assert gitops.advance_is_engine_bookkeeping(
+        fixture_repo, recorded, tip=gitops.head_sha(again.path),
+        bookkeeping=engine_bookkeeping_candidates(
+            again.path, again.path / "runs/demo" / mgr.status("demo").run_id,
+        ),
+    )
 
 
 # --- F-002: rollback reaches the executor in dedicated mode ------------------

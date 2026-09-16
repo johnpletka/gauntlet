@@ -529,7 +529,9 @@ def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
     _step_off_the_run_branch(fixture_repo)
     run_dir = mgr.layout("demo").active_run_dir()
     before_head = gitops.head_sha(fixture_repo)
+    from conftest import _operator_fingerprint
 
+    before_operator = _operator_fingerprint(fixture_repo)
     out = mgr.migrate_worktree("demo")
     assert "migrated 'demo'" in out
 
@@ -574,6 +576,8 @@ def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
                          adapter_factory=lambda n: FakeAdapter())
     assert status == M.RUN_PARKED
     assert gitops.current_branch(fixture_repo) == "main"
+
+    assert _operator_fingerprint(fixture_repo) == before_operator
 
     # 7. rollback returns it to same_tree, with the journal intact.
     out = mgr.rollback_worktree_migration("demo")
