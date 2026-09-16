@@ -217,10 +217,13 @@ def test_due_schedule_is_fired_write_ahead_and_audited(tmp_path):
     assert man.record("implement").scheduled_resume.attempts == 1  # counted write-ahead
     assert any(w.startswith("unattended sweep resumed (scheduled_resume/usage_limit)")
                for w in man.warnings)
-    # Quota schedules do not exhaust the shared provider-outage ceiling.
-    SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
-    SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
-    out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
+    # Quota schedules do not exhaust the shared provider-outage ceiling — but
+    # each fire moves the deadline out one interval (write-ahead spacing), so
+    # the sweeps that keep firing are the ones that arrive after it.
+    step = timedelta(seconds=1800)
+    SW.sweep_run(h.mgr, "demo", now=T0 + step, launcher=h.launcher)
+    SW.sweep_run(h.mgr, "demo", now=T0 + 2 * step, launcher=h.launcher)
+    out = SW.sweep_run(h.mgr, "demo", now=T0 + 3 * step, launcher=h.launcher)
     assert out.action == SW.ACTION_RESUMED
     assert len(h.launches) == 4
     rec = h.load().record("implement")
