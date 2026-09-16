@@ -413,3 +413,43 @@ def test_stamp_rechecks_decision_under_lock(tmp_path, change):
     reason = SW._stamp_under_lock(h.mgr, "demo", h.run_dir, "run-1", decision, T0)
     assert reason and "state changed" in reason
     assert h.load().steps[0].scheduled_resume.attempts == 0
+
+
+# --- #166 review: arm-path deadline rule, spaced re-fire, deduped audit -------
+def test_sweep_arm_honors_a_future_structured_reset(tmp_path):
+    h = _Harness(tmp_path, AUTO)
+    man = _parked(M.PARKED_REASON_USAGE_LIMIT)
+    man.steps[0].quota_reset_at = (T0 + timedelta(hours=5)).isoformat()
+    h.save(man)
+    out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
+    assert out.action == SW.ACTION_ARMED
+    sched = h.load().record("implement").scheduled_resume
+    assert sched.deadline_source == "provider_hint"
+    assert datetime.fromisoformat(sched.attempt_at) == T0 + timedelta(hours=5)
+    assert sched.armed_at == T0.isoformat()
+    assert any(w.startswith("unattended sweep armed (quota_fallback_armed)")
+               for w in h.load().warnings)
+
+
+def test_sweep_arms_legacy_quota_park_behind_a_proven_dead_lock():
+    d = SW.decide(_parked(M.PARKED_REASON_USAGE_LIMIT), op.LIVENESS_NONE,
+                  lock=SW.LOCK_DEAD, config=AUTO, now=T0)
+    assert d.act and d.reason == SW.REASON_ARM_QUOTA
+
+
+def test_sweep_refire_is_spaced_and_audited_once_per_episode(tmp_path):
+    h = _Harness(tmp_path, AUTO)
+    h.save(_parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due()))
+    assert SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher).action == SW.ACTION_RESUMED
+    sched = h.load().record("implement").scheduled_resume
+    assert datetime.fromisoformat(sched.attempt_at) == T0 + timedelta(seconds=1800)
+    # a child that died before re-parking is NOT re-fired by the next sweep
+    out = SW.sweep_run(h.mgr, "demo", now=T0 + timedelta(seconds=120), launcher=h.launcher)
+    assert out.action == SW.ACTION_SKIPPED and "not due" in out.reason
+    assert len(h.launches) == 1
+    # ...but is once the interval has elapsed, with ONE audit line for the episode
+    out = SW.sweep_run(h.mgr, "demo", now=T0 + timedelta(seconds=1800), launcher=h.launcher)
+    assert out.action == SW.ACTION_RESUMED and len(h.launches) == 2
+    notes = [w for w in h.load().warnings
+             if w.startswith("unattended sweep resumed (scheduled_resume/usage_limit)")]
+    assert len(notes) == 1 and notes[0].endswith((T0 + timedelta(seconds=1800)).isoformat())

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -363,18 +364,121 @@ class ScheduledResume(BaseModel):
     policy: Literal["bounded", "until_cancelled"] | None = None
     interval_s: float | None = None
     deadline_source: Literal["provider_hint", "fallback", "backoff"] | None = None
+    # Identity + escalation state of an until_cancelled schedule (#166 review).
+    # ``armed_at`` is when the schedule was FIRST armed and is carried across
+    # every re-park, so a notification de-dup key can treat the whole retry
+    # episode as one park rather than one notification per denial.
+    # ``consecutive_denials`` counts recognized quota denials since arming;
+    # ``escalated_at`` is stamped once that count reaches
+    # ``quota_denials_before_escalation`` — the "this restriction may be
+    # persistent (billing / plan)" signal the operator surfaces render.
+    armed_at: str | None = None
+    consecutive_denials: int = 0
+    escalated_at: str | None = None
+
+
+SCHEDULE_POLICY_BOUNDED = "bounded"
+SCHEDULE_POLICY_UNTIL_CANCELLED = "until_cancelled"
+
+# A hint-derived quota deadline is never allowed closer than this to "now":
+# with no attempt ceiling on an until_cancelled schedule, a provider answering
+# ``Retry-After: 1`` would otherwise drive a full resume every second.
+QUOTA_RETRY_MIN_SPACING_S = 60.0
+
+# ``auto_resume_history`` is evidence, not a ledger of record: only the latest
+# denial is ever surfaced and the counters live on the schedule, so the list is
+# a bounded ring — an until_cancelled loop must not grow the manifest (and the
+# journal's full-manifest snapshots) without limit.
+AUTO_RESUME_HISTORY_MAX = 50
+
+
+def schedule_policy(sched: "ScheduledResume | None", park_reason: str | None) -> str:
+    """The effective retry policy of a schedule — the ONE place the legacy
+    inference lives (a pre-#166 schedule has ``policy=None``; a usage-limit
+    park is until_cancelled, everything else bounded)."""
+    if sched is not None and sched.policy is not None:
+        return sched.policy
+    reason = (sched.reason if sched is not None else None) or park_reason
+    return (
+        SCHEDULE_POLICY_UNTIL_CANCELLED
+        if reason == PARKED_REASON_USAGE_LIMIT else SCHEDULE_POLICY_BOUNDED
+    )
+
+
+def schedule_is_unbounded(sched: "ScheduledResume | None", park_reason: str | None) -> bool:
+    return schedule_policy(sched, park_reason) == SCHEDULE_POLICY_UNTIL_CANCELLED
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def quota_schedule_deadline(
+    now: datetime, reset_at: str | None, interval_s: float,
+    *, min_spacing_s: float = QUOTA_RETRY_MIN_SPACING_S,
+) -> tuple[str, str]:
+    """Choose the next quota retry deadline and name its evidence.
+
+    Shared by the orchestrator's park path and the sweep's legacy-arm path so
+    "how a quota deadline is chosen" has exactly one definition. A structured
+    ``reset_at`` is used only when parseable and still in the future, floored
+    at ``min_spacing_s`` from ``now``; otherwise the engine schedules
+    ``interval_s`` out from its own clock. Prose is never parsed (#166).
+    """
+    now = _as_utc(now)
+    floor = now + timedelta(seconds=min_spacing_s)
+    if reset_at is not None:
+        try:
+            target = _as_utc(datetime.fromisoformat(reset_at))
+        except (ValueError, TypeError):
+            target = None
+        if target is not None and target > now:
+            return max(target, floor).isoformat(), "provider_hint"
+    return (now + timedelta(seconds=interval_s)).isoformat(), "fallback"
+
+
+def quota_schedule(
+    now: datetime, reset_at: str | None, *, interval_s: float, max_attempts: int,
+    prior: "ScheduledResume | None" = None,
+) -> "ScheduledResume":
+    """Build (or re-arm) an until_cancelled quota schedule, carrying the
+    attempt count, arming time and escalation state of ``prior`` across a
+    re-park so the episode's identity survives every denial."""
+    attempt_at, source = quota_schedule_deadline(now, reset_at, interval_s)
+    return ScheduledResume(
+        attempt_at=attempt_at,
+        attempts=prior.attempts if prior else 0,
+        max_attempts=max_attempts,
+        reason=PARKED_REASON_USAGE_LIMIT,
+        policy=SCHEDULE_POLICY_UNTIL_CANCELLED,
+        interval_s=interval_s,
+        deadline_source=source,
+        armed_at=(prior.armed_at if prior and prior.armed_at else _as_utc(now).isoformat()),
+        consecutive_denials=prior.consecutive_denials if prior else 0,
+        escalated_at=prior.escalated_at if prior else None,
+    )
 
 
 class AutoResumeEvent(BaseModel):
-    """Append-only evidence for one scheduled-resume transition (#166)."""
+    """Bounded evidence for one scheduled-resume transition (#166)."""
 
     at: str
     attempt: int
     reason: str
-    outcome: Literal["attempt_started", "quota_denied", "continued"]
+    outcome: Literal[
+        "attempt_started", "quota_denied", "continued", "cancelled", "escalated",
+    ]
     marker: str | None = None
     excerpt: str | None = None
     next_attempt_at: str | None = None
+
+
+def append_auto_resume_event(rec: "StepRecord", event: AutoResumeEvent) -> None:
+    """Append to the step's auto-resume ring, dropping the oldest past the cap."""
+    rec.auto_resume_history.append(event)
+    overflow = len(rec.auto_resume_history) - AUTO_RESUME_HISTORY_MAX
+    if overflow > 0:
+        del rec.auto_resume_history[:overflow]
 
 
 class RevalidationRecord(BaseModel):

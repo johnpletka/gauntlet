@@ -871,3 +871,36 @@ def test_footer_no_auto_resume_line_when_unarmed(host):
     rstate = op.compute_run_state(man, op.LIVENESS_NONE)
     lines = op.render_footer(driver, rstate, quota_reset_at="2026-07-02T09:00:00+00:00")
     assert not any("auto-resume scheduled" in ln for ln in lines)
+
+
+# --- #166 review: the footer never promises a retry nothing will perform -----
+def test_footer_says_when_a_schedule_is_cancelled_or_has_no_driver(host):
+    man = _manifest(
+        M.RUN_PARKED,
+        [_step("impl", "agent_task", M.PARKED, reason=M.PARKED_REASON_USAGE_LIMIT)],
+    )
+    sched = M.ScheduledResume(
+        attempt_at="2026-07-02T09:00:00+00:00", attempts=4, policy="until_cancelled",
+        interval_s=1800, consecutive_denials=4,
+    )
+    # knob flipped to notify: the schedule on record is reported as cancelled
+    driver = op.DriverInfo(op.LIVENESS_ALIVE, 4242, None, None)
+    rstate = op.compute_run_state(man, op.LIVENESS_ALIVE)
+    lines = op.render_footer(driver, rstate, slug="demo", scheduled_resume=sched,
+                             auto_resume_enabled=False)
+    assert any("retries are cancelled" in ln for ln in lines)
+    assert not any("retries until resume_on_quota" in ln for ln in lines)
+    assert not any("cancel auto-resume:" in ln for ln in lines)
+    # no live driver: the schedule is named, and so is the fact nothing fires it
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    rstate = op.compute_run_state(man, op.LIVENESS_NONE)
+    lines = op.render_footer(driver, rstate, slug="demo", scheduled_resume=sched,
+                             auto_resume_enabled=True)
+    assert any("no live driver: nothing fires this schedule" in ln for ln in lines)
+    assert any(ln == "consecutive quota denials: 4" for ln in lines)
+    # escalated: the persistent-restriction suspicion is on the same line
+    esc = sched.model_copy(update={"escalated_at": "2026-07-02T08:00:00+00:00"})
+    lines = op.render_footer(driver, rstate, slug="demo", scheduled_resume=esc,
+                             auto_resume_enabled=True)
+    assert any("persistent restriction suspected since 2026-07-02T08:00:00+00:00" in ln
+               for ln in lines)

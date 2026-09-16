@@ -3387,18 +3387,12 @@ def scheduled_resume_dict(
     """
     if sched is None:
         return None
-    reason = sched.reason
-    effective_reason = reason or park_reason
-    policy = sched.policy or (
-        "until_cancelled"
-        if effective_reason == M.PARKED_REASON_USAGE_LIMIT else "bounded"
-    )
     return {
         "attempt_at": sched.attempt_at,
         "attempts": sched.attempts,
         "max_attempts": sched.max_attempts,
-        "reason": reason,
-        "policy": policy,
+        "reason": sched.reason,
+        "policy": M.schedule_policy(sched, park_reason),
         "interval_s": sched.interval_s,
         "deadline_source": sched.deadline_source,
         "last_denial": _last_quota_denial(history),
@@ -3419,8 +3413,14 @@ def render_footer(
     slug: str | None = None,
     scheduled_resume: "M.ScheduledResume | None" = None,
     auto_resume_history: list["M.AutoResumeEvent"] | None = None,
+    auto_resume_enabled: bool | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
+
+    ``auto_resume_enabled`` is the live state of the knob governing the parked
+    step's schedule (``None`` = unknown to the caller). A schedule on record
+    whose knob is off, or whose driver is gone, is rendered as exactly that —
+    the footer never promises a retry nothing will perform (#166 review).
 
     Each action renders as ``  $ <command>`` so the footer's commands are
     exactly the ``command`` fields of ``rstate.next_actions`` (FR-1.2 lockstep).
@@ -3492,10 +3492,18 @@ def render_footer(
             if rstate.state == STATE_PARKED_USAGE_LIMIT
             else M.PARKED_REASON_PROVIDER_UNAVAILABLE
         )
-        policy = scheduled_resume.policy or (
-            "until_cancelled" if reason == M.PARKED_REASON_USAGE_LIMIT else "bounded"
+        policy = M.schedule_policy(scheduled_resume, reason)
+        knob = (
+            "resume_on_quota" if reason == M.PARKED_REASON_USAGE_LIMIT
+            else "resume_on_provider_unavailable"
         )
-        if policy == "until_cancelled":
+        if auto_resume_enabled is False:
+            lines.append(
+                f"auto-resume schedule on record but {knob} is not auto — "
+                f"retries are cancelled; `gauntlet resume {slug or rstate.slug}` "
+                "continues manually"
+            )
+        elif policy == M.SCHEDULE_POLICY_UNTIL_CANCELLED:
             cadence = (
                 f", every {scheduled_resume.interval_s:g}s"
                 if scheduled_resume.interval_s is not None else ""
@@ -3511,11 +3519,27 @@ def render_footer(
                 f"auto-resume scheduled at {scheduled_resume.attempt_at} "
                 f"(attempt {nxt}/{scheduled_resume.max_attempts}, {reason})"
             )
+        if auto_resume_enabled is not False and driver.state == LIVENESS_NONE:
+            # A persisted schedule cannot launch itself (FR-3.4): say so
+            # rather than letting "scheduled at" read as "will happen".
+            lines.append(
+                "  (no live driver: nothing fires this schedule until a "
+                f"`gauntlet sweep` or `gauntlet resume {slug or rstate.slug}`)"
+            )
         denial = _last_quota_denial(auto_resume_history)
         if denial is not None:
             detail = f" [{denial['marker']}]" if denial.get("marker") else ""
             lines.append(f"last quota denial: {denial['at']}{detail}")
-        if reason == M.PARKED_REASON_USAGE_LIMIT:
+        if scheduled_resume.consecutive_denials:
+            lines.append(
+                f"consecutive quota denials: {scheduled_resume.consecutive_denials}"
+                + (
+                    f" — persistent restriction suspected since "
+                    f"{scheduled_resume.escalated_at} (billing / plan?)"
+                    if scheduled_resume.escalated_at else ""
+                )
+            )
+        if reason == M.PARKED_REASON_USAGE_LIMIT and auto_resume_enabled is not False:
             lines.append(
                 "cancel auto-resume: set resume_on_quota: notify; "
                 "end the run: gauntlet abort " + (slug or rstate.slug)

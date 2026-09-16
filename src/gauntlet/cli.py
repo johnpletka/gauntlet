@@ -1222,6 +1222,7 @@ def status(
     quota_reset_at = None
     scheduled_resume = None
     auto_resume_history = None
+    auto_resume_enabled = None
     if rstate.state in (
         operator.STATE_PARKED_USAGE_LIMIT,
         operator.STATE_PARKED_USAGE_WINDOW,
@@ -1236,6 +1237,10 @@ def status(
         # FR-3.4 / #134: the armed auto-resume schedule, same datum as --json.
         scheduled_resume = pr.scheduled_resume if pr is not None else None
         auto_resume_history = pr.auto_resume_history if pr is not None else None
+        if pr is not None:
+            auto_resume_enabled = mgr._auto_resume_enabled_for(
+                operator.M.normalize_parked_reason(pr.parked_reason, pr.type, pr.status)
+            )
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
@@ -1245,6 +1250,7 @@ def status(
         slug=slug,  # names the §4 recover verb in the agent-silent line (#103)
         scheduled_resume=scheduled_resume,
         auto_resume_history=auto_resume_history,
+        auto_resume_enabled=auto_resume_enabled,
     ):
         typer.echo(line)
     for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):

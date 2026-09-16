@@ -242,7 +242,7 @@ def decide(
             reason == M.PARKED_REASON_USAGE_LIMIT
             and is_auto
             and liveness == operator.LIVENESS_NONE
-            and lock == LOCK_ABSENT
+            and lock in (LOCK_ABSENT, LOCK_DEAD)
         ):
             return SweepDecision(
                 True, REASON_ARM_QUOTA, step_id=parked_rec.id,
@@ -363,7 +363,12 @@ def _resolve_run_dir(mgr, slug: str) -> Path:
 
 def audit_note(reason: str, now: datetime) -> str:
     """The manifest warning every sweep action stamps (spec item 5)."""
-    return f"unattended sweep resumed ({reason}) at {now.isoformat()}"
+    verb = "armed" if reason == REASON_ARM_QUOTA else "resumed"
+    return f"unattended sweep {verb} ({reason}) at {now.isoformat()}"
+
+
+def _audit_prefix(reason: str) -> str:
+    return audit_note(reason, datetime.now(timezone.utc)).split(" at ")[0]
 
 
 def _stamp_under_lock(
@@ -410,16 +415,12 @@ def _stamp_under_lock(
             )
             if step is None or step.scheduled_resume is not None:
                 return "state changed under the sweep (quota park changed)"
-            step.scheduled_resume = M.ScheduledResume(
-                attempt_at=(
-                    now + timedelta(seconds=mgr.config.quota_retry_interval_s)
-                ).isoformat(),
-                attempts=0,
-                max_attempts=mgr.config.max_auto_resume_attempts,
-                reason=M.PARKED_REASON_USAGE_LIMIT,
-                policy="until_cancelled",
+            # Same deadline rule as the orchestrator's park path: a still-
+            # future structured reset wins over the fallback cadence.
+            step.scheduled_resume = M.quota_schedule(
+                now, step.quota_reset_at,
                 interval_s=mgr.config.quota_retry_interval_s,
-                deadline_source="fallback",
+                max_attempts=mgr.config.max_auto_resume_attempts,
             )
         else:
             step = next(
@@ -433,14 +434,23 @@ def _stamp_under_lock(
             reason = M.normalize_parked_reason(
                 step.parked_reason, step.type, step.status
             )
-            unbounded = (
-                sched.policy == "until_cancelled"
-                or reason == M.PARKED_REASON_USAGE_LIMIT
-            )
+            unbounded = M.schedule_is_unbounded(sched, reason)
             if not unbounded and sched.attempts >= sched.max_attempts:
                 return "state changed under the sweep (schedule exhausted)"
             sched.attempts += 1
-            step.auto_resume_history.append(M.AutoResumeEvent(
+            if unbounded:
+                # Write-ahead spacing (mirrors RunManager._arm_next_attempt):
+                # a launched child that dies before re-parking must not be
+                # re-fired by the very next sweep.
+                sched.attempt_at = (now + timedelta(
+                    seconds=sched.interval_s or mgr.config.quota_retry_interval_s
+                )).isoformat()
+                # One audit line per episode, not one per fire: an
+                # until_cancelled schedule is fired indefinitely, and
+                # `warnings` is copied into every status payload/notification.
+                prefix = _audit_prefix(decision.audit_reason)
+                man.warnings = [w for w in man.warnings if not w.startswith(prefix)]
+            M.append_auto_resume_event(step, M.AutoResumeEvent(
                 at=now.isoformat(),
                 attempt=sched.attempts,
                 reason=reason,

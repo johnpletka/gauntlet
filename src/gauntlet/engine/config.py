@@ -715,6 +715,12 @@ class RunConfig(BaseModel):
     # structured retry deadline (#166). The failure classifier still does not
     # parse prose reset hints; the engine schedules from its own clock instead.
     quota_retry_interval_s: float = 1800.0
+    # Recognized quota denials in a row (on one until_cancelled schedule)
+    # before the engine flags the restriction as possibly persistent — a
+    # billing / plan block reads exactly like a session window to the
+    # classifier, so the loop keeps retrying but the operator is paged once,
+    # distinctly, and `status` says so (#166 review). Retries do NOT stop.
+    quota_denials_before_escalation: int = 6
     # The same policy for a `provider_unavailable` park (#134, rec. 1a): the
     # bounded in-process dependency retries (below) exhausted and the step
     # parked with a concrete backoff / Retry-After deadline. `notify` (default)
@@ -880,6 +886,15 @@ class RunConfig(BaseModel):
         """A non-positive fallback would create an immediate quota hot loop."""
         if v <= 0:
             raise ValueError(f"quota_retry_interval_s must be > 0; got {v!r}")
+        return v
+
+    @field_validator("quota_denials_before_escalation")
+    @classmethod
+    def _validate_quota_denials_before_escalation(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"quota_denials_before_escalation must be >= 1; got {v!r}"
+            )
         return v
 
     @field_validator("max_frs_per_phase")

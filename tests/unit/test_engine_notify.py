@@ -537,3 +537,33 @@ def test_delivery_survives_unavailable_advisory_lock(tmp_path, monkeypatch, unav
     notifier.notify_transition(event)
     assert len(channel.sent) == 1
     assert N.NotificationLedger.for_run_dir(tmp_path).entries()[0]["status"] == "delivered"
+
+
+# --- #166 review: one episode per armed schedule; escalation is a new key -----
+def test_armed_schedule_reparks_share_one_key_until_escalation():
+    sched = M.ScheduledResume(
+        attempt_at="2026-09-16T12:30:00+00:00", reason=M.PARKED_REASON_USAGE_LIMIT,
+        policy="until_cancelled", armed_at="2026-09-16T12:00:00+00:00",
+    )
+    first = _parked(M.PARKED_REASON_USAGE_LIMIT, scheduled_resume=sched,
+                    ended="2026-09-16T12:00:00+00:00")
+    repark = _parked(M.PARKED_REASON_USAGE_LIMIT, scheduled_resume=sched,
+                     ended="2026-09-16T12:30:05+00:00")
+    k1 = N.Notifier._key(_event(first), N.KIND_PARKED_USAGE_LIMIT)
+    k2 = N.Notifier._key(_event(repark), N.KIND_PARKED_USAGE_LIMIT)
+    assert k1 == k2  # a denial inside the same armed episode does not re-page
+    escalated = sched.model_copy(update={
+        "consecutive_denials": 6, "escalated_at": "2026-09-16T15:00:00+00:00"})
+    later = _parked(M.PARKED_REASON_USAGE_LIMIT, scheduled_resume=escalated,
+                    ended="2026-09-16T15:00:05+00:00")
+    ev = _event(later)
+    assert N.Notifier._key(ev, N.KIND_PARKED_USAGE_LIMIT) != k1
+    action = N.next_action_for(ev, N.KIND_PARKED_USAGE_LIMIT)
+    assert "persistent restriction" in action and "6 consecutive denials" in action
+    body = N.Notification.build(ev, N.KIND_PARKED_USAGE_LIMIT).body
+    assert "6 consecutive denials" in body and "persistent restriction suspected" in body
+    # without a schedule every re-park is its own episode, as before
+    plain_a = _parked(M.PARKED_REASON_USAGE_LIMIT, ended="2026-09-16T12:00:00+00:00")
+    plain_b = _parked(M.PARKED_REASON_USAGE_LIMIT, ended="2026-09-16T12:30:00+00:00")
+    assert (N.Notifier._key(_event(plain_a), N.KIND_PARKED_USAGE_LIMIT)
+            != N.Notifier._key(_event(plain_b), N.KIND_PARKED_USAGE_LIMIT))

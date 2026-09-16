@@ -40,6 +40,9 @@ reviewer_mutation: commit
 #                             #   or every quota_retry_interval_s when absent
 # quota_retry_interval_s: 1800
 #                             # fallback only; prose reset hints are not parsed
+# quota_denials_before_escalation: 6
+#                             # denials in a row before a "possibly persistent
+#                             #   restriction" flag (retries still continue)
 # keep_awake: true            # default; wraps the driver in `caffeinate -i`
 #                             #   (darwin) — set false to allow host sleep
 # resume_on_provider_unavailable: notify

@@ -1896,32 +1896,14 @@ class Orchestrator:
             return None
         return (base + timedelta(seconds=retry_after_s)).isoformat()
 
-    def _quota_schedule_deadline(self, reset_at: str | None) -> tuple[str, str]:
-        """Return a safely spaced quota retry deadline and its evidence source.
-
-        A structured deadline is used only when it is parseable and still in
-        the future. Missing, stale, or malformed provider hints fall back to the
-        configured interval from the engine clock; prose is never parsed (#166).
-        """
+    def _now(self, stamp: str | None = None) -> datetime:
+        """``stamp`` (else the orchestrator clock) as an aware UTC datetime
+        (fail-safe: an unparseable string falls back to the wall clock)."""
         try:
-            now = datetime.fromisoformat(self.clock())
+            now = datetime.fromisoformat(stamp or self.clock())
         except (ValueError, TypeError):
             now = datetime.now(timezone.utc)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        if reset_at is not None:
-            try:
-                target = datetime.fromisoformat(reset_at)
-                if target.tzinfo is None:
-                    target = target.replace(tzinfo=timezone.utc)
-                if target > now:
-                    return target.isoformat(), "provider_hint"
-            except (ValueError, TypeError):
-                pass
-        return (
-            (now + timedelta(seconds=self.config.quota_retry_interval_s)).isoformat(),
-            "fallback",
-        )
+        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
 
     def _record_auto_resume_outcome(
         self,
@@ -1929,26 +1911,58 @@ class Orchestrator:
         result: StepResult,
         prior_schedule: "M.ScheduledResume | None",
     ) -> None:
-        """Append denial/success evidence without erasing prior attempts (#166)."""
+        """Append denial/success evidence without erasing prior attempts (#166).
+
+        Evidence is recorded only for an ARMED schedule: in ``notify`` mode no
+        loop exists, so a denial is just a park (nothing to audit). The ring is
+        bounded (``M.AUTO_RESUME_HISTORY_MAX``); the counters that policy reads
+        live on the schedule itself. Once ``consecutive_denials`` reaches
+        ``quota_denials_before_escalation`` the schedule is stamped
+        ``escalated_at`` exactly once and a run warning names the suspicion —
+        the loop keeps retrying (the issue's contract), but the operator is
+        told, distinctly, that the restriction may not be a window at all.
+        """
         attempt = prior_schedule.attempts if prior_schedule is not None else 0
-        if result.status == PARKED and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+        sched = rec.scheduled_resume
+        if (
+            result.status == PARKED
+            and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT
+            and sched is not None
+        ):
             marker = result.failure_info.marker if result.failure_info else None
             excerpt = result.failure_info.raw_excerpt if result.failure_info else None
             if excerpt:
-                from gauntlet.logging.redact import build_redactor
-
-                excerpt = build_redactor(self.config.redaction).redact(excerpt)[0]
-            rec.auto_resume_history.append(M.AutoResumeEvent(
-                at=rec.ended or self.clock(),
+                excerpt = self.writer.redactor.redact(excerpt)[0]
+            at = rec.ended or self.clock()
+            sched.consecutive_denials += 1
+            M.append_auto_resume_event(rec, M.AutoResumeEvent(
+                at=at,
                 attempt=attempt,
                 reason=M.PARKED_REASON_USAGE_LIMIT,
                 outcome="quota_denied",
                 marker=marker,
                 excerpt=excerpt,
-                next_attempt_at=(
-                    rec.scheduled_resume.attempt_at if rec.scheduled_resume else None
-                ),
+                next_attempt_at=sched.attempt_at,
             ))
+            threshold = self.config.quota_denials_before_escalation
+            if sched.escalated_at is None and sched.consecutive_denials >= threshold:
+                sched.escalated_at = at
+                M.append_auto_resume_event(rec, M.AutoResumeEvent(
+                    at=at,
+                    attempt=attempt,
+                    reason=M.PARKED_REASON_USAGE_LIMIT,
+                    outcome="escalated",
+                    marker=marker,
+                ))
+                note = (
+                    f"auto-resume: {sched.consecutive_denials} consecutive quota "
+                    f"denials on {rec.id} since {sched.armed_at or at} — the "
+                    "restriction may be persistent (billing / plan), not a "
+                    "window; retries continue until resume_on_quota is set to "
+                    "notify or the run is aborted (#166)"
+                )
+                if note not in self.manifest.warnings:
+                    self.manifest.warnings.append(note)
             return
         if (
             result.status == DONE
@@ -1956,7 +1970,7 @@ class Orchestrator:
             and rec.auto_resume_history
             and rec.auto_resume_history[-1].outcome == "attempt_started"
         ):
-            rec.auto_resume_history.append(M.AutoResumeEvent(
+            M.append_auto_resume_event(rec, M.AutoResumeEvent(
                 at=rec.ended or self.clock(),
                 attempt=attempt,
                 reason=prior_schedule.reason or M.PARKED_REASON_USAGE_LIMIT,
@@ -2119,15 +2133,14 @@ class Orchestrator:
                 prior_schedule.attempts if prior_schedule else 0
             )
             if result.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
-                attempt_at, source = self._quota_schedule_deadline(rec.quota_reset_at)
-                rec.scheduled_resume = M.ScheduledResume(
-                    attempt_at=attempt_at,
-                    attempts=prior_attempts,
-                    max_attempts=self.config.max_auto_resume_attempts,
-                    reason=result.parked_reason,
-                    policy="until_cancelled",
+                # Deadline choice + spacing floor live in M.quota_schedule
+                # (shared with the sweep's legacy-arm path); the prior
+                # schedule's attempts / armed_at / denial counters carry over.
+                rec.scheduled_resume = M.quota_schedule(
+                    self._now(rec.ended), rec.quota_reset_at,
                     interval_s=self.config.quota_retry_interval_s,
-                    deadline_source=source,
+                    max_attempts=self.config.max_auto_resume_attempts,
+                    prior=prior_schedule,
                 )
             elif rec.quota_reset_at is not None:
                 rec.scheduled_resume = M.ScheduledResume(
@@ -2135,12 +2148,17 @@ class Orchestrator:
                     attempts=prior_attempts,
                     max_attempts=self.config.max_auto_resume_attempts,
                     reason=result.parked_reason,
-                    policy="bounded",
+                    policy=M.SCHEDULE_POLICY_BOUNDED,
                     deadline_source=(
                         "provider_hint" if result.retry_after_s is not None else "backoff"
                     ),
+                    armed_at=(
+                        prior_schedule.armed_at
+                        if prior_schedule and prior_schedule.armed_at
+                        else self.clock()
+                    ),
                 )
-            else:
+            else:  # a provider_unavailable park always carries its deadline
                 rec.scheduled_resume = None
         else:
             rec.scheduled_resume = None

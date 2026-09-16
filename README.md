@@ -318,9 +318,12 @@ gauntlet report myfeat           # per-step / per-agent cost, tokens + clock tim
   as they complete, so a resumed cycle re-enters at the first incomplete
   sub-step. Builders also commit `P<N> wip:` milestones inside a phase, bounding
   worst-case lost work to one milestone. Opt-in `resume_on_quota: auto`
-  uses a future structured provider reset when available, otherwise retrying on
-  `quota_retry_interval_s`; recognized quota denials keep retrying until the
-  policy is disabled or the run is aborted.
+  uses a future structured provider reset when available (never closer than
+  60 s), otherwise retrying on `quota_retry_interval_s`; recognized quota
+  denials keep retrying until the policy is disabled or the run is aborted.
+  After `quota_denials_before_escalation` denials in a row the run is flagged —
+  once, distinctly — as a possibly persistent restriction (billing / plan),
+  since the classifier cannot tell that apart from a session window.
 - **Laptop sleep is survivable.** A driver heartbeat detects host suspension and
   credits the slept time back to the running step's deadline (capped), so
   closing the lid neither silently stalls the run nor spuriously kills a healthy
@@ -671,6 +674,10 @@ resume_on_quota: notify      # notify (default) | auto — self-resume a
                              #   usage-limit park at a structured reset deadline,
                              #   else on the fallback cadence below
 quota_retry_interval_s: 1800 # fallback cadence; prose reset hints are not parsed
+quota_denials_before_escalation: 6
+                             # consecutive quota denials before `status` and the
+                             #   notifier flag a possibly persistent restriction
+                             #   (retries continue; you decide to stop or abort)
 keep_awake: true             # default; wraps the driver in `caffeinate -i`
                              #   (darwin) — false lets the host sleep mid-run
 resume_on_provider_unavailable: notify

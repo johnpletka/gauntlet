@@ -60,6 +60,11 @@ behind that output. Drive every decision off the reported state class:
   `resume_on_quota: auto` configured, the live driver uses a future structured
   reset hint or the configured fallback cadence and keeps retrying until that
   policy is disabled or the run is aborted — check `status` before acting.
+  `status` also says when the schedule cannot fire (no live driver, or the
+  knob was flipped to `notify` — the engine then clears the schedule and notes
+  the cancellation) and, after `quota_denials_before_escalation` denials in a
+  row, flags a **possibly persistent restriction** (billing / plan) — that is
+  the one quota signal worth paging a human about.
 - **`parked_usage_window`** — the pre-step admission check (a configured
   `providers.<name>` window with `enforce: true`) parked *before* launching a
   step predicted not to fit the remaining window. Nothing is in flight; zero
@@ -277,7 +282,7 @@ in ad-hoc prose, and so you never exceed it:
 | Park / state | Resolve autonomously | Page the human |
 |---|---|---|
 | `orphaned` (driver proven dead) | plain `resume` (or the sweep does it) | — |
-| `parked_usage_limit` | plain `resume` after the deadline `status` prints; with auto mode, let the fallback schedule continue | if you want to disable auto mode or abort the run |
+| `parked_usage_limit` | plain `resume` after the deadline `status` prints; with auto mode, let the fallback schedule continue | when `status` flags a persistent restriction, or to disable auto mode / abort the run |
 | `parked_provider_unavailable`, `parked_usage_window` | plain `resume` after the deadline `status` prints | if the provider-unavailable park repeats past its auto-resume ceiling |
 | `failed` shell step with an `on_fail` route, budget spent | plain `resume` re-arms one route (audited) | after the second identical re-failure — the cause is not transient |
 | `failed` / `halted` for any other reason, `interrupted` | read `logs`; a plain `resume` when the cause is clearly fixed | anything that needs judgment, or `--reset-interrupted` |

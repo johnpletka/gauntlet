@@ -1034,3 +1034,147 @@ def test_e2e_provider_park_exhausts_then_leaves_plain_park(fixture_repo):
     assert rec.scheduled_resume is None
     assert rec.quota_reset_at is not None
     assert "auto-resume exhausted" in (rec.notes or "")
+
+
+# --- #166 review: spacing floor, evidence gating, reload resilience, cancel ---
+def test_quota_schedule_deadline_rules():
+    now = T0
+    # a still-future structured hint wins, floored at the minimum spacing
+    at, src = M.quota_schedule_deadline(now, (now + timedelta(hours=5)).isoformat(), 1800)
+    assert (datetime.fromisoformat(at), src) == (now + timedelta(hours=5), "provider_hint")
+    at, src = M.quota_schedule_deadline(now, (now + timedelta(seconds=1)).isoformat(), 1800)
+    assert (datetime.fromisoformat(at), src) == (
+        now + timedelta(seconds=M.QUOTA_RETRY_MIN_SPACING_S), "provider_hint")
+    # stale, missing or unparseable hints fall back to the interval
+    for hint in [(now - timedelta(seconds=1)).isoformat(), None, "not a time"]:
+        at, src = M.quota_schedule_deadline(now, hint, 1800)
+        assert (datetime.fromisoformat(at), src) == (now + timedelta(seconds=1800), "fallback")
+
+
+def test_short_structured_hint_is_floored_not_hot_looped(fixture_repo):
+    # Review F1: with no attempt ceiling, `Retry-After: 1` must not become a
+    # resume every second. The hint still governs (provider_hint) but is spaced.
+    man = _manifest()
+    cfg = {"agents": {"builder": {"adapter": "claude-code"}},
+           "resume_on_quota": "auto", "keep_awake": True}
+    orch = _build(fixture_repo, PIPE, config=cfg,
+                  adapters={"builder": _RaiseOnce(_transient(retry_after_s=1))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    sched = rec.scheduled_resume
+    assert sched is not None and sched.deadline_source == "provider_hint"
+    spacing = datetime.fromisoformat(sched.attempt_at) - datetime.fromisoformat(rec.ended)
+    assert spacing >= timedelta(seconds=M.QUOTA_RETRY_MIN_SPACING_S)
+    assert sched.armed_at == rec.ended
+    assert sched.consecutive_denials == 1
+
+
+def test_notify_mode_records_no_auto_resume_evidence(fixture_repo):
+    # Review F5: no loop exists in notify mode, so a denial is just a park.
+    man = _manifest()
+    cfg = {"agents": {"builder": {"adapter": "claude-code"}}, "resume_on_quota": "notify"}
+    orch = _build(fixture_repo, PIPE, config=cfg,
+                  adapters={"builder": _RaiseOnce(_transient(retry_after_s=None))},
+                  manifest=man)
+    assert orch.drive() == M.RUN_PARKED
+    rec = man.record("implement")
+    assert rec.scheduled_resume is None
+    assert rec.auto_resume_history == []
+
+
+def test_auto_resume_history_is_a_bounded_ring():
+    rec = StepRecord(id="implement", type="agent_task", status=M.PARKED)
+    for i in range(M.AUTO_RESUME_HISTORY_MAX + 10):
+        M.append_auto_resume_event(rec, M.AutoResumeEvent(
+            at=T0.isoformat(), attempt=i, reason=M.PARKED_REASON_USAGE_LIMIT,
+            outcome="attempt_started"))
+    assert len(rec.auto_resume_history) == M.AUTO_RESUME_HISTORY_MAX
+    assert rec.auto_resume_history[0].attempt == 10  # oldest dropped first
+
+
+def test_arm_next_attempt_spaces_an_unbounded_schedule_write_ahead(tmp_path):
+    # Review F7/C2: the write-ahead increment also moves the deadline out one
+    # interval, so a resume that dies before re-parking is not retried at once.
+    h = _AutoResumeHarness(tmp_path, outcomes=[])
+    h.park(attempt_at=T0 - timedelta(seconds=1))
+    assert h.mgr._arm_next_attempt("demo", h.run_dir, "run-1", now=T0) is True
+    sched = h._load().record("implement").scheduled_resume
+    assert sched.attempts == 1
+    assert datetime.fromisoformat(sched.attempt_at) == T0 + timedelta(seconds=1800)
+
+
+def test_config_reload_failure_keeps_waiting_and_records_a_warning(tmp_path):
+    # Review F2: a transiently unreadable config must not end an unattended
+    # wait silently. The loop continues on the last loaded knobs and says so.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    config_dir = tmp_path / ".gauntlet"
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        "resume_on_quota: auto\nkeep_awake: true\nrun_root: runs\n"
+    )
+    h.mgr._live_config_path = config_path
+    h.park(attempt_at=T0 + timedelta(seconds=90))
+    real_sleep = h._sleep
+    writes = {"n": 0}
+
+    def corrupt_then_sleep(seconds):
+        writes["n"] += 1
+        if writes["n"] == 1:
+            config_path.write_text("resume_on_quota: [unterminated\n")  # mid-save
+        real_sleep(seconds)
+
+    h._sleep = corrupt_then_sleep
+    assert h.run() == M.RUN_DONE
+    assert h.resume_calls == 1
+    assert any("could not be reloaded" in w for w in h._load().warnings)
+
+
+def test_flip_to_notify_clears_the_quota_schedule_and_records_cancellation(tmp_path):
+    # Review F6: cancellation is persisted (schedule cleared, event + note) so
+    # `status`, `--json`, the sweep and the notifier all agree nothing fires.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 + timedelta(seconds=30), attempts=2)
+    real_sleep = h._sleep
+
+    def flip_then_sleep(seconds):
+        h.mgr.config.resume_on_quota = "notify"
+        real_sleep(seconds)
+
+    h._sleep = flip_then_sleep
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+    rec = h._load().record("implement")
+    assert rec.scheduled_resume is None
+    assert rec.auto_resume_history[-1].outcome == "cancelled"
+    assert rec.auto_resume_history[-1].attempt == 2
+    assert "auto-resume cancelled after 2 attempts" in (rec.notes or "")
+
+
+_ESCALATING_QUOTA_E2E_CONFIG = _QUOTA_E2E_CONFIG + "quota_denials_before_escalation: 3\n"
+
+
+def test_consecutive_denials_escalate_once_but_retries_continue(fixture_repo):
+    # Review F3: a restriction that never clears is flagged as possibly
+    # persistent exactly once (schedule stamp, history event, run warning) —
+    # and the loop still keeps its contract of retrying until it succeeds.
+    mgr, run_dir = _seed_e2e(fixture_repo, _ESCALATING_QUOTA_E2E_CONFIG)
+    mgr._auto_resume_wait_context = lambda run_dir: contextlib.nullcontext()
+    adapter = _FixtureQuotaAdapter(fail_times=5)
+    ft = _FakeTime()
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter,
+        clock=ft.clock, auto_sleep=ft.sleep,
+    )
+    assert status == M.RUN_DONE
+    assert len(adapter.calls) == 6
+    man = Manifest.load(run_dir / "manifest.json")
+    rec = man.record("implement")
+    escalations = [e for e in rec.auto_resume_history if e.outcome == "escalated"]
+    assert len(escalations) == 1
+    assert escalations[0].at == [
+        e for e in rec.auto_resume_history if e.outcome == "quota_denied"
+    ][2].at  # stamped on the third consecutive denial
+    assert sum("consecutive quota denials" in w for w in man.warnings) == 1
+    assert rec.scheduled_resume is None  # cleared on DONE
