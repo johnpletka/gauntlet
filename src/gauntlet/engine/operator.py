@@ -1589,11 +1589,11 @@ _STATUS_SCHEMA_JSON = r'''{
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["attempt_at", "attempts", "max_attempts", "reason"],
-      "description": "The armed in-process auto-resume schedule on the parked step (harness-efficiency FR-3.4; generalized to provider_unavailable parks by #134), non-null only when parked on a usage_limit or provider_unavailable park whose step carries a schedule (armed by `resume_on_quota: auto` / `resume_on_provider_unavailable: auto`); null otherwise, including after the schedule is exhausted. Additive; keeps schema_version=1.",
+      "description": "The armed in-process auto-resume schedule on the parked step (harness-efficiency FR-3.4; generalized to provider_unavailable parks by #134), non-null only when parked on a usage_limit or provider_unavailable park whose step carries a schedule (armed by `resume_on_quota: auto` / `resume_on_provider_unavailable: auto`); null otherwise, including after a bounded provider-unavailable schedule is exhausted. Additive; keeps schema_version=1.",
       "properties": {
         "attempt_at": {
           "type": "string",
-          "description": "Absolute UTC time (ISO-8601) of the next scheduled resume attempt: the park's recorded reset / backoff / Retry-After deadline."
+          "description": "Absolute UTC time (ISO-8601) of the next scheduled resume attempt: a future structured quota reset, engine-computed fallback, or provider backoff / Retry-After deadline."
         },
         "attempts": {
           "type": "integer",
@@ -1601,12 +1601,39 @@ _STATUS_SCHEMA_JSON = r'''{
         },
         "max_attempts": {
           "type": "integer",
-          "description": "The attempt ceiling (`max_auto_resume_attempts`); at attempts >= max_attempts the schedule is cleared with an exhaustion note and the park is left plain."
+          "description": "The provider-unavailable attempt ceiling (`max_auto_resume_attempts`). Informational for an until_cancelled quota policy, which does not exhaust at this value."
         },
         "reason": {
           "type": ["string", "null"],
           "enum": ["usage_limit", "provider_unavailable", null],
           "description": "Which park reason armed the schedule. null on a schedule persisted before #134 (read as the step's own park reason)."
+        },
+        "policy": {
+          "type": "string",
+          "enum": ["bounded", "until_cancelled"],
+          "description": "bounded for provider outages; until_cancelled for recognized quota denials."
+        },
+        "interval_s": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Fallback quota retry cadence, or null when the provider/backoff deadline governs."
+        },
+        "deadline_source": {
+          "type": ["string", "null"],
+          "enum": ["provider_hint", "fallback", "backoff", null],
+          "description": "Evidence used to choose attempt_at. A fallback is engine-computed and never parsed from prose."
+        },
+        "last_denial": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["at", "attempt", "marker", "excerpt"],
+          "properties": {
+            "at": {"type": "string"},
+            "attempt": {"type": "integer"},
+            "marker": {"type": ["string", "null"]},
+            "excerpt": {"type": ["string", "null"]}
+          },
+          "description": "Latest persisted recognized quota denial, or null before the first denial evidence."
         }
       }
     },
@@ -2522,9 +2549,9 @@ def status_payload(
         parked_rec = by_rendered.get(rstate.parked.step_id)
         quota = {"reset_at": parked_rec.quota_reset_at if parked_rec else None}
     # FR-3.4 / #134: the armed auto-resume schedule on the parked step, so an
-    # operator can see WHEN the live driver will retry (and how many attempts
-    # remain) without opening the manifest. Null on every other state and once
-    # the schedule is exhausted.
+    # operator can see WHEN the live driver will retry and which reason-specific
+    # policy applies without opening the manifest. Null on every other state and
+    # once a bounded provider-unavailable schedule is exhausted.
     scheduled_resume = None
     if (
         rstate.state in (STATE_PARKED_USAGE_LIMIT, STATE_PARKED_PROVIDER_UNAVAILABLE)
@@ -2532,7 +2559,14 @@ def status_payload(
     ):
         parked_rec = by_rendered.get(rstate.parked.step_id)
         scheduled_resume = scheduled_resume_dict(
-            parked_rec.scheduled_resume if parked_rec else None
+            parked_rec.scheduled_resume if parked_rec else None,
+            parked_rec.auto_resume_history if parked_rec else None,
+            (
+                M.normalize_parked_reason(
+                    parked_rec.parked_reason, parked_rec.type, parked_rec.status
+                )
+                if parked_rec else None
+            ),
         )
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -3329,7 +3363,23 @@ def _fmt_age(age_s: float) -> str:
     return f"{age_s / 60:.0f}m"
 
 
-def scheduled_resume_dict(sched: "M.ScheduledResume | None") -> dict | None:
+def _last_quota_denial(history: list["M.AutoResumeEvent"] | None) -> dict | None:
+    for event in reversed(history or []):
+        if event.outcome == "quota_denied":
+            return {
+                "at": event.at,
+                "attempt": event.attempt,
+                "marker": event.marker,
+                "excerpt": event.excerpt,
+            }
+    return None
+
+
+def scheduled_resume_dict(
+    sched: "M.ScheduledResume | None",
+    history: list["M.AutoResumeEvent"] | None = None,
+    park_reason: str | None = None,
+) -> dict | None:
     """The §6.1 ``scheduled_resume`` object for an armed schedule, else ``None``.
 
     Shared by ``status --json`` and the human footer so the two surfaces render
@@ -3337,11 +3387,21 @@ def scheduled_resume_dict(sched: "M.ScheduledResume | None") -> dict | None:
     """
     if sched is None:
         return None
+    reason = sched.reason
+    effective_reason = reason or park_reason
+    policy = sched.policy or (
+        "until_cancelled"
+        if effective_reason == M.PARKED_REASON_USAGE_LIMIT else "bounded"
+    )
     return {
         "attempt_at": sched.attempt_at,
         "attempts": sched.attempts,
         "max_attempts": sched.max_attempts,
-        "reason": sched.reason,
+        "reason": reason,
+        "policy": policy,
+        "interval_s": sched.interval_s,
+        "deadline_source": sched.deadline_source,
+        "last_denial": _last_quota_denial(history),
     }
 
 
@@ -3358,6 +3418,7 @@ def render_footer(
     quota_reset_at: str | None = None,
     slug: str | None = None,
     scheduled_resume: "M.ScheduledResume | None" = None,
+    auto_resume_history: list["M.AutoResumeEvent"] | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -3431,11 +3492,34 @@ def render_footer(
             if rstate.state == STATE_PARKED_USAGE_LIMIT
             else M.PARKED_REASON_PROVIDER_UNAVAILABLE
         )
-        nxt = min(scheduled_resume.attempts + 1, scheduled_resume.max_attempts)
-        lines.append(
-            f"auto-resume scheduled at {scheduled_resume.attempt_at} "
-            f"(attempt {nxt}/{scheduled_resume.max_attempts}, {reason})"
+        policy = scheduled_resume.policy or (
+            "until_cancelled" if reason == M.PARKED_REASON_USAGE_LIMIT else "bounded"
         )
+        if policy == "until_cancelled":
+            cadence = (
+                f", every {scheduled_resume.interval_s:g}s"
+                if scheduled_resume.interval_s is not None else ""
+            )
+            lines.append(
+                f"auto-resume scheduled at {scheduled_resume.attempt_at} "
+                f"({scheduled_resume.attempts} attempts made{cadence}; "
+                "retries until resume_on_quota is set to notify or the run is aborted)"
+            )
+        else:
+            nxt = min(scheduled_resume.attempts + 1, scheduled_resume.max_attempts)
+            lines.append(
+                f"auto-resume scheduled at {scheduled_resume.attempt_at} "
+                f"(attempt {nxt}/{scheduled_resume.max_attempts}, {reason})"
+            )
+        denial = _last_quota_denial(auto_resume_history)
+        if denial is not None:
+            detail = f" [{denial['marker']}]" if denial.get("marker") else ""
+            lines.append(f"last quota denial: {denial['at']}{detail}")
+        if reason == M.PARKED_REASON_USAGE_LIMIT:
+            lines.append(
+                "cancel auto-resume: set resume_on_quota: notify; "
+                "end the run: gauntlet abort " + (slug or rstate.slug)
+            )
 
     if current_step_freshness is not None:
         lines.append(

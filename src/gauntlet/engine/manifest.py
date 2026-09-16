@@ -342,11 +342,12 @@ class ScheduledResume(BaseModel):
     Persisted on the parked step BEFORE the run parks, so a process death
     between scheduling and ``attempt_at`` loses nothing — the next driver start
     or ``gauntlet resume`` reconciles from disk. ``attempt_at`` is the absolute
-    UTC time to resume (``now + retry_after_s``, else the quota reset time; for
-    a ``provider_unavailable`` park the recorded backoff / Retry-After
-    deadline); ``attempts`` counts spaced attempts made; once ``attempts >=
-    max_attempts`` the step re-parks plain (no schedule) with an exhaustion
-    note. ``reason`` records which park reason armed the schedule
+    UTC time to resume (a future structured reset hint, otherwise the configured
+    fallback cadence; for a ``provider_unavailable`` park the recorded backoff /
+    Retry-After deadline). ``attempts`` counts spaced attempts made. Provider
+    outages stop at ``max_attempts``; recognized quota denials remain scheduled
+    until auto-resume is disabled or the run is aborted. ``reason`` records
+    which park reason armed the schedule
     (``usage_limit`` / ``provider_unavailable``) so the wait loop can consult
     the matching config knob; ``None`` on manifests written before #134 (an
     unstamped schedule is read as the step's own park reason). Additive/nullable.
@@ -356,6 +357,24 @@ class ScheduledResume(BaseModel):
     attempts: int = 0
     max_attempts: int = 3
     reason: str | None = None
+    # Additive policy metadata (#166). Older schedules omit these fields; their
+    # effective policy is inferred from the parked reason (usage_limit is
+    # until_cancelled, provider_unavailable is bounded).
+    policy: Literal["bounded", "until_cancelled"] | None = None
+    interval_s: float | None = None
+    deadline_source: Literal["provider_hint", "fallback", "backoff"] | None = None
+
+
+class AutoResumeEvent(BaseModel):
+    """Append-only evidence for one scheduled-resume transition (#166)."""
+
+    at: str
+    attempt: int
+    reason: str
+    outcome: Literal["attempt_started", "quota_denied", "continued"]
+    marker: str | None = None
+    excerpt: str | None = None
+    next_attempt_at: str | None = None
 
 
 class RevalidationRecord(BaseModel):
@@ -551,6 +570,9 @@ class StepRecord(BaseModel):
     # this step; ``None`` otherwise and after a successful resume.
     # Additive/nullable — older manifests load unchanged.
     scheduled_resume: ScheduledResume | None = None
+    # Attempts and their outcomes survive schedule replacement/clearing, so a
+    # restart or successful continuation never erases the recovery audit.
+    auto_resume_history: list[AutoResumeEvent] = Field(default_factory=list)
     # Content-hash pair recorded on an ``artifact_invalid`` park (FR-7.2/§6). P3
     # defines the shape here; P4 populates it on the validator-repair park path.
     # Additive/nullable — ``None`` on every other outcome, so older manifests load

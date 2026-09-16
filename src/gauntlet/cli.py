@@ -900,9 +900,10 @@ def sweep(
 ) -> None:
     """Unattended, judgment-free resume sweep (#134).
 
-    Takes ONLY the two actions the operator playbook classes as no-decision:
-    reclaim a run whose driver is PROVEN dead (orphaned), and fire a parked
-    step's armed, due `scheduled_resume` under the config knob that armed it
+    Takes ONLY three actions the operator playbook classes as no-decision:
+    reclaim a run whose driver is PROVEN dead (orphaned), arm a fallback
+    schedule for a legacy recognized quota park, and fire a parked step's armed,
+    due `scheduled_resume` under the config knob that armed it
     (`resume_on_quota: auto` / `resume_on_provider_unavailable: auto`). Gates,
     response parks, failures, indeterminate liveness, malformed locks and live
     drivers are skipped with a one-line reason. Idempotent: exit 0 whether or
@@ -1220,6 +1221,7 @@ def status(
     # state requires reading a transcript to identify the next command.
     quota_reset_at = None
     scheduled_resume = None
+    auto_resume_history = None
     if rstate.state in (
         operator.STATE_PARKED_USAGE_LIMIT,
         operator.STATE_PARKED_USAGE_WINDOW,
@@ -1233,6 +1235,7 @@ def status(
         quota_reset_at = pr.quota_reset_at if pr is not None else None
         # FR-3.4 / #134: the armed auto-resume schedule, same datum as --json.
         scheduled_resume = pr.scheduled_resume if pr is not None else None
+        auto_resume_history = pr.auto_resume_history if pr is not None else None
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
@@ -1241,6 +1244,7 @@ def status(
         quota_reset_at=quota_reset_at,
         slug=slug,  # names the §4 recover verb in the agent-silent line (#103)
         scheduled_resume=scheduled_resume,
+        auto_resume_history=auto_resume_history,
     ):
         typer.echo(line)
     for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):

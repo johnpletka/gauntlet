@@ -313,7 +313,8 @@ AUTO_RESUME_EXHAUST = "exhaust"
 
 
 def next_auto_resume_action(
-    scheduled_resume: "M.ScheduledResume | None", now: datetime
+    scheduled_resume: "M.ScheduledResume | None", now: datetime,
+    *, reason: str | None = None,
 ) -> tuple[str, float]:
     """Decide the next auto-resume step for a scheduled usage-limit park (FR-3.4).
 
@@ -328,7 +329,11 @@ def next_auto_resume_action(
     """
     if scheduled_resume is None:
         return (AUTO_RESUME_NONE, 0.0)
-    if scheduled_resume.attempts >= scheduled_resume.max_attempts:
+    unbounded = (
+        scheduled_resume.policy == "until_cancelled"
+        or reason == M.PARKED_REASON_USAGE_LIMIT
+    )
+    if not unbounded and scheduled_resume.attempts >= scheduled_resume.max_attempts:
         return (AUTO_RESUME_EXHAUST, 0.0)
     try:
         target = datetime.fromisoformat(scheduled_resume.attempt_at)
@@ -676,6 +681,9 @@ def render_config_snapshot(config: RunConfig) -> str:
 class RunManager:
     def __init__(self, repo_root: Path, config: RunConfig | None = None) -> None:
         self.repo_root = repo_root
+        self._live_config_path = (
+            repo_root / ".gauntlet/config.yaml" if config is None else None
+        )
         self.config = config or RunConfig.load(repo_root / ".gauntlet/config.yaml")
         # The configured redaction list (FR-4.4) governs every byte the run
         # writes; default-on even with an empty `redaction:` section.
@@ -3227,8 +3235,10 @@ class RunManager:
         "manual override resumes now" branch): that is ``_resume_once``. If the
         run re-parks on the usage limit under ``resume_on_quota: auto`` (or on a
         dependency failure under ``resume_on_provider_unavailable: auto``), the
-        live driver waits until the recorded deadline and resumes again, bounded
-        by ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
+        live driver waits until the recorded deadline and resumes again via
+        :meth:`_auto_resume_if_scheduled`. Provider-unavailable retries are
+        bounded by ``max_auto_resume_attempts``; recognized quota retries
+        continue until the operator disables auto-resume or aborts the run. In
         ``notify`` mode the wrapper is a no-op.
         """
         # R5 (plan §4.5): fingerprint the persisted state before and after the
@@ -3866,6 +3876,27 @@ class RunManager:
         knob = self._AUTO_RESUME_KNOB_BY_REASON.get(reason or "")
         return knob is not None and getattr(self.config, knob) == RESUME_ON_QUOTA_AUTO
 
+    def _refresh_auto_resume_policy(self) -> bool:
+        """Reload live recovery knobs while a long quota wait is parked (#166).
+
+        Injected configs are intentionally stable for embedders/tests. A normal
+        CLI manager re-reads the repo config on every poll so changing
+        ``resume_on_quota`` to ``notify`` stops before another provider call.
+        Invalid/missing config fails closed by stopping the unattended loop.
+        """
+        if self._live_config_path is None:
+            return True
+        try:
+            fresh = RunConfig.load(self._live_config_path)
+        except (OSError, ValueError):
+            return False
+        self.config.resume_on_quota = fresh.resume_on_quota
+        self.config.resume_on_provider_unavailable = (
+            fresh.resume_on_provider_unavailable
+        )
+        self.config.quota_retry_interval_s = fresh.quota_retry_interval_s
+        return True
+
     def _parked_auto_resume_step(self, man: Manifest) -> "M.StepRecord | None":
         """The scheduled-resume-armed usage-limit / provider-unavailable park whose
         governing knob is ``auto``, or ``None`` (shared find, FR-3.4 / #134).
@@ -3913,14 +3944,16 @@ class RunManager:
         with KeepAwake(enabled=self.config.keep_awake), writer:
             yield
 
-    def _arm_next_attempt(self, slug: str, run_dir: Path, run_id: str | None) -> bool:
+    def _arm_next_attempt(
+        self, slug: str, run_dir: Path, run_id: str | None, *, now: datetime
+    ) -> bool:
         """Increment the parked step's auto-resume attempt count under the lock (F-005).
 
         Auto-resume runs outside the worktree lock (each attempt re-acquires it),
         but its manifest writes must not race a concurrent manual resume. Reload +
         revalidate under the lock so a state change between the loop's read and this
         write is not clobbered; return ``False`` (re-loop and re-decide) if the
-        parked usage-limit schedule is gone or already at the ceiling.
+        parked schedule is gone or a bounded provider schedule reached its ceiling.
         """
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
@@ -3928,16 +3961,32 @@ class RunManager:
             step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return False
-            if step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts:
+            reason = M.normalize_parked_reason(
+                step.parked_reason, step.type, step.status
+            )
+            unbounded = (
+                step.scheduled_resume.policy == "until_cancelled"
+                or reason == M.PARKED_REASON_USAGE_LIMIT
+            )
+            if (
+                not unbounded
+                and step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts
+            ):
                 return False
             step.scheduled_resume.attempts += 1
+            step.auto_resume_history.append(M.AutoResumeEvent(
+                at=now.isoformat(),
+                attempt=step.scheduled_resume.attempts,
+                reason=reason,
+                outcome="attempt_started",
+            ))
             man.write_atomic(run_dir / "manifest.json")
             return True
         finally:
             self._release_worktree_lock(handle)
 
     def _exhaust_schedule(self, slug: str, run_dir: Path, run_id: str | None) -> None:
-        """Clear the auto-resume schedule at the ceiling under the lock (F-005).
+        """Clear a bounded provider schedule at its ceiling under the lock (F-005).
 
         Same lock discipline as :meth:`_arm_next_attempt`: reload + revalidate so
         the exhaustion note never overwrites a concurrent manual resume's state.
@@ -4002,6 +4051,8 @@ class RunManager:
         wait_cm = None  # heartbeat/keep-awake held across contiguous waits only
         try:
             while True:
+                if not self._refresh_auto_resume_policy():
+                    return status
                 try:
                     run_dir = layout.active_run_dir()
                     man = Manifest.load(run_dir / "manifest.json")
@@ -4013,7 +4064,12 @@ class RunManager:
                 if step is None:
                     return status
                 now = self._auto_resume_now(clock)
-                action, wait_s = next_auto_resume_action(step.scheduled_resume, now)
+                reason = M.normalize_parked_reason(
+                    step.parked_reason, step.type, step.status
+                )
+                action, wait_s = next_auto_resume_action(
+                    step.scheduled_resume, now, reason=reason
+                )
                 # Leaving the wait: release the heartbeat/keep-awake before any
                 # resume so its `_drive` heartbeat does not overlap this one.
                 if action != AUTO_RESUME_WAIT and wait_cm is not None:
@@ -4036,7 +4092,9 @@ class RunManager:
                 # AUTO_RESUME_RESUME: count the attempt write-ahead (under the
                 # lock, F-005), then continue with one continuation resume.
                 try:
-                    armed = self._arm_next_attempt(slug, run_dir, man.run_id)
+                    armed = self._arm_next_attempt(
+                        slug, run_dir, man.run_id, now=now
+                    )
                 except WorktreeLockError:
                     return status  # a concurrent driver holds the lock — defer
                 if not armed:
@@ -4572,7 +4630,8 @@ class RunManager:
         # Terminal history is read-only (review F-002): never rewrite a
         # done/aborted/failed run's status. Fail closed so neither a stray CLI
         # `gauntlet abort` nor the console control path can corrupt a completed
-        # run's recorded outcome.
+        # run's recorded outcome. An auto-resume wait polls this status between
+        # sleeps, so this existing transition also cancels #166 retry loops.
         if man.status in _TERMINAL_RUN_STATES:
             raise AbortGuardError(
                 f"run {man.run_id!r} for slug {slug!r} is already {man.status}; "

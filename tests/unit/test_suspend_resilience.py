@@ -9,6 +9,7 @@ suspension block (FR-5.3), and the in-process auto-resume loop (FR-3.4).
 from __future__ import annotations
 
 import contextlib
+import json
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from gauntlet.adapters.base import (
     FailureInfo,
     Usage,
 )
+from gauntlet.adapters.failure_markers import classify_claude_failure
 from gauntlet.engine import heartbeat as HB
 from gauntlet.engine import manifest as M
 from gauntlet.engine import operator as op
@@ -116,10 +118,9 @@ def test_notify_mode_never_arms_a_schedule(fixture_repo):
     assert man.record("implement").scheduled_resume is None
 
 
-def test_auto_mode_no_schedule_without_reset_time(fixture_repo):
-    # F-003: a transient usage-limit park with NO reported reset time must not arm
-    # a schedule — arming with attempt_at=now() makes the auto loop treat it as due
-    # immediately and burn every attempt in an unspaced hot loop (FR-3.4 spacing).
+def test_auto_mode_arms_fallback_schedule_without_reset_time(fixture_repo):
+    # #166: a recognized quota denial with no structured deadline uses a spaced
+    # engine fallback. The provider fact remains unknown; prose is not parsed.
     man = _manifest()
     cfg = {"agents": {"builder": {"adapter": "claude-code"}},
            "resume_on_quota": "auto", "keep_awake": True}
@@ -130,13 +131,23 @@ def test_auto_mode_no_schedule_without_reset_time(fixture_repo):
     rec = man.record("implement")
     assert rec.parked_reason == M.PARKED_REASON_USAGE_LIMIT
     assert rec.quota_reset_at is None
-    assert rec.scheduled_resume is None  # plain park, no hot-loop schedule
+    assert rec.scheduled_resume is not None
+    assert rec.scheduled_resume.policy == "until_cancelled"
+    assert rec.scheduled_resume.interval_s == 1800
+    assert rec.scheduled_resume.deadline_source == "fallback"
+    assert datetime.fromisoformat(rec.scheduled_resume.attempt_at) > datetime.fromisoformat(rec.ended)
+    assert rec.auto_resume_history[-1].outcome == "quota_denied"
 
 
 # --- FR-3.4 / FR-5.4: config validation + load warnings ----------------------
 def test_resume_on_quota_rejects_unknown_value():
     with pytest.raises(ValueError):
         RunConfig.model_validate({"resume_on_quota": "sometimes"})
+
+
+def test_quota_retry_interval_must_be_positive():
+    with pytest.raises(ValueError, match="quota_retry_interval_s"):
+        RunConfig.model_validate({"quota_retry_interval_s": 0})
 
 
 def test_auto_without_keep_awake_or_scheduler_warns():
@@ -406,7 +417,14 @@ class _AutoResumeHarness:
             quota_reset_at=attempt_at.isoformat(),
             scheduled_resume=ScheduledResume(
                 attempt_at=attempt_at.isoformat(), attempts=attempts, max_attempts=3,
-                reason=stamp),
+                reason=stamp,
+                policy=(
+                    "until_cancelled"
+                    if reason == M.PARKED_REASON_USAGE_LIMIT else "bounded"
+                ),
+                interval_s=(
+                    1800 if reason == M.PARKED_REASON_USAGE_LIMIT else None
+                )),
         ))
         self._save(m)
 
@@ -421,8 +439,12 @@ class _AutoResumeHarness:
             step.status = M.DONE
             step.parked_reason = None
             step.scheduled_resume = None
-        # "reparks": leave the usage-limit park + schedule as the loop left it
-        # (attempts already incremented + persisted before this call).
+        elif step.scheduled_resume is not None:
+            # A real finalizer schedules from the current denial time, never the
+            # stale prior deadline. Mirror that spacing in this loop harness.
+            step.scheduled_resume.attempt_at = (
+                self.now + timedelta(seconds=step.scheduled_resume.interval_s or 2)
+            ).isoformat()
         self._save(man)
         return man.status
 
@@ -450,14 +472,29 @@ def test_auto_resume_waits_for_a_future_reset_then_resumes(tmp_path):
     assert h.now >= T0 + timedelta(seconds=120)  # the loop waited out the reset
 
 
-def test_auto_resume_stops_at_max_attempts_with_exhaustion_note(tmp_path):
+def test_provider_auto_resume_stops_at_max_attempts_with_exhaustion_note(tmp_path):
     h = _AutoResumeHarness(tmp_path, outcomes=["reparks", "reparks", "reparks", "reparks"])
-    h.park(attempt_at=T0 - timedelta(seconds=1))
+    h.mgr.config.resume_on_provider_unavailable = "auto"
+    h.park(
+        attempt_at=T0 - timedelta(seconds=1),
+        reason=M.PARKED_REASON_PROVIDER_UNAVAILABLE,
+    )
     h.run()
     assert h.resume_calls == 3  # exactly max_auto_resume_attempts spaced attempts
     step = h._load().record("implement")
     assert step.scheduled_resume is None  # schedule cleared at exhaustion
     assert "auto-resume exhausted" in (step.notes or "")
+
+
+def test_quota_auto_resume_continues_past_shared_ceiling_then_completes(tmp_path):
+    h = _AutoResumeHarness(
+        tmp_path, outcomes=["reparks", "reparks", "reparks", "reparks", "done"]
+    )
+    h.park(attempt_at=T0 - timedelta(seconds=1))
+    assert h.run() == M.RUN_DONE
+    assert h.resume_calls == 5
+    history = h._load().record("implement").auto_resume_history
+    assert [e.attempt for e in history if e.outcome == "attempt_started"] == [1, 2, 3, 4, 5]
 
 
 def test_notify_mode_auto_loop_is_a_noop(tmp_path):
@@ -745,6 +782,52 @@ def test_knob_flipped_to_notify_mid_wait_stops_the_loop(tmp_path):
     assert h._load().record("implement").scheduled_resume is not None
 
 
+def test_repo_config_flipped_to_notify_mid_wait_stops_the_loop(tmp_path):
+    # A CLI-created manager has a live config path. Prove the loop reloads that
+    # file rather than merely observing mutations to its in-memory model.
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    config_dir = tmp_path / ".gauntlet"
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        "resume_on_quota: auto\n"
+        "keep_awake: true\n"
+        "run_root: runs\n"
+        "quota_retry_interval_s: 1800\n"
+    )
+    h.mgr._live_config_path = config_path
+    h.park(attempt_at=T0 + timedelta(seconds=30))
+    real_sleep = h._sleep
+
+    def disable_then_sleep(seconds):
+        config_path.write_text(
+            "resume_on_quota: notify\n"
+            "keep_awake: true\n"
+            "run_root: runs\n"
+            "quota_retry_interval_s: 1800\n"
+        )
+        real_sleep(seconds)
+
+    h._sleep = disable_then_sleep
+    assert h.run() == M.RUN_PARKED
+    assert h.resume_calls == 0
+
+
+def test_abort_cancels_quota_wait_before_provider_call(tmp_path):
+    h = _AutoResumeHarness(tmp_path, outcomes=["done"])
+    h.park(attempt_at=T0 + timedelta(seconds=30))
+    real_sleep = h._sleep
+
+    def abort_then_sleep(seconds):
+        h.mgr.abort("demo")
+        real_sleep(seconds)
+
+    h._sleep = abort_then_sleep
+    assert h.run() == M.RUN_PARKED  # wrapper returns the last drive status
+    assert h._load().status == M.RUN_ABORTED
+    assert h.resume_calls == 0
+
+
 def test_both_knobs_auto_drive_either_park_reason(tmp_path):
     both = {"resume_on_quota": "auto", "resume_on_provider_unavailable": "auto"}
     for reason in (M.PARKED_REASON_USAGE_LIMIT, M.PARKED_REASON_PROVIDER_UNAVAILABLE):
@@ -801,13 +884,13 @@ class _FlakyDependencyAdapter:
         return AgentResult(text="done", session_id="s1", exit_code=0)
 
 
-def _seed_e2e(repo: Path):
+def _seed_e2e(repo: Path, config_text: str = _E2E_CONFIG):
     from conftest import git
     from gauntlet.engine.manifest import PipelineRef
     from gauntlet.engine.pipeline import load_pipeline
 
     (repo / ".gauntlet").mkdir(exist_ok=True)
-    (repo / ".gauntlet" / "config.yaml").write_text(_E2E_CONFIG)
+    (repo / ".gauntlet" / "config.yaml").write_text(config_text)
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "seed config")
     git(repo, "checkout", "-qb", "gauntlet/demo")
@@ -839,6 +922,74 @@ class _FakeTime:
 
     def sleep(self, seconds: float) -> None:
         self.now = self.now + timedelta(seconds=seconds)
+
+
+_QUOTA_E2E_CONFIG = """
+base_branch: main
+run_root: runs
+interrupted_step: park
+resume_on_quota: auto
+quota_retry_interval_s: 30
+external_scheduler: true
+agents:
+  builder: {adapter: claude-code}
+"""
+
+
+class _FixtureQuotaAdapter:
+    """Replays the committed text-only Claude quota envelope, then recovers."""
+
+    name = "fake"
+    timeout_s = 600.0
+
+    def __init__(self, fail_times: int):
+        self.capabilities = AdapterCapabilities(
+            repo_write=True, structured_output="native", resume=True
+        )
+        event = json.loads(
+            (Path(__file__).parents[2] / ".gauntlet/failure-fixtures/claude/usage-limit.json")
+            .read_text()
+        )
+        self.event = event
+        self.info = classify_claude_failure(event, 1)
+        self.fail_times = fail_times
+        self.calls: list[dict] = []
+
+    def run(self, prompt, *, session=None, schema=None, cwd=None,
+            extra_flags=None, sink=None):
+        self.calls.append({"prompt": prompt, "session": session})
+        partial = Path(cwd) / "partial-work.txt"
+        if not partial.exists():
+            partial.write_text("preserved across quota retries\n")
+        if len(self.calls) <= self.fail_times:
+            raise AgentFailedError(
+                "claude usage limit",
+                partial=AgentResult(
+                    text=self.event["result"], session_id="fixture-session",
+                    raw_events=[self.event], exit_code=1,
+                ),
+                failure_info=self.info,
+            )
+        return AgentResult(text="done", session_id="fixture-session", exit_code=0)
+
+
+def test_text_only_quota_retries_beyond_three_then_continues(fixture_repo):
+    mgr, run_dir = _seed_e2e(fixture_repo, _QUOTA_E2E_CONFIG)
+    mgr._auto_resume_wait_context = lambda run_dir: contextlib.nullcontext()
+    adapter = _FixtureQuotaAdapter(fail_times=5)
+    ft = _FakeTime()
+    status = mgr.resume(
+        "demo", use_judge=False, adapter_factory=lambda n: adapter,
+        clock=ft.clock, auto_sleep=ft.sleep,
+    )
+    assert status == M.RUN_DONE
+    assert len(adapter.calls) == 6
+    assert all(call["session"] == "fixture-session" for call in adapter.calls[1:])
+    assert (fixture_repo / "partial-work.txt").read_text().startswith("preserved")
+    rec = Manifest.load(run_dir / "manifest.json").record("implement")
+    assert rec.status == M.DONE and rec.scheduled_resume is None
+    assert [e.attempt for e in rec.auto_resume_history if e.outcome == "attempt_started"] == [1, 2, 3, 4, 5]
+    assert len([e for e in rec.auto_resume_history if e.outcome == "quota_denied"]) == 5
 
 
 def test_e2e_provider_park_auto_resumes_through_the_plain_retry_path(fixture_repo):

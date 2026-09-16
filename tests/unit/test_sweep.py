@@ -105,13 +105,13 @@ NOTIFY = _cfg()
         (_parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due()), op.LIVENESS_NONE,
          SW.LOCK_ABSENT, NOTIFY, False, "not `auto`"),
         (_parked(M.PARKED_REASON_USAGE_LIMIT), op.LIVENESS_NONE, SW.LOCK_ABSENT, AUTO,
-         False, "no scheduled_resume"),
+         True, SW.REASON_ARM_QUOTA),
         (_parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due()), op.LIVENESS_ALIVE,
          SW.LOCK_LIVE, AUTO, False, "live driver is waiting"),
         (_parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due()), op.LIVENESS_INDETERMINATE,
          SW.LOCK_LIVE, AUTO, False, "cannot be proven"),
         (_parked(M.PARKED_REASON_USAGE_LIMIT, sched=_due(attempts=3)), op.LIVENESS_NONE,
-         SW.LOCK_ABSENT, AUTO, False, "exhausted"),
+         SW.LOCK_ABSENT, AUTO, True, SW.REASON_SCHEDULE),
         (_parked(M.PARKED_REASON_USAGE_LIMIT, sched=ScheduledResume(
             attempt_at=(T0 + timedelta(hours=2)).isoformat())), op.LIVENESS_NONE,
          SW.LOCK_ABSENT, AUTO, False, "not due"),
@@ -122,6 +122,9 @@ NOTIFY = _cfg()
         (_parked(M.PARKED_REASON_PROVIDER_UNAVAILABLE, sched=_due()), op.LIVENESS_NONE,
          SW.LOCK_ABSENT, SimpleNamespace(resume_on_provider_unavailable="auto"), True,
          SW.REASON_SCHEDULE),
+        (_parked(M.PARKED_REASON_PROVIDER_UNAVAILABLE, sched=_due(attempts=3)),
+         op.LIVENESS_NONE, SW.LOCK_ABSENT,
+         SimpleNamespace(resume_on_provider_unavailable="auto"), False, "exhausted"),
         # terminal / failure states
         (_manifest(M.RUN_DONE), op.LIVENESS_NONE, SW.LOCK_ABSENT, AUTO, False, "terminal"),
         (_manifest(M.RUN_FAILED, [StepRecord(id="tests", type="shell", status=M.FAILED)]),
@@ -214,13 +217,15 @@ def test_due_schedule_is_fired_write_ahead_and_audited(tmp_path):
     assert man.record("implement").scheduled_resume.attempts == 1  # counted write-ahead
     assert any(w.startswith("unattended sweep resumed (scheduled_resume/usage_limit)")
                for w in man.warnings)
-    # Each sweep is one attempt; the ceiling still holds across sweeps.
+    # Quota schedules do not exhaust the shared provider-outage ceiling.
     SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
     SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
     out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
-    assert out.action == SW.ACTION_SKIPPED and "exhausted" in out.reason
-    assert len(h.launches) == 3
-    assert h.load().record("implement").scheduled_resume.attempts == 3
+    assert out.action == SW.ACTION_RESUMED
+    assert len(h.launches) == 4
+    rec = h.load().record("implement")
+    assert rec.scheduled_resume.attempts == 4
+    assert [e.attempt for e in rec.auto_resume_history] == [1, 2, 3, 4]
 
 
 def test_notify_knob_never_fires(tmp_path):
@@ -229,6 +234,19 @@ def test_notify_knob_never_fires(tmp_path):
     out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
     assert out.action == SW.ACTION_SKIPPED and "not `auto`" in out.reason
     assert h.launches == [] and h.load().warnings == []
+
+
+def test_sweep_arms_legacy_text_only_quota_park_without_launching(tmp_path):
+    h = _Harness(tmp_path, AUTO)
+    h.save(_parked(M.PARKED_REASON_USAGE_LIMIT))
+    out = SW.sweep_run(h.mgr, "demo", now=T0, launcher=h.launcher)
+    assert out.action == SW.ACTION_ARMED
+    assert h.launches == []
+    sched = h.load().record("implement").scheduled_resume
+    assert sched is not None
+    assert sched.policy == "until_cancelled"
+    assert sched.deadline_source == "fallback"
+    assert datetime.fromisoformat(sched.attempt_at) == T0 + timedelta(seconds=1800)
 
 
 def test_orphan_with_dead_lock_is_reclaimed(tmp_path):

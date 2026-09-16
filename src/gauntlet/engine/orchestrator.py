@@ -1741,6 +1741,7 @@ class Orchestrator:
                     usage=partial.usage if partial else None,
                     retry_after_s=info.retry_after_s,
                     backoff_s=deadline_s,
+                    failure_info=info,
                     notes=(
                         f"provider-unavailable park (plan §5.2): {info.kind} "
                         f"[{info.marker}] after "
@@ -1761,6 +1762,7 @@ class Orchestrator:
                 session_id=partial.session_id if partial else None,
                 usage=partial.usage if partial else None,
                 retry_after_s=info.retry_after_s,
+                failure_info=info,
                 notes=(
                     f"usage-limit park (FR-3.2): {info.kind} [{info.marker}]; "
                     "worktree and CLI session preserved — `gauntlet resume` "
@@ -1894,6 +1896,73 @@ class Orchestrator:
             return None
         return (base + timedelta(seconds=retry_after_s)).isoformat()
 
+    def _quota_schedule_deadline(self, reset_at: str | None) -> tuple[str, str]:
+        """Return a safely spaced quota retry deadline and its evidence source.
+
+        A structured deadline is used only when it is parseable and still in
+        the future. Missing, stale, or malformed provider hints fall back to the
+        configured interval from the engine clock; prose is never parsed (#166).
+        """
+        try:
+            now = datetime.fromisoformat(self.clock())
+        except (ValueError, TypeError):
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if reset_at is not None:
+            try:
+                target = datetime.fromisoformat(reset_at)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                if target > now:
+                    return target.isoformat(), "provider_hint"
+            except (ValueError, TypeError):
+                pass
+        return (
+            (now + timedelta(seconds=self.config.quota_retry_interval_s)).isoformat(),
+            "fallback",
+        )
+
+    def _record_auto_resume_outcome(
+        self,
+        rec: StepRecord,
+        result: StepResult,
+        prior_schedule: "M.ScheduledResume | None",
+    ) -> None:
+        """Append denial/success evidence without erasing prior attempts (#166)."""
+        attempt = prior_schedule.attempts if prior_schedule is not None else 0
+        if result.status == PARKED and result.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+            marker = result.failure_info.marker if result.failure_info else None
+            excerpt = result.failure_info.raw_excerpt if result.failure_info else None
+            if excerpt:
+                from gauntlet.logging.redact import build_redactor
+
+                excerpt = build_redactor(self.config.redaction).redact(excerpt)[0]
+            rec.auto_resume_history.append(M.AutoResumeEvent(
+                at=rec.ended or self.clock(),
+                attempt=attempt,
+                reason=M.PARKED_REASON_USAGE_LIMIT,
+                outcome="quota_denied",
+                marker=marker,
+                excerpt=excerpt,
+                next_attempt_at=(
+                    rec.scheduled_resume.attempt_at if rec.scheduled_resume else None
+                ),
+            ))
+            return
+        if (
+            result.status == DONE
+            and prior_schedule is not None
+            and rec.auto_resume_history
+            and rec.auto_resume_history[-1].outcome == "attempt_started"
+        ):
+            rec.auto_resume_history.append(M.AutoResumeEvent(
+                at=rec.ended or self.clock(),
+                attempt=attempt,
+                reason=prior_schedule.reason or M.PARKED_REASON_USAGE_LIMIT,
+                outcome="continued",
+            ))
+
     def _apply_budget_guard(
         self, step: Step, rec: StepRecord, result: StepResult
     ) -> StepResult:
@@ -1939,6 +2008,7 @@ class Orchestrator:
         return False
 
     def _finalize(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
+        prior_schedule = rec.scheduled_resume
         rec.status = {
             DONE: M.DONE,
             FAILED: M.FAILED,
@@ -2040,33 +2110,41 @@ class Orchestrator:
         # — carries its schedule the instant `_drive` returns (before any wait),
         # and a process death loses nothing. Preserve the prior attempts count
         # across re-parks (the RunManager increments it around each in-process
-        # resume; the ceiling is shared across both park reasons so an outage
-        # that turns into a quota wall still stops at `max_auto_resume_attempts`).
+        # resume). Provider-unavailable schedules use the configured ceiling;
+        # recognized quota schedules remain armed until disabled or aborted.
         # Cleared on any other finalization so a step resumed to DONE never
         # carries a stale schedule. `notify` mode never arms one.
-        if (
-            result.status == PARKED
-            and self._auto_resume_armed_for(result.parked_reason)
-            # Arm ONLY with a concrete deadline (FR-3.4): a usage-limit park with
-            # no reported reset has ``quota_reset_at is None``; falling back to
-            # ``self.clock()`` would make the schedule due immediately, and the
-            # auto-resume loop would burn every attempt in an unspaced hot loop.
-            # With no deadline, leave a plain park for a human. (A
-            # provider_unavailable park always carries its backoff deadline —
-            # depretry.park_deadline_s — so it always arms under `auto`.)
-            and rec.quota_reset_at is not None
-        ):
+        if result.status == PARKED and self._auto_resume_armed_for(result.parked_reason):
             prior_attempts = (
-                rec.scheduled_resume.attempts if rec.scheduled_resume else 0
+                prior_schedule.attempts if prior_schedule else 0
             )
-            rec.scheduled_resume = M.ScheduledResume(
-                attempt_at=rec.quota_reset_at,
-                attempts=prior_attempts,
-                max_attempts=self.config.max_auto_resume_attempts,
-                reason=result.parked_reason,
-            )
+            if result.parked_reason == M.PARKED_REASON_USAGE_LIMIT:
+                attempt_at, source = self._quota_schedule_deadline(rec.quota_reset_at)
+                rec.scheduled_resume = M.ScheduledResume(
+                    attempt_at=attempt_at,
+                    attempts=prior_attempts,
+                    max_attempts=self.config.max_auto_resume_attempts,
+                    reason=result.parked_reason,
+                    policy="until_cancelled",
+                    interval_s=self.config.quota_retry_interval_s,
+                    deadline_source=source,
+                )
+            elif rec.quota_reset_at is not None:
+                rec.scheduled_resume = M.ScheduledResume(
+                    attempt_at=rec.quota_reset_at,
+                    attempts=prior_attempts,
+                    max_attempts=self.config.max_auto_resume_attempts,
+                    reason=result.parked_reason,
+                    policy="bounded",
+                    deadline_source=(
+                        "provider_hint" if result.retry_after_s is not None else "backoff"
+                    ),
+                )
+            else:
+                rec.scheduled_resume = None
         else:
             rec.scheduled_resume = None
+        self._record_auto_resume_outcome(rec, result, prior_schedule)
         if result.session_id:
             rec.session_id = result.session_id
         if result.usage is not None:

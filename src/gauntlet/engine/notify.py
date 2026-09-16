@@ -226,6 +226,8 @@ class Transition(BaseModel):
     # Whether an in-process auto-resume schedule is armed on the parked step
     # (`resume_on_quota: auto`, FR-3.4).
     auto_resume_armed: bool = False
+    scheduled_resume_at: str | None = None
+    auto_resume_policy: str | None = None
     # Run-level non-fatal anomalies (manifest.warnings) for the advisory streams.
     warnings: list[str] = Field(default_factory=list)
 
@@ -250,6 +252,14 @@ class Transition(BaseModel):
             halt_reason=cur.halt_reason if cur else None,
             quota_reset_at=cur.quota_reset_at if cur else None,
             auto_resume_armed=bool(cur and cur.scheduled_resume is not None),
+            scheduled_resume_at=(
+                cur.scheduled_resume.attempt_at
+                if cur and cur.scheduled_resume is not None else None
+            ),
+            auto_resume_policy=(
+                cur.scheduled_resume.policy
+                if cur and cur.scheduled_resume is not None else None
+            ),
             warnings=list(man.warnings),
         )
 
@@ -323,7 +333,11 @@ def next_action_for(event: Transition, kind: str) -> str | None:
         return f"gauntlet resume {slug} --response '<decision>'"
     if kind == KIND_PARKED_USAGE_LIMIT:
         if event.auto_resume_armed:
-            return f"auto-resume armed (reset at {deadline}); nothing to do unless it exhausts"
+            target = event.scheduled_resume_at or deadline
+            return (
+                f"auto-resume armed (next attempt at {target}); set "
+                f"resume_on_quota: notify to stop retries, or gauntlet abort {slug}"
+            )
         return f"gauntlet resume {slug} once the limit clears (reset at {deadline})"
     if kind == KIND_PARKED_PROVIDER_UNAVAILABLE:
         return f"gauntlet resume {slug} retries the step (backoff until {deadline})"
@@ -395,7 +409,10 @@ class Notification(BaseModel):
         if note:
             body = f"{body}: {note}"
         if kind in (KIND_PARKED_USAGE_LIMIT, KIND_PARKED_PROVIDER_UNAVAILABLE):
-            deadline = event.quota_reset_at or "no reset time reported"
+            deadline = (
+                event.scheduled_resume_at or event.quota_reset_at
+                or "no reset time reported"
+            )
             armed = "armed" if event.auto_resume_armed else "not armed"
             body = f"{body} — deadline {deadline}; auto-resume {armed}"
         return cls(

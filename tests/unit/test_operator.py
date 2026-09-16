@@ -854,9 +854,11 @@ def test_footer_usage_limit_park_names_armed_auto_resume_with_fallback_reason(ho
     lines = op.render_footer(driver, rstate, scheduled_resume=sched)
     assert any(
         ln == "auto-resume scheduled at 2026-07-02T09:00:00+00:00 "
-              "(attempt 1/3, usage_limit)"
+              "(0 attempts made; retries until resume_on_quota is set to notify "
+              "or the run is aborted)"
         for ln in lines
     )
+    assert any("cancel auto-resume:" in ln for ln in lines)
 
 
 def test_footer_no_auto_resume_line_when_unarmed(host):
