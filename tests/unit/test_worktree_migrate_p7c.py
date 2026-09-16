@@ -516,7 +516,6 @@ def test_the_eligibility_predicate_reads_no_worktree_evidence_of_its_own():
 # --- the round trip: migrate → drive → roll back ------------------------------
 
 
-@pytest.mark.operator_tree_verb  # explicitly returns to same_tree, then drives it
 def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
     """The whole capability, in one run's life.
 
@@ -578,9 +577,6 @@ def test_migrate_then_drive_then_rollback_round_trip(fixture_repo):
     assert status == M.RUN_PARKED
     assert gitops.current_branch(fixture_repo) == "main"
 
-    # Scope A1 to the dedicated part of this mixed-mode scenario. The final
-    # same-tree drive deliberately changes the operator checkout (and can now
-    # append terminal bookkeeping even when it has no implementation step).
     assert _operator_fingerprint(fixture_repo) == before_operator
 
     # 7. rollback returns it to same_tree, with the journal intact.

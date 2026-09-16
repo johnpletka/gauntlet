@@ -149,10 +149,14 @@ def test_two_distinct_gates_not_collapsed(repo: Path, store: RunStore):
 def test_revision_change_emits_even_when_semantic_fields_identical(
     repo: Path, store: RunStore
 ):
-    """FR-8.1: ``manifest_revision`` (mtime) is part of the event identity, so a
+    """FR-8.1: ``manifest_revision`` is part of the event identity, so a
     rewrite that changes only the revision still emits (review F-001). The PRD
     includes the revision so a re-entry into the same semantic state is observed;
     suppressing duplicate *notifications* is FR-9.1's separate concern (P6).
+
+    The revision is the journal head sequence (FR-8.1's "write counter"), so
+    the write that must be observed is an engine persist — which appends one
+    journal event — not a bare mtime touch of the projection file.
     """
     rd = _run_dir(repo, "alpha", "run-1")
     man = _manifest(
@@ -162,13 +166,14 @@ def test_revision_change_emits_even_when_semantic_fields_identical(
     )
     _write(rd, man)
     w = Watcher(store)
-    assert len(w.poll_once()) == 1
+    first = w.poll_once()
+    assert len(first) == 1
     mpath = rd / "manifest.json"
     st = mpath.stat()
 
     # Rewrite the *same* four semantic fields — only a non-identity field and the
-    # revision change. Force a strictly-later mtime so the assertion does not
-    # depend on filesystem mtime granularity.
+    # revision change. Force a strictly-later mtime so the cheap re-read gate
+    # does not depend on filesystem mtime granularity.
     man.totals.input_tokens += 7
     _write(rd, man)
     os.utime(mpath, ns=(st.st_atime_ns, st.st_mtime_ns + 1000))
@@ -179,8 +184,14 @@ def test_revision_change_emits_even_when_semantic_fields_identical(
     assert evs[0].run_status == "running"
     assert evs[0].current_step == "impl"
     assert evs[0].current_step_status == "running"
-    assert evs[0].revision == st.st_mtime_ns + 1000
-    assert w.poll_once() == []  # no further write → unchanged mtime → nothing
+    assert evs[0].revision == first[0].revision + 1  # one more journaled persist
+    assert w.poll_once() == []  # no further write → unchanged revision → nothing
+
+    # A bare touch of the projection (no engine persist, no journal event) is a
+    # re-read, not a transition: the journal head — the authority — is unchanged.
+    st = mpath.stat()
+    os.utime(mpath, ns=(st.st_atime_ns, st.st_mtime_ns + 1000))
+    assert w.poll_once() == []
 
 
 def test_current_step_status_change_emits(repo: Path, store: RunStore):
