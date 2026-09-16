@@ -770,37 +770,133 @@ def derive_kind(prev: dict | None, cur: dict) -> tuple[str, list[str]]:
 # --- migration genesis (deliverable 4, plan §8) -------------------------------
 
 
-def bootstrap_state(run_dir: Path, *, validate: "Validator | None" = None) -> tuple[str, str]:
+def has_events(run_dir: Path) -> bool:
+    """Whether the journal directory holds at least one validly-named event.
+
+    A bare ``journal/`` directory (created by :func:`_append_event` before its
+    first write, or left holding only quarantined ``.torn``/``.dup`` files) is
+    NOT run state; callers deciding whether a run dir exists must not count it.
+    """
+    return bool(_event_paths(journal_dir(run_dir)))
+
+
+def _pipeline_identity(state: dict) -> Any:
+    pipeline = state.get("pipeline")
+    if isinstance(pipeline, dict):
+        return pipeline.get("hash")
+    return pipeline
+
+
+def _completion_state(
+    run_dir: Path, legacy: dict | None, validate: "Validator | None"
+) -> str | None:
+    """The validated ``completion.json`` text for THIS run, or ``None``.
+
+    Every rejection returns ``None`` rather than raising: the caller falls
+    back to the legacy manifest, and none of these reasons is an error the
+    operator can act on from a read-only surface.
+    """
+    try:
+        completed = (run_dir / "completion.json").read_text()
+    except OSError:
+        return None
+    if not _valid_state(completed, validate):
+        return None
+    state = json.loads(completed)
+    if (
+        state.get("status") != _DONE
+        or state.get("current_step") is not None
+        or state.get("run_id") != run_dir.name
+        or state.get("slug") != run_dir.parent.name
+    ):
+        return None
+    if legacy is not None:
+        # Same identity as the local manifest: run instance, slug, and the
+        # pipeline HASH — the field the engine itself treats as pipeline
+        # identity (resume checks the hash, not the whole ref), so a defaulted
+        # field added to PipelineRef by an upgrade cannot reject a snapshot.
+        if any(legacy.get(key) != state.get(key) for key in ("run_id", "slug")):
+            return None
+        if _pipeline_identity(legacy) != _pipeline_identity(state):
+            return None
+    return completed
+
+
+def bootstrap_state(
+    run_dir: Path,
+    *,
+    validate: "Validator | None" = None,
+    superseded: str | None = None,
+) -> tuple[str, str]:
     """No-journal source for both read-only views and first mutating contact.
 
     Git carries completion.json, a terminal snapshot separate from the mutable
     manifest. Accept it only for this run instance and (when present) the same
     manifest identity/pipeline. A local journal ALWAYS takes precedence, even
     after rollback. This helper must only be called when no state event exists.
+
+    A legacy ``manifest.json`` that does not parse cannot veto a valid
+    snapshot: the identity comparison is simply skipped (the run_id/slug
+    checks against the directory still apply), and the corrupt bytes are
+    returned only when no snapshot is usable — exactly as before.
+
+    ``superseded`` is the state text of an imported completion genesis whose
+    source no longer matches (see :func:`superseded_import`); a projection
+    carrying those exact bytes is derived from the superseded import and is
+    not a bootstrap source either.
     """
-    legacy = run_dir / "manifest.json"
+    legacy_path = run_dir / "manifest.json"
     try:
-        text = legacy.read_text()
+        text: str | None = legacy_path.read_text()
     except (FileNotFoundError, NotADirectoryError):
         text = None
-    try:
-        completed = (run_dir / "completion.json").read_text()
-        if not _valid_state(completed, validate):
-            raise ValueError("invalid completion snapshot")
-        state = json.loads(completed)
-        if (state.get("status") != "done" or state.get("current_step") is not None
-                or state.get("run_id") != run_dir.name
-                or state.get("slug") != run_dir.parent.name):
-            raise ValueError("completion does not identify this completed run")
-        if text is not None:
-            old = json.loads(text)
-            if any(old.get(key) != state.get(key) for key in ("run_id", "slug", "pipeline")):
-                raise ValueError("completion differs from manifest identity")
+    if text is not None and superseded is not None and text == superseded:
+        text = None
+    legacy: dict | None = None
+    if text is not None:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        legacy = parsed if isinstance(parsed, dict) else None
+    completed = _completion_state(run_dir, legacy, validate)
+    if completed is not None and completed != superseded:
         return completed, "completion.json"
-    except (OSError, ValueError, AttributeError):
-        if text is None:
-            raise FileNotFoundError(legacy) from None
-        return text, "manifest.json"
+    if text is None:
+        raise FileNotFoundError(legacy_path)
+    return text, "manifest.json"
+
+
+def superseded_import(run_dir: Path, head_event: dict | None) -> str | None:
+    """The imported state an unchanged completion genesis no longer stands on.
+
+    A ``JournalGenesis`` seeded from ``completion.json`` is DERIVED authority:
+    this checkout never drove the run, it imported Git's terminal snapshot.
+    While no local transition has been journaled on top of it, that genesis
+    is only as valid as its source — and a rollback published upstream
+    (which rewinds the branch and drops ``completion.json``) must be able to
+    reach this checkout. So when the head state is still that genesis and
+    ``completion.json`` is missing or holds different bytes, the import is
+    superseded: readers and the first mutating contact treat the journal as
+    holding no state and bootstrap again from what Git now carries. Returns
+    the superseded state text (so a projection written from it can be
+    recognised), or ``None`` when the head is authoritative.
+
+    Any journaled transition after the import (a sanctioned local rollback,
+    a resume) makes the local journal authoritative for good — "an existing
+    journal always takes precedence" is unchanged for every run this
+    checkout has actually driven.
+    """
+    if head_event is None or head_event.get("kind") != "JournalGenesis":
+        return None
+    if (head_event.get("payload") or {}).get("migrated_from") != "completion.json":
+        return None
+    text = head_event.get("state_json")
+    try:
+        current: str | None = (run_dir / "completion.json").read_text()
+    except OSError:
+        current = None
+    return None if current == text else text
 
 
 def ensure_genesis(
@@ -828,10 +924,14 @@ def ensure_genesis(
     genesis from the repaired bytes.
     """
     jdir = journal_dir(run_dir)
-    if _head_state(jdir, mutate=False).event is not None:
+    head = _head_state(jdir, mutate=False)
+    superseded = superseded_import(run_dir, head.event)
+    if head.event is not None and superseded is None:
         return None
     try:
-        text, source = bootstrap_state(run_dir, validate=validate)
+        text, source = bootstrap_state(
+            run_dir, validate=validate, superseded=superseded
+        )
     except (FileNotFoundError, NotADirectoryError):
         return None
     if not _valid_state(text, validate):
@@ -839,11 +939,14 @@ def ensure_genesis(
     state = json.loads(text)
     run_id = str(state.get("run_id") or "unknown")
     step, iteration, attempt = _envelope_context(state)
+    key = f"genesis:{run_id}:{_sha256_text(text)}"
+    if superseded is not None:
+        key += f":reseed-after-{head.event['seq']}"
     return _append_event(
         jdir,
         kind="JournalGenesis",
         run_id=run_id,
-        idempotency_key=_sha256_text(f"genesis:{run_id}:{_sha256_text(text)}"),
+        idempotency_key=_sha256_text(key),
         payload={
             "migrated_from": source,
             "note": (
@@ -893,6 +996,10 @@ class ProjectionStatus:
     head_state_json: str | None
     evidence_fingerprint: str
     notes: list[str] = field(default_factory=list)
+    # The state text of a completion-import genesis whose source no longer
+    # matches (:func:`superseded_import`); ``None`` when the head is
+    # authoritative. Readers pass it to :func:`bootstrap_state`.
+    superseded_import: str | None = None
 
 
 def projection_status(
@@ -916,6 +1023,15 @@ def projection_status(
     head = _head_state(jdir, mutate=mutate)
     notes = list(head.notes)
     fingerprint = evidence_fingerprint(manifest_path)
+    superseded = superseded_import(run_dir, head.event)
+    if superseded is not None:
+        notes.append(
+            f"imported completion genesis (seq {head.event['seq']}) no longer "
+            "matches completion.json on disk (the branch was rewound or "
+            "re-completed upstream); the import is superseded and the run "
+            "bootstraps again from what Git carries"
+        )
+        head = _Head(event=None, path=None, notes=notes)
 
     try:
         on_disk: str | None = manifest_path.read_text()
@@ -933,6 +1049,7 @@ def projection_status(
             head_state_json=None,
             evidence_fingerprint=fingerprint,
             notes=notes,
+            superseded_import=superseded,
         )
 
     head_seq = head.event["seq"]
@@ -1048,10 +1165,51 @@ def reconcile_projection(
     if status.health == HEALTH_NO_JOURNAL:
         genesis = ensure_genesis(run_dir, clock=clock, validate=validate)
         if genesis is not None:
-            if genesis["payload"]["migrated_from"] != "manifest.json":
-                # Use the ordinary preserve/rebuild path after importing the
-                # portable snapshot, so stale bytes are never discarded.
-                return reconcile_projection(run_dir, clock=clock, validate=validate)
+            source = genesis["payload"]["migrated_from"]
+            if source != "manifest.json":
+                # Imported a portable snapshot (#164). Whatever manifest.json
+                # held — typically the branch's last checkpoint commit, one or
+                # more transitions BEHIND the snapshot — is a state this
+                # snapshot deliberately supersedes, not an out-of-band write:
+                # preserve it verbatim (never discard bytes, R2) and project
+                # the imported head. Routing this through the generic
+                # unjournaled path instead would stamp a "hand-edit / stale
+                # driver" warning into the manifest, and that warning would
+                # make the projection differ from the committed snapshot, so
+                # every later resume of the done run minted a fresh
+                # completion commit.
+                text = genesis["state_json"]
+                preserved_as = None
+                try:
+                    on_disk: str | None = manifest_path.read_text()
+                except (FileNotFoundError, NotADirectoryError):
+                    on_disk = None
+                if on_disk is not None and on_disk != text:
+                    preserved = manifest_path.with_name(
+                        unjournaled_preserved_name(genesis["seq"], on_disk)
+                    )
+                    if not preserved.exists():
+                        _write_projection(preserved, on_disk)
+                    preserved_as = preserved.name
+                    notes.append(
+                        "projection superseded: manifest.json held a "
+                        "pre-completion checkpoint state; preserved verbatim "
+                        f"as {preserved.name}"
+                    )
+                if on_disk != text:
+                    _write_projection(manifest_path, text)
+                notes.append(
+                    f"journal genesis appended from {source} "
+                    f"(seq {genesis['seq']}; portable completion import, #164)"
+                )
+                return ReconcileOutcome(
+                    health=HEALTH_GENESIS,
+                    run_id=genesis["run_id"],
+                    head_seq=genesis["seq"],
+                    evidence_fingerprint=evidence_fingerprint(manifest_path),
+                    notes=notes,
+                    preserved_as=preserved_as,
+                )
             notes.append(
                 f"journal genesis appended from the existing manifest "
                 f"(seq {genesis['seq']}; pre-P6 migration, plan §8)"
@@ -1196,11 +1354,13 @@ __all__ = [
     "derive_kind",
     "ensure_genesis",
     "evidence_fingerprint",
+    "has_events",
     "journal_dir",
     "projection_status",
     "read_events",
     "rebuild_source",
     "reconcile_projection",
     "record_transition",
+    "superseded_import",
     "write_projection_from_head",
 ]

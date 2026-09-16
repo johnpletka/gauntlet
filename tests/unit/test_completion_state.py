@@ -6,6 +6,7 @@ import pytest
 
 from conftest import git
 from gauntlet.engine import journal
+from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, PipelineRef, StepRecord
 from gauntlet.web.store import RunNotFound, RunStore
 from gauntlet.web.watcher import Watcher
@@ -300,3 +301,464 @@ def test_completion_retries_a_failed_recovery_audit_without_new_commit(fixture_r
     assert git(fixture_repo, "rev-parse", "gauntlet/demo") == tip
     rd = mgr.layout("demo").active_run_dir()
     assert mgr._recorded_branch_sha(rd, mgr.status("demo"), "gauntlet/demo") == tip.strip()
+
+
+# --- review fixes (PR #165) ---------------------------------------------------
+#
+# Each test below pins one finding from the PR review; the name says which.
+
+
+def _done_copy(man: Manifest) -> Manifest:
+    done = man.model_copy(deep=True)
+    done.status = "done"
+    done.current_step = None
+    for step in done.steps:
+        step.status = "done"
+    return done
+
+
+def _drop_journal(rd: Path) -> None:
+    for path in (rd / "journal").iterdir():
+        path.unlink()
+    (rd / "journal").rmdir()
+
+
+def _bump(path: Path, seconds: int = 2) -> None:
+    """Advance a path's mtime deterministically (no reliance on fs granularity)."""
+    st = path.stat()
+    stamp = st.st_mtime_ns + seconds * 1_000_000_000
+    os.utime(path, ns=(stamp, stamp))
+
+
+def test_same_tree_completion_never_moves_operator_checkout(fixture_repo):
+    """F-1: a same-tree run completed by ``approve`` from another branch lands
+    its export on the run branch through the object database; the operator's
+    branch, index and working tree — including uncommitted edits that would
+    make a ``git checkout`` refuse — are byte-identical before and after."""
+    from conftest import _operator_fingerprint
+    from gauntlet.engine import gitops
+
+    mgr = _prepare(fixture_repo, CONFIG_YAML + "worktree:\n  mode: same_tree\n")
+    _author_prd(mgr, "demo")
+    pipeline = _write_pipeline(fixture_repo, GATED)
+    assert mgr.start("demo", pipeline, use_judge=False) == "parked"
+    git(fixture_repo, "checkout", "-q", "main")
+    (fixture_repo / "README.md").write_text("operator edit in progress\n")
+    before = _operator_fingerprint(fixture_repo)
+
+    assert mgr.approve("demo", use_judge=False) == "done"
+
+    assert gitops.current_branch(fixture_repo) == "main"
+    assert _operator_fingerprint(fixture_repo) == before
+    assert (fixture_repo / "README.md").read_text() == "operator edit in progress\n"
+    man = mgr.status("demo")
+    relative = f"runs/demo/{man.run_id}/completion.json"
+    committed = Manifest.model_validate_json(git(fixture_repo, "show", f"gauntlet/demo:{relative}"))
+    assert committed.status == "done"
+    files = git(fixture_repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "gauntlet/demo").splitlines()
+    assert set(files) == {relative}
+    assert git(fixture_repo, "log", "-1", "--format=%an", "gauntlet/demo").strip() == "Gauntlet Engine"
+    # The export is journaled in same-tree mode too, at the branch tip.
+    rd = mgr.layout("demo").active_run_dir()
+    tip = git(fixture_repo, "rev-parse", "gauntlet/demo").strip()
+    assert mgr._recorded_branch_sha(rd, man, "gauntlet/demo") == tip
+
+
+def test_commit_file_to_branch_is_idempotent_and_refuses_checked_out_branch(fixture_repo, tmp_path):
+    from gauntlet.engine import gitops
+
+    git(fixture_repo, "branch", "target")
+    first = gitops.commit_file_to_branch(
+        fixture_repo, "target", "runs/x/completion.json", "{}\n", "gauntlet: complete x",
+        identity=gitops.ENGINE_IDENTITY,
+    )
+    assert first == git(fixture_repo, "rev-parse", "target").strip()
+    assert git(fixture_repo, "show", "target:runs/x/completion.json") == "{}\n"
+    assert gitops.commit_file_to_branch(
+        fixture_repo, "target", "runs/x/completion.json", "{}\n", "gauntlet: complete x",
+        identity=gitops.ENGINE_IDENTITY,
+    ) is None
+    assert git(fixture_repo, "rev-parse", "target").strip() == first
+    assert gitops.current_branch(fixture_repo) == "main"
+    assert git(fixture_repo, "status", "--porcelain").strip() == ""
+    git(fixture_repo, "worktree", "add", "-q", str(tmp_path / "held"), "target")
+    with pytest.raises(gitops.GitError, match="checked out"):
+        gitops.commit_file_to_branch(
+            fixture_repo, "target", "runs/x/completion.json", "{2}\n", "gauntlet: complete x",
+            identity=gitops.ENGINE_IDENTITY,
+        )
+
+
+def test_failed_completion_audit_then_missing_tree_still_resumes(fixture_repo, monkeypatch):
+    """F-2: the advertised "resume to retry" works even when the dedicated tree
+    vanished between the completion commit and the retry: a branch tip that is
+    the recorded SHA plus engine bookkeeping only is accepted by the recreate."""
+    import shutil
+    from gauntlet.engine import gitops, worktree as WT
+    from gauntlet.engine.execution import engine_bookkeeping_candidates
+
+    mgr = _prepare(fixture_repo)
+    real_append = journal.append_audit
+
+    def fail_completion(run_dir, kind, *args, **kwargs):
+        if kind == "CompletionExported":
+            return None
+        return real_append(run_dir, kind, *args, **kwargs)
+
+    monkeypatch.setattr(journal, "append_audit", fail_completion)
+    with pytest.raises(journal.JournalError, match="recovery record"):
+        _run_linear(mgr, fixture_repo, "demo")
+    monkeypatch.setattr(journal, "append_audit", real_append)
+    man = mgr.status("demo")
+    tip = git(fixture_repo, "rev-parse", man.branch).strip()
+    state = WT.describe(fixture_repo, mode=WT.MODE_DEDICATED, branch=man.branch)
+    shutil.rmtree(state.path)
+
+    def no_agent(name):
+        pytest.fail("an audit retry must not replay agents")
+
+    assert mgr.resume("demo", use_judge=False, adapter_factory=no_agent) == "done"
+    new_tip = git(fixture_repo, "rev-parse", man.branch).strip()
+    restored = WT.describe(fixture_repo, mode=WT.MODE_DEDICATED, branch=man.branch)
+    assert gitops.advance_is_engine_bookkeeping(
+        fixture_repo, tip, tip=new_tip,
+        bookkeeping=engine_bookkeeping_candidates(
+            restored.path, restored.path / "runs/demo" / man.run_id,
+        ),
+    )
+    rd = mgr.layout("demo").active_run_dir()
+    assert mgr._recorded_branch_sha(rd, mgr.status("demo"), man.branch) == new_tip
+    # A genuinely foreign tip is still refused.
+    (restored.path / "unrecorded.txt").write_text("unrecorded branch change")
+    git(restored.path, "add", "unrecorded.txt")
+    git(restored.path, "commit", "-qm", "unrecorded human change")
+    shutil.rmtree(restored.path)
+    from gauntlet.engine.run import WorktreeUnavailableError
+
+    with pytest.raises(WorktreeUnavailableError, match="journal disagree"):
+        mgr.resume("demo", use_judge=False, adapter_factory=no_agent)
+
+
+@pytest.mark.parametrize("bad", ["{", "[]", "null", "\"text\""])
+def test_corrupt_legacy_manifest_cannot_veto_valid_completion(fixture_repo, bad):
+    """F-3: an unparseable / non-object manifest.json beside a valid
+    completion.json (a torn or conflict-marked checkpoint in a fresh checkout)
+    skips the identity comparison instead of discarding the snapshot."""
+    from gauntlet.engine import operator
+
+    mgr = _prepare(fixture_repo)
+    rd, man, store = _run(fixture_repo)
+    _drop_journal(rd)
+    (rd / "completion.json").write_text(_done_copy(man).model_dump_json(indent=2) + "\n")
+    (rd / "manifest.json").write_text(bad)
+    assert store.manifest("demo").status == "done"
+    assert operator.load_projection_view(fixture_repo, rd).manifest.status == "done"
+    assert not (rd / "journal").exists()
+    mgr._reconcile_projection(rd, "demo")
+    assert journal.read_events(rd)[0]["payload"]["migrated_from"] == "completion.json"
+    assert Manifest.load(rd / "manifest.json").status == "done"
+    # The corrupt bytes were preserved, never silently discarded.
+    assert any(
+        p.read_text() == bad for p in rd.glob("manifest.*json") if p.name != "manifest.json"
+    )
+
+
+def test_completion_snapshot_accepts_pipeline_ref_with_extra_defaulted_field(tmp_path):
+    """F-3 (cont.): pipeline identity is the hash the engine itself checks, so
+    a serialization difference in the ref cannot reject a snapshot."""
+    import json
+
+    rd, man, store = _run(tmp_path)
+    _drop_journal(rd)
+    snapshot = json.loads(_done_copy(man).model_dump_json())
+    snapshot["pipeline"] = {**snapshot["pipeline"], "hash": man.pipeline.hash}
+    legacy = json.loads((rd / "manifest.json").read_text())
+    legacy["pipeline"] = {"name": man.pipeline.name, "hash": man.pipeline.hash}
+    (rd / "manifest.json").write_text(json.dumps(legacy))
+    (rd / "completion.json").write_text(json.dumps(snapshot))
+    assert store.manifest("demo").status == "done"
+
+
+def test_completion_import_over_checkpoint_manifest_adds_no_warning_or_commit(fixture_repo):
+    """F-4: importing the snapshot over the branch's checkpoint manifest is a
+    deliberate supersession, not an out-of-band edit: no "[projection]"
+    warning is stamped into the manifest, so a later resume of the done run
+    re-exports identical bytes and mints no new commit."""
+    import shutil
+
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == "done"
+    man = mgr.status("demo")
+    rd = mgr.layout("demo").active_run_dir()
+    tip = git(fixture_repo, "rev-parse", man.branch).strip()
+    completion = git(fixture_repo, "show", f"{man.branch}:runs/demo/{man.run_id}/completion.json")
+    # A fresh checkout: no journal; the branch's last checkpoint (running)
+    # projection beside the committed terminal snapshot.
+    shutil.rmtree(rd / "journal")
+    stale = man.model_copy(deep=True)
+    stale.status = "running"
+    stale.current_step = stale.steps[0].id
+    stale.steps[0].status = "running"
+    (rd / "manifest.json").write_text(stale.model_dump_json(indent=2))
+    (rd / "completion.json").write_text(completion)
+
+    def no_agent(name):
+        pytest.fail("importing a completion must not replay agents")
+
+    assert mgr.resume("demo", use_judge=False, adapter_factory=no_agent) == "done"
+    after = Manifest.load(rd / "manifest.json")
+    assert not any(w.startswith("[projection]") for w in after.warnings)
+    assert git(fixture_repo, "rev-parse", man.branch).strip() == tip
+    events = journal.read_events(rd)
+    assert events[0]["kind"] == "JournalGenesis"
+    assert events[0]["payload"]["migrated_from"] == "completion.json"
+    preserved = [p for p in rd.glob("manifest.unjournaled-*.json")]
+    assert preserved and Manifest.model_validate_json(preserved[0].read_text()).status == "running"
+    assert mgr.resume("demo", use_judge=False, adapter_factory=no_agent) == "done"
+    assert git(fixture_repo, "rev-parse", man.branch).strip() == tip
+
+
+def test_console_gate_diff_and_supervisor_read_authoritative_state(fixture_repo):
+    """F-5: the gate/diff resolvers and the job supervisor classify from the
+    same journal-aware state as the run list — a stale parked projection over
+    a journal-done run offers no gate, and a completion-only checkout does not
+    500."""
+    from fastapi.testclient import TestClient
+
+    from gauntlet.web.service import TOKEN_HEADER, create_app
+    from gauntlet.web.supervisor import JobSupervisor
+
+    rd, man, store = _run(fixture_repo)
+    path = rd / "manifest.json"
+    parked = man.model_copy(deep=True)
+    parked.status = "parked"
+    parked.current_step = "gate"
+    parked.steps = [
+        StepRecord(id="build", type="agent_task", status="done"),
+        StepRecord(id="gate", type="human_gate", status="parked", notes="awaiting human"),
+    ]
+    parked.write_atomic(path)
+    parked_bytes = path.read_bytes()
+    done = _done_copy(parked)
+    done.write_atomic(path)
+    path.write_bytes(parked_bytes)  # kill window: journal says done, file says parked
+
+    headers = {TOKEN_HEADER: "t"}
+    client = TestClient(create_app(store, token="t"), raise_server_exceptions=False)
+    assert client.get("/api/runs", headers=headers).json()[0]["status"] == "done"
+    assert client.get("/api/runs/demo/gate", headers=headers).status_code == 404
+    assert client.get("/runs/demo/diff", headers=headers).status_code != 500
+    sup = JobSupervisor(fixture_repo, RunConfig())
+    assert sup._load_manifest(rd).status == "done"
+
+    # A fresh checkout carrying only the terminal snapshot.
+    _drop_journal(rd)
+    path.unlink()
+    (rd / "completion.json").write_text(done.model_dump_json(indent=2) + "\n")
+    fresh = RunStore.from_repo(fixture_repo)
+    client = TestClient(create_app(fresh, token="t"), raise_server_exceptions=False)
+    assert client.get("/api/runs", headers=headers).json()[0]["status"] == "done"
+    assert client.get("/runs/demo/diff", headers=headers).status_code != 500
+    assert client.get("/api/runs/demo/gate", headers=headers).status_code == 404
+    assert sup._load_manifest(rd).status == "done"
+
+
+def test_bare_journal_dir_is_not_a_run(tmp_path):
+    """F-6: an empty (or quarantine-only) journal/ dir — the engine creates it
+    before the first event — never selects an unreadable newest run dir and
+    hides the slug's readable history behind it."""
+    rd, man, store = _run(tmp_path)
+    newer = rd.parent / "run-2026-01-02T00-00-00"
+    (newer / "journal").mkdir(parents=True)
+    assert [r.run_id for r in store.list_rows()] == [rd.name]
+    assert store.manifest("demo").run_id == rd.name
+    assert [e["run_id"] for e in store.run_history("demo")] == [rd.name]
+    (newer / "journal" / "evt-00000001-JournalGenesis-abcdefabcdef.json.torn").write_text("{")
+    assert store.manifest("demo").run_id == rd.name
+    with pytest.raises(RunNotFound):
+        store.manifest("demo", newer.name)
+    # An explicit pointer at the empty dir cannot resurrect it either.
+    (rd.parent / "active-run.txt").write_text(newer.name)
+    assert store.manifest("demo").run_id == rd.name
+
+
+def test_superseded_completion_import_follows_upstream_rollback(fixture_repo):
+    """F-7: a checkout that only IMPORTED a completion (no local transition on
+    top of the genesis) stops trusting that import once Git no longer carries
+    the snapshot — an upstream rollback rewinds the branch and drops
+    completion.json — and bootstraps again from what the branch holds now."""
+    from gauntlet.engine import manifest as M, operator
+
+    mgr = _prepare(fixture_repo)
+    rd, man, store = _run(fixture_repo)
+    _drop_journal(rd)
+    checkpoint = (rd / "manifest.json").read_text()  # the branch's tracked checkpoint
+    (rd / "completion.json").write_text(_done_copy(man).model_dump_json(indent=2) + "\n")
+    mgr._reconcile_projection(rd, "demo")
+    assert store.manifest("demo").status == "done"
+    assert journal.read_events(rd)[0]["payload"]["migrated_from"] == "completion.json"
+
+    # Upstream rolled back: `git reset --hard` to the rewound tip restores the
+    # checkpoint manifest and removes the snapshot.
+    (rd / "completion.json").unlink()
+    (rd / "manifest.json").write_text(checkpoint)
+    _bump(rd / "manifest.json")
+    assert store.manifest("demo").status == "running"
+    view = operator.load_projection_view(fixture_repo, rd)
+    assert view.manifest.status == "running"
+    assert view.health == journal.HEALTH_NO_JOURNAL
+    mgr._reconcile_projection(rd, "demo")
+    events = journal.read_events(rd)
+    assert events[-1]["kind"] == "JournalGenesis"
+    assert events[-1]["payload"]["migrated_from"] == "manifest.json"
+    assert Manifest.load(rd / "manifest.json").status == "running"
+    assert journal.projection_status(rd, validate=M.validate_projection_text).health == journal.HEALTH_OK
+    # ... and it is idempotent: a second contact seeds nothing more.
+    mgr._reconcile_projection(rd, "demo")
+    assert len(journal.read_events(rd)) == len(events)
+
+
+def test_superseded_import_with_no_other_source_reports_no_state(fixture_repo):
+    """F-7 (cont.): when the rewound branch carries no manifest either, the
+    projection this checkout wrote from the superseded import is not a
+    bootstrap source; the run reads as unavailable rather than done."""
+    from gauntlet.engine import operator
+
+    mgr = _prepare(fixture_repo)
+    rd, man, store = _run(fixture_repo)
+    _drop_journal(rd)
+    (rd / "manifest.json").unlink()
+    (rd / "completion.json").write_text(_done_copy(man).model_dump_json(indent=2) + "\n")
+    mgr._reconcile_projection(rd, "demo")
+    assert store.manifest("demo").status == "done"
+    (rd / "completion.json").unlink()
+    assert operator.load_projection_view(fixture_repo, rd).manifest is None
+    with pytest.raises(RunNotFound):
+        store.manifest("demo")
+
+
+def test_local_transition_after_import_keeps_journal_authority(fixture_repo):
+    """F-7 (cont.): once this checkout journals its own transition on top of
+    the import, the local journal is authoritative for good — with or without
+    the snapshot on disk."""
+    mgr = _prepare(fixture_repo)
+    rd, man, store = _run(fixture_repo)
+    _drop_journal(rd)
+    (rd / "completion.json").write_text(_done_copy(man).model_dump_json(indent=2) + "\n")
+    mgr._reconcile_projection(rd, "demo")
+    rolled = man.model_copy(deep=True)
+    rolled.status = "running"
+    rolled.write_atomic(rd / "manifest.json")
+    (rd / "completion.json").unlink()
+    assert store.manifest("demo").status == "running"
+    (rd / "completion.json").write_text(_done_copy(man).model_dump_json(indent=2) + "\n")
+    assert store.manifest("demo").status == "running"
+
+
+def test_run_manager_status_reads_journal_head_not_stale_projection(fixture_repo):
+    """F-8: ``RunManager.status`` (``gauntlet report`` and the CLI echoes) can
+    never disagree with ``gauntlet status``: a projection left one journaled
+    state behind is resolved from the head."""
+    from gauntlet.engine.report import render_report
+
+    mgr = _prepare(fixture_repo)
+    assert _run_linear(mgr, fixture_repo, "demo") == "done"
+    rd = mgr.layout("demo").active_run_dir()
+    older = next(
+        e["state_json"] for e in journal.read_events(rd)
+        if e.get("state_json") and '"status": "running"' in e["state_json"]
+    )
+    (rd / "manifest.json").write_text(older)
+    assert Manifest.load(rd / "manifest.json").status == "running"
+    assert mgr.status("demo").status == "done"
+    assert "[done]" in render_report(mgr.status("demo"))
+
+
+def test_watcher_emits_one_transition_across_the_two_step_persist(tmp_path):
+    """F-9: the engine's persist is journal append THEN projection replace. A
+    poll landing between the two, and the next poll after the replace, must
+    observe ONE transition (FR-8.1: exactly once); an audit-only append is no
+    transition at all."""
+    from gauntlet.engine.manifest import _replace_atomic
+
+    rd, man, store = _run(tmp_path)
+    path = rd / "manifest.json"
+    watcher = Watcher(store)
+    assert watcher.poll_once()[0].run_status == "running"
+    man.status = "parked"
+    man.steps[0].status = "parked"
+    payload = man.model_dump_json(indent=2)
+    journal.record_transition(path, payload)
+    _bump(rd / "journal")
+    mid = watcher.poll_once()
+    assert len(mid) == 1 and mid[0].run_status == "parked"
+    _replace_atomic(path, payload)
+    _bump(path)
+    assert watcher.poll_once() == []
+    journal.append_audit(
+        rd, "WorktreeAdopted", {"branch": man.branch, "branch_sha": "abc"},
+        run_id=man.run_id, idempotency_key="audit-only",
+    )
+    _bump(rd / "journal", 4)
+    assert watcher.poll_once() == []
+    # A genuine re-persist of the same semantic state is still a new identity.
+    man.totals.input_tokens += 7
+    man.write_atomic(path)
+    _bump(rd / "journal", 6)
+    again = watcher.poll_once()
+    assert len(again) == 1 and again[0].revision > mid[0].revision
+
+
+def test_console_memoises_projection_view_on_state_revision(tmp_path, monkeypatch):
+    """F-10: the read-only resolver replays the whole journal per call; the
+    console resolves each run once per state revision, not once per row,
+    history entry, manifest fetch and watcher tick."""
+    from gauntlet.engine import operator
+
+    rd, man, store = _run(tmp_path)
+    calls: list[int] = []
+    real = operator.load_projection_view
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(operator, "load_projection_view", counting)
+    store.list_rows()
+    store.run_history("demo")
+    store.manifest("demo")
+    store.step_detail("demo", "build")
+    Watcher(store).poll_once()
+    assert len(calls) == 1
+    man.status = "done"
+    man.current_step = None
+    man.steps[0].status = "done"
+    man.write_atomic(rd / "manifest.json")
+    _bump(rd / "manifest.json")
+    assert store.manifest("demo").status == "done"
+    assert len(calls) == 2
+    store.list_rows()
+    assert len(calls) == 2
+
+
+def test_console_still_refuses_journal_event_symlink_outside_run_root(tmp_path):
+    rd, man, store = _run(tmp_path / "repo")
+    outside = tmp_path / "evt-00000099-JournalGenesis-abcdefabcdef.json"
+    outside.write_text("{}")
+    (rd / "journal" / outside.name).symlink_to(outside)
+    with pytest.raises(RunNotFound, match="path escapes"):
+        store.manifest("demo")
+
+
+def test_row_updated_follows_the_newest_state_source(tmp_path):
+    """A row resolved from a journal append the projection never caught up
+    with sorts by that append, not by the stale projection's mtime."""
+    rd, man, store = _run(tmp_path)
+    before = store.list_rows()[0].updated
+    done = _done_copy(man)
+    journal.record_transition(rd / "manifest.json", done.model_dump_json(indent=2))
+    _bump(rd / "journal", 30)
+    row = store.list_rows()[0]
+    assert row.status == "done"
+    assert row.updated > before
+    assert store.run_history("demo")[0]["updated"] == row.updated

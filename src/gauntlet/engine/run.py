@@ -1171,6 +1171,7 @@ class RunManager:
             state = WT.describe(self.operator_root, mode=mode, branch=branch)
             if state.missing:
                 expect = self._recorded_branch_sha(run_dir, man, branch)
+                expect = self._tolerate_bookkeeping_advance(run_dir, man, branch, expect)
             factory = WT.recreate if state.missing else WT.ensure
             kwargs = {"expect_head": expect} if state.missing else {}
             wt = factory(
@@ -1398,6 +1399,53 @@ class RunManager:
             run_id=(man.run_id if man is not None else "unknown"),
             snapshot_ref=ref,
         )
+
+    def _tolerate_bookkeeping_advance(
+        self, run_dir: Path, man: Manifest | None, branch: str, expect: str | None
+    ) -> str | None:
+        """Accept a branch tip the run's own state accounts for (A3).
+
+        The recreate check demands the branch tip equal the SHA the journal
+        last recorded — the newest worktree adoption or completion export.
+        Two things the run itself did legitimately move the tip past that:
+
+        * the builder's phase commits, which the MANIFEST records
+          (``man.commits``) while the journal's adoption record predates them;
+        * the engine's own bookkeeping commits — the terminal
+          ``completion.json`` export lands on the branch BEFORE its journal
+          record, so a crash (or an unwritable journal) between the two leaves
+          the tip one bookkeeping commit ahead of every record.
+
+        Refusing either would make the advertised "resume to retry" impossible
+        once the tree is gone, and the suggested rollback would discard the
+        run's own commits. So a tip that equals any recorded SHA (journal or
+        manifest), or is one of them plus engine bookkeeping only — both
+        engine markers AND a tree diff confined to the bookkeeping allowlist,
+        exactly the rollback guard's tolerance (#62/#65) — is accepted as the
+        expectation. Anything else keeps the strict check: a foreign commit
+        on the branch is still refused.
+        """
+        if expect is None:
+            return None
+        try:
+            tip = gitops.rev_parse(self.repo_root, f"refs/heads/{branch}")
+        except gitops.GitError:
+            return expect
+        recorded = [expect]
+        if man is not None and man.commits and man.commits[-1].sha not in recorded:
+            recorded.append(man.commits[-1].sha)
+        if tip in recorded:
+            return tip
+        try:
+            allowlist = engine_bookkeeping_candidates(self.repo_root, run_dir)
+            for base in recorded:
+                if gitops.advance_is_engine_bookkeeping(
+                    self.repo_root, base, bookkeeping=allowlist, tip=tip,
+                ):
+                    return tip
+        except (gitops.GitError, StateDirNotContained):
+            return expect
+        return expect
 
     def _recorded_branch_sha(
         self, run_dir: Path, man: Manifest | None, branch: str
@@ -6502,8 +6550,20 @@ class RunManager:
 
     # ---- status -------------------------------------------------------------
     def status(self, slug: str) -> Manifest:
-        layout = self.layout(slug)
-        return Manifest.load(layout.active_run_dir() / "manifest.json")
+        """The run's AUTHORITATIVE state: the journal head, never a stale
+        projection (#164). ``gauntlet report`` and every other CLI surface
+        that narrates run state read through here, so they cannot disagree
+        with ``gauntlet status``. Read-only: no genesis, no repair. Falls back
+        to the raw load only to raise its original error when neither the
+        journal nor the projection yields a loadable manifest.
+        """
+        from gauntlet.engine.operator import load_projection_view
+
+        run_dir = self.layout(slug).active_run_dir()
+        view = load_projection_view(self.repo_root, run_dir, slug=slug)
+        if view.manifest is not None:
+            return view.manifest
+        return Manifest.load(run_dir / "manifest.json")
 
     # ---- usage-ledger backfill (harness-efficiency FR-10.1) -----------------
     def _iter_run_manifests(self) -> "list[Manifest]":
@@ -7114,23 +7174,28 @@ class RunManager:
                 if self._paths is None:
                     raise RuntimeError("completion export requires resolved run paths")
                 sha = commit_completion(self._paths, man, self.writer)
-                if self._paths.dedicated_worktree:
-                    # A3 recreates against recorded history, so the final
-                    # engine commit must be recorded too. Retrying after a
-                    # commit-to-journal crash fills this audit gap without
-                    # creating an empty commit or replaying agents.
-                    head = sha or gitops.head_sha(self.work_root)
-                    key = f"completion-exported:{man.run_id}:{head}"
-                    J.append_audit(
-                        run_dir, "CompletionExported",
-                        {"branch": man.branch, "branch_sha": head},
-                        run_id=man.run_id, idempotency_key=key,
+                # A3 recreates (and a later `migrate-worktree`) verify against
+                # recorded history, so the final engine commit must be
+                # recorded too — in EVERY mode, so a same-tree run's recorded
+                # tip is never one commit behind its branch. Read the branch
+                # ref, not the work root's HEAD: a same-tree checkout may be
+                # on another branch while the export lands on the run branch.
+                # Retrying after a commit-to-journal crash fills this audit
+                # gap without creating an empty commit or replaying agents.
+                head = sha or gitops.rev_parse(
+                    self.repo_root, f"refs/heads/{man.branch}"
+                )
+                key = f"completion-exported:{man.run_id}:{head}"
+                J.append_audit(
+                    run_dir, "CompletionExported",
+                    {"branch": man.branch, "branch_sha": head},
+                    run_id=man.run_id, idempotency_key=key,
+                )
+                if not self._journal_has_key(run_dir, key):
+                    raise J.JournalError(
+                        "completion was committed but its recovery record "
+                        "could not be saved; resume the completed run to retry"
                     )
-                    if not self._journal_has_key(run_dir, key):
-                        raise J.JournalError(
-                            "completion was committed but its recovery record "
-                            "could not be saved; resume the completed run to retry"
-                        )
         finally:
             self._notify_transition(layout, run_dir)
 

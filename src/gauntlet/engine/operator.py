@@ -985,7 +985,11 @@ def load_projection_view(
         # validated completion export if present, otherwise the legacy manifest.
         try:
             if status.health == JR.HEALTH_NO_JOURNAL:
-                text, _ = JR.bootstrap_state(run_instance_dir, validate=M.validate_projection_text)
+                text, _ = JR.bootstrap_state(
+                    run_instance_dir,
+                    validate=M.validate_projection_text,
+                    superseded=status.superseded_import,
+                )
                 man: "Manifest | None" = Manifest.model_validate_json(text)
             else:
                 man = Manifest.load(manifest_path)

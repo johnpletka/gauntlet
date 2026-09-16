@@ -14,12 +14,14 @@ repo tree.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from gauntlet.engine.config import RunConfig
+from gauntlet.engine.journal import JOURNAL_DIRNAME, has_events
 from gauntlet.engine.manifest import (
     RUN_ABORTED,
     RUN_DONE,
@@ -181,14 +183,6 @@ def _started_ended(man: Manifest) -> tuple[str | None, str | None]:
     return started, ended
 
 
-def _mtime_iso(path: Path) -> str | None:
-    try:
-        ts = path.stat().st_mtime
-    except OSError:
-        return None
-    return datetime.fromtimestamp(ts).astimezone().isoformat()
-
-
 def duration_seconds(started: str | None, ended: str | None) -> float | None:
     """Wall-clock seconds between two ISO timestamps, or None if unparseable."""
     if not started or not ended:
@@ -214,6 +208,8 @@ class RunStore:
         self.repo_root = repo_root.resolve()
         self.config = config
         self.supervisor = supervisor
+        # run dir → (revision key, ProjectionView); see ``load_view``.
+        self._views: dict[Path, tuple[tuple, object]] = {}
         # Belt-and-suspenders for FR-10.1 / review F-001: `RunConfig` already
         # validates `run_root` as a repo-relative, non-escaping path, but a
         # directly-constructed config (or a future loosening) could still point
@@ -277,44 +273,137 @@ class RunStore:
         _safe_segment(slug, kind="slug")
         return self._assert_contained(self.run_root_dir / slug)
 
+    # The three on-disk sources a run's authoritative state can come from:
+    # the projection, the journal directory, and the portable completion
+    # export (#164). Their mtimes together are the cheap change signal.
+    _STATE_SOURCES = ("manifest.json", JOURNAL_DIRNAME, "completion.json")
+
     def _has_run_state(self, run_dir: Path) -> bool:
+        """Whether ``run_dir`` holds readable run state.
+
+        A bare ``journal/`` directory is NOT state: the engine creates it
+        before writing the first event, and a quarantine can leave it holding
+        only ``.torn``/``.dup`` files. Counting it would select an empty
+        newest run dir and hide the slug's readable history behind it.
+        """
         run_dir = self._assert_contained(run_dir)
-        return any(
-            (run_dir / name).exists()
-            for name in ("manifest.json", "journal", "completion.json")
+        return (
+            (run_dir / "manifest.json").exists()
+            or (run_dir / "completion.json").exists()
+            or has_events(run_dir)
         )
 
-    def _load_manifest(self, manifest_path: Path) -> Manifest:
-        """Read authoritative state without repairing the projection (#164)."""
+    def _state_paths(self, run_dir: Path) -> tuple[Path, Path, Path]:
+        """``(manifest.json, journal/, completion.json)`` under a contained run dir."""
+        run_dir = self._assert_contained(run_dir)
+        return tuple(run_dir / name for name in self._STATE_SOURCES)  # type: ignore[return-value]
+
+    def _revision_key(self, run_dir: Path) -> tuple:
+        """The cache key for a run dir's state: the three source mtimes plus
+        the newest journal entry name, so a same-tick append on a coarse-mtime
+        filesystem still misses the cache."""
+        revision = self.state_revision(run_dir / "manifest.json")
+        journal = run_dir / JOURNAL_DIRNAME
+        try:
+            newest = max(os.listdir(journal), default=None)
+        except OSError:
+            newest = None
+        return (*revision, newest)
+
+    def load_view(self, run_dir: Path):
+        """The run's journal-aware :class:`ProjectionView`, read-only (#164).
+
+        Never repairs the projection: stale, corrupt or missing projections
+        are resolved in memory from the journal head (or the completion
+        export). Memoised per run dir on the state revision, because the
+        engine's read-only resolver replays the whole journal on every call
+        and the console asks for every row, every history entry and every
+        watcher change — without the cache a list page costs runs × events.
+        """
         from gauntlet.engine.operator import load_projection_view
 
-        manifest_path = self._assert_contained(manifest_path)
+        manifest_path, journal, completion = self._state_paths(run_dir)
         run_dir = manifest_path.parent
-        self._assert_contained(run_dir / "completion.json")
-        journal = self._assert_contained(run_dir / "journal")
+        for path in (manifest_path, journal, completion):
+            self._assert_contained(path)
         # Journals are local files, but their symlinks must obey the same
-        # containment boundary as request-selected artifacts.
-        for event in journal.glob("*.json"):
-            self._assert_contained(event)
+        # containment boundary as request-selected artifacts. ``scandir``
+        # answers ``is_symlink`` from the directory entry itself, so this is
+        # one listing rather than a ``resolve()`` per event file.
+        try:
+            with os.scandir(journal) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        self._assert_contained(journal / entry.name)
+        except FileNotFoundError:
+            pass
+        except NotADirectoryError as exc:
+            raise ValueError(f"journal path is not a directory: {journal}") from exc
+        key = self._revision_key(run_dir)
+        cached = self._views.get(run_dir)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         view = load_projection_view(self.repo_root, run_dir, slug=run_dir.parent.name)
+        self._views[run_dir] = (key, view)
+        return view
+
+    def load_manifest(self, run_dir: Path) -> Manifest:
+        """The run's authoritative :class:`Manifest` (see :meth:`load_view`).
+
+        Raises :class:`ValueError` when neither the journal nor any on-disk
+        snapshot yields a loadable manifest, so callers can treat it exactly
+        like the old raw ``Manifest.load`` failure.
+        """
+        view = self.load_view(run_dir)
         if view.manifest is None:
             raise ValueError(f"no readable manifest or journal state at {run_dir}")
         return view.manifest
 
+    def _load_manifest(self, manifest_path: Path) -> Manifest:
+        """Read authoritative state without repairing the projection (#164)."""
+        return self.load_manifest(self._assert_contained(manifest_path).parent)
+
+    def projection(self, slug: str, run_id: str | None = None):
+        """The resolved run's :class:`ProjectionView` (the watcher's input)."""
+        run_dir = self.run_dir(slug, run_id)
+        try:
+            return self.load_view(run_dir)
+        except (OSError, ValueError) as exc:
+            raise RunNotFound(f"unreadable manifest for {slug!r}: {exc}") from exc
+
     def state_revision(self, manifest_path: Path) -> tuple[int | None, ...]:
-        """Detect projection writes, journal appends and completion imports."""
-        manifest_path = self._assert_contained(manifest_path)
-        journal = self._assert_contained(manifest_path.parent / "journal")
-        completion = self._assert_contained(manifest_path.parent / "completion.json")
+        """Detect projection writes, journal appends and completion imports.
+
+        Three stats under one containment check of the run dir: this runs
+        for every run on every watcher tick, and only ``load_view`` (which
+        reads bytes) needs the per-path symlink check.
+        """
+        paths = self._state_paths(manifest_path.parent)
         revisions = []
-        for path in (manifest_path, journal, completion):
+        for path in paths:
             try:
-                revisions.append(path.stat().st_mtime_ns)
+                revisions.append(os.stat(path).st_mtime_ns)
             except FileNotFoundError:
                 revisions.append(None)
         if all(value is None for value in revisions):
             raise FileNotFoundError(manifest_path)
         return tuple(revisions)
+
+    def updated_iso(self, run_dir: Path) -> str | None:
+        """When the run's state last changed, from whichever source moved last.
+
+        A row whose state came from a journal append the projection never
+        caught up with (a kill window), or from an imported completion
+        export, must not sort under its stale projection mtime.
+        """
+        try:
+            revision = self.state_revision(run_dir / "manifest.json")
+        except (OSError, UnsafePath):
+            return None
+        newest = max((v for v in revision if v is not None), default=None)
+        if newest is None:
+            return None
+        return datetime.fromtimestamp(newest / 1_000_000_000).astimezone().isoformat()
 
     def _run_dirs(self, slug_dir: Path) -> list[str]:
         """Sorted run-dir names (lexical == chronological for ``run-<ts>``)."""
@@ -525,7 +614,7 @@ class RunStore:
             n_steps=len(man.steps),
             n_done=sum(1 for s in man.steps if s.status == DONE),
             warnings_count=len(man.warnings),
-            updated=_mtime_iso(manifest_path),
+            updated=self.updated_iso(run_dir),
         )
 
     def list_rows(
@@ -591,7 +680,7 @@ class RunStore:
                     "current_step_status": cur.status if cur else None,
                     "started": started,
                     "ended": ended,
-                    "updated": _mtime_iso(manifest_path),
+                    "updated": self.updated_iso(slug_dir / rid),
                     "active": rid == active,
                 }
             )

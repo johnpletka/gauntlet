@@ -375,10 +375,8 @@ def _echo_ratification_audit(mgr, slug: str) -> None:
     the persisted manifest — the same record `status`/`report` show — so the
     CLI never narrates something the run did not record. Loud on drift.
     """
-    from gauntlet.engine.manifest import Manifest
-
     try:
-        man = Manifest.load(mgr.layout(slug).active_run_dir() / "manifest.json")
+        man = mgr.status(slug)
     except (OSError, ValueError):
         return
     if not man.ratified_artifacts:
@@ -433,6 +431,20 @@ def _manager() -> "object":
     cwd = Path.cwd()
     _refuse_inside_run_worktree(cwd)
     return RunManager(cwd)
+
+
+def _authoritative_manifest(mgr, run_instance_dir: Path, slug: str):
+    """The run's authoritative state (journal head / completion export), never
+    the raw projection (#164): every CLI surface that narrates run state reads
+    through here so none can disagree with ``gauntlet status``. Raises the raw
+    load's own error when no source yields a loadable manifest."""
+    from gauntlet.engine import operator
+    from gauntlet.engine.manifest import Manifest
+
+    view = operator.load_projection_view(mgr.repo_root, run_instance_dir, slug=slug)
+    if view.manifest is not None:
+        return view.manifest
+    return Manifest.load(run_instance_dir / "manifest.json")
 
 
 def _resolve_run_instance_dir(mgr, slug: str) -> Path:
@@ -1267,10 +1279,8 @@ def _status_interactive(mgr, slug: str, *, agent: str) -> None:
     # FR-8.1 unknown/absent-run error contract. Load and validate the manifest
     # with the same handling as the normal `status` path BEFORE foregrounding the
     # agent, and confirm it is the manifest for this slug + this instance.
-    from gauntlet.engine.manifest import Manifest
-
     try:
-        man = Manifest.load(run_instance_dir / "manifest.json")
+        man = _authoritative_manifest(mgr, run_instance_dir, slug)
     except (OSError, ValueError) as exc:
         typer.echo(
             f"error: cannot load manifest for {slug!r}: {exc}", err=True
@@ -1601,8 +1611,7 @@ def _echo_interrupted_park_detail(mgr, slug: str, status: str) -> None:
     if status != M.RUN_PARKED:
         return
     try:
-        run_dir = mgr.layout(slug).active_run_dir()
-        man = M.Manifest.load(run_dir / "manifest.json")
+        man = mgr.status(slug)
     except Exception:
         return
     noted = [
@@ -1666,11 +1675,10 @@ def _echo_recover_composite(mgr, slug: str) -> None:
     here never masks the recover outcome (recover already succeeded).
     """
     from gauntlet.engine import operator
-    from gauntlet.engine.manifest import Manifest
 
     try:
         run_instance_dir = _resolve_run_instance_dir(mgr, slug)
-        man = Manifest.load(run_instance_dir / "manifest.json")
+        man = _authoritative_manifest(mgr, run_instance_dir, slug)
         run_root = mgr.repo_root / mgr.config.run_root
         liveness = operator.driver_liveness(
             run_root, slug, run_instance_dir=run_instance_dir

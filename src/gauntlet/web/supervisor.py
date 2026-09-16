@@ -491,12 +491,16 @@ class JobSupervisor:
             )
         return rp
 
-    @staticmethod
-    def _load_manifest(run_dir: Path) -> Manifest | None:
-        """The run's manifest, or ``None`` when absent/unreadable (pre-manifest
-        starting runs have none yet, which is not itself terminal)."""
+    def _load_manifest(self, run_dir: Path) -> Manifest | None:
+        """The run's AUTHORITATIVE manifest (journal head, or a completion
+        export — #164), or ``None`` when absent/unreadable (pre-manifest
+        starting runs have none yet, which is not itself terminal). Read-only:
+        the supervisor classifies from the same state the driver would resolve
+        to, so a journal-done run is terminal here too."""
+        from gauntlet.engine.operator import load_projection_view
+
         try:
-            return Manifest.load(run_dir / "manifest.json")
+            return load_projection_view(self.repo_root, run_dir).manifest
         except (OSError, FileNotFoundError, ValueError):
             return None
 

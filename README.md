@@ -299,13 +299,17 @@ gauntlet report myfeat           # per-step / per-agent cost, tokens + clock tim
   `gauntlet resume` re-enters at the last incomplete step. A step that wrote a
   dirty tree before dying is parked or reset rather than re-run blindly.
 - **Completion travels through Git.** After a run finishes, the engine commits
-  `runs/<slug>/<run-id>/completion.json` on the run branch. A checkout without
-  the local journal reads this validated terminal snapshot; its first mutating
-  command imports the same state into a journal. An existing journal always
-  wins, including after rollback. The completion commit stages only this file.
-  If publication fails, resume the completed run to retry without rerunning
-  its agents. Older runs without this snapshot retain their legacy behavior;
-  reconcile their manifests once before sharing them through Git.
+  `runs/<slug>/<run-id>/completion.json` on the run branch — without moving
+  your checkout, even when a same-tree run completes while you are on another
+  branch. A checkout without the local journal reads this validated terminal
+  snapshot; its first mutating command imports the same state into a journal.
+  A journal this checkout has driven always wins, including after rollback. A
+  journal holding only an imported snapshot follows the branch: if the branch
+  is later rewound upstream and the snapshot disappears, the checkout
+  bootstraps again from what Git carries. The completion commit stages only
+  this file. If publication fails, resume the completed run to retry without
+  rerunning its agents. Older runs without this snapshot retain their legacy
+  behavior; reconcile their manifests once before sharing them through Git.
 - **Provider usage limits pause, they don't destroy.** A quota/429/usage-limit
   hit mid-step — including inside a review cycle's sub-agents — **parks** the run
   (`parked_usage_limit`) with the worktree untouched and the agent session

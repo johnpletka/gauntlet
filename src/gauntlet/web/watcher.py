@@ -5,19 +5,21 @@ export once per second and publishes transitions to an event bus feeding the SSE
 streams (P2) and, later, the notifier (P6). The watcher owns **no** run state —
 it only observes journal-authoritative state. A watcher error cannot affect a run.
 
-**Two uses of the manifest mtime (review F-001/F-002):**
+**Change detection vs. event identity (review F-001/F-002, #164):**
 
-- *File-change detection* uses projection/journal-directory/completion-export ``st_mtime_ns``
-  as a cheap gate:
-  a changed mtime means "re-parse this file", an unchanged mtime means "skip the
-  read" without even parsing.
+- *File-change detection* uses the projection / journal-directory /
+  completion-export ``st_mtime_ns`` tuple as a cheap gate: any changed mtime
+  means "re-resolve this run", an unchanged tuple means "skip" without parsing.
 - *Event identity* is the FR-8.1 tuple ``(run_id, current_step,
-  current_step_status, run_status, manifest_revision)``, where
-  ``manifest_revision`` is the projection mtime, or journal-directory mtime for
-  a journal-only update (or completion-export mtime on import) — the PRD's v1 revision
-  marker (``prd.md`` FR-8.1, "``mtime`` suffices"). Including the revision means
-  any manifest write is a new identity even when the four semantic fields are
-  unchanged, so a run that re-enters the *same* semantic state (e.g. parks at
+  current_step_status, run_status, manifest_revision)``. ``manifest_revision``
+  is the **journal head sequence** — the write counter FR-8.1 anticipated
+  ("``mtime`` suffices … or a write counter if added later") — whenever the run
+  has a journal; every engine persist appends one event, so any manifest write
+  is a new identity even when the four semantic fields are unchanged, while the
+  two-step persist (journal append, then projection replace) is ONE transition
+  however many ticks straddle it. A run with no journal (legacy, or an imported
+  completion export) falls back to the newest state-source mtime. A run that
+  re-enters the *same* semantic state (e.g. parks at
   gate A, leaves, parks at gate A again) is still observed rather than collapsed.
 
 De-duplicating actual *notifications* across revision-only changes is FR-9.1's
@@ -44,7 +46,7 @@ from pydantic import BaseModel
 from gauntlet.engine.notify import Transition
 
 from gauntlet.engine.manifest import Manifest
-from gauntlet.web.store import RunNotFound, RunStore, _mtime_iso
+from gauntlet.web.store import RunNotFound, RunStore
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +69,17 @@ class WatchEvent(Transition):
     manifest rewrite already re-fires via its revision/mtime).
     """
 
-    updated: str | None = None  # manifest mtime as ISO (display)
-    revision: int | None = None  # manifest mtime in ns: the FR-8.1 manifest_revision
+    updated: str | None = None  # newest state-source mtime as ISO (display)
+    # The FR-8.1 manifest_revision: the journal head seq, or (no journal) the
+    # newest state-source mtime in ns.
+    revision: int | None = None
 
     @property
     def identity(self) -> Identity:
         """The FR-8.1 identity tuple the watcher de-dups on.
 
-        Includes ``manifest_revision`` (mtime ns) so a manifest write is a new
-        identity even when the four semantic fields are unchanged (review F-001).
+        Includes ``manifest_revision`` so a manifest write is a new identity
+        even when the four semantic fields are unchanged (review F-001).
         """
         return (
             self.run_id,
@@ -178,7 +182,7 @@ class Watcher:
 
     # ---- polling core --------------------------------------------------------
     def _event_for(
-        self, slug: str, man: Manifest, manifest_path: Path, mtime_ns: int | None
+        self, slug: str, man: Manifest, manifest_path: Path, revision: int | None
     ) -> WatchEvent:
         # The typed state (incl. persisted park/halt reasons) comes from the
         # engine's own transition builder so the console classifies exactly
@@ -186,8 +190,8 @@ class Watcher:
         base = Transition.from_manifest(man, slug=slug)
         return WatchEvent(
             **base.model_dump(),
-            updated=_mtime_iso(manifest_path),
-            revision=mtime_ns,
+            updated=self.store.updated_iso(manifest_path.parent),
+            revision=revision,
         )
 
     def poll_once(self) -> list[WatchEvent]:
@@ -211,22 +215,25 @@ class Watcher:
             if prev is not None and prev[0] == revision:
                 continue  # cheap gate: file untouched since last tick
             try:
-                man = self.store.manifest(slug, _rid)
+                view = self.store.projection(slug, _rid)
             except (OSError, ValueError, RunNotFound):
+                view = None
+            if view is None or view.manifest is None:
                 # Fail closed: record the mtime so we don't spin re-parsing a
                 # torn/broken file, but keep the prior identity so a later valid
                 # rewrite still reads as a transition.
                 self._seen[manifest_path] = (revision, prev[1] if prev else None)
                 continue
-            # Preserve the projection-mtime contract when it changes. A
-            # journal-only append has its own directory revision, including
-            # when the projection is missing or was never updated.
-            mtime_ns = revision[0]
-            if mtime_ns is None or (prev is not None and prev[0][0] == mtime_ns):
-                mtime_ns = max(
-                    (value for value in revision[1:] if value is not None), default=None,
+            # The journal head seq is the revision whenever there is one: the
+            # engine's two-step persist (append, then projection replace) and
+            # its audit-only appends then read as exactly one identity per
+            # state transition. Without a journal, the newest source mtime.
+            marker = view.journal_seq
+            if marker is None:
+                marker = max(
+                    (value for value in revision if value is not None), default=None,
                 )
-            event = self._event_for(slug, man, manifest_path, mtime_ns)
+            event = self._event_for(slug, view.manifest, manifest_path, marker)
             identity = event.identity
             if prev is None or prev[1] != identity:
                 events.append(event)

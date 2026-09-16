@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,7 @@ ROOT_SCOPE: dict[str, str] = {
     "object_exists": ROOT_SCOPE_REPO,
     "mktree": ROOT_SCOPE_REPO,
     "commit_tree": ROOT_SCOPE_REPO,
+    "commit_file_to_branch": ROOT_SCOPE_REPO,  # object-db + ref CAS; touches no checkout (#164)
     "commit_subject": ROOT_SCOPE_REPO,
     "commit_parent": ROOT_SCOPE_REPO,
     "commit_message": ROOT_SCOPE_REPO,
@@ -1155,6 +1157,66 @@ def commit_run_bookkeeping(
     ]
     _commit_stdin(repo, args, message)
     return head_sha(repo)
+
+
+def commit_file_to_branch(
+    repo: Path,
+    branch: str,
+    relpath: str,
+    content: str,
+    message: str,
+    *,
+    identity: Identity,
+) -> str | None:
+    """Commit one file onto ``refs/heads/<branch>`` WITHOUT touching any checkout.
+
+    Pure object-database work: hash the blob, build a tree from the branch tip
+    plus this one entry in a scratch index, ``commit-tree`` it and move the
+    ref with a compare-and-swap. The operator's (or any) working tree, index
+    and HEAD are never read or written, so this can publish engine metadata
+    onto a run branch from a checkout that is on a different branch — the
+    same-tree ``approve``/``reject`` case, where switching the operator's
+    checkout to land a bookkeeping commit would be a mutation of *their*
+    tree (and refuses outright over conflicting local edits).
+
+    **Idempotent:** when the branch tip already carries identical bytes at
+    ``relpath`` this returns ``None`` and creates nothing. Refuses (raises
+    :class:`GitError`) when ``branch`` is checked out in a registered
+    worktree: moving a checked-out branch's ref from outside would leave
+    that tree's index and files behind its own HEAD. Callers handle that
+    case by committing through the checked-out tree instead.
+    """
+    holder = worktree_for_branch(repo, branch)
+    if holder is not None:
+        raise GitError(
+            ["update-ref", f"refs/heads/{branch}"], 1,
+            f"branch {branch!r} is checked out at {holder.path}; commit "
+            "through that worktree rather than moving its ref from outside",
+        )
+    ref = f"refs/heads/{branch}"
+    tip = rev_parse(repo, ref)
+    blob = _run(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
+    try:
+        existing: str | None = _run(repo, "rev-parse", "--verify", "--quiet", f"{tip}:{relpath}").strip()
+    except GitError:
+        existing = None
+    if existing == blob:
+        return None
+    with tempfile.TemporaryDirectory(prefix="gauntlet-index-") as scratch:
+        index = Path(scratch) / "index"
+        validate_temp_index_path(repo, index)
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        _run(repo, "read-tree", tip, _env=env)
+        _run(
+            repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{relpath}",
+            _env=env,
+        )
+        tree = _run(repo, "write-tree", _env=env).strip()
+    new = commit_tree(
+        repo, tree, [tip], _sanitize_commit_message(message), identity=identity
+    )
+    _run(repo, "update-ref", ref, new, tip)  # CAS: refuses if the tip moved
+    return new
 
 
 def is_tracked(repo: Path, relpath: str) -> bool:
