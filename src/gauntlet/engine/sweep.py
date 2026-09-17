@@ -4,7 +4,7 @@ A dead driver cannot self-resume: the in-process auto-resume loop (FR-3.4)
 dies with the process that armed it, and a stale drive lock is only ever
 reclaimed by the next driving verb someone types. Unattended recovery
 therefore needs a *resident* process — the console's timer, or a cron/launchd
-job — running a sweep that takes ONLY the two actions the operator playbook
+job — running a sweep that takes ONLY the three actions the operator playbook
 already classes as no-decision:
 
 * **orphan reclaim** — a run whose manifest says ``running`` while its drive
@@ -13,8 +13,11 @@ already classes as no-decision:
   types it.
 * **firing a due schedule** — a parked step carrying an armed
   ``scheduled_resume`` whose ``attempt_at`` has passed and whose attempts are
-  under the ceiling, under the config knob that armed it. The driver that
-  armed it would have fired it had it survived.
+  permitted by its reason-specific policy, under the config knob that armed it.
+  The driver that armed it would have fired it had it survived.
+* **arming a legacy quota park** — a recognized usage-limit park created before
+  fallback schedules existed, under ``resume_on_quota: auto``. The first sweep
+  persists a fallback deadline; a later sweep fires it when due.
 
 Everything else is skipped with a one-line reason: gates and response parks
 (a human decision), ``indeterminate`` liveness and malformed locks (fail
@@ -44,7 +47,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gauntlet.engine import locking
@@ -67,12 +70,14 @@ log = logging.getLogger(__name__)
 
 # What the sweep did for one run.
 ACTION_RESUMED = "resumed"  # a resume was launched (foreground done / child started)
+ACTION_ARMED = "armed"  # a legacy quota park gained a fallback deadline
 ACTION_SKIPPED = "skipped"  # no-decision rule did not apply; nothing touched
 ACTION_REFUSED = "refused"  # the engine's resume failed closed (lock race, guard)
 
 # Why the sweep acted — stamped into the manifest audit warning.
 REASON_ORPHAN = "orphan_reclaim"
 REASON_SCHEDULE = "scheduled_resume"
+REASON_ARM_QUOTA = "quota_fallback_armed"
 
 # The lock proof the sweep computes for a run (the reclaim precondition).
 LOCK_DEAD = "dead"  # a record for THIS slug whose holder is proven dead/reused
@@ -232,6 +237,17 @@ def decide(
     )
     sched = parked_rec.scheduled_resume
     if sched is None:
+        _knob, is_auto = auto_resume_knob(config, reason)
+        if (
+            reason == M.PARKED_REASON_USAGE_LIMIT
+            and is_auto
+            and liveness == operator.LIVENESS_NONE
+            and lock in (LOCK_ABSENT, LOCK_DEAD)
+        ):
+            return SweepDecision(
+                True, REASON_ARM_QUOTA, step_id=parked_rec.id,
+                park_reason=reason, iteration=parked_rec.iteration,
+            )
         return SweepDecision(
             False, f"{state}: no scheduled_resume armed — a human resumes"
         )
@@ -259,7 +275,7 @@ def decide(
         return SweepDecision(
             False, f"{state}: driver/lock state cannot be proven — fail closed"
         )
-    action, wait_s = next_auto_resume_action(sched, now)
+    action, wait_s = next_auto_resume_action(sched, now, reason=reason)
     if action == AUTO_RESUME_EXHAUST:
         return SweepDecision(
             False,
@@ -347,7 +363,12 @@ def _resolve_run_dir(mgr, slug: str) -> Path:
 
 def audit_note(reason: str, now: datetime) -> str:
     """The manifest warning every sweep action stamps (spec item 5)."""
-    return f"unattended sweep resumed ({reason}) at {now.isoformat()}"
+    verb = "armed" if reason == REASON_ARM_QUOTA else "resumed"
+    return f"unattended sweep {verb} ({reason}) at {now.isoformat()}"
+
+
+def _audit_prefix(reason: str) -> str:
+    return audit_note(reason, datetime.now(timezone.utc)).split(" at ")[0]
 
 
 def _stamp_under_lock(
@@ -386,6 +407,21 @@ def _stamp_under_lock(
         if decision.reason == REASON_ORPHAN:
             if man.status != M.RUN_RUNNING:
                 return f"state changed under the sweep (run is {man.status})"
+        elif decision.reason == REASON_ARM_QUOTA:
+            step = next(
+                (s for s in man.steps
+                 if s.id == decision.step_id and s.iteration == decision.iteration
+                 and s.status == M.PARKED), None,
+            )
+            if step is None or step.scheduled_resume is not None:
+                return "state changed under the sweep (quota park changed)"
+            # Same deadline rule as the orchestrator's park path: a still-
+            # future structured reset wins over the fallback cadence.
+            step.scheduled_resume = M.quota_schedule(
+                now, step.quota_reset_at,
+                interval_s=mgr.config.quota_retry_interval_s,
+                max_attempts=mgr.config.max_auto_resume_attempts,
+            )
         else:
             step = next(
                 (s for s in man.steps
@@ -395,9 +431,31 @@ def _stamp_under_lock(
             if step is None or step.scheduled_resume is None:
                 return "state changed under the sweep (schedule gone)"
             sched = step.scheduled_resume
-            if sched.attempts >= sched.max_attempts:
+            reason = M.normalize_parked_reason(
+                step.parked_reason, step.type, step.status
+            )
+            unbounded = M.schedule_is_unbounded(sched, reason)
+            if not unbounded and sched.attempts >= sched.max_attempts:
                 return "state changed under the sweep (schedule exhausted)"
             sched.attempts += 1
+            if unbounded:
+                # Write-ahead spacing (mirrors RunManager._arm_next_attempt):
+                # a launched child that dies before re-parking must not be
+                # re-fired by the very next sweep.
+                sched.attempt_at = (now + timedelta(
+                    seconds=sched.interval_s or mgr.config.quota_retry_interval_s
+                )).isoformat()
+                # One audit line per episode, not one per fire: an
+                # until_cancelled schedule is fired indefinitely, and
+                # `warnings` is copied into every status payload/notification.
+                prefix = _audit_prefix(decision.audit_reason)
+                man.warnings = [w for w in man.warnings if not w.startswith(prefix)]
+            M.append_auto_resume_event(step, M.AutoResumeEvent(
+                at=now.isoformat(),
+                attempt=sched.attempts,
+                reason=reason,
+                outcome="attempt_started",
+            ))
         note = audit_note(decision.audit_reason, now)
         if note not in man.warnings:
             man.warnings.append(note)
@@ -480,6 +538,11 @@ def sweep_run(
                             decision.audit_reason, f"{type(exc).__name__}: {exc}")
     if moved is not None:
         return SweepOutcome(slug, man.run_id, state, ACTION_SKIPPED, moved)
+    if decision.reason == REASON_ARM_QUOTA:
+        return SweepOutcome(
+            slug, man.run_id, state, ACTION_ARMED, decision.audit_reason,
+            "fallback quota retry persisted; no provider call launched",
+        )
     try:
         detail = launch(mgr, slug, run_dir, man.run_id)
     except _RESUME_REFUSALS as exc:
@@ -500,6 +563,7 @@ def sweep_slugs(
 
 __all__ = [
     "ACTION_REFUSED",
+    "ACTION_ARMED",
     "ACTION_RESUMED",
     "ACTION_SKIPPED",
     "LOCK_ABSENT",
@@ -507,6 +571,7 @@ __all__ = [
     "LOCK_LIVE",
     "LOCK_MALFORMED",
     "REASON_ORPHAN",
+    "REASON_ARM_QUOTA",
     "REASON_SCHEDULE",
     "SweepDecision",
     "SweepOutcome",

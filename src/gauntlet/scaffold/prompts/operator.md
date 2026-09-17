@@ -33,9 +33,10 @@ behind that output. Drive every decision off the reported state class:
   only (`status`, `logs`). Do **not** resume or recover a healthy run.
 - **`orphaned`** — the manifest says running but the driver is dead or its PID was
   recycled; the drive lock is reclaimable. Action: `gauntlet resume <slug>`.
-  No decision is at stake, so this is one of the two actions `gauntlet sweep`
-  takes unattended (the other: firing a due `scheduled_resume`); a console or
-  a cron/launchd sweep may already have reclaimed it — check `status` first.
+  No decision is at stake, so this is one of the three actions `gauntlet sweep`
+  takes unattended (the others: arming a legacy quota fallback and firing a due
+  `scheduled_resume`); a console or cron/launchd sweep may already have
+  reclaimed it — check `status` first.
 - **`indeterminate`** — liveness cannot be proven either way (an unparseable,
   unverifiable, or foreign-host lock; an unsupported platform). Action:
   **read-only inspection only** (`logs`, `status --json`) — never a mutating verb.
@@ -56,8 +57,14 @@ behind that output. Drive every decision off the reported state class:
   resume <slug>` once the window replenishes — it **continues the same session**
   with a short continuation prompt (FR-3.3); resuming too early harmlessly
   re-parks. `status` prints the reset time when the provider reported one. With
-  `resume_on_quota: auto` configured, the live driver self-resumes at the hinted
-  time (bounded attempts) — check `status` before assuming you must act.
+  `resume_on_quota: auto` configured, the live driver uses a future structured
+  reset hint or the configured fallback cadence and keeps retrying until that
+  policy is disabled or the run is aborted — check `status` before acting.
+  `status` also says when the schedule cannot fire (no live driver, or the
+  knob was flipped to `notify` — the engine then clears the schedule and notes
+  the cancellation) and, after `quota_denials_before_escalation` denials in a
+  row, flags a **possibly persistent restriction** (billing / plan) — that is
+  the one quota signal worth paging a human about.
 - **`parked_usage_window`** — the pre-step admission check (a configured
   `providers.<name>` window with `enforce: true`) parked *before* launching a
   step predicted not to fit the remaining window. Nothing is in flight; zero
@@ -275,7 +282,8 @@ in ad-hoc prose, and so you never exceed it:
 | Park / state | Resolve autonomously | Page the human |
 |---|---|---|
 | `orphaned` (driver proven dead) | plain `resume` (or the sweep does it) | — |
-| `parked_usage_limit`, `parked_provider_unavailable`, `parked_usage_window` | plain `resume` after the deadline `status` prints | if the same park repeats past the auto-resume ceiling |
+| `parked_usage_limit` | plain `resume` after the deadline `status` prints; with auto mode, let the fallback schedule continue | when `status` flags a persistent restriction, or to disable auto mode / abort the run |
+| `parked_provider_unavailable`, `parked_usage_window` | plain `resume` after the deadline `status` prints | if the provider-unavailable park repeats past its auto-resume ceiling |
 | `failed` shell step with an `on_fail` route, budget spent | plain `resume` re-arms one route (audited) | after the second identical re-failure — the cause is not transient |
 | `failed` / `halted` for any other reason, `interrupted` | read `logs`; a plain `resume` when the cause is clearly fixed | anything that needs judgment, or `--reset-interrupted` |
 | `parked_gate` | never | always — a human ratifies |

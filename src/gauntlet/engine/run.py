@@ -27,7 +27,7 @@ from contextlib import contextmanager
 
 import yaml
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gauntlet.engine import (
@@ -313,7 +313,8 @@ AUTO_RESUME_EXHAUST = "exhaust"
 
 
 def next_auto_resume_action(
-    scheduled_resume: "M.ScheduledResume | None", now: datetime
+    scheduled_resume: "M.ScheduledResume | None", now: datetime,
+    *, reason: str | None = None,
 ) -> tuple[str, float]:
     """Decide the next auto-resume step for a scheduled usage-limit park (FR-3.4).
 
@@ -328,7 +329,10 @@ def next_auto_resume_action(
     """
     if scheduled_resume is None:
         return (AUTO_RESUME_NONE, 0.0)
-    if scheduled_resume.attempts >= scheduled_resume.max_attempts:
+    if (
+        not M.schedule_is_unbounded(scheduled_resume, reason)
+        and scheduled_resume.attempts >= scheduled_resume.max_attempts
+    ):
         return (AUTO_RESUME_EXHAUST, 0.0)
     try:
         target = datetime.fromisoformat(scheduled_resume.attempt_at)
@@ -676,6 +680,11 @@ def render_config_snapshot(config: RunConfig) -> str:
 class RunManager:
     def __init__(self, repo_root: Path, config: RunConfig | None = None) -> None:
         self.repo_root = repo_root
+        self._live_config_path = (
+            repo_root / ".gauntlet/config.yaml" if config is None else None
+        )
+        self._live_config_mtime: float | None = None
+        self._live_config_reload_failed = False
         self.config = config or RunConfig.load(repo_root / ".gauntlet/config.yaml")
         # The configured redaction list (FR-4.4) governs every byte the run
         # writes; default-on even with an empty `redaction:` section.
@@ -3227,8 +3236,10 @@ class RunManager:
         "manual override resumes now" branch): that is ``_resume_once``. If the
         run re-parks on the usage limit under ``resume_on_quota: auto`` (or on a
         dependency failure under ``resume_on_provider_unavailable: auto``), the
-        live driver waits until the recorded deadline and resumes again, bounded
-        by ``max_auto_resume_attempts`` — :meth:`_auto_resume_if_scheduled`. In
+        live driver waits until the recorded deadline and resumes again via
+        :meth:`_auto_resume_if_scheduled`. Provider-unavailable retries are
+        bounded by ``max_auto_resume_attempts``; recognized quota retries
+        continue until the operator disables auto-resume or aborts the run. In
         ``notify`` mode the wrapper is a no-op.
         """
         # R5 (plan §4.5): fingerprint the persisted state before and after the
@@ -3866,6 +3877,113 @@ class RunManager:
         knob = self._AUTO_RESUME_KNOB_BY_REASON.get(reason or "")
         return knob is not None and getattr(self.config, knob) == RESUME_ON_QUOTA_AUTO
 
+    def _refresh_auto_resume_policy(self) -> bool:
+        """Reload live recovery knobs while a long quota wait is parked (#166).
+
+        Injected configs are intentionally stable for embedders/tests. A normal
+        CLI manager re-reads the repo config while it waits so changing
+        ``resume_on_quota`` to ``notify`` stops before another provider call.
+        The file is re-parsed only when its mtime moved (the wait polls every
+        minute for hours). Returns ``False`` when the file cannot be read or
+        does not validate — the caller keeps the last loaded knobs and records
+        the failure, rather than abandoning an unattended wait on a transient
+        (a non-atomic editor save, a `gauntlet upgrade` rewrite in flight).
+        """
+        if self._live_config_path is None:
+            return True
+        try:
+            mtime = self._live_config_path.stat().st_mtime
+            if mtime == self._live_config_mtime and not self._live_config_reload_failed:
+                return True
+            fresh = RunConfig.load(self._live_config_path)
+        except (OSError, ValueError) as exc:
+            if not self._live_config_reload_failed:
+                logging.getLogger(__name__).warning(
+                    "auto-resume: could not reload %s (%s); keeping the last "
+                    "loaded recovery knobs", self._live_config_path, exc,
+                )
+            self._live_config_reload_failed = True
+            return False
+        self._live_config_mtime = mtime
+        self._live_config_reload_failed = False
+        self.config.resume_on_quota = fresh.resume_on_quota
+        self.config.resume_on_provider_unavailable = (
+            fresh.resume_on_provider_unavailable
+        )
+        self.config.quota_retry_interval_s = fresh.quota_retry_interval_s
+        self.config.quota_denials_before_escalation = (
+            fresh.quota_denials_before_escalation
+        )
+        return True
+
+    _CONFIG_RELOAD_NOTE = (
+        "auto-resume: .gauntlet/config.yaml could not be reloaded during the "
+        "quota wait — continuing with the last loaded recovery knobs until it "
+        "is readable again (#166)"
+    )
+
+    def _note_run_warning(
+        self, slug: str, run_dir: Path, run_id: str | None, note: str,
+    ) -> None:
+        """Persist one run-level warning under the lock (idempotent by text)."""
+        handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            if note not in man.warnings:
+                man.warnings.append(note)
+                man.write_atomic(run_dir / "manifest.json")
+        finally:
+            self._release_worktree_lock(handle)
+
+    def _cancel_disabled_quota_schedule(
+        self, slug: str, run_dir: Path, run_id: str | None, man: Manifest,
+    ) -> bool:
+        """Clear an until_cancelled schedule whose knob is no longer ``auto``.
+
+        Cancellation is the operator's decision (the knob flip); recording it
+        on the manifest — schedule cleared, a ``cancelled`` history event and
+        a step note — is what lets ``status``, ``--json``, the sweep and the
+        notifier all agree that nothing will fire, instead of each inferring
+        it from a config file. Bounded provider schedules are left as they
+        were (they exhaust on their own). Returns whether anything changed.
+        """
+        target = None
+        for s in man.steps:
+            if s.status != M.PARKED or s.scheduled_resume is None:
+                continue
+            reason = M.normalize_parked_reason(s.parked_reason, s.type, s.status)
+            if (
+                M.schedule_is_unbounded(s.scheduled_resume, reason)
+                and not self._auto_resume_enabled_for(reason)
+            ):
+                target = s
+                break
+        if target is None:
+            return False
+        handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
+        try:
+            man = Manifest.load(run_dir / "manifest.json")
+            step = man.record(target.id, target.iteration)
+            if step is None or step.status != M.PARKED or step.scheduled_resume is None:
+                return False
+            sched = step.scheduled_resume
+            at = datetime.now(timezone.utc).isoformat()
+            step.scheduled_resume = None
+            M.append_auto_resume_event(step, M.AutoResumeEvent(
+                at=at, attempt=sched.attempts,
+                reason=M.PARKED_REASON_USAGE_LIMIT, outcome="cancelled",
+            ))
+            note = (
+                f"auto-resume cancelled after {sched.attempts} attempts: "
+                "resume_on_quota is no longer auto; left as a plain usage_limit "
+                "park — `gauntlet resume` continues manually once the limit clears"
+            )
+            step.notes = f"{step.notes}\n{note}" if step.notes else note
+            man.write_atomic(run_dir / "manifest.json")
+            return True
+        finally:
+            self._release_worktree_lock(handle)
+
     def _parked_auto_resume_step(self, man: Manifest) -> "M.StepRecord | None":
         """The scheduled-resume-armed usage-limit / provider-unavailable park whose
         governing knob is ``auto``, or ``None`` (shared find, FR-3.4 / #134).
@@ -3913,14 +4031,16 @@ class RunManager:
         with KeepAwake(enabled=self.config.keep_awake), writer:
             yield
 
-    def _arm_next_attempt(self, slug: str, run_dir: Path, run_id: str | None) -> bool:
+    def _arm_next_attempt(
+        self, slug: str, run_dir: Path, run_id: str | None, *, now: datetime
+    ) -> bool:
         """Increment the parked step's auto-resume attempt count under the lock (F-005).
 
         Auto-resume runs outside the worktree lock (each attempt re-acquires it),
         but its manifest writes must not race a concurrent manual resume. Reload +
         revalidate under the lock so a state change between the loop's read and this
         write is not clobbered; return ``False`` (re-loop and re-decide) if the
-        parked usage-limit schedule is gone or already at the ceiling.
+        parked schedule is gone or a bounded provider schedule reached its ceiling.
         """
         handle = self._acquire_worktree_lock(slug, run_id, run_dir=run_dir)
         try:
@@ -3928,16 +4048,35 @@ class RunManager:
             step = self._parked_auto_resume_step(man)
             if step is None or step.scheduled_resume is None:
                 return False
-            if step.scheduled_resume.attempts >= step.scheduled_resume.max_attempts:
+            reason = M.normalize_parked_reason(
+                step.parked_reason, step.type, step.status
+            )
+            sched = step.scheduled_resume
+            unbounded = M.schedule_is_unbounded(sched, reason)
+            if not unbounded and sched.attempts >= sched.max_attempts:
                 return False
-            step.scheduled_resume.attempts += 1
+            sched.attempts += 1
+            if unbounded:
+                # Write-ahead spacing: with no attempt ceiling, the re-park's
+                # fresh deadline is otherwise the only thing keeping a resume
+                # that dies before `_finalize` from being retried immediately
+                # on the next pass (or by the next sweep).
+                sched.attempt_at = (now + timedelta(
+                    seconds=sched.interval_s or self.config.quota_retry_interval_s
+                )).isoformat()
+            M.append_auto_resume_event(step, M.AutoResumeEvent(
+                at=now.isoformat(),
+                attempt=sched.attempts,
+                reason=reason,
+                outcome="attempt_started",
+            ))
             man.write_atomic(run_dir / "manifest.json")
             return True
         finally:
             self._release_worktree_lock(handle)
 
     def _exhaust_schedule(self, slug: str, run_dir: Path, run_id: str | None) -> None:
-        """Clear the auto-resume schedule at the ceiling under the lock (F-005).
+        """Clear a bounded provider schedule at its ceiling under the lock (F-005).
 
         Same lock discipline as :meth:`_arm_next_attempt`: reload + revalidate so
         the exhaustion note never overwrites a concurrent manual resume's state.
@@ -4002,18 +4141,50 @@ class RunManager:
         wait_cm = None  # heartbeat/keep-awake held across contiguous waits only
         try:
             while True:
+                config_ok = self._refresh_auto_resume_policy()
                 try:
                     run_dir = layout.active_run_dir()
                     man = Manifest.load(run_dir / "manifest.json")
                 except (FileNotFoundError, OSError, ValueError):
                     return status
+                if not config_ok:
+                    # Evidence first (data over inference), then fail closed:
+                    # a malformed config may be a mid-save transition from
+                    # ``auto`` to ``notify``.  Never let the last successfully
+                    # loaded knobs authorize a provider call while the current
+                    # file is unreadable.  Keep the waiter heartbeat alive and
+                    # poll until a valid config can be loaded.
+                    try:
+                        self._note_run_warning(
+                            slug, run_dir, man.run_id, self._CONFIG_RELOAD_NOTE
+                        )
+                    except WorktreeLockError:
+                        pass
+                    if wait_cm is None:
+                        wait_cm = _wait_ctx(run_dir)
+                        wait_cm.__enter__()
+                    _sleep(_AUTO_RESUME_POLL_S)
+                    continue
                 if man.status != M.RUN_PARKED:
                     return status
                 step = self._parked_auto_resume_step(man)
                 if step is None:
+                    # The knob was flipped to notify mid-wait: persist the
+                    # cancellation so every reader agrees nothing will fire.
+                    try:
+                        self._cancel_disabled_quota_schedule(
+                            slug, run_dir, man.run_id, man
+                        )
+                    except WorktreeLockError:
+                        pass
                     return status
                 now = self._auto_resume_now(clock)
-                action, wait_s = next_auto_resume_action(step.scheduled_resume, now)
+                reason = M.normalize_parked_reason(
+                    step.parked_reason, step.type, step.status
+                )
+                action, wait_s = next_auto_resume_action(
+                    step.scheduled_resume, now, reason=reason
+                )
                 # Leaving the wait: release the heartbeat/keep-awake before any
                 # resume so its `_drive` heartbeat does not overlap this one.
                 if action != AUTO_RESUME_WAIT and wait_cm is not None:
@@ -4036,7 +4207,9 @@ class RunManager:
                 # AUTO_RESUME_RESUME: count the attempt write-ahead (under the
                 # lock, F-005), then continue with one continuation resume.
                 try:
-                    armed = self._arm_next_attempt(slug, run_dir, man.run_id)
+                    armed = self._arm_next_attempt(
+                        slug, run_dir, man.run_id, now=now
+                    )
                 except WorktreeLockError:
                     return status  # a concurrent driver holds the lock — defer
                 if not armed:
@@ -4572,7 +4745,8 @@ class RunManager:
         # Terminal history is read-only (review F-002): never rewrite a
         # done/aborted/failed run's status. Fail closed so neither a stray CLI
         # `gauntlet abort` nor the console control path can corrupt a completed
-        # run's recorded outcome.
+        # run's recorded outcome. An auto-resume wait polls this status between
+        # sleeps, so this existing transition also cancels #166 retry loops.
         if man.status in _TERMINAL_RUN_STATES:
             raise AbortGuardError(
                 f"run {man.run_id!r} for slug {slug!r} is already {man.status}; "

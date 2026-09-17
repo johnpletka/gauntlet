@@ -36,17 +36,23 @@ reviewer_mutation: commit
 # README "Configuration" section for the full reference.
 #
 # resume_on_quota: notify     # notify (default) | auto — auto self-resumes a
-#                             #   usage-limit park at the provider's hinted
-#                             #   reset time (wants keep_awake or an external
-#                             #   scheduler re-invoking `gauntlet resume`)
+#                             #   usage-limit park at a structured reset time,
+#                             #   or every quota_retry_interval_s when absent
+# quota_retry_interval_s: 1800
+#                             # fallback only; prose reset hints are not parsed
+# quota_denials_before_escalation: 6
+#                             # denials in a row before a "possibly persistent
+#                             #   restriction" flag (retries still continue)
 # keep_awake: true            # default; wraps the driver in `caffeinate -i`
 #                             #   (darwin) — set false to allow host sleep
 # resume_on_provider_unavailable: notify
 #                             # notify (default) | auto — auto self-resumes a
 #                             #   provider_unavailable park (dependency retries
 #                             #   exhausted) at its recorded backoff/Retry-After
-#                             #   deadline; same survival needs and shared
-#                             #   max_auto_resume_attempts as resume_on_quota
+#                             #   deadline; same survival needs, bounded by
+#                             #   max_auto_resume_attempts
+# max_auto_resume_attempts: 3 # provider_unavailable only; quota auto-resume
+#                             #   continues until disabled or the run is aborted
 # external_scheduler: false   # true = you run `gauntlet sweep --all` from
 #                             #   cron/launchd, so a dead driver's due schedule
 #                             #   and an orphaned run are reclaimed unattended

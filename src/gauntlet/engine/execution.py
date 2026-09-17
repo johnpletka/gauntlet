@@ -18,7 +18,7 @@ from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
 
-from gauntlet.adapters.base import AgentResult, Usage
+from gauntlet.adapters.base import AgentResult, FailureInfo, Usage
 from gauntlet.engine.config import RunConfig
 from gauntlet.engine.manifest import Manifest, RevalidationRecord, StepRecord
 from gauntlet.engine.pipeline import Pipeline, Step
@@ -74,6 +74,10 @@ class StepResult:
     # deadline the P4.1 F-006 no-progress exemption requires. ``None`` for every
     # other outcome.
     backoff_s: int | None = None
+    # The recognized failure evidence that produced a resumable park. It is
+    # carried only until finalization, where a bounded/redacted excerpt and
+    # marker are persisted in auto_resume_history (#166).
+    failure_info: FailureInfo | None = None
     # Which cycle sub-step produced the preserved ``session_id`` on a usage-limit
     # park (harness-efficiency FR-3.3): e.g. ``"r1-review"``, ``"r1-fix"``,
     # ``"r2-triage"``. Carried onto the StepRecord by ``_finalize`` so a resume

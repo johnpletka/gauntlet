@@ -711,19 +711,29 @@ class RunConfig(BaseModel):
     # (`external_scheduler: true` declares the operator re-invokes `gauntlet
     # resume` via cron/launchd); enabling `auto` with neither is a load warning.
     resume_on_quota: str = RESUME_ON_QUOTA_NOTIFY
+    # Fallback cadence when a recognized usage-limit envelope carries no usable
+    # structured retry deadline (#166). The failure classifier still does not
+    # parse prose reset hints; the engine schedules from its own clock instead.
+    quota_retry_interval_s: float = 1800.0
+    # Recognized quota denials in a row (on one until_cancelled schedule)
+    # before the engine flags the restriction as possibly persistent — a
+    # billing / plan block reads exactly like a session window to the
+    # classifier, so the loop keeps retrying but the operator is paged once,
+    # distinctly, and `status` says so (#166 review). Retries do NOT stop.
+    quota_denials_before_escalation: int = 6
     # The same policy for a `provider_unavailable` park (#134, rec. 1a): the
     # bounded in-process dependency retries (below) exhausted and the step
     # parked with a concrete backoff / Retry-After deadline. `notify` (default)
     # leaves it for the operator; `auto` has the live driver wait out that
-    # deadline and perform the plain retry resume itself — the same wait loop,
-    # survival requirement (keep_awake / external_scheduler) and shared attempt
-    # ceiling as `resume_on_quota`. No provider health probe is attempted: the
+    # deadline and perform the plain retry resume itself — the same wait loop
+    # and survival requirement (keep_awake / external_scheduler), but with the
+    # bounded attempt ceiling below. No provider health probe is attempted: the
     # only signal is the recorded deadline (fail-closed).
     resume_on_provider_unavailable: str = AUTO_RESUME_NOTIFY
     external_scheduler: bool = False
-    # Spaced auto-resume attempts before falling back to a plain usage_limit /
-    # provider_unavailable park with an exhaustion note (FR-3.4) — a persistent
-    # limit or outage is not a hot loop. Shared by both `auto` knobs.
+    # Spaced provider-unavailable auto-resume attempts before falling back to a
+    # plain park. Usage-limit schedules are interval-spaced but continue while
+    # `resume_on_quota: auto` remains enabled (#166).
     max_auto_resume_attempts: int = 3
 
     # --- dependency retry policy (recovery-redesign plan §5.2, P5) -----------
@@ -868,6 +878,23 @@ class RunConfig(BaseModel):
         """A pool of at least 1 worker; fail closed on a non-positive value (FR-9.1)."""
         if v < 1:
             raise ValueError(f"triage_concurrency must be >= 1; got {v!r}")
+        return v
+
+    @field_validator("quota_retry_interval_s")
+    @classmethod
+    def _validate_quota_retry_interval(cls, v: float) -> float:
+        """A non-positive fallback would create an immediate quota hot loop."""
+        if v <= 0:
+            raise ValueError(f"quota_retry_interval_s must be > 0; got {v!r}")
+        return v
+
+    @field_validator("quota_denials_before_escalation")
+    @classmethod
+    def _validate_quota_denials_before_escalation(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"quota_denials_before_escalation must be >= 1; got {v!r}"
+            )
         return v
 
     @field_validator("max_frs_per_phase")

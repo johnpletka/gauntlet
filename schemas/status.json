@@ -133,11 +133,11 @@
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["attempt_at", "attempts", "max_attempts", "reason"],
-      "description": "The armed in-process auto-resume schedule on the parked step (harness-efficiency FR-3.4; generalized to provider_unavailable parks by #134), non-null only when parked on a usage_limit or provider_unavailable park whose step carries a schedule (armed by `resume_on_quota: auto` / `resume_on_provider_unavailable: auto`); null otherwise, including after the schedule is exhausted. Additive; keeps schema_version=1.",
+      "description": "The armed in-process auto-resume schedule on the parked step (harness-efficiency FR-3.4; generalized to provider_unavailable parks by #134), non-null only when parked on a usage_limit or provider_unavailable park whose step carries a schedule (armed by `resume_on_quota: auto` / `resume_on_provider_unavailable: auto`); null otherwise, including after a bounded provider-unavailable schedule is exhausted. Additive; keeps schema_version=1.",
       "properties": {
         "attempt_at": {
           "type": "string",
-          "description": "Absolute UTC time (ISO-8601) of the next scheduled resume attempt: the park's recorded reset / backoff / Retry-After deadline."
+          "description": "Absolute UTC time (ISO-8601) of the next scheduled resume attempt: a future structured quota reset, engine-computed fallback, or provider backoff / Retry-After deadline."
         },
         "attempts": {
           "type": "integer",
@@ -145,12 +145,51 @@
         },
         "max_attempts": {
           "type": "integer",
-          "description": "The attempt ceiling (`max_auto_resume_attempts`); at attempts >= max_attempts the schedule is cleared with an exhaustion note and the park is left plain."
+          "description": "The provider-unavailable attempt ceiling (`max_auto_resume_attempts`). Informational for an until_cancelled quota policy, which does not exhaust at this value."
         },
         "reason": {
           "type": ["string", "null"],
           "enum": ["usage_limit", "provider_unavailable", null],
           "description": "Which park reason armed the schedule. null on a schedule persisted before #134 (read as the step's own park reason)."
+        },
+        "policy": {
+          "type": "string",
+          "enum": ["bounded", "until_cancelled"],
+          "description": "bounded for provider outages; until_cancelled for recognized quota denials."
+        },
+        "interval_s": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Fallback quota retry cadence, or null when the provider/backoff deadline governs."
+        },
+        "deadline_source": {
+          "type": ["string", "null"],
+          "enum": ["provider_hint", "fallback", "backoff", null],
+          "description": "Evidence used to choose attempt_at. A fallback is engine-computed and never parsed from prose."
+        },
+        "last_denial": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["at", "attempt", "marker", "excerpt"],
+          "properties": {
+            "at": {"type": "string"},
+            "attempt": {"type": "integer"},
+            "marker": {"type": ["string", "null"]},
+            "excerpt": {"type": ["string", "null"]}
+          },
+          "description": "Latest persisted recognized quota denial, or null before the first denial evidence."
+        },
+        "enabled": {
+          "type": ["boolean", "null"],
+          "description": "Current live state of the reason-specific auto-resume config knob: true for auto, false for notify, or null when the caller could not resolve current configuration. Distinct from the persisted schedule policy."
+        },
+        "executor_live": {
+          "type": "boolean",
+          "description": "True only when a lock-owning driver or a fresh heartbeat from a live PID proves that a process can execute this schedule."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "True only when the current config enables auto-resume and a live executor is present; persisted schedule intent alone is never active."
         }
       }
     },

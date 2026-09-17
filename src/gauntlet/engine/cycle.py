@@ -1528,6 +1528,7 @@ def _run_sub(
                             backoff_s=depretry.park_deadline_s(
                                 ctx.record, ctx.config, info
                             ),
+                            failure_info=info,
                             notes=(
                                 f"provider-unavailable park (plan §5.2): "
                                 f"{agent_name} sub-agent hit {info.kind} "
@@ -1547,6 +1548,7 @@ def _run_sub(
                         session_id=sess,
                         parked_substep=substep,
                         retry_after_s=info.retry_after_s,
+                        failure_info=info,
                         notes=(
                             f"usage-limit park (FR-3.2): {agent_name} sub-agent hit "
                             f"{info.kind} [{info.marker}] in the cycle; worktree "

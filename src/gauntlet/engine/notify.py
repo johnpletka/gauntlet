@@ -226,12 +226,27 @@ class Transition(BaseModel):
     # Whether an in-process auto-resume schedule is armed on the parked step
     # (`resume_on_quota: auto`, FR-3.4).
     auto_resume_armed: bool = False
+    scheduled_resume_at: str | None = None
+    auto_resume_policy: str | None = None
+    # Until_cancelled retry evidence (#166): how many recognized denials in a
+    # row, and when the engine flagged the restriction as possibly persistent.
+    consecutive_denials: int = 0
+    escalated_at: str | None = None
     # Run-level non-fatal anomalies (manifest.warnings) for the advisory streams.
     warnings: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_manifest(cls, man: Manifest, *, slug: str | None = None) -> "Transition":
         cur = current_record(man)
+        sched = cur.scheduled_resume if cur else None
+        # An armed schedule is ONE park episode however many times the loop
+        # re-parks it: key the episode on the arming time (a fresh key only
+        # when escalation fires), so an until_cancelled loop pages the
+        # operator once at the park and once at escalation — not once per
+        # denial. Without a schedule each re-park is a new episode, as before.
+        episode = cur.ended if cur else None
+        if sched is not None and sched.armed_at:
+            episode = sched.armed_at + ("/escalated" if sched.escalated_at else "")
         return cls(
             slug=slug or man.slug,
             run_id=man.run_id,
@@ -241,7 +256,7 @@ class Transition(BaseModel):
             current_step_type=cur.type if cur else None,
             current_step_notes=cur.notes if cur else None,
             iteration=cur.iteration if cur else None,
-            episode=cur.ended if cur else None,
+            episode=episode,
             parked_reason=(
                 M.normalize_parked_reason(cur.parked_reason, cur.type, cur.status)
                 if cur
@@ -250,6 +265,13 @@ class Transition(BaseModel):
             halt_reason=cur.halt_reason if cur else None,
             quota_reset_at=cur.quota_reset_at if cur else None,
             auto_resume_armed=bool(cur and cur.scheduled_resume is not None),
+            scheduled_resume_at=(
+                cur.scheduled_resume.attempt_at
+                if cur and cur.scheduled_resume is not None else None
+            ),
+            auto_resume_policy=sched.policy if sched is not None else None,
+            consecutive_denials=sched.consecutive_denials if sched is not None else 0,
+            escalated_at=sched.escalated_at if sched is not None else None,
             warnings=list(man.warnings),
         )
 
@@ -323,7 +345,19 @@ def next_action_for(event: Transition, kind: str) -> str | None:
         return f"gauntlet resume {slug} --response '<decision>'"
     if kind == KIND_PARKED_USAGE_LIMIT:
         if event.auto_resume_armed:
-            return f"auto-resume armed (reset at {deadline}); nothing to do unless it exhausts"
+            target = event.scheduled_resume_at or deadline
+            if event.escalated_at:
+                return (
+                    f"auto-resume still armed (next attempt at {target}) but "
+                    f"{event.consecutive_denials} consecutive denials suggest a "
+                    "persistent restriction (billing / plan?) — check the "
+                    "account; set resume_on_quota: notify to stop retries, or "
+                    f"gauntlet abort {slug}"
+                )
+            return (
+                f"auto-resume armed (next attempt at {target}); set "
+                f"resume_on_quota: notify to stop retries, or gauntlet abort {slug}"
+            )
         return f"gauntlet resume {slug} once the limit clears (reset at {deadline})"
     if kind == KIND_PARKED_PROVIDER_UNAVAILABLE:
         return f"gauntlet resume {slug} retries the step (backoff until {deadline})"
@@ -395,9 +429,16 @@ class Notification(BaseModel):
         if note:
             body = f"{body}: {note}"
         if kind in (KIND_PARKED_USAGE_LIMIT, KIND_PARKED_PROVIDER_UNAVAILABLE):
-            deadline = event.quota_reset_at or "no reset time reported"
+            deadline = (
+                event.scheduled_resume_at or event.quota_reset_at
+                or "no reset time reported"
+            )
             armed = "armed" if event.auto_resume_armed else "not armed"
             body = f"{body} — deadline {deadline}; auto-resume {armed}"
+            if event.consecutive_denials:
+                body = f"{body}; {event.consecutive_denials} consecutive denials"
+            if event.escalated_at:
+                body = f"{body}; persistent restriction suspected since {event.escalated_at}"
         return cls(
             slug=event.slug,
             run_id=event.run_id,
