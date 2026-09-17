@@ -1104,9 +1104,10 @@ def test_arm_next_attempt_spaces_an_unbounded_schedule_write_ahead(tmp_path):
     assert datetime.fromisoformat(sched.attempt_at) == T0 + timedelta(seconds=1800)
 
 
-def test_config_reload_failure_keeps_waiting_and_records_a_warning(tmp_path):
-    # Review F2: a transiently unreadable config must not end an unattended
-    # wait silently. The loop continues on the last loaded knobs and says so.
+def test_config_reload_failure_waits_without_provider_call_until_valid(tmp_path):
+    # Review F2 follow-up: a transiently unreadable config must neither end the
+    # wait nor authorize a provider call using stale knobs.  The second sleep is
+    # caused solely by the failed reload; repair after observing zero resumes.
     h = _AutoResumeHarness(tmp_path, outcomes=["done"])
     config_dir = tmp_path / ".gauntlet"
     config_dir.mkdir()
@@ -1123,12 +1124,33 @@ def test_config_reload_failure_keeps_waiting_and_records_a_warning(tmp_path):
         writes["n"] += 1
         if writes["n"] == 1:
             config_path.write_text("resume_on_quota: [unterminated\n")  # mid-save
+        elif writes["n"] == 2:
+            assert h.resume_calls == 0
+            config_path.write_text(
+                "resume_on_quota: auto\nkeep_awake: true\nrun_root: runs\n"
+            )
         real_sleep(seconds)
 
     h._sleep = corrupt_then_sleep
     assert h.run() == M.RUN_DONE
     assert h.resume_calls == 1
     assert any("could not be reloaded" in w for w in h._load().warnings)
+
+
+def test_auto_resume_executor_uses_fresh_live_heartbeat_without_lock(
+    tmp_path, monkeypatch
+):
+    # The quota waiter intentionally has no drive lock while sleeping.  A fresh
+    # heartbeat from a live PID is affirmative executor evidence for status.
+    _write_heartbeat(tmp_path, 100.0, T0)
+    monkeypatch.setattr(op, "_probe_pid", lambda pid: "alive")
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    assert op.auto_resume_executor_live(
+        driver, tmp_path, now=T0 + timedelta(seconds=10)
+    ) is True
+    assert op.auto_resume_executor_live(
+        driver, tmp_path, now=T0 + timedelta(seconds=60)
+    ) is False
 
 
 def test_flip_to_notify_clears_the_quota_schedule_and_records_cancellation(tmp_path):

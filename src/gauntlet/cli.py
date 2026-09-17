@@ -1157,6 +1157,44 @@ def status(
                         pstep, cur.agent, mgr.config
                     )
 
+        # #166: persisted schedule intent, current config, and a process able to
+        # execute it are three different facts.  Resolve them once and thread the
+        # same snapshot into both JSON and human renderers.  The quota waiter runs
+        # outside the drive lock, so a fresh heartbeat from its live PID is valid
+        # executor evidence even when ``driver.state`` is ``none``.
+        quota_reset_at = None
+        scheduled_resume = None
+        auto_resume_history = None
+        auto_resume_enabled = None
+        auto_resume_executor_live = False
+        if rstate.state in (
+            operator.STATE_PARKED_USAGE_LIMIT,
+            operator.STATE_PARKED_USAGE_WINDOW,
+            operator.STATE_PARKED_PROVIDER_UNAVAILABLE,
+        ) and rstate.parked is not None:
+            pr = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            quota_reset_at = pr.quota_reset_at if pr is not None else None
+            scheduled_resume = pr.scheduled_resume if pr is not None else None
+            auto_resume_history = pr.auto_resume_history if pr is not None else None
+            if pr is not None:
+                auto_resume_enabled = mgr._auto_resume_enabled_for(
+                    operator.M.normalize_parked_reason(
+                        pr.parked_reason, pr.type, pr.status
+                    )
+                )
+            if scheduled_resume is not None:
+                auto_resume_executor_live = operator.auto_resume_executor_live(
+                    driver, run_instance_dir, now=now,
+                    interval_s=getattr(
+                        mgr.config, "heartbeat_interval_s",
+                        operator.HB.DEFAULT_HEARTBEAT_INTERVAL_S,
+                    ),
+                )
+
         # Gate decision context (FR-8.1): assembled only when parked at a human
         # gate, from the manifest + the upstream cycle's persisted artifacts (the
         # I/O point), then threaded into the pure serializer below like the other
@@ -1197,6 +1235,8 @@ def status(
                     mgr.operator_root, man,
                     mode=mgr._effective_worktree_mode(man),
                 ),
+                auto_resume_enabled=auto_resume_enabled,
+                auto_resume_executor_live=auto_resume_executor_live,
             )
             typer.echo(json.dumps(payload, indent=2))
             return
@@ -1219,28 +1259,6 @@ def status(
     # FR-7.3 footer enrichment: elapsed, cost-so-far, and — when parked on a
     # usage limit — the reset time, all sourced from the manifest so no parked
     # state requires reading a transcript to identify the next command.
-    quota_reset_at = None
-    scheduled_resume = None
-    auto_resume_history = None
-    auto_resume_enabled = None
-    if rstate.state in (
-        operator.STATE_PARKED_USAGE_LIMIT,
-        operator.STATE_PARKED_USAGE_WINDOW,
-        operator.STATE_PARKED_PROVIDER_UNAVAILABLE,
-    ) and rstate.parked is not None:
-        pr = next(
-            (r for r in man.steps
-             if operator.render_step_id(r) == rstate.parked.step_id),
-            None,
-        )
-        quota_reset_at = pr.quota_reset_at if pr is not None else None
-        # FR-3.4 / #134: the armed auto-resume schedule, same datum as --json.
-        scheduled_resume = pr.scheduled_resume if pr is not None else None
-        auto_resume_history = pr.auto_resume_history if pr is not None else None
-        if pr is not None:
-            auto_resume_enabled = mgr._auto_resume_enabled_for(
-                operator.M.normalize_parked_reason(pr.parked_reason, pr.type, pr.status)
-            )
     for line in operator.render_footer(
         driver, rstate, reconciliation=recon, anomaly=anomaly,
         current_step_freshness=freshness, suspension=suspension,
@@ -1251,6 +1269,7 @@ def status(
         scheduled_resume=scheduled_resume,
         auto_resume_history=auto_resume_history,
         auto_resume_enabled=auto_resume_enabled,
+        auto_resume_executor_live=auto_resume_executor_live,
     ):
         typer.echo(line)
     for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):

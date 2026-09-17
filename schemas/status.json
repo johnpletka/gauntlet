@@ -178,6 +178,18 @@
             "excerpt": {"type": ["string", "null"]}
           },
           "description": "Latest persisted recognized quota denial, or null before the first denial evidence."
+        },
+        "enabled": {
+          "type": ["boolean", "null"],
+          "description": "Current live state of the reason-specific auto-resume config knob: true for auto, false for notify, or null when the caller could not resolve current configuration. Distinct from the persisted schedule policy."
+        },
+        "executor_live": {
+          "type": "boolean",
+          "description": "True only when a lock-owning driver or a fresh heartbeat from a live PID proves that a process can execute this schedule."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "True only when the current config enables auto-resume and a live executor is present; persisted schedule intent alone is never active."
         }
       }
     },

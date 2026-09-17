@@ -698,6 +698,9 @@ def test_scheduled_resume_block_on_provider_unavailable_park():
         "interval_s": None,
         "deadline_source": None,
         "last_denial": None,
+        "enabled": None,
+        "executor_live": False,
+        "active": False,
     }
     validate_schema(payload, STATUS_SCHEMA)
 
@@ -730,8 +733,39 @@ def test_scheduled_resume_block_on_usage_limit_park_with_null_reason():
             "marker": "usage_limit",
             "excerpt": "usage limit reached",
         },
+        "enabled": None,
+        "executor_live": False,
+        "active": False,
     }
     validate_schema(payload, STATUS_SCHEMA)
+
+
+def test_scheduled_resume_distinguishes_persisted_intent_from_active_executor():
+    man = _manifest(M.RUN_PARKED, [
+        StepRecord(id="impl", type="agent_task", status=M.PARKED,
+                   parked_reason=M.PARKED_REASON_USAGE_LIMIT,
+                   scheduled_resume=M.ScheduledResume(
+                       attempt_at="2026-07-02T09:00:00+00:00")),
+    ])
+    driver = op.DriverInfo(op.LIVENESS_NONE, None, None, None)
+    rstate = op.compute_run_state(man, driver.state)
+    cancelled = op.status_payload(
+        man, driver, rstate, None,
+        run_root=Path("/runs"), run_instance_dir=Path("/runs/demo/run-x"),
+        auto_resume_enabled=False, auto_resume_executor_live=False,
+    )
+    assert cancelled["scheduled_resume"]["policy"] == "until_cancelled"
+    assert cancelled["scheduled_resume"]["enabled"] is False
+    assert cancelled["scheduled_resume"]["active"] is False
+
+    waiting = op.status_payload(
+        man, driver, rstate, None,
+        run_root=Path("/runs"), run_instance_dir=Path("/runs/demo/run-x"),
+        auto_resume_enabled=True, auto_resume_executor_live=True,
+    )
+    assert waiting["scheduled_resume"]["executor_live"] is True
+    assert waiting["scheduled_resume"]["active"] is True
+    validate_schema(waiting, STATUS_SCHEMA)
 
 
 def test_scheduled_resume_always_present_null_when_unarmed():

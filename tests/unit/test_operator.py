@@ -898,6 +898,14 @@ def test_footer_says_when_a_schedule_is_cancelled_or_has_no_driver(host):
                              auto_resume_enabled=True)
     assert any("no live driver: nothing fires this schedule" in ln for ln in lines)
     assert any(ln == "consecutive quota denials: 4" for ln in lines)
+    # The lockless waiter's fresh heartbeat is live executor evidence: do not
+    # claim that nothing will fire merely because the drive lock is absent.
+    lines = op.render_footer(
+        driver, rstate, slug="demo", scheduled_resume=sched,
+        auto_resume_enabled=True, auto_resume_executor_live=True,
+    )
+    assert any("auto-resume waiter live via heartbeat" in ln for ln in lines)
+    assert not any("no live driver: nothing fires this schedule" in ln for ln in lines)
     # escalated: the persistent-restriction suspicion is on the same line
     esc = sched.model_copy(update={"escalated_at": "2026-07-02T08:00:00+00:00"})
     lines = op.render_footer(driver, rstate, slug="demo", scheduled_resume=esc,

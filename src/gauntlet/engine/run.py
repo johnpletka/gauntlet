@@ -4148,14 +4148,23 @@ class RunManager:
                 except (FileNotFoundError, OSError, ValueError):
                     return status
                 if not config_ok:
-                    # Evidence first (data over inference): the wait continues
-                    # on the last loaded knobs, and the manifest says so.
+                    # Evidence first (data over inference), then fail closed:
+                    # a malformed config may be a mid-save transition from
+                    # ``auto`` to ``notify``.  Never let the last successfully
+                    # loaded knobs authorize a provider call while the current
+                    # file is unreadable.  Keep the waiter heartbeat alive and
+                    # poll until a valid config can be loaded.
                     try:
                         self._note_run_warning(
                             slug, run_dir, man.run_id, self._CONFIG_RELOAD_NOTE
                         )
                     except WorktreeLockError:
                         pass
+                    if wait_cm is None:
+                        wait_cm = _wait_ctx(run_dir)
+                        wait_cm.__enter__()
+                    _sleep(_AUTO_RESUME_POLL_S)
+                    continue
                 if man.status != M.RUN_PARKED:
                     return status
                 step = self._parked_auto_resume_step(man)

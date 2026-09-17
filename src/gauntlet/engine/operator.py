@@ -1634,6 +1634,18 @@ _STATUS_SCHEMA_JSON = r'''{
             "excerpt": {"type": ["string", "null"]}
           },
           "description": "Latest persisted recognized quota denial, or null before the first denial evidence."
+        },
+        "enabled": {
+          "type": ["boolean", "null"],
+          "description": "Current live state of the reason-specific auto-resume config knob: true for auto, false for notify, or null when the caller could not resolve current configuration. Distinct from the persisted schedule policy."
+        },
+        "executor_live": {
+          "type": "boolean",
+          "description": "True only when a lock-owning driver or a fresh heartbeat from a live PID proves that a process can execute this schedule."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "True only when the current config enables auto-resume and a live executor is present; persisted schedule intent alone is never active."
         }
       }
     },
@@ -2473,6 +2485,8 @@ def status_payload(
     current_step_timeout_s: float | None = None,
     projection: dict | None = None,
     worktree: dict | None = None,
+    auto_resume_enabled: bool | None = None,
+    auto_resume_executor_live: bool = False,
 ) -> dict:
     """The §6.1 ``status --json`` object — a *second rendering* of the P1 state.
 
@@ -2567,6 +2581,8 @@ def status_payload(
                 )
                 if parked_rec else None
             ),
+            enabled=auto_resume_enabled,
+            executor_live=auto_resume_executor_live,
         )
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -3379,6 +3395,9 @@ def scheduled_resume_dict(
     sched: "M.ScheduledResume | None",
     history: list["M.AutoResumeEvent"] | None = None,
     park_reason: str | None = None,
+    *,
+    enabled: bool | None = None,
+    executor_live: bool = False,
 ) -> dict | None:
     """The §6.1 ``scheduled_resume`` object for an armed schedule, else ``None``.
 
@@ -3396,7 +3415,43 @@ def scheduled_resume_dict(
         "interval_s": sched.interval_s,
         "deadline_source": sched.deadline_source,
         "last_denial": _last_quota_denial(history),
+        # Persisted intent is not the same as executable work.  Surface the
+        # live knob and executor evidence separately so a stale schedule can
+        # never be mistaken for a retry that will actually fire.
+        "enabled": enabled,
+        "executor_live": executor_live,
+        "active": enabled is True and executor_live,
     }
+
+
+def auto_resume_executor_live(
+    driver: DriverInfo,
+    run_instance_dir: Path,
+    *,
+    now: datetime | None = None,
+    interval_s: float = HB.DEFAULT_HEARTBEAT_INTERVAL_S,
+    threshold_s: float = HB.SUSPEND_THRESHOLD_S,
+) -> bool:
+    """Whether a process can execute an armed auto-resume schedule now.
+
+    A normal drive proves this through its lock.  The quota waiter deliberately
+    releases that lock between attempts, so its fresh heartbeat plus a live PID
+    is the authoritative evidence in that state.  A stale/malformed heartbeat,
+    or an unprovable PID, fails closed to ``False``.
+    """
+    if driver.state == LIVENESS_ALIVE:
+        return True
+    sample = HB.HeartbeatSample.read(run_instance_dir / HB.HEARTBEAT_FILENAME)
+    if sample is None:
+        return False
+    stamp = HB.parse_wallclock(sample.wallclock_utc)
+    if stamp is None:
+        return False
+    observed_at = now or datetime.now(timezone.utc)
+    age_s = max(0.0, (observed_at - stamp).total_seconds())
+    if age_s > interval_s + threshold_s:
+        return False
+    return _probe_pid(sample.pid) == "alive"
 
 
 def render_footer(
@@ -3414,6 +3469,7 @@ def render_footer(
     scheduled_resume: "M.ScheduledResume | None" = None,
     auto_resume_history: list["M.AutoResumeEvent"] | None = None,
     auto_resume_enabled: bool | None = None,
+    auto_resume_executor_live: bool | None = None,
 ) -> list[str]:
     """The status footer lines: driver-liveness line + next-action block.
 
@@ -3437,8 +3493,13 @@ def render_footer(
     ``None`` (no heartbeat and no interval) adds no line.
     """
     lines: list[str] = []
+    executor_live = (
+        driver.state == LIVENESS_ALIVE
+        if auto_resume_executor_live is None else auto_resume_executor_live
+    )
     if driver.state == LIVENESS_NONE:
-        lines.append("driver: none (no active drive lock)")
+        suffix = "; auto-resume waiter live via heartbeat" if executor_live else ""
+        lines.append(f"driver: none (no active drive lock{suffix})")
     else:
         extra: list[str] = []
         if driver.pid is not None:
@@ -3519,7 +3580,7 @@ def render_footer(
                 f"auto-resume scheduled at {scheduled_resume.attempt_at} "
                 f"(attempt {nxt}/{scheduled_resume.max_attempts}, {reason})"
             )
-        if auto_resume_enabled is not False and driver.state == LIVENESS_NONE:
+        if auto_resume_enabled is not False and not executor_live:
             # A persisted schedule cannot launch itself (FR-3.4): say so
             # rather than letting "scheduled at" read as "will happen".
             lines.append(
