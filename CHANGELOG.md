@@ -6,6 +6,12 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-16
+
+Gauntlet 1.4.0 improves recovery when hitting usage limits (better auto-restart,
+proper parsing of the Claude messages).  Also, fixes stale run-completion 
+state in the monitor caused by "gauntlet finalize" not fully cleaning up the run
+
 ## [1.3.3] — 2026-09-06
 
 Gauntlet 1.3.3 speeds up feedback in large repositories without giving up a
