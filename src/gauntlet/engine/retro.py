@@ -15,6 +15,15 @@ persisted) rather than reporting the retro loop complete (review F-002). A
 pipeline that wants advisory, best-effort synthesis opts in with
 ``proposals_optional: true``. Self-critique remains best-effort — a single
 agent's flaky end-of-run critique is logged and skipped, not fatal.
+
+Failing closed must not strand a complete run (#169): a FAILED retrospective
+accepts ``gauntlet resume --response "<note>"``. That re-run keeps the
+self-critiques already on disk (no agent is re-asked), retries synthesis once
+with the note as guidance, and completes the step even if synthesis fails
+again — the human decision is the ratification that proposals are advisory for
+this run. A synthesis re-ask that fails AFTER a first parse succeeded (the
+generation-time apply-validation regen) keeps the proposals it has, exactly as
+regen exhaustion does, instead of discarding them as a synthesis failure.
 """
 
 from __future__ import annotations
@@ -53,7 +62,7 @@ _PROPOSAL_REGEN_RETRIES = 2
 def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     from gauntlet.engine.cycle import wrap_as_data
     from gauntlet.engine.feedback import read_feedback
-    from gauntlet.engine.steptypes import _UsageAccumulator, step_logger
+    from gauntlet.engine.steptypes import _pending_response, _UsageAccumulator, step_logger
 
     agents = list(step.get("agents", []) or [])
     if not agents:
@@ -64,9 +73,19 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     usage = _UsageAccumulator()
     template = _template(ctx, step, "retro_prompt", "prompts/retro.md", _BUILTIN_RETRO)
 
+    # A `--response` re-run of a failed retrospective (#169) is consuming a
+    # human decision: the critiques the first run wrote are kept as-is, so the
+    # re-run spends only the synthesis call the human asked for.
+    response = _pending_response(ctx)
     critiques: dict[str, str] = {}
     failed_agents: list[str] = []
+    reused: list[str] = []
     for agent in agents:
+        saved = retro_dir / f"retro-{agent}.md"
+        if response is not None and saved.is_file():
+            critiques[agent] = saved.read_text()
+            reused.append(agent)
+            continue
         prompt = (
             f"{template}\n\n--- your role in this run: {agent} ---\n"
             + wrap_as_data(build_agent_summary(ctx, agent))
@@ -98,7 +117,8 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     if proposer:
         try:
             generated = _generate_proposals(
-                ctx, step, build_run_summary(ctx), critiques, feedback, proposer, usage
+                ctx, step, build_run_summary(ctx), critiques, feedback, proposer, usage,
+                guidance=response,
             )
         except Exception as exc:
             synth_error = repr(exc)
@@ -107,10 +127,16 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
                 retro_dir / "proposal-synthesis-error.txt",
                 f"proposal synthesis failed: {synth_error}\n",
             )
-            gen_note = (
-                f"; proposal synthesis FAILED: {synth_error}"
-                + (" (proposals_optional — continuing)" if proposals_optional else "")
-            )
+            if proposals_optional:
+                continuing = " (proposals_optional — continuing)"
+            elif response is not None:
+                continuing = (
+                    f" (accepted without proposals by {response.response_id} — "
+                    "continuing; `gauntlet feedback` can re-run synthesis later)"
+                )
+            else:
+                continuing = ""
+            gen_note = f"; proposal synthesis FAILED: {synth_error}{continuing}"
     else:
         gen_note = "; no proposer configured — self-critique only"
 
@@ -129,11 +155,18 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     notes = (
         f"retrospective: {len(critiques)} self-critique(s)"
         + (f" ({len(failed_agents)} failed: {', '.join(failed_agents)})" if failed_agents else "")
+        + (f" ({len(reused)} reused from the prior attempt)" if reused else "")
         + f"; {len(generated) + len(governance)} proposal(s) generated, {valid} applyable"
         + (f"; {recorded} decline(s) recorded" if recorded else "")
         + gen_note
     )
-    status = FAILED if (synth_error is not None and not proposals_optional) else DONE
+    # Fail closed on synthesis — unless the pipeline opted into advisory
+    # proposals, or a human has already decided this run proceeds (#169).
+    status = (
+        FAILED
+        if (synth_error is not None and not proposals_optional and response is None)
+        else DONE
+    )
     return StepResult(
         status=status,
         usage=usage.result(),
@@ -522,7 +555,7 @@ def _finding_line(
 # --- proposal generation (FR-6.3) --------------------------------------------
 def _generate_proposals(
     ctx: StepContext, step: Step, summary: str, critiques: dict[str, str],
-    feedback: Any, proposer: str, usage: Any,
+    feedback: Any, proposer: str, usage: Any, *, guidance: Any = None,
 ) -> list[Any]:
     from gauntlet.engine.cycle import _run_sub, wrap_as_data
     from gauntlet.engine.proposals import materialize_proposals, validate_item
@@ -543,6 +576,16 @@ def _generate_proposals(
         parts.append(
             "\n\n--- human feedback ---\n"
             + wrap_as_data(json.dumps(feedback.model_dump(), indent=2, ensure_ascii=False))
+        )
+    if guidance is not None and (guidance.response_text or "").strip():
+        # The operator's `--response` on a failed retrospective (#169): their
+        # direction for this synthesis retry (e.g. "keep diffs small", "unified
+        # diff only"). A human decision, so it is instructions, not run data.
+        parts.append(
+            f"\n\n--- operator guidance ({guidance.response_id}) ---\n"
+            "A previous synthesis attempt for this run failed. The operator "
+            "re-ran it with this direction:\n"
+            + guidance.response_text.strip()
         )
     parts.append(
         "\n\n--- current versioned assets (your diffs must apply against these) ---\n"
@@ -573,10 +616,22 @@ def _generate_proposals(
         if not rejected:
             break
         retry_prompt = prompt + _regen_feedback(ctx, rejected, attempt=regen)
-        result = _run_sub(
-            ctx, proposer, retry_prompt, schema=schema, usage=usage,
-            logger=logger, structured_name=f"proposals.regen{regen}.json",
-        )
+        try:
+            result = _run_sub(
+                ctx, proposer, retry_prompt, schema=schema, usage=usage,
+                logger=logger, structured_name=f"proposals.regen{regen}.json",
+            )
+        except AdapterError as exc:
+            # The first synthesis parsed; only this repair re-ask failed (#169:
+            # a proposer that emitted malformed JSON on every regen attempt
+            # turned three parsed proposals into a terminal synthesis failure).
+            # Treat it as regen exhaustion: keep what we have, materialize the
+            # still-rejected proposals as `invalid` evidence, record why.
+            ctx.writer.write_text(
+                ctx.run_dir / "retro" / f"proposal-regen{regen}-error.txt",
+                f"proposal regeneration attempt {regen} failed: {exc!r}\n",
+            )
+            break
         # Merge, never replace (PR #93 review F-003): the retry is asked for
         # corrections of the REJECTED proposals only, matched back by slug.
         # Already-valid proposals are retained verbatim (a fresh model call

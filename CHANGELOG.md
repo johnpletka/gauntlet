@@ -6,6 +6,27 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed retrospective no longer strands a complete run (#169).** When
+  proposal synthesis fails, `gauntlet resume <slug> --response "<note>"` now
+  finishes the run instead of leaving `abort` as the only option. The
+  self-critiques already written are kept, synthesis is retried once with the
+  note as guidance, and the run completes even if synthesis fails again
+  (proposals are advisory once a human has decided). If the synthesiser's
+  *repair* re-ask fails after a first successful parse, the parsed proposals
+  are now kept instead of failing the step.
+- **The API adapter recovers near-miss JSON (#169).** Schema-bound calls ask
+  for the provider's JSON mode when LiteLLM reports support (falling back
+  without it if the provider refuses), a reply that is valid except for a
+  stray bracket or trailing comma is repaired locally and the repair is
+  recorded in the step events, and a parse failure now names the error
+  position and nearby text.
+- **A failed run publishes its state to the run branch (#169).** When a run
+  ends `failed`, the engine commits its `manifest.json` and `RUN.md`, so other
+  checkouts read `failed` instead of an old `running` record that classified
+  the run as `orphaned`.
+
 ## [1.4.0] - 2026-09-16
 
 Gauntlet 1.4.0 improves recovery when hitting usage limits (better auto-restart,

@@ -170,3 +170,91 @@ def test_unknown_exception_classified_terminal(fake_litellm):
     with pytest.raises(AgentFailedError) as excinfo:
         ApiAdapter(model="m").run("classify")
     assert excinfo.value.failure_info.kind == "terminal"
+
+
+# --- #169: provider JSON mode + local repair ---------------------------------
+def _provider(name):
+    return lambda model, **_: (model, name, None, None)
+
+
+def test_json_mode_requested_when_litellm_reports_support(fake_litellm):
+    fake_litellm.get_llm_provider = _provider("openai")
+    fake_litellm.get_supported_openai_params = (
+        lambda model=None, **_: ["temperature", "response_format"]
+    )
+    fake_litellm.responses = [make_response('{"verdict": "ok"}')]
+    ApiAdapter(model="m").run("judge", schema=SCHEMA)
+    assert fake_litellm.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_json_mode_auto_stays_off_for_emulated_providers(fake_litellm):
+    """LiteLLM emulates JSON mode for Anthropic with a forced tool call; auto
+    mode leaves those requests exactly as before (forcing still works)."""
+    fake_litellm.get_llm_provider = _provider("anthropic")
+    fake_litellm.get_supported_openai_params = lambda model=None, **_: ["response_format"]
+    fake_litellm.responses = [make_response('{"verdict": "ok"}')] * 2
+    ApiAdapter(model="claude-x").run("judge", schema=SCHEMA)
+    ApiAdapter(model="claude-x", json_mode=True).run("judge", schema=SCHEMA)
+    assert ["response_format" in c for c in fake_litellm.calls] == [False, True]
+
+
+def test_json_mode_not_requested_without_support_or_schema(fake_litellm):
+    fake_litellm.get_llm_provider = _provider("openai")
+    fake_litellm.get_supported_openai_params = lambda model=None, **_: ["temperature"]
+    fake_litellm.responses = [make_response('{"verdict": "ok"}'), make_response("x")]
+    ApiAdapter(model="m").run("judge", schema=SCHEMA)
+    ApiAdapter(model="m", json_mode=True).run("no schema, no json mode")
+    assert all("response_format" not in c for c in fake_litellm.calls)
+
+
+def test_json_mode_rejected_by_provider_retries_without_it(fake_litellm):
+    class BadRequestError(Exception):
+        pass
+
+    def completion(**kwargs):
+        fake_litellm.calls.append(kwargs)
+        if "response_format" in kwargs:
+            raise BadRequestError("response_format json_object is not supported")
+        return make_response('{"verdict": "ok"}')
+
+    fake_litellm.completion = completion
+    adapter = ApiAdapter(model="m", json_mode=True)
+    result = adapter.run("judge", schema=SCHEMA)
+    assert result.structured == {"verdict": "ok"}
+    assert ["response_format" in c for c in fake_litellm.calls] == [True, False]
+    assert adapter.json_mode is False  # not re-asked on later calls
+    assert any(e["type"] == "api.json_mode_unsupported" for e in result.raw_events)
+
+
+def test_unrelated_bad_request_is_not_swallowed_by_json_mode(fake_litellm):
+    class BadRequestError(Exception):
+        pass
+
+    def completion(**kwargs):
+        raise BadRequestError("context window exceeded")
+
+    fake_litellm.completion = completion
+    from gauntlet.adapters.base import AgentFailedError
+
+    with pytest.raises(AgentFailedError):
+        ApiAdapter(model="m", json_mode=True).run("judge", schema=SCHEMA)
+
+
+def test_near_miss_json_is_repaired_without_a_reask(fake_litellm):
+    fake_litellm.responses = [make_response('{"verdict": "ok"}}')]
+    result = ApiAdapter(model="m").run("judge", schema=SCHEMA)
+    assert result.structured == {"verdict": "ok"}
+    assert len(fake_litellm.calls) == 1
+    [repaired] = [e for e in result.raw_events if e["type"] == "api.json_repaired"]
+    assert repaired["repairs"] and "'}'" in repaired["repairs"][0]
+
+
+def test_exhaustion_error_names_the_parse_position(fake_litellm):
+    bad = '{"verdict" "ok"}'
+    fake_litellm.responses = [make_response(bad) for _ in range(3)]
+    with pytest.raises(MalformedOutputError) as exc:
+        ApiAdapter(model="m").run("judge", schema=SCHEMA)
+    assert "(char 11 of 16)" in str(exc.value)
+    # the re-ask told the model where its JSON broke
+    reask = fake_litellm.calls[1]["messages"][-1]["content"]
+    assert "Expecting ':' delimiter" in reask
