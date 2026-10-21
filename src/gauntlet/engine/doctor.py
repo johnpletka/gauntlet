@@ -1087,7 +1087,7 @@ def _required_key(model: str) -> str | None:
 # Step keys that reference a named agent profile (FR-2.1). `agents` (list) is the
 # retrospective step's form.
 _AGENT_REF_KEYS = ("agent", "reviewer", "triager", "fixer", "escalation_agent",
-                   "message_agent", "disposition_agent")
+                   "fix_contract_agent", "message_agent", "disposition_agent")
 
 
 def _referenced_agents(repo_root: Path, asset_root: str = ".") -> set[str] | None:

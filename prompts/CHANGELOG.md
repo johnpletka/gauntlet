@@ -48,3 +48,13 @@ apply, so the file reads oldest-first.
 
 - **commit-message.md** (#141 review): retain the updated guidance to aim under
   72 characters while making the enforced 100-character ceiling explicit.
+
+- **escalation-contract.md / schemas/fix-contract.json / pipelines** (#163):
+  add the fix-contract prompt and schema for the optional `fix_contract_agent`
+  on an `adversarial_cycle`. At an escalation park it drafts, per open finding,
+  the change the next fix round should make, the approved-artifact clause that
+  binds it, and an acceptance check, so the human approves or redlines a
+  proposal instead of reconstructing context from raw findings. The standard
+  and review pipelines set `fix_contract_agent: escalation`.
+- **operator.md** (#163): document the escalation brief on a cycle escalation
+  park and the per-item response form.

@@ -1459,7 +1459,7 @@ _STATUS_SCHEMA_JSON = r'''{
   "$id": "gauntlet/schemas/status.json",
   "title": "gauntlet status --json contract (PRD operator-aids, §6.1)",
   "description": "The stable machine contract emitted by `gauntlet status <slug> --json` (FR-4). It is a single rendering of the same computation behind the human footer (operator.compute_run_state / driver_info / next_actions), so the two surfaces can never diverge. `additionalProperties: false` is set top-level and on every nested object: an unknown field is a validation failure, not silently accepted. This strictness is scoped to the CURRENT schema_version — it describes exactly what the current Gauntlet emits. All listed properties are required; a nullable field is always PRESENT and explicitly `null` when not applicable (never omitted).",
-  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1; #134 adds the always-present nullable top-level `scheduled_resume` object (the armed auto-resume schedule on a usage_limit / provider_unavailable park) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
+  "$comment": "Compatibility policy (§6.5 / harness-efficiency FR-7.1): schema_version starts at 1 and identifies the MAJOR version. This committed schema is the single living source for that major version — updated additively IN PLACE (new optional/always-present fields, appended enum members) without bumping schema_version. Any field removal, type change, or required-field addition is a BREAKING change that bumps schema_version. Harness-efficiency FR-7 adds fields (current_step_elapsed_s, current_step_timeout_remaining_s, run_elapsed_s, totals, agent_usage, quota, and per-step duration_s/notes/halt_reason/parked_reason) additively and keeps schema_version=1; FR-8 additively populates the `gate` object body and adds `next_actions[].consequence`, likewise keeping schema_version=1; FR-10.3 adds the always-present `warnings` array additively, likewise keeping schema_version=1; recovery-redesign P5 appends the `parked_provider_unavailable` state, the `provider_unavailable` park reason, the remaining built-in step types to `parked.type`, and the always-present per-step `recovery_cause`/`recovery_disposition` fields, likewise keeping schema_version=1; recovery-redesign P6 adds the always-present nullable top-level `projection` object (journal-vs-projection agreement, plan §4.6/R8) additively, likewise keeping schema_version=1; #134 adds the always-present nullable top-level `scheduled_resume` object (the armed auto-resume schedule on a usage_limit / provider_unavailable park) additively, likewise keeping schema_version=1; #163 adds the always-present nullable top-level `escalation` object (the per-finding escalation brief / proposed fix contracts on a cycle escalation park) additively, likewise keeping schema_version=1. A strict-validating consumer MUST validate against the committed schema at the payload's schema_version OR NEWER, never a private frozen copy (an additive field/enum is correctly rejected by an older snapshot under additionalProperties:false — the documented re-pin cost, not a break). A consumer that cannot track the committed schema must instead tolerate unknown object properties and unknown enum members defensively.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -1498,6 +1498,7 @@ _STATUS_SCHEMA_JSON = r'''{
     "current_step_freshness",
     "suspension",
     "gate",
+    "escalation",
     "projection",
     "worktree",
     "steps",
@@ -1856,6 +1857,268 @@ _STATUS_SCHEMA_JSON = r'''{
               "confidence": {"type": ["string", "null"]},
               "reasoning": {"type": ["string", "null"]}
             }
+          }
+        }
+      }
+    },
+    "escalation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "description": "Escalation brief (#163): always present, non-null only when parked_for_response on an adversarial_cycle that wrote an escalation brief. A per-open-finding digest — one-line claim, residual gap, fix history — plus, when the cycle step sets `fix_contract_agent`, a proposed fix contract for the human to approve, amend, or reject. Assembled from the cycle's persisted artifacts/escalation-brief.json; content fields pass through the redaction path (PRD §7). Additive; keeps schema_version=1.",
+      "required": [
+        "step_id",
+        "kind",
+        "brief_path",
+        "created_at",
+        "responses_since",
+        "contract_status",
+        "contract_agent",
+        "contract_error",
+        "findings",
+        "surfaced_ids"
+      ],
+      "properties": {
+        "step_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "max_rounds_exhausted",
+            "closure_guard",
+            "triage_needs_human",
+            null
+          ]
+        },
+        "brief_path": {
+          "type": "string",
+          "description": "Run-dir-relative path of the full brief."
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responses_since": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Human responses recorded after the brief was written (0 = this park's brief)."
+        },
+        "contract_status": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "proposed",
+            "not_configured",
+            "unavailable",
+            null
+          ]
+        },
+        "contract_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contract_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "finding_id",
+              "severity",
+              "location",
+              "claim",
+              "triage_verdict",
+              "triage_action",
+              "target_artifact",
+              "residual_gap",
+              "fix_rounds",
+              "proposed_contract",
+              "decision_owed"
+            ],
+            "properties": {
+              "finding_id": {
+                "type": "string"
+              },
+              "severity": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "location": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "claim": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "One-line, condensed."
+              },
+              "triage_verdict": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "triage_action": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "target_artifact": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "residual_gap": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": false,
+                "required": [
+                  "verdict",
+                  "notes"
+                ],
+                "properties": {
+                  "verdict": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "notes": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "description": "Latest confirm verdict + notes: what is still wrong. null when no fix round touched it."
+              },
+              "fix_rounds": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "round",
+                    "fix_sha",
+                    "verdict",
+                    "notes"
+                  ],
+                  "properties": {
+                    "round": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "fix_sha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "verdict": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "notes": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "description": "Each fix round's commit and the confirm verdict on it, oldest first (a carried remainder includes its parent's rounds)."
+              },
+              "proposed_contract": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": false,
+                "required": [
+                  "proposed_change",
+                  "grounding",
+                  "acceptance_check",
+                  "recommendation"
+                ],
+                "description": "The fix_contract_agent's proposal for this finding; null when none was drafted.",
+                "properties": {
+                  "proposed_change": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "grounding": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "acceptance_check": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "recommendation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "fix_in_scope",
+                      "amend_upstream",
+                      "decline",
+                      null
+                    ]
+                  }
+                }
+              },
+              "decision_owed": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "surfaced_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         }
       }
@@ -2470,6 +2733,37 @@ def compute_gate_context(
     }
 
 
+def compute_escalation_context(
+    run_instance_dir: Path,
+    parked_rec: StepRecord | None,
+    *,
+    redaction: "RedactionSettings | None" = None,
+) -> dict | None:
+    """The §6.1 ``escalation`` block for a cycle parked for a response (#163).
+
+    I/O-bearing like :func:`compute_gate_context`: reads the cycle's persisted
+    ``artifacts/escalation-brief.json`` and returns its redacted projection, or
+    ``None`` when the parked step is not an ``adversarial_cycle`` or wrote no
+    brief for this step record. The cycle deletes its brief when it converges,
+    so a brief on disk for the parked record is from its latest escalation
+    park; ``responses_since`` says whether a later response (e.g. a disposition
+    re-park) has come in since it was drafted."""
+    if parked_rec is None or parked_rec.type != "adversarial_cycle":
+        return None
+    from gauntlet.engine import escalation_brief as EB
+    from gauntlet.logging.redact import build_redactor
+
+    brief = EB.load_for_step(run_instance_dir, parked_rec.id, parked_rec.iteration)
+    if brief is None:
+        return None
+    redactor = build_redactor(redaction)
+    return EB.status_block(
+        brief,
+        responses_now=len(parked_rec.human_responses or []),
+        redact=lambda text: redactor.redact(text)[0] if isinstance(text, str) else text,
+    )
+
+
 def status_payload(
     man: Manifest,
     driver: DriverInfo,
@@ -2481,6 +2775,7 @@ def status_payload(
     current_step_freshness: float | None = None,
     suspension: dict | None = None,
     gate: dict | None = None,
+    escalation: dict | None = None,
     now: datetime | None = None,
     current_step_timeout_s: float | None = None,
     projection: dict | None = None,
@@ -2651,6 +2946,10 @@ def status_payload(
         # `suspension`), so this serializer stays pure. `None` for every non-gate
         # state — the caller passes it only for a `parked_gate`.
         "gate": gate,
+        # #163 escalation brief: always present, non-null only on a cycle parked
+        # for a response that wrote a brief. Assembled by the I/O-bearing
+        # `compute_escalation_context` in the caller, like `gate`.
+        "escalation": escalation,
         # P6 (plan §4.6): journal ↔ projection agreement. Always present; null
         # when the on-disk manifest matches the journal head (or the run
         # predates the journal). Non-null names the divergence and whether a
