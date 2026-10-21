@@ -48,3 +48,11 @@ apply, so the file reads oldest-first.
 
 - **commit-message.md** (#141 review): retain the updated guidance to aim under
   72 characters while making the enforced 100-character ceiling explicit.
+
+- **operator.md / policy.yaml descriptions** (PRD v1.6, FR-9.8): remote actions
+  are owned by role. In-run agents never push, open, or merge, while the operator
+  (the human or a `/gauntlet-operator` session) is expected to push, open and
+  manage the PR, and merge when the human chooses. §7 no longer says "the human
+  pushes". §8 adds "Publishing is yours", which also tells the operator to hand a
+  judge-denied `gh pr merge` to the human instead of working around it. Policy
+  rule descriptions only; no pattern or `pipeline_step_only` flag changed.
