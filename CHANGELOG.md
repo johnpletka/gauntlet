@@ -6,6 +6,28 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Escalation parks present a proposed fix contract
+
+- **A cycle escalation park now arrives pre-digested** (#163). When an
+  adversarial cycle parks for a human (round budget exhausted with open
+  blockers, a blocker not fixed in its round, a fix that lands in an approved
+  upstream artifact, or a verdict that needs a human), it writes
+  `artifacts/escalation-brief.json`: per open finding, the one-line claim, the
+  residual gap from the latest confirm pass, and each fix round's commit and
+  confirm verdict. `gauntlet status` renders it, `status --json` carries it as
+  the new always-present `escalation` object (additive; `schema_version` stays
+  1), and the web console shows it in the escalation panel.
+- **Optional proposed fix contracts.** Set `fix_contract_agent: <profile>` on an
+  `adversarial_cycle` and the park also carries, per finding, a proposed change,
+  the PRD/plan clause that binds it, an acceptance check, and a recommendation
+  (`fix_in_scope`, `amend_upstream`, or `decline`). The shipped pipelines use the
+  `escalation` profile. The contract is advisory: if drafting fails the brief
+  says why and the cycle parks exactly as before.
+- **The answering re-drive gets the contracts.** On the `resume --response`
+  that answers a brief, the reviewer, triager, and fixer receive the contracts
+  the operator ruled on (as data, after the authoritative decision), so an
+  approved contract is implemented as approved.
+
 ## [1.4.0] - 2026-09-16
 
 Gauntlet 1.4.0 improves recovery when hitting usage limits (better auto-restart,

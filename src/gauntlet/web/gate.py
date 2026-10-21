@@ -100,6 +100,11 @@ class GateView(BaseModel):
     # persisted artifacts by :func:`operator.compute_gate_context`, so the gate is
     # decidable from this view alone (no transcript). None for an escalation park.
     context: dict | None = None
+    # Escalation brief (#163), escalation parks only: per-finding residual gap,
+    # fix history and proposed fix contract — the same redacted block
+    # `status --json` emits (operator.compute_escalation_context). None when the
+    # cycle wrote no brief (e.g. a park from before #163).
+    brief: dict | None = None
 
 
 class DiffView(BaseModel):
@@ -309,12 +314,16 @@ class GateResolver:
                     confidence=v.get("confidence"),
                 )
             )
+        brief = operator.compute_escalation_context(
+            run_dir, rec, redaction=self.store.config.redaction,
+        )
         return GateView(
             slug=slug,
             run_id=rid,
             gate_id=rec.id,
             gate_type="adversarial_cycle",
             kind="escalation",
+            brief=brief,
             notes=rec.notes,
             artifacts=[findings_art, triage_art],
             escalated_finding_ids=fids,
@@ -536,6 +545,26 @@ def handoff_prompt(view: GateView) -> HandoffView:
                 f"target={ef.target_artifact} confidence={ef.confidence}",
                 f"    reasoning: {ef.reasoning}",
             ]
+        if view.brief:
+            lines += ["", "Escalation brief (residual gaps, fix history, proposed contracts):"]
+            for bf in view.brief.get("findings") or []:
+                gap = bf.get("residual_gap") or {}
+                pc = bf.get("proposed_contract") or {}
+                lines.append(
+                    f"- {bf.get('finding_id')}: residual gap "
+                    f"({gap.get('verdict') or 'n/a'}) {gap.get('notes') or ''}"
+                )
+                for e in bf.get("fix_rounds") or []:
+                    lines.append(
+                        f"    round {e.get('round')} fix {(e.get('fix_sha') or '')[:10]}: "
+                        f"{e.get('verdict')} — {e.get('notes')}"
+                    )
+                if pc:
+                    lines.append(
+                        f"    proposed contract [{pc.get('recommendation')}]: "
+                        f"{pc.get('proposed_change')} (grounding: {pc.get('grounding')}; "
+                        f"acceptance: {pc.get('acceptance_check')})"
+                    )
         lines += [
             "",
             "Reconciliation options: (a) amend the named approved artifact "

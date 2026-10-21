@@ -91,3 +91,6 @@ table.findings td, table.audit td { font-size: 13px; }
 .status-allow { background: #ecfdf5; color: #047857; }
 .status-deny  { background: #fef2f2; color: #b91c1c; }
 .status-ask   { background: #fffbeb; color: #b45309; }
+
+/* #163 escalation brief */
+.escalation-brief .brief-item { margin: 0.5rem 0; padding-top: 0.25rem; }

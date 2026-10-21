@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gauntlet/schemas/fix-contract.json",
+  "title": "Proposed fix contracts for an escalation park (#163)",
+  "description": "Output of the optional `fix_contract_agent` on an adversarial_cycle escalation park: one proposed fix contract per open finding, for the human to approve, amend, or reject. Advisory — a contract never unparks a cycle; the operator's `resume --response` is the authority. Every property is required (native --output-schema strict mode).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contracts", "summary"],
+  "properties": {
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "proposed_change", "grounding", "acceptance_check", "recommendation"],
+        "properties": {
+          "finding_id": {"type": "string", "description": "The open finding's id, exactly as given in the brief."},
+          "proposed_change": {"type": "string", "description": "The specific change the next fix round should make — concrete enough to implement, scoped to the finding and its residual gap."},
+          "grounding": {"type": "string", "description": "The approved PRD/plan clause(s) that bind the fix (cite section / FR ids), or 'no binding clause found'. For a decline, why."},
+          "acceptance_check": {"type": "string", "description": "What the confirm pass should verify to call the finding resolved."},
+          "recommendation": {
+            "type": "string",
+            "enum": ["fix_in_scope", "amend_upstream", "decline"],
+            "description": "fix_in_scope: fix it in this cycle; amend_upstream: the fix needs an approved artifact changed by a human first; decline: do not fix (reason in grounding)."
+          }
+        }
+      }
+    },
+    "summary": {"type": "string", "description": "One or two sentences on the overall decision the human owes."}
+  }
+}

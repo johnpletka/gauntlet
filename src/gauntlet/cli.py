@@ -1214,6 +1214,23 @@ def status(
                     pipeline=pipeline, redaction=mgr.config.redaction,
                 )
 
+        # Escalation brief (#163): a cycle parked for a response carries a
+        # per-finding digest + proposed fix contracts, so the operator decides
+        # from this view instead of reconstructing context from raw round files.
+        escalation_ctx = None
+        if (
+            rstate.state == operator.STATE_PARKED_FOR_RESPONSE
+            and rstate.parked is not None
+        ):
+            esc_rec = next(
+                (r for r in man.steps
+                 if operator.render_step_id(r) == rstate.parked.step_id),
+                None,
+            )
+            escalation_ctx = operator.compute_escalation_context(
+                run_instance_dir, esc_rec, redaction=mgr.config.redaction,
+            )
+
         if json_output:
             # A single JSON object on stdout, no interleaved log lines (FR-4.3). A
             # malformed surviving intent is a human-footer anomaly only, so `recon`
@@ -1224,6 +1241,7 @@ def status(
                 current_step_freshness=freshness,
                 suspension=suspension,
                 gate=gate_ctx,
+                escalation=escalation_ctx,
                 now=now,
                 current_step_timeout_s=current_step_timeout_s,
                 projection=view.payload_block(),
@@ -1272,6 +1290,11 @@ def status(
         auto_resume_executor_live=auto_resume_executor_live,
     ):
         typer.echo(line)
+    if escalation_ctx is not None:
+        from gauntlet.engine import escalation_brief
+
+        for line in escalation_brief.render_lines(escalation_ctx, slug=slug):
+            typer.echo(line)
     for line in _plan_preflight_advisory(mgr, man, rstate, pipeline):
         typer.echo(line)
 
