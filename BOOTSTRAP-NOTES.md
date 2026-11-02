@@ -1311,3 +1311,27 @@ genuine engine defects in the first two stages of one live run.
   nondeterminism in diff synthesis, of the same character as the
   `impl-cycle`/`phase-gate` park this tranche carried forward, and the
   assertion was NOT loosened to make it pass.
+
+## 2026-11-01 — #175: cycle re-entry used two different review bases
+
+The operator authorized one focused repair outside `gauntlet run`, with the
+process exception recorded here, full live integration validation, and an
+independent `gauntlet review` before PR creation. The gap is the cycle's own
+re-entry recovery: driving this repair through the affected cycle would expose
+the repair's operator decisions to the same stale-handoff rewind. The scope and
+test plan are in `proposals/issue-175-plan.md`; no approved artifact or judge
+policy was changed.
+
+The regression was reproduced with deterministic adapters and real Git history
+in shared and dedicated worktrees. A response, gate rejection, or plain resume
+could freshly review operator commits and then discard them because the manifest
+still contained an older fix with the same round label. Recovery snapshots were
+lossless, but they did not make the review and fix agree about their baseline.
+
+The repair records HEAD after the clean-handoff bookkeeping flush, independently
+of the full-phase diff base. Forced stale-fix recovery requires a reused review;
+freshly reviewed commits remain in history. Checkpointed fixes still recover if
+the process died before manifest finalization, and replacing an earlier sub-step
+invalidates its downstream checkpoint suffix before a later interruption can
+combine evidence from different reviews. Snapshot-backed partial-edit recovery,
+human gates, and governed-artifact policy remain in force.
