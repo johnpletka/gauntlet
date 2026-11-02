@@ -205,3 +205,33 @@ def test_later_round_flush_keeps_fix_in_regression_diff(cycle_repo):
     assert orch.drive() == M.RUN_DONE
     assert "ROUND-ONE-FIX" in adapters["reviewer"].calls[2]["prompt"]
     assert all(c.handoff_sha == seen[c.round - 1] for c in man.record("cycle").checkpoints)
+
+
+def test_restored_review_handoff_does_not_reuse_dropped_fix(cycle_repo):
+    """HEAD reset to a recorded review handoff no longer contains the fix (F-001)."""
+    repo = cycle_repo
+    seen = {}
+
+    def refix(cwd):
+        seen["fix_base"] = gitops.head_sha(Path(cwd))
+        return writer("src.py", "fixed again\n", {})(cwd)
+
+    adapters = {
+        "reviewer": SeqAdapter(REVIEW(F("F-1")), _transient_exc(), REVIEW(F("F-1")), CONFIRM(CV("F-1"))),
+        "triage": SeqAdapter(V("F-1"), V("F-1")),
+        "builder": SeqAdapter(writer("src.py", "fixed\n", {}), refix),
+    }
+    orch, man = _build_cycle_orch(repo, adapters)
+    assert orch.drive() == M.RUN_PARKED
+    cps = man.record("cycle").checkpoints
+    review_handoff = next(c.handoff_sha for c in cps if c.sub_step == "review")
+    fix_sha = next(c.result_sha for c in cps if c.sub_step == "fix")
+    assert fix_sha != review_handoff
+    git(repo, "reset", "-q", "--hard", review_handoff)
+    assert orch.drive() == M.RUN_DONE
+    assert "checkpoint reuse invalidated" in (man.record("cycle").notes or "")
+    assert len(adapters["reviewer"].calls) == 4
+    assert len(adapters["triage"].calls) == 2
+    assert seen["fix_base"] == review_handoff
+    assert (repo / "src.py").read_text() == "fixed again\n"
+    assert not gitops.is_ancestor(repo, fix_sha, gitops.head_sha(repo))

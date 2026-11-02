@@ -312,7 +312,14 @@ def _sha_guard_ok(ctx: StepContext) -> bool:
         if c.sub_step == "fix" and c.result_sha
     }
     tips.update(c.handoff_sha for c in ctx.record.checkpoints if c.sub_step == "review")
-    return not tips or head in tips
+    if not tips:
+        return True
+    # Membership alone is not enough: HEAD restored to an earlier review handoff
+    # is a recorded tip, yet a later checkpointed fix is no longer on the branch.
+    # Every recorded tip must be in HEAD's ancestry, i.e. HEAD is the newest one.
+    return head in tips and all(
+        t == head or gitops.is_ancestor(ctx.work_root, t, head) for t in tips
+    )
 
 
 def _dirty_expected_at_reentry(ctx: StepContext) -> bool:
