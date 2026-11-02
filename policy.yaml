@@ -28,7 +28,7 @@ deny:
       - '\bgit\s+branch\s+(-D|-M|--delete\s+--force)\b'
 
   - name: gh-pr-merge
-    description: "Merging a PR lands code on a shared base branch — a human ratification step, not an agent action (CLAUDE.md §2: humans ratify, agents propose). Denied even in a chained command so a benign prefix cannot bless it."
+    description: "Merging a PR lands code on a shared base branch. Merging is an operator-role action, taken when the human chooses (FR-9.8 v1.6), and never an in-run agent action. This rule still denies it in EVERY judged context, including the judge-gated interactive monitor, so a judged session cannot merge; the human or an unjudged operator session merges. Whether to narrow it to pipeline steps is PRD Open Question 5. Denied even in a chained command so a benign prefix cannot bless it."
     applies_to_tools: [Bash]
     command_patterns:
       - '\bgh\s+pr\s+merge\b'
@@ -49,7 +49,7 @@ deny:
       - '\bgit\s+push\b[^\n]*refs/heads/(main|master)(\s|$|:)'   # full-ref src or dst
 
   - name: push-or-pr-open-in-pipeline-step
-    description: "FR-9.8 / §2.2 defense-in-depth: a gauntlet pipeline must not autonomously push or open PRs (it drafts PR.md; the human opens it). So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though the operator's own interactive sessions allow them below."
+    description: "FR-9.8 / §2.2 defense in depth: in-run agents never act on the remote. The pipeline drafts PR.md, and the operator role (the human or a /gauntlet-operator session) pushes and opens the PR. So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though operator sessions are allowed them below. The point is containment: an agent reading untrusted content must not be able to turn it into a remote write."
     applies_to_tools: [Bash]
     pipeline_step_only: true
     command_patterns:
@@ -171,13 +171,13 @@ allow:
       - '^\s*git\s+(add|commit(?![^\n]*--amend)|checkout(?![^\n]*-f\b)|switch|fetch|pull(?![^\n]*--force)|merge(?![^\n]*--abort)|restore|tag(?!\s+-d))\b'
 
   - name: git-push
-    description: "Push a feature branch to the remote in an operator (non-pipeline) session. Deny-first rules evaluated above already block the unsafe forms in every context (force-push, history rewrite, remote-branch delete, push to main/master) and block ALL push inside a pipeline step — so this allow only ever covers ordinary feature-branch publishing the operator directed."
+    description: "Push a feature branch to the remote in an operator (non-pipeline) session. Pushing a run or feature branch is an expected operator-role action (FR-9.8 v1.6). Deny-first rules evaluated above already block the unsafe forms in every context (force-push, history rewrite, remote-branch delete, push to main/master) and block ALL push inside a pipeline step, so this allow only ever covers ordinary feature-branch publishing by the operator."
     applies_to_tools: [Bash]
     command_patterns:
       - '^\s*git\s+push\b'
 
   - name: gh-pr-propose-and-read
-    description: "Operator session: open a PR (create) and read PR state (view/list/diff/checks/status). Merging stays denied (gh-pr-merge); `gh pr create` inside a pipeline step is denied (push-or-pr-open-in-pipeline-step) — FR-9.8 keeps PR-opening a human action for the harness while leaving it available to the operator."
+    description: "Operator session: open a PR (create) and read PR state (view/list/diff/checks/status). Opening and managing the PR is the operator role's job (FR-9.8 v1.6); `gh pr create` inside a pipeline step is denied (push-or-pr-open-in-pipeline-step) so in-run agents never open one. Merging is still denied in judged sessions (gh-pr-merge; PRD Open Question 5). Other PR-management verbs (edit/comment/review) are not fast-pathed here and fall through to the LLM classifier."
     applies_to_tools: [Bash]
     command_patterns:
       - '^\s*gh\s+pr\s+(create|view|list|diff|checks|status)\b'
@@ -225,9 +225,10 @@ allow:
         from its own process on every --pr run, so they are blessed explicitly
         here rather than left to the LLM fallback (FR-7.3), under a stable
         id/version the deterministic FR-7.4 preflight verifies before any read
-        runs. Remote-mutating gh/git (push, pr create, pr merge) stay independently
-        denied by the deny-first rules in every context (FR-9.8), so this allow
-        never widens the blast radius. Like every allow rule it is skipped on a
+        runs. Remote-mutating gh/git stay independently denied by the deny-first
+        rules (FR-9.8): push and pr create inside any pipeline step, pr merge in
+        every judged context. So this allow never widens the blast radius of the
+        in-run review agents. Like every allow rule it is skipped on a
         chained/piped/redirected command, so a benign prefix cannot bless a
         dangerous trailing segment."
     applies_to_tools: [ Bash ]

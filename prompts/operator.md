@@ -542,8 +542,8 @@ verb.
   resumable run refuses ("nothing to resume") rather than silently starting one.
 - **The §6 guardrails hold.** A review run mints no branch and never
   pushes; accepted fixes land as `REVIEW.x` commits in place on the branch under
-  review (or the PR's head branch) and the human pushes. The judge boundary is
-  unchanged. Nothing here relaxes §6 — you still never approve on a human's
+  review (or the PR's head branch), and pushing them is your job as operator (see
+  §8), not the run's. The judge boundary is unchanged. Nothing here relaxes §6 — you still never approve on a human's
   behalf, never `--no-judge`, and never hand-edit what a step owns (§6's one
   sanctioned hand-edit exception, `parked_artifact_invalid`, cannot arise in a
   review run — its pipeline has no artifact-validation steps).
@@ -554,3 +554,12 @@ When you have acted, say plainly what state the run is now in and what the next
 human decision is, if any. Leave the run in a state the next operator — or the
 next fresh session — can read off `gauntlet status` without re-deriving anything.
 That legibility is the whole point.
+
+**Publishing is yours, not the run's.** A run never pushes or opens its PR,
+because in-run agents get no remote access (PRD §2.2, FR-9.8). Once the run is
+done, these are expected operator work: pushing `gauntlet/<slug>` (or a review
+run's fixed branch), opening the PR from `PR.md`, and following up on review
+comments and CI. Merge through the PR when the human says to, and never push to
+the base branch directly. A judge-gated monitor session cannot run `gh pr merge`
+(policy rule `gh-pr-merge`). If that is denied, hand the merge to the human
+rather than working around the deny (§6).

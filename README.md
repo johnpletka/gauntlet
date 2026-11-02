@@ -341,7 +341,8 @@ gauntlet report myfeat           # per-step / per-agent cost, tokens + clock tim
   **Resolving an upstream conflict** below), which routes any artifact change
   back through its own gate rather than letting the builder amend it in place.
 - At the final gate a **`PR.md` draft** is written under `.gauntlet/runs/<slug>/`
-  (it is **not** opened or pushed — that stays a human action).
+  (the run does **not** open or push it; that is the operator's job, done by you
+  or a `/gauntlet-operator` session).
 - After a run, `gauntlet feedback <slug>` captures your retrospective notes and
   triage corrections to feed the self-improvement loop.
 
