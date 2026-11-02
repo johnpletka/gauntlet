@@ -570,3 +570,120 @@ def test_regeneration_merges_never_replaces(tmp_path: Path):
     assert props["never-applies"].status == P.INVALID
     # bounded: initial ask + the full retry budget (empty replies never converge)
     assert len(triage.calls) == 1 + R._PROPOSAL_REGEN_RETRIES
+
+
+# --- #169: a failed synthesis has a human exit -------------------------------
+def _redrive_with_response(repo: Path, adapters: dict, man, run_dir: Path, text: str):
+    """Re-drive the run the way `gauntlet resume --response` does: the planned
+    `append` action lands a pending entry on the failed retrospective, which
+    re-arms it for the stage walk."""
+    from gauntlet.engine.orchestrator import ResponseAction
+
+    step = {
+        "id": "retrospective", "type": "retrospective",
+        "agents": ["builder", "reviewer"], "proposer": "triage",
+        "retro_prompt": "prompts/retro.md",
+        "synthesis_prompt": "prompts/proposal-synthesis.md",
+    }
+    pipeline = Pipeline.model_validate(
+        {"name": "demo", "version": 1, "stages": [{"id": "retro", "steps": [step]}]}
+    )
+    orch = Orchestrator(
+        repo_root=repo, run_dir=run_dir, artifact_root=repo,
+        config=RunConfig.model_validate(BASE_CONFIG), pipeline=pipeline,
+        manifest=man, adapter_factory=lambda n: adapters[n],
+        response_action=ResponseAction(
+            kind="append", step_id="retrospective", text=text, user="op@example.com",
+        ),
+    )
+    return orch.drive()
+
+
+def test_retrospective_is_respondable():
+    assert "retrospective" in M.RESPONDABLE_STEP_TYPES
+
+
+def test_failed_synthesis_resumes_with_response_reusing_critiques(tmp_path: Path):
+    """#169 acceptance: a retrospective that failed closed on synthesis is
+    finished by `resume --response` — synthesis re-runs with the note as
+    guidance, and the self-critiques already on disk are NOT re-run."""
+    repo = _retro_repo(tmp_path)
+    status, man, run_dir = _run_retro(repo, _boom_adapters())
+    assert status == M.RUN_FAILED
+    first_critique = (run_dir / "retro" / "retro-builder.md").read_text()
+
+    builder = FakeAdapter(text="must not be asked again")
+    reviewer = FakeAdapter(text="must not be asked again")
+    triage = _adapters(repo)["triage"]
+    status = _redrive_with_response(
+        repo, {"builder": builder, "reviewer": reviewer, "triage": triage},
+        man, run_dir, "keep each diff to one hunk",
+    )
+
+    assert status == M.RUN_DONE
+    rec = man.record("retrospective")
+    assert rec.status == M.DONE
+    assert rec.human_responses[-1].state == M.RESPONSE_CONSUMED
+    assert builder.calls == [] and reviewer.calls == []
+    assert (run_dir / "retro" / "retro-builder.md").read_text() == first_critique
+    assert "2 reused from the prior attempt" in rec.notes
+    first_ask = triage.calls[0]["prompt"]
+    assert "operator guidance (retrospective-resp-1)" in first_ask
+    assert "keep each diff to one hunk" in first_ask
+    assert len(P.list_proposals(run_dir / "retro" / "proposals")) == 2
+
+
+def test_failed_synthesis_with_response_completes_even_if_synthesis_fails_again(
+    tmp_path: Path,
+):
+    """The human decision is the ratification that proposals are advisory for
+    this run: a second synthesis failure is recorded, not a second dead end."""
+    repo = _retro_repo(tmp_path)
+    status, man, run_dir = _run_retro(repo, _boom_adapters())
+    assert status == M.RUN_FAILED
+
+    status = _redrive_with_response(
+        repo, _boom_adapters(), man, run_dir, "finish without proposals"
+    )
+    assert status == M.RUN_DONE
+    rec = man.record("retrospective")
+    assert rec.status == M.DONE
+    assert "proposal synthesis FAILED" in rec.notes
+    assert "accepted without proposals by retrospective-resp-1" in rec.notes
+    assert (run_dir / "retro" / "proposal-synthesis-error.txt").exists()
+
+
+def test_regeneration_failure_keeps_parsed_proposals(tmp_path: Path):
+    """#169: the first synthesis parsed, then the apply-validation re-ask came
+    back malformed. That used to discard the parsed proposals and fail the
+    step; it now stops regenerating and keeps them as evidence."""
+    from gauntlet.adapters.base import MalformedOutputError
+
+    repo = _retro_repo(tmp_path)
+    item = {"slug": "never-applies", "target_path": "prompts/triage.md",
+            "rationale": "stale", "diff": _stale_diff()}
+
+    def malformed_on_reask(adapter, prompt, cwd):
+        if "REJECTED PROPOSALS" in prompt:
+            raise MalformedOutputError(
+                "schema validation failed after 3 attempts: no parseable JSON"
+            )
+
+    triage = FakeAdapter(
+        text="{}", structured={"proposals": [item]}, on_run=malformed_on_reask
+    )
+    adapters = {
+        "builder": FakeAdapter(text="b."),
+        "reviewer": FakeAdapter(text="r."),
+        "triage": triage,
+    }
+    status, man, run_dir = _run_retro(repo, adapters)
+    assert status == M.RUN_DONE
+    assert man.record("retrospective").status == M.DONE
+    [prop] = P.list_proposals(run_dir / "retro" / "proposals")
+    assert prop.slug == "never-applies" and prop.status == P.INVALID
+    # the failed re-ask stopped regeneration: no second regen round was tried
+    err = (run_dir / "retro" / "proposal-regen1-error.txt").read_text()
+    assert "no parseable JSON" in err
+    assert not (run_dir / "retro" / "proposal-regen2-error.txt").exists()
+    assert not any("REJECTED PROPOSALS (attempt 2)" in c["prompt"] for c in triage.calls)

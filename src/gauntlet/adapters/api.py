@@ -4,8 +4,13 @@ Used for classification work that needs no repo access: triage, judge LLM
 fallback, retro summarization, commit messages. Structured output is enforced
 locally — schema embedded in the prompt, response parsed and validated with
 jsonschema, bounded validate-and-retry with error feedback (FR-3.4
-groundwork) — so behavior is identical across providers rather than
-depending on per-provider response_format support.
+groundwork) — so correctness never depends on per-provider response_format
+support. For providers whose API has a native JSON mode (OpenAI/Azure) and a
+model LiteLLM reports accepts ``response_format``, the adapter ALSO asks for
+it as a first net (#169); the local
+parse/validate stays the authority, and a provider that rejects the parameter
+is retried once without it. A near-miss reply (one stray bracket) is repaired
+locally before spending a re-ask, and the repair is recorded in the events.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from gauntlet.adapters._structured import (
-    extract_json,
+    parse_json_output,
     schema_instruction,
     validate_schema,
 )
@@ -30,6 +35,11 @@ from gauntlet.adapters.base import (
 from gauntlet.adapters.failure_markers import classify_api_failure
 
 DEFAULT_TIMEOUT_S = 120.0
+# Providers whose API implements ``response_format: json_object`` natively.
+# LiteLLM also advertises it for others (e.g. Anthropic) by emulating it with a
+# forced tool call, which changes the reply's shape; auto mode stays off there
+# (``json_mode=True`` still forces it).
+_NATIVE_JSON_MODE_PROVIDERS = frozenset({"openai", "azure"})
 
 
 class ApiAdapter:
@@ -51,6 +61,7 @@ class ApiAdapter:
         temperature: float | None = None,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        json_mode: bool | None = None,
     ) -> None:
         self.model = model
         self.max_schema_retries = max_schema_retries
@@ -60,6 +71,11 @@ class ApiAdapter:
         # Reasoning-model latency knob (gpt-5 family): "minimal" turns a
         # multi-second deliberation into a fast classification (notes #26).
         self.reasoning_effort = reasoning_effort
+        # Provider JSON mode for schema-bound calls (#169): None = auto (on when
+        # LiteLLM reports `response_format` support for this model), True/False
+        # force it. Flipped off for this adapter instance if the provider
+        # rejects the parameter, so one unsupported model costs one extra call.
+        self.json_mode = json_mode
 
     def run(
         self,
@@ -102,7 +118,7 @@ class ApiAdapter:
                     }
                 )
             try:
-                response = self._complete(messages)
+                response = self._complete_maybe_json(messages, schema, raw_events)
             except Exception as exc:  # noqa: BLE001 — classify then fail closed
                 # FR-3.1: a LiteLLM RateLimitError (429) / InternalServerError
                 # (overload) is a transient park-and-resume condition, not a step
@@ -120,11 +136,15 @@ class ApiAdapter:
             if schema is None:
                 return self._result(text, None, usage_total, raw_events)
             try:
-                structured = extract_json(text)
+                structured, repairs = parse_json_output(text)
                 validate_schema(structured, schema)
             except ValueError as exc:
                 last_error = str(exc)
                 continue
+            if repairs:
+                # Data over inference: the value we are about to trust was
+                # repaired, so say exactly how next to the raw completion.
+                raw_events.append({"type": "api.json_repaired", "repairs": repairs})
             return self._result(text, structured, usage_total, raw_events)
         raise MalformedOutputError(
             f"schema validation failed after {1 + self.max_schema_retries} "
@@ -136,7 +156,63 @@ class ApiAdapter:
     def _render(prompt: str, schema: dict | None) -> str:
         return prompt + schema_instruction(schema) if schema else prompt
 
-    def _complete(self, messages: list[dict[str, str]]) -> Any:
+    def _wants_json_mode(self, schema: dict | None) -> bool:
+        """Request provider JSON mode for this call?
+
+        Only for an object-rooted schema (``json_object`` mode cannot return a
+        top-level array) and only when forced on, or the provider's JSON mode
+        is native and LiteLLM reports the model accepts ``response_format``.
+        Any lookup failure means "not supported" —
+        the local parse is the authority either way, so the safe default is to
+        leave the request exactly as it was before JSON mode existed.
+        """
+        if schema is None or schema.get("type") != "object" or self.json_mode is False:
+            return False
+        if self.json_mode is True:
+            return True
+        try:
+            import litellm
+
+            provider = litellm.get_llm_provider(self.model)[1]
+            if provider not in _NATIVE_JSON_MODE_PROVIDERS:
+                return False
+            supported = litellm.get_supported_openai_params(
+                model=self.model, custom_llm_provider=provider
+            ) or []
+        except Exception:
+            return False
+        return "response_format" in supported
+
+    def _complete_maybe_json(
+        self, messages: list[dict[str, str]], schema: dict | None,
+        raw_events: list[dict[str, Any]],
+    ) -> Any:
+        """One completion, in provider JSON mode when :meth:`_wants_json_mode`.
+
+        A provider that refuses the parameter itself (not a quota/overload
+        fault — those propagate and park) is recorded, JSON mode is switched
+        off for this adapter instance, and the same call is retried without it.
+        """
+        if not self._wants_json_mode(schema):
+            return self._complete(messages)
+        try:
+            return self._complete(messages, response_format={"type": "json_object"})
+        except Exception as exc:  # noqa: BLE001 — narrowed just below
+            if not _rejects_response_format(exc):
+                raise
+            self.json_mode = False
+            raw_events.append({
+                "type": "api.json_mode_unsupported",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            })
+        return self._complete(messages)
+
+    def _complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_format: dict[str, str] | None = None,
+    ) -> Any:
         import litellm  # deferred: heavy import, only needed on the API path
 
         kwargs: dict[str, Any] = {
@@ -150,6 +226,8 @@ class ApiAdapter:
             kwargs["max_tokens"] = self.max_tokens
         if self.reasoning_effort is not None:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         return litellm.completion(**kwargs)
 
     @staticmethod
@@ -167,6 +245,20 @@ class ApiAdapter:
             raw_events=raw_events,
             exit_code=0,
         )
+
+
+def _rejects_response_format(exc: Exception) -> bool:
+    """True when ``exc`` is the provider refusing the ``response_format`` param.
+
+    Matched narrowly — a bad-request / unsupported-params class whose message
+    names the parameter — so a rate limit, an overload, or an unrelated 400
+    still propagates to the FR-3.1 classifier unchanged.
+    """
+    name = type(exc).__name__
+    if name not in {"BadRequestError", "UnsupportedParamsError", "UnprocessableEntityError"}:
+        return False
+    text = str(exc).lower()
+    return "response_format" in text or "json_object" in text or "json mode" in text
 
 
 def _accumulate_usage(total: Usage, response: Any) -> None:

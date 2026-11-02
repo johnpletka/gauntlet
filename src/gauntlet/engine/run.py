@@ -4321,7 +4321,17 @@ class RunManager:
                     # --response validator will actually accept; a terminally
                     # failed shell step / rejected gate gets the executable
                     # exit (abort) instead of a command that will be refused.
-                    if failed.type in M.RESPONDABLE_STEP_TYPES:
+                    if failed.type == "retrospective":
+                        # #169: the build is complete; only the advisory
+                        # proposal synthesis failed. Say what the response does.
+                        way_out = (
+                            f'Run `gauntlet resume {man.slug} --response "<note>"` '
+                            "to finish it: proposal synthesis is retried once "
+                            "with your note as guidance (the self-critiques "
+                            "already written are kept), and the run completes "
+                            "even if synthesis fails again."
+                        )
+                    elif failed.type in M.RESPONDABLE_STEP_TYPES:
                         way_out = (
                             "If a human decision can unblock it (e.g. "
                             "reclassifying a finding the fixer could not act "
