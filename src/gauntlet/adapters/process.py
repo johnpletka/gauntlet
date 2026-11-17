@@ -27,6 +27,7 @@ import io
 import locale
 import os
 import selectors
+import shutil
 import signal
 import subprocess
 import time
@@ -50,6 +51,48 @@ _FINAL_DRAIN_S = 5.0
 # heartbeat) this constant is unused and behavior is byte-for-byte the historical
 # single-``communicate()`` / uncapped-``select`` path.
 _DEADLINE_POLL_S = 5.0
+
+# Process groups (``getpgid``/``killpg``/``start_new_session``) and
+# ``selectors`` over pipes are POSIX-only. On native Windows the child is put in
+# its own console process group, the "group kill" is a ``taskkill /T`` tree
+# kill, the vanish watchdog can never prove the group empty (so it fails closed
+# and never fires — only the hard wall-clock timeout applies), and a streaming
+# ``sink`` is fed after a buffered run instead of line-by-line.
+_POSIX = os.name == "posix"
+
+# Bound on the Windows ``taskkill /T /F`` tree kill before falling back to
+# killing only the leader.
+_TASKKILL_TIMEOUT_S = 10.0
+
+
+def resolve_argv0(argv: Sequence[str]) -> list[str]:
+    """Resolve a bare executable name to its full path on Windows.
+
+    ``CreateProcess`` only appends ``.exe`` to a bare name, so npm-installed
+    CLIs (``codex.cmd``, possibly ``claude.cmd``) raise ``FileNotFoundError``
+    even though ``shutil.which`` finds them via ``PATHEXT``. Given the full
+    ``.cmd`` path, ``CreateProcess`` runs it through ``cmd.exe``. Callers pass
+    prompts on stdin, never in argv, so cmd re-parsing only sees controlled
+    flags. POSIX, an already-qualified path, or an unresolvable name → unchanged
+    (the spawn then fails exactly as before).
+    """
+    out = list(argv)
+    if _POSIX or not out:
+        return out
+    name = out[0]
+    if os.path.dirname(name):
+        return out
+    resolved = shutil.which(name)
+    if resolved:
+        out[0] = resolved
+    return out
+
+
+def _spawn_isolation_kwargs() -> dict:
+    """Popen kwargs that give the child its own process group, per platform."""
+    if _POSIX:
+        return {"start_new_session": True}
+    return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
 
 # Grace granted to reap a child whose pipes have already hit EOF when the
 # wall-clock budget is exhausted. Pipe EOF is strong evidence the child is
@@ -81,14 +124,17 @@ class ProcessOutput:
     agent_vanished: bool = False
 
 
-def _group_alive(pgid: int) -> bool | None:
+def _group_alive(pgid: int | None) -> bool | None:
     """Probe whether ANY process remains in ``pgid`` (fail-closed tri-state).
 
     ``killpg(pgid, 0)`` delivers no signal; it only reports existence. ``False``
     is the only value that can arm the watchdog, so anything ambiguous —
     a permission error (processes exist but are not ours) or an unexpected OS
-    error — reads as alive/unknowable, never as proof of absence.
+    error — reads as alive/unknowable, never as proof of absence. A ``None``
+    pgid (no POSIX process groups, e.g. native Windows) is always unknowable.
     """
+    if pgid is None or not _POSIX:
+        return None
     try:
         os.killpg(pgid, 0)
         return True
@@ -126,6 +172,14 @@ class _VanishWatch:
         # Detection latency is therefore O(bound), never worse than ~2 polls.
         self.poll_s = max(0.1, min(_DEADLINE_POLL_S, bound_s / 2.0))
         self._clock = clock
+        self.pgid: int | None
+        if not _POSIX:
+            # No POSIX process groups: emptiness is unprovable, so
+            # _group_alive reads None and the watchdog fails closed.
+            self.pgid = None
+            self._last_progress = clock()
+            self._dead_since = None
+            return
         try:
             self.pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
@@ -245,6 +299,17 @@ def run_with_timeout(
     from gauntlet.engine.heartbeat import build_active_deadline
 
     deadline = build_active_deadline(timeout_s)
+    if sink is not None and not _POSIX:
+        # selectors cannot wait on pipes on Windows: run buffered, then hand
+        # the complete lines to the sink. Same result; only the timing of the
+        # sink calls differs (they land after exit rather than live).
+        out = _run_buffered(
+            argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
+            deadline=deadline, preexec_fn=preexec_fn,
+            watchdog_silence_s=watchdog_silence_s,
+        )
+        _replay_lines_to_sink(out.stdout, sink)
+        return out
     if sink is None:
         return _run_buffered(
             argv, timeout_s=timeout_s, stdin_text=stdin_text, cwd=cwd, env=env,
@@ -262,6 +327,23 @@ def run_with_timeout(
         preexec_fn=preexec_fn,
         watchdog_silence_s=watchdog_silence_s,
     )
+
+
+def _replay_lines_to_sink(stdout: str, sink: Callable[[str], None]) -> None:
+    """Feed each complete (newline-terminated) line of ``stdout`` to ``sink``.
+
+    Mirrors the streaming path's framing: a trailing non-terminated segment is
+    never sinked (FR-2.4), and a sink fault is fail-closed (FR-6.2).
+    """
+    for line in stdout.splitlines(keepends=True):
+        if not line.endswith("\n"):
+            break
+        try:
+            sink(line)
+        except Exception as exc:
+            raise StreamSinkError(
+                "streaming sink failed while persisting a line"
+            ) from exc
 
 
 def _run_buffered(
@@ -286,15 +368,16 @@ def _run_buffered(
     """
     start = time.monotonic()
     proc = subprocess.Popen(
-        list(argv),
+        resolve_argv0(argv),
         stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
         env=dict(env) if env is not None else None,
         text=True,
-        start_new_session=True,  # own process group, so killpg reaps children
         preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
+        # own process group, so the group kill reaps children
+        **_spawn_isolation_kwargs(),
     )
     watch = _build_vanish_watch(proc, watchdog_silence_s)
     if deadline is None and watch is None:
@@ -451,15 +534,15 @@ def _run_streaming(
     use_stdin = stdin_text is not None
 
     proc = subprocess.Popen(
-        list(argv),
+        resolve_argv0(argv),
         stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
         env=dict(env) if env is not None else None,
         bufsize=0,  # raw binary pipes; we frame + decode ourselves
-        start_new_session=True,
         preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
+        **_spawn_isolation_kwargs(),
     )
 
     # Raw byte buffers, maintained independently of the line sink: every byte
@@ -683,7 +766,33 @@ def _decode_like_text_mode(raw: bytearray, enc: str) -> str:
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
+    if not _POSIX:
+        _kill_process_tree_windows(proc)
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         proc.kill()
+
+
+def _kill_process_tree_windows(proc: subprocess.Popen) -> None:
+    """Windows group kill: ``taskkill /T /F`` reaps the child's whole tree.
+
+    Agent CLIs spawn workers (often via a ``.cmd`` shim), so killing only the
+    leader would orphan them. The leader is always killed as a backstop.
+    """
+    if proc.poll() is None:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_TASKKILL_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
