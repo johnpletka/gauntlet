@@ -26,6 +26,7 @@ Three layers, all pure:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -3200,7 +3201,16 @@ def read_log_chunk(path: Path, offset: int, max_bytes: int) -> LogChunkBytes:
     (``OSError``/``ELOOP``, fail-closed; FR-3.3), and ``fstat`` reads the same
     inode the open returned, so there is no second path lookup to race.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        # Native Windows has no O_NOFOLLOW. Refuse a symlink leaf up front
+        # (same fail-closed ELOOP the POSIX open raises); the residual swap
+        # window needs symlink-create privilege, which Windows withholds by
+        # default.
+        if os.path.islink(path):
+            raise OSError(errno.ELOOP, "refusing to follow a symlink", str(path))
+        nofollow = 0
+    fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_BINARY", 0))
     with os.fdopen(fd, "rb") as fh:
         size = os.fstat(fh.fileno()).st_size
         start = max(0, offset)
@@ -3209,9 +3219,12 @@ def read_log_chunk(path: Path, offset: int, max_bytes: int) -> LogChunkBytes:
         fh.seek(start)
         raw = fh.read(max_bytes)
     end = start + len(raw)
-    return LogChunkBytes(
-        text=raw.decode("utf-8", errors="replace"), start=start, end=end, size=size
-    )
+    text = raw.decode("utf-8", errors="replace")
+    if os.name == "nt":
+        # Logs written in text mode carry CRLF on Windows; offsets stay byte
+        # offsets, but the returned text matches POSIX (LF only).
+        text = text.replace("\r\n", "\n")
+    return LogChunkBytes(text=text, start=start, end=end, size=size)
 
 
 @dataclass

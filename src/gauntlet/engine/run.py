@@ -499,7 +499,8 @@ def _atomic_write_durable(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as fh:
+        # UTF-8 + LF on every platform (completion.json is compared by the journal).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())

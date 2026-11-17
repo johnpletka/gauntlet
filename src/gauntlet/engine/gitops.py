@@ -229,16 +229,25 @@ def _run(
     repo: Path, *args: str, stdin: str | None = None, _env: dict[str, str] | None = None
 ) -> str:
     argv = ["git", "-C", str(repo), *args]
+    # Bytes in, explicit UTF-8 — not ``text=True``. Text mode on native Windows
+    # rewrites every ``\n`` written to stdin as ``\r\n`` (``update-ref --stdin``
+    # then rejects the line: "extra input: \r") and encodes with the locale
+    # code page, so ``hash-object --stdin`` would store different bytes per
+    # platform. Output keeps text mode's universal-newline semantics.
     proc = subprocess.run(
         argv,
-        input=stdin,
+        input=None if stdin is None else stdin.encode("utf-8"),
         capture_output=True,
-        text=True,
         env=_env,
     )
     if proc.returncode != 0:
-        raise GitError(list(args), proc.returncode, proc.stderr)
-    return proc.stdout
+        raise GitError(list(args), proc.returncode, _decode_git_text(proc.stderr))
+    return _decode_git_text(proc.stdout)
+
+
+def _decode_git_text(raw: bytes) -> str:
+    """Decode git output as ``text=True`` did on POSIX: UTF-8, universal newlines."""
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _run_bytes(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
@@ -1908,11 +1917,13 @@ def apply_patch_error(repo: Path, patch: str) -> str | None:
     act on. Side-effect-free (``--check``)."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "apply", "--check", "-"],
-        input=patch, capture_output=True, text=True,
+        # Bytes, not text=True: Windows text mode would CRLF every patch line.
+        input=patch.encode("utf-8"), capture_output=True,
     )
     if proc.returncode == 0:
         return None
-    return (proc.stderr or proc.stdout).strip() or f"git apply --check exited {proc.returncode}"
+    err = _decode_git_text(proc.stderr) or _decode_git_text(proc.stdout)
+    return err.strip() or f"git apply --check exited {proc.returncode}"
 
 
 def apply_patch(repo: Path, patch: str) -> None:
