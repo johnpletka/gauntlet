@@ -241,7 +241,12 @@ def _run(
         env=_env,
     )
     if proc.returncode != 0:
-        raise GitError(list(args), proc.returncode, _decode_git_text(proc.stderr))
+        # git reports some failures (e.g. "nothing to commit") on stdout only;
+        # an empty stderr would otherwise yield a reason-less manifest note.
+        raise GitError(
+            list(args), proc.returncode,
+            _decode_git_text(proc.stderr) or _decode_git_text(proc.stdout),
+        )
     return _decode_git_text(proc.stdout)
 
 
