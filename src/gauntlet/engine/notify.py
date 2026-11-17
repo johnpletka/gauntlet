@@ -51,8 +51,12 @@ from typing import TYPE_CHECKING, Any
 
 try:
     import fcntl
-except ImportError:  # non-POSIX: notifications still work; ledger de-dup is best-effort
+except ImportError:  # non-POSIX: msvcrt below, else de-dup is best-effort
     fcntl = None
+try:
+    import msvcrt  # native Windows byte-range locks for the delivery lock
+except ImportError:
+    msvcrt = None
 
 import httpx
 from pydantic import BaseModel, Field
@@ -565,6 +569,13 @@ class DesktopChannel:
         tn = shutil.which("terminal-notifier")
         if tn:
             return [tn, "-title", note.title, "-message", note.body, "-open", note.url]
+        if os.name == "nt":
+            # Native Windows has neither notifier: raise a toast through the
+            # WinRT API that ships with Windows PowerShell. The script is a
+            # constant; title/body travel only in env vars (see ``send``) and
+            # are XML-escaped inside it, so note text can never inject script.
+            ps = shutil.which("powershell") or "powershell"
+            return [ps, "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_TOAST_PS]
         # AppleScript fallback: `display notification "<body>" with title "<title>"`.
         script = (
             f'display notification {_osa_quote(note.body)} '
@@ -573,12 +584,38 @@ class DesktopChannel:
         return ["osascript", "-e", script]
 
     def send(self, note: Notification) -> None:
+        env = None
+        if os.name == "nt":
+            env = {
+                **os.environ,
+                "GAUNTLET_TOAST_TITLE": note.title,
+                "GAUNTLET_TOAST_BODY": note.body,
+            }
         subprocess.run(  # noqa: S603 - fixed argv, no shell
             self._command(note),
             timeout=self.timeout,
             check=True,
             capture_output=True,
+            env=env,
         )
+
+
+# Constant script (no interpolation); reads the note from the environment.
+_WINDOWS_TOAST_PS = (
+    "$ErrorActionPreference='Stop';"
+    "[void][Windows.UI.Notifications.ToastNotificationManager,"
+    "Windows.UI.Notifications,ContentType=WindowsRuntime];"
+    "[void][Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,"
+    "ContentType=WindowsRuntime];"
+    "$t=[Security.SecurityElement]::Escape($env:GAUNTLET_TOAST_TITLE);"
+    "$b=[Security.SecurityElement]::Escape($env:GAUNTLET_TOAST_BODY);"
+    "$x=New-Object Windows.Data.Xml.Dom.XmlDocument;"
+    "$x.LoadXml(\"<toast><visual><binding template='ToastGeneric'>"
+    "<text>$t</text><text>$b</text></binding></visual></toast>\");"
+    "$app='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app)"
+    ".Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+)
 
 
 def _osa_quote(value: str) -> str:
@@ -778,25 +815,34 @@ class NotificationLedger:
     @contextmanager
     def delivery_lock(self, channel: str):
         """Serialize check/send/ack across driver and console, with a bound."""
-        if fcntl is None:
+        if fcntl is None and msvcrt is None:
             yield
             return
         suffix = hashlib.sha256(channel.encode()).hexdigest()[:12]
         path = self.path.with_name(f"{self.path.name}.{suffix}.lock")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("a")
+            handle = path.open("a+")
         except OSError:
             # Broken ledger storage must not suppress the notification.
             yield
             return
+        locked_windows = False
         try:
             deadline = time.monotonic() + 6
             while True:
                 try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fcntl is not None:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        # Native Windows: a non-blocking exclusive lock on
+                        # byte 0 (msvcrt locks from the current position).
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        locked_windows = True
                     break
-                except BlockingIOError:
+                except (BlockingIOError, PermissionError):
+                    # PermissionError is how Windows reports "held elsewhere".
                     if time.monotonic() >= deadline:
                         raise TimeoutError("notification delivery lock timed out")
                     time.sleep(0.02)
@@ -807,6 +853,12 @@ class NotificationLedger:
                     return
             yield
         finally:
+            if locked_windows:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
             handle.close()
 
     def append(self, key: Key, *, kind: str, channels: list[str], by: str) -> None:

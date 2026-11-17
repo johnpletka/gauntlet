@@ -468,6 +468,24 @@ def build_active_deadline(timeout_s: float) -> SuspendAwareDeadline | None:
     )
 
 
+def _replace_with_retry(src: str, dst: Path, *, attempts: int = 10,
+                        delay_s: float = 0.05) -> None:
+    """``os.replace`` that tolerates a momentary reader on native Windows.
+
+    Windows refuses to replace a file another process has open (``status``,
+    the console) with ``PermissionError``; POSIX never does. Retry briefly,
+    then re-raise so the caller's cleanup still runs.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
+
 class HeartbeatWriter:
     """A daemon thread that writes ``heartbeat.json`` and detects suspensions.
 
@@ -547,7 +565,13 @@ class HeartbeatWriter:
     # -- internals ------------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.wait(self.interval_s):
-            self._write_sample()
+            try:
+                self._write_sample()
+            except OSError:
+                # One failed write (e.g. a reader holding the file on Windows)
+                # must not end liveness for the rest of the drive: the next
+                # tick writes again. The first sample in `start` still raises.
+                continue
 
     def _write_sample(self) -> None:
         sample = HeartbeatSample(
@@ -595,11 +619,11 @@ class HeartbeatWriter:
         payload = json.dumps(sample.to_dict(), indent=2)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".hb-", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(payload)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            _replace_with_retry(tmp, self.path)
         except BaseException:
             try:
                 os.unlink(tmp)

@@ -935,3 +935,19 @@ def test_make_scratch_home_seeds_only_the_claude_login_surface(tmp_path, monkeyp
         assert not (scratch / hidden).exists(), hidden
     # idempotent (resume-safe)
     assert verify.make_scratch_home(tmp_path / "sandbox") == scratch
+
+
+def test_sandbox_env_keeps_windows_process_essentials_but_no_secrets():
+    """Without SYSTEMROOT a Windows child cannot load Winsock (`import asyncio`
+    -> WinError 10106), which failed pytest enumeration closed."""
+    from gauntlet.engine.verify import build_sandbox_env
+
+    base = {
+        "SYSTEMROOT": r"C:\Windows", "COMSPEC": r"C:\Windows\system32\cmd.exe",
+        "PATHEXT": ".COM;.EXE", "USERPROFILE": r"C:\Users\u",
+        "OPENAI_API_KEY": "sk-x", "GH_TOKEN": "t",
+    }
+    env = build_sandbox_env(base)
+    for key in ("SYSTEMROOT", "COMSPEC", "PATHEXT", "USERPROFILE"):
+        assert env[key] == base[key]
+    assert "OPENAI_API_KEY" not in env and "GH_TOKEN" not in env

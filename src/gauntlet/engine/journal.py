@@ -136,7 +136,15 @@ def _fsync_dir(path: Path, *, strict: bool = False) -> None:
     inverse of fail-closed, post-P6 review F-006). Optional evidence writes
     (audit events, quarantine renames) stay best-effort by contract: they must
     never prevent a finalization (plan §9).
+
+    Native Windows has no directory-fsync primitive: ``os.open`` on a directory
+    always fails (``EACCES``), so ``strict`` would refuse every authoritative
+    write and no run could ever start or abort. NTFS journals directory
+    metadata itself, and the file's own ``fsync`` before the ``os.replace``
+    still holds, so the directory flush is skipped there rather than failed.
     """
+    if os.name == "nt":
+        return
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError as exc:
@@ -167,7 +175,7 @@ def _write_new_file_atomic(path: Path, text: str, *, strict: bool = True) -> Non
     """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".evt-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -190,7 +198,7 @@ def _write_projection(path: Path, text: str) -> None:
     """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -231,7 +239,7 @@ def _observed_head_sha(start: Path) -> str | None:
                 if not text.startswith("gitdir:"):
                     return None
                 git_dir = (candidate / text.split(":", 1)[1].strip()).resolve()
-            head = (git_dir / "HEAD").read_text().strip()
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
             if not head.startswith("ref:"):
                 return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
             ref = head.split(":", 1)[1].strip()
@@ -294,7 +302,7 @@ def _parse_event(path: Path) -> dict | None:
     if not match:
         return None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -431,7 +439,7 @@ def evidence_fingerprint(projection_path: Path) -> str:
     the executor re-verifies under the lock before mutating anything.
     """
     try:
-        return _sha256_text(projection_path.read_text())
+        return _sha256_text(projection_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError:
@@ -797,7 +805,7 @@ def _completion_state(
     operator can act on from a read-only surface.
     """
     try:
-        completed = (run_dir / "completion.json").read_text()
+        completed = (run_dir / "completion.json").read_text(encoding="utf-8")
     except OSError:
         return None
     if not _valid_state(completed, validate):
@@ -847,7 +855,7 @@ def bootstrap_state(
     """
     legacy_path = run_dir / "manifest.json"
     try:
-        text: str | None = legacy_path.read_text()
+        text: str | None = legacy_path.read_text(encoding="utf-8")
     except (FileNotFoundError, NotADirectoryError):
         text = None
     if text is not None and superseded is not None and text == superseded:
@@ -893,7 +901,7 @@ def superseded_import(run_dir: Path, head_event: dict | None) -> str | None:
         return None
     text = head_event.get("state_json")
     try:
-        current: str | None = (run_dir / "completion.json").read_text()
+        current: str | None = (run_dir / "completion.json").read_text(encoding="utf-8")
     except OSError:
         current = None
     return None if current == text else text
@@ -1034,7 +1042,7 @@ def projection_status(
         head = _Head(event=None, path=None, notes=notes)
 
     try:
-        on_disk: str | None = manifest_path.read_text()
+        on_disk: str | None = manifest_path.read_text(encoding="utf-8")
     except (FileNotFoundError, NotADirectoryError):
         on_disk = None
     except OSError as exc:
@@ -1181,7 +1189,7 @@ def reconcile_projection(
                 text = genesis["state_json"]
                 preserved_as = None
                 try:
-                    on_disk: str | None = manifest_path.read_text()
+                    on_disk: str | None = manifest_path.read_text(encoding="utf-8")
                 except (FileNotFoundError, NotADirectoryError):
                     on_disk = None
                 if on_disk is not None and on_disk != text:
@@ -1261,7 +1269,7 @@ def reconcile_projection(
         # (a migrated run resets onto a PRE-genesis committed manifest, which
         # no journal event can match), so treating it as the newest authority
         # would reintroduce exactly the loss this phase removes.
-        text = manifest_path.read_text()
+        text = manifest_path.read_text(encoding="utf-8")
         preserved = manifest_path.with_name(
             unjournaled_preserved_name(status.head_seq, text)
         )

@@ -2895,9 +2895,26 @@ def step_log_dir(ctx: StepContext) -> Path:
     return ctx.steps_dir() / leaf
 
 
+_WINDOWS_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"|?*]')
+
+
+def _portable_log_component(name: str) -> str:
+    """A step-log directory name that native Windows can create.
+
+    Panel finding ids are namespaced ``<member>:<id>`` (cycle.py), and ``:`` is
+    illegal in a Windows file name (``WinError 267``), so every triage leaf
+    failed there. POSIX names are left byte-identical; readers enumerate these
+    dirs and take the finding id from ``verdict.json``, not the dir name.
+    """
+    if os.name != "nt":
+        return name
+    return _WINDOWS_ILLEGAL_NAME_CHARS.sub("_", name)
+
+
 def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
     """FR-4 logger for this step (or a sub-step, e.g. a cycle round's review)."""
-    return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
+    parts = [_portable_log_component(s) for s in subdir]
+    return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*parts))
 
 
 def open_step_stream(ctx: StepContext, adapter, logger: StepLogger, *, suffix: str = ""):

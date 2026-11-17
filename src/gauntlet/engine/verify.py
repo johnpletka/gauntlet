@@ -108,6 +108,15 @@ ENV_ALLOWLIST: frozenset[str] = frozenset(
         # and node/uv locators so a real `uv run pytest`/build resolves toolchains.
         "CLAUDE_CONFIG_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_PATH", "NVM_DIR", "UV_CACHE_DIR",
+        # Native Windows process essentials. Without SYSTEMROOT a child cannot
+        # load Winsock (`import asyncio` -> WinError 10106), so pytest
+        # enumeration and the verifier both fail closed. USERPROFILE/APPDATA/
+        # LOCALAPPDATA are Windows' HOME equivalents (CLI login, uv cache).
+        # os.environ is case-insensitive on Windows, so upper-case names match.
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE",
+        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+        "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+        "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
     }
 )
 
