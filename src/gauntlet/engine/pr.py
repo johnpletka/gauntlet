@@ -4,9 +4,10 @@ When a run reaches DONE, Gauntlet *drafts* (never opens) a PR description into
 ``runs/<slug>/PR.md``: the PRD summary, the per-phase commit list including fix
 rounds, links to the run transcripts, and the final per-finding verdicts from
 the last confirm pass. The run itself never pushes or opens the PR: in-run
-agents get no remote access (PRD §2.2, FR-9.8). Pushing, opening, and managing
-the PR belong to the operator role, meaning the human or a `/gauntlet-operator`
-session working for them, which uses this artifact as the PR description.
+agents cannot push, create, or merge PRs (PRD §2.2, FR-9.8). Pushing, opening,
+and managing the PR belong to the operator role, meaning the human or a
+`/gauntlet-operator` session working for them, which uses this artifact as the
+PR description.
 """
 
 from __future__ import annotations

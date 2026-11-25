@@ -56,3 +56,8 @@ apply, so the file reads oldest-first.
   pushes". §8 adds "Publishing is yours", which also tells the operator to hand a
   judge-denied `gh pr merge` to the human instead of working around it. Policy
   rule descriptions only; no pattern or `pipeline_step_only` flag changed.
+
+- **operator.md / policy.yaml descriptions** (PR #173, F-001): narrow the
+  enforced boundary to pushing, PR creation, and merging. Remote reads remain
+  permitted; other PR-management writes reach the LLM classifier in both roles.
+  PRD Open Question 6 tracks broader remote-write enforcement separately.

@@ -49,7 +49,7 @@ deny:
       - '\bgit\s+push\b[^\n]*refs/heads/(main|master)(\s|$|:)'   # full-ref src or dst
 
   - name: push-or-pr-open-in-pipeline-step
-    description: "FR-9.8 / §2.2 defense in depth: in-run agents never act on the remote. The pipeline drafts PR.md, and the operator role (the human or a /gauntlet-operator session) pushes and opens the PR. So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though operator sessions are allowed them below. The point is containment: an agent reading untrusted content must not be able to turn it into a remote write."
+    description: "FR-9.8 / §2.2 defense in depth: in-run agents cannot push or create PRs. The pipeline drafts PR.md, and the operator role (the human or a /gauntlet-operator session) pushes and opens the PR. So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though operator sessions are allowed them below. This contains those remote writes; remote reads remain permitted, and other PR-management writes reach the LLM classifier without role-specific enforcement (PRD Open Question 6)."
     applies_to_tools: [Bash]
     pipeline_step_only: true
     command_patterns:

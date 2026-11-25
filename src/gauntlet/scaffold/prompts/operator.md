@@ -556,9 +556,12 @@ next fresh session — can read off `gauntlet status` without re-deriving anythi
 That legibility is the whole point.
 
 **Publishing is yours, not the run's.** A run never pushes or opens its PR,
-because in-run agents get no remote access (PRD §2.2, FR-9.8). Once the run is
-done, these are expected operator work: pushing `gauntlet/<slug>` (or a review
-run's fixed branch), opening the PR from `PR.md`, and following up on review
+and the judge denies in-run `git push`, `gh pr create`, and `gh pr merge`
+(PRD §2.2, FR-9.8). Remote reads remain permitted; other PR-management writes
+reach the LLM classifier in both roles, without a role-specific deny (PRD Open
+Question 6). Once the run is done, these are expected operator work: pushing
+`gauntlet/<slug>` (or a review run's fixed branch), opening the PR from `PR.md`,
+and following up on review
 comments and CI. Merge through the PR when the human says to, and never push to
 the base branch directly. A judge-gated monitor session cannot run `gh pr merge`
 (policy rule `gh-pr-merge`). If that is denied, hand the merge to the human
