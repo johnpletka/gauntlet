@@ -620,8 +620,8 @@ def run_bookkeeping_excludes(
 
     ``PR.md`` (FR-9.8) IS listed — for EVERY slug under the run root, as a
     ``<run_root>/*/PR.md`` exclude glob (PR #75 review): it is engine-drafted at
-    final-gate pass but must never be auto-committed or pushed — opening the PR
-    stays a human action (PRD §2.2). A completed sibling run's PR.md therefore
+    final-gate pass but must never be auto-committed or pushed by the run —
+    opening the PR is the operator role's job (PRD §2.2). A completed sibling run's PR.md therefore
     legitimately sits uncommitted while the next run drives; scoping the exclude
     to only the current slug made that pending file read as dirt to the next
     run's clean-handoff checks and let commit steps sweep it into a machine

@@ -6,6 +6,15 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- PRD v1.6 revises §2.2 and FR-9.8 so remote actions are owned by role: in-run
+  agents never push, open, or merge a PR, while the operator (you, or a
+  `/gauntlet-operator` session) is expected to push, open and manage the PR, and
+  merge it when you choose. Also updated: the `policy.yaml` rule descriptions,
+  the operator playbook, the README, and the `PR.md` banner. No judge rule
+  changed; whether a judged operator session may merge is PRD Open Question 5.
+
 ## [1.4.0] - 2026-09-16
 
 Gauntlet 1.4.0 improves recovery when hitting usage limits (better auto-restart,
