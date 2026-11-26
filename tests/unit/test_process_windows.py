@@ -149,15 +149,22 @@ def test_windows_real_watchdog_run_and_timeout_tree_kill():
 
 
 def test_resolve_argv0_uses_which_off_posix(non_posix, monkeypatch):
-    monkeypatch.setattr(process.shutil, "which", lambda n: rf"C:\bin\{n}.CMD")
+    monkeypatch.setattr(process.shutil, "which", lambda n, path=None: rf"C:\bin\{n}.exe")
     assert process.resolve_argv0(["codex", "exec", "-"]) == [
-        r"C:\bin\codex.CMD", "exec", "-"]
+        r"C:\bin\codex.exe", "exec", "-"]
+
+
+def test_resolve_argv0_resolved_batch_file_is_quoted_not_listed(non_posix, monkeypatch):
+    # A resolved .cmd that is not an npm shim is launched as a quoted command
+    # line (a string), never as a bare list cmd.exe would re-parse.
+    monkeypatch.setattr(process.shutil, "which", lambda n, path=None: rf"C:\bin\{n}.CMD")
+    assert process.resolve_argv0(["codex", "exec", "-"]) == r"C:\bin\codex.CMD exec -"
 
 
 def test_resolve_argv0_leaves_qualified_and_unknown_names(non_posix, monkeypatch):
-    monkeypatch.setattr(process.shutil, "which", lambda n: None)
+    monkeypatch.setattr(process.shutil, "which", lambda n, path=None: None)
     assert process.resolve_argv0(["nope", "x"]) == ["nope", "x"]
-    assert process.resolve_argv0([r"C:\t\codex.cmd"]) == [r"C:\t\codex.cmd"]
+    assert process.resolve_argv0([r"C:\t\codex.exe"]) == [r"C:\t\codex.exe"]
     assert process.resolve_argv0([]) == []
 
 
