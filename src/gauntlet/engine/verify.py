@@ -315,7 +315,9 @@ def verifier_env(
     # still finds its login via CLAUDE_CONFIG_DIR, pinned to the real config
     # dir (which remains the one credential the CLI itself must hold).
     if scratch_home is not None:
-        real_home = env.get("HOME") or os.environ.get("HOME") or ""
+        # Native Windows usually has no HOME; its home is USERPROFILE.
+        real_home = (env.get("HOME") or os.environ.get("HOME")
+                     or env.get("USERPROFILE") or os.environ.get("USERPROFILE") or "")
         if "CLAUDE_CONFIG_DIR" not in env and real_home:
             env["CLAUDE_CONFIG_DIR"] = str(Path(real_home) / ".claude")
         # Offline toolchain provisioning (#69): the disposable copy has no `.venv`
@@ -325,14 +327,50 @@ def verifier_env(
         # offline so it provisions a fresh venv INSIDE the copy from cache only (no
         # network — the deny stands; a cache miss fails fast instead of hanging).
         # The venv lives in the throwaway copy; the real one is never touched.
-        uv_cache = os.environ.get("UV_CACHE_DIR") or (
-            str(Path(real_home) / ".cache" / "uv") if real_home else ""
-        )
+        uv_cache = os.environ.get("UV_CACHE_DIR") or _default_uv_cache(env, real_home)
         if uv_cache:
             env["UV_CACHE_DIR"] = uv_cache
         env["UV_OFFLINE"] = "1"
         env["HOME"] = str(scratch_home)
+        _repoint_windows_home(env, scratch_home)
     return env
+
+
+def _default_uv_cache(env: dict[str, str], real_home: str) -> str:
+    """uv's default cache dir on this platform (read before HOME is repointed)."""
+    local = env.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        return str(Path(local) / "uv" / "cache")
+    return str(Path(real_home) / ".cache" / "uv") if real_home else ""
+
+
+# Windows' HOME equivalents. Node's os.homedir(), Python's Path.home(), gh and
+# the AWS CLI read these, NOT HOME, so the F-006 scratch-HOME isolation must
+# repoint them too or an un-hooked child reads %USERPROFILE%\.ssh / .aws and
+# %APPDATA%\GitHub CLI (#178 second-round review).
+_WINDOWS_HOME_DIRS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("USERPROFILE", ()),
+    ("APPDATA", ("AppData", "Roaming")),
+    ("LOCALAPPDATA", ("AppData", "Local")),
+)
+
+
+def _repoint_windows_home(env: dict[str, str], scratch_home: Path) -> None:
+    """Point the Windows home variables PRESENT in ``env`` at the scratch home.
+
+    Only variables already present are touched, so a POSIX environment (which
+    has none of them) is unchanged. The claude login and uv cache were pinned
+    from the real profile above, before this repoint.
+    """
+    for var, parts in _WINDOWS_HOME_DIRS:
+        if var in env:
+            target = Path(scratch_home, *parts)
+            target.mkdir(parents=True, exist_ok=True)
+            env[var] = str(target)
+    if "HOMEDRIVE" in env or "HOMEPATH" in env:
+        drive, rest = os.path.splitdrive(str(scratch_home))
+        env["HOMEDRIVE"] = drive
+        env["HOMEPATH"] = rest or os.sep
 
 
 # --- sandbox backend (claude-code + judge hook) ----------------------------------

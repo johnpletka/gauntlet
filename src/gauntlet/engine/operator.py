@@ -3062,7 +3062,13 @@ def _select_logs_step(
         raise _unknown()
     # A non-existent sub-dir is an unknown leaf (exit 1), distinct from an
     # existing dir with no transcript.
-    sub = step_dir_for(run_instance_dir, rec).joinpath(*segments[1:])
+    # Map the selector exactly as the writer named the dirs (Windows escapes
+    # `:` in panel finding ids; a no-op on POSIX).
+    from gauntlet.engine.steptypes import portable_log_component
+
+    sub = step_dir_for(run_instance_dir, rec).joinpath(
+        *(portable_log_component(s) for s in segments[1:])
+    )
     if not sub.is_dir():
         raise _unknown()
     return rec, sub

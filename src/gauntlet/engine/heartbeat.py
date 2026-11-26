@@ -579,7 +579,13 @@ class HeartbeatWriter:
             wallclock_utc=format_wallclock(self._wall()),
             pid=self._pid,
         )
-        self._persist(sample)
+        # Suspension detection compares consecutive clock OBSERVATIONS, not
+        # consecutive successful writes (#178 review F-004). Were `_prev`
+        # advanced only after a successful write, a run of failed writes (which
+        # `_loop` survives) would make the next success compare against a stale
+        # sample and credit the elapsed wall time as a host suspension,
+        # stretching the FR-3.3 hard timeout. So: observe, detect, THEN persist —
+        # a genuine suspension is still recorded even if this tick's write fails.
         with self._lock:
             prev = self._prev
             self._prev = sample
@@ -594,6 +600,7 @@ class HeartbeatWriter:
                 # Persist promptly so live `status` and a crash both see it
                 # (FR-5.1/5.3), independent of the drive's manifest drain.
                 self._append_suspension_log(interval)
+        self._persist(sample)
 
     def _append_suspension_log(self, interval: "Suspension") -> None:
         """Append a detected interval to the run-safe log (best-effort, FR-5.1).

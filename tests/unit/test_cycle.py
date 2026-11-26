@@ -3062,3 +3062,21 @@ def test_git_error_falls_back_to_stdout_when_stderr_is_empty(tmp_path):
         G._run(tmp_path, "-c", "user.name=t", "-c", "user.email=t@t",
                "commit", "-m", "x")
     assert "nothing to commit" in str(exc.value)
+
+
+def test_portable_log_component_is_injective_on_windows(monkeypatch):
+    """#178 second-round review: `a:F-1` and `a_F-1` must not share a dir (one
+    verdict would overwrite the other); reserved device names and a trailing
+    dot are escaped too. POSIX is identity."""
+    from gauntlet.engine import steptypes
+
+    assert steptypes.portable_log_component("a:F-1") == "a:F-1"
+    monkeypatch.setattr(steptypes.os, "name", "nt")
+    enc = steptypes.portable_log_component
+    names = ["a:F-1", "a_F-1", "a%3AF-1", "CON", "con.txt", "x."]
+    encoded = [enc(n) for n in names]
+    assert len(set(encoded)) == len(names)
+    assert encoded[0] == "a%3AF-1" and encoded[2] == "a%253AF-1"
+    assert encoded[3] == "%43ON" and encoded[5] == "x%2E"
+    for e in encoded:
+        assert not any(c in e for c in '<>:"|?*')

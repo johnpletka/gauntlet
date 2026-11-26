@@ -26,14 +26,16 @@ from __future__ import annotations
 import io
 import locale
 import os
+import re
 import selectors
 import shutil
 import signal
 import subprocess
 import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 # Read chunk for the streaming reader. Larger than a typical pipe buffer so a
 # single ready stdout/stderr fd is drained in as few syscalls as possible.
@@ -54,10 +56,12 @@ _DEADLINE_POLL_S = 5.0
 
 # Process groups (``getpgid``/``killpg``/``start_new_session``) and
 # ``selectors`` over pipes are POSIX-only. On native Windows the child is put in
-# its own console process group, the "group kill" is a ``taskkill /T`` tree
-# kill, the vanish watchdog can never prove the group empty (so it fails closed
-# and never fires — only the hard wall-clock timeout applies), and a streaming
-# ``sink`` is fed after a buffered run instead of line-by-line.
+# its own console process group and (best effort) its own Job Object, the
+# "group kill" terminates that job and runs a ``taskkill /T`` tree kill, the
+# post-kill drain is bounded, the vanish watchdog can never prove the group
+# empty (so it fails closed and never fires — the hard wall-clock timeout plus
+# the bounded drain keep the step finite), and a streaming ``sink`` is fed
+# after a buffered run instead of line-by-line.
 _POSIX = os.name == "posix"
 
 # Bound on the Windows ``taskkill /T /F`` tree kill before falling back to
@@ -65,27 +69,119 @@ _POSIX = os.name == "posix"
 _TASKKILL_TIMEOUT_S = 10.0
 
 
-def resolve_argv0(argv: Sequence[str]) -> list[str]:
-    """Resolve a bare executable name to its full path on Windows.
+# Windows batch files (`.cmd`/`.bat`) are run by CreateProcess through
+# `cmd.exe`, which re-parses the command line: `& | < > ^` outside quotes are
+# operators, `%VAR%` expands even inside quotes, and `\"` is not an escape
+# (the "BatBadBut" class — see Python's subprocess security notes). Agent argv
+# carries filesystem paths, JSON schemas and system-prompt text, so it is never
+# handed to `cmd.exe` unexamined (#178 review F-002).
+_BATCH_SUFFIXES = (".cmd", ".bat")
+# An npm cmd-shim forwards `%*` to `"%_prog%" "%dp0%\<script>"`; running
+# `node <script>` directly bypasses `cmd.exe` entirely.
+_NPM_SHIM_TARGET_RE = re.compile(r'"%dp0%\\([^"\r\n]+)"\s+%\*')
+# Arguments made only of these characters need no quoting for `cmd.exe` or
+# the CRT parser; anything else is double-quoted.
+_BATCH_PLAIN_ARG_RE = re.compile(r"[A-Za-z0-9_\-./:=,+@\\]+")
+# Characters that cannot be carried through `cmd.exe` safely even inside
+# double quotes (`%` expands, `"` toggles quoting, newlines end the command).
+_BATCH_UNSAFE_CHARS = frozenset('"%\r\n\x00')
 
-    ``CreateProcess`` only appends ``.exe`` to a bare name, so npm-installed
-    CLIs (``codex.cmd``, possibly ``claude.cmd``) raise ``FileNotFoundError``
-    even though ``shutil.which`` finds them via ``PATHEXT``. Given the full
-    ``.cmd`` path, ``CreateProcess`` runs it through ``cmd.exe``. Callers pass
-    prompts on stdin, never in argv, so cmd re-parsing only sees controlled
-    flags. POSIX, an already-qualified path, or an unresolvable name → unchanged
-    (the spawn then fails exactly as before).
+
+class UnsafeBatchArgumentsError(OSError):
+    """A Windows batch-file launch would hand ``cmd.exe`` an argument it would
+    re-parse (fail closed: the spawn is refused, never run mangled)."""
+
+
+def resolve_argv0(
+    argv: Sequence[str], *, env: Mapping[str, str] | None = None
+) -> list[str] | str:
+    """The spawnable form of ``argv`` on this platform.
+
+    POSIX, or an empty argv → ``argv`` unchanged.
+
+    On native Windows:
+
+    * A bare name is resolved with ``shutil.which`` against the child's
+      ``PATH`` (an explicit path list, so the current directory — the run's
+      worktree, which an agent can write — is NOT searched first).
+      ``CreateProcess`` only appends ``.exe`` itself, so npm-installed CLIs
+      (``codex.cmd``) would otherwise raise ``FileNotFoundError``.
+    * A resolved npm ``.cmd`` shim is unwrapped to ``node <script> ...`` so the
+      arguments never pass through ``cmd.exe``.
+    * Any other batch file is launched with a command line whose non-trivial
+      arguments are double-quoted (``cmd.exe`` treats operators inside quotes
+      literally); an argument containing ``"``, ``%`` or a newline cannot be
+      carried safely, so the launch is refused with
+      :class:`UnsafeBatchArgumentsError`. This form is returned as a string.
+
+    An unresolvable name is returned unchanged (the spawn then fails exactly as
+    before).
     """
     out = list(argv)
     if _POSIX or not out:
         return out
     name = out[0]
-    if os.path.dirname(name):
+    if not os.path.dirname(name):
+        search = (env if env is not None else os.environ).get("PATH") or os.defpath
+        resolved = shutil.which(name, path=search)
+        if resolved:
+            out[0] = resolved
+    if not out[0].lower().endswith(_BATCH_SUFFIXES):
         return out
-    resolved = shutil.which(name)
-    if resolved:
-        out[0] = resolved
-    return out
+    unwrapped = _unwrap_npm_shim(out[0], env)
+    if unwrapped is not None:
+        return unwrapped + out[1:]
+    return _batch_command_line(out)
+
+
+def _unwrap_npm_shim(shim: str, env: Mapping[str, str] | None) -> list[str] | None:
+    """``[node, script]`` for a standard npm cmd-shim, else ``None``."""
+    try:
+        text = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _NPM_SHIM_TARGET_RE.search(text)
+    if match is None:
+        return None
+    base = Path(shim).parent
+    # The shim names its script with Windows separators, relative to itself.
+    script = base.joinpath(*PureWindowsPath(match.group(1)).parts)
+    if not script.is_file():
+        return None
+    if script.suffix.lower() == ".exe":
+        return [str(script)]
+    if script.suffix.lower() not in (".js", ".cjs", ".mjs"):
+        return None
+    local_node = base / "node.exe"
+    if local_node.is_file():
+        node = str(local_node)
+    else:
+        search = (env if env is not None else os.environ).get("PATH") or os.defpath
+        node = shutil.which("node", path=search)
+    if not node:
+        return None
+    return [node, str(script)]
+
+
+def _batch_command_line(argv: Sequence[str]) -> str:
+    """A ``cmd.exe``-safe command line for a batch file, or refuse."""
+    parts = []
+    for i, arg in enumerate(argv):
+        if _BATCH_UNSAFE_CHARS.intersection(arg):
+            raise UnsafeBatchArgumentsError(
+                f"refusing to pass argument {i} to batch file {argv[0]!r}: it "
+                "contains a character cmd.exe re-parses even inside quotes "
+                '(", %, or a newline). Install the CLI as a native executable '
+                "(.exe) or via npm so Gauntlet can run it without cmd.exe."
+            )
+        if arg and _BATCH_PLAIN_ARG_RE.fullmatch(arg):
+            parts.append(arg)
+        else:
+            # Inside quotes cmd.exe takes & | < > ^ ( ) literally. Backslashes
+            # before the closing quote are doubled for the CRT parser.
+            trailing = len(arg) - len(arg.rstrip("\\"))
+            parts.append('"' + arg + "\\" * trailing + '"')
+    return " ".join(parts)
 
 
 def _spawn_isolation_kwargs() -> dict:
@@ -93,6 +189,68 @@ def _spawn_isolation_kwargs() -> dict:
     if _POSIX:
         return {"start_new_session": True}
     return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+
+
+def _text_kwargs() -> dict:
+    """Popen text-mode kwargs. POSIX: the historical locale codec (unchanged).
+
+    Windows: UTF-8 explicitly. The locale codec there is usually cp1252, which
+    cannot encode prompt characters such as ``→`` (``UnicodeEncodeError`` on
+    stdin) and mis-decodes the agents' UTF-8 output (#178 review F-003).
+    """
+    if _POSIX:
+        return {"text": True}
+    return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def _assign_windows_job(proc: subprocess.Popen) -> None:
+    """Put a Windows child in its own Job Object (best effort).
+
+    Every descendant the child starts joins the job, so the timeout kill
+    (``TerminateJobObject``) reaches them even after their parent exited —
+    ``taskkill /T`` walks live parent links and misses such orphans, which can
+    then hold the output pipes open forever (#178 review F-001). Any failure
+    leaves the child unjobbed; the ``taskkill`` tree kill and the bounded
+    post-kill drain still apply.
+    """
+    if _POSIX:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        if not k32.AssignProcessToJobObject(job, int(proc._handle)):  # type: ignore[attr-defined]
+            k32.CloseHandle(job)
+            return
+    except Exception:  # noqa: BLE001 — best effort; the taskkill path remains
+        return
+    proc._gauntlet_job_kill = lambda: bool(k32.TerminateJobObject(job, 1))  # type: ignore[attr-defined]
+    weakref.finalize(proc, k32.CloseHandle, job)
+
+
+def _drain_after_kill(proc: subprocess.Popen) -> tuple[str | None, str | None]:
+    """Collect output after a timeout kill.
+
+    POSIX: the group kill closed every write end, so ``communicate()`` is the
+    historical unbounded drain (unchanged). Windows: a descendant outside the
+    kill's reach can keep a pipe open, so the drain is bounded — FR-3.3 promises
+    a bounded step even when the tree kill is incomplete.
+    """
+    if _POSIX:
+        return proc.communicate()
+    return _drain_bounded(proc)
 
 # Grace granted to reap a child whose pipes have already hit EOF when the
 # wall-clock budget is exhausted. Pipe EOF is strong evidence the child is
@@ -335,9 +493,11 @@ def _replay_lines_to_sink(stdout: str, sink: Callable[[str], None]) -> None:
     Mirrors the streaming path's framing: a trailing non-terminated segment is
     never sinked (FR-2.4), and a sink fault is fail-closed (FR-6.2).
     """
-    for line in stdout.splitlines(keepends=True):
-        if not line.endswith("\n"):
-            break
+    # Frame on "\n" ONLY, exactly like the streaming reader: str.splitlines
+    # would also split on U+2028/U+2029/\x0c/\x85, which JSON printers emit
+    # unescaped, yielding a non-terminated fragment mid-output.
+    *complete, _tail = stdout.split("\n")
+    for line in (c + "\n" for c in complete):
         try:
             sink(line)
         except Exception as exc:
@@ -368,17 +528,18 @@ def _run_buffered(
     """
     start = time.monotonic()
     proc = subprocess.Popen(
-        resolve_argv0(argv),
+        resolve_argv0(argv, env=env),
         stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
         env=dict(env) if env is not None else None,
-        text=True,
         preexec_fn=preexec_fn,  # optional rlimit caps (verifier, PR #59 §7 item 5)
         # own process group, so the group kill reaps children
         **_spawn_isolation_kwargs(),
+        **_text_kwargs(),
     )
+    _assign_windows_job(proc)
     watch = _build_vanish_watch(proc, watchdog_silence_s)
     if deadline is None and watch is None:
         try:
@@ -387,7 +548,7 @@ def _run_buffered(
         except subprocess.TimeoutExpired:
             _kill_process_group(proc)
             # Second communicate() collects whatever the pipes still hold.
-            stdout, stderr = proc.communicate()
+            stdout, stderr = _drain_after_kill(proc)
             timed_out = True
         vanished = False
     else:
@@ -461,7 +622,7 @@ def _communicate_with_deadline(
                 expired = (time.monotonic() - start) >= timeout_s
             if expired:
                 _kill_process_group(proc)
-                stdout, stderr = proc.communicate()
+                stdout, stderr = _drain_after_kill(proc)
                 return stdout or "", stderr or "", True, False
 
 
@@ -534,7 +695,7 @@ def _run_streaming(
     use_stdin = stdin_text is not None
 
     proc = subprocess.Popen(
-        resolve_argv0(argv),
+        resolve_argv0(argv, env=env),
         stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -776,11 +937,20 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def _kill_process_tree_windows(proc: subprocess.Popen) -> None:
-    """Windows group kill: ``taskkill /T /F`` reaps the child's whole tree.
+    """Windows group kill: the child's Job Object, then ``taskkill /T /F``.
 
     Agent CLIs spawn workers (often via a ``.cmd`` shim), so killing only the
-    leader would orphan them. The leader is always killed as a backstop.
+    leader would orphan them. Terminating the job reaches every descendant,
+    including ones whose parent already exited; ``taskkill /T`` covers a child
+    that could not be put in a job (or a descendant started before the
+    assignment landed). The leader is always killed as a backstop.
     """
+    job_kill = getattr(proc, "_gauntlet_job_kill", None)
+    if job_kill is not None:
+        try:
+            job_kill()
+        except Exception:  # noqa: BLE001 — fall through to taskkill
+            pass
     if proc.poll() is None:
         try:
             subprocess.run(

@@ -128,3 +128,58 @@ def test_replace_with_retry_does_not_mask_posix_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(HB.os, "replace", deny)
     with pytest.raises(PermissionError):
         HB._replace_with_retry("a", tmp_path / "b")
+
+
+def test_failed_writes_do_not_fabricate_suspension_credit(tmp_path, monkeypatch):
+    """#178 review F-004: a run of failed writes followed by a success must
+    NOT be read as a host suspension — both clocks advanced continuously, so
+    no deadline credit is owed (a false credit stretches the FR-3.3 timeout)."""
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    tick = [0]
+    w = HB.HeartbeatWriter(
+        tmp_path,
+        monotonic_clock=lambda: 100.0 + 15.0 * tick[0],
+        wall_clock=lambda: t0 + timedelta(seconds=15 * tick[0]),
+    )
+    w._write_sample()  # t=0 ok
+    real_persist = w._persist
+
+    def failing(_sample):
+        raise PermissionError("held open by a reader")
+
+    monkeypatch.setattr(w, "_persist", failing)
+    for t in (1, 2, 3):  # t=15, 30, 45: three failed writes in a row
+        tick[0] = t
+        with pytest.raises(OSError):
+            w._write_sample()
+    monkeypatch.setattr(w, "_persist", real_persist)
+    tick[0] = 4  # t=60: the next write succeeds
+    w._write_sample()
+    assert w.drain_suspensions() == []
+    assert w.detected_suspension_s() == 0.0
+
+
+def test_genuine_suspension_is_detected_even_when_that_write_fails(tmp_path, monkeypatch):
+    """Detection runs on the observation, before the write: a real suspension
+    is still credited when the tick that sees it cannot persist."""
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    walls = [t0, t0 + timedelta(minutes=40)]
+    monos = [100.0, 115.0]
+    i = [0]
+    w = HB.HeartbeatWriter(
+        tmp_path, monotonic_clock=lambda: monos[i[0]], wall_clock=lambda: walls[i[0]]
+    )
+    w._write_sample()
+
+    def failing(_sample):
+        raise PermissionError("held open by a reader")
+
+    monkeypatch.setattr(w, "_persist", failing)
+    i[0] = 1
+    with pytest.raises(OSError):
+        w._write_sample()
+    assert [s.gap_s for s in w.drain_suspensions()] == [2400]

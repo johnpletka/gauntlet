@@ -150,7 +150,10 @@ class CodexAdapter:
                 watchdog_silence_s=self.watchdog_silence_s,
             )
             last_message = (
-                output_path.read_text() if output_path.exists() else None
+                # Explicit UTF-8: the CLI writes UTF-8, and Windows' locale
+                # codec (cp1252) would mis-decode it (#178 review F-003).
+                output_path.read_text(encoding="utf-8", errors="replace")
+                if output_path.exists() else None
             )
         if out.agent_vanished:
             raise AgentVanishedError(
