@@ -173,8 +173,8 @@ def _checkpoint(
     :class:`~gauntlet.engine.manifest.Checkpoint` and flushes the manifest — the
     checkpoint and its artifact are on disk before the next sub-step (which might
     park/die) begins. A re-run of the same ``(round, sub_step)`` supersedes the
-    prior record (dedup by key), so an invalidated-then-rerun sub-step leaves one
-    truthful checkpoint.
+    prior record and its downstream suffix, so an interrupted re-run cannot
+    combine a new review with old triage/fix/confirm checkpoints.
     """
     artifact_rel: str | None = None
     if data is not None:
@@ -186,7 +186,7 @@ def _checkpoint(
         artifact_rel = rel
     ctx.record.checkpoints = [
         c for c in ctx.record.checkpoints
-        if not (c.round == rnd and c.sub_step == sub_step)
+        if (c.round, _SUBSTEP_ORDER[c.sub_step]) < (rnd, _SUBSTEP_ORDER[sub_step])
     ]
     ctx.record.checkpoints.append(
         M.Checkpoint(
@@ -292,12 +292,11 @@ class _Resume:
         self.ctx.record.checkpoints = []
 
 
-def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
+def _sha_guard_ok(ctx: StepContext) -> bool:
     """FR-4.2: True iff HEAD is still at a tip the cycle itself produced.
 
-    Reuse is safe only when git is where the cycle left it. The valid tips are the
-    fix commits the cycle produced: those the manifest recorded (attributed by
-    ``step_id``) AND those recorded only as a fix checkpoint's ``result_sha`` — a
+    Reuse is safe only when git is where this checkpoint set left it. Valid tips
+    are its recorded review handoffs and fix checkpoint ``result_sha`` values — a
     kill after the fix sub-step committed+checkpointed but before finalization
     leaves the commit on HEAD yet absent from the manifest (review F-002), so a
     manifest-only check would misread HEAD as "moved" and discard the cycle's own
@@ -306,15 +305,21 @@ def _sha_guard_ok(ctx: StepContext, resume: "_Resume") -> bool:
     a stale base; the round then restarts fresh.
     """
     head = gitops.head_sha(ctx.work_root)
-    tips = {c.sha for c in ctx.manifest.commits if c.step_id == ctx.record.id}
-    tips.update(
+    # Historical commits share the step id across re-drives. Only this
+    # checkpoint set describes the reviewed state we may reuse (#175).
+    tips = {
         c.result_sha for c in ctx.record.checkpoints
         if c.sub_step == "fix" and c.result_sha
+    }
+    tips.update(c.handoff_sha for c in ctx.record.checkpoints if c.sub_step == "review")
+    if not tips:
+        return True
+    # Membership alone is not enough: HEAD restored to an earlier review handoff
+    # is a recorded tip, yet a later checkpointed fix is no longer on the branch.
+    # Every recorded tip must be in HEAD's ancestry, i.e. HEAD is the newest one.
+    return head in tips and all(
+        t == head or gitops.is_ancestor(ctx.work_root, t, head) for t in tips
     )
-    if tips:
-        return head in tips
-    r1 = resume.cp(1, "review")
-    return r1 is None or head == r1.handoff_sha
 
 
 def _dirty_expected_at_reentry(ctx: StepContext) -> bool:
@@ -352,7 +357,7 @@ def _reuse_invalidation_reason(ctx: StepContext, resume: "_Resume") -> str | Non
         pending fixer re-run (:func:`_dirty_expected_at_reentry`).
     Either way, reuse is discarded and the cycle re-runs from a clean handoff.
     """
-    if not _sha_guard_ok(ctx, resume):
+    if not _sha_guard_ok(ctx):
         return (
             "checkpoint reuse invalidated (FR-4.2): HEAD moved since the round was "
             "checkpointed (manual commit during the park?); re-running the cycle "
@@ -655,6 +660,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             notes="adversarial_cycle cannot resolve its phase: no prior commit "
             "in the manifest and no explicit `phase:` on the step",
         )
+    # The phase's diff base and the review's checkout tip are different facts.
+    # Resolve the former while `handoff` still names the phase/fix marker; a
+    # subsequent bookkeeping flush or operator commit must not narrow review
+    # to that commit alone (#175).
+    phase_review_base = (
+        step.get("review_base") or _code_review_base(ctx, handoff)
+        if step.get("mode", "artifact") == "code_review" else None
+    )
 
     findings_schema = _load_schema(ctx, step.get("findings_schema") or DEFAULT_FINDINGS_SCHEMA)
     # The strict per-member output schema (FR-1.2 / F-007): the ensemble-annotated
@@ -817,9 +830,6 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # with reuse (a reused round still advances `handoff`).
     prev_review_handoff: str | None = None
     for rnd in range(1, max_rounds + 1):
-        # This round's review handoff — captured before `handoff` advances to the
-        # fix SHA at the loop bottom, so the next round can diff against it (FR-1.2).
-        review_handoff = handoff
         # FR-4.1 reuse is ordered-prefix and FAIL-CLOSED (review F-001): a
         # checkpoint whose round-scoped artifact is missing (corruption / manual
         # deletion) is NOT reused, and it ends reuse for every later sub-step too —
@@ -838,10 +848,8 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             # below stays green. Re-commit that tracked bookkeeping so both views
             # agree and control passes to the reviewer on a genuinely clean tree. A
             # no-op when bookkeeping is still untracked (the run-dir self-ignore
-            # already hides it) — this never force-adds. It may land a bookkeeping
-            # commit on HEAD above `handoff`; a later usage-limit park then re-runs
-            # the round fresh (the SHA guard's sanctioned fail-closed path, §2)
-            # rather than reusing — correct, if slightly less efficient.
+            # already hides it) — this never force-adds. Capture the resulting
+            # HEAD below: it is the exact tree the reviewer will inspect.
             _persist_manifest(ctx)  # commit the CURRENT state, not a stale flush
             gitops.commit_tracked_bookkeeping(
                 ctx.work_root,
@@ -855,6 +863,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
             )
             if not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
                 return finish(_clean_handoff_failure(ctx, rnd))
+            handoff = gitops.head_sha(ctx.work_root)
+        else:
+            # Each reused round can have its own bookkeeping handoff above
+            # the previous fix commit; preserve the SHA actually reviewed.
+            handoff = resume.cp(rnd, "review").handoff_sha
+        review_handoff = handoff
 
         # ---- 1. review (single reviewer OR ensemble panel) --------------------
         # `findings` is the PERSISTED record: for a single reviewer, exactly the
@@ -879,13 +893,14 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 findings, open_questions, review_summary = _ensemble_review(
                     step, ctx, panel, rnd, handoff, policy, phase, commits,
                     reviewer_schema, usage, carried, prev_review_handoff,
-                    dedup_threshold, cycle_effort,
+                    dedup_threshold, cycle_effort, phase_review_base,
                 )
             except _ParkCycle as park:
                 return finish(park.result)
         else:
             review_prompt = _review_prompt(
-                step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
+                step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff,
+                phase_review_base=phase_review_base,
             )
             guard = _MutationGuard(step, ctx, policy, phase, rnd, handoff, reviewer, commits)
             review_logger = step_logger(ctx, f"r{rnd}-review")
@@ -1174,14 +1189,21 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     "FR-4.1/F-002)"
                 )
         else:
-            # A stale fix commit for THIS round recorded by a prior interrupted
-            # attempt (F-001 ordered-prefix rerun) sits on HEAD ahead of the
-            # handoff; force its discard even though the tree is clean. A fresh run
-            # has no such record, so a same-round reviewer-mutation commit is kept.
+            # Only a reused review can own an interrupted fix to discard. A
+            # fresh review has just examined HEAD, including older attempts'
+            # fixes and operator commits; a historical phase/round label alone
+            # must never authorize rewinding that reviewed state (#175).
+            # Include write-ahead fix checkpoints: a kill before finalization
+            # leaves no corresponding manifest commit yet.
             phase_tag = f"{phase}.{rnd}"
-            stale_fix = any(
-                c.step_id == ctx.record.id and c.phase == phase_tag
-                for c in ctx.manifest.commits
+            stale_fix = reuse_review and (
+                resume.cp(rnd, "fix") is not None or any(
+                    c.step_id == ctx.record.id and c.phase == phase_tag
+                    and c.sha != handoff
+                    and gitops.is_ancestor(ctx.work_root, handoff, c.sha)
+                    and gitops.is_ancestor(ctx.work_root, c.sha, gitops.head_sha(ctx.work_root))
+                    for c in ctx.manifest.commits
+                )
             )
             note = _reset_dirty_to_handoff(ctx, handoff, rnd, force=stale_fix)  # discard parked/stale edits
             if note is not None:
@@ -1881,6 +1903,7 @@ def _ensemble_review(
     policy: str, phase: str, commits: list[tuple[str, str]],
     reviewer_schema: dict | None, usage: Any, carried: list[dict[str, Any]],
     prev_review_handoff: str | None, threshold: float, effort: str | None,
+    phase_review_base: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     """Run/reuse every panel member independently, then deterministically merge
     (FR-1.1/FR-1.2). Members run sequentially in panel order — deliberately, not
@@ -1893,7 +1916,8 @@ def _ensemble_review(
     Returns ``(merged_findings, merged_open_questions, merged_summary)`` — the
     merged set is primaries + marked duplicates; only primaries reach triage."""
     base_prompt = _review_prompt(
-        step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff
+        step, ctx, handoff, rnd, carried, prev_review_sha=prev_review_handoff,
+        phase_review_base=phase_review_base,
     )
     scope_hash = hashlib.sha256(base_prompt.encode("utf-8")).hexdigest()
     stamped: list[dict[str, Any]] = []
@@ -2211,14 +2235,18 @@ def _code_review_base(ctx: StepContext, handoff: str) -> str:
         while first > 0 and phase[1:].isdigit() and commits[first - 1].phase.split(".")[0] == phase:
             first -= 1
         previous = commits[first - 1].sha if first else None
-        base = commit.base_sha
+        # A re-drive may resolve through a later fix record whose base is the
+        # cycle's entry tip, already above the implementation. The first phase
+        # record owns the full-phase base, including adopted checkpoints.
+        phase_commit = commits[first]
+        base = phase_commit.base_sha or commit.base_sha
         if base and (previous is None or gitops.is_ancestor(ctx.work_root, base, previous)):
             return base
         if previous:
             return previous
         # Legacy manifests have no CommitRecord.base_sha. The matching
         # foreach commit record may still carry a repaired base after adoption.
-        record = (ctx.manifest.record(commit.step_id, ctx.record.iteration)
+        record = (ctx.manifest.record(phase_commit.step_id, ctx.record.iteration)
                   if isinstance(ctx.manifest, M.Manifest) else None)
         if record is not None and record.base_sha:
             return record.base_sha
@@ -2712,6 +2740,7 @@ def _panel_input_cap(step: Step, ctx: StepContext) -> tuple[int | None, bool]:
 def _review_prompt(
     step: Step, ctx: StepContext, handoff: str, rnd: int,
     carried: list[dict[str, Any]], prev_review_sha: str | None = None,
+    phase_review_base: str | None = None,
 ) -> str:
     # Round 1 is a full adversarial review; rounds 2+ are REGRESSION-SCOPED so
     # the loop converges instead of bikeshedding (BOOTSTRAP-NOTES #30): the
@@ -2735,11 +2764,12 @@ def _review_prompt(
         elif rnd == 1:
             # Round 1 reviews the whole phase: span its full commit range so an
             # empty phase-marker over intra-phase checkpoints is not an empty diff.
-            base = _code_review_base(ctx, handoff)
+            base = phase_review_base or _code_review_base(ctx, handoff)
         else:
             # Rounds 2+ are regression-scoped (see the round-1 vs 2+ note above):
-            # the handoff is the fix commit, so `handoff^` diffs only that fix.
-            base = f"{handoff}^"
+            # Include the previous round's fix even when a bookkeeping flush
+            # advances HEAD above it before this review.
+            base = prev_review_sha or f"{handoff}^"
         diff = gitops.range_diff(ctx.work_root, base, handoff)
         section = (
             f"\n--- commit-range diff under review ({base}..{handoff[:10]}) ---\n{diff}"
