@@ -13,32 +13,43 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 # Bounded structural repair (#169). Models occasionally emit JSON that is valid
 # except for one bracket slip — an extra ``}`` after a long string, a trailing
 # comma — and repeat the same slip on every re-ask. A handful of local,
-# position-anchored edits recovers those without another model call. The bound
-# keeps this a repair of a near-miss, never a guess at free-form text; the
-# caller's schema validation still applies to whatever the repair yields.
+# position-anchored edits recovers those without another model call.
+#
+# Repair is OPT-IN (``repair=True``) and used only at the ApiAdapter boundary,
+# which records every repair it applies. Everything else — the artifact
+# validators (whose bytes stay on disk and must parse as-is, harness-efficiency
+# FR-2.1), the judge's classifier (a parse error is a deny), and the CLI
+# adapters — parses strictly. Repair is a structural guess, so when the caller
+# has a schema a repaired candidate is accepted only if it ALSO validates
+# against that schema; the search moves on to the next edit otherwise.
 _MAX_REPAIRS = 4
 _CLOSERS = "}]"
 _CONTEXT_CHARS = 40
 
 
-def extract_json(text: str) -> Any:
+def extract_json(text: str, *, repair: bool = False, schema: dict | None = None) -> Any:
     """Extract a JSON value from model text output.
 
     Tries, in order: the whole text, the first fenced code block, the
-    outermost ``{...}`` / ``[...]`` span. Each is parsed strictly first; only
-    when none parses is a bounded structural repair attempted (see
-    :func:`parse_json_output`). Raises ``ValueError`` — naming the parse error
-    and its position — if nothing parses.
+    outermost ``{...}`` / ``[...]`` span, each parsed strictly. Only with
+    ``repair=True`` and when none parses is a bounded structural repair
+    attempted (see :func:`parse_json_output`). Raises ``ValueError`` — naming
+    the parse error and its position — if nothing parses.
     """
-    return parse_json_output(text)[0]
+    return parse_json_output(text, repair=repair, schema=schema)[0]
 
 
-def parse_json_output(text: str) -> tuple[Any, list[str]]:
+def parse_json_output(
+    text: str, *, repair: bool = False, schema: dict | None = None
+) -> tuple[Any, list[str]]:
     """Like :func:`extract_json`, also returning the repairs applied.
 
-    The repair list is empty for output that parsed as-is. Each entry is a
-    short human-readable note (``"removed stray '}' at char 1580"``) so a
-    caller can record that the value it is about to trust was repaired.
+    The repair list is empty for output that parsed as-is (always the case with
+    ``repair=False``). Each entry is a short human-readable note (``"removed
+    stray '}' at char 1580"``) so a caller can record that the value it is
+    about to trust was repaired. With ``schema``, a repaired value is returned
+    only if it validates against it (a strictly parsed value is returned
+    as-is; the caller still validates it).
     """
     candidates = _candidates(text)
     errors: list[tuple[str, json.JSONDecodeError]] = []
@@ -47,10 +58,11 @@ def parse_json_output(text: str) -> tuple[Any, list[str]]:
             return json.loads(candidate), []
         except json.JSONDecodeError as exc:
             errors.append((candidate, exc))
-    for candidate in candidates:
-        repaired = _repair(candidate)
-        if repaired is not None:
-            return repaired
+    if repair:
+        for candidate in candidates:
+            repaired = _repair(candidate, schema)
+            if repaired is not None:
+                return repaired
     raise ValueError(_describe_failure(errors))
 
 
@@ -67,16 +79,17 @@ def _candidates(text: str) -> list[str]:
     return list(dict.fromkeys(c for c in candidates if c))
 
 
-def _repair(candidate: str) -> tuple[Any, list[str]] | None:
+def _repair(candidate: str, schema: dict | None = None) -> tuple[Any, list[str]] | None:
     """Depth-first search over at most ``_MAX_REPAIRS`` local edits.
 
     Every edit is anchored at the decoder's own error position, so the search
     only ever touches the byte the parser stopped on (or the comma just before
-    it). Returns the first value that parses, with the edits that produced it.
+    it). Returns the first value that parses — and, given ``schema``, also
+    validates — with the edits that produced it.
     """
     def search(s: str, notes: list[str]) -> tuple[Any, list[str]] | None:
         try:
-            return json.loads(s), notes
+            value = json.loads(s)
         except json.JSONDecodeError as exc:
             if len(notes) >= _MAX_REPAIRS:
                 return None
@@ -85,6 +98,12 @@ def _repair(candidate: str) -> tuple[Any, list[str]] | None:
                 if found is not None:
                     return found
             return None
+        if notes and schema is not None:
+            try:
+                validate_schema(value, schema)
+            except ValueError:
+                return None  # parses, but not into the shape asked for
+        return value, notes
 
     return search(candidate, [])
 
@@ -94,7 +113,12 @@ def _edits(s: str, exc: json.JSONDecodeError) -> list[tuple[str, str]]:
     pos = exc.pos
     ch = s[pos] if pos < len(s) else ""
     edits: list[tuple[str, str]] = []
-    if ch and ch in _CLOSERS:
+    if ch == "," and exc.msg.startswith("Illegal trailing comma"):
+        # Python >= 3.13 reports a trailing comma at the comma itself
+        # ("Illegal trailing comma before end of object/array"); earlier
+        # versions stop on the closer after it (handled below).
+        edits.append((s[:pos] + s[pos + 1 :], f"removed trailing ',' at char {pos}"))
+    elif ch and ch in _CLOSERS:
         if exc.msg.startswith("Expecting ',' delimiter"):
             # A closer that does not match the open container: either it is a
             # stray extra (the observed `}}` slip) or the container it belongs

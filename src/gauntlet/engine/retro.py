@@ -33,7 +33,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from gauntlet.adapters.base import AdapterError
+from gauntlet.adapters.base import AdapterError, MalformedOutputError
 from gauntlet.engine.execution import DONE, FAILED, StepContext, StepResult, StepSpec
 from gauntlet.engine.pipeline import Step
 
@@ -56,6 +56,9 @@ _ASSET_TAIL_BYTES = 2_048
 # apply validation (#55) — the same bounded-retry shape as the cycle's schema
 # re-ask; exhaustion falls closed to materializing the evidence as `invalid`.
 _PROPOSAL_REGEN_RETRIES = 2
+# First line of the placeholder written for a self-critique that failed; a
+# `--response` re-run re-asks that agent instead of reusing the placeholder.
+_CRITIQUE_FAILED_MARKER = "self-critique failed:"
 
 
 # --- the handler -------------------------------------------------------------
@@ -83,9 +86,13 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
     for agent in agents:
         saved = retro_dir / f"retro-{agent}.md"
         if response is not None and saved.is_file():
-            critiques[agent] = saved.read_text()
-            reused.append(agent)
-            continue
+            prior = saved.read_text()
+            # Reuse only a real critique; a failure placeholder from the prior
+            # attempt is re-asked (review: it is not a critique to keep).
+            if _CRITIQUE_FAILED_MARKER not in prior:
+                critiques[agent] = prior
+                reused.append(agent)
+                continue
         prompt = (
             f"{template}\n\n--- your role in this run: {agent} ---\n"
             + wrap_as_data(build_agent_summary(ctx, agent))
@@ -102,7 +109,7 @@ def handle_retrospective(step: Step, ctx: StepContext) -> StepResult:
             critiques[agent] = f"(self-critique unavailable: {exc})"
             ctx.writer.write_text(
                 retro_dir / f"retro-{agent}.md",
-                f"# Retrospective — {agent}\n\nself-critique failed: {exc}\n",
+                f"# Retrospective — {agent}\n\n{_CRITIQUE_FAILED_MARKER} {exc}\n",
             )
 
     proposer = step.get("proposer")
@@ -621,7 +628,10 @@ def _generate_proposals(
                 ctx, proposer, retry_prompt, schema=schema, usage=usage,
                 logger=logger, structured_name=f"proposals.regen{regen}.json",
             )
-        except AdapterError as exc:
+        except MalformedOutputError as exc:
+            # Only a MALFORMED re-ask is absorbed — a quota/overload park, a
+            # timeout or a vanished agent still propagates and fails the
+            # synthesis closed (review F-002).
             # The first synthesis parsed; only this repair re-ask failed (#169:
             # a proposer that emitted malformed JSON on every regen attempt
             # turned three parsed proposals into a terminal synthesis failure).

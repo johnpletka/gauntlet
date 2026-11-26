@@ -249,6 +249,23 @@ def test_near_miss_json_is_repaired_without_a_reask(fake_litellm):
     assert repaired["repairs"] and "'}'" in repaired["repairs"][0]
 
 
+def test_json_repair_can_be_disabled(fake_litellm):
+    """The judge classifier passes ``json_repair=False``: a near-miss is a
+    schema failure (deny), never a repaired verdict (#171 review)."""
+    fake_litellm.responses = [make_response('{"verdict": "ok"}}')]
+    with pytest.raises(MalformedOutputError):
+        ApiAdapter(model="m", json_repair=False, max_schema_retries=0).run(
+            "judge", schema=SCHEMA
+        )
+
+
+def test_judge_classifier_parses_strictly():
+    from gauntlet.judge.runner import build_classifier
+
+    classifier = build_classifier(judge_model="m")
+    assert classifier._adapter.json_repair is False
+
+
 def test_exhaustion_error_names_the_parse_position(fake_litellm):
     bad = '{"verdict" "ok"}'
     fake_litellm.responses = [make_response(bad) for _ in range(3)]

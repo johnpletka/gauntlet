@@ -62,6 +62,7 @@ class ApiAdapter:
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
         json_mode: bool | None = None,
+        json_repair: bool = True,
     ) -> None:
         self.model = model
         self.max_schema_retries = max_schema_retries
@@ -76,6 +77,10 @@ class ApiAdapter:
         # force it. Flipped off for this adapter instance if the provider
         # rejects the parameter, so one unsupported model costs one extra call.
         self.json_mode = json_mode
+        # Bounded local repair of a near-miss reply (#169), schema-gated and
+        # recorded as an `api.json_repaired` event. A caller whose contract is
+        # "unparseable means deny" (the judge classifier) turns it off.
+        self.json_repair = json_repair
 
     def run(
         self,
@@ -136,7 +141,9 @@ class ApiAdapter:
             if schema is None:
                 return self._result(text, None, usage_total, raw_events)
             try:
-                structured, repairs = parse_json_output(text)
+                structured, repairs = parse_json_output(
+                    text, repair=self.json_repair, schema=schema
+                )
                 validate_schema(structured, schema)
             except ValueError as exc:
                 last_error = str(exc)

@@ -39,7 +39,7 @@ def test_extra_closing_brace_is_repaired():
     text = _proposals_with_extra_brace()
     with pytest.raises(json.JSONDecodeError):
         json.loads(text)
-    value, repairs = parse_json_output(text)
+    value, repairs = parse_json_output(text, repair=True)
     assert [p["slug"] for p in value["proposals"]] == [
         "tighten-fix-scope", "require-counter-fixtures",
     ]
@@ -62,13 +62,15 @@ def test_valid_json_reports_no_repairs():
     ],
 )
 def test_bounded_structural_repairs(text, expected):
-    assert extract_json(text) == expected
+    # Python >= 3.13 reports a trailing comma at the comma, earlier versions at
+    # the closer after it; both shapes must repair (second-round review).
+    assert extract_json(text, repair=True) == expected
 
 
 def test_unrepairable_output_names_the_error_position():
     text = 'prose first {"proposals": [{"slug": "x" "diff": "y"}]} trailing'
     with pytest.raises(ValueError) as exc:
-        extract_json(text)
+        extract_json(text, repair=True)
     msg = str(exc.value)
     assert msg.startswith("no parseable JSON found in output text: ")
     assert "Expecting ',' delimiter" in msg
@@ -79,3 +81,38 @@ def test_unrepairable_output_names_the_error_position():
 def test_free_text_is_not_repaired_into_json():
     with pytest.raises(ValueError):
         extract_json("I could not produce the proposals this time.")
+
+
+def test_repair_is_opt_in():
+    """Review F-001 (#171): strict by default — the artifact validators and
+    the CLI adapters must not accept bytes that ``json.loads`` rejects."""
+    with pytest.raises(ValueError):
+        parse_json_output('{"a": 1,}')
+    with pytest.raises(ValueError):
+        extract_json('{"a": {"b": 1}}}')
+
+
+def test_repair_must_validate_against_the_callers_schema():
+    """Second-round review: inserting a missing closer can move a field into
+    another object. With a schema, such a repair is rejected, not trusted."""
+    schema = {
+        "type": "object",
+        "required": ["summary"],
+        "additionalProperties": False,
+        "properties": {
+            "summary": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "notes": {"type": "array"},
+                    "approved": {"type": "boolean"},
+                },
+            },
+        },
+    }
+    text = '{"summary": {"notes": ["x"}, "approved": true}'
+    # Without a schema the guess parses — and has moved `approved` up a level.
+    value, _ = parse_json_output(text, repair=True)
+    assert value == {"summary": {"notes": ["x"]}, "approved": True}
+    with pytest.raises(ValueError):
+        parse_json_output(text, repair=True, schema=schema)
