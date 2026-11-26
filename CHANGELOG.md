@@ -6,35 +6,13 @@ All notable changes to Gauntlet are recorded here. The format follows
 
 ## [Unreleased]
 
-### Documentation
+## [1.5.0] - 2026-11-25
 
-- PRD v1.6 revises §2.2 and FR-9.8 so remote actions are owned by role: in-run
-  agents never push, open, or merge a PR, while the operator (you, or a
-  `/gauntlet-operator` session) is expected to push, open and manage the PR, and
-  merge it when you choose. Also updated: the `policy.yaml` rule descriptions,
-  the operator playbook, the README, and the `PR.md` banner. No judge rule
-  changed; whether a judged operator session may merge is PRD Open Question 5.
-
-### Fixed
-
-- **A failed retrospective no longer strands a complete run (#169).** When
-  proposal synthesis fails, `gauntlet resume <slug> --response "<note>"` now
-  finishes the run instead of leaving `abort` as the only option. The
-  self-critiques already written are kept, synthesis is retried once with the
-  note as guidance, and the run completes even if synthesis fails again
-  (proposals are advisory once a human has decided). If the synthesiser's
-  *repair* re-ask fails after a first successful parse, the parsed proposals
-  are now kept instead of failing the step.
-- **The API adapter recovers near-miss JSON (#169).** Schema-bound calls ask
-  for the provider's JSON mode when LiteLLM reports support (falling back
-  without it if the provider refuses), a reply that is valid except for a
-  stray bracket or trailing comma is repaired locally and the repair is
-  recorded in the step events, and a parse failure now names the error
-  position and nearby text.
-- **A failed run publishes its state to the run branch (#169).** When a run
-  ends `failed`, the engine commits its `manifest.json` and `RUN.md`, so other
-  checkouts read `failed` instead of an old `running` record that classified
-  the run as `orphaned`.
+Gauntlet 1.5.0 makes escalation parks actionable with a pre-digested brief
+and optional proposed fix contracts, gives a failed retrospective a human
+exit, hardens the API adapter's structured output, adds first native-Windows
+support for spawning agent CLIs, and assigns pushing and PR management to the
+operator role (PRD v1.6).
 
 ### Escalation parks present a proposed fix contract
 
@@ -56,7 +34,63 @@ All notable changes to Gauntlet are recorded here. The format follows
 - **The answering re-drive gets the contracts.** On the `resume --response`
   that answers a brief, the reviewer, triager, and fixer receive the contracts
   the operator ruled on (as data, after the authoritative decision), so an
-  approved contract is implemented as approved.
+  approved contract is implemented as approved. They still reach the fixer if
+  that re-drive is interrupted by a usage-limit park and resumed.
+- **The contract agent is read-only.** If it edits or commits, its contract is
+  discarded and its changes are reverted to the pre-call commit (a recovery
+  snapshot keeps them), so a later round never adopts them.
+
+### Fixed
+
+- **A failed retrospective no longer strands a complete run (#169).** When
+  proposal synthesis fails, `gauntlet resume <slug> --response "<note>"` now
+  finishes the run instead of leaving `abort` as the only option. The
+  self-critiques already written are kept, synthesis is retried once with the
+  note as guidance, and the run completes even if synthesis fails again
+  (proposals are advisory once a human has decided). If the synthesiser's
+  *repair* re-ask fails after a first successful parse, the parsed proposals
+  are now kept instead of failing the step.
+- **The API adapter recovers near-miss JSON (#169).** Schema-bound calls ask
+  for the provider's JSON mode when LiteLLM reports support (falling back
+  without it if the provider refuses), a reply that is valid except for a
+  stray bracket or trailing comma is repaired locally (only when the repaired
+  value also matches the schema) and the repair is recorded in the step
+  events, and a parse failure now names the error position and nearby text.
+  Repair is limited to the API adapter: artifact validation, the CLI adapters
+  and the judge's classifier still parse strictly, so the judge still denies
+  any reply that is not well-formed JSON.
+- **A failed run publishes its state to the run branch (#169).** When a run
+  ends `failed`, the engine commits its `manifest.json` and `RUN.md`, so other
+  checkouts read `failed` instead of an old `running` record that classified
+  the run as `orphaned`.
+
+### Native Windows: agent CLI spawning (partial support)
+
+- **`gauntlet doctor` and agent steps can spawn CLIs on native Windows** (#178).
+  Process isolation, timeout kills and the streaming sink have Windows
+  fallbacks. A timed-out agent's whole process tree is killed through a Job
+  Object, and waiting for its output after the kill is time-limited. npm-installed
+  `.cmd` shims run as `node <script>`, so arguments never pass through
+  `cmd.exe`, and agent I/O is UTF-8. The verifier's isolated HOME also covers
+  `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`. POSIX behaviour is unchanged.
+  Full native-Windows *runs* still need follow-up work (run locking and
+  liveness checks use POSIX-only calls).
+- **A failed heartbeat write no longer adds fake suspension time** (all
+  platforms). The heartbeat thread now survives a failed write, and the next
+  successful write is no longer read as a host suspension, which used to
+  extend step timeouts.
+- `gauntlet approve` / `reject` now run inside the same heartbeat and
+  keep-awake as other drives, so a run continued from a gate no longer shows
+  `driver_orphaned`.
+
+### Documentation
+
+- PRD v1.6 revises §2.2 and FR-9.8 so remote actions are owned by role: in-run
+  agents never push, open, or merge a PR, while the operator (you, or a
+  `/gauntlet-operator` session) is expected to push, open and manage the PR, and
+  merge it when you choose. Also updated: the `policy.yaml` rule descriptions,
+  the operator playbook, the README, and the `PR.md` banner. No judge rule
+  changed; whether a judged operator session may merge is PRD Open Question 5.
 
 ## [1.4.0] - 2026-09-16
 
