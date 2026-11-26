@@ -7429,8 +7429,8 @@ class RunManager:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.
 
         Owned by the RunManager (not the orchestrator) because PR.md is a
-        slug-dir deliverable a human edits and commits — opening and pushing
-        stay human actions (PRD §2.2).
+        slug-dir deliverable the operator edits and commits — opening and
+        pushing belong to the operator role, never the run (PRD §2.2).
 
         PR.md is a REQUIRED final-gate artifact (FR-9.8), so a failure to render
         it is not swallowed (review F-005): the error is recorded as a manifest

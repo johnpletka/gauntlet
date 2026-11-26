@@ -61,3 +61,12 @@ apply, so the file reads oldest-first.
   enforced boundary to pushing, PR creation, and merging. Remote reads remain
   permitted; other PR-management writes reach the LLM classifier in both roles.
   PRD Open Question 6 tracks broader remote-write enforcement separately.
+
+- **operator.md / policy.yaml descriptions** (PR #173, second review): the
+  `gh-pr-merge` description no longer points a denied agent at "an unjudged
+  operator session". It says to hand the merge to the human and not retry by
+  another route, matching operator.md §6. The push/create deny is described as
+  covering the literal command forms: `git -C … push` and `gh api` variants
+  reach the classifier (PRD Open Question 6). Remote reads are qualified as
+  fast-pathed and outside the network-denied verifier. operator.md is
+  reflowed. Descriptions only; no pattern, flag, rule id or version changed.

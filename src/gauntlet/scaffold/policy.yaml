@@ -28,7 +28,7 @@ deny:
       - '\bgit\s+branch\s+(-D|-M|--delete\s+--force)\b'
 
   - name: gh-pr-merge
-    description: "Merging a PR lands code on a shared base branch. Merging is an operator-role action, taken when the human chooses (FR-9.8 v1.6), and never an in-run agent action. This rule still denies it in EVERY judged context, including the judge-gated interactive monitor, so a judged session cannot merge; the human or an unjudged operator session merges. Whether to narrow it to pipeline steps is PRD Open Question 5. Denied even in a chained command so a benign prefix cannot bless it."
+    description: "Merging a PR lands code on a shared base branch. Merging is an operator-role action, taken when the human chooses (FR-9.8 v1.6), and never an in-run agent action. This rule still denies it in EVERY judged context, including the judge-gated interactive monitor: a judged session cannot merge, so hand the merge to the human and do not retry it by another route. Whether to narrow it to pipeline steps is PRD Open Question 5. Denied even in a chained command so a benign prefix cannot bless it."
     applies_to_tools: [Bash]
     command_patterns:
       - '\bgh\s+pr\s+merge\b'
@@ -49,7 +49,7 @@ deny:
       - '\bgit\s+push\b[^\n]*refs/heads/(main|master)(\s|$|:)'   # full-ref src or dst
 
   - name: push-or-pr-open-in-pipeline-step
-    description: "FR-9.8 / §2.2 defense in depth: in-run agents cannot push or create PRs. The pipeline drafts PR.md, and the operator role (the human or a /gauntlet-operator session) pushes and opens the PR. So an in-run agent (decide request carried a step_id) is denied `git push` and `gh pr create`, even though operator sessions are allowed them below. This contains those remote writes; remote reads remain permitted, and other PR-management writes reach the LLM classifier without role-specific enforcement (PRD Open Question 6)."
+    description: "FR-9.8 / §2.2 defense in depth: in-run agents cannot push or create PRs. The pipeline drafts PR.md, and the operator role (the human or a /gauntlet-operator session) pushes and opens the PR. So an in-run agent (decide request carried a step_id) is denied the literal `git push` and `gh pr create` forms, even though operator sessions are allowed them below. The patterns match command text: variants such as `git -C <dir> push` or `gh api` calls on PR endpoints are not matched and reach the LLM classifier, as do other PR-management writes (PRD Open Question 6). Fast-pathed remote reads remain permitted outside the network-denied verifier."
     applies_to_tools: [Bash]
     pipeline_step_only: true
     command_patterns:
