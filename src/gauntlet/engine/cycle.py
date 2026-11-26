@@ -3690,7 +3690,10 @@ def _write_escalation_brief(
                 "findings.json / triage.json / confirm.json directly.")
     agent = step.get("fix_contract_agent")
     if agent and brief["findings"]:
-        _synthesize_fix_contracts(step, ctx, agent, brief, usage, effort)
+        try:
+            _synthesize_fix_contracts(step, ctx, agent, brief, usage, effort)
+        except Exception as exc:  # noqa: BLE001 — advisory; the park stands
+            EB.mark_unavailable(brief, agent, f"contract step error: {exc}")
     try:
         _write_artifact(ctx, EB.BRIEF_ARTIFACT, brief)
     except Exception as exc:  # noqa: BLE001 — advisory; the park stands
@@ -3706,9 +3709,17 @@ def _synthesize_fix_contracts(
 
     Fail-soft (the park is already the fail-closed state): a usage-limit or
     provider failure, a schema failure, or any adapter error records why on the
-    brief and returns. So does a worktree the agent dirtied — its contract is
-    discarded and the dirt is reported, never auto-reverted (the human sees it
-    at the park)."""
+    brief and returns.
+
+    The contract agent is read-only by contract. If it moves HEAD (a commit)
+    or dirties a tree that was clean, its contract is discarded and its changes
+    are reverted to the pre-call HEAD through the shared recovery transaction
+    (a durable snapshot keeps them for inspection), exactly as the FR-9.6
+    reviewer-mutation revert does. Left in place, a stray commit would be
+    adopted on the re-drive (operator commits made at a park are preserved) and
+    a stray artifact edit would be baseline-committed as the builder's work
+    (#172 second-round review). A revert that cannot complete is named on the
+    brief with the exact manual remedy."""
     from gauntlet.engine.steptypes import step_logger
 
     try:
@@ -3722,9 +3733,12 @@ def _synthesize_fix_contracts(
         grounding = _contract_grounding(ctx, step, cap, reads_repo, len(base))
         prompt = EB.contract_prompt(template, brief, grounding, wrap_as_data)
         was_clean = gitops.is_clean(ctx.work_root, exclude=ctx.excludes)
+        head_before = gitops.head_sha(ctx.work_root)
     except Exception as exc:  # noqa: BLE001
         EB.mark_unavailable(brief, agent, f"could not assemble the contract prompt: {exc}")
         return
+    result = None
+    call_error: str | None = None
     try:
         result = _run_sub(
             ctx, agent, prompt, schema=schema, usage=usage,
@@ -3733,23 +3747,71 @@ def _synthesize_fix_contracts(
             effort=effort,
         )
     except _ParkCycle as park:
-        EB.mark_unavailable(
-            brief, agent,
-            f"{park.result.parked_reason or 'transient'} failure: "
-            f"{_condense(park.result.notes or '')}",
-        )
-        return
+        call_error = (f"{park.result.parked_reason or 'transient'} failure: "
+                      f"{_condense(park.result.notes or '')}")
     except Exception as exc:  # noqa: BLE001 — schema/adapter error: advisory only
-        EB.mark_unavailable(brief, agent, f"{type(exc).__name__}: {exc}")
+        call_error = f"{type(exc).__name__}: {exc}"
+    # The mutation check runs whatever the call's outcome: an agent can edit
+    # (or commit) and THEN fail.
+    mutation = _revert_contract_mutation(
+        ctx, was_clean=was_clean, head_before=head_before
+    )
+    if mutation is not None:
+        EB.mark_unavailable(brief, agent, mutation)
         return
-    if was_clean and not gitops.is_clean(ctx.work_root, exclude=ctx.excludes):
-        EB.mark_unavailable(
-            brief, agent,
-            "the contract agent modified the worktree; contract discarded and "
-            "the changes left in place for inspection (`git status`)",
-        )
+    if call_error is not None or result is None:
+        EB.mark_unavailable(brief, agent, call_error or "no result")
         return
     EB.merge_contracts(brief, agent, result.structured or {})
+
+
+def _revert_contract_mutation(
+    ctx: StepContext, *, was_clean: bool, head_before: str,
+) -> str | None:
+    """Detect and undo worktree/HEAD changes made by the contract agent.
+
+    ``None`` when the agent left HEAD and the (clean) tree untouched; else the
+    note to record on the brief. Only a tree that was clean before the call is
+    reverted automatically — pre-existing dirt is never discarded by the engine.
+    """
+    head_now = gitops.head_sha(ctx.work_root)
+    dirty = not gitops.is_clean(ctx.work_root, exclude=ctx.excludes)
+    moved = head_now != head_before
+    if not moved and not (was_clean and dirty):
+        return None
+    what = " and ".join(
+        part for part, hit in (
+            (f"moved HEAD {head_before[:10]} → {head_now[:10]}", moved),
+            ("left uncommitted changes", was_clean and dirty),
+        ) if hit
+    )
+    remedy = (f"reset the run worktree to {head_before[:10]} (the pre-call "
+              "HEAD) before resuming")
+    if not was_clean:
+        return (f"the contract agent {what}; contract discarded. The worktree "
+                "was already dirty before the call, so the engine reverted "
+                f"nothing — {remedy}, keeping any changes of your own")
+    try:
+        rewind = _apply_cycle_rewind(
+            ctx,
+            site="cycle.contract_mutation_revert",
+            target_sha=head_before,
+            recorded_sha=head_before,
+            cause=RX.RecoveryCause.POLICY_DENIED,
+            reason=f"fix-contract agent mutation during {ctx.record.id} escalation",
+            snapshot_id=f"{ctx.record.id}-contract-mutation",
+            reset_mode=RX.RESET_PLAIN,
+        )
+    except Exception as exc:  # noqa: BLE001 — named on the brief; the park stands
+        return (f"the contract agent {what}; contract discarded, and the "
+                f"automatic revert failed ({exc}) — {remedy}")
+    if (gitops.head_sha(ctx.work_root) != head_before
+            or not gitops.is_clean(ctx.work_root, exclude=ctx.excludes)):
+        return (f"the contract agent {what}; contract discarded, and the "
+                f"revert left residue — {remedy}")
+    snap = getattr(getattr(rewind, "snapshot", None), "ref", None)
+    return (f"the contract agent {what}; contract discarded and its changes "
+            "reverted" + (f" (snapshot kept at {snap})" if snap else ""))
 
 
 def _contract_grounding(
@@ -3760,6 +3822,10 @@ def _contract_grounding(
     itself). Never truncated — a partial spec is worse than a pointer."""
     root = ctx.repo_root.resolve()
     docs: list[tuple[str, str]] = []
+    # In an artifact cycle (prd-cycle / plan-cycle) the file under review is a
+    # DRAFT, not an approved constraint: labelling it "approved" would steer the
+    # agent to `amend_upstream` for an ordinary in-scope edit (#172 review).
+    under_review = step.get("artifact")
     for name in ("prd.md", "plan.md"):
         path = Path(ctx.artifacts.get(name) or (ctx.artifact_root / name))
         try:
@@ -3772,11 +3838,18 @@ def _contract_grounding(
     if not docs:
         return ("\n\n--- approved artifacts ---\nNo PRD/plan is available to "
                 "this run; write `no binding clause found` for grounding.\n")
-    inline = "".join(f"\n\n--- approved artifact: {n} ---\n{t}" for n, t in docs)
+    def label(n: str) -> str:
+        return (f"artifact under review: {n} (a DRAFT this cycle is editing — "
+                "NOT an approved constraint; a fix to it is fix_in_scope, never "
+                "amend_upstream)" if n == under_review else f"approved artifact: {n}")
+
+    inline = "".join(f"\n\n--- {label(n)} ---\n{t}" for n, t in docs)
     if cap is None or base_len + len(inline) <= cap - _REVIEW_PROMPT_HEADROOM:
         return inline
     paths = ", ".join(
-        str(Path(ctx.artifacts.get(n) or (ctx.artifact_root / n))) for n, _ in docs
+        str(Path(ctx.artifacts.get(n) or (ctx.artifact_root / n)))
+        + (" [under review: a draft, not approved]" if n == under_review else "")
+        for n, _ in docs
     )
     how = ("Read them yourself, read-only." if reads_repo else
            "They are too large to inline and you cannot read the repository: "

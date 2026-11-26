@@ -374,3 +374,134 @@ def test_status_escalation_none_for_other_steps(tmp_path):
         tmp_path, StepRecord(id="g", type="human_gate")) is None
     assert op.compute_escalation_context(
         tmp_path, StepRecord(id="cycle", type="adversarial_cycle")) is None  # no brief
+
+
+# --- #172 review fixes ---------------------------------------------------------
+def test_consumed_response_still_carries_its_contract(cycle_repo):
+    """F-001: a re-drive that hit a usage-limit park consumed the response; the
+    plain resume that continues the same authorized work must still hand the
+    fixer the contract the operator ruled on (not just the decision text)."""
+    _seed_brief(cycle_repo, response_count=0)
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {}))
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(V("F-001")),
+                "builder": builder}
+    record = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[
+        _response("F-001: approve as proposed", state="consumed")])
+    status, _ = _drive_with_record(cycle_repo, adapters, record)
+    assert status == M.RUN_DONE
+    assert "CONTRACT-SENTINEL" in builder.calls[0]["prompt"]
+    assert "F-001: approve as proposed" in builder.calls[0]["prompt"]
+
+
+def test_brief_answered_by_an_earlier_response_is_not_reinjected(cycle_repo):
+    """Second-round review: a brief stays on disk across non-escalation parks.
+    Once a later response answers some OTHER park, the old contracts must not
+    be presented as what that response answers."""
+    _seed_brief(cycle_repo, response_count=0)
+    reviewer = SeqAdapter(REVIEW(F("F-001")), CONFIRM(CV("F-001")))
+    builder = SeqAdapter(writer("src.py", "fixed\n", {}))
+    adapters = {"reviewer": reviewer, "triage": SeqAdapter(V("F-001")),
+                "builder": builder}
+    record = StepRecord(id="cycle", type="adversarial_cycle", human_responses=[
+        _response("F-001: approve", state="consumed"),
+        _response("verifier is fine now, carry on", ordinal=2),
+    ])
+    _drive_with_record(cycle_repo, adapters, record)
+    assert "CONTRACT-SENTINEL" not in reviewer.calls[0]["prompt"]
+    assert "CONTRACT-SENTINEL" not in builder.calls[0]["prompt"]
+
+
+def test_distinct_new_findings_keep_distinct_brief_entries():
+    """F-002: every ordinary new finding from the final confirm pass carries
+    the placeholder id NEW; each must stay its own brief entry."""
+    brief = EB.build_brief(
+        step_id="c", iteration=None, phase="P1", kind=EB.KIND_MAX_ROUNDS, notes="n",
+        open_findings=[
+            {**F("NEW", "blocking", claim="race in reader"), "confirm_verdict": "new_finding"},
+            {**F("NEW", "blocking", claim="leak in writer"), "confirm_verdict": "new_finding"},
+            F("F-001", "blocking"),
+        ],
+        verdicts_by_id={}, history=EB.FixHistory(), response_count=0,
+    )
+    ids = [it["finding_id"] for it in brief["findings"]]
+    assert ids == ["NEW-1", "NEW-2", "F-001"]
+    assert [it["claim"] for it in brief["findings"][:2]] == [
+        "race in reader", "leak in writer"]
+    EB.merge_contracts(brief, "contract", {"contracts": [
+        _contract("NEW-1"), _contract("NEW-2"), _contract("F-001")], "summary": ""})
+    assert all(it["proposed_contract"] for it in brief["findings"])
+
+
+def test_contract_text_is_capped():
+    brief = EB.build_brief(
+        step_id="c", iteration=None, phase="P1", kind=EB.KIND_CLOSURE, notes="n",
+        open_findings=[F("F-001")], verdicts_by_id={}, history=EB.FixHistory(),
+        response_count=0,
+    )
+    EB.merge_contracts(brief, "contract", {"contracts": [
+        {**_contract(), "proposed_change": "x" * 50_000}], "summary": ""})
+    change = brief["findings"][0]["proposed_contract"]["proposed_change"]
+    assert len(change) == EB._CONTRACT_FIELD_LIMIT and change.endswith("…")
+
+
+def test_contract_agent_that_commits_is_reverted(cycle_repo):
+    """Second-round review: a commit by the contract agent moved HEAD and went
+    undetected; left in place it would be adopted on the re-drive."""
+    import subprocess
+
+    def commit_then_answer(cwd):
+        (Path(cwd) / "stray.txt").write_text("oops\n")
+        for args in (["add", "stray.txt"],
+                     ["-c", "user.name=x", "-c", "user.email=x@x", "commit",
+                      "-qm", "contract agent was here"]):
+            subprocess.run(["git", "-C", str(cwd), *args], check=True)
+        return {"contracts": [_contract()], "summary": ""}
+
+    head = lambda: subprocess.run(  # noqa: E731
+        ["git", "-C", str(cycle_repo), "log", "--format=%s"],
+        capture_output=True, text=True, check=True).stdout
+    status, man, run_dir = run_cycle(
+        cycle_repo, _exhausting_adapters(contract=SeqAdapter(commit_then_answer)),
+        config=CONTRACT_CONFIG,
+        step_extra={"escalation_agent": "esc", "fix_contract_agent": "contract"},
+    )
+    assert status == M.RUN_PARKED
+    brief = json.loads(_brief_path(run_dir).read_text())
+    assert brief["contract"]["status"] == EB.CONTRACT_UNAVAILABLE
+    assert "moved HEAD" in brief["contract"]["error"]
+    assert "reverted" in brief["contract"]["error"]
+    assert brief["findings"][0]["proposed_contract"] is None
+    assert not (cycle_repo / "stray.txt").exists()
+    assert "contract agent was here" not in head()
+
+
+def test_contract_step_engine_error_still_parks(cycle_repo, monkeypatch):
+    """Second-round review: the contract step is advisory end to end — an
+    engine error after the call degrades to a note, never a crashed step."""
+    def boom(*a, **k):
+        raise RuntimeError("merge exploded")
+
+    monkeypatch.setattr(EB, "merge_contracts", boom)
+    contract = SeqAdapter({"contracts": [_contract()], "summary": ""})
+    status, man, run_dir = run_cycle(
+        cycle_repo, _exhausting_adapters(contract=contract), config=CONTRACT_CONFIG,
+        step_extra={"escalation_agent": "esc", "fix_contract_agent": "contract"},
+    )
+    assert status == M.RUN_PARKED
+    assert man.record("cycle").parked_reason == M.PARKED_REASON_RESPONSE
+    brief = json.loads(_brief_path(run_dir).read_text())
+    assert brief["contract"]["status"] == EB.CONTRACT_UNAVAILABLE
+    assert "merge exploded" in brief["contract"]["error"]
+
+
+def test_artifact_under_review_is_labelled_a_draft(tmp_path):
+    from gauntlet.engine.cycle import _contract_grounding
+
+    (tmp_path / "prd.md").write_text("PRD-BODY\n")
+    (tmp_path / "plan.md").write_text("PLAN-BODY\n")
+    ctx = SimpleNamespace(repo_root=tmp_path, artifact_root=tmp_path, artifacts={})
+    text = _contract_grounding(ctx, {"artifact": "plan.md"}, None, False, 0)
+    assert "approved artifact: prd.md" in text
+    assert "approved artifact: plan.md" not in text
+    assert "artifact under review: plan.md (a DRAFT" in text

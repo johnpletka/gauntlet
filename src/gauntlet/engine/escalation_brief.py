@@ -60,6 +60,13 @@ RECOMMENDATIONS = ("fix_in_scope", "amend_upstream", "decline")
 
 _CLAIM_LIMIT = 240
 _NOTE_LIMIT = 400
+# Per-field cap on agent-drafted contract text. Contracts are re-injected into
+# the reviewer, every per-finding triage prompt and the fixer on the re-drive,
+# so an unbounded contract could push those prompts past their input caps.
+_CONTRACT_FIELD_LIMIT = 1500
+# The placeholder id `_open_after_confirm` gives an ordinary new finding the
+# final confirm pass raised; the brief renumbers them so each stays distinct.
+_NEW_FINDING_ID = "NEW"
 
 # Used when the asset root predates this schema (an adopter that has not run
 # `gauntlet upgrade`), so a configured contract agent still gets a schema.
@@ -120,6 +127,12 @@ def _condense(text: object, limit: int) -> str:
         return ""
     one = " ".join(text.split())
     return one if len(one) <= limit else one[: limit - 1] + "…"
+
+
+def _cap(text: object, limit: int) -> str:
+    """Truncate agent text to ``limit`` chars, keeping its line structure."""
+    out = str(text or "").strip()
+    return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
 
 
 # --- fix history (accumulated by the cycle, one entry per confirm) ---------------
@@ -214,8 +227,15 @@ def build_brief(
     now = now or datetime.now(timezone.utc)
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
+    new_seq = 0
     for f in open_findings:
         fid = str(f.get("id") or "?")
+        if fid == _NEW_FINDING_ID:
+            # Every new finding the final confirm pass raised carries the same
+            # placeholder id; give each its own so none is collapsed into
+            # another and each gets its own contract and decision (#172 F-002).
+            new_seq += 1
+            fid = f"{_NEW_FINDING_ID}-{new_seq}"
         if fid in seen:
             continue
         seen.add(fid)
@@ -316,9 +336,9 @@ def merge_contracts(brief: dict[str, Any], agent: str, structured: dict[str, Any
             continue
         rec = c.get("recommendation")
         item["proposed_contract"] = {
-            "proposed_change": str(c.get("proposed_change") or ""),
-            "grounding": str(c.get("grounding") or ""),
-            "acceptance_check": str(c.get("acceptance_check") or ""),
+            "proposed_change": _cap(c.get("proposed_change"), _CONTRACT_FIELD_LIMIT),
+            "grounding": _cap(c.get("grounding"), _CONTRACT_FIELD_LIMIT),
+            "acceptance_check": _cap(c.get("acceptance_check"), _CONTRACT_FIELD_LIMIT),
             "recommendation": rec if rec in RECOMMENDATIONS else None,
         }
         item["decision_owed"] = _decision_owed(
@@ -379,13 +399,25 @@ def load_for_step(run_dir: Path, step_id: str, iteration: int | None) -> dict[st
 
 def load_answered(run_dir: Path, step_id: str, iteration: int | None,
                   responses: list[Any]) -> dict[str, Any] | None:
-    """The brief a pending ``--response`` answers, or ``None``.
+    """The brief the latest ``--response`` answers, or ``None``.
 
-    Requires the latest response to be pending (we are on the re-drive that
-    consumes it) and the brief to predate it (``response_count`` below the
-    current count) — a brief written after the latest response is a newer
-    park the human has not answered yet."""
-    if not responses or getattr(responses[-1], "state", None) != "pending":
+    The brief records how many responses the step had when it was written
+    (``response_count``). The latest response answers it exactly when that
+    count is ``len(responses) - 1``: the brief was the park immediately before
+    the latest response.
+
+    * A brief written AFTER the latest response (count == len) is a newer park
+      the human has not answered yet — never injected.
+    * A brief from an older park (count < len - 1) was answered by an earlier
+      response; the latest one answers some later park (a verifier
+      fail-closed, a vacuous-convergence re-park, …) whose subject is not this
+      brief — never injected (#172 second-round review).
+    * The response's ``pending``/``consumed`` state does NOT matter: a re-drive
+      that hit a usage-limit park consumes the response, and the plain
+      ``resume`` that continues the same authorized work must still see the
+      contracts the operator ruled on (#172 F-001). The decision block itself
+      renders every response regardless of state, so the two stay paired."""
+    if not responses:
         return None
     brief = load_for_step(run_dir, step_id, iteration)
     if brief is None:
@@ -394,7 +426,7 @@ def load_answered(run_dir: Path, step_id: str, iteration: int | None,
         count = int(brief.get("response_count", -1))
     except (TypeError, ValueError):
         return None
-    return brief if 0 <= count < len(responses) else None
+    return brief if count == len(responses) - 1 else None
 
 
 def answered_contracts_block(brief: dict[str, Any], wrap: Callable[[str], str]) -> str:
@@ -442,7 +474,7 @@ def status_block(brief: dict[str, Any], *, responses_now: int,
             "claim": r(it.get("claim")),
             "triage_verdict": tri.get("verdict"),
             "triage_action": tri.get("action"),
-            "target_artifact": tri.get("target_artifact"),
+            "target_artifact": r(tri.get("target_artifact")),
             "residual_gap": (
                 {"verdict": gap.get("verdict"), "notes": r(gap.get("notes"))}
                 if isinstance(gap, dict) else None
@@ -458,7 +490,7 @@ def status_block(brief: dict[str, Any], *, responses_now: int,
                 )} | {"recommendation": pc.get("recommendation")}
                 if isinstance(pc, dict) else None
             ),
-            "decision_owed": it.get("decision_owed"),
+            "decision_owed": r(it.get("decision_owed")),
         })
     contract = brief.get("contract") or {}
     try:
