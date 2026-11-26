@@ -226,6 +226,9 @@ def test_section_6_2_example_validates():
         "suspension": None,
         # PRD §6 gate block: always present, body populated in P8; null for now.
         "gate": None,
+        # Additive #163 field: the escalation brief on a cycle parked for a
+        # response; always present, null otherwise.
+        "escalation": None,
         # Additive P6 field (recovery-redesign plan §4.6): journal ↔ projection
         # agreement — always present, null when the projection is healthy.
         "projection": None,

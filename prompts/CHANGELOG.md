@@ -70,3 +70,13 @@ apply, so the file reads oldest-first.
   reach the classifier (PRD Open Question 6). Remote reads are qualified as
   fast-pathed and outside the network-denied verifier. operator.md is
   reflowed. Descriptions only; no pattern, flag, rule id or version changed.
+
+- **escalation-contract.md / schemas/fix-contract.json / pipelines** (#163):
+  add the fix-contract prompt and schema for the optional `fix_contract_agent`
+  on an `adversarial_cycle`. At an escalation park it drafts, per open finding,
+  the change the next fix round should make, the approved-artifact clause that
+  binds it, and an acceptance check, so the human approves or redlines a
+  proposal instead of reconstructing context from raw findings. The standard
+  and review pipelines set `fix_contract_agent: escalation`.
+- **operator.md** (#163): document the escalation brief on a cycle escalation
+  park and the per-item response form.

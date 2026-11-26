@@ -46,6 +46,7 @@ from gauntlet.adapters.base import (
     SessionNotFoundError,
 )
 from gauntlet.engine import ensemble
+from gauntlet.engine import escalation_brief as EB
 from gauntlet.engine import gitops
 from gauntlet.engine import manifest as M
 from gauntlet.engine import recovery_exec as RX
@@ -82,6 +83,9 @@ CYCLE_PROMPT_DEFAULTS = {
     "triage_prompt": "prompts/triage.md",
     "fix_prompt": "prompts/cycle-fix.md",
     "confirm_prompt": "prompts/cycle-confirm.md",
+    # #163: loaded only on an escalation park when `fix_contract_agent` is set,
+    # but hashed regardless so the manifest pins the full prompt set.
+    "fix_contract_prompt": EB.DEFAULT_CONTRACT_PROMPT,
 }
 
 REJECT_VERDICTS = frozenset({"bikeshedding", "premature_optimization", "not_applicable"})
@@ -704,6 +708,11 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     surfaced: dict[str, dict[str, Any]] = {}  # non-blocking opens, for the gate
     last_forcing: list[dict[str, Any]] = []  # what forced the last round (post-loop)
     resume_notes: list[str] = []  # FR-4.1/FR-4.2 audit lines for the final result
+    # #163: per-finding fix history (each round's fix SHA + confirm verdict),
+    # rebuilt on resume from reused confirms, for the escalation brief.
+    fix_history = EB.FixHistory()
+    last_verdicts: list[dict[str, Any]] = []  # latest round's triage verdicts
+    rounds_run = 0
 
     # Artifact-mode baseline commit (FR-5.1 ↔ FR-9.3). In `standard.yaml` the
     # plan-author writes plan.md, then plan-cycle reviews it with no commit step
@@ -823,7 +832,27 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         if resume_notes:
             extra = "\n".join(resume_notes)
             result.notes = f"{result.notes}\n{extra}" if result.notes else extra
+        if result.status == DONE:
+            # Absent > stale (#163): a converged cycle owes no human decision, so
+            # its escalation brief must not resurface on a later re-drive.
+            _drop_escalation_brief(ctx)
         return _finish(result, usage, commits, artifact_writes, metrics)
+
+    def escalate(
+        notes: str, kind: str, open_findings: list[dict[str, Any]],
+        verdicts: list[dict[str, Any]], surfaced_ids: list[str] = (),  # type: ignore[assignment]
+    ) -> StepResult:
+        # Every cycle escalation park carries a pre-digested brief (#163). The
+        # brief is advisory: whatever happens building it, the cycle still parks.
+        suffix = _write_escalation_brief(
+            step, ctx, phase=phase, kind=kind, notes=notes,
+            open_findings=open_findings, verdicts=verdicts,
+            history=fix_history, surfaced_ids=list(surfaced_ids),
+            rounds_run=rounds_run, usage=usage, effort=cycle_effort,
+        )
+        return finish(StepResult(
+            status=PARKED, notes=f"{notes}\n{suffix}" if suffix else notes,
+            parked_reason=M.PARKED_REASON_RESPONSE))
 
     # FR-1.2: the SHA the previous round's reviewer saw the artifact at — the
     # "last reviewed version" a round-2+ artifact diff is scoped against. Advanced
@@ -831,6 +860,7 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
     # with reuse (a reused round still advances `handoff`).
     prev_review_handoff: str | None = None
     for rnd in range(1, max_rounds + 1):
+        rounds_run = rnd
         # FR-4.1 reuse is ordered-prefix and FAIL-CLOSED (review F-001): a
         # checkpoint whose round-scoped artifact is missing (corruption / manual
         # deletion) is NOT reused, and it ends reuse for every later sub-step too —
@@ -1117,9 +1147,18 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                 f"from round-{rnd} findings ({', '.join(stray)}); refusing to "
                 "surface a phantom escalation (findings/triage desync)"
             )))
+        last_verdicts = verdicts
         if park_reason is not None:
-            return finish(StepResult(status=PARKED, notes=park_reason,
-                                     parked_reason=M.PARKED_REASON_RESPONSE))
+            needs_human_ids = {
+                v["finding_id"] for v in verdicts
+                if v.get("escalated")
+                and (not step.get("escalation_agent") or v.get("confidence") == "low")
+            }
+            return escalate(
+                park_reason, EB.KIND_TRIAGE,
+                [f for f in triage_findings if f.get("id") in needs_human_ids],
+                verdicts,
+            )
         if not reuse_triage:  # checkpoint the completed, integrity-checked batch
             _checkpoint(ctx, "triage", rnd, handoff, data={"verdicts": verdicts})
 
@@ -1151,10 +1190,12 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
                     "finding(s) whose fix lands in an upstream artifact "
                     f"(FR-10.4 upstream invalidation): {', '.join(upstream)}"
                 )
-            return finish(StepResult(
-                status=PARKED,
-                notes="escalation: " + "; ".join(reasons),
-                parked_reason=M.PARKED_REASON_RESPONSE))
+            closure_ids = set(unfixed_blockers) | set(upstream)
+            return escalate(
+                "escalation: " + "; ".join(reasons), EB.KIND_CLOSURE,
+                [f for f in triage_findings if f.get("id") in closure_ids],
+                verdicts,
+            )
 
         accepted = [v for v in verdicts if v["action"] == "fix_now"]
         if not accepted:
@@ -1325,6 +1366,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         open_items, reconciliation = _open_after_confirm(
             by_id, actions, cdata, new_remainders
         )
+        fix_history.record_round(
+            rnd, fix_sha, [v["finding_id"] for v in accepted], cdata, new_remainders
+        )
         if demoted_carries:
             # B2 guard audit trail: forged/stale carried_from references were
             # demoted to ordinary regressions — record why, next to the verdicts.
@@ -1379,15 +1423,17 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
 
     # max_rounds exhausted (FR-10.5): open blockers escalate, never carry forward.
     if last_forcing:
-        return finish(StepResult(
-            status=PARKED,
-            notes="escalation (FR-10.5): max_rounds="
+        return escalate(
+            "escalation (FR-10.5): max_rounds="
             f"{max_rounds} exhausted with open "
             f"{'finding' if convergence == 'strict' else 'blocking'}(s): "
             f"{_fmt_ids(last_forcing)}; a human must resolve"
             + (f". Also surfaced (non-blocking): {', '.join(surfaced)}"
                if surfaced else ""),
-            parked_reason=M.PARKED_REASON_RESPONSE))
+            EB.KIND_MAX_ROUNDS, last_forcing, last_verdicts,
+            surfaced_ids=[s for s in surfaced
+                          if s not in {str(f.get("id")) for f in last_forcing}],
+        )
     return finish(StepResult(
         status=DONE,
         notes=f"max_rounds={max_rounds} reached with non-blocking items "
@@ -2303,7 +2349,22 @@ def _human_decision_block(ctx: StepContext) -> str:
         "empty findings array.\n"
         + render_human_responses(responses)
         + "\n--- END HUMAN DECISION(S) ---"
+        + _answered_contracts_block(ctx)
     )
+
+
+def _answered_contracts_block(ctx: StepContext) -> str:
+    """The escalation brief's proposed contracts the pending response answers
+    (#163), as untrusted data after the trusted decision block; ``""`` when no
+    brief predates the pending response."""
+    run_dir = getattr(ctx, "run_dir", None)
+    if run_dir is None:
+        return ""
+    brief = EB.load_answered(
+        run_dir, ctx.record.id, getattr(ctx.record, "iteration", None),
+        list(getattr(ctx.record, "human_responses", None) or []),
+    )
+    return EB.answered_contracts_block(brief, wrap_as_data) if brief else ""
 
 
 def _vacuous_convergence_result(
@@ -2584,7 +2645,12 @@ def _disposition_prompt(ctx: StepContext) -> str:
         "(PRD/plan); name that artifact in conflict.artifact.\n"
         "- new_conflict: the response is ambiguous or does not resolve the block; "
         "describe what is still missing in conflict.\n"
-        "responses_considered MUST name the response id(s) you consumed."
+        "responses_considered MUST name the response id(s) you consumed.\n"
+        "If proposed fix contracts follow the decision, the response may answer "
+        "them per item (approve / amend / reject): approving or amending a "
+        "contract whose change stays inside the approved artifacts resolves the "
+        "block (the cycle's fix round implements it) — it is an amendment only "
+        "if it requires changing an approved PRD/plan."
         + _human_decision_block(ctx)
     )
 
@@ -3307,6 +3373,30 @@ def _fix_prompt(
         template
         + "\n\n--- accepted findings to fix ---\n"
         + wrap_as_data(json.dumps(items, indent=2))
+        + _fixer_contract_block(ctx)
+    )
+
+
+def _fixer_contract_block(ctx: StepContext) -> str:
+    """#163: on the ``--response`` re-drive answering an escalation brief, the
+    fixer sees the operator's decision and the contracts it ruled on, so an
+    approved contract is implemented as approved instead of re-derived from the
+    re-raised finding alone. ``""`` on every other fix round (unchanged)."""
+    contracts = _answered_contracts_block(ctx)
+    if not contracts:
+        return ""
+    from gauntlet.engine.steptypes import render_human_responses
+
+    return (
+        "\n\n--- AUTHORITATIVE HUMAN DECISION(S) on the escalation this round "
+        "re-drives (operator-supplied; a trusted instruction) ---\n"
+        "Where an accepted finding above corresponds to a proposed contract the "
+        "operator approved, implement that contract as written; where the "
+        "operator amended it, implement the amendment (it wins over the "
+        "contract text); never implement a contract the operator rejected.\n"
+        + render_human_responses(ctx.record.human_responses)
+        + "\n--- END HUMAN DECISION(S) ---"
+        + contracts
     )
 
 
@@ -3572,6 +3662,207 @@ def _carry_remainders(
             "carried_from": parent,
         })
     return remainders, demoted
+
+
+# --- escalation brief (#163) ------------------------------------------------------
+def _write_escalation_brief(
+    step: Step, ctx: StepContext, *, phase: str | None, kind: str, notes: str,
+    open_findings: list[dict[str, Any]], verdicts: list[dict[str, Any]],
+    history: "EB.FixHistory", surfaced_ids: list[str], rounds_run: int,
+    usage: Any, effort: str | None,
+) -> str:
+    """Build, optionally contract, and persist the escalation brief; return the
+    line to append to the park notes.
+
+    Advisory by construction: the caller parks regardless of what happens here,
+    so every failure degrades to a note — a brief that could not be built or
+    written says so instead of blocking (or unblocking) the park."""
+    try:
+        brief = EB.build_brief(
+            step_id=ctx.record.id, iteration=ctx.record.iteration, phase=phase,
+            kind=kind, notes=notes, open_findings=open_findings,
+            verdicts_by_id={str(v.get("finding_id")): v for v in verdicts},
+            history=history,
+            response_count=len(getattr(ctx.record, "human_responses", None) or []),
+            surfaced_ids=surfaced_ids, rounds_run=rounds_run,
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory; the park stands
+        return (f"Escalation brief unavailable (engine error: {exc}); read "
+                "findings.json / triage.json / confirm.json directly.")
+    agent = step.get("fix_contract_agent")
+    if agent and brief["findings"]:
+        try:
+            _synthesize_fix_contracts(step, ctx, agent, brief, usage, effort)
+        except Exception as exc:  # noqa: BLE001 — advisory; the park stands
+            EB.mark_unavailable(brief, agent, f"contract step error: {exc}")
+    try:
+        _write_artifact(ctx, EB.BRIEF_ARTIFACT, brief)
+    except Exception as exc:  # noqa: BLE001 — advisory; the park stands
+        return f"Escalation brief could not be written ({exc})."
+    return EB.park_note_suffix(brief)
+
+
+def _synthesize_fix_contracts(
+    step: Step, ctx: StepContext, agent: str, brief: dict[str, Any],
+    usage: Any, effort: str | None,
+) -> None:
+    """One structured call to ``fix_contract_agent`` for the proposed contracts.
+
+    Fail-soft (the park is already the fail-closed state): a usage-limit or
+    provider failure, a schema failure, or any adapter error records why on the
+    brief and returns.
+
+    The contract agent is read-only by contract. If it moves HEAD (a commit)
+    or dirties a tree that was clean, its contract is discarded and its changes
+    are reverted to the pre-call HEAD through the shared recovery transaction
+    (a durable snapshot keeps them for inspection), exactly as the FR-9.6
+    reviewer-mutation revert does. Left in place, a stray commit would be
+    adopted on the re-drive (operator commits made at a park are preserved) and
+    a stray artifact edit would be baseline-committed as the builder's work
+    (#172 second-round review). A revert that cannot complete is named on the
+    brief with the exact manual remedy."""
+    from gauntlet.engine.steptypes import step_logger
+
+    try:
+        schema_path = ctx.repo_root / ctx.config.asset_root / EB.DEFAULT_CONTRACT_SCHEMA
+        schema = (json.loads(schema_path.read_text()) if schema_path.exists()
+                  else EB.BUILTIN_CONTRACT_SCHEMA)
+        template = _template(ctx, step, "fix_contract_prompt",
+                             EB.DEFAULT_CONTRACT_PROMPT, EB.BUILTIN_CONTRACT_PROMPT)
+        cap, reads_repo = profile_input_cap(ctx, agent)
+        base = EB.contract_prompt(template, brief, "", wrap_as_data)
+        grounding = _contract_grounding(ctx, step, cap, reads_repo, len(base))
+        prompt = EB.contract_prompt(template, brief, grounding, wrap_as_data)
+        was_clean = gitops.is_clean(ctx.work_root, exclude=ctx.excludes)
+        head_before = gitops.head_sha(ctx.work_root)
+    except Exception as exc:  # noqa: BLE001
+        EB.mark_unavailable(brief, agent, f"could not assemble the contract prompt: {exc}")
+        return
+    result = None
+    call_error: str | None = None
+    try:
+        result = _run_sub(
+            ctx, agent, prompt, schema=schema, usage=usage,
+            logger=step_logger(ctx, "escalation-contract"),
+            structured_name="contract.json", substep="escalation-contract",
+            effort=effort,
+        )
+    except _ParkCycle as park:
+        call_error = (f"{park.result.parked_reason or 'transient'} failure: "
+                      f"{_condense(park.result.notes or '')}")
+    except Exception as exc:  # noqa: BLE001 — schema/adapter error: advisory only
+        call_error = f"{type(exc).__name__}: {exc}"
+    # The mutation check runs whatever the call's outcome: an agent can edit
+    # (or commit) and THEN fail.
+    mutation = _revert_contract_mutation(
+        ctx, was_clean=was_clean, head_before=head_before
+    )
+    if mutation is not None:
+        EB.mark_unavailable(brief, agent, mutation)
+        return
+    if call_error is not None or result is None:
+        EB.mark_unavailable(brief, agent, call_error or "no result")
+        return
+    EB.merge_contracts(brief, agent, result.structured or {})
+
+
+def _revert_contract_mutation(
+    ctx: StepContext, *, was_clean: bool, head_before: str,
+) -> str | None:
+    """Detect and undo worktree/HEAD changes made by the contract agent.
+
+    ``None`` when the agent left HEAD and the (clean) tree untouched; else the
+    note to record on the brief. Only a tree that was clean before the call is
+    reverted automatically — pre-existing dirt is never discarded by the engine.
+    """
+    head_now = gitops.head_sha(ctx.work_root)
+    dirty = not gitops.is_clean(ctx.work_root, exclude=ctx.excludes)
+    moved = head_now != head_before
+    if not moved and not (was_clean and dirty):
+        return None
+    what = " and ".join(
+        part for part, hit in (
+            (f"moved HEAD {head_before[:10]} → {head_now[:10]}", moved),
+            ("left uncommitted changes", was_clean and dirty),
+        ) if hit
+    )
+    remedy = (f"reset the run worktree to {head_before[:10]} (the pre-call "
+              "HEAD) before resuming")
+    if not was_clean:
+        return (f"the contract agent {what}; contract discarded. The worktree "
+                "was already dirty before the call, so the engine reverted "
+                f"nothing — {remedy}, keeping any changes of your own")
+    try:
+        rewind = _apply_cycle_rewind(
+            ctx,
+            site="cycle.contract_mutation_revert",
+            target_sha=head_before,
+            recorded_sha=head_before,
+            cause=RX.RecoveryCause.POLICY_DENIED,
+            reason=f"fix-contract agent mutation during {ctx.record.id} escalation",
+            snapshot_id=f"{ctx.record.id}-contract-mutation",
+            reset_mode=RX.RESET_PLAIN,
+        )
+    except Exception as exc:  # noqa: BLE001 — named on the brief; the park stands
+        return (f"the contract agent {what}; contract discarded, and the "
+                f"automatic revert failed ({exc}) — {remedy}")
+    if (gitops.head_sha(ctx.work_root) != head_before
+            or not gitops.is_clean(ctx.work_root, exclude=ctx.excludes)):
+        return (f"the contract agent {what}; contract discarded, and the "
+                f"revert left residue — {remedy}")
+    snap = getattr(getattr(rewind, "snapshot", None), "ref", None)
+    return (f"the contract agent {what}; contract discarded and its changes "
+            "reverted" + (f" (snapshot kept at {snap})" if snap else ""))
+
+
+def _contract_grounding(
+    ctx: StepContext, step: Step, cap: int | None, reads_repo: bool, base_len: int,
+) -> str:
+    """The run's PRD/plan for the contract agent: inlined when they fit the
+    profile's input cap, else by path (a repo-reading profile reads them
+    itself). Never truncated — a partial spec is worse than a pointer."""
+    root = ctx.repo_root.resolve()
+    docs: list[tuple[str, str]] = []
+    # In an artifact cycle (prd-cycle / plan-cycle) the file under review is a
+    # DRAFT, not an approved constraint: labelling it "approved" would steer the
+    # agent to `amend_upstream` for an ordinary in-scope edit (#172 review).
+    under_review = step.get("artifact")
+    for name in ("prd.md", "plan.md"):
+        path = Path(ctx.artifacts.get(name) or (ctx.artifact_root / name))
+        try:
+            resolved = path.resolve()
+            if root != resolved and root not in resolved.parents:
+                continue
+            docs.append((name, resolved.read_text()))
+        except OSError:
+            continue
+    if not docs:
+        return ("\n\n--- approved artifacts ---\nNo PRD/plan is available to "
+                "this run; write `no binding clause found` for grounding.\n")
+    def label(n: str) -> str:
+        return (f"artifact under review: {n} (a DRAFT this cycle is editing — "
+                "NOT an approved constraint; a fix to it is fix_in_scope, never "
+                "amend_upstream)" if n == under_review else f"approved artifact: {n}")
+
+    inline = "".join(f"\n\n--- {label(n)} ---\n{t}" for n, t in docs)
+    if cap is None or base_len + len(inline) <= cap - _REVIEW_PROMPT_HEADROOM:
+        return inline
+    paths = ", ".join(
+        str(Path(ctx.artifacts.get(n) or (ctx.artifact_root / n)))
+        + (" [under review: a draft, not approved]" if n == under_review else "")
+        for n, _ in docs
+    )
+    how = ("Read them yourself, read-only." if reads_repo else
+           "They are too large to inline and you cannot read the repository: "
+           "ground only in what the brief quotes, and say so in grounding.")
+    return f"\n\n--- approved artifacts (by reference: {paths}) ---\n{how}\n"
+
+
+def _drop_escalation_brief(ctx: StepContext) -> None:
+    """Remove this step's escalation brief (another step's is left alone)."""
+    brief = EB.load_for_step(ctx.run_dir, ctx.record.id, ctx.record.iteration)
+    if brief is not None:
+        (ctx.run_dir / "artifacts" / EB.BRIEF_ARTIFACT).unlink(missing_ok=True)
 
 
 def _fmt_ids(items: list[dict[str, Any]]) -> str:

@@ -330,7 +330,15 @@ own worktree off the branch's tip — never adopt or edit the run's.
   the judge like `approve`.
 - **Respond** to a `parked_for_response` park with the human's decision:
   `gauntlet resume <slug> --response "<decision>"`. The text is passed verbatim
-  to the agent that re-evaluates the conflict; be specific. **Phrasing trap:**
+  to the agent that re-evaluates the conflict; be specific. A cycle escalation
+  park carries an **escalation brief** (`status` renders it; `status --json`
+  has it as `escalation`; the file is `artifacts/escalation-brief.json`): per
+  open finding, the one-line claim, the residual gap, what each fix round did,
+  and — when the cycle sets `fix_contract_agent` — a proposed fix contract.
+  Decide from it rather than from the raw round files, and answer per item
+  (`"F-001: approve; F-002: amend — <redline>; F-003: reject — <reason>"`).
+  The re-drive hands the contracts you ruled on to the reviewer and fixer; your
+  response wins over any contract text. **Phrasing trap:**
   a response that *states* acceptance but contains imperative verbs ("record
   these digests…", "implement it as written") is routinely classified
   `amendment_required` and re-parked. For pure acceptance use

@@ -30,7 +30,8 @@ stages:
          phase: PRD, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: reviewer, lens: spec-coverage}],
-         escalation_agent: escalation, max_rounds: 2,
+         escalation_agent: escalation, fix_contract_agent: escalation,
+         max_rounds: 2,
          review_prompt: prompts/review-document.md}
       - {id: prd-approve, type: human_gate,
          show: [prd.md, findings.json, triage.json, confirm.json]}
@@ -72,7 +73,8 @@ stages:
          phase: PLAN, triager: triage, fixer: builder,
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: reviewer, lens: spec-coverage}],
-         escalation_agent: escalation, max_rounds: 3,
+         escalation_agent: escalation, fix_contract_agent: escalation,
+         max_rounds: 3,
          review_against: prd.md,
          review_prompt: prompts/review-document.md}
       # Deterministic structural gate (FR-5.1): the prose reviewer above never
@@ -153,7 +155,8 @@ stages:
          reviewers: [{profile: reviewer, lens: correctness},
                      {profile: reviewer, lens: spec-coverage}],
          verifier: verifier,
-         escalation_agent: escalation, max_rounds: 3,
+         escalation_agent: escalation, fix_contract_agent: escalation,
+         max_rounds: 3,
          review_prompt: prompts/review-code.md}
       # Post-cycle re-check (PR #59 review F1): the pre-cycle acceptance gate's
       # guarantee decays the moment a fix round touches a cited test — a P<N>.x

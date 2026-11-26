@@ -45,6 +45,31 @@
       {% endfor %}
       </tbody>
     </table>
+
+    {# --- escalation brief (#163): the decision pre-digested per finding --- #}
+    {% set eb = gate.brief %}
+    {% if eb %}
+      <details open class="escalation-brief">
+        <summary>Escalation brief — {{ eb.findings | length }} open item(s){% if eb.contract_status == "proposed" %}, proposed fix contracts{% endif %}</summary>
+        {% if eb.responses_since %}<p class="muted">Drafted before {{ eb.responses_since }} later response(s).</p>{% endif %}
+        {% if eb.contract_status == "unavailable" %}<p class="muted">Proposed contracts unavailable: {{ eb.contract_error }}</p>{% endif %}
+        {% if eb.contract_status == "not_configured" %}<p class="muted">Digest only — set <code>fix_contract_agent:</code> on the cycle step for proposed contracts.</p>{% endif %}
+        {% for f in eb.findings %}
+          <div class="brief-item">
+            <p><strong>{{ f.finding_id }}</strong> [{{ f.severity or "—" }}] {{ f.location or "" }} — {{ f.claim or "—" }}</p>
+            {% if f.residual_gap %}<p>Residual gap ({{ f.residual_gap.verdict }}): {{ f.residual_gap.notes }}</p>{% endif %}
+            {% if f.fix_rounds %}
+              <ul>{% for e in f.fix_rounds %}<li>Round {{ e.round }} fix <code>{{ (e.fix_sha or "")[:10] }}</code>: {{ e.verdict }} — {{ e.notes }}</li>{% endfor %}</ul>
+            {% endif %}
+            {% if f.proposed_contract %}
+              <p>Proposed contract{% if f.proposed_contract.recommendation %} [{{ f.proposed_contract.recommendation }}]{% endif %}: {{ f.proposed_contract.proposed_change }}</p>
+              <p class="muted">Grounding: {{ f.proposed_contract.grounding }} · Acceptance: {{ f.proposed_contract.acceptance_check }}</p>
+            {% endif %}
+            <p class="muted">Decision owed: {{ f.decision_owed }}</p>
+          </div>
+        {% endfor %}
+      </details>
+    {% endif %}
   {% endif %}
 
   {# --- gate show: artifacts (FR-4.3): rendered readably --- #}

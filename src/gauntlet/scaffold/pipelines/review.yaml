@@ -43,7 +43,8 @@ stages:
       #    timeout_s: 1800}
       - {id: review-cycle, type: adversarial_cycle, mode: code_review,
          phase: REVIEW, reviewer: reviewer, triager: triage, fixer: builder,
-         escalation_agent: escalation, max_rounds: 1,
+         escalation_agent: escalation, fix_contract_agent: escalation,
+         max_rounds: 1,
          review_prompt: prompts/review-code-intent.md}
          # review_base / max_rounds / intent_* are injected by the review command
          # from the FR-5 base resolution and FR-2 intent resolution.

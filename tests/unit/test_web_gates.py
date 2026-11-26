@@ -288,6 +288,56 @@ def test_escalation_handoff_assembles_prompt_only(fixture_repo):
     assert h.invocation.startswith("claude")
 
 
+def _write_escalation_brief(run_dir: Path, *, contract: bool = True) -> None:
+    from gauntlet.engine import escalation_brief as EB
+
+    history = EB.FixHistory()
+    history.record_round(1, "abc1234567890", ["F-003"], {"verdicts": [
+        {"finding_id": "F-003", "verdict": "partially_resolved",
+         "notes": "BRIEF-GAP-SENTINEL: section 3 still contradicts the PRD"}]})
+    brief = EB.build_brief(
+        step_id="impl-cycle", iteration=None, phase="P2", kind=EB.KIND_CLOSURE,
+        notes="escalation: ...",
+        open_findings=[{"id": "F-003", "severity": "blocking", "claim": "plan is wrong",
+                        "location": "plan.md §3"}],
+        verdicts_by_id={"F-003": {"verdict": "legitimate", "action": "defer",
+                                  "target_artifact": "plan.md"}},
+        history=history, response_count=0,
+    )
+    if contract:
+        EB.merge_contracts(brief, "escalation", {"contracts": [{
+            "finding_id": "F-003", "proposed_change": "BRIEF-CONTRACT-SENTINEL",
+            "grounding": "PRD §3", "acceptance_check": "plan §3 matches PRD §3",
+            "recommendation": "amend_upstream"}], "summary": ""})
+    (run_dir / "artifacts" / EB.BRIEF_ARTIFACT).write_text(json.dumps(brief))
+
+
+def test_escalation_view_carries_brief(fixture_repo):
+    # #163: the escalation park shows the pre-digested brief, not just raw rows.
+    _write_escalation_brief(_escalation_run(fixture_repo))
+    view = GateResolver(_store(fixture_repo)).gate("demo")
+    assert view.brief is not None and view.brief["contract_status"] == "proposed"
+    [f] = view.brief["findings"]
+    assert f["proposed_contract"]["proposed_change"] == "BRIEF-CONTRACT-SENTINEL"
+    assert "BRIEF-GAP-SENTINEL" in f["residual_gap"]["notes"]
+    h = handoff_prompt(view)
+    assert "BRIEF-CONTRACT-SENTINEL" in h.prompt and "BRIEF-GAP-SENTINEL" in h.prompt
+
+
+def test_escalation_view_without_brief_is_unchanged(fixture_repo):
+    _escalation_run(fixture_repo)  # a park from before #163: no brief on disk
+    view = GateResolver(_store(fixture_repo)).gate("demo")
+    assert view.brief is None and view.escalated[0].finding_id == "F-003"
+
+
+def test_recovery_panel_renders_escalation_brief(fixture_repo):
+    _write_escalation_brief(_escalation_run(fixture_repo))
+    html = _client(fixture_repo).get("/runs/demo", headers={TOKEN_HEADER: TOKEN}).text
+    assert "Escalation brief" in html
+    assert "BRIEF-CONTRACT-SENTINEL" in html and "BRIEF-GAP-SENTINEL" in html
+    assert "abc1234567" in html and "amend_upstream" in html
+
+
 # --------------------------------------------------------------------------- #
 # deterministic phase diff (FR-4.3)
 # --------------------------------------------------------------------------- #

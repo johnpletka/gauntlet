@@ -1580,7 +1580,8 @@ class Orchestrator:
     # because ``step.agent`` is unset (F-002). ``confirmer`` defaults to the
     # reviewer profile (already covered by ``reviewer``); listing it still
     # correctly checks a distinct confirmer profile when one is configured.
-    _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent")
+    _CYCLE_ROLES = ("reviewer", "triager", "fixer", "confirmer", "escalation_agent",
+                    "fix_contract_agent")
 
     def _admission_profiles(self, step: Step) -> dict[str, int]:
         """The agent profiles whose provider window this step must clear, mapped to
@@ -1607,7 +1608,8 @@ class Orchestrator:
             for member in _panel(step):  # reviewer / panel members, N per profile
                 if member.profile:
                     counts[member.profile] = counts.get(member.profile, 0) + 1
-            for role in ("triager", "fixer", "confirmer", "escalation_agent"):
+            for role in ("triager", "fixer", "confirmer", "escalation_agent",
+                         "fix_contract_agent"):
                 profile = step.get(role)
                 if profile and profile not in counts:  # dedup vs the panel
                     counts[profile] = 1
