@@ -233,9 +233,12 @@ def test_contract_agent_that_dirties_the_tree_is_discarded(cycle_repo):
     assert status == M.RUN_PARKED
     brief = json.loads(_brief_path(run_dir).read_text())
     assert brief["contract"]["status"] == EB.CONTRACT_UNAVAILABLE
-    assert "modified the worktree" in brief["contract"]["error"]
+    assert "left uncommitted changes" in brief["contract"]["error"]
+    assert "reverted" in brief["contract"]["error"]
     assert brief["findings"][0]["proposed_contract"] is None
-    assert (cycle_repo / "stray.txt").exists()  # reported, never auto-reverted
+    # reverted to the pre-call HEAD (snapshot kept), never left for the
+    # re-drive to adopt or baseline-commit (#172 second-round review)
+    assert not (cycle_repo / "stray.txt").exists()
 
 
 def test_merge_contracts_with_no_match_is_unavailable():
