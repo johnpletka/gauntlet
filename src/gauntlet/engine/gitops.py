@@ -176,6 +176,7 @@ ROOT_SCOPE: dict[str, str] = {
     "mktree": ROOT_SCOPE_REPO,
     "commit_tree": ROOT_SCOPE_REPO,
     "commit_file_to_branch": ROOT_SCOPE_REPO,  # object-db + ref CAS; touches no checkout (#164)
+    "commit_files_to_branch": ROOT_SCOPE_REPO,  # same, several files in one commit (#169)
     "commit_subject": ROOT_SCOPE_REPO,
     "commit_parent": ROOT_SCOPE_REPO,
     "commit_message": ROOT_SCOPE_REPO,
@@ -229,16 +230,30 @@ def _run(
     repo: Path, *args: str, stdin: str | None = None, _env: dict[str, str] | None = None
 ) -> str:
     argv = ["git", "-C", str(repo), *args]
+    # Bytes in, explicit UTF-8 — not ``text=True``. Text mode on native Windows
+    # rewrites every ``\n`` written to stdin as ``\r\n`` (``update-ref --stdin``
+    # then rejects the line: "extra input: \r") and encodes with the locale
+    # code page, so ``hash-object --stdin`` would store different bytes per
+    # platform. Output keeps text mode's universal-newline semantics.
     proc = subprocess.run(
         argv,
-        input=stdin,
+        input=None if stdin is None else stdin.encode("utf-8"),
         capture_output=True,
-        text=True,
         env=_env,
     )
     if proc.returncode != 0:
-        raise GitError(list(args), proc.returncode, proc.stderr)
-    return proc.stdout
+        # git reports some failures (e.g. "nothing to commit") on stdout only;
+        # an empty stderr would otherwise yield a reason-less manifest note.
+        raise GitError(
+            list(args), proc.returncode,
+            _decode_git_text(proc.stderr) or _decode_git_text(proc.stdout),
+        )
+    return _decode_git_text(proc.stdout)
+
+
+def _decode_git_text(raw: bytes) -> str:
+    """Decode git output as ``text=True`` did on POSIX: UTF-8, universal newlines."""
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _run_bytes(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
@@ -1186,6 +1201,25 @@ def commit_file_to_branch(
     that tree's index and files behind its own HEAD. Callers handle that
     case by committing through the checked-out tree instead.
     """
+    return commit_files_to_branch(
+        repo, branch, {relpath: content}, message, identity=identity
+    )
+
+
+def commit_files_to_branch(
+    repo: Path,
+    branch: str,
+    files: dict[str, str],
+    message: str,
+    *,
+    identity: Identity,
+) -> str | None:
+    """:func:`commit_file_to_branch` for several files in ONE commit.
+
+    Same contract: object-database only (no checkout, index or HEAD is
+    touched), idempotent (``None`` when the tip already carries every file's
+    bytes), and refuses a branch checked out in a registered worktree.
+    """
     holder = worktree_for_branch(repo, branch)
     if holder is not None:
         raise GitError(
@@ -1195,22 +1229,30 @@ def commit_file_to_branch(
         )
     ref = f"refs/heads/{branch}"
     tip = rev_parse(repo, ref)
-    blob = _run(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
-    try:
-        existing: str | None = _run(repo, "rev-parse", "--verify", "--quiet", f"{tip}:{relpath}").strip()
-    except GitError:
-        existing = None
-    if existing == blob:
+    blobs: dict[str, str] = {}
+    changed = False
+    for relpath, content in files.items():
+        blob = _run(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
+        blobs[relpath] = blob
+        try:
+            existing: str | None = _run(
+                repo, "rev-parse", "--verify", "--quiet", f"{tip}:{relpath}"
+            ).strip()
+        except GitError:
+            existing = None
+        changed = changed or existing != blob
+    if not changed:
         return None
     with tempfile.TemporaryDirectory(prefix="gauntlet-index-") as scratch:
         index = Path(scratch) / "index"
         validate_temp_index_path(repo, index)
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         _run(repo, "read-tree", tip, _env=env)
-        _run(
-            repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{relpath}",
-            _env=env,
-        )
+        for relpath, blob in blobs.items():
+            _run(
+                repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{relpath}",
+                _env=env,
+            )
         tree = _run(repo, "write-tree", _env=env).strip()
     new = commit_tree(
         repo, tree, [tip], _sanitize_commit_message(message), identity=identity
@@ -1908,11 +1950,13 @@ def apply_patch_error(repo: Path, patch: str) -> str | None:
     act on. Side-effect-free (``--check``)."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "apply", "--check", "-"],
-        input=patch, capture_output=True, text=True,
+        # Bytes, not text=True: Windows text mode would CRLF every patch line.
+        input=patch.encode("utf-8"), capture_output=True,
     )
     if proc.returncode == 0:
         return None
-    return (proc.stderr or proc.stdout).strip() or f"git apply --check exited {proc.returncode}"
+    err = _decode_git_text(proc.stderr) or _decode_git_text(proc.stdout)
+    return err.strip() or f"git apply --check exited {proc.returncode}"
 
 
 def apply_patch(repo: Path, patch: str) -> None:

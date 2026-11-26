@@ -734,8 +734,9 @@ def handle_adversarial_cycle(step: Step, ctx: StepContext) -> StepResult:
         baseline = _baseline_commit(ctx, step, phase, fixer)
         if isinstance(baseline, StepResult):
             return _finish(baseline, usage, commits, artifact_writes, metrics)
-        commits.append((phase, baseline))
-        handoff = baseline
+        if baseline is not None:  # None: already committed, nothing to freeze
+            commits.append((phase, baseline))
+            handoff = baseline
         # The baseline commit froze the work tree's copy; bring the authority
         # copy the engine reads and hashes level with it (§14.2 correction).
         _adopt_artifact(ctx, step)
@@ -3995,10 +3996,21 @@ def _baseline_commit(ctx: StepContext, step: Step, phase: str, fixer: str):
             status=FAILED,
             notes=f"artifact-mode baseline commit message invalid: {err.reason}",
         )
-    sha = gitops.commit_all(
-        ctx.work_root, message,
-        identity=ctx.config.identity(fixer), exclude=ctx.excludes,
-    )
+    try:
+        sha = gitops.commit_all(
+            ctx.work_root, message,
+            identity=ctx.config.identity(fixer), exclude=ctx.excludes,
+        )
+    except gitops.GitError:
+        # The artifact read as dirty but staging it changed nothing: its
+        # content already equals HEAD once git normalizes it (e.g. a
+        # line-ending-only re-publish on a `--response` resume under
+        # core.autocrlf). It is already the committed baseline, so there is
+        # nothing to freeze. Only that exact case is absorbed: anything still
+        # dirty after the failed commit re-raises (fail closed).
+        if gitops.dirty_paths(ctx.work_root, exclude=ctx.excludes):
+            raise
+        return None
     return sha
 
 

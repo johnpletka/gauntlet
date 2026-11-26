@@ -573,7 +573,10 @@ def _validate_review_against(
         )
         return
     parts = Path(name).parts
-    if Path(name).is_absolute() or ".." in parts:
+    # `anchor` (any root or drive), not only is_absolute(): on Windows
+    # "/etc/passwd" is rooted but drive-less, so is_absolute() is False and the
+    # path escaped this containment check.
+    if Path(name).is_absolute() or Path(name).anchor or ".." in parts:
         report.errors.append(
             f"step {step.id!r} review_against {name!r} must be a run-artifact "
             "name, not an absolute or parent-escaping path: its body is inlined "

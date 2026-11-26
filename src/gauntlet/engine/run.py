@@ -499,7 +499,8 @@ def _atomic_write_durable(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as fh:
+        # UTF-8 + LF on every platform (completion.json is compared by the journal).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -4321,7 +4322,17 @@ class RunManager:
                     # --response validator will actually accept; a terminally
                     # failed shell step / rejected gate gets the executable
                     # exit (abort) instead of a command that will be refused.
-                    if failed.type in M.RESPONDABLE_STEP_TYPES:
+                    if failed.type == "retrospective":
+                        # #169: the build is complete; only the advisory
+                        # proposal synthesis failed. Say what the response does.
+                        way_out = (
+                            f'Run `gauntlet resume {man.slug} --response "<note>"` '
+                            "to finish it: proposal synthesis is retried once "
+                            "with your note as guidance (the self-critiques "
+                            "already written are kept), and the run completes "
+                            "even if synthesis fails again."
+                        )
+                    elif failed.type in M.RESPONDABLE_STEP_TYPES:
                         way_out = (
                             "If a human decision can unblock it (e.g. "
                             "reclassifying a finding the fixer could not act "
@@ -4528,7 +4539,8 @@ class RunManager:
                         layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
                 orch = self._orchestrator(layout, run_dir, pipeline, man,
                                           judge_env={}, adapter_factory=adapter_factory)
-                status = orch.approve_gate(gate, notes)
+                with self._gate_drive_liveness(run_dir, man):
+                    status = orch.approve_gate(gate, notes)
                 self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
@@ -4632,8 +4644,9 @@ class RunManager:
                         adapter_factory, allow_terminal=allow_terminal))
                 orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                           adapter_factory=adapter_factory)
-                status = orch.reject_gate(gate, notes, user,
-                                          allow_terminal=allow_terminal)
+                with self._gate_drive_liveness(run_dir, man):
+                    status = orch.reject_gate(gate, notes, user,
+                                              allow_terminal=allow_terminal)
                 self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
@@ -4643,7 +4656,8 @@ class RunManager:
                       adapter_factory, *, allow_terminal: bool = False):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
+        with self._gate_drive_liveness(run_dir, man):
+            status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
         self._finish_drive(layout, run_dir, man, status)
         return status
 
@@ -7429,8 +7443,8 @@ class RunManager:
         """Draft runs/<slug>/PR.md at final-gate pass (FR-9.8); never opens it.
 
         Owned by the RunManager (not the orchestrator) because PR.md is a
-        slug-dir deliverable a human edits and commits — opening and pushing
-        stay human actions (PRD §2.2).
+        slug-dir deliverable the operator edits and commits — opening and
+        pushing belong to the operator role, never the run (PRD §2.2).
 
         PR.md is a REQUIRED final-gate artifact (FR-9.8), so a failure to render
         it is not swallowed (review F-005): the error is recorded as a manifest
@@ -7536,11 +7550,36 @@ class RunManager:
         man.agent_usage["judge_llm"] = agg
         man.write_atomic(run_dir / "manifest.json")
 
+    @contextlib.contextmanager
+    def _gate_drive_liveness(self, run_dir: Path, man: Manifest):
+        """FR-5 liveness for a gate verb's drive (approve/reject).
+
+        `approve` and `reject` drive the rest of the run, but unlike `_drive`
+        they never started a heartbeat writer: every run continued from a gate
+        kept the previous driver's stale heartbeat, `status` classified it
+        `driver_orphaned`, and suspensions went uncredited. Same writer +
+        keep-awake as `_drive`, scoped to the drive; detected suspensions are
+        drained before the caller's `_finish_drive`, matching `_drive`.
+        """
+        from gauntlet.engine.heartbeat import HeartbeatWriter, KeepAwake
+
+        writer = HeartbeatWriter(
+            run_dir,
+            interval_s=self.config.heartbeat_interval_s,
+            credit_cap_s=self.config.suspend_credit_cap_s,
+        )
+        with KeepAwake(enabled=self.config.keep_awake), writer:
+            try:
+                yield writer
+            finally:
+                self._drain_suspensions(writer, man, run_dir)
+
     def _approve_drive(self, layout, run_dir, pipeline, man, gate, notes, env,
                        adapter_factory):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.approve_gate(gate, notes)
+        with self._gate_drive_liveness(run_dir, man):
+            status = orch.approve_gate(gate, notes)
         self._finish_drive(layout, run_dir, man, status)
         return status
 

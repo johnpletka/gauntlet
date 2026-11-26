@@ -849,7 +849,7 @@ def test_gemini_panel_profile_valid_model_id_probes_ok(monkeypatch):
     monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
     monkeypatch.setattr(
         ApiAdapter, "_complete",
-        lambda self, messages: SimpleNamespace(
+        lambda self, messages, **_kw: SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))],
             usage=None,
         ),
@@ -932,7 +932,7 @@ def test_api_model_probe_sends_mapped_effort_and_passes(monkeypatch, tmp_path):
     monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
     captured: dict = {}
 
-    def fake_complete(self, messages):
+    def fake_complete(self, messages, **_kw):
         captured["reasoning_effort"] = self.reasoning_effort
         captured["model"] = self.model
         return SimpleNamespace(
@@ -957,7 +957,7 @@ def test_api_model_probe_fails_when_effort_rejected(monkeypatch, tmp_path):
 
     monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
 
-    def boom(self, messages):
+    def boom(self, messages, **_kw):
         raise ValueError("reasoning_effort is not supported by this model")
 
     monkeypatch.setattr(ApiAdapter, "_complete", boom)
@@ -980,7 +980,7 @@ def test_real_judge_probe_uses_classifier_schema_timeout_and_profile_effort(monk
     monkeypatch.setattr("gauntlet.adapters.api.model_provider_error", lambda _m: None)
     captured: dict = {}
 
-    def fake_complete(self, messages):
+    def fake_complete(self, messages, **_kw):
         captured.update(
             model=self.model,
             effort=self.reasoning_effort,

@@ -49,6 +49,28 @@ apply, so the file reads oldest-first.
 - **commit-message.md** (#141 review): retain the updated guidance to aim under
   72 characters while making the enforced 100-character ceiling explicit.
 
+- **operator.md / policy.yaml descriptions** (PRD v1.6, FR-9.8): remote actions
+  are owned by role. In-run agents never push, open, or merge, while the operator
+  (the human or a `/gauntlet-operator` session) is expected to push, open and
+  manage the PR, and merge when the human chooses. §7 no longer says "the human
+  pushes". §8 adds "Publishing is yours", which also tells the operator to hand a
+  judge-denied `gh pr merge` to the human instead of working around it. Policy
+  rule descriptions only; no pattern or `pipeline_step_only` flag changed.
+
+- **operator.md / policy.yaml descriptions** (PR #173, F-001): narrow the
+  enforced boundary to pushing, PR creation, and merging. Remote reads remain
+  permitted; other PR-management writes reach the LLM classifier in both roles.
+  PRD Open Question 6 tracks broader remote-write enforcement separately.
+
+- **operator.md / policy.yaml descriptions** (PR #173, second review): the
+  `gh-pr-merge` description no longer points a denied agent at "an unjudged
+  operator session". It says to hand the merge to the human and not retry by
+  another route, matching operator.md §6. The push/create deny is described as
+  covering the literal command forms: `git -C … push` and `gh api` variants
+  reach the classifier (PRD Open Question 6). Remote reads are qualified as
+  fast-pathed and outside the network-denied verifier. operator.md is
+  reflowed. Descriptions only; no pattern, flag, rule id or version changed.
+
 - **escalation-contract.md / schemas/fix-contract.json / pipelines** (#163):
   add the fix-contract prompt and schema for the optional `fix_contract_agent`
   on an `adversarial_cycle`. At an escalation park it drafts, per open finding,

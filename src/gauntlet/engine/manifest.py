@@ -140,8 +140,14 @@ RESPONSE_RESOLVABLE_PARK_REASONS = frozenset({PARKED_REASON_RESPONSE})
 # otherwise-unrecoverable terminal failure) re-runs consuming the decision: a
 # response that is itself a valid commit message is used verbatim (a
 # deterministic operator override for a drafter that could not produce a legal
-# header), else it steers the redraft.
-RESPONDABLE_STEP_TYPES = frozenset({"agent_task", "adversarial_cycle", "commit"})
+# header), else it steers the redraft. A `retrospective` whose proposal
+# synthesis failed (fail-closed, but otherwise a dead end at the very last step
+# of a complete run, #169) re-runs synthesis only — the self-critiques on disk
+# are kept — with the decision as guidance, and completes even if synthesis
+# fails again: proposals are advisory once a human has decided.
+RESPONDABLE_STEP_TYPES = frozenset(
+    {"agent_task", "adversarial_cycle", "commit", "retrospective"}
+)
 
 # --- halt reasons (terminal HALTED/FAILED/INTERRUPTED discriminator) ---------
 # The disjoint sibling of ``parked_reason`` (harness-efficiency FR-7.2, PRD §6):
@@ -1082,7 +1088,7 @@ class Manifest(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
-        return cls.model_validate_json(path.read_text())
+        return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def validate_projection_text(text: str) -> bool:
@@ -1116,7 +1122,9 @@ def _replace_atomic(path: Path, payload: str) -> None:
     """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as fh:
+        # UTF-8 + LF on every platform: the projection must be byte-identical
+        # to the journal's embedded state_json (journal._write_projection).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())

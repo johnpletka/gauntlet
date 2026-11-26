@@ -935,3 +935,61 @@ def test_make_scratch_home_seeds_only_the_claude_login_surface(tmp_path, monkeyp
         assert not (scratch / hidden).exists(), hidden
     # idempotent (resume-safe)
     assert verify.make_scratch_home(tmp_path / "sandbox") == scratch
+
+
+def test_sandbox_env_keeps_windows_process_essentials_but_no_secrets():
+    """Without SYSTEMROOT a Windows child cannot load Winsock (`import asyncio`
+    -> WinError 10106), which failed pytest enumeration closed."""
+    from gauntlet.engine.verify import build_sandbox_env
+
+    base = {
+        "SYSTEMROOT": r"C:\Windows", "COMSPEC": r"C:\Windows\system32\cmd.exe",
+        "PATHEXT": ".COM;.EXE", "USERPROFILE": r"C:\Users\u",
+        "OPENAI_API_KEY": "sk-x", "GH_TOKEN": "t",
+    }
+    env = build_sandbox_env(base)
+    for key in ("SYSTEMROOT", "COMSPEC", "PATHEXT", "USERPROFILE"):
+        assert env[key] == base[key]
+    assert "OPENAI_API_KEY" not in env and "GH_TOKEN" not in env
+
+
+def test_scratch_home_also_repoints_windows_home_variables(tmp_path, monkeypatch):
+    """#178 second-round review: on Windows, Node/Python/gh/aws resolve the
+    home from USERPROFILE/APPDATA/LOCALAPPDATA, not HOME. With a scratch HOME
+    those must point into the scratch dir too, or the F-006 isolation leaks
+    %USERPROFILE%\\.ssh, .aws and %APPDATA%\\GitHub CLI."""
+    from gauntlet.engine import verify
+
+    real = {
+        "USERPROFILE": str(tmp_path / "real"),
+        "APPDATA": str(tmp_path / "real" / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(tmp_path / "real" / "AppData" / "Local"),
+        "HOMEDRIVE": "C:", "HOMEPATH": r"\Users\real",
+    }
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    for k, v in real.items():
+        monkeypatch.setenv(k, v)
+    scratch = tmp_path / "scratch"
+    env = verify.verifier_env(
+        _JUDGE_ENV, tmp_path / "copy", step_id="s", scratch_home=scratch,
+    )
+    for var in ("USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+        assert env[var].startswith(str(scratch)), var
+        assert Path(env[var]).is_dir()
+    assert "real" not in env["HOMEPATH"]
+    # the claude login is still pinned to the REAL profile (read before repoint)
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "real" / ".claude")
+
+
+def test_scratch_home_leaves_posix_env_without_windows_vars(tmp_path, monkeypatch):
+    from gauntlet.engine import verify
+
+    for var in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"):
+        monkeypatch.delenv(var, raising=False)
+    env = verify.verifier_env(
+        _JUDGE_ENV, tmp_path / "copy", step_id="s", scratch_home=tmp_path / "s",
+    )
+    for var in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"):
+        assert var not in env

@@ -3020,3 +3020,63 @@ def test_adopt_artifact_fires_only_in_artifact_mode(tmp_path):
 
     _adopt_artifact(ctx, {"artifact": "prd.md"})  # artifact mode is the default
     assert called == ["prd.md"]
+
+
+# --- artifact baseline commit is idempotent (resume after --response) ----------
+
+
+def test_baseline_commit_absorbs_nothing_to_commit_only(tmp_path, monkeypatch):
+    """A `--response` resume can re-publish an artifact that differs from HEAD
+    only in line endings: it reads dirty, but staging changes nothing and
+    `git commit` exits 1. That artifact is already the committed baseline, so
+    `_baseline_commit` returns None instead of failing the cycle — and still
+    re-raises when the tree is genuinely dirty after the failed commit."""
+    from types import SimpleNamespace
+
+    from gauntlet.engine import cycle as C
+    from gauntlet.engine import gitops as G
+
+    def boom(*a, **k):
+        raise G.GitError(["commit"], 1, "nothing to commit, working tree clean")
+
+    ctx = SimpleNamespace(
+        work_root=tmp_path, excludes=[],
+        config=SimpleNamespace(identity=lambda who: None),
+    )
+    step = {"artifact": "plan.md"}
+    monkeypatch.setattr(G, "commit_all", boom)
+
+    monkeypatch.setattr(G, "dirty_paths", lambda *a, **k: [])
+    assert C._baseline_commit(ctx, step, "PLAN", "builder") is None
+
+    monkeypatch.setattr(G, "dirty_paths", lambda *a, **k: ["plan.md"])
+    with pytest.raises(G.GitError):
+        C._baseline_commit(ctx, step, "PLAN", "builder")
+
+
+def test_git_error_falls_back_to_stdout_when_stderr_is_empty(tmp_path):
+    from gauntlet.engine import gitops as G
+
+    G._run(tmp_path, "init", "-q")
+    with pytest.raises(G.GitError) as exc:
+        G._run(tmp_path, "-c", "user.name=t", "-c", "user.email=t@t",
+               "commit", "-m", "x")
+    assert "nothing to commit" in str(exc.value)
+
+
+def test_portable_log_component_is_injective_on_windows(monkeypatch):
+    """#178 second-round review: `a:F-1` and `a_F-1` must not share a dir (one
+    verdict would overwrite the other); reserved device names and a trailing
+    dot are escaped too. POSIX is identity."""
+    from gauntlet.engine import steptypes
+
+    assert steptypes.portable_log_component("a:F-1") == "a:F-1"
+    monkeypatch.setattr(steptypes.os, "name", "nt")
+    enc = steptypes.portable_log_component
+    names = ["a:F-1", "a_F-1", "a%3AF-1", "CON", "con.txt", "x."]
+    encoded = [enc(n) for n in names]
+    assert len(set(encoded)) == len(names)
+    assert encoded[0] == "a%3AF-1" and encoded[2] == "a%253AF-1"
+    assert encoded[3] == "%43ON" and encoded[5] == "x%2E"
+    for e in encoded:
+        assert not any(c in e for c in '<>:"|?*')

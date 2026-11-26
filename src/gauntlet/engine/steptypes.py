@@ -2895,9 +2895,53 @@ def step_log_dir(ctx: StepContext) -> Path:
     return ctx.steps_dir() / leaf
 
 
+# Characters a Windows file name cannot hold, plus `%` (the escape character
+# itself, so the encoding stays injective).
+_WINDOWS_ESCAPED_NAME_CHARS = re.compile(r'[<>:"|?*%\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _pct(ch: str) -> str:
+    return f"%{ord(ch):02X}"
+
+
+def portable_log_component(name: str) -> str:
+    """A step-log directory name that native Windows can create.
+
+    Panel finding ids are namespaced ``<member>:<id>`` (cycle.py), and ``:`` is
+    illegal in a Windows file name (``WinError 267``), so every triage leaf
+    failed there. POSIX names are left byte-identical; readers enumerate these
+    dirs and take the finding id from ``verdict.json``, not the dir name.
+
+    On Windows the mapping is INJECTIVE (#178 review): each illegal character
+    and ``%`` become ``%XX``, so ``a:F-1`` and ``a_F-1`` stay distinct dirs and
+    one verdict never overwrites another. A reserved device name (``CON``,
+    ``NUL``, ``COM1``, … with or without an extension) has its first character
+    escaped, and a trailing ``.``/space (which Windows strips) is escaped too.
+    ``gauntlet logs --step`` maps its selector through this same function.
+    """
+    if os.name != "nt":
+        return name
+    out = _WINDOWS_ESCAPED_NAME_CHARS.sub(lambda m: _pct(m.group()), name)
+    if out and out.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        out = _pct(out[0]) + out[1:]
+    if out and out[-1] in ". ":
+        out = out[:-1] + _pct(out[-1])
+    return out
+
+
+# Back-compat alias for the original private name.
+_portable_log_component = portable_log_component
+
+
 def step_logger(ctx: StepContext, *subdir: str) -> StepLogger:
     """FR-4 logger for this step (or a sub-step, e.g. a cycle round's review)."""
-    return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*subdir))
+    parts = [_portable_log_component(s) for s in subdir]
+    return StepLogger(ctx.writer, step_log_dir(ctx).joinpath(*parts))
 
 
 def open_step_stream(ctx: StepContext, adapter, logger: StepLogger, *, suffix: str = ""):
