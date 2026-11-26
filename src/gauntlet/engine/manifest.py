@@ -1088,7 +1088,7 @@ class Manifest(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
-        return cls.model_validate_json(path.read_text())
+        return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def validate_projection_text(text: str) -> bool:
@@ -1122,7 +1122,9 @@ def _replace_atomic(path: Path, payload: str) -> None:
     """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as fh:
+        # UTF-8 + LF on every platform: the projection must be byte-identical
+        # to the journal's embedded state_json (journal._write_projection).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())

@@ -32,6 +32,7 @@ projection-write ``mid`` boundary) lives in
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -900,6 +901,22 @@ def test_engine_write_path_never_journals_an_unloadable_state(tmp_path):
 # --- F-006: authoritative writes fail closed on a durability failure ---------
 
 
+def test_directory_flush_is_skipped_on_windows(tmp_path, monkeypatch):
+    """Native Windows cannot open a directory to fsync it, so ``_fsync_dir``
+    returns without trying — even in strict mode — instead of failing every
+    authoritative write."""
+    calls: list[str] = []
+    monkeypatch.setattr(J.os, "name", "nt")
+    monkeypatch.setattr(
+        J.os, "open", lambda path, *a, **kw: calls.append(str(path)) or 0
+    )
+    J._fsync_dir(tmp_path, strict=True)
+    assert calls == []
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="no directory fsync on native Windows; see above"
+)
 def test_state_append_fails_closed_when_the_directory_flush_fails(
     tmp_path, monkeypatch
 ):

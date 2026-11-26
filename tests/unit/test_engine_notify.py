@@ -567,3 +567,42 @@ def test_armed_schedule_reparks_share_one_key_until_escalation():
     plain_b = _parked(M.PARKED_REASON_USAGE_LIMIT, ended="2026-09-16T12:30:00+00:00")
     assert (N.Notifier._key(_event(plain_a), N.KIND_PARKED_USAGE_LIMIT)
             != N.Notifier._key(_event(plain_b), N.KIND_PARKED_USAGE_LIMIT))
+
+
+# --- desktop channel on native Windows ----------------------------------------
+
+
+def _desktop_note(title: str, body: str) -> N.Notification:
+    fields = {}
+    for name, info in N.Notification.model_fields.items():
+        fields[name] = {} if "dict" in str(info.annotation) else "x"
+    fields.update(title=title, body=body, url="http://127.0.0.1/")
+    return N.Notification(**fields)
+
+
+def test_desktop_channel_uses_a_constant_powershell_toast_on_windows(monkeypatch):
+    """No terminal-notifier/osascript on Windows: the channel raises a WinRT
+    toast via PowerShell. The script is constant and the note text travels
+    only in env vars, so hostile text cannot reach the command line."""
+    monkeypatch.setattr(N.shutil, "which", lambda name: None)
+    monkeypatch.setattr(N.os, "name", "nt")
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"], seen["env"] = argv, kw.get("env")
+
+    monkeypatch.setattr(N.subprocess, "run", fake_run)
+    hostile = r'x"; $(Remove-Item C:\) <tag>&'
+    N.DesktopChannel().send(_desktop_note(hostile, hostile))
+
+    assert seen["argv"][-1] == N._WINDOWS_TOAST_PS
+    assert all(hostile not in a for a in seen["argv"])
+    assert seen["env"]["GAUNTLET_TOAST_TITLE"] == hostile
+    assert seen["env"]["GAUNTLET_TOAST_BODY"] == hostile
+
+
+def test_desktop_channel_keeps_osascript_off_windows(monkeypatch):
+    monkeypatch.setattr(N.shutil, "which", lambda name: None)
+    monkeypatch.setattr(N.os, "name", "posix")
+    argv = N.DesktopChannel()._command(_desktop_note("t", "b"))
+    assert argv[0] == "osascript"

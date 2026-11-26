@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable
 
 from gauntlet import __version__
+from gauntlet.adapters.process import resolve_argv0
 from gauntlet.engine.init import HOOK_COMMAND
 from gauntlet.pins import PinFile, load_pins, pin_file_path
 
@@ -249,7 +250,7 @@ def _cli_profile_round_trip(name: str, profile) -> ProbeResult:
         return ProbeResult(WARN, f"could not construct probe for {name!r}: {exc}")
     try:
         proc = subprocess.run(
-            argv, input="ping", capture_output=True, text=True, timeout=90,
+            resolve_argv0(argv), input="ping", capture_output=True, text=True, timeout=90,
         )
     except (OSError, subprocess.SubprocessError):
         return ProbeResult(WARN, f"could not run the {cli} model probe for {name!r}")
@@ -407,7 +408,7 @@ def _real_cli_version(name: str) -> str | None:
         return None
     try:
         out = subprocess.run(
-            [name, "--version"],
+            resolve_argv0([name, "--version"]),
             capture_output=True,
             text=True,
             timeout=15,
@@ -440,13 +441,13 @@ def _real_cli_authenticated(name: str) -> bool | None:
     try:
         if name == "claude":
             proc = subprocess.run(
-                ["claude", "-p", "--output-format", "json",
-                 "--model", "haiku", "--tools", ""],
+                resolve_argv0(["claude", "-p", "--output-format", "json",
+                 "--model", "haiku", "--tools", ""]),
                 input="ping", capture_output=True, text=True, timeout=90,
             )
         elif name == "codex":
             proc = subprocess.run(
-                ["codex", "exec", "--json", "-s", "read-only", "-"],
+                resolve_argv0(["codex", "exec", "--json", "-s", "read-only", "-"]),
                 input="ping", capture_output=True, text=True, timeout=90,
             )
         else:

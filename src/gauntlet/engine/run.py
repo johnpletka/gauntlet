@@ -499,7 +499,8 @@ def _atomic_write_durable(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as fh:
+        # UTF-8 + LF on every platform (completion.json is compared by the journal).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -4538,7 +4539,8 @@ class RunManager:
                         layout, run_dir, pipeline, man, gate, notes, env, adapter_factory))
                 orch = self._orchestrator(layout, run_dir, pipeline, man,
                                           judge_env={}, adapter_factory=adapter_factory)
-                status = orch.approve_gate(gate, notes)
+                with self._gate_drive_liveness(run_dir, man):
+                    status = orch.approve_gate(gate, notes)
                 self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
@@ -4642,8 +4644,9 @@ class RunManager:
                         adapter_factory, allow_terminal=allow_terminal))
                 orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env={},
                                           adapter_factory=adapter_factory)
-                status = orch.reject_gate(gate, notes, user,
-                                          allow_terminal=allow_terminal)
+                with self._gate_drive_liveness(run_dir, man):
+                    status = orch.reject_gate(gate, notes, user,
+                                              allow_terminal=allow_terminal)
                 self._finish_drive(layout, run_dir, man, status)
                 return status
         finally:
@@ -4653,7 +4656,8 @@ class RunManager:
                       adapter_factory, *, allow_terminal: bool = False):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
+        with self._gate_drive_liveness(run_dir, man):
+            status = orch.reject_gate(gate, notes, user, allow_terminal=allow_terminal)
         self._finish_drive(layout, run_dir, man, status)
         return status
 
@@ -7546,11 +7550,36 @@ class RunManager:
         man.agent_usage["judge_llm"] = agg
         man.write_atomic(run_dir / "manifest.json")
 
+    @contextlib.contextmanager
+    def _gate_drive_liveness(self, run_dir: Path, man: Manifest):
+        """FR-5 liveness for a gate verb's drive (approve/reject).
+
+        `approve` and `reject` drive the rest of the run, but unlike `_drive`
+        they never started a heartbeat writer: every run continued from a gate
+        kept the previous driver's stale heartbeat, `status` classified it
+        `driver_orphaned`, and suspensions went uncredited. Same writer +
+        keep-awake as `_drive`, scoped to the drive; detected suspensions are
+        drained before the caller's `_finish_drive`, matching `_drive`.
+        """
+        from gauntlet.engine.heartbeat import HeartbeatWriter, KeepAwake
+
+        writer = HeartbeatWriter(
+            run_dir,
+            interval_s=self.config.heartbeat_interval_s,
+            credit_cap_s=self.config.suspend_credit_cap_s,
+        )
+        with KeepAwake(enabled=self.config.keep_awake), writer:
+            try:
+                yield writer
+            finally:
+                self._drain_suspensions(writer, man, run_dir)
+
     def _approve_drive(self, layout, run_dir, pipeline, man, gate, notes, env,
                        adapter_factory):
         orch = self._orchestrator(layout, run_dir, pipeline, man, judge_env=env,
                                   adapter_factory=adapter_factory)
-        status = orch.approve_gate(gate, notes)
+        with self._gate_drive_liveness(run_dir, man):
+            status = orch.approve_gate(gate, notes)
         self._finish_drive(layout, run_dir, man, status)
         return status
 
