@@ -2651,7 +2651,50 @@ class Orchestrator:
         if self.manifest.status in (M.RUN_DONE,):
             self.manifest.current_step = None
         self._persist()
+        if self.manifest.status == M.RUN_FAILED:
+            self._publish_failed_state()
         return self.manifest.status
+
+    def _publish_failed_state(self) -> None:
+        """Commit the run bookkeeping when a drive ends ``failed`` (#169).
+
+        The tracked ``manifest.json``/``RUN.md`` only advance at engine
+        checkpoints, so a run that failed after its last one left a committed
+        record saying ``running`` — and every other checkout classified a
+        finished run as ``orphaned`` with ``resume`` as its next action. A
+        ``done`` run publishes ``completion.json`` for the same reason (#164);
+        a failed run is not final (``resume --response`` can re-arm it), so it
+        publishes the ordinary mutable bookkeeping instead, through the same
+        engine-identity checkpoint commit a response uses.
+
+        Idempotent (an unchanged state commits nothing), and never switches a
+        checkout: when the operator's same-tree checkout is on another branch
+        (an ``approve``/``reject`` drive) the files are committed straight onto
+        the run branch through the object database. A Git fault here is
+        recorded as a manifest warning, never raised — the run's state is
+        already durable locally; only its publication failed.
+        """
+        message = f"gauntlet: run failed at {self.manifest.current_step or 'run start'}"
+        try:
+            if gitops.current_branch(self.work_root) == self.manifest.branch:
+                self._commit_manifest_checkpoint(message)
+                return
+            write_run_index(self.run_dir, self.manifest, self.writer)
+            self._refresh_bookkeeping_export()
+            files = {
+                rel: (self.work_root / rel).read_text()
+                for rel in self._bookkeeping_paths()
+            }
+            if files:
+                gitops.commit_files_to_branch(
+                    self.repo_root, self.manifest.branch, files, message,
+                    identity=ENGINE_IDENTITY,
+                )
+        except (gitops.GitError, OSError) as exc:
+            note = f"failed-run state was not committed to the run branch: {exc}"
+            if note not in self.manifest.warnings:
+                self.manifest.warnings.append(note)
+                self._persist()
 
     def _finalize_terminal(self, rec: StepRecord, result: StepResult) -> "M.HumanResponse | None":
         """Finalize a step AND its mapped run status in ONE durable write (P4).

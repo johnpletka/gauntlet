@@ -423,6 +423,12 @@ def test_schema_ref_validator_passes_and_fails(tmp_path):
     assert validate_artifact(
         "schema:s.json", "not json at all", repo_root=tmp_path, asset_root="."
     ) is not None
+    # #171 review F-001: the persisted bytes must parse as-is, so a near-miss
+    # that only a structural repair would accept still fails validation (and
+    # goes back through the agent repair loop).
+    assert validate_artifact(
+        "schema:s.json", '{"ok": 1,}', repo_root=tmp_path, asset_root="."
+    ) is not None
 
 
 def test_schema_ref_missing_file_raises(tmp_path):

@@ -59,6 +59,9 @@ def build_classifier(
             # A schema-invalid answer fails closed to deny rather than
             # burning the timeout on retries.
             max_schema_retries=0,
+            # Strict parse: the judge fails closed on any output that is not
+            # well-formed JSON; it never trusts a locally repaired verdict.
+            json_repair=False,
         )
     )
 

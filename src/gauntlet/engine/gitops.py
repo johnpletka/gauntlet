@@ -176,6 +176,7 @@ ROOT_SCOPE: dict[str, str] = {
     "mktree": ROOT_SCOPE_REPO,
     "commit_tree": ROOT_SCOPE_REPO,
     "commit_file_to_branch": ROOT_SCOPE_REPO,  # object-db + ref CAS; touches no checkout (#164)
+    "commit_files_to_branch": ROOT_SCOPE_REPO,  # same, several files in one commit (#169)
     "commit_subject": ROOT_SCOPE_REPO,
     "commit_parent": ROOT_SCOPE_REPO,
     "commit_message": ROOT_SCOPE_REPO,
@@ -1186,6 +1187,25 @@ def commit_file_to_branch(
     that tree's index and files behind its own HEAD. Callers handle that
     case by committing through the checked-out tree instead.
     """
+    return commit_files_to_branch(
+        repo, branch, {relpath: content}, message, identity=identity
+    )
+
+
+def commit_files_to_branch(
+    repo: Path,
+    branch: str,
+    files: dict[str, str],
+    message: str,
+    *,
+    identity: Identity,
+) -> str | None:
+    """:func:`commit_file_to_branch` for several files in ONE commit.
+
+    Same contract: object-database only (no checkout, index or HEAD is
+    touched), idempotent (``None`` when the tip already carries every file's
+    bytes), and refuses a branch checked out in a registered worktree.
+    """
     holder = worktree_for_branch(repo, branch)
     if holder is not None:
         raise GitError(
@@ -1195,22 +1215,30 @@ def commit_file_to_branch(
         )
     ref = f"refs/heads/{branch}"
     tip = rev_parse(repo, ref)
-    blob = _run(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
-    try:
-        existing: str | None = _run(repo, "rev-parse", "--verify", "--quiet", f"{tip}:{relpath}").strip()
-    except GitError:
-        existing = None
-    if existing == blob:
+    blobs: dict[str, str] = {}
+    changed = False
+    for relpath, content in files.items():
+        blob = _run(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
+        blobs[relpath] = blob
+        try:
+            existing: str | None = _run(
+                repo, "rev-parse", "--verify", "--quiet", f"{tip}:{relpath}"
+            ).strip()
+        except GitError:
+            existing = None
+        changed = changed or existing != blob
+    if not changed:
         return None
     with tempfile.TemporaryDirectory(prefix="gauntlet-index-") as scratch:
         index = Path(scratch) / "index"
         validate_temp_index_path(repo, index)
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         _run(repo, "read-tree", tip, _env=env)
-        _run(
-            repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{relpath}",
-            _env=env,
-        )
+        for relpath, blob in blobs.items():
+            _run(
+                repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{relpath}",
+                _env=env,
+            )
         tree = _run(repo, "write-tree", _env=env).strip()
     new = commit_tree(
         repo, tree, [tip], _sanitize_commit_message(message), identity=identity
